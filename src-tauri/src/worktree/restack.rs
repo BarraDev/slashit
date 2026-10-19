@@ -159,7 +159,13 @@ pub async fn has_commit(dir: &Path, oid: &str) -> Result<bool, String> {
         return Ok(false);
     }
     let ran = run(dir, &["cat-file", "-e", &format!("{oid}^{{commit}}")], &[]).await?;
-    Ok(ran.code == Some(0))
+    match ran.code {
+        Some(0) => Ok(true),
+        // This Git version reports an absent full object with this explicit
+        // diagnostic. Any other nonzero status is an inspection failure.
+        Some(128) if ran.stderr.contains("Not a valid object name") => Ok(false),
+        _ => Err(format!("git could not inspect commit {oid}: {}", ran.stderr)),
+    }
 }
 
 /// Whether commit `ancestor` is an ancestor of (or equal to) `descendant`,

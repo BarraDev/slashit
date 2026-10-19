@@ -132,11 +132,62 @@ record stores its parent and fork point (below).
   that lacks one of those commits is refused and left as it is; bringing it up
   to date is a decision for the person.
 
-  Limit: a Task whose branch is already recorded is reattached without
-  re-reading its dependencies. Dependencies cannot change once a checkout
-  exists, so a branch created by a start is always one that holds the work it
-  needed. A branch recorded before this rule existed is not re-checked, because
-  an interrupted run and an approved continuation look the same on the record.
+  **Durable admission evidence.** A Task records a versioned
+  `CheckoutAdmission` in the same durable board write that first records its
+  checkout identity. It binds the Task and repository IDs, branch, a commit
+  observed on that branch at admission, the exact dependency Task IDs and the
+  commits checked for each, plus the format and admission-policy versions. A
+  branchless dependency is recorded explicitly with no required commits; an
+  empty dependency list means the Task had no dependencies. The admission
+  commit is a Git ancestry boundary, not a replacement for `base_commit` and
+  not a claim about the Task's diff boundary when the checkout was adopted.
+
+  The planner records the same commits it proved before creating or adopting a
+  new checkout: the dependency branch tip for a stacked start, the locally
+  integrated approved tip, or the recorded merged-PR commit. Later starts
+  require those commits to remain ancestors of the admission commit and the
+  admission commit to remain an ancestor of the Task branch. They do not
+  require a dependency branch to remain at its old tip. Dependency-list edits
+  require a fresh admission check.
+
+  An existing supported admission is checked against the Task ID, registered
+  repository ID, recorded branch, current dependency IDs and Git ancestry
+  before SlashIt reattaches the worktree. Missing, malformed or unsupported
+  evidence is unknown, never inferred from a branch, `base_commit`, a run
+  marker or a timestamp. A legacy checkout can be requalified without
+  changing it only where saved stable evidence identifies the requirement
+  (for example, a local integration's approved commit or a merged pull
+  request's merge commit) and Git proves that commit is present. A stacked
+  legacy checkout can also be requalified from its recorded parent branch and
+  fork point when the Task still depends on that parent and both branches
+  prove the fork point by ancestry. Other dependency-bearing legacy checkouts
+  remain untouched and refuse ordinary execution until their requirements can
+  be established.
+
+  Exact-checkout approvals and Worker recovery decisions remain separate
+  authorizations. Each continues to bind the checkout and state its existing
+  contract requires; neither is converted into dependency-admission evidence.
+  Recovery of an interrupted run may proceed only through its existing
+  exact-checkout decision. An older SlashIt version may drop this optional
+  field when it saves a Task; the next version then treats the evidence as
+  unknown and requalifies or refuses. A supported restack carries the record
+  forward in the same durable Task write when exact required commits remain on
+  the landed base. For the exact stacked parent whose merge commit was just
+  verified, its old branch commit requirement may be replaced with that merge
+  commit when the old work is in the recorded fork. Other missing requirements
+  refuse before changing the checkout. Dependency branch advances alone do not
+  invalidate a supported admission.
+
+  Admission validation is read-only and runs before reattaching an existing
+  branch. A refusal leaves its refs, checkout, branch and user files in place.
+  New branch creation and explicit checkout creation use the same planner and
+  persist admission with checkout identity; a failed or unconfirmed write
+  follows the existing durable-write cleanup rules and never launches a
+  Worker without a durable run-start record. Immediately before that record,
+  the captured execution HEAD is checked again against the admitted commit.
+  This narrows the gap after reattachment, but an external Git writer can
+  still move the branch after that last check and before the provider starts;
+  eliminating that residual race requires broader branch ownership or locking.
 
   A refusal creates no branch or worktree, and changes no dependency, branch,
   worktree or user branch. The executor then records the refusal as the Task's

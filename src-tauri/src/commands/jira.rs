@@ -200,6 +200,7 @@ pub async fn import_jira_issues(
             error_message: None,
             worktree_path: None,
             branch_name: None,
+            checkout_admission: None,
             base_commit: None,
             branch_origin: None,
             pending_republish: None,

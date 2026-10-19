@@ -77,6 +77,7 @@ pub(crate) async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid
         if let Some(task) = staged.get_mut(&task_id) {
             task.worktree_path = Some(acquired.info.path.clone());
             task.branch_name = Some(acquired.info.branch.clone());
+            if let Some(evidence) = &acquired.checkout_admission { task.checkout_admission = Some(evidence.clone()); }
             if let Some(base_commit) = &acquired.base_commit {
                 task.base_commit = Some(base_commit.clone());
             }

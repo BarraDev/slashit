@@ -1706,6 +1706,47 @@ mod tests {
     }
 
     #[test]
+    fn checkout_admission_round_trips_through_production_task_board_storage() {
+        use crate::domain::task::{CheckoutAdmission, DependencyAdmission, DependencyRequirement};
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let dependency_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let mut task = crate::test_helpers::create_test_task("Admission persistence");
+        task.project_id = project_id;
+        task.dependencies = vec![dependency_id];
+        task.checkout_admission = Some(CheckoutAdmission {
+            format_version: CheckoutAdmission::FORMAT_VERSION,
+            policy_version: CheckoutAdmission::POLICY_VERSION,
+            task_id: task.id,
+            repository_id,
+            branch: "task/board-round-trip".into(),
+            admitted_commit: "a".repeat(40),
+            dependencies: vec![DependencyAdmission {
+                task_id: dependency_id,
+                requirement: DependencyRequirement::Commits(vec!["b".repeat(40), "c".repeat(40)]),
+            }],
+        });
+
+        storage.save_project_tasks(project_id, &[task.clone()]).expect("write production Task board");
+        let loaded = storage.load_project_tasks(project_id).expect("read production Task board");
+        let restarted = loaded.iter().find(|saved| saved.id == task.id).expect("saved Task");
+
+        assert_eq!(restarted.checkout_admission, task.checkout_admission);
+        let admission = restarted.checkout_admission.as_ref().unwrap();
+        assert_eq!(admission.format_version, CheckoutAdmission::FORMAT_VERSION);
+        assert_eq!(admission.policy_version, CheckoutAdmission::POLICY_VERSION);
+        assert_eq!(admission.task_id, task.id);
+        assert_eq!(admission.repository_id, repository_id);
+        assert_eq!(admission.branch, "task/board-round-trip");
+        assert_eq!(admission.admitted_commit, "a".repeat(40));
+        assert_eq!(admission.dependencies, vec![DependencyAdmission {
+            task_id: dependency_id,
+            requirement: DependencyRequirement::Commits(vec!["b".repeat(40), "c".repeat(40)]),
+        }]);
+    }
+
+    #[test]
     fn a_missing_file_and_an_empty_board_are_both_loadable_but_different() {
         let (storage, _dir) = create_test_storage();
         let missing = Uuid::new_v4();

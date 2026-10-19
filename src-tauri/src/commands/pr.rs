@@ -4187,6 +4187,88 @@ async fn restack_onto_landed_parent(
         );
     }
 
+    // A supported admission record is part of this checkout's identity. A
+    // restack carries it forward when required commits remain on the landed
+    // base, or when an exact stacked-parent requirement is replaced by the
+    // already-verified merge commit for that parent. Unknown evidence stays unknown.
+    let (project_id, task_dependencies_before, admission_before, origin_before) = state
+        .task.tasks.read().await.get(&task_uuid)
+        .map(|task| (task.project_id, task.dependencies.clone(), task.checkout_admission.clone(), task.branch_origin.clone()))
+        .ok_or("Task not found")?;
+    let repository_id = state.project.projects.read().await.get(&project_id).and_then(|project| project.repository_id);
+    let admission_rebound = admission_before.as_ref().and_then(|evidence| {
+            use crate::domain::task::CheckoutAdmission;
+            let mut ids: Vec<_> = evidence.dependencies.iter().map(|d| d.task_id).collect();
+            let mut task_ids = task_dependencies_before.clone();
+            ids.sort();
+            task_ids.sort();
+            let supported = evidence.format_version == CheckoutAdmission::FORMAT_VERSION
+                && evidence.policy_version == CheckoutAdmission::POLICY_VERSION
+                && evidence.task_id == task_uuid
+                && Some(evidence.repository_id) == repository_id
+                && evidence.branch == branch
+                && ids == task_ids;
+            supported.then(|| evidence.clone())
+    });
+    if let Some(evidence) = admission_rebound.as_ref() {
+        if !restack::has_commit(repo, &evidence.admitted_commit).await?
+            || !restack::is_ancestor(repo, &evidence.admitted_commit, &tip).await? {
+            return Err("The Task's recorded checkout admission no longer matches its branch; SlashIt preserved the branch and checkout.".into());
+        }
+    }
+    let mut admission_rebound = admission_rebound;
+    if let Some(evidence) = admission_rebound.as_mut() {
+        for dependency in &mut evidence.dependencies {
+            let crate::domain::task::DependencyRequirement::Commits(commits) = &mut dependency.requirement else {
+                continue;
+            };
+            if commits.is_empty() {
+                return Err("The Task's admission contains an empty dependency requirement; SlashIt preserved the branch and checkout.".into());
+            }
+            let mut all_on_landed_base = true;
+            for commit in commits.iter() {
+                if !restack::has_commit(repo, commit).await?
+                    || !restack::is_ancestor(repo, commit, &evidence.admitted_commit).await? {
+                    return Err(format!("The Task's admission requirement {commit} does not match its recorded admission boundary; SlashIt preserved the branch and checkout."));
+                }
+                if !restack::is_ancestor(repo, commit, &onto).await? {
+                    all_on_landed_base = false;
+                }
+            }
+            if all_on_landed_base {
+                continue;
+            }
+
+            let is_landed_parent = {
+                let tasks = state.task.tasks.read().await;
+                let child_matches_parent = tasks.get(&task_uuid).is_some_and(|task| {
+                    matches!(task.branch_origin.as_ref(), Some(BranchOrigin::Stacked { parent_branch }) if parent_branch == parent)
+                });
+                let dependency_matches_parent = tasks.get(&dependency.task_id).is_some_and(|task| {
+                    task.branch_name.as_deref() == Some(parent)
+                });
+                child_matches_parent && dependency_matches_parent
+            };
+            let old_parent_work_is_in_fork = {
+                let mut all_in_fork = true;
+                for commit in commits.iter() {
+                    if !restack::is_ancestor(repo, commit, &fork_point).await? {
+                        all_in_fork = false;
+                        break;
+                    }
+                }
+                all_in_fork
+            };
+            if !is_landed_parent || !old_parent_work_is_in_fork {
+                return Err(format!(
+                    "The Task's admitted dependency work is not present on the landed base {onto} and cannot be tied to the verified landed parent; SlashIt preserved the branch and checkout."
+                ));
+            }
+            dependency.requirement = crate::domain::task::DependencyRequirement::Commits(vec![merge_commit.to_string()]);
+        }
+        evidence.admitted_commit = onto.clone();
+    }
+
     let unchanged_note = "Nothing was changed or pushed.";
     if pushed.is_some() {
         return Err(format!(
@@ -4310,10 +4392,16 @@ async fn restack_onto_landed_parent(
             if task.branch_name.as_deref() == Some(branch)
                 && task.base_commit.as_deref() == Some(fork_point.as_str())
                 && task.branch_origin.as_ref() == Some(&stacked)
+                && task.branch_origin == origin_before
+                && task.dependencies == task_dependencies_before
+                && task.checkout_admission == admission_before
             {
                 task.base_commit = Some(onto.clone());
                 task.branch_origin =
                     Some(BranchOrigin::DefaultBase { branch: Some(default.to_string()) });
+                if let Some(admission) = admission_rebound.as_ref() {
+                    task.checkout_admission = Some(admission.clone());
+                }
                 recorded.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -4322,7 +4410,7 @@ async fn restack_onto_landed_parent(
     let unrecorded = match written {
         Err(e) => Some(format!("the task could not record the restack: {e}")),
         Ok(()) if !recorded.load(std::sync::atomic::Ordering::SeqCst) => Some(
-            "the task's branch, fork point or parent changed while the branch was being restacked"
+            "the task's branch, fork point, parent, dependencies or checkout admission changed while the branch was being restacked"
                 .to_string(),
         ),
         Ok(()) => None,
@@ -10147,6 +10235,33 @@ mod tests {
                     );
                     let (state, _tmp) = build_test_state().await;
                     let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                    let parent_task_id = seed_task(
+                        &state,
+                        landed.repo.checkout.to_str().unwrap(),
+                        Some("task-parent"),
+                        TaskStatus::Done,
+                    ).await;
+                    let repository_id = {
+                        let tasks = state.task.tasks.read().await;
+                        state.project.projects.read().await[&tasks[&task_id].project_id].repository_id.unwrap()
+                    };
+                    {
+                        let mut tasks = state.task.tasks.write().await;
+                        let task = tasks.get_mut(&task_id).unwrap();
+                        task.dependencies = vec![parent_task_id];
+                        task.checkout_admission = Some(crate::domain::task::CheckoutAdmission {
+                            format_version: crate::domain::task::CheckoutAdmission::FORMAT_VERSION,
+                            policy_version: crate::domain::task::CheckoutAdmission::POLICY_VERSION,
+                            task_id,
+                            repository_id,
+                            branch: "task-branch".to_string(),
+                            admitted_commit: landed.base_commit.clone(),
+                            dependencies: vec![crate::domain::task::DependencyAdmission {
+                                task_id: parent_task_id,
+                                requirement: crate::domain::task::DependencyRequirement::Commits(vec![landed.base_commit.clone()]),
+                            }],
+                        });
+                    }
                     assert_eq!(landed.repo.remote_has_branch("task-branch"), None, "{name}");
 
                     let result = create_pr_inner(&state, &task_id.to_string()).await;
@@ -10187,6 +10302,8 @@ mod tests {
                     let task = &tasks[&task_id];
                     assert_eq!(task.base_commit.as_deref(), Some(onto.as_str()), "{name}");
                     assert_eq!(task.branch_origin, Some(crate::domain::BranchOrigin::DefaultBase { branch: Some("main".to_string()) }), "{name}");
+                    assert_eq!(task.checkout_admission.as_ref().map(|a| a.admitted_commit.as_str()), Some(onto.as_str()), "{name}: admission follows the restacked checkout");
+                    assert_eq!(task.checkout_admission.as_ref().map(|a| &a.dependencies[0].requirement), Some(&crate::domain::task::DependencyRequirement::Commits(vec![landed.merge_commit.clone()])), "{name}: parent requirement follows the verified merged parent");
                     assert_eq!(task.pr_url.as_deref(), Some(CHILD_PR_URL), "{name}");
                 }
             }
@@ -10208,6 +10325,39 @@ mod tests {
                     );
                     let (state, _tmp) = build_test_state().await;
                     let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                    let parent_task_id = seed_task(
+                        &state,
+                        landed.repo.checkout.to_str().unwrap(),
+                        Some("task-parent"),
+                        TaskStatus::Done,
+                    )
+                    .await;
+                    let repository_id = {
+                        let tasks = state.task.tasks.read().await;
+                        state.project.projects.read().await[&tasks[&task_id].project_id]
+                            .repository_id
+                            .unwrap()
+                    };
+                    let admission = crate::domain::task::CheckoutAdmission {
+                        format_version: crate::domain::task::CheckoutAdmission::FORMAT_VERSION,
+                        policy_version: crate::domain::task::CheckoutAdmission::POLICY_VERSION,
+                        task_id,
+                        repository_id,
+                        branch: "task-branch".into(),
+                        admitted_commit: landed.child_tip.clone(),
+                        dependencies: vec![crate::domain::task::DependencyAdmission {
+                            task_id: parent_task_id,
+                            requirement: crate::domain::task::DependencyRequirement::Commits(vec![
+                                landed.base_commit.clone(),
+                            ]),
+                        }],
+                    };
+                    {
+                        let mut tasks = state.task.tasks.write().await;
+                        let task = tasks.get_mut(&task_id).unwrap();
+                        task.dependencies = vec![parent_task_id];
+                        task.checkout_admission = Some(admission.clone());
+                    }
 
                     let result = create_pr_inner(&state, &task_id.to_string()).await;
 
@@ -10229,6 +10379,7 @@ mod tests {
                     let tasks = state.task.tasks.read().await;
                     assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(landed.base_commit.as_str()));
                     assert_eq!(tasks[&task_id].branch_origin, stacked_on_parent());
+                    assert_eq!(tasks[&task_id].checkout_admission.as_ref(), Some(&admission), "the required commit already on landed main keeps its admission intact");
                 }
             }
 
@@ -10261,6 +10412,82 @@ mod tests {
                 git(co, &["fetch", "-q", "origin"]);
                 assert_eq!(subjects(co, "origin/main..origin/task-branch"), ["B1", "B2"]);
                 assert_eq!(git(co, &["show", "origin/task-branch:a.txt"]), "v2");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_required_non_parent_commit_missing_from_landed_base_refuses_without_mutation() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec::new(Landing::Squash));
+                let mock = MockGh::setup_answering(
+                    CHILD_PR_URL,
+                    r#"{"state":"OPEN"}"#,
+                    &merged_parent_answers(&landed),
+                );
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                let parent_task_id = seed_task(
+                    &state,
+                    landed.repo.checkout.to_str().unwrap(),
+                    Some("task-parent"),
+                    TaskStatus::Done,
+                )
+                .await;
+                let other_dependency_id = seed_task(
+                    &state,
+                    landed.repo.checkout.to_str().unwrap(),
+                    Some("another-dependency-branch"),
+                    TaskStatus::Done,
+                )
+                .await;
+                let repository_id = {
+                    let tasks = state.task.tasks.read().await;
+                    state.project.projects.read().await[&tasks[&task_id].project_id]
+                        .repository_id
+                        .unwrap()
+                };
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.dependencies = vec![parent_task_id, other_dependency_id];
+                    task.checkout_admission = Some(crate::domain::task::CheckoutAdmission {
+                        format_version: crate::domain::task::CheckoutAdmission::FORMAT_VERSION,
+                        policy_version: crate::domain::task::CheckoutAdmission::POLICY_VERSION,
+                        task_id,
+                        repository_id,
+                        branch: "task-branch".into(),
+                        admitted_commit: landed.child_tip.clone(),
+                        dependencies: vec![
+                            crate::domain::task::DependencyAdmission {
+                                task_id: parent_task_id,
+                                requirement: crate::domain::task::DependencyRequirement::Commits(vec![landed.base_commit.clone()]),
+                            },
+                            crate::domain::task::DependencyAdmission {
+                                task_id: other_dependency_id,
+                                requirement: crate::domain::task::DependencyRequirement::Commits(vec![landed.pr_commits[0].clone()]),
+                            },
+                        ],
+                    });
+                }
+                let record_before = serde_json::to_value(&state.task.tasks.read().await[&task_id]).unwrap();
+                let refs_before = git(&landed.repo.checkout, &["for-each-ref", "--format=%(refname) %(objectname)"])
+                    .lines()
+                    .filter(|line| !line.starts_with("refs/remotes/"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err("unlanded required work refuses restack");
+
+                assert!(error.contains("admitted dependency work is not present on the landed base"), "{error}");
+                assert_untouched("missing required commit", &state, &landed, task_id, &mock).await;
+                let refs_after = git(&landed.repo.checkout, &["for-each-ref", "--format=%(refname) %(objectname)"])
+                    .lines()
+                    .filter(|line| !line.starts_with("refs/remotes/"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(refs_after, refs_before, "all local refs stay unchanged");
+                assert_eq!(serde_json::to_value(&state.task.tasks.read().await[&task_id]).unwrap(), record_before, "the complete Task record is unchanged");
+                assert!(landed.worktree.is_dir(), "the checkout is preserved");
+                assert_eq!(git(&landed.worktree, &["rev-parse", "HEAD"]), landed.child_tip);
             }
 
             /// When the parent was amended after the task forked from it, the
@@ -10614,6 +10841,24 @@ mod tests {
                 let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
                 let (state, _tmp) = build_test_state().await;
                 let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                let repository_id = {
+                    let tasks = state.task.tasks.read().await;
+                    state.project.projects.read().await[&tasks[&task_id].project_id].repository_id.unwrap()
+                };
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.dependencies.clear();
+                    task.checkout_admission = Some(crate::domain::task::CheckoutAdmission {
+                        format_version: crate::domain::task::CheckoutAdmission::FORMAT_VERSION,
+                        policy_version: crate::domain::task::CheckoutAdmission::POLICY_VERSION,
+                        task_id,
+                        repository_id,
+                        branch: "task-branch".to_string(),
+                        admitted_commit: landed.base_commit.clone(),
+                        dependencies: Vec::new(),
+                    });
+                }
                 let state = std::sync::Arc::new(state);
 
                 let running = tokio::spawn({
@@ -10628,8 +10873,7 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 assert!(entered.exists(), "the rebase never reached its post-rewrite hook");
-                state.task.tasks.write().await.get_mut(&task_id).unwrap().branch_origin =
-                    Some(crate::domain::BranchOrigin::Stacked { parent_branch: "task-other".to_string() });
+                state.task.tasks.write().await.get_mut(&task_id).unwrap().checkout_admission = None;
                 std::fs::write(&release, "").unwrap();
                 let error = running.await.unwrap().expect_err("changed meanwhile");
 
