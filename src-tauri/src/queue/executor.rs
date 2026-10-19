@@ -1391,6 +1391,7 @@ struct RunEventForwarder {
     logs: ExecutionLogs,
     events: SharedEventSink,
     tasks: Tasks,
+    storage: crate::config::Storage,
     run_tools: SharedRunTools,
     working_dir: String,
 }
@@ -1463,6 +1464,31 @@ impl RunEventForwarder {
         }
     }
 
+    /// Durably records `observed` as the Task's latest observed model. The
+    /// record is written only when the value changes. A failed write is logged
+    /// and does not fail the run: the observation is evidence, not an outcome.
+    async fn record_observed_model(&self, task_id: Uuid, observed: &str) {
+        let revise: crate::lifecycle::Revise<'_> = &|staged| match staged.get_mut(&task_id) {
+            Some(task) if task.last_observed_model.as_deref() != Some(observed) => {
+                task.last_observed_model = Some(observed.to_string());
+                true
+            }
+            _ => false,
+        };
+        if let Err(error) =
+            crate::lifecycle::record_typed_if_changed(&self.tasks, &self.storage, task_id, revise)
+                .await
+        {
+            record_output(
+                &self.logs,
+                self.execution_id,
+                LogLevel::Warn,
+                format!("The model the provider reported was not recorded on the Task: {error}"),
+            )
+            .await;
+        }
+    }
+
     async fn handle(&self, event: ClaudeEvent) {
         let task_id = self.task_id;
         let task_id_str = task_id.to_string();
@@ -1513,12 +1539,11 @@ impl RunEventForwarder {
             ClaudeEvent::SystemInit {
                 session_id, model, ..
             } => {
-                // Capture actual model on the task
-                if let Some(m) = model {
-                    let mut tasks_w = self.tasks.write().await;
-                    if let Some(t) = tasks_w.get_mut(&task_id) {
-                        t.model = m.clone();
-                    }
+                // The provider's report is evidence of what ran. It is kept as
+                // the Task's last observed model and never written into `model`,
+                // the configured policy that launches and approvals read.
+                if let Some(observed) = &model {
+                    self.record_observed_model(task_id, observed).await;
                 }
                 record_output(
                     &self.logs,
@@ -4535,6 +4560,7 @@ impl TaskExecutor {
                     logs: logs.clone(),
                     events: events.clone(),
                     tasks: tasks.clone(),
+                    storage: storage.clone(),
                     run_tools: run_tools.clone(),
                     working_dir: working_dir.clone(),
                 }
@@ -8084,9 +8110,143 @@ mod tests {
             logs: executor.logs.clone(),
             events: executor.events.clone(),
             tasks: executor.tasks.clone(),
+            storage: executor.storage.clone(),
             run_tools: executor.run_tools.clone(),
             working_dir: "/nowhere".into(),
         }
+    }
+
+    // --- the model a run reports is evidence, never configuration (#219) ---
+
+    /// Seed one Backlog task on `executor`'s board and disk, configured with
+    /// `model`.
+    async fn seed_configured_task(executor: &TaskExecutor, model: &str) -> (Uuid, Uuid) {
+        let project_id = Uuid::new_v4();
+        let mut task =
+            crate::test_helpers::create_test_task_full("subject", project_id, TaskStatus::Backlog, 0);
+        task.model = model.to_string();
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task.clone());
+        executor
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
+        (task_id, project_id)
+    }
+
+    /// Hands one provider report to run `run`'s forwarder, as the run does.
+    async fn report_model(executor: &TaskExecutor, task_id: Uuid, run: u32, model: Option<&str>) {
+        let event = ClaudeEvent::SystemInit {
+            session_id: "session".into(),
+            model: model.map(str::to_string),
+            message: None,
+        };
+        forwarder(executor, task_id, run).handle(event).await;
+    }
+
+    #[tokio::test]
+    async fn a_reported_model_does_not_replace_a_provider_default_configuration() {
+        let (executor, _temps) = test_executor();
+        let (task_id, project_id) = seed_configured_task(&executor, "default").await;
+
+        report_model(&executor, task_id, 1, Some("claude-sonnet-5-5")).await;
+
+        let live = executor.tasks.read().await[&task_id].clone();
+        assert_eq!(live.model, "default");
+        assert_eq!(live.last_observed_model.as_deref(), Some("claude-sonnet-5-5"));
+        let on_disk = persisted_task(&executor, project_id, task_id);
+        assert_eq!(on_disk.model, "default");
+        assert_eq!(on_disk.last_observed_model.as_deref(), Some("claude-sonnet-5-5"));
+    }
+
+    #[tokio::test]
+    async fn a_reported_model_does_not_replace_an_explicit_configuration() {
+        let (executor, _temps) = test_executor();
+        let (task_id, project_id) =
+            seed_configured_task(&executor, "claude-opus-4-0-20250514").await;
+
+        report_model(&executor, task_id, 1, Some("claude-sonnet-5-5")).await;
+
+        let on_disk = persisted_task(&executor, project_id, task_id);
+        assert_eq!(on_disk.model, "claude-opus-4-0-20250514");
+        assert_eq!(on_disk.last_observed_model.as_deref(), Some("claude-sonnet-5-5"));
+    }
+
+    /// Each run's report is evidence for that run: the latest one is kept, the
+    /// configuration is never rewritten, and a repeated report writes nothing.
+    #[tokio::test]
+    async fn repeated_runs_keep_the_configuration_and_the_latest_observation() {
+        let (executor, _temps) = test_executor();
+        let (task_id, project_id) = seed_configured_task(&executor, "opus").await;
+
+        report_model(&executor, task_id, 1, Some("claude-sonnet-5-5")).await;
+        report_model(&executor, task_id, 2, Some("claude-haiku-5-5")).await;
+        let after_second = persisted_task(&executor, project_id, task_id);
+        assert_eq!(after_second.model, "opus");
+        assert_eq!(after_second.last_observed_model.as_deref(), Some("claude-haiku-5-5"));
+
+        report_model(&executor, task_id, 3, Some("claude-haiku-5-5")).await;
+        assert_eq!(
+            persisted_task(&executor, project_id, task_id).updated_at,
+            after_second.updated_at,
+            "a repeated observation is not a change to the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_reports_no_model_changes_neither_setting_nor_evidence() {
+        let (executor, _temps) = test_executor();
+        let (task_id, project_id) = seed_configured_task(&executor, "default").await;
+        let before = persisted_task(&executor, project_id, task_id);
+
+        report_model(&executor, task_id, 1, None).await;
+
+        let after = persisted_task(&executor, project_id, task_id);
+        assert_eq!(after.model, "default");
+        assert_eq!(after.last_observed_model, None);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    /// The approval names the configured policy. An observed model does not
+    /// move it, and an explicit change in either direction does.
+    #[tokio::test]
+    async fn an_approval_binds_the_configured_policy_not_the_observed_model() {
+        use crate::queue::prompt::{approved_input_digest, task_input_digest};
+
+        let (executor, _temps) = test_executor();
+        let (task_id, _project_id) = seed_configured_task(&executor, "default").await;
+        let before = executor.tasks.read().await[&task_id].clone();
+
+        report_model(&executor, task_id, 1, Some("claude-sonnet-5-5")).await;
+        let observed = executor.tasks.read().await[&task_id].clone();
+        assert_eq!(
+            approved_input_digest(&observed, Some("extra")),
+            approved_input_digest(&before, Some("extra")),
+            "an observed model must not stale an approval"
+        );
+        assert_eq!(task_input_digest(&observed), task_input_digest(&before));
+
+        let mut pinned = observed.clone();
+        pinned.model = "claude-opus-4-0-20250514".into();
+        assert_ne!(
+            approved_input_digest(&pinned, Some("extra")),
+            approved_input_digest(&before, Some("extra")),
+            "provider default to explicit must fail closed"
+        );
+        assert_ne!(task_input_digest(&pinned), task_input_digest(&before));
+
+        let mut back_to_default = pinned.clone();
+        back_to_default.model = "default".into();
+        assert_ne!(
+            approved_input_digest(&back_to_default, Some("extra")),
+            approved_input_digest(&pinned, Some("extra")),
+            "explicit to provider default must fail closed"
+        );
+        assert_eq!(
+            task_input_digest(&back_to_default),
+            task_input_digest(&before),
+            "returning to the same configuration restores the same approval"
+        );
     }
 
     /// Every tool call the run's reader sent before the run ended is in its
