@@ -281,7 +281,7 @@ fn parse_github_url(url: &str, is_pr: bool) -> Option<ExternalRef> {
     let repo = repo_part.split(segment).next()?.to_string();
 
     if is_pr {
-        Some(ExternalRef::GithubPr { url: url.to_string(), number, repo, state: None })
+        Some(ExternalRef::GithubPr { url: url.to_string(), number, repo, state: None , merge_commit: None})
     } else {
         Some(ExternalRef::GithubIssue { url: url.to_string(), number, repo, state: None })
     }
@@ -3174,7 +3174,7 @@ user_name = "Test"
         let result = parse_github_url("https://github.com/owner/repo/pull/456", true);
         assert!(result.is_some());
         match result.unwrap() {
-            ExternalRef::GithubPr { number, repo, url, state } => {
+            ExternalRef::GithubPr { number, repo, url, state, .. } => {
                 assert_eq!(number, 456);
                 assert_eq!(repo, "owner/repo");
                 assert_eq!(url, "https://github.com/owner/repo/pull/456");

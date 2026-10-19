@@ -2690,8 +2690,18 @@ impl TaskExecutor {
         for ((key, answer), task_ids) in answers.into_iter().zip(task_ids) {
             let Ok(status) = answer else { continue };
             for task_id in task_ids {
-                self.apply_polled_pr_state(task_id, &key, status.state)
-                    .await;
+                if let Err(message) = self.apply_polled_pr_state(
+                    task_id,
+                    &key,
+                    status.state,
+                    status.merge_commit.as_deref(),
+                ).await {
+                    self.events.agent_event(AgentEvent::Log {
+                        task_id: task_id.to_string(),
+                        level: LogLevel::Warn,
+                        message,
+                    });
+                }
             }
         }
     }
@@ -2721,17 +2731,23 @@ impl TaskExecutor {
     /// the user has taken back.
     ///
     /// Also what an explicit "check now" does (`commands::pr::refresh_pr_status`),
-    /// so asking by hand has exactly the background poll's consequences.
+    /// so asking by hand has exactly the background poll's consequences. The
+    /// exception is a reference already recorded as merged: it is not finished
+    /// again, and only its missing merge commit is written.
+    ///
+    /// `merge_commit` is the commit GitHub reported for a merged pull request.
+    /// It is recorded with the merge, and never on its own.
     pub(crate) async fn apply_polled_pr_state(
         &self,
         task_id: Uuid,
         key: &crate::pr_status::PrKey,
         state: crate::pr_status::PrState,
-    ) {
+        merge_commit: Option<&str>,
+    ) -> Result<(), String> {
         use crate::pr_status::PrState;
 
         let Some(recorded) = state.as_recorded() else {
-            return;
+            return Ok(());
         };
         // Answers are applied once a whole batch has settled, so a newer
         // reading may have landed in the meantime, say an open after a
@@ -2742,7 +2758,13 @@ impl TaskExecutor {
             .and_then(|e| e.status)
             .is_some_and(|s| s.state != state)
         {
-            return;
+            return Ok(());
+        }
+        // A recorded merge needs only its evidence repaired, even when
+        // cleanup prevents a lifecycle transition. A declined repair must be
+        // reported to an explicit refresh.
+        if state == PrState::Merged && self.merge_on_record(task_id, key).await {
+            return self.record_missing_merge_commit(task_id, key, merge_commit).await;
         }
         let lifecycle = {
             let tasks = self.tasks.read().await;
@@ -2750,16 +2772,104 @@ impl TaskExecutor {
                 // Its interrupted cleanup is reported on the task and only an
                 // explicit lifecycle action finishes it; see
                 // `polled_pull_requests`.
-                Some(t) if t.cleanup_in_flight => return,
+                Some(t) if t.cleanup_in_flight => return Ok(()),
                 Some(t) => in_pr_lifecycle(t),
-                None => return,
+                None => return Ok(()),
             }
         };
         match state {
-            PrState::Merged if lifecycle => self.complete_merged_task(task_id, key, recorded).await,
+            PrState::Merged if lifecycle => {
+                self.complete_merged_task(task_id, key, recorded, merge_commit)
+                    .await
+            }
             PrState::Merged => {}
             _ => self.record_pr_poll_state(task_id, key, recorded).await,
         }
+        Ok(())
+    }
+
+    /// Whether the task records `key`'s pull request as merged already.
+    async fn merge_on_record(&self, task_id: Uuid, key: &crate::pr_status::PrKey) -> bool {
+        self.tasks.read().await.get(&task_id).is_some_and(|t| {
+            t.external_refs.iter().any(|r| {
+                matches!(
+                    r,
+                    ExternalRef::GithubPr { number, repo, state, .. }
+                        if *number == key.number
+                            && *repo == key.repo
+                            && state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("MERGED"))
+                )
+            })
+        })
+    }
+
+    /// Write the merge commit onto a pull request reference recorded as merged
+    /// that has none: a merge recorded before the commit was kept. Only the
+    /// commit is written, under the task's lifecycle lease. The state, the
+    /// status and any cleanup are left alone, so nothing is finished again.
+    async fn record_missing_merge_commit(
+        &self,
+        task_id: Uuid,
+        key: &crate::pr_status::PrKey,
+        commit: Option<&str>,
+    ) -> Result<(), String> {
+        {
+            let tasks = self.tasks.read().await;
+            let task = tasks.get(&task_id).ok_or("Task not found")?;
+            let missing = task.external_refs.iter().any(|r| {
+                matches!(r, ExternalRef::GithubPr { number, repo, state, merge_commit, .. }
+                    if *number == key.number && *repo == key.repo
+                        && state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("MERGED"))
+                        && !merge_commit.as_deref().is_some_and(crate::worktree::restack::is_full_object_id))
+            });
+            if !missing {
+                return Ok(());
+            }
+            if task.cleanup_in_flight {
+                return Err(format!("Pull request #{} merge commit was not recorded: Task cleanup is in flight; refresh once it finishes", key.number));
+            }
+        }
+        let commit = commit.filter(|c| crate::worktree::restack::is_full_object_id(c))
+            .ok_or_else(|| format!("Pull request #{} merge commit was not recorded: GitHub returned no usable merge commit; refresh again", key.number))?;
+        // Declined while the task is busy, and said so; the next refresh asks
+        // again.
+        let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
+            return Err(format!(
+                "Pull request #{} merge commit was not recorded: Task is busy; refresh once it is idle",
+                key.number
+            ));
+        };
+        if self.tasks.read().await.get(&task_id).is_some_and(|t| t.cleanup_in_flight) {
+            return Err(format!("Pull request #{} merge commit was not recorded: Task cleanup is in flight; refresh once it finishes", key.number));
+        }
+        let key_owned = key.clone();
+        let commit_owned = commit.to_string();
+        let backfill = move |staged: &mut HashMap<Uuid, Task>| {
+            let Some(t) = staged.get_mut(&task_id) else {
+                return false;
+            };
+            // Missing evidence includes a commit that is not a full object ID.
+            let missing = t.external_refs.iter().any(|r| {
+                matches!(
+                    r,
+                    ExternalRef::GithubPr { number, repo, state, merge_commit, .. }
+                        if *number == key_owned.number
+                            && *repo == key_owned.repo
+                            && state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("MERGED"))
+                            && !merge_commit
+                                .as_deref()
+                                .is_some_and(crate::worktree::restack::is_full_object_id)
+                )
+            });
+            if missing {
+                Self::record_merge_commit(t, &key_owned, &commit_owned);
+            }
+            missing
+        };
+        crate::lifecycle::record_if_changed(&self.tasks, &self.storage, task_id, &backfill)
+            .await
+            .map_err(|e| format!("Could not record merge commit for pull request #{}: {e}", key.number))?;
+        Ok(())
     }
 
     /// Record a non-`MERGED` pull request state observed by the poll above.
@@ -2843,6 +2953,29 @@ impl TaskExecutor {
         }
     }
 
+    /// Write the merge commit GitHub reported for a merged pull request onto
+    /// the task's external ref to that exact pull request, the same way
+    /// [`Self::record_pr_state`] writes the state.
+    pub(crate) fn record_merge_commit(
+        task: &mut Task,
+        key: &crate::pr_status::PrKey,
+        merge_commit: &str,
+    ) {
+        for r in &mut task.external_refs {
+            if let crate::domain::task::ExternalRef::GithubPr {
+                number,
+                repo,
+                merge_commit: recorded,
+                ..
+            } = r
+            {
+                if *number == key.number && *repo == key.repo {
+                    *recorded = Some(merge_commit.to_string());
+                }
+            }
+        }
+    }
+
     /// Finish a task whose pull request GitHub now reports as merged.
     ///
     /// Ordering is the whole content of this function. The merged fact is not
@@ -2872,6 +3005,7 @@ impl TaskExecutor {
         task_id: Uuid,
         key: &crate::pr_status::PrKey,
         state: &str,
+        merge_commit: Option<&str>,
     ) {
         // Declined, not failed. Nothing was asked and nothing is owed, so the
         // next pass finds the task exactly as eligible as this one did.
@@ -2902,6 +3036,9 @@ impl TaskExecutor {
         let record_merge = move |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
                 Self::record_pr_state(t, key, state);
+                if let Some(commit) = merge_commit {
+                    Self::record_merge_commit(t, key, commit);
+                }
             }
         };
         // Only true of a task that is actually finished, so it is withheld from
@@ -3011,6 +3148,9 @@ impl TaskExecutor {
                 let latch = move |staged: &mut HashMap<Uuid, Task>| {
                     if let Some(t) = staged.get_mut(&task_id) {
                         Self::record_pr_state(t, key, state);
+                        if let Some(commit) = merge_commit {
+                            Self::record_merge_commit(t, key, commit);
+                        }
                         t.error_message = Some(if republish_pending {
                             crate::lifecycle::merged_while_republish_pending_message()
                         } else {
@@ -3138,12 +3278,16 @@ impl TaskExecutor {
         } else {
             Vec::new()
         };
+        // The base a dependency's merge was checked against, when one was:
+        // the ordinary branch below is created at exactly that commit.
+        let mut delivered_base: Option<crate::worktree::ResolvedBase> = None;
         if dependency_ids.len() > 1 {
-            if let Err(refused) = self
+            match self
                 .dependencies_are_in_the_base(task_id, &dependency_ids, repo_path)
                 .await
             {
-                return (existing_branch, Err(refused));
+                Ok(base) => delivered_base = base,
+                Err(refused) => return (existing_branch, Err(refused)),
             }
         }
         let dependency = match dependency_ids.as_slice() {
@@ -3244,15 +3388,30 @@ impl TaskExecutor {
                         )),
                     );
                 }
+                // A merge is delivered only when its commit is in the base the
+                // branch would start from. That base is checked here and the
+                // branch is created at it, so the two cannot disagree.
+                let base = match self.resolve_merge_base(task_id, repo_path).await {
+                    Ok(base) => base,
+                    Err(refused) => return (existing_branch, Err(refused)),
+                };
+                if let Err(refused) = self
+                    .merged_work_is_in_the_base(dependency_ids[0], repo_path, &base)
+                    .await
+                {
+                    return (existing_branch, Err(refused));
+                }
                 self.events.agent_event(AgentEvent::Log {
                     task_id: task_id.to_string(),
                     level: LogLevel::Info,
                     message: format!(
                         "The dependency's pull request was merged and its branch {branch} \
-                         no longer exists locally, so its work is delivered; starting an \
-                         ordinary branch instead of stacking on it"
+                         no longer exists locally, and its merge commit is in the base {}; \
+                         starting an ordinary branch instead of stacking on it",
+                        base.describe()
                     ),
                 });
+                delivered_base = Some(base);
                 None
             }
             Some((branch, ..)) => Some(branch),
@@ -3348,12 +3507,20 @@ impl TaskExecutor {
             // never recorded it may have stacked it. A task with no starting
             // commit has no known diff boundary, as for one recorded before
             // starting commits were kept.
-            let project_base = self.project_base_of(task_id).await;
-            match self
-                .worktree_manager
-                .create_or_adopt(repo_path, &branch_name, project_base.as_ref())
-                .await
-            {
+            let created = match delivered_base {
+                Some(base) => {
+                    self.worktree_manager
+                        .create_or_adopt_from(repo_path, &branch_name, base)
+                        .await
+                }
+                None => {
+                    let project_base = self.project_base_of(task_id).await;
+                    self.worktree_manager
+                        .create_or_adopt(repo_path, &branch_name, project_base.as_ref())
+                        .await
+                }
+            };
+            match created {
                 Ok((info, Some(base))) => Ok(Acquired {
                     info,
                     what_happened: "Created worktree",
@@ -3429,16 +3596,24 @@ impl TaskExecutor {
     /// is proven to be in the base a new task would start from.
     ///
     /// A dependency with no branch recorded has no work SlashIt made, so it
-    /// needs nothing. Any other must pass
+    /// needs nothing. A merged dependency whose branch is gone must pass
+    /// [`Self::merged_work_is_in_the_base`] against one base, resolved on the
+    /// first such dependency. Any other must pass
     /// [`Self::dependency_work_is_in_the_base`]. A Task that is not on the
     /// board, or whose work is not proven there, refuses the start and says
     /// which one it was.
+    ///
+    /// `Ok` carries the base the merged checks were made against, `None` when
+    /// none needed one. The start creates its branch at that base.
     async fn dependencies_are_in_the_base(
         &self,
         task_id: Uuid,
         dependency_ids: &[Uuid],
         repo_path: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Option<crate::worktree::ResolvedBase>, String> {
+        // The base every merged dependency is checked against, resolved on
+        // first need. It is the base the start creates its branch at.
+        let mut merge_base: Option<crate::worktree::ResolvedBase> = None;
         for dependency_id in dependency_ids {
             let (branch, recorded) = {
                 let tasks = self.tasks.read().await;
@@ -3459,10 +3634,18 @@ impl TaskExecutor {
                 continue;
             };
             // The same delivery rule the single dependency uses: a pull request
-            // recorded as merged, whose branch is gone, is delivered.
+            // recorded as merged, whose branch is gone, is delivered only when
+            // its merge commit is in the base.
             if recorded == RecordedPr::Merged
                 && WorktreeManager::local_branch_exists(repo_path, &branch).await == Ok(false)
             {
+                let base = match merge_base.take() {
+                    Some(base) => base,
+                    None => self.resolve_merge_base(task_id, repo_path).await?,
+                };
+                self.merged_work_is_in_the_base(*dependency_id, repo_path, &base)
+                    .await?;
+                merge_base = Some(base);
                 continue;
             }
             if !self
@@ -3483,6 +3666,138 @@ impl TaskExecutor {
                      shown to be in the base, so the start would omit it; nothing was started. \
                      {advice}"
                 ));
+            }
+        }
+        Ok(merge_base)
+    }
+
+    /// The base a start checks its merged dependencies against, and creates
+    /// its branch at. Resolved once per start, so every check and the branch
+    /// agree on one commit.
+    async fn resolve_merge_base(
+        &self,
+        task_id: Uuid,
+        repo_path: &str,
+    ) -> Result<crate::worktree::ResolvedBase, String> {
+        let project_base = self.project_base_of(task_id).await;
+        crate::worktree::resolve_default_base(repo_path, project_base.as_ref())
+            .await
+            .map_err(|e| {
+                format!(
+                    "it depends on merged pull requests, but the base could not be read to show \
+                     that their work is in it; nothing was started. {e}"
+                )
+            })
+    }
+
+    /// Whether every pull request recorded as merged on `dependency_id` is
+    /// delivered to `base`, the base a new branch of the dependent Task would
+    /// start from.
+    ///
+    /// A merge counts only when the merge commit GitHub reported for it is an
+    /// ancestor of `base`. A merged reference without a recorded commit proves
+    /// nothing, and neither does a commit the repository cannot find or `base`
+    /// does not contain. Nothing is fetched, so a base that is behind is
+    /// refused, and the refusal names the recovery.
+    async fn merged_work_is_in_the_base(
+        &self,
+        dependency_id: Uuid,
+        repo_path: &str,
+        base: &crate::worktree::ResolvedBase,
+    ) -> Result<(), String> {
+        use crate::worktree::restack::{has_commit, is_ancestor, is_full_object_id};
+
+        let merges: Vec<(u32, Option<String>)> = {
+            let tasks = self.tasks.read().await;
+            let Some(dependency) = tasks.get(&dependency_id) else {
+                return Err(format!(
+                    "it depends on Task {dependency_id}, which is no longer on this board, so \
+                     nothing shows that its work reached the base; nothing was started"
+                ));
+            };
+            dependency
+                .external_refs
+                .iter()
+                .filter_map(|r| match r {
+                    ExternalRef::GithubPr {
+                        number,
+                        state,
+                        merge_commit,
+                        ..
+                    } if state
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("MERGED")) =>
+                    {
+                        Some((*number, merge_commit.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // The caller saw a merged reference; if none is recorded now, nothing
+        // shows the work is delivered, so the start is refused rather than
+        // passing vacuously.
+        if merges.is_empty() {
+            return Err(format!(
+                "it depends on Task {dependency_id}, which no longer records a merged pull \
+                 request, so nothing shows its work reached the base; nothing was started"
+            ));
+        }
+        let repo = std::path::Path::new(repo_path);
+        for (number, merge_commit) in merges {
+            let Some(commit) = merge_commit else {
+                return Err(format!(
+                    "it depends on pull request #{number}, which is recorded as merged, but \
+                     SlashIt has no merge commit recorded for it, so nothing shows that its work \
+                     is in the base; nothing was started. Use Refresh on the dependency's Task \
+                     card to record the merge commit, then start this Task again"
+                ));
+            };
+            if !is_full_object_id(&commit) {
+                return Err(format!(
+                    "it depends on pull request #{number}, whose recorded merge commit {commit:?} \
+                     is not a full commit ID, so its work cannot be checked; nothing was started. \
+                     Use Refresh on the dependency's Task card to record the merge commit again, \
+                     then start this Task again"
+                ));
+            }
+            match has_commit(repo, &commit).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "it depends on pull request #{number}, merged as {commit}, and this \
+                         repository does not contain that commit, so the base cannot be shown to \
+                         hold its work; nothing was started. Fetch the repository (for example, \
+                         git fetch origin) and start this Task again; nothing was fetched"
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "it depends on pull request #{number}, merged as {commit}, and Git could \
+                         not look that commit up, so the base cannot be shown to hold its work; \
+                         nothing was started. {e}"
+                    ));
+                }
+            }
+            match is_ancestor(repo, &commit, &base.commit).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "it depends on pull request #{number}, merged as {commit}, but the base \
+                         {} at {} does not contain that commit, so the start would omit its work; \
+                         nothing was started. Fetch the repository, or update the project's base \
+                         branch, and start this Task again; nothing was fetched",
+                        base.describe(),
+                        base.commit,
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "it depends on pull request #{number}, merged as {commit}, and Git could \
+                         not check that the base {} contains it; nothing was started. {e}",
+                        base.describe(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -7934,6 +8249,7 @@ mod tests {
                 repo: "owner/repo".to_string(),
                 url: "https://example.invalid/pr/7".to_string(),
                 state: None,
+                merge_commit: None,
             });
         let id = task.id;
         executor.tasks.write().await.insert(id, task.clone());
@@ -7951,6 +8267,144 @@ mod tests {
         })
     }
 
+    /// A merge that is recorded but cannot finish the task still records the
+    /// commit it came with: the recording is what a dependent Task checks.
+    #[tokio::test]
+    async fn a_merge_held_back_from_finishing_the_task_still_records_its_commit() {
+        let (executor, _temps) = test_executor();
+        let (id, _project_id) = task_with_open_pr(&executor, Some("/nonexistent/checkout")).await;
+        let merged = "1111111111111111111111111111111111111111";
+
+        executor
+            .complete_merged_task(
+                id,
+                &crate::pr_status::PrKey::new("owner/repo", 7),
+                "MERGED",
+                Some(merged),
+            )
+            .await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(recorded_pr_state(&after).as_deref(), Some("MERGED"));
+        assert_eq!(recorded_merge_commits(&after), vec![Some(merged.to_string())]);
+    }
+
+    /// A merge recorded before its commit was kept gets the commit from a
+    /// refresh, and nothing else changes: the task is not finished again, its
+    /// status and its state are as they were.
+    #[tokio::test]
+    async fn a_refresh_writes_the_missing_commit_of_a_recorded_merge_and_nothing_else() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_with_pr(
+            &executor,
+            TaskStatus::PrCreated,
+            pr_ref("owner/repo", 7, Some("MERGED")),
+        )
+        .await;
+        let status_before = executor.tasks.read().await[&id].status.clone();
+        let merged = "1111111111111111111111111111111111111111";
+
+        executor
+            .apply_polled_pr_state(
+                id,
+                &crate::pr_status::PrKey::new("owner/repo", 7),
+                crate::pr_status::PrState::Merged,
+                Some(merged),
+            )
+            .await.expect("observation applies");
+
+        for (seen, task) in [
+            ("in memory", executor.tasks.read().await[&id].clone()),
+            ("on disk", on_disk_task(&executor, project_id, id)),
+        ] {
+            assert_eq!(
+                recorded_merge_commits(&task),
+                vec![Some(merged.to_string())],
+                "{seen}: the commit is written"
+            );
+            assert_eq!(task.status, status_before, "{seen}: the task is not finished again");
+            assert_eq!(recorded_pr_state(&task).as_deref(), Some("MERGED"), "{seen}");
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_backfill_reports_write_failure_without_publishing_evidence() {
+        use slashit_durable_fs::{fault, Stage};
+        let (executor, _temps) = test_executor();
+        let (id, project) = seed_with_pr(&executor, TaskStatus::Done,
+            pr_ref("owner/repo", 7, Some("MERGED"))).await;
+        let before = executor.tasks.read().await[&id].clone();
+        let _fault = fault::fail_at(Stage::SyncTemp, std::io::ErrorKind::Other);
+        let error = executor.apply_polled_pr_state(id,
+            &crate::pr_status::PrKey::new("owner/repo", 7),
+            crate::pr_status::PrState::Merged,
+            Some("1111111111111111111111111111111111111111"))
+            .await.expect_err("failed persistence must reach the caller");
+        assert!(error.contains("Could not record merge commit"), "{error}");
+        assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![None]);
+        assert_eq!(recorded_merge_commits(&on_disk_task(&executor, project, id)), vec![None]);
+        assert_eq!(executor.tasks.read().await[&id].updated_at, before.updated_at);
+    }
+
+    #[tokio::test]
+    async fn merge_backfill_reports_unconfirmed_durability_and_adopts_the_visible_write() {
+        use slashit_durable_fs::{fault, Stage};
+        let (executor, _temps) = test_executor();
+        let (id, project) = seed_with_pr(&executor, TaskStatus::Done,
+            pr_ref("owner/repo", 7, Some("MERGED"))).await;
+        let commit = "1111111111111111111111111111111111111111";
+        let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = executor.apply_polled_pr_state(id,
+            &crate::pr_status::PrKey::new("owner/repo", 7),
+            crate::pr_status::PrState::Merged, Some(commit))
+            .await.expect_err("unconfirmed durability is not success");
+        assert!(crate::config::says_in_place_but_unconfirmed(&error), "{error}");
+        assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![Some(commit.into())]);
+        assert_eq!(recorded_merge_commits(&on_disk_task(&executor, project, id)), vec![Some(commit.into())]);
+    }
+
+    #[tokio::test]
+    async fn merge_backfill_distinguishes_a_busy_task_from_valid_existing_evidence() {
+        let (executor, temps) = test_executor();
+        let (id, _) = seed_with_pr(&executor, TaskStatus::Done,
+            pr_ref("owner/repo", 7, Some("MERGED"))).await;
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let commit = "1111111111111111111111111111111111111111";
+        let lease = executor.lifecycle.try_acquire(id).await.unwrap();
+        let error = executor.apply_polled_pr_state(id, &key,
+            crate::pr_status::PrState::Merged, Some(commit)).await.unwrap_err();
+        assert!(error.contains("busy"), "{error}");
+        assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![None]);
+        drop(lease);
+        executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Merged, Some(commit))
+            .await.unwrap();
+        let before = executor.tasks.read().await[&id].updated_at;
+        let _lease = executor.lifecycle.try_acquire(id).await.unwrap();
+        block_persistence(&temps[0]);
+        executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Merged, None)
+            .await.expect("valid evidence requires neither a lease nor a write");
+        assert_eq!(executor.tasks.read().await[&id].updated_at, before);
+    }
+
+    #[tokio::test]
+    async fn merge_backfill_reports_cleanup_and_missing_remote_evidence() {
+        let (executor, _temps) = test_executor();
+        let (id, _) = seed_with_pr(&executor, TaskStatus::Done,
+            pr_ref("owner/repo", 7, Some("MERGED"))).await;
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        for commit in [None, Some("main")] {
+            let error = executor.apply_polled_pr_state(id, &key,
+                crate::pr_status::PrState::Merged, commit).await.unwrap_err();
+            assert!(error.contains("no usable merge commit"), "{error}");
+        }
+        executor.tasks.write().await.get_mut(&id).unwrap().cleanup_in_flight = true;
+        let error = executor.apply_polled_pr_state(id, &key,
+            crate::pr_status::PrState::Merged,
+            Some("1111111111111111111111111111111111111111")).await.unwrap_err();
+        assert!(error.contains("cleanup"), "{error}");
+        assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![None]);
+    }
+
     #[tokio::test]
     async fn a_merge_that_cannot_resolve_a_repository_is_recorded_once_instead_of_polled_forever() {
         // No project and no repository, which is what `RepositoryUnresolved`
@@ -7963,7 +8417,7 @@ mod tests {
         let (id, project_id) = task_with_open_pr(&executor, Some("/nonexistent/checkout")).await;
 
         executor
-            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED")
+            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
@@ -8034,7 +8488,7 @@ mod tests {
         }
 
         executor
-            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED")
+            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
@@ -8087,7 +8541,7 @@ mod tests {
             .expect("the lease must be free to take");
 
         executor
-            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED")
+            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
@@ -8733,6 +9187,7 @@ mod tests {
             number,
             repo: repo.to_string(),
             state: state.map(str::to_string),
+            merge_commit: None,
         }
     }
 
@@ -8744,6 +9199,7 @@ mod tests {
             failing_check_count: 0,
             review_decision: None,
             mergeable: None,
+            merge_commit: None,
         }
     }
 
@@ -8968,12 +9424,87 @@ mod tests {
         .await;
 
         executor
-            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED")
+            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
             .await;
 
         let after = executor.tasks.read().await[&id].clone();
         assert_eq!(after.status, TaskStatus::InProgress);
         assert_eq!(recorded_pr_state(&after).as_deref(), Some("OPEN"));
+    }
+
+    /// The merge commit GitHub reports with a merge is recorded on that pull
+    /// request's reference, together with the merged state, in memory and on
+    /// disk. A dependent Task checks it later.
+    #[tokio::test]
+    async fn a_merge_records_the_merge_commit_it_was_heard_with() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_with_pr(
+            &executor,
+            TaskStatus::PrCreated,
+            pr_ref("owner/repo", 7, Some("OPEN")),
+        )
+        .await;
+        let merged = "1111111111111111111111111111111111111111";
+
+        executor
+            .apply_polled_pr_state(
+                id,
+                &crate::pr_status::PrKey::new("owner/repo", 7),
+                crate::pr_status::PrState::Merged,
+                Some(merged),
+            )
+            .await.expect("observation applies");
+
+        for (seen, task) in [
+            ("in memory", executor.tasks.read().await[&id].clone()),
+            ("on disk", on_disk_task(&executor, project_id, id)),
+        ] {
+            assert_eq!(
+                recorded_merge_commits(&task),
+                vec![Some(merged.to_string())],
+                "{seen}: the merge commit is recorded with the merge"
+            );
+            assert_eq!(recorded_pr_state(&task).as_deref(), Some("MERGED"), "{seen}");
+        }
+    }
+
+    /// A merge heard outside the delivery columns is shown, not acted on, and
+    /// its commit is not recorded either: evidence never exists without the
+    /// merged state it belongs to.
+    #[tokio::test]
+    async fn a_merge_heard_outside_the_delivery_columns_records_no_commit() {
+        let (executor, _temps) = test_executor();
+        let (id, _project_id) = seed_with_pr(
+            &executor,
+            TaskStatus::InProgress,
+            pr_ref("owner/repo", 7, Some("OPEN")),
+        )
+        .await;
+
+        executor
+            .apply_polled_pr_state(
+                id,
+                &crate::pr_status::PrKey::new("owner/repo", 7),
+                crate::pr_status::PrState::Merged,
+                Some("1111111111111111111111111111111111111111"),
+            )
+            .await.expect("observation applies");
+
+        let task = executor.tasks.read().await[&id].clone();
+        assert_eq!(recorded_pr_state(&task).as_deref(), Some("OPEN"));
+        assert_eq!(recorded_merge_commits(&task), vec![None]);
+    }
+
+    /// The merge commits recorded on a task's pull request references, one
+    /// per reference, in order.
+    fn recorded_merge_commits(task: &Task) -> Vec<Option<String>> {
+        task.external_refs
+            .iter()
+            .filter_map(|r| match r {
+                ExternalRef::GithubPr { merge_commit, .. } => Some(merge_commit.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Two repositories each have a pull request 7, and a task links both.
@@ -9007,8 +9538,9 @@ mod tests {
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged,
+                None,
             )
-            .await;
+            .await.expect("observation applies");
 
         let states = |task: &Task| -> Vec<(String, Option<String>)> {
             task.external_refs
@@ -9096,8 +9628,9 @@ mod tests {
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged,
+                None,
             )
-            .await;
+            .await.expect("observation applies");
 
         for (seen, task) in [
             ("in memory", executor.tasks.read().await[&id].clone()),
@@ -9204,7 +9737,7 @@ mod tests {
             crate::pr_status::PrState::Closed,
             crate::pr_status::PrState::Open,
         ] {
-            executor.apply_polled_pr_state(id, &key, answer).await;
+            executor.apply_polled_pr_state(id, &key, answer, None).await.expect("observation applies");
         }
 
         for (seen, task) in [
@@ -9255,8 +9788,9 @@ mod tests {
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged,
+                None,
             )
-            .await;
+            .await.expect("observation applies");
 
         let after = executor.tasks.read().await[&id].clone();
         assert_eq!(after.status, TaskStatus::PrCreated);
@@ -9309,8 +9843,9 @@ mod tests {
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged,
+                None,
             )
-            .await;
+            .await.expect("observation applies");
 
         for (seen, task) in [
             ("in memory", executor.tasks.read().await[&id].clone()),
@@ -9384,7 +9919,7 @@ mod tests {
         let (id, project_id) = task_with_open_pr(&executor, Some("/nonexistent/checkout")).await;
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
 
-        executor.complete_merged_task(id, &key, "MERGED").await;
+        executor.complete_merged_task(id, &key, "MERGED", None).await;
         assert_eq!(
             recorded_pr_state(&executor.tasks.read().await[&id]).as_deref(),
             Some("MERGED")
@@ -9546,8 +10081,9 @@ mod tests {
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged,
+                None,
             )
-            .await;
+            .await.expect("observation applies");
 
         for (seen, task) in [
             ("in memory", executor.tasks.read().await[&id].clone()),
@@ -9626,6 +10162,29 @@ mod tests {
             recorded_pr_state(&executor.tasks.read().await[&id]).as_deref(),
             Some("OPEN")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_poll_keeps_processing_after_one_observation_cannot_persist() {
+        use slashit_durable_fs::{fault, Stage};
+        let dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh(dir.path(), &format!("*) {OPEN_FAILING} ;;"));
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(gh, Duration::from_secs(5)));
+        let (executor, _temps) = test_executor_with_prs(statuses);
+        let (first, _) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 1, None)).await;
+        let (second, _) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 2, None)).await;
+        let _fault = fault::fail_at(Stage::SyncTemp, std::io::ErrorKind::Other);
+        executor.poll_pull_requests().await;
+        let tasks = executor.tasks.read().await;
+        let states = [recorded_pr_state(&tasks[&first]), recorded_pr_state(&tasks[&second])];
+        assert_eq!(states.iter().filter(|s| s.as_deref() == Some("OPEN")).count(), 1,
+            "the other observation still persists after one write fails: {states:?}");
+        assert_eq!(states.iter().filter(|s| s.is_none()).count(), 1);
+        for number in [1, 2] {
+            assert!(executor.pr_statuses.get(&crate::pr_status::PrKey::new("o/r", number))
+                .unwrap().status.is_some());
+        }
     }
 
     #[cfg(unix)]
@@ -9814,8 +10373,8 @@ mod tests {
             .await;
 
             executor
-                .apply_polled_pr_state(id, &key, crate::pr_status::PrState::Closed)
-                .await;
+                .apply_polled_pr_state(id, &key, crate::pr_status::PrState::Closed, None)
+                .await.expect("observation applies");
 
             let after = executor.tasks.read().await[&id].clone();
             assert_eq!(
@@ -9852,7 +10411,7 @@ mod tests {
             )
             .await;
 
-            executor.apply_polled_pr_state(id, &key, stale).await;
+            executor.apply_polled_pr_state(id, &key, stale, None).await.expect("observation applies");
 
             let after = executor.tasks.read().await[&id].clone();
             assert_eq!(
@@ -11527,6 +12086,7 @@ mod tests {
                     number: 7,
                     repo: "test-org/test-repo".to_string(),
                     state: (!state.is_empty()).then(|| state.to_string()),
+                    merge_commit: None,
                 });
         }
         let dependency_id = dependency.id;
@@ -11670,7 +12230,7 @@ mod tests {
     async fn a_task_whose_done_dependency_branch_is_gone_starts_from_the_default_base() {
         let recording = Arc::new(crate::events::RecordingEventSink::new());
         let (executor, temps) = test_executor_with_events(recording.clone());
-        let (repo, task_id, _) = stacked_task_fixture(
+        let (repo, task_id, dependency_id) = stacked_task_fixture(
             &executor,
             &temps,
             TaskStatus::Done,
@@ -11680,6 +12240,8 @@ mod tests {
         .await;
         publish_default_base(&repo);
         let main_tip = git_in(&repo, &["rev-parse", "main"]);
+        // The merge is recorded with its commit, and the base holds that commit.
+        set_merge_commit(&executor, dependency_id, &main_tip).await;
 
         let (existing, acquired) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
@@ -12111,6 +12673,319 @@ mod tests {
             .await;
     }
 
+    /// Reproduces the stale-base defect. The dependency's pull request is
+    /// recorded as merged and its branch is gone, so the dependent is taken
+    /// as delivered and starts from the local copy of the default base. That
+    /// copy is `origin/main` as last fetched, which predates the merge, so the
+    /// new worktree silently lacks the dependency's file.
+    ///
+    /// The record predates the merge commit being kept, so nothing shows the
+    /// work is in the base: the start is refused through the same path a
+    /// person's start takes, and nothing is created.
+    #[tokio::test]
+    async fn a_merged_dependency_is_not_started_on_a_stale_base() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some("MERGED"), "task-merged01")
+                .await;
+        publish_default_base(&repo);
+        commit_unmerged_work(&repo, "task-merged01", "first.txt");
+        git_in(&repo, &["branch", "-D", "task-merged01"]);
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("a merged dependency with no recorded merge commit is refused");
+
+        assert!(refused.contains("#7"), "{refused}");
+        assert_refused_before_attach(
+            &executor,
+            &repo,
+            task_id,
+            &refs_before,
+            "has no merge commit recorded",
+        )
+        .await;
+    }
+
+    /// A merged dependency whose recorded merge commit is not in the base is
+    /// refused, and the refusal says which commit the base lacks. The branch
+    /// is gone and nothing else shows where the work went, so the commit is
+    /// the only evidence there is.
+    #[tokio::test]
+    async fn a_merged_dependency_whose_merge_commit_is_not_in_the_base_is_refused() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some("MERGED"), "task-merged02")
+                .await;
+        publish_default_base(&repo);
+        commit_unmerged_work(&repo, "task-merged02", "first.txt");
+        let merged = git_in(&repo, &["rev-parse", "task-merged02"]);
+        git_in(&repo, &["branch", "-D", "task-merged02"]);
+        set_merge_commit(&executor, dependency_id, &merged).await;
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("a base without the merge commit refuses the start");
+
+        assert!(refused.contains(&merged), "{refused}");
+        assert_refused_before_attach(
+            &executor,
+            &repo,
+            task_id,
+            &refs_before,
+            "does not contain that commit",
+        )
+        .await;
+    }
+
+    /// A merged dependency whose merge commit the base holds starts from that
+    /// base, and its work is in the new worktree. The branch is created at
+    /// exactly the commit that was checked.
+    #[tokio::test]
+    async fn a_merged_dependency_whose_base_holds_its_merge_commit_starts_with_its_work() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some("MERGED"), "task-merged03")
+                .await;
+        commit_unmerged_work(&repo, "task-merged03", "first.txt");
+        let merged = git_in(&repo, &["rev-parse", "task-merged03"]);
+        git_in(&repo, &["merge", "-q", "--no-edit", "task-merged03"]);
+        git_in(&repo, &["branch", "-D", "task-merged03"]);
+        publish_default_base(&repo);
+        set_merge_commit(&executor, dependency_id, &merged).await;
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        let Acquired {
+            info,
+            base_commit,
+            origin,
+            ..
+        } = acquired.expect("the base holds the merge commit, so the start proceeds");
+        assert!(std::path::Path::new(&info.path).join("first.txt").exists());
+        assert_eq!(base_commit.as_deref(), Some(merged.as_str()));
+        assert_eq!(origin, Some(on_main()));
+    }
+
+    /// A merge commit the repository does not contain cannot show that the
+    /// base holds the work, so the start is refused: nothing is fetched to
+    /// find it, and the refusal says to fetch the repository.
+    #[tokio::test]
+    async fn a_merge_commit_the_repository_does_not_have_is_refused() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some("MERGED"), "task-merged04")
+                .await;
+        publish_default_base(&repo);
+        commit_unmerged_work(&repo, "task-merged04", "first.txt");
+        git_in(&repo, &["branch", "-D", "task-merged04"]);
+        set_merge_commit(
+            &executor,
+            dependency_id,
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .await;
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("an unknown merge commit refuses the start");
+
+        assert!(refused.contains("git fetch origin"), "{refused}");
+        assert_refused_before_attach(
+            &executor,
+            &repo,
+            task_id,
+            &refs_before,
+            "does not contain that commit",
+        )
+        .await;
+    }
+
+    /// A recorded merge commit that is not a full object ID cannot be checked
+    /// at all, so it is refused rather than compared as text.
+    #[tokio::test]
+    async fn a_merge_commit_that_is_not_a_full_object_id_is_refused() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some("MERGED"), "task-merged05")
+                .await;
+        publish_default_base(&repo);
+        commit_unmerged_work(&repo, "task-merged05", "first.txt");
+        git_in(&repo, &["branch", "-D", "task-merged05"]);
+        set_merge_commit(&executor, dependency_id, "main").await;
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("a merge commit that is not an object ID refuses the start");
+
+        assert!(refused.contains("is not a full commit ID"), "{refused}");
+        assert_refused_before_attach(
+            &executor,
+            &repo,
+            task_id,
+            &refs_before,
+            "is not a full commit ID",
+        )
+        .await;
+    }
+
+    /// Several dependencies in mixed states: one integrated locally and one
+    /// merged without a recorded merge commit. The merged one alone refuses
+    /// the start, and nothing is created.
+    #[tokio::test]
+    async fn a_legacy_merged_dependency_among_several_refuses_the_start() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, first_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-first06").await;
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let mut second = create_test_task_full("second", project_id, TaskStatus::Done, 0);
+        second.branch_name = Some("task-gone06".to_string());
+        second
+            .external_refs
+            .push(crate::domain::task::ExternalRef::GithubPr {
+                url: "https://github.com/test-org/test-repo/pull/8".to_string(),
+                number: 8,
+                repo: "test-org/test-repo".to_string(),
+                state: Some("MERGED".to_string()),
+                merge_commit: None,
+            });
+        let second_id = second.id;
+        executor.tasks.write().await.insert(second_id, second);
+        commit_unmerged_work(&repo, "task-first06", "first.txt");
+        git_in(&repo, &["merge", "-q", "--no-edit", "task-first06"]);
+        publish_default_base(&repo);
+        integrate_dependency_locally(&executor, &repo, first_id, "task-first06").await;
+        set_recorded_dependencies(&executor, task_id, vec![first_id, second_id]).await;
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("the merged dependency without evidence refuses the start");
+
+        assert!(refused.contains("#8"), "{refused}");
+        assert_refused_before_attach(
+            &executor,
+            &repo,
+            task_id,
+            &refs_before,
+            "has no merge commit recorded",
+        )
+        .await;
+    }
+
+    /// Several dependencies in mixed states: one integrated locally, one
+    /// merged with a commit the base does not hold. Its own check refuses the
+    /// start even though the other is delivered.
+    #[tokio::test]
+    async fn a_stale_merged_dependency_among_several_refuses_the_start() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, first_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-first07").await;
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        commit_unmerged_work(&repo, "task-first07", "first.txt");
+        git_in(&repo, &["merge", "-q", "--no-edit", "task-first07"]);
+        publish_default_base(&repo);
+        integrate_dependency_locally(&executor, &repo, first_id, "task-first07").await;
+        commit_unmerged_work(&repo, "task-gone07", "second.txt");
+        let merged = git_in(&repo, &["rev-parse", "task-gone07"]);
+        git_in(&repo, &["branch", "-D", "task-gone07"]);
+        let mut second = create_test_task_full("second", project_id, TaskStatus::Done, 0);
+        second.branch_name = Some("task-gone07".to_string());
+        second
+            .external_refs
+            .push(crate::domain::task::ExternalRef::GithubPr {
+                url: "https://github.com/test-org/test-repo/pull/9".to_string(),
+                number: 9,
+                repo: "test-org/test-repo".to_string(),
+                state: Some("MERGED".to_string()),
+                merge_commit: Some(merged.clone()),
+            });
+        let second_id = second.id;
+        executor.tasks.write().await.insert(second_id, second);
+        set_recorded_dependencies(&executor, task_id, vec![first_id, second_id]).await;
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("a merged dependency missing from the base refuses the start");
+
+        assert!(refused.contains("#9") && refused.contains(&merged), "{refused}");
+        assert_refused_before_attach(
+            &executor,
+            &repo,
+            task_id,
+            &refs_before,
+            "does not contain that commit",
+        )
+        .await;
+    }
+
+    /// A missing dependency among several refuses the start. The start is not
+    /// made from the base the other dependency is delivered to, because the
+    /// missing one's work cannot be shown there.
+    #[tokio::test]
+    async fn a_missing_dependency_among_several_refuses_the_start() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, first_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-first08").await;
+        commit_unmerged_work(&repo, "task-first08", "first.txt");
+        git_in(&repo, &["merge", "-q", "--no-edit", "task-first08"]);
+        publish_default_base(&repo);
+        integrate_dependency_locally(&executor, &repo, first_id, "task-first08").await;
+        let missing = Uuid::new_v4();
+        set_recorded_dependencies(&executor, task_id, vec![first_id, missing]).await;
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("a missing dependency among several refuses the start");
+
+        assert!(refused.contains(&missing.to_string()), "{refused}");
+        assert_refused_before_attach(
+            &executor,
+            &repo,
+            task_id,
+            &refs_before,
+            "is no longer on this board",
+        )
+        .await;
+    }
+
+    /// A dependency with no merged pull request reference cannot prove it was
+    /// delivered, even when the check is asked about it directly: the merged
+    /// check refuses rather than passing on an empty list.
+    #[tokio::test]
+    async fn a_dependency_with_no_merged_reference_is_not_proven_delivered() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-none01").await;
+        publish_default_base(&repo);
+        let base = executor
+            .resolve_merge_base(task_id, repo.to_str().unwrap())
+            .await
+            .expect("a base");
+
+        let refused = executor
+            .merged_work_is_in_the_base(dependency_id, repo.to_str().unwrap(), &base)
+            .await
+            .expect_err("nothing shows the work was delivered");
+
+        assert!(refused.contains("no longer records a merged pull request"), "{refused}");
+    }
+
     /// Commit `file` on a new `branch` off `main`, then return to `main`. The
     /// commit is not recorded as completed, approved or integrated anywhere.
     fn commit_unmerged_work(repo: &std::path::Path, branch: &str, file: &str) {
@@ -12151,6 +13026,17 @@ mod tests {
     async fn set_recorded_dependencies(executor: &TaskExecutor, task_id: Uuid, ids: Vec<Uuid>) {
         let mut tasks = executor.tasks.write().await;
         tasks.get_mut(&task_id).unwrap().dependencies = ids;
+    }
+
+    /// Record `commit` as the merge commit of every pull request reference on
+    /// `task_id`, as observing the merge does.
+    async fn set_merge_commit(executor: &TaskExecutor, task_id: Uuid, commit: &str) {
+        let mut tasks = executor.tasks.write().await;
+        for r in &mut tasks.get_mut(&task_id).unwrap().external_refs {
+            if let crate::domain::task::ExternalRef::GithubPr { merge_commit, .. } = r {
+                *merge_commit = Some(commit.to_string());
+            }
+        }
     }
 
     /// Mark `dependency_id` completed locally and integrated into `main`,
@@ -12273,6 +13159,7 @@ mod tests {
                 number: 8,
                 repo: "test-org/test-repo".to_string(),
                 state: Some("MERGED".to_string()),
+                merge_commit: None,
             });
         let second_id = second.id;
         executor.tasks.write().await.insert(second_id, second);
@@ -12280,6 +13167,9 @@ mod tests {
         git_in(&repo, &["merge", "-q", "--no-edit", "task-first04"]);
         publish_default_base(&repo);
         integrate_dependency_locally(&executor, &repo, first_id, "task-first04").await;
+        // The second pull request's merge commit is one the base holds.
+        let main_tip = git_in(&repo, &["rev-parse", "main"]);
+        set_merge_commit(&executor, second_id, &main_tip).await;
         set_recorded_dependencies(&executor, task_id, vec![first_id, second_id]).await;
 
         let (_, acquired) = executor

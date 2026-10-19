@@ -28,6 +28,7 @@ fn parse_pr_url_to_ref(pr_url: &str) -> Option<ExternalRef> {
         number,
         repo,
         state: Some("OPEN".to_string()),
+        merge_commit: None,
     })
 }
 
@@ -5193,12 +5194,16 @@ async fn pr_statuses_for_project(
 /// `TaskExecutor::apply_polled_pr_state`). An open pull
 /// request never moves the task or ends its work, in any column. Merged and
 /// closed have consequences only where a delivered pull request lives (Pull
-/// Request Created, Human Review, Done): a merge finishes the task, and a
-/// closure is explained as its error. Anywhere else a closure is only
-/// recorded and a merge only shown, and an unchanged state writes nothing.
+/// Request Created, Human Review, Done): a newly observed merge finishes the
+/// task, and a closure is explained as its error. A reference already recorded
+/// as merged is not finished again; a refresh can only write its missing merge
+/// commit. Anywhere else a closure is only recorded and a merge only shown, and
+/// an unchanged state writes nothing.
 ///
 /// Answers with the refreshed cache entries; a failed refresh is in its
-/// entry's `error`, beside the last good status.
+/// entry's `error`, beside the last good status. A required merge-commit
+/// backfill that fails or is declined returns an error after all answers have
+/// been processed; a fresh cache entry does not confirm a persisted repair.
 #[tauri::command]
 pub async fn refresh_pr_status(
     _gui: GuiMutation,
@@ -5212,8 +5217,8 @@ pub async fn refresh_pr_status(
         task.external_refs
             .iter()
             .filter_map(|r| match r {
-                ExternalRef::GithubPr { repo, number, state, .. }
-                    if !state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("MERGED") || s.eq_ignore_ascii_case("CLOSED")) =>
+                ExternalRef::GithubPr { repo, number, state, merge_commit, .. }
+                    if asked_on_refresh(state.as_deref(), merge_commit.as_deref()) =>
                 {
                     Some(crate::pr_status::PrKey::new(repo.clone(), *number))
                 }
@@ -5223,12 +5228,42 @@ pub async fn refresh_pr_status(
     };
     // Asked a few at a time, like the poll; applied in order afterwards, each
     // on its own answer, so a timeout on one never drops another's.
+    let mut errors = Vec::new();
     for (key, answer) in state.pr_statuses.refresh_each(keys.clone()).await {
-        if let (Ok(status), Some(executor)) = (answer, state.executor.get()) {
-            executor.apply_polled_pr_state(task_uuid, &key, status.state).await;
+        if let Ok(status) = answer {
+            match state.executor.get() {
+                Some(executor) => {
+                    if let Err(error) = executor
+                        .apply_polled_pr_state(task_uuid, &key, status.state, status.merge_commit.as_deref())
+                        .await
+                    {
+                        errors.push(error);
+                    }
+                }
+                None => errors.push(format!("Pull request #{} was refreshed, but its observation could not be recorded: executor is unavailable", key.number)),
+            }
         }
     }
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
     Ok(state.pr_statuses.entries_for(keys.iter()))
+}
+
+/// Whether an explicit refresh asks GitHub about a pull request reference in
+/// `state`. An open one is always asked. A closed one is final and is not
+/// asked again. A merged one is asked while it lacks usable evidence, meaning
+/// no commit or one that is not a full object ID: the answer then records that
+/// evidence and nothing else, so a merge recorded without a usable commit gets
+/// it from the refresh the person asked for.
+fn asked_on_refresh(state: Option<&str>, merge_commit: Option<&str>) -> bool {
+    match state {
+        Some(s) if s.eq_ignore_ascii_case("CLOSED") => false,
+        Some(s) if s.eq_ignore_ascii_case("MERGED") => {
+            !merge_commit.is_some_and(crate::worktree::restack::is_full_object_id)
+        }
+        _ => true,
+    }
 }
 
 /// Whether recording `remote` for `pr_url` would change `task`: a reference
@@ -5355,13 +5390,27 @@ pub async fn refresh_task_pr_state(
 
     let refreshed = remote_state.clone();
     let target = pr_url.clone();
+    // Only a merged answer carries a merge commit. It is recorded with the
+    // state, so this refresh is also how a merged reference recorded before
+    // the commit was kept gets its evidence.
+    let merge_commit = status.merge_commit.clone();
     let apply = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             let mut numbers = Vec::new();
             for r in task.external_refs.iter_mut() {
-                if let ExternalRef::GithubPr { url, number, state: s, .. } = r {
+                if let ExternalRef::GithubPr {
+                    url,
+                    number,
+                    state: s,
+                    merge_commit: recorded,
+                    ..
+                } = r
+                {
                     if url == &target {
                         *s = Some(refreshed.clone());
+                        if let Some(commit) = &merge_commit {
+                            *recorded = Some(commit.clone());
+                        }
                         numbers.push(*number);
                     }
                 }
@@ -6176,6 +6225,7 @@ mod tests {
                 number: 50,
                 repo: "org/repo".to_string(),
                 state: Some("MERGED".to_string()),
+                merge_commit: None,
             },
         ];
 
@@ -6213,6 +6263,7 @@ mod tests {
                 number: 8,
                 repo: "org/repo".to_string(),
                 state: None,
+                merge_commit: None,
             },
             ExternalRef::LinearTicket {
                 id: "LIN-1".to_string(),
@@ -6287,13 +6338,30 @@ mod tests {
         );
     }
 
+    /// Which references an explicit refresh asks GitHub about: open ones and
+    /// merged ones still without a commit, never a closed one, and never a
+    /// merged one that already has its evidence.
+    #[test]
+    fn a_refresh_asks_about_open_references_and_merges_still_missing_a_commit() {
+        let commit = Some("0123456789abcdef0123456789abcdef01234567");
+        assert!(asked_on_refresh(None, None));
+        assert!(asked_on_refresh(Some("OPEN"), None));
+        assert!(!asked_on_refresh(Some("CLOSED"), None));
+        assert!(asked_on_refresh(Some("MERGED"), None), "a legacy merge gets its commit");
+        assert!(!asked_on_refresh(Some("MERGED"), commit), "a merge with its commit is settled");
+        assert!(
+            asked_on_refresh(Some("MERGED"), Some("main")),
+            "a commit that is not a full ID is not evidence, so it is asked again"
+        );
+    }
+
     #[test]
     fn parse_pr_url_valid() {
         let result = parse_pr_url_to_ref("https://github.com/acme/widgets/pull/42");
         assert!(result.is_some());
         let r = result.unwrap();
         match r {
-            ExternalRef::GithubPr { url, number, repo, state } => {
+            ExternalRef::GithubPr { url, number, repo, state, .. } => {
                 assert_eq!(url, "https://github.com/acme/widgets/pull/42");
                 assert_eq!(number, 42);
                 assert_eq!(repo, "acme/widgets");
@@ -6336,6 +6404,7 @@ mod tests {
             number: 5,
             repo: "o/r".to_string(),
             state: state.map(str::to_string),
+            merge_commit: None,
         });
         task
     }
@@ -6395,6 +6464,7 @@ mod tests {
             failing_check_count: 0,
             review_decision: None,
             mergeable: None,
+            merge_commit: None,
         };
         statuses.remember(&crate::pr_status::PrKey::new("o/r", 5), status.clone());
         statuses.remember(&crate::pr_status::PrKey::new("o/r", 6), status.clone());
@@ -12264,6 +12334,70 @@ mod tests {
             use super::*;
             use crate::test_helpers::attach_test_executor;
 
+            #[tokio::test(flavor = "multi_thread")]
+            async fn explicit_refresh_reports_partial_backfill_failure_after_processing_other_refs() {
+                use tauri::Manager;
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup("unused",
+                    r#"{"state":"MERGED","mergeCommit":{"oid":"1111111111111111111111111111111111111111"}}"#);
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let id = seed_task(&state, "/tmp", None, TaskStatus::InProgress).await;
+                let project = {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&id).unwrap();
+                    for number in [7, 8, 9] {
+                        task.external_refs.push(ExternalRef::GithubPr {
+                            number, repo: "owner/repo".into(),
+                            url: format!("https://github.com/owner/repo/pull/{number}"),
+                            state: Some(if number == 9 { "OPEN" } else { "MERGED" }.into()),
+                            merge_commit: None,
+                        });
+                    }
+                    task.project_id
+                };
+                state.storage.save_project_tasks(project,
+                    &[state.task.tasks.read().await[&id].clone()]).unwrap();
+                let lease = state.task_lifecycle_locks.try_acquire(id).await.unwrap();
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let error = refresh_pr_status(GuiMutation::untracked(), app.state(), id.to_string())
+                    .await.expect_err("both required backfills are busy");
+                assert!(error.contains("#7") && error.contains("#8"), "{error}");
+                let state = app.state::<crate::AppState>();
+                for number in [7, 8, 9] {
+                    assert!(state.pr_statuses.get(&crate::pr_status::PrKey::new("owner/repo", number))
+                        .unwrap().status.is_some(), "each answer was processed");
+                }
+                assert!(state.task.tasks.read().await[&id].external_refs.iter().all(|r|
+                    !matches!(r, ExternalRef::GithubPr { merge_commit: Some(_), .. })));
+                drop(lease);
+                let fault = slashit_durable_fs::fault::fail_at(
+                    slashit_durable_fs::Stage::SyncTemp, std::io::ErrorKind::Other);
+                let error = refresh_pr_status(GuiMutation::untracked(), app.state(), id.to_string())
+                    .await.expect_err("the first repair fails, but the next must still persist");
+                assert!(error.contains("#7") && !error.contains("#8"), "{error}");
+                drop(fault);
+                for task in [state.task.tasks.read().await[&id].clone(),
+                    state.storage.load_project_tasks(project).unwrap().into_iter().find(|t| t.id == id).unwrap()] {
+                    let commits: Vec<_> = task.external_refs.iter().filter_map(|r| match r {
+                        ExternalRef::GithubPr { merge_commit, .. } => Some(merge_commit.clone()), _ => None,
+                    }).collect();
+                    assert_eq!(commits, vec![None, Some("1111111111111111111111111111111111111111".into()), None]);
+                }
+                let entries = refresh_pr_status(GuiMutation::untracked(), app.state(), id.to_string())
+                    .await.expect("idle retry repairs the remaining recorded merge");
+                assert_eq!(entries.len(), 2);
+                let task = state.task.tasks.read().await[&id].clone();
+                assert_eq!(task.status, TaskStatus::InProgress, "new merges outside delivery stay unrecorded");
+                let evidence: Vec<_> = task.external_refs.iter().filter_map(|r| match r {
+                    ExternalRef::GithubPr { merge_commit, .. } => Some(merge_commit.clone()), _ => None,
+                }).collect();
+                assert_eq!(evidence, vec![Some("1111111111111111111111111111111111111111".into()),
+                    Some("1111111111111111111111111111111111111111".into()), None]);
+                let _ = executor;
+            }
+
             /// A stand-in `claude` for the PR-helper path: prints one valid
             /// `stream-json` init line (so `ClaudeRunner`'s reader has
             /// something to parse), then backgrounds a real `sleep 300` and
@@ -13288,6 +13422,7 @@ mod tests {
                             number: 18,
                             repo: "testorg/testrepo".to_string(),
                             state: None,
+                            merge_commit: None,
                         });
                     }
                     pin_pending_integration(&state, task_id, false).await;
@@ -13315,6 +13450,62 @@ mod tests {
                 }
             }
 
+            /// A merged reference recorded before the merge commit was kept has
+            /// no evidence. The explicit refresh asks GitHub again and records
+            /// the commit with the merged state it already holds, and it does
+            /// not change the task's status or its other references.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_refresh_records_the_merge_commit_of_a_legacy_merged_reference() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let commit = "0123456789abcdef0123456789abcdef01234567";
+                let mock = MockGh::setup(
+                    "unused",
+                    &format!(r#"{{"state":"MERGED","mergeCommit":{{"oid":"{commit}"}}}}"#),
+                );
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.pr_url = Some("https://github.com/testorg/testrepo/pull/21".to_string());
+                    task.external_refs.push(crate::domain::task::ExternalRef::GithubPr {
+                        url: "https://github.com/testorg/testrepo/pull/21".to_string(),
+                        number: 21,
+                        repo: "testorg/testrepo".to_string(),
+                        state: Some("MERGED".to_string()),
+                        merge_commit: None,
+                    });
+                }
+                pin_pending_integration(&state, task_id, false).await;
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let after = refresh_task_pr_state(GuiMutation::untracked(), app.state(), task_id.to_string())
+                    .await
+                    .expect("recording the evidence does not depend on finishing the task")
+                    .expect("the task is there");
+
+                assert_eq!(after.status, before.status, "the refresh does not move the task");
+                let recorded: Vec<_> = after
+                    .external_refs
+                    .iter()
+                    .filter_map(|r| match r {
+                        crate::domain::task::ExternalRef::GithubPr { merge_commit, .. } => {
+                            Some(merge_commit.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(recorded, vec![Some(commit.to_string())]);
+            }
+
             /// And a MERGED answer: recorded, then refused by the same guard
             /// `link_pr_to_task` runs into, the command answering with the
             /// task -- which never moved.
@@ -13324,7 +13515,10 @@ mod tests {
                 use tauri::Manager;
 
                 let _guard = PATH_LOCK.lock().await;
-                let mock = MockGh::setup("unused", r#"{"state":"MERGED"}"#);
+                let mock = MockGh::setup(
+                    "unused",
+                    r#"{"state":"MERGED","mergeCommit":{"oid":"0123456789abcdef0123456789abcdef01234567"}}"#,
+                );
                 let _ = &mock;
 
                 let (state, _tmp) = build_test_state().await;
@@ -13342,6 +13536,7 @@ mod tests {
                         number: 19,
                         repo: "testorg/testrepo".to_string(),
                         state: Some("OPEN".to_string()),
+                        merge_commit: None,
                     });
                 }
                 pin_pending_integration(&state, task_id, false).await;
@@ -13369,6 +13564,11 @@ mod tests {
                         .any(|r| matches!(r, crate::domain::task::ExternalRef::GithubPr { state, .. }
                             if state.as_deref() == Some("MERGED"))),
                     "the merged state was recorded, whatever git holds"
+                );
+                assert!(
+                    after.external_refs.iter().any(|r| matches!(r, crate::domain::task::ExternalRef::GithubPr { merge_commit, .. }
+                        if merge_commit.as_deref() == Some("0123456789abcdef0123456789abcdef01234567"))),
+                    "the merge commit was recorded with the merged state"
                 );
                 assert!(
                     after
@@ -13473,7 +13673,7 @@ mod tests {
             fn parse_pr_url_to_ref_with_state(url: &str, state: &str) -> crate::domain::task::ExternalRef {
                 match parse_pr_url_to_ref(url).expect("a pull request URL") {
                     crate::domain::task::ExternalRef::GithubPr { url, number, repo, .. } => {
-                        crate::domain::task::ExternalRef::GithubPr { url, number, repo, state: Some(state.to_string()) }
+                        crate::domain::task::ExternalRef::GithubPr { url, number, repo, state: Some(state.to_string()) , merge_commit: None}
                     }
                     other => other,
                 }

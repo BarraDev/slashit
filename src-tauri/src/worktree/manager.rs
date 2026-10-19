@@ -1007,16 +1007,51 @@ impl WorktreeManager {
         project_base: Option<&ProjectBase>,
     ) -> Result<(WorktreeInfo, Option<ResolvedBase>), String> {
         let branch = checked_task_branch(branch)?;
-        // A folder git cannot create a worktree from is refused saying what
-        // to do about it, not with whatever `git worktree list` answers.
-        if let Some(refused) = super::vcs::detect(Path::new(repo_path)).await?.refusal(repo_path) {
-            return Err(refused);
-        }
-        if let Some(path) = self.adoptable_worktree(repo_path, branch).await? {
-            let info = WorktreeInfo { path, branch: branch.to_string() };
+        if let Some(info) = self.adoptable_task_checkout(repo_path, branch).await? {
             return Ok((info, None));
         }
         let base = resolve_default_base(repo_path, project_base).await?;
+        self.create_at_base(repo_path, branch, base).await
+    }
+
+    /// [`Self::create_or_adopt`] for a new branch that must start at `base`,
+    /// a base the caller has already resolved and checked to hold the work
+    /// the new Task depends on. The branch is created at exactly that commit,
+    /// not at whatever the default base resolves to now, so the check and
+    /// the branch cannot disagree about the base.
+    pub async fn create_or_adopt_from(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        base: ResolvedBase,
+    ) -> Result<(WorktreeInfo, Option<ResolvedBase>), String> {
+        let branch = checked_task_branch(branch)?;
+        if let Some(info) = self.adoptable_task_checkout(repo_path, branch).await? {
+            return Ok((info, None));
+        }
+        self.create_at_base(repo_path, branch, base).await
+    }
+
+    /// The worktree already holding `branch`, when there is one to adopt. A
+    /// folder git cannot create a worktree from is refused saying what to do
+    /// about it, not with whatever `git worktree list` answers.
+    async fn adoptable_task_checkout(&self, repo_path: &str, branch: &str) -> Result<Option<WorktreeInfo>, String> {
+        if let Some(refused) = super::vcs::detect(Path::new(repo_path)).await?.refusal(repo_path) {
+            return Err(refused);
+        }
+        Ok(self
+            .adoptable_worktree(repo_path, branch)
+            .await?
+            .map(|path| WorktreeInfo { path, branch: branch.to_string() }))
+    }
+
+    /// Create `branch` at `base` and check it out in a new worktree.
+    async fn create_at_base(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        base: ResolvedBase,
+    ) -> Result<(WorktreeInfo, Option<ResolvedBase>), String> {
         Self::create_branch_at(repo_path, branch, &base.commit).await?;
         let worktree_path = self.managed_path(repo_path, branch);
         let info = match self.git_worktree_add(repo_path, &worktree_path, branch).await {
@@ -7246,6 +7281,38 @@ branch refs/heads/some-other-branch
     // -------------------------------------------------------
     // Taking back a checkout a task could not record
     // -------------------------------------------------------
+
+    /// A branch created from a base its caller validated starts at exactly
+    /// that commit, even though the default base has moved on since. The
+    /// check and the branch cannot disagree about the base.
+    #[tokio::test]
+    async fn a_branch_created_from_a_validated_base_starts_at_that_commit() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let validated = resolve_default_base(repo_path, None).await.expect("a base");
+
+        std::fs::write(tmp.path().join("later.txt"), "later\n").unwrap();
+        run_git(repo_path, &["add", "later.txt"]);
+        run_git(repo_path, &["commit", "-q", "-m", "later"]);
+        run_git(repo_path, &["push", "-q", "origin", "main"]);
+        let moved = run_git(repo_path, &["rev-parse", "HEAD"]);
+        assert_ne!(moved, validated.commit);
+        assert_eq!(
+            resolve_default_base(repo_path, None).await.expect("a base").commit,
+            moved,
+            "the default base has moved on"
+        );
+
+        let mgr = test_manager();
+        let (info, base) = mgr
+            .create_or_adopt_from(repo_path, "task-0a1b2c3d", validated.clone())
+            .await
+            .expect("create");
+
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), validated.commit);
+        assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), validated.commit);
+        assert_eq!(base, Some(validated));
+    }
 
     /// A checkout exactly as its creation left it is taken back whole: the
     /// worktree, its registration and the branch.
