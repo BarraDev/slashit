@@ -1,6 +1,6 @@
 use crate::commands::gui_admission::GuiMutation;
 use crate::config::QueueConfig;
-use crate::domain::{Task, TaskStatus};
+use crate::domain::Task;
 use crate::queue::QueueManager;
 use crate::commands::task::Tasks;
 use uuid::Uuid;
@@ -125,65 +125,36 @@ pub(crate) async fn apply_queue_config_patch(
     Ok(next)
 }
 
-/// Durably, rather than through a `QueueManager` method that only ever
-/// mutated the shared map: that ordering published the status change in
-/// memory before persistence was attempted at all. See
-/// `lifecycle::commit_task`.
+/// Queue a Task through the lifecycle's own entry point, the one the CLI
+/// reaches as well. See `lifecycle::enqueue_current`.
 ///
 /// `add_to_queue`/`bulk_add_to_queue`/`requeue_task` all reach this, and none
 /// of them are restricted to a task with no active owner: a task selected for
 /// a bulk "add to queue" or an explicit requeue can be `InProgress` or
-/// `AiReview` right now. The lease and the ownership-ending guard below give
-/// this the same contract `update_task_status` has -- a previous owner cannot
-/// be left running under a status this write is about to overwrite.
+/// `AiReview` right now. The lifecycle ends such an owner before its write,
+/// the same contract `update_task_status` has. A refusal that is already known
+/// (a Task whose Worker handoff is still `Started`, for example) is returned
+/// without ending that owner, so a request that cannot be written never stops
+/// a running Worker.
 async fn enqueue_durably(
     state: &tauri::State<'_, crate::AppState>,
     task_id: Uuid,
 ) -> Result<(), String> {
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
-
-    let old_status = state
-        .task
-        .tasks
-        .read()
-        .await
-        .get(&task_id)
-        .map(|t| (t.status.clone(), t.integration_unfinished_refusal()));
-    let (old_status, unfinished_integration) = match old_status {
-        Some((status, refusal)) => (Some(status), refusal),
-        None => (None, None),
-    };
-
-    // Queueing withdraws the approval a pending local integration is
-    // resumed from; refused before an owner is ended or anything is written.
-    if old_status != Some(TaskStatus::Queue) {
-        if let Some(refusal) = unfinished_integration {
-            return Err(refusal);
-        }
-    }
-
-    if !matches!(&old_status, None | Some(TaskStatus::Queue)) {
-        let running = state
-            .executor
-            .get()
-            .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
-        crate::lifecycle::end_active_ownership(running, task_id).await?;
-    }
-
-    let amend = move |staged: &mut HashMap<Uuid, Task>| {
-        if let Some(task) = staged.get_mut(&task_id) {
-            let from = task.status.clone();
-            task.status = TaskStatus::Queue;
-            task.record_move(&from);
-            // Queued to run again: an approval of the current changes no
-            // longer covers what the branch will hold.
-            task.human_review.withdraw_approval();
-        }
-    };
-    match crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await?
-    {
-        Some(_) => Ok(()),
-        None => Err(format!("Task {} not found", task_id)),
+    let running = state
+        .executor
+        .get()
+        .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+    let verdict = crate::lifecycle::enqueue_current(
+        &state.task.tasks,
+        &state.storage,
+        &state.task_lifecycle_locks,
+        running,
+        task_id,
+    )
+    .await?;
+    match verdict.refusal(task_id) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
     }
 }
 
@@ -294,6 +265,7 @@ pub async fn requeue_task(
 #[cfg(test)]
 mod lifecycle_ownership {
     use super::*;
+    use crate::domain::TaskStatus;
     use crate::test_helpers::{attach_test_executor, create_test_task_full};
     use tauri::Manager;
 
@@ -377,6 +349,7 @@ mod lifecycle_ownership {
 #[cfg(test)]
 mod enqueue_parity {
     use super::*;
+    use crate::domain::TaskStatus;
     use crate::test_helpers::create_test_task_full;
     use tauri::Manager;
 
@@ -849,5 +822,93 @@ mod queue_settings {
         assert_eq!(config.parallel_task_limit, 1);
         assert!(!config.auto_promote, "repairing the limit must not re-enable promotion");
         assert!(!config.fifo_ordering);
+    }
+}
+
+/// The desktop's Add to Queue and the lifecycle's own entry point, which the
+/// CLI shares, leave a stale Task in the same durable state.
+#[cfg(test)]
+mod enqueue_front_doors {
+    use super::*;
+    use crate::domain::{TaskPhase, TaskStatus};
+    use crate::test_helpers::create_test_task_full;
+    use tauri::Manager;
+
+    /// The fields an enqueue is meant to settle, for the one Task it queued.
+    fn queued_record(task: &Task) -> (TaskStatus, TaskPhase, u8, u8, Option<String>, bool, i32) {
+        (
+            task.status.clone(),
+            task.phase.clone(),
+            task.phase_progress,
+            task.overall_progress,
+            task.error_message.clone(),
+            task.human_review.is_approved(),
+            task.position,
+        )
+    }
+
+    #[tokio::test]
+    async fn add_to_queue_and_the_lifecycle_entry_point_leave_the_same_record() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _report) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state should build under a fresh tempdir");
+
+        let project_id = Uuid::new_v4();
+        let stale = |title: &str| {
+            let mut task = create_test_task_full(title, project_id, TaskStatus::Error, 0);
+            task.phase = TaskPhase::Coding;
+            task.phase_progress = 40;
+            task.overall_progress = 40;
+            task.error_message = Some("old failure".into());
+            task
+        };
+        let by_desktop = stale("by desktop");
+        let by_lifecycle = stale("by lifecycle");
+        let (desktop_id, lifecycle_id) = (by_desktop.id, by_lifecycle.id);
+        {
+            let mut tasks = state.task.tasks.write().await;
+            tasks.insert(desktop_id, by_desktop.clone());
+            tasks.insert(lifecycle_id, by_lifecycle.clone());
+        }
+        state
+            .storage
+            .save_project_tasks(project_id, &[by_desktop, by_lifecycle])
+            .expect("seed the board");
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let live: &crate::AppState = app.state::<crate::AppState>().inner();
+
+        add_to_queue(GuiMutation::untracked(), app.state(), desktop_id.to_string())
+            .await
+            .expect("the desktop enqueue");
+        let verdict = crate::lifecycle::enqueue_current(
+            &live.task.tasks,
+            &live.storage,
+            &live.task_lifecycle_locks,
+            None,
+            lifecycle_id,
+        )
+        .await
+        .expect("the lifecycle enqueue");
+        assert!(matches!(verdict, crate::lifecycle::EnqueueVerdict::Queued(_)), "{verdict:?}");
+
+        let tasks = live.task.tasks.read().await;
+        let desktop = queued_record(&tasks[&desktop_id]);
+        let lifecycle = queued_record(&tasks[&lifecycle_id]);
+        assert_eq!(desktop.0, TaskStatus::Queue);
+        assert_eq!(desktop.1, TaskPhase::Idle);
+        assert_eq!(desktop.4, None);
+        assert_eq!(desktop.2, 0);
+        assert_eq!(desktop.3, 0);
+        assert_eq!(lifecycle, (desktop.0.clone(), desktop.1.clone(), 0, 0, None, false, 0), "the record of the second entry");
+        assert_eq!(desktop.6, 1, "the first Task is pushed down by the second entry, not left colliding");
     }
 }

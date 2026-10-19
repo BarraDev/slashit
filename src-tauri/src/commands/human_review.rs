@@ -542,6 +542,12 @@ async fn request_changes(
                 .to_string(),
         );
     }
+    // Refused before any owner is ended and before the feedback is written, so
+    // a Task with unfinished cleanup, restack, recovery or integration work
+    // keeps its status and its feedback is not recorded.
+    if let Some(refusal) = crate::lifecycle::queue_move_refusal(&task, &TaskStatus::Queue) {
+        return Err(refusal);
+    }
 
     // The task leaves Human Review for the queue, so whatever owns it now (a
     // pull request helper, say) is ended first, exactly as a status move does.
@@ -550,6 +556,12 @@ async fn request_changes(
         .get()
         .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
     crate::lifecycle::end_active_ownership(running, task_id).await?;
+    // Ending the owner can leave a Worker in recovery, so the entry is checked
+    // again under the lease before the feedback and the Queue move are written.
+    let stopped = current(state, task_id).await.ok_or("Task not found")?;
+    if let Some(refusal) = crate::lifecycle::queue_move_refusal(&stopped, &TaskStatus::Queue) {
+        return Err(refusal);
+    }
 
     let project_id = task.project_id;
     let now = chrono::Utc::now();
@@ -799,6 +811,37 @@ mod tests {
         // The next run's prompt carries it.
         let prompt = crate::queue::prompt::build_task_prompt(&persisted, None);
         assert!(prompt.contains("Also count lines."));
+    }
+
+    /// Changes cannot be requested while an earlier cleanup of the Task's
+    /// checkout is unfinished: the Task would enter Queue with that work still
+    /// pending. Nothing is recorded, and the Task stays in Human Review.
+    #[tokio::test]
+    async fn changes_cannot_be_requested_while_a_cleanup_is_unfinished() {
+        let (_tmp, state) = test_state().await;
+        let (project_id, task_id) = seed_in_review(&state).await;
+        let mut task = on_disk(&state, project_id, task_id);
+        task.cleanup_in_flight = true;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        let before = on_disk(&state, project_id, task_id);
+        let executor = crate::test_helpers::attach_test_executor(&state);
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let Err(refusal) = request_changes(&state, task_id, "Also count lines.").await else {
+            panic!("a Task with unfinished cleanup must not be queued by a review decision");
+        };
+
+        assert!(refusal.contains("cleanup"), "{refusal}");
+        assert!(
+            !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "a request that will be refused must not end the owner"
+        );
+        let after = on_disk(&state, project_id, task_id);
+        assert_eq!(after.status, TaskStatus::HumanReview);
+        assert_eq!(after.human_review.entries.len(), before.human_review.entries.len());
+        assert!(after.human_review.pending_feedback().is_empty(), "no feedback is recorded");
+        assert_eq!(state.task.tasks.read().await[&task_id].status, TaskStatus::HumanReview);
     }
 
     /// Requesting changes is a decision, not new work, so it is recorded on

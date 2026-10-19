@@ -735,6 +735,25 @@ impl Task {
         })
     }
 
+    /// Why this Task may not enter Queue, for the reasons that need no approval,
+    /// or `None`.
+    ///
+    /// An unfinished cleanup, restack, Worker recovery or local integration
+    /// records work that a new run would overwrite or make ambiguous, so every
+    /// front door that queues a Task refuses here. A live Worker whose handoff
+    /// is still `Started` counts as recovery evidence, so this refusal is what
+    /// keeps a queue request from stopping it. The board, the desktop, the CLI
+    /// and the Coordinator reach it through `lifecycle::enqueue_leased` or
+    /// `lifecycle::enqueue_current`; a move that names Queue as its target
+    /// reaches it through `lifecycle::queue_move_refusal`.
+    pub fn queue_entry_refusal(&self) -> Option<String> {
+        self.cleanup_in_flight
+            .then(|| "An earlier cleanup of this Task's checkout is unfinished, so it cannot run yet".to_string())
+            .or_else(|| self.republish_pending_refusal())
+            .or_else(|| self.worker_recovery_refusal())
+            .or_else(|| self.integration_unfinished_refusal())
+    }
+
     /// Return the task to a state work can start from again, keeping the work
     /// it has already produced.
     ///

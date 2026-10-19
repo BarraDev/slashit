@@ -166,14 +166,24 @@ pub async fn update_task_status(
     close_without_merge: Option<bool>,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    set_task_status(&state, task_id, status, close_without_merge).await
+}
 
+/// The status move behind [`update_task_status`], for callers that hold the
+/// application state rather than a Tauri `State`.
+pub(crate) async fn set_task_status(
+    state: &crate::AppState,
+    task_id: Uuid,
+    status: TaskStatus,
+    close_without_merge: Option<bool>,
+) -> Result<Option<Task>, String> {
     if matches!(status, TaskStatus::Done) {
         let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
         if let Some(old_status) = state.task.tasks.read().await.get(&task_id).map(|t| t.status.clone()) {
             refuse_unconfirmed_close(&old_status, close_without_merge)?;
         }
         return match crate::lifecycle::terminalize_leased(
-            terminalize_ctx(&state),
+            terminalize_ctx(state),
             task_id,
             crate::lifecycle::Origin::User,
             crate::lifecycle::TerminalizeRequest::new(status),
@@ -188,12 +198,26 @@ pub async fn update_task_status(
 
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
-    let Some((old_status, unfinished_integration)) = ({
+    let Some((old_status, unfinished_integration, queue_refusal, repeated_queue)) = ({
         let tasks = state.task.tasks.read().await;
-        tasks.get(&task_id).map(|t| (t.status.clone(), t.integration_unfinished_refusal()))
+        tasks.get(&task_id).map(|t| {
+            (
+                t.status.clone(),
+                t.integration_unfinished_refusal(),
+                crate::lifecycle::queue_move_refusal(t, &status),
+                crate::lifecycle::is_repeated_queue_move(t, &status),
+            )
+        })
     }) else {
         return Ok(None);
     };
+
+    // A request for the column a queued Task already holds is answered with the
+    // Task as it is. Nothing is reset, withdrawn or recorded, and nothing is
+    // written, so the error and recovery evidence it carries survives.
+    if repeated_queue {
+        return Ok(state.task.tasks.read().await.get(&task_id).cloned());
+    }
 
     // A pending local integration is recovered from the column it was made
     // in, so no move out of it is made until a person resumes or discards it.
@@ -202,6 +226,12 @@ pub async fn update_task_status(
         if let Some(refusal) = unfinished_integration {
             return Err(refusal);
         }
+    }
+
+    // A move into Queue is refused for the same reasons as every other queue
+    // entry, before a current owner is ended or anything is written.
+    if let Some(refusal) = queue_refusal {
+        return Err(refusal);
     }
 
     // A move into In Progress asks for a new execution; while new work is
@@ -222,6 +252,18 @@ pub async fn update_task_status(
             .get()
             .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
         crate::lifecycle::end_active_ownership(running, task_id).await?;
+        // Ending the owner can leave a Worker in recovery, so a move into
+        // Queue is checked again under the lease before the write.
+        let recorded = state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .and_then(|t| crate::lifecycle::queue_move_refusal(t, &status));
+        if let Some(refusal) = recorded {
+            return Err(refusal);
+        }
     }
 
     let effect = classify_status_transition(&old_status, &status);
@@ -646,9 +688,11 @@ pub async fn reorder_task(
 
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
-    let Some((project_id, old_status, unfinished_integration)) = ({
+    let Some((project_id, old_status, unfinished_integration, queue_refusal)) = ({
         let tasks = state.task.tasks.read().await;
-        tasks.get(&task_id).map(|t| (t.project_id, t.status.clone(), t.integration_unfinished_refusal()))
+        tasks
+            .get(&task_id)
+            .map(|t| (t.project_id, t.status.clone(), t.integration_unfinished_refusal(), t.queue_entry_refusal()))
     }) else {
         return Ok(None);
     };
@@ -668,6 +712,15 @@ pub async fn reorder_task(
     // changes no status and stays allowed.
     if old_status != target_status {
         if let Some(refusal) = unfinished_integration {
+            return Err(refusal);
+        }
+    }
+
+    // A card entering Queue by any gesture is refused for the same reasons as
+    // every other queue entry (`Task::queue_entry_refusal`), so a drag cannot
+    // queue what Add to Queue refuses. The drop position is still the card's.
+    if target_status == TaskStatus::Queue && old_status != TaskStatus::Queue {
+        if let Some(refusal) = queue_refusal {
             return Err(refusal);
         }
     }
@@ -722,6 +775,19 @@ pub async fn reorder_task(
             .get()
             .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
         crate::lifecycle::end_active_ownership(running, task_id).await?;
+        // Ending the owner can record a refusal of its own: a Worker stopped
+        // mid-run is left in recovery. The entry is checked again under the
+        // lease, before anything is written.
+        let recorded = state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .and_then(|t| crate::lifecycle::queue_move_refusal(t, &target_status));
+        if let Some(refusal) = recorded {
+            return Err(refusal);
+        }
     }
 
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
@@ -1895,6 +1961,87 @@ mod lifecycle_ownership {
         assert_eq!(done.status, TaskStatus::Done);
     }
 
+    /// The Task as the board file holds it.
+    fn persisted_task(state: &crate::AppState, project_id: Uuid, task_id: Uuid) -> Task {
+        state
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task must be on disk")
+    }
+
+    /// The desktop twin of the IPC test: a repeated request for Queue returns
+    /// the Task as it is and writes nothing.
+    #[tokio::test]
+    async fn a_repeated_update_into_queue_keeps_the_evidence_a_queued_task_carries() {
+        let (_tmp, state) = test_state().await;
+        let executor = attach_test_executor(&state);
+        let project_id = Uuid::new_v4();
+        // Once without recovery evidence, where a reset would be written, and
+        // once with it, where the board refuses any write.
+        let mut seeded = Vec::new();
+        for with_recovery in [false, true] {
+            let mut task = create_test_task_full("queued with evidence", project_id, TaskStatus::Queue, 0);
+            task.error_message = Some("the last run failed".into());
+            task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
+            if with_recovery {
+                task.worker_handoff = Some(crate::domain::WorkerHandoff {
+                    task_id: task.id,
+                    project_id,
+                    repository_id: None,
+                    run: Some(1),
+                    branch: None,
+                    start_head: None,
+                    stage: crate::domain::WorkerHandoffStage::RecoveryRequired {
+                        reason: "the run was interrupted".into(),
+                        observed_commit: None,
+                    },
+                    acceptance: None,
+                });
+            }
+            // A fixed, old timestamp: any rewrite of the record moves it.
+            task.updated_at = chrono::DateTime::from_timestamp(0, 0).expect("the epoch");
+            let task_id = task.id;
+            let board = {
+                let mut tasks = state.task.tasks.write().await;
+                tasks.insert(task_id, task);
+                tasks.values().filter(|t| t.project_id == project_id).cloned().collect::<Vec<_>>()
+            };
+            state.storage.save_project_tasks(project_id, &board).expect("seed the board");
+            let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+            let memory_before = serde_json::to_value(state.task.tasks.read().await[&task_id].clone()).unwrap();
+            let disk_before = serde_json::to_value(persisted_task(&state, project_id, task_id)).unwrap();
+            seeded.push((with_recovery, task_id, cleaned_up, memory_before, disk_before));
+        }
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        for (with_recovery, task_id, cleaned_up, memory_before, disk_before) in seeded {
+            let answer = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::Queue, None)
+                .await
+                .unwrap_or_else(|error| panic!("with recovery {with_recovery}: a repeated request is answered, not refused: {error}"))
+                .expect("the Task exists");
+
+            assert_eq!(answer.status, TaskStatus::Queue);
+            assert!(
+                !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+                "with recovery {with_recovery}: a request that changes nothing must not end the owner"
+            );
+            let state = app.state::<crate::AppState>();
+            let memory_after = serde_json::to_value(state.task.tasks.read().await[&task_id].clone()).unwrap();
+            let disk_after = serde_json::to_value(persisted_task(&state, project_id, task_id)).unwrap();
+            assert_eq!(memory_after, memory_before, "with recovery {with_recovery}: memory is unchanged");
+            assert_eq!(disk_after, disk_before, "with recovery {with_recovery}: the record is not rewritten");
+            let written = persisted_task(&state, project_id, task_id);
+            assert_eq!(written.error_message.as_deref(), Some("the last run failed"));
+            assert!(written.human_review.is_approved());
+            assert_eq!(written.worker_handoff.is_some(), with_recovery);
+        }
+    }
+
     #[tokio::test]
     async fn update_task_status_ends_a_running_execution_before_moving_the_task() {
         let (_tmp, state) = test_state().await;
@@ -2061,6 +2208,35 @@ mod lifecycle_ownership {
             "moving a task out of its column must end its previous owner first"
         );
         assert!(!executor.is_task_running(task_id).await);
+    }
+
+    /// A card dragged into Queue meets the refusal that Add to Queue meets, so
+    /// the two gestures cannot queue different Tasks. Nothing is written.
+    #[tokio::test]
+    async fn a_drag_into_queue_is_refused_while_a_cleanup_is_unfinished() {
+        let (_tmp, state) = test_state().await;
+        let task_id = seed(&state, TaskStatus::Backlog).await;
+        state.task.tasks.write().await.get_mut(&task_id).expect("seeded").cleanup_in_flight = true;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let refused = reorder_task(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            Some(TaskStatus::Queue),
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an unfinished cleanup refuses the drag");
+
+        assert!(refused.contains("cleanup"), "{refused}");
+        let live = app.state::<crate::AppState>();
+        let task = live.task.tasks.read().await[&task_id].clone();
+        assert_eq!(task.status, TaskStatus::Backlog);
+        assert!(task.cleanup_in_flight, "the refusal leaves the record as it was");
     }
 
     /// A stale enqueue: the person saw the task in one column and asked to
@@ -2378,5 +2554,124 @@ mod disk_pressure {
             crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap(),
             Some(crate::domain::storage_usage::StartBlock::DiskSpaceUnavailable { .. })
         ));
+    }
+}
+
+/// A status move into Queue, asked from the desktop, is refused for the same
+/// reasons as every other queue entry, and a refused move changes nothing.
+#[cfg(test)]
+mod queue_entry_from_a_status_move {
+    use super::*;
+    use crate::domain::{TaskStatus, WorkerHandoff, WorkerHandoffStage};
+    use crate::test_helpers::create_test_task_full;
+
+    async fn test_state() -> (tempfile::TempDir, crate::AppState) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _report) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state should build under a fresh tempdir");
+        (tmp, state)
+    }
+
+    async fn seed(state: &crate::AppState, task: Task) -> (Uuid, Uuid) {
+        let project_id = task.project_id;
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        (project_id, task_id)
+    }
+
+    fn persisted(state: &crate::AppState, project_id: Uuid, task_id: Uuid) -> Task {
+        state
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task must be on disk")
+    }
+
+    #[tokio::test]
+    async fn a_status_move_into_queue_refuses_unfinished_cleanup() {
+        let (_tmp, state) = test_state().await;
+        let mut task = create_test_task_full("cleaning up", Uuid::new_v4(), TaskStatus::HumanReview, 0);
+        task.cleanup_in_flight = true;
+        let (project_id, task_id) = seed(&state, task).await;
+        let executor = crate::test_helpers::attach_test_executor(&state);
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let Err(refusal) = set_task_status(&state, task_id, TaskStatus::Queue, None).await else {
+            panic!("a Task with unfinished cleanup must not enter Queue");
+        };
+
+        assert!(refusal.contains("cleanup"), "{refusal}");
+        assert!(
+            !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "a move that will be refused must not end the owner"
+        );
+        assert!(executor.is_task_running(task_id).await);
+        assert_eq!(state.task.tasks.read().await[&task_id].status, TaskStatus::HumanReview);
+        assert_eq!(persisted(&state, project_id, task_id).status, TaskStatus::HumanReview);
+    }
+
+    #[tokio::test]
+    async fn a_status_move_into_queue_refuses_a_live_worker_without_stopping_it() {
+        let (_tmp, state) = test_state().await;
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("running", project_id, TaskStatus::InProgress, 0);
+        task.worker_handoff = Some(WorkerHandoff {
+            task_id: task.id,
+            project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            stage: WorkerHandoffStage::Started,
+            acceptance: None,
+        });
+        let (project_id, task_id) = seed(&state, task).await;
+        let executor = crate::test_helpers::attach_test_executor(&state);
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let Err(refusal) = set_task_status(&state, task_id, TaskStatus::Queue, None).await else {
+            panic!("a Task whose Worker is still running must not enter Queue");
+        };
+
+        assert!(refusal.contains("recovery"), "{refusal}");
+        assert!(
+            !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "a queue request that cannot be written must leave the live Worker running"
+        );
+        assert!(executor.is_task_running(task_id).await);
+        assert_eq!(state.task.tasks.read().await[&task_id].status, TaskStatus::InProgress);
+        assert_eq!(persisted(&state, project_id, task_id).status, TaskStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn a_status_move_into_queue_that_is_not_refused_is_written_once() {
+        let (_tmp, state) = test_state().await;
+        let task = create_test_task_full("ready", Uuid::new_v4(), TaskStatus::Backlog, 0);
+        let (project_id, task_id) = seed(&state, task).await;
+
+        let moved = set_task_status(&state, task_id, TaskStatus::Queue, None)
+            .await
+            .expect("an unrefused move is written")
+            .expect("the task exists");
+        assert_eq!(moved.status, TaskStatus::Queue);
+        let activity = persisted(&state, project_id, task_id).activity.len();
+
+        // A repeated request changes nothing, and records no second move.
+        set_task_status(&state, task_id, TaskStatus::Queue, None)
+            .await
+            .expect("a repeat is not an error");
+        let repeated = persisted(&state, project_id, task_id);
+        assert_eq!(repeated.status, TaskStatus::Queue);
+        assert_eq!(repeated.activity.len(), activity);
     }
 }
