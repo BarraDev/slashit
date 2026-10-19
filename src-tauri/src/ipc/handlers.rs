@@ -256,12 +256,18 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         Err(e) => return IpcResponse::error(e),
     };
 
-    let (old_status, unfinished_integration) = match ctx
+    let (old_status, unfinished_integration, queue_refusal) = match ctx
         .tasks
         .read()
         .await
         .get(&task_uuid)
-        .map(|t| (t.status.clone(), t.integration_unfinished_refusal()))
+        .map(|t| {
+            (
+                t.status.clone(),
+                t.integration_unfinished_refusal(),
+                crate::lifecycle::queue_move_refusal(t, &new_status),
+            )
+        })
     {
         Some(found) => found,
         None => return IpcResponse::error(format!("Task {task_id} not found")),
@@ -273,6 +279,13 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         if let Some(refusal) = unfinished_integration {
             return IpcResponse::error(refusal);
         }
+    }
+
+    // Same as the desktop `update_task_status`: a move into Queue is refused
+    // for the same reasons as every other queue entry, before an owner is
+    // ended or anything is written.
+    if let Some(refusal) = queue_refusal {
+        return IpcResponse::error(refusal);
     }
 
     // Same as the desktop `update_task_status`: a move into In Progress is
@@ -294,6 +307,17 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
             .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
         if let Err(e) = crate::lifecycle::end_active_ownership(running, task_uuid).await {
             return IpcResponse::error(e);
+        }
+        // Ending the owner can leave a Worker in recovery, so a move into
+        // Queue is checked again under the lease before the write.
+        let recorded = ctx
+            .tasks
+            .read()
+            .await
+            .get(&task_uuid)
+            .and_then(|t| crate::lifecycle::queue_move_refusal(t, &new_status));
+        if let Some(refusal) = recorded {
+            return IpcResponse::error(refusal);
         }
     }
 
@@ -1220,6 +1244,109 @@ mod lifecycle_ownership {
              working on it"
         );
         assert!(executor.is_task_running(task_id).await);
+    }
+
+    /// Stores `task` on the board and in memory, as the desktop would have.
+    async fn seed_task(ctx: &IpcContext, task: crate::domain::Task) -> Uuid {
+        let project_id = task.project_id;
+        let task_id = task.id;
+        ctx.tasks.write().await.insert(task_id, task.clone());
+        ctx.storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
+        task_id
+    }
+
+    fn persisted(ctx: &IpcContext, project_id: Uuid, task_id: Uuid) -> crate::domain::Task {
+        ctx.storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task must be on disk")
+    }
+
+    fn move_to_queue(task_id: Uuid) -> IpcRequest {
+        IpcRequest::MoveTask { task_id: task_id.to_string(), status: "queue".to_string() }
+    }
+
+    #[tokio::test]
+    async fn a_move_into_queue_refuses_unfinished_cleanup_before_ending_an_owner() {
+        let (_tmp, ctx) = test_ctx().await;
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let project_id = Uuid::new_v4();
+        // A Done cleanup that stamped its flag, then failed before its status
+        // write: the Task is still in Human Review with the flag set.
+        let mut task = create_test_task_full("cleaning up", project_id, TaskStatus::HumanReview, 0);
+        task.cleanup_in_flight = true;
+        let task_id = seed_task(&ctx, task).await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
+
+        assert!(!answer.ok, "{answer:?}");
+        assert!(format!("{answer:?}").contains("cleanup"), "{answer:?}");
+        assert!(
+            !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "a move that will be refused must not end the owner"
+        );
+        assert!(executor.is_task_running(task_id).await);
+        assert_eq!(ctx.tasks.read().await[&task_id].status, TaskStatus::HumanReview);
+        assert_eq!(persisted(&ctx, project_id, task_id).status, TaskStatus::HumanReview);
+    }
+
+    #[tokio::test]
+    async fn a_move_into_queue_refuses_a_live_worker_without_stopping_it() {
+        let (_tmp, ctx) = test_ctx().await;
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let project_id = Uuid::new_v4();
+        // A Worker is running: its handoff is recorded as Started and the
+        // Task is In Progress.
+        let mut task = create_test_task_full("running", project_id, TaskStatus::InProgress, 0);
+        task.worker_handoff = Some(crate::domain::WorkerHandoff {
+            task_id: task.id,
+            project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            stage: crate::domain::WorkerHandoffStage::Started,
+            acceptance: None,
+        });
+        let task_id = seed_task(&ctx, task).await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
+
+        assert!(!answer.ok, "{answer:?}");
+        assert!(
+            !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "a queue request that cannot be written must leave the live Worker running"
+        );
+        assert!(executor.is_task_running(task_id).await);
+        assert_eq!(ctx.tasks.read().await[&task_id].status, TaskStatus::InProgress);
+        assert_eq!(persisted(&ctx, project_id, task_id).status, TaskStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn a_move_into_queue_that_is_not_refused_is_written_once() {
+        let (_tmp, ctx) = test_ctx().await;
+        let project_id = Uuid::new_v4();
+        let task = create_test_task_full("ready", project_id, TaskStatus::Backlog, 0);
+        let task_id = seed_task(&ctx, task).await;
+
+        let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
+        assert!(answer.ok, "{answer:?}");
+        let written = persisted(&ctx, project_id, task_id);
+        assert_eq!(written.status, TaskStatus::Queue);
+        let activity = written.activity.len();
+
+        // A repeated request changes nothing, and records no second move.
+        let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
+        assert!(answer.ok, "{answer:?}");
+        let repeated = persisted(&ctx, project_id, task_id);
+        assert_eq!(repeated.status, TaskStatus::Queue);
+        assert_eq!(repeated.activity.len(), activity);
     }
 
     #[tokio::test]

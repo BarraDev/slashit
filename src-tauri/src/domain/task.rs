@@ -740,9 +740,12 @@ impl Task {
     ///
     /// An unfinished cleanup, restack, Worker recovery or local integration
     /// records work that a new run would overwrite or make ambiguous, so every
-    /// front door that queues a Task refuses here. The board, the desktop, the
-    /// CLI and the Coordinator all reach it through
-    /// `lifecycle::enqueue_leased` or `lifecycle::enqueue_current`.
+    /// front door that queues a Task refuses here. A live Worker whose handoff
+    /// is still `Started` counts as recovery evidence, so this refusal is what
+    /// keeps a queue request from stopping it. The board, the desktop, the CLI
+    /// and the Coordinator reach it through `lifecycle::enqueue_leased` or
+    /// `lifecycle::enqueue_current`; a move that names Queue as its target
+    /// reaches it through `lifecycle::queue_move_refusal`.
     pub fn queue_entry_refusal(&self) -> Option<String> {
         self.cleanup_in_flight
             .then(|| "An earlier cleanup of this Task's checkout is unfinished, so it cannot run yet".to_string())

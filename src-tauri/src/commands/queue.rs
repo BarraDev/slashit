@@ -132,7 +132,10 @@ pub(crate) async fn apply_queue_config_patch(
 /// of them are restricted to a task with no active owner: a task selected for
 /// a bulk "add to queue" or an explicit requeue can be `InProgress` or
 /// `AiReview` right now. The lifecycle ends such an owner before its write,
-/// the same contract `update_task_status` has.
+/// the same contract `update_task_status` has. A refusal that is already known
+/// (a Task whose Worker handoff is still `Started`, for example) is returned
+/// without ending that owner, so a request that cannot be written never stops
+/// a running Worker.
 async fn enqueue_durably(
     state: &tauri::State<'_, crate::AppState>,
     task_id: Uuid,

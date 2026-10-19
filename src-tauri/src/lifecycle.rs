@@ -840,6 +840,25 @@ fn queue_entry_check(
     }
 }
 
+/// Why a request that moves `task` into `target` must not be written, when the
+/// move is a queue entry and the refusal needs no approval, or `None`.
+///
+/// Every front door that writes Queue from a status the caller named (the
+/// desktop status move, the CLI move, a board drag, Request Changes) calls
+/// this under the Task's lease, once before any owner is ended and again after
+/// the owner has ended, because ending it can leave a Worker in recovery. The
+/// answer is `Task::queue_entry_refusal`, the same list that
+/// [`enqueue_leased`] and [`enqueue_current`] apply, so no front door has a
+/// private set of queue-entry rules. A move into any other column, or a Task
+/// already in Queue, is not a queue entry and is never refused here.
+pub fn queue_move_refusal(task: &Task, target: &TaskStatus) -> Option<String> {
+    if *target == TaskStatus::Queue && task.status != TaskStatus::Queue {
+        task.queue_entry_refusal()
+    } else {
+        None
+    }
+}
+
 /// Put a Task at the top of Queue provided it is still in `seen_in`, the
 /// column the caller saw it in.
 ///
