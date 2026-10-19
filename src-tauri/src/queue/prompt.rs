@@ -713,6 +713,7 @@ mod tests {
                 number: 20,
                 repo: "org/repo".to_string(),
                 state: Some("OPEN".to_string()),
+                merge_commit: None,
             },
             ExternalRef::GitlabIssue {
                 url: "https://gitlab.com/org/repo/-/issues/30".to_string(),

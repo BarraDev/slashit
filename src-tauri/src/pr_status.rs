@@ -40,7 +40,7 @@ pub const CONCURRENCY: usize = 4;
 pub const FAILING_NAMES_KEPT: usize = 3;
 
 /// The fields one status query asks for.
-const FIELDS: &str = "state,statusCheckRollup,reviewDecision,mergeable";
+const FIELDS: &str = "state,statusCheckRollup,reviewDecision,mergeable,mergeCommit";
 
 /// A pull request, as GitHub identifies it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,6 +70,11 @@ pub struct PrStatus {
     pub review_decision: Option<ReviewDecision>,
     /// `None` when GitHub reported nothing SlashIt recognizes.
     pub mergeable: Option<Mergeability>,
+    /// The full commit GitHub reports as the merge commit, for a merged pull
+    /// request only. It is what a dependent Task's start checks is in its
+    /// base, so it is recorded with the merged state and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,17 +263,27 @@ fn summarize_checks(rollup: Option<&Value>) -> (ChecksState, Vec<String>, u32) {
     (state, failing, count)
 }
 
-/// Read what `gh pr view --json state,statusCheckRollup,reviewDecision,mergeable`
+/// Read what `gh pr view --json state,statusCheckRollup,reviewDecision,mergeable,mergeCommit`
 /// printed.
 pub fn parse_pr_status(json: &Value) -> PrStatus {
     let (checks, failing_checks, failing_check_count) = summarize_checks(json.get("statusCheckRollup"));
+    let state = PrState::from_gh(json.get("state").and_then(Value::as_str).unwrap_or(""));
+    // Only a full object ID is kept: anything else cannot be checked against
+    // a repository, so it is not evidence of anything.
+    let merge_commit = json
+        .get("mergeCommit")
+        .and_then(|c| c.get("oid"))
+        .and_then(Value::as_str)
+        .filter(|oid| state == PrState::Merged && crate::worktree::restack::is_full_object_id(oid))
+        .map(str::to_string);
     PrStatus {
-        state: PrState::from_gh(json.get("state").and_then(Value::as_str).unwrap_or("")),
+        state,
         checks,
         failing_checks,
         failing_check_count,
         review_decision: json.get("reviewDecision").and_then(Value::as_str).and_then(ReviewDecision::from_gh),
         mergeable: json.get("mergeable").and_then(Value::as_str).and_then(Mergeability::from_gh),
+        merge_commit,
     }
 }
 
@@ -724,6 +739,7 @@ mod tests {
                 failing_check_count: 1,
                 review_decision: Some(ReviewDecision::ChangesRequested),
                 mergeable: Some(Mergeability::Conflicting),
+                merge_commit: None,
             }
         );
 
@@ -738,6 +754,33 @@ mod tests {
         assert_eq!(odd.checks, ChecksState::Unknown);
         assert_eq!(odd.review_decision, None);
         assert_eq!(odd.mergeable, None);
+    }
+
+    /// The merge commit is read only from a merged answer, and only when it is
+    /// a full object ID. Anything else is not evidence of a merge.
+    #[test]
+    fn a_merge_commit_is_read_only_from_a_merged_answer_with_a_full_id() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let merged = parse_pr_status(&json!({
+            "state": "MERGED",
+            "mergeCommit": { "oid": commit },
+        }));
+        assert_eq!(merged.merge_commit.as_deref(), Some(commit));
+
+        let open = parse_pr_status(&json!({
+            "state": "OPEN",
+            "mergeCommit": { "oid": commit },
+        }));
+        assert_eq!(open.merge_commit, None, "an open pull request has no merge commit");
+
+        let short = parse_pr_status(&json!({
+            "state": "MERGED",
+            "mergeCommit": { "oid": "0123456" },
+        }));
+        assert_eq!(short.merge_commit, None, "an abbreviated ID cannot be checked");
+
+        let absent = parse_pr_status(&json!({ "state": "MERGED", "mergeCommit": null }));
+        assert_eq!(absent.merge_commit, None);
     }
 
     /// The wire shape the frontend's mirror in `src/models/task.rs` reads.
@@ -755,6 +798,7 @@ mod tests {
                 failing_check_count: 0,
                 review_decision: Some(ReviewDecision::ReviewRequired),
                 mergeable: Some(Mergeability::Mergeable),
+                merge_commit: None,
             }),
             fetched_at: Some(at),
             attempted_at: at,
@@ -793,7 +837,7 @@ mod tests {
     }
 
     fn status(state: PrState, checks: ChecksState) -> PrStatus {
-        PrStatus { state, checks, failing_checks: vec![], failing_check_count: 0, review_decision: None, mergeable: None }
+        PrStatus { state, checks, failing_checks: vec![], failing_check_count: 0, review_decision: None, mergeable: None , merge_commit: None}
     }
 
     #[test]

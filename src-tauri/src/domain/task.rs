@@ -25,6 +25,13 @@ pub enum ExternalRef {
         number: u32,
         repo: String,
         state: Option<String>,
+        /// The full commit GitHub reported as this pull request's merge
+        /// commit, recorded together with a `MERGED` state. It is what a
+        /// dependent Task checks for in its base before it starts. Absent on
+        /// a merged reference recorded before it was kept, which a start
+        /// refuses until the pull request is refreshed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        merge_commit: Option<String>,
     },
     #[serde(rename = "gitlab_issue")]
     GitlabIssue { url: String },

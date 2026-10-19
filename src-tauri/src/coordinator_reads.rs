@@ -718,6 +718,7 @@ mod tests {
             number: 7,
             repo: "o/r".into(),
             state: Some("OPEN".into()),
+            merge_commit: None,
         });
         let plain = task(project, "Plain", TaskStatus::Backlog, 1);
         let (id, plain_id) = (subject.id, plain.id);
@@ -740,6 +741,7 @@ mod tests {
             number: 7,
             repo: "o/r".into(),
             state: None,
+            merge_commit: None,
         });
         let id = subject.id;
         let statuses = no_github();
@@ -752,6 +754,7 @@ mod tests {
                 failing_check_count: 1,
                 review_decision: Some(ReviewDecision::ChangesRequested),
                 mergeable: None,
+                merge_commit: None,
             },
         );
         let result =

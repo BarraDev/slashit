@@ -162,6 +162,7 @@ mod external_ref_tests {
             number: 456,
             repo: "org/repo".to_string(),
             state: Some("open".to_string()),
+            merge_commit: None,
         };
         assert_eq!(r.label(), "PR #456");
     }
@@ -211,6 +212,7 @@ mod external_ref_tests {
             number: 2,
             repo: "org/repo".to_string(),
             state: None,
+            merge_commit: None,
         };
         assert_eq!(r.url(), Some("https://github.com/org/repo/pull/2"));
     }
@@ -249,6 +251,7 @@ mod external_ref_tests {
             number: 10,
             repo: "org/repo".to_string(),
             state: None,
+            merge_commit: None,
         };
         assert!(r.is_pr());
         assert!(!r.is_issue());
@@ -316,6 +319,7 @@ mod external_ref_tests {
             number: 99,
             repo: "org/repo".to_string(),
             state: Some("merged".to_string()),
+            merge_commit: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let deserialized: ExternalRef = serde_json::from_str(&json).unwrap();
@@ -373,6 +377,7 @@ mod external_ref_tests {
             number: 5,
             repo: "a/b".to_string(),
             state: Some("closed".to_string()),
+            merge_commit: None,
         };
         let json: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(json["ref_type"], "github_pr");
@@ -433,6 +438,7 @@ mod external_ref_tests {
             number: 77,
             repo: "org/repo".to_string(),
             state: Some("merged".to_string()),
+            merge_commit: None,
         };
         assert_eq!(r.label(), "PR #77");
         assert!(r.is_pr());
@@ -448,9 +454,43 @@ mod external_ref_tests {
             number: 88,
             repo: "org/repo".to_string(),
             state: None,
+            merge_commit: None,
         };
         let json: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert!(json["state"].is_null());
+    }
+
+    /// A pull request reference written before its merge commit was kept
+    /// still loads, with no commit, and a reference without one writes no key
+    /// for it, so existing task files stay as they were.
+    #[test]
+    fn test_github_pr_merge_commit_is_optional_on_disk() {
+        let legacy = r#"{"ref_type": "github_pr", "url": "https://github.com/org/repo/pull/5", "number": 5, "repo": "org/repo", "state": "MERGED"}"#;
+        let loaded: ExternalRef = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            loaded,
+            ExternalRef::GithubPr {
+                url: "https://github.com/org/repo/pull/5".to_string(),
+                number: 5,
+                repo: "org/repo".to_string(),
+                state: Some("MERGED".to_string()),
+                merge_commit: None,
+            }
+        );
+        let written = serde_json::to_value(&loaded).unwrap();
+        assert!(written.get("merge_commit").is_none());
+
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let with_commit = ExternalRef::GithubPr {
+            url: "https://github.com/org/repo/pull/5".to_string(),
+            number: 5,
+            repo: "org/repo".to_string(),
+            state: Some("MERGED".to_string()),
+            merge_commit: Some(commit.to_string()),
+        };
+        let round_trip: ExternalRef =
+            serde_json::from_str(&serde_json::to_string(&with_commit).unwrap()).unwrap();
+        assert_eq!(round_trip, with_commit);
     }
 
     #[test]

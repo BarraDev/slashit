@@ -88,18 +88,34 @@ record stores its parent and fork point (below).
     base, is stacked on that branch. This includes a Task that is Done with no
     pull request: Done does not prove its work reached the base.
   - One dependency whose recorded branch is gone starts from the base only when
-    its pull request was recorded as merged. Otherwise the start is refused and
-    names the branch.
+    its pull request was recorded as merged and the merge commit recorded with
+    it is in the base. Otherwise the start is refused and names the branch, the
+    pull request, or the commit the base lacks.
   - A dependency that is no longer on the board refuses the start.
   - A Task with several dependencies (legacy records; a new configuration names
     at most one) starts from the base only when every dependency with a
     recorded branch is shown to be integrated into it, or its pull request was
-    recorded as merged and its branch is gone. Otherwise the start is refused
-    and names the first dependency that is not. It is never stacked on one of
-    them. A dependency whose pull request is recorded as merged but whose
-    branch still exists is refused here, although a single dependency in that
-    state is stacked on its branch: the start stays conservative until the
-    branch is deleted or its work is shown in the base.
+    recorded as merged with a merge commit in the base and its branch is gone.
+    Otherwise the start is refused and names the first dependency that is not.
+    It is never stacked on one of them. A dependency whose pull request is
+    recorded as merged but whose branch still exists is refused here, although
+    a single dependency in that state is stacked on its branch: the start stays
+    conservative until the branch is deleted or its work is shown in the base.
+
+  **Merge evidence.** A merge is proven by the merge commit GitHub reports for
+  its pull request, not by the Task's approved tip, because a squash, rebase or
+  merge-commit landing each produce a different commit on the default branch.
+  The commit is recorded on the pull request reference together with the
+  `MERGED` state, when the merge is observed by the background poll or by an
+  explicit refresh of the Task's pull request. A merge recorded any other way,
+  such as linking an existing pull request that is already merged, records no
+  commit. A start validates the commit against the base it resolves, the same
+  base the new branch is created at, and creates the branch at that commit.
+  Nothing is fetched during the start. A merged reference with no recorded
+  commit is refused, and Refresh on the dependency's Task card records the
+  commit. A refresh writes only that commit; it does not finish the Task again.
+  A base that does not contain the commit is refused, and the recovery is to
+  fetch the repository (or update the project's base branch) and start again.
 
   A refusal creates no branch or worktree, and changes no dependency, branch,
   worktree or user branch. The executor then records the refusal as the Task's

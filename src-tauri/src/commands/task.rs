@@ -569,6 +569,7 @@ pub async fn link_pr(
                                     number,
                                     repo,
                                     state: Some("OPEN".to_string()),
+                                    merge_commit: None,
                                 });
                             }
                         }
