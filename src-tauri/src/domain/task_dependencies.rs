@@ -1,10 +1,11 @@
 //! The rules for the Task dependencies a person configures.
 //!
 //! A new configuration names at most one Task. The executor stacks a Task's
-//! branch on the first entry of `Task::dependencies`, and no rule yet says how
-//! several parents combine, so this module refuses a request that would name
+//! branch on a single dependency, and no rule yet says how several parents
+//! combine into one stack, so this module refuses a request that would name
 //! more. A Task that already holds several keeps them: nothing here removes or
-//! replaces them, and a change to such a set is refused.
+//! replaces them, a change to such a set is refused, and the executor starts
+//! such a Task only from a base that holds the work of every one of them.
 //!
 //! Every function here refuses rather than repairs. A malformed identifier is
 //! an error, not something to skip, and a refused request changes nothing.

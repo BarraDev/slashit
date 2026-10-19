@@ -318,7 +318,11 @@ The Task branch and its commits are never deleted, and nothing is pushed.
 
 A Task that depends on a locally integrated Task starts from the Project's base
 when the base holds the approved work, and so receives exactly the approved
-commits; otherwise it is stacked on the dependency's branch as before.
+commits; otherwise it is stacked on the dependency's branch. A dependency whose
+work cannot be shown to be in the base, and whose branch is gone, refuses the
+start rather than letting the Task begin without that work. A Task with several
+dependencies starts only from a base that holds all of them. The rules are in
+[task-checkouts-and-stacks.md](task-checkouts-and-stacks.md#stacked-tasks).
 
 Workspace and Task Checkout are distinct concepts at different levels:
 
