@@ -3695,6 +3695,11 @@ impl TaskExecutor {
             let Some(dependency) = tasks.get(dependency_id) else {
                 continue;
             };
+            // A dependency with no branch has no work the start must hold; the
+            // planner skips it the same way.
+            if dependency.branch_name.is_none() {
+                continue;
+            }
             if let Some(integration) = dependency.local_integration.as_ref() {
                 if matches!(integration.state, crate::domain::IntegrationState::Integrated) {
                     held.push(integration.approved_tip.clone());

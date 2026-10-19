@@ -1036,6 +1036,7 @@ impl WorktreeManager {
             Self::require_branch_holds(repo_path, branch, held).await?;
             return Ok((info, None));
         }
+        Self::require_base_holds(repo_path, &base, held).await?;
         self.create_at_base(repo_path, branch, base).await
     }
 
@@ -1056,6 +1057,7 @@ impl WorktreeManager {
             return Ok((info, None));
         }
         let base = resolve_default_base(repo_path, project_base).await?;
+        Self::require_base_holds(repo_path, &base, held).await?;
         self.create_at_base(repo_path, branch, base).await
     }
 
@@ -1095,6 +1097,36 @@ impl WorktreeManager {
                     return Err(format!(
                         "the checkout of branch {branch} was not adopted, because it could not be \
                          shown to contain {commit}: {e}. Nothing was changed."
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse to create a branch at `base` unless `base` holds every commit in
+    /// `held`. The check is against the base the branch is actually created at,
+    /// so the new branch holds the work its Task's dependencies hold. Nothing is
+    /// created when it refuses.
+    async fn require_base_holds(repo_path: &str, base: &ResolvedBase, held: &[String]) -> Result<(), String> {
+        for commit in held {
+            match super::restack::is_ancestor(Path::new(repo_path), commit, &base.commit).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "the base {} ({}) does not contain {commit}, work the Task's dependencies \
+                         hold, so no branch was created. Nothing was changed. Fetch the \
+                         repository, or update the project's base branch, and start the Task \
+                         again.",
+                        base.commit,
+                        base.describe(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "the base {} could not be shown to contain {commit}, so no branch was \
+                         created: {e}. Nothing was changed.",
+                        base.commit
                     ));
                 }
             }
@@ -7444,6 +7476,33 @@ branch refs/heads/some-other-branch
         );
         assert_eq!(base, None, "an adopted checkout claims no start");
         assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), held_commit);
+    }
+
+    /// A new branch for a Task whose dependency work is not in the base it would
+    /// be created at is refused, and no ref or checkout is created.
+    #[tokio::test]
+    async fn a_new_branch_is_not_created_on_a_base_lacking_the_held_work() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        run_git(repo_path, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(tmp.path().join("other.txt"), "other\n").unwrap();
+        run_git(repo_path, &["add", "other.txt"]);
+        run_git(repo_path, &["commit", "-q", "-m", "other"]);
+        let held_commit = run_git(repo_path, &["rev-parse", "HEAD"]);
+        run_git(repo_path, &["checkout", "-q", "main"]);
+        let refs_before = all_refs(repo_path);
+
+        let mgr = test_manager();
+        let refused = match mgr
+            .create_or_adopt_holding(repo_path, "task-0a1b2c3d", None, std::slice::from_ref(&held_commit))
+            .await
+        {
+            Err(refused) => refused,
+            Ok(_) => panic!("a branch was created on a base lacking the held work"),
+        };
+
+        assert!(refused.contains(&held_commit), "{refused}");
+        assert_eq!(all_refs(repo_path), refs_before);
     }
 
     /// A checkout exactly as its creation left it is taken back whole: the
