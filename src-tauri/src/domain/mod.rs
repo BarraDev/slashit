@@ -2,6 +2,7 @@ pub mod repository;
 pub mod project;
 pub mod workspace;
 pub mod task;
+pub mod task_dependencies;
 pub mod conversation;
 pub mod agent;
 pub mod session;

@@ -11,6 +11,7 @@ pub mod task_card;
 pub mod pr_status;
 pub mod restack_published;
 pub mod task_activity;
+pub mod task_dependency;
 pub mod task_drawer;
 pub mod task_live;
 pub mod task_review;

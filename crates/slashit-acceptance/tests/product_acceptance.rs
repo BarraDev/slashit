@@ -76,6 +76,8 @@ mod stacked_tasks;
 mod storage;
 #[path = "product_acceptance/task_runs.rs"]
 mod task_runs;
+#[path = "product_acceptance/task_dependencies.rs"]
+mod task_dependencies;
 #[path = "product_acceptance/worker_recovery.rs"]
 mod worker_recovery;
 

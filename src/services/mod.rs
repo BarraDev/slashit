@@ -32,7 +32,7 @@ pub use opener_service::{is_safe_link_destination, open_url_external, route_exte
 pub use repository_service::{list_repositories, pick_folder, check_is_git_repo};
 pub use repository_setup_service::create_repository;
 pub use project_service::{create_project, list_projects, get_project, get_project_path, attach_project_to_workspace, detach_project_from_workspace};
-pub use task_service::{create_task, list_tasks, update_task_status, reorder_task, delete_task, toggle_subtask, update_task};
+pub use task_service::{create_task, list_tasks, update_task_status, reorder_task, delete_task, toggle_subtask, update_task, set_task_dependencies};
 pub use agent_service::*;
 pub use jj_service::*;
 pub use queue_service::*;

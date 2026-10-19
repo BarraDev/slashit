@@ -590,6 +590,20 @@ pub async fn create(
     project_id: Uuid,
     build: impl FnOnce(&HashMap<Uuid, Task>) -> Task,
 ) -> Result<Task, String> {
+    create_checked(gate, tasks, projects, storage, project_id, |existing| Ok(build(existing))).await
+}
+
+/// [`create`] for a Task whose content must be checked against the Project's
+/// Tasks under the same write. `build` sees exactly the Tasks `create` would
+/// stage, and a refusal from it writes nothing.
+pub async fn create_checked(
+    gate: &ProjectLifecycleGate,
+    tasks: &Tasks,
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    storage: &Storage,
+    project_id: Uuid,
+    build: impl FnOnce(&HashMap<Uuid, Task>) -> Result<Task, String>,
+) -> Result<Task, String> {
     // The deletion barrier is held before anything is read: if a deletion is
     // underway, this creation waits for it to settle and is then refused by
     // the existence check below -- the Project went away while this creation
@@ -614,7 +628,7 @@ pub async fn create(
     }
 
     let mut staged = stage_project(&tasks_w, project_id);
-    let task = build(&staged);
+    let task = build(&staged)?;
     staged.insert(task.id, task.clone());
     publish(&mut tasks_w, storage, project_id, staged)
         .map_err(|e| creation_consequence(&e, "task"))?;

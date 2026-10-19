@@ -754,6 +754,38 @@ impl Task {
             .or_else(|| self.integration_unfinished_refusal())
     }
 
+    /// Why this Task's dependencies may not change in its current state, or
+    /// `None`.
+    ///
+    /// The dependency chooses the base of the Task's branch when the branch is
+    /// created, and a run reads it when the run starts. Once a checkout exists,
+    /// an approved run is bound to this Task, or work is unfinished, the base
+    /// on record must not be contradicted. So a change is allowed only while
+    /// the Task is in Backlog or Queue with none of those. Clearing a
+    /// dependency is subject to the same rule.
+    pub fn dependency_change_refusal(&self) -> Option<String> {
+        if !matches!(self.status, TaskStatus::Backlog | TaskStatus::Queue) {
+            return Some(format!(
+                "A dependency can be changed only while the Task is in Backlog or Queue, and this \
+                 Task is in {}; nothing was changed",
+                crate::domain::task_dependencies::column_name(&self.status)
+            ));
+        }
+        if self.branch_name.is_some() || self.worktree_path.is_some() {
+            return Some(
+                "This Task already has a checkout, so its dependency cannot change; nothing was changed"
+                    .to_string(),
+            );
+        }
+        if self.approved_execution.is_some() {
+            return Some(
+                "This Task holds an approved run, so its dependency cannot change; nothing was changed"
+                    .to_string(),
+            );
+        }
+        self.queue_entry_refusal()
+    }
+
     /// Return the task to a state work can start from again, keeping the work
     /// it has already produced.
     ///

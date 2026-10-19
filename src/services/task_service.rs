@@ -5,6 +5,18 @@ use wasm_bindgen::prelude::*;
 extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"])]
     async fn invoke(cmd: &str, args: JsValue) -> JsValue;
+
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke)]
+    fn raw_invoke(cmd: &str, args: JsValue) -> js_sys::Promise;
+}
+
+/// `invoke` for a command whose refusal the person must read. The backend's
+/// message arrives as the rejection, and it is returned as the error instead of
+/// ending the call.
+async fn invoke_reporting(cmd: &str, args: JsValue) -> Result<JsValue, String> {
+    wasm_bindgen_futures::JsFuture::from(raw_invoke(cmd, args))
+        .await
+        .map_err(|e| e.as_string().unwrap_or_else(|| format!("{cmd} was refused")))
 }
 
 pub struct CreateTaskParams {
@@ -38,7 +50,7 @@ pub async fn create_task(params: CreateTaskParams) -> Result<Task, String> {
         }
     })).unwrap();
 
-    let response = invoke("create_task", args).await;
+    let response = invoke_reporting("create_task", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
@@ -97,7 +109,19 @@ pub async fn update_task(params: UpdateTaskParams) -> Result<Option<Task>, Strin
         }
     })).unwrap();
 
-    let response = invoke("update_task", args).await;
+    let response = invoke_reporting("update_task", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// Replace a Task's dependencies. The backend validates the whole set and
+/// refuses a request it cannot write, so a refusal leaves the Task unchanged.
+pub async fn set_task_dependencies(task_id: String, dependencies: Vec<String>) -> Result<Option<Task>, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "taskId": task_id,
+        "dependencies": dependencies,
+    })).unwrap();
+
+    let response = invoke_reporting("set_task_dependencies", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
