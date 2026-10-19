@@ -4359,21 +4359,23 @@ impl TaskExecutor {
         {
             Ok(evidence) => evidence,
             Err(error) => {
-                self.worktree_manager
+                let cleanup = self
+                    .worktree_manager
                     .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
                     .await;
                 return Err(RunStartError::Refused(format!(
-                    "Git could not recheck the Task Checkout immediately before run start ({error}); nothing was recorded or launched."
+                    "Git could not recheck the Task Checkout immediately before run start ({error}); nothing was recorded or launched. {cleanup}."
                 )));
             }
         };
         if boundary_branch != branch || boundary_head != start_head {
-            self.worktree_manager
+            let cleanup = self
+                .worktree_manager
                 .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
                 .await;
-            return Err(RunStartError::Refused(
-                "The Task Checkout branch or HEAD changed after the execution checkout was captured; nothing was recorded or launched. The checkout and branch were preserved for review.".into(),
-            ));
+            return Err(RunStartError::Refused(format!(
+                "The Task Checkout branch or HEAD changed after the execution checkout was captured; nothing was recorded or launched. {cleanup}."
+            )));
         }
         if let Some(admission) = acquired.checkout_admission.as_ref() {
             let admitted = match admission_commit_is_ancestor(
@@ -4385,21 +4387,23 @@ impl TaskExecutor {
             {
                 Ok(admitted) => admitted,
                 Err(error) => {
-                    self.worktree_manager
+                    let cleanup = self
+                        .worktree_manager
                         .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
                         .await;
                     return Err(RunStartError::Refused(format!(
-                        "Git could not verify checkout admission immediately before run start ({error}); nothing was recorded or launched."
+                        "Git could not verify checkout admission immediately before run start ({error}); nothing was recorded or launched. {cleanup}."
                     )));
                 }
             };
             if !admitted {
-                self.worktree_manager
+                let cleanup = self
+                    .worktree_manager
                     .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
                     .await;
-                return Err(RunStartError::Refused(
-                    "The captured Task Checkout HEAD no longer contains its admitted dependency commit; nothing was recorded or launched.".into(),
-                ));
+                return Err(RunStartError::Refused(format!(
+                    "The captured Task Checkout HEAD no longer contains its admitted dependency commit; nothing was recorded or launched. {cleanup}."
+                )));
             }
         }
         match crate::lifecycle::record_typed(&self.tasks, &self.storage, task_id, &amend).await {
@@ -14841,6 +14845,10 @@ mod tests {
                 .to_string()
                 .contains("captured Task Checkout HEAD no longer contains"),
             "{refusal}"
+        );
+        assert!(
+            refusal.to_string().contains("were kept:"),
+            "the refusal reports the created checkout cleanup outcome: {refusal}"
         );
         assert_eq!(
             git_in(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
