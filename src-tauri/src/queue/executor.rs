@@ -3122,25 +3122,54 @@ impl TaskExecutor {
         // Check dependencies for stacked branching (only for new branches).
         // Stack when the dependency has a branch that hasn't been merged to main yet.
         // If merged, base on main normally (the code is already there).
-        let dependency = if existing_branch.is_none() {
-            let tasks_r = self.tasks.read().await;
-            tasks_r
+        //
+        // A branch is stacked on one parent. A Task that names several (a
+        // legacy record; a new configuration names at most one) has to be
+        // started from a base that already holds every one of their work, or
+        // not at all: stacking on the first and starting the rest without it
+        // would omit the others' work silently.
+        let dependency_ids = if existing_branch.is_none() {
+            self.tasks
+                .read()
+                .await
                 .get(&task_id)
-                .and_then(|t| t.dependencies.first())
-                .and_then(|dep_id| tasks_r.get(dep_id))
-                .and_then(|dep_task| {
-                    // Dependency must have a branch
-                    let branch = dep_task.branch_name.clone()?;
-                    let is_done = dep_task.status == TaskStatus::Done;
-                    Some((
+                .map(|t| t.dependencies.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if dependency_ids.len() > 1 {
+            if let Err(refused) = self
+                .dependencies_are_in_the_base(task_id, &dependency_ids, repo_path)
+                .await
+            {
+                return (existing_branch, Err(refused));
+            }
+        }
+        let dependency = match dependency_ids.as_slice() {
+            [dependency_id] => {
+                let tasks_r = self.tasks.read().await;
+                let Some(dep_task) = tasks_r.get(dependency_id) else {
+                    return (
+                        existing_branch,
+                        Err(format!(
+                            "it depends on Task {dependency_id}, which is no longer on this \
+                             board, so nothing shows that its work reached the base; restore \
+                             that Task, or move this Task back to Queue and clear its \
+                             dependency, before starting it"
+                        )),
+                    );
+                };
+                // Dependency must have a branch
+                dep_task.branch_name.clone().map(|branch| {
+                    (
                         branch,
-                        is_done,
                         RecordedPr::of(dep_task),
                         dep_task.completed_locally(),
-                    ))
+                    )
                 })
-        } else {
-            None
+            }
+            _ => None,
         };
         // A dependency completed locally whose approved work SlashIt has
         // integrated into the project's base: that work is in the base, so
@@ -3153,7 +3182,7 @@ impl TaskExecutor {
         // stack around it.
         let dependency = match dependency {
             Some(_) => match self
-                .dependency_work_is_in_the_base(task_id, repo_path)
+                .dependency_work_is_in_the_base(task_id, dependency_ids[0], repo_path)
                 .await
             {
                 Ok(true) => None,
@@ -3164,22 +3193,25 @@ impl TaskExecutor {
         };
         let base_branch = match dependency {
             None => None,
-            // Done with no pull request: its work reached main without one.
-            // Not a task completed locally: that one is Done with its branch
-            // kept precisely because nothing merged it, so Done proves
-            // nothing about main. It stacks like any unmerged dependency, and
-            // is refused when its branch is gone, because nothing says its
-            // work is anywhere else.
-            Some((_, true, RecordedPr::None, false)) => None,
-            Some((branch, _, RecordedPr::None, true))
+            // Done with no pull request is not proof that the work reached
+            // main: a branch the dependency still holds is work nothing has
+            // placed in the base, so the task stacks on it like any unmerged
+            // dependency. Only a branch that is gone is refused below, and
+            // only when nothing else (a merged pull request) says where its
+            // work went.
+            Some((branch, RecordedPr::None, completed))
                 if WorktreeManager::local_branch_exists(repo_path, &branch).await == Ok(false) =>
             {
+                let why = if completed {
+                    "was completed locally and was never merged"
+                } else {
+                    "was never merged by SlashIt"
+                };
                 return (
                     existing_branch,
                     Err(format!(
-                        "it depends on the work on branch {branch}, which was completed locally \
-                         and was never merged, and that branch no longer exists; restore the \
-                         branch, or merge that work, before starting this task"
+                        "it depends on the work on branch {branch}, which {why}, and that \
+                         branch no longer exists; restore the branch before starting this task"
                     )),
                 );
             }
@@ -3192,7 +3224,7 @@ impl TaskExecutor {
             // was queued to build on. Only a definite answer from git
             // counts. An invalid name, or a git that could not be asked,
             // still goes to the stacked path, which refuses it and says why.
-            Some((branch, _, recorded, _))
+            Some((branch, recorded, _))
                 if recorded != RecordedPr::None
                     && WorktreeManager::local_branch_exists(repo_path, &branch).await
                         == Ok(false) =>
@@ -3201,14 +3233,14 @@ impl TaskExecutor {
                     let why = if recorded == RecordedPr::ClosedUnmerged {
                         "was closed without being merged, so that work was never delivered"
                     } else {
-                        "is not recorded as merged; move the dependency to PR Created so \
-                         SlashIt can record its merge, or restore the branch"
+                        "is not recorded as merged"
                     };
                     return (
                         existing_branch,
                         Err(format!(
                             "it depends on the work on branch {branch}, which no longer exists \
-                             locally, and the dependency's pull request {why}"
+                             locally, and the dependency's pull request {why}; restore the \
+                             branch before starting this task"
                         )),
                     );
                 }
@@ -3393,9 +3425,72 @@ impl TaskExecutor {
         })
     }
 
-    /// Whether `task_id`'s first dependency was completed locally, has its
-    /// currently approved work integrated into a local branch, and the base a
-    /// new task would start from holds that work.
+    /// Whether every one of `dependency_ids`, the dependencies of `task_id`,
+    /// is proven to be in the base a new task would start from.
+    ///
+    /// A dependency with no branch recorded has no work SlashIt made, so it
+    /// needs nothing. Any other must pass
+    /// [`Self::dependency_work_is_in_the_base`]. A Task that is not on the
+    /// board, or whose work is not proven there, refuses the start and says
+    /// which one it was.
+    async fn dependencies_are_in_the_base(
+        &self,
+        task_id: Uuid,
+        dependency_ids: &[Uuid],
+        repo_path: &str,
+    ) -> Result<(), String> {
+        for dependency_id in dependency_ids {
+            let (branch, recorded) = {
+                let tasks = self.tasks.read().await;
+                match tasks.get(dependency_id) {
+                    Some(dependency) => {
+                        (dependency.branch_name.clone(), RecordedPr::of(dependency))
+                    }
+                    None => {
+                        return Err(format!(
+                            "it depends on several Tasks, and Task {dependency_id} is no longer \
+                             on this board, so its work cannot be shown to be in the base; \
+                             nothing was started"
+                        ));
+                    }
+                }
+            };
+            let Some(branch) = branch else {
+                continue;
+            };
+            // The same delivery rule the single dependency uses: a pull request
+            // recorded as merged, whose branch is gone, is delivered.
+            if recorded == RecordedPr::Merged
+                && WorktreeManager::local_branch_exists(repo_path, &branch).await == Ok(false)
+            {
+                continue;
+            }
+            if !self
+                .dependency_work_is_in_the_base(task_id, *dependency_id, repo_path)
+                .await?
+            {
+                // Local integration refuses a Task with a pull request, so only
+                // a Task with none can be integrated from here.
+                let advice = if recorded == RecordedPr::None {
+                    "Integrate that Task's approved work into the base, which needs its Human \
+                     Review approved, then start this Task again"
+                } else {
+                    "That Task is delivered through its pull request, which SlashIt does not \
+                     integrate locally, so this start stays refused"
+                };
+                return Err(format!(
+                    "it depends on several Tasks, and the work on branch {branch} is not \
+                     shown to be in the base, so the start would omit it; nothing was started. \
+                     {advice}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `dependency_id` was completed locally, has its currently
+    /// approved work integrated into a local branch, and the base a new task
+    /// of `task_id`'s project would start from holds that work.
     ///
     /// `Ok(false)` means the base resolved and does not hold the work (or the
     /// dependency was not integrated locally): stacking may be appropriate.
@@ -3405,15 +3500,12 @@ impl TaskExecutor {
     async fn dependency_work_is_in_the_base(
         &self,
         task_id: Uuid,
+        dependency_id: Uuid,
         repo_path: &str,
     ) -> Result<bool, String> {
         let approved = {
             let tasks = self.tasks.read().await;
-            let Some(dependency) = tasks
-                .get(&task_id)
-                .and_then(|t| t.dependencies.first())
-                .and_then(|id| tasks.get(id))
-            else {
+            let Some(dependency) = tasks.get(&dependency_id) else {
                 return Ok(false);
             };
             let integrated = dependency
@@ -11477,6 +11569,42 @@ mod tests {
             .count()
     }
 
+    /// A start refused before anything was attached, through the same path a
+    /// person's start takes: the Task is in Error with `reason`, keeps no
+    /// branch, worktree or base, holds no provider lease, starts no agent,
+    /// and the repository's refs and worktrees are as they were.
+    async fn assert_refused_before_attach(
+        executor: &TaskExecutor,
+        repo: &std::path::Path,
+        task_id: Uuid,
+        refs_before: &str,
+        reason: &str,
+    ) {
+        assert!(
+            executor.running_handles.read().await.is_empty(),
+            "no agent may start for a refused task"
+        );
+        assert_eq!(refs_of(repo), refs_before);
+        assert_eq!(worktree_count(repo), 1);
+        assert!(!executor.provider_lease_path(task_id).exists());
+        assert!(
+            executor.lifecycle.try_acquire(task_id).await.is_some(),
+            "the lifecycle lease is released after a refusal"
+        );
+        let task = executor.tasks.read().await[&task_id].clone();
+        assert_eq!(task.status, TaskStatus::Error);
+        assert_eq!(task.branch_name, None);
+        assert_eq!(task.worktree_path, None);
+        assert_eq!(task.base_commit, None);
+        assert!(
+            task.error_message
+                .as_deref()
+                .is_some_and(|m| m.contains(reason)),
+            "the reason has to name {reason}: {:?}",
+            task.error_message
+        );
+    }
+
     /// A task stacked on a dependency whose branch cannot be stacked on is
     /// not started from the default base instead.
     ///
@@ -11915,6 +12043,10 @@ mod tests {
             refused.contains("task-local01") && refused.contains("completed locally"),
             "the reason has to name the branch and why: {refused}"
         );
+        assert!(
+            refused.contains("restore the branch") && !refused.contains("merge that work"),
+            "the reason has to name the recovery that works, and no other: {refused}"
+        );
         assert_eq!(
             refs_of(&repo),
             refs_before,
@@ -11923,16 +12055,82 @@ mod tests {
         assert_eq!(worktree_count(&repo), 1);
     }
 
-    /// The same Done task with no pull request and no local completion is
-    /// still taken as delivered to `main`, branch or not.
+    /// The recovery the refusal names works: with the branch restored at the
+    /// commit it had, the start stacks on it and receives the dependency's
+    /// work, as it would have before the branch went missing.
     #[tokio::test]
-    async fn a_done_dependency_without_a_pull_request_or_local_completion_starts_from_the_default_base()
-     {
+    async fn restoring_the_branch_of_a_dependency_completed_locally_unblocks_the_start() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-local01").await;
+        let tip =
+            complete_dependency_locally(&executor, &repo, dependency_id, "task-local01").await;
+        git_in(&repo, &["branch", "-D", "task-local01"]);
+        let (_, refused) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        assert!(refused.is_err(), "the start is refused while the branch is gone");
+
+        git_in(&repo, &["branch", "task-local01", tip.as_str()]);
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let Acquired {
+            origin,
+            base_commit,
+            ..
+        } = acquired.expect("the restored branch is the stack parent");
+        assert_eq!(
+            origin,
+            Some(BranchOrigin::Stacked {
+                parent_branch: "task-local01".to_string()
+            })
+        );
+        assert_eq!(base_commit, Some(tip));
+    }
+
+    /// A Done dependency with no pull request and no local completion is not
+    /// taken as delivered to `main` on its status alone. Its branch is
+    /// recorded and gone, and nothing else says where its work went, so the
+    /// start is refused and nothing is created.
+    #[tokio::test]
+    async fn a_done_dependency_without_a_pull_request_whose_branch_is_gone_refuses_the_start() {
         let (executor, temps) = test_executor();
         let (repo, task_id, _) =
             stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-deadbeef").await;
         publish_default_base(&repo);
-        let main_tip = git_in(&repo, &["rev-parse", "main"]);
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("a start on a base that may omit the dependency's work is refused");
+
+        assert!(refused.contains("task-deadbeef"), "{refused}");
+        assert_refused_before_attach(&executor, &repo, task_id, &refs_before, "task-deadbeef")
+            .await;
+    }
+
+    /// Commit `file` on a new `branch` off `main`, then return to `main`. The
+    /// commit is not recorded as completed, approved or integrated anywhere.
+    fn commit_unmerged_work(repo: &std::path::Path, branch: &str, file: &str) {
+        git_in(repo, &["checkout", "-q", "-b", branch, "main"]);
+        std::fs::write(repo.join(file), "unmerged work\n").unwrap();
+        git_in(repo, &["add", file]);
+        git_in(repo, &["commit", "-q", "-m", "unmerged work"]);
+        git_in(repo, &["checkout", "-q", "main"]);
+    }
+
+    /// A Done dependency with no pull request and no local completion still
+    /// holds its branch, and that branch has work `main` does not. The
+    /// dependent stacks on that branch rather than starting without the work.
+    #[tokio::test]
+    async fn a_done_dependency_without_a_pull_request_is_stacked_on_its_branch() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-done01").await;
+        commit_unmerged_work(&repo, "task-done01", "dependency.txt");
+        publish_default_base(&repo);
 
         let (_, acquired) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
@@ -11941,15 +12139,235 @@ mod tests {
         let Acquired {
             info,
             what_happened,
-            origin,
+            ..
+        } = acquired.expect("a worktree");
+        assert_eq!(what_happened, "Created stacked worktree");
+        let worktree = std::path::Path::new(&info.path);
+        assert!(worktree.join("dependency.txt").exists());
+    }
+
+    /// Replace the dependencies `task_id` records, as a legacy record holds
+    /// them, without any other change to the Task.
+    async fn set_recorded_dependencies(executor: &TaskExecutor, task_id: Uuid, ids: Vec<Uuid>) {
+        let mut tasks = executor.tasks.write().await;
+        tasks.get_mut(&task_id).unwrap().dependencies = ids;
+    }
+
+    /// Mark `dependency_id` completed locally and integrated into `main`,
+    /// with exactly the commit `branch` holds now as the approved work. The
+    /// caller merges `branch` into `main` before the base is read.
+    async fn integrate_dependency_locally(
+        executor: &TaskExecutor,
+        repo: &std::path::Path,
+        dependency_id: Uuid,
+        branch: &str,
+    ) {
+        let tip = git_in(repo, &["rev-parse", branch]);
+        let mut tasks = executor.tasks.write().await;
+        let dependency = tasks.get_mut(&dependency_id).unwrap();
+        dependency.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+        dependency.human_review.record_arrival();
+        dependency
+            .human_review
+            .approve(Some(tip.clone()), chrono::Utc::now());
+        dependency.local_integration = Some(crate::domain::LocalIntegration {
+            state: crate::domain::IntegrationState::Integrated,
+            target_branch: "main".to_string(),
+            target_old_oid: git_in(repo, &["rev-parse", "main"]),
+            approved_tip: tip.clone(),
+            result_oid: tip,
+            strategy: crate::domain::IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            completes_task: false,
+        });
+    }
+
+    /// Two dependencies, each integrated into the base: the base holds both
+    /// works, so the task starts from it with both of them.
+    #[tokio::test]
+    async fn two_integrated_dependencies_start_from_a_base_that_holds_both() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, first_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-first02").await;
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let mut second = create_test_task_full("second", project_id, TaskStatus::Done, 0);
+        second.branch_name = Some("task-second02".to_string());
+        let second_id = second.id;
+        executor.tasks.write().await.insert(second_id, second);
+        commit_unmerged_work(&repo, "task-first02", "first.txt");
+        commit_unmerged_work(&repo, "task-second02", "second.txt");
+        git_in(&repo, &["merge", "-q", "--no-edit", "task-first02"]);
+        git_in(&repo, &["merge", "-q", "--no-edit", "task-second02"]);
+        publish_default_base(&repo);
+        integrate_dependency_locally(&executor, &repo, first_id, "task-first02").await;
+        integrate_dependency_locally(&executor, &repo, second_id, "task-second02").await;
+        set_recorded_dependencies(&executor, task_id, vec![first_id, second_id]).await;
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        let Acquired {
+            info,
+            what_happened,
             ..
         } = acquired.expect("an ordinary worktree");
         assert_eq!(what_happened, "Created worktree");
+        let worktree = std::path::Path::new(&info.path);
+        assert!(worktree.join("first.txt").exists());
+        assert!(worktree.join("second.txt").exists());
+    }
+
+    /// One dependency integrated into the base and one whose work is not:
+    /// the second's work would be omitted, so the start is refused.
+    #[tokio::test]
+    async fn one_unintegrated_dependency_among_several_refuses_the_start() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, first_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-first03").await;
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let mut second = create_test_task_full("second", project_id, TaskStatus::Done, 0);
+        second.branch_name = Some("task-second03".to_string());
+        let second_id = second.id;
+        executor.tasks.write().await.insert(second_id, second);
+        commit_unmerged_work(&repo, "task-first03", "first.txt");
+        commit_unmerged_work(&repo, "task-second03", "second.txt");
+        git_in(&repo, &["merge", "-q", "--no-edit", "task-first03"]);
+        publish_default_base(&repo);
+        integrate_dependency_locally(&executor, &repo, first_id, "task-first03").await;
+        set_recorded_dependencies(&executor, task_id, vec![first_id, second_id]).await;
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("a start that would omit the second dependency's work is refused");
+
+        assert!(refused.contains("task-second03"), "{refused}");
+        assert_refused_before_attach(&executor, &repo, task_id, &refs_before, "task-second03")
+            .await;
         assert_eq!(
-            git_in(std::path::Path::new(&info.path), &["rev-parse", "HEAD"]),
-            main_tip
+            executor.tasks.read().await[&task_id].dependencies,
+            vec![first_id, second_id]
         );
-        assert_eq!(origin, Some(on_main()));
+    }
+
+    /// Two dependencies: one integrated into the base, and one whose pull
+    /// request was recorded as merged while its branch is gone. A single
+    /// dependency in that state starts from the base, so the same delivery
+    /// rule holds among several.
+    #[tokio::test]
+    async fn a_merged_pull_request_among_several_dependencies_counts_as_delivered() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, first_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-first04").await;
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let mut second = create_test_task_full("second", project_id, TaskStatus::Done, 0);
+        second.branch_name = Some("task-gone04".to_string());
+        second
+            .external_refs
+            .push(crate::domain::task::ExternalRef::GithubPr {
+                url: "https://github.com/test-org/test-repo/pull/8".to_string(),
+                number: 8,
+                repo: "test-org/test-repo".to_string(),
+                state: Some("MERGED".to_string()),
+            });
+        let second_id = second.id;
+        executor.tasks.write().await.insert(second_id, second);
+        commit_unmerged_work(&repo, "task-first04", "first.txt");
+        git_in(&repo, &["merge", "-q", "--no-edit", "task-first04"]);
+        publish_default_base(&repo);
+        integrate_dependency_locally(&executor, &repo, first_id, "task-first04").await;
+        set_recorded_dependencies(&executor, task_id, vec![first_id, second_id]).await;
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        let Acquired {
+            info,
+            what_happened,
+            ..
+        } = acquired.expect("an ordinary worktree");
+        assert_eq!(what_happened, "Created worktree");
+        assert!(std::path::Path::new(&info.path).join("first.txt").exists());
+    }
+
+    /// A dependency that is no longer on the board cannot show that its work
+    /// reached the base, so the start is refused. The Task is in Error with
+    /// the reason, keeps the dependency it records, and has no checkout.
+    #[tokio::test]
+    async fn a_missing_dependency_refuses_the_start_and_keeps_the_task() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-gone01").await;
+        publish_default_base(&repo);
+        let missing = Uuid::new_v4();
+        set_recorded_dependencies(&executor, task_id, vec![missing]).await;
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("a start with no record of the dependency's work is refused");
+
+        assert!(refused.contains(&missing.to_string()), "{refused}");
+        assert_refused_before_attach(
+            &executor,
+            &repo,
+            task_id,
+            &refs_before,
+            &missing.to_string(),
+        )
+        .await;
+        assert_eq!(
+            executor.tasks.read().await[&task_id].dependencies,
+            vec![missing]
+        );
+    }
+
+    /// Two dependencies with unmerged work are refused, and the refusal
+    /// names the first one that is not in the base. The Task keeps both
+    /// recorded dependencies.
+    #[tokio::test]
+    async fn two_unmerged_dependencies_refuse_the_start_instead_of_stacking_on_the_first() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, first_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-first01").await;
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let mut second = create_test_task_full("second", project_id, TaskStatus::Done, 0);
+        second.branch_name = Some("task-second01".to_string());
+        let second_id = second.id;
+        executor.tasks.write().await.insert(second_id, second);
+        commit_unmerged_work(&repo, "task-first01", "first.txt");
+        commit_unmerged_work(&repo, "task-second01", "second.txt");
+        publish_default_base(&repo);
+        for id in [first_id, second_id] {
+            executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&id)
+                .unwrap()
+                .record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+        }
+        set_recorded_dependencies(&executor, task_id, vec![first_id, second_id]).await;
+
+        let refs_before = refs_of(&repo);
+
+        let refused = executor
+            .spawn_task_execution(task_id, None)
+            .await
+            .expect_err("a start that would omit a prerequisite is refused");
+
+        assert!(refused.contains("task-first01"), "{refused}");
+        assert_refused_before_attach(&executor, &repo, task_id, &refs_before, "task-first01").await;
+        assert_eq!(
+            executor.tasks.read().await[&task_id].dependencies,
+            vec![first_id, second_id]
+        );
     }
 
     /// A retry that picks up the branch an earlier attempt left, with the

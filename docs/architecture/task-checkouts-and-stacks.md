@@ -76,6 +76,35 @@ record stores its parent and fork point (below).
   branch of the Task's name left by an unfinished attempt is reattached only
   while it still contains the dependency's tip; otherwise it is refused and
   left alone.
+- **Which base a new branch starts from.** The executor reads the Task's
+  dependencies when it creates the branch; a Task with an existing branch is
+  reattached and reads none. The first matching rule decides:
+  - One dependency with no branch recorded has no work SlashIt made, and the
+    branch starts from the default base.
+  - One dependency whose approved work was integrated locally, and whose
+    approved tip is an ancestor of the base, starts from the base, so it
+    receives exactly the approved commits.
+  - One dependency that still has a branch, and is not shown to be in the
+    base, is stacked on that branch. This includes a Task that is Done with no
+    pull request: Done does not prove its work reached the base.
+  - One dependency whose recorded branch is gone starts from the base only when
+    its pull request was recorded as merged. Otherwise the start is refused and
+    names the branch.
+  - A dependency that is no longer on the board refuses the start.
+  - A Task with several dependencies (legacy records; a new configuration names
+    at most one) starts from the base only when every dependency with a
+    recorded branch is shown to be integrated into it, or its pull request was
+    recorded as merged and its branch is gone. Otherwise the start is refused
+    and names the first dependency that is not. It is never stacked on one of
+    them. A dependency whose pull request is recorded as merged but whose
+    branch still exists is refused here, although a single dependency in that
+    state is stacked on its branch: the start stays conservative until the
+    branch is deleted or its work is shown in the base.
+
+  A refusal creates no branch or worktree, and changes no dependency, branch,
+  worktree or user branch. The executor then records the refusal as the Task's
+  error, status Error, as it does for any start that cannot attach a worktree,
+  so the Task is not retried silently.
 - **Persisted semantics.** Two fields on the Task hold the stack, written
   when the branch is created and not inferred later from the dependency list
   or the branch's tip:
