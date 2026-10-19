@@ -294,6 +294,15 @@ pub fn TaskEditModal(
                                     }).collect::<Vec<_>>()
                                 }}
                             </select>
+                            {move || match mode.get() {
+                                TaskEditMode::Edit(task) => task.last_observed_model.map(|observed| view! {
+                                    <p class="mt-1.5 text-xs text-white/50">
+                                        "Last reported by the provider: " {observed}
+                                        ". This is evidence from the last run and does not change the model setting."
+                                    </p>
+                                }),
+                                TaskEditMode::Create => None,
+                            }}
                         </div>
 
                         // Planning mode toggle

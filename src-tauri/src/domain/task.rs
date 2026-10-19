@@ -76,7 +76,16 @@ pub struct Task {
     pub title: String,
     pub description: Option<String>,
     pub status: TaskStatus,
+    /// The configured model policy: a model identifier, or an empty or
+    /// `"default"` value for provider default. Only a person's explicit
+    /// configuration changes it. A run's report never does.
     pub model: String,
+    /// The model the provider most recently reported for one of this Task's
+    /// runs. It is evidence of what ran, never configuration: approvals,
+    /// proposals and launches read `model` only. `None` until a run reports a
+    /// model, and for every record written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observed_model: Option<String>,
     pub planning_mode: bool,
     pub dependencies: Vec<Uuid>,
     /// Per-task git worktree. Renamed from `workspace_id`. Without the alias
@@ -761,6 +770,7 @@ impl Task {
             description: new.description,
             status: TaskStatus::Backlog,
             model: new.model,
+            last_observed_model: None,
             planning_mode: new.planning_mode,
             dependencies: new.dependencies,
             worktree_id: None,
@@ -2154,6 +2164,25 @@ mod tests {
             serde_json::from_value(old_json).expect("old JSON/IPC Task remains compatible");
         assert!(from_json.worker_handoff.is_none());
         assert!(!from_json.worker_handoff_confirmed);
+    }
+
+    /// A record written before `last_observed_model` existed loads with no
+    /// observation, and its configured model is kept exactly as stored: nothing
+    /// is inferred about what it was configured to before.
+    #[test]
+    fn old_task_records_load_without_an_observed_model_and_keep_their_configured_model() {
+        let task: Task = toml::from_str(LEGACY_TASK_TOML).expect("old Task TOML remains compatible");
+        assert_eq!(task.model, "test-model");
+        assert_eq!(task.last_observed_model, None);
+
+        let json = serde_json::to_value(&task).expect("serialize the Task");
+        assert!(
+            json.get("last_observed_model").is_none(),
+            "an absent observation is not written"
+        );
+        let reloaded: Task = serde_json::from_value(json).expect("reload the Task");
+        assert_eq!(reloaded.model, "test-model");
+        assert_eq!(reloaded.last_observed_model, None);
     }
 
     fn recovered_task_with_decision(run: u32) -> (Task, NewAttemptDecision) {

@@ -2408,11 +2408,18 @@ async fn fail_then_retry(
 
     // The same settled state the success journey derives, reached the second
     // time round.
-    let reported_model = settled.get("model").and_then(Value::as_str);
-    if reported_model != Some(REPORTED_MODEL) {
+    let configured_model = settled.get("model").and_then(Value::as_str);
+    if configured_model != Some("default") {
         bail!(
-            "the task does not carry the model the agent reported: expected {REPORTED_MODEL:?}, \
-             found {reported_model:?} — the runner did not parse the retried run's output"
+            "the run changed the task's configured model to {configured_model:?}; a reported \
+             model is evidence and must leave the configuration at provider default"
+        );
+    }
+    let observed_model = settled.get("last_observed_model").and_then(Value::as_str);
+    if observed_model != Some(REPORTED_MODEL) {
+        bail!(
+            "the task does not record the model the agent reported: expected {REPORTED_MODEL:?}, \
+             found {observed_model:?} — the runner did not parse the retried run's output"
         );
     }
     let overall = settled.get("overall_progress").and_then(Value::as_u64);
@@ -2592,14 +2599,21 @@ async fn execute_one_task(
         );
     }
 
-    // The runner parsed the fixture's own stdout: the model on the task is the
-    // one only that executable reports. A task forced into this state by any
-    // other means could not carry it.
-    let reported_model = final_task.get("model").and_then(Value::as_str);
-    if reported_model != Some(REPORTED_MODEL) {
+    // The runner parsed the fixture's own stdout: the observed model on the task
+    // is the one only that executable reports. A task forced into this state by
+    // any other means could not carry it. The configured model stays as created.
+    let configured_model = final_task.get("model").and_then(Value::as_str);
+    if configured_model != Some("default") {
         bail!(
-            "the task does not carry the model the agent reported: expected {REPORTED_MODEL:?}, \
-             found {reported_model:?} — the runner did not parse this agent's output"
+            "the run changed the task's configured model to {configured_model:?}; a reported \
+             model is evidence and must leave the configuration at provider default"
+        );
+    }
+    let observed_model = final_task.get("last_observed_model").and_then(Value::as_str);
+    if observed_model != Some(REPORTED_MODEL) {
+        bail!(
+            "the task does not record the model the agent reported: expected {REPORTED_MODEL:?}, \
+             found {observed_model:?} — the runner did not parse this agent's output"
         );
     }
 

@@ -68,6 +68,10 @@ pub struct Task {
     pub description: Option<String>,
     pub status: TaskStatus,
     pub model: String,
+    /// Evidence only: the model the provider last reported for a run. It never
+    /// changes `model`, the configured policy.
+    #[serde(default)]
+    pub last_observed_model: Option<String>,
     pub planning_mode: bool,
     pub dependencies: Vec<Uuid>,
     pub workspace_id: Option<Uuid>,
