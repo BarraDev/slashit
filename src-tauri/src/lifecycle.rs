@@ -859,6 +859,19 @@ pub fn queue_move_refusal(task: &Task, target: &TaskStatus) -> Option<String> {
     }
 }
 
+/// Whether a status move asks for the column a Task already holds, and that
+/// column is Queue.
+///
+/// A repeated request of this kind is answered with the Task as it stands. It
+/// resets no execution state, withdraws no approval, records no move and does
+/// not rewrite the board, so the error and recovery evidence a queued Task
+/// carries survive it. [`classify_status_transition`] still classifies
+/// `Queue -> Queue` as a reset for its other callers; the desktop and IPC status
+/// moves check this first, so they never apply that reset to a repeated request.
+pub fn is_repeated_queue_move(task: &Task, target: &TaskStatus) -> bool {
+    task.status == TaskStatus::Queue && *target == TaskStatus::Queue
+}
+
 /// Put a Task at the top of Queue provided it is still in `seen_in`, the
 /// column the caller saw it in.
 ///
@@ -4228,6 +4241,96 @@ mod tests {
             task.local_integration = Some(integration_record(crate::domain::IntegrationState::Pending));
         })
         .await;
+    }
+
+    /// An owner whose stop leaves recovery evidence behind: the run was
+    /// interrupted before its outcome was recorded. Ending it writes that through
+    /// the production board write, under the lease the caller holds.
+    struct OwnerThatRecordsRecoveryWhenStopped {
+        tasks: Tasks,
+        storage: Storage,
+        ended: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionOwnership for OwnerThatRecordsRecoveryWhenStopped {
+        async fn is_task_running(&self, _task_id: Uuid) -> bool {
+            true
+        }
+
+        async fn end_ownership_under_lease(&self, task_id: Uuid) -> Result<(), String> {
+            let amend = move |staged: &mut HashMap<Uuid, Task>| {
+                if let Some(task) = staged.get_mut(&task_id) {
+                    task.worker_handoff = Some(crate::domain::WorkerHandoff {
+                        task_id,
+                        project_id: task.project_id,
+                        repository_id: None,
+                        run: Some(1),
+                        branch: None,
+                        start_head: None,
+                        stage: crate::domain::WorkerHandoffStage::RecoveryRequired {
+                            reason: "the run was stopped before its outcome was recorded".into(),
+                            observed_commit: None,
+                        },
+                        acceptance: None,
+                    });
+                }
+            };
+            record_typed(&self.tasks, &self.storage, task_id, &amend)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A refusal that the owner's stop introduces, which the request could not
+    /// have seen before it began. The Task passes the checks before the owner
+    /// ends, the owner's stop records recovery evidence, and the entry is
+    /// refused: no Queue transition is written, and the Task keeps the status,
+    /// history and evidence the stop left.
+    #[tokio::test]
+    async fn a_refusal_that_an_owners_stop_introduces_refuses_queue_entry() {
+        let world = world(true);
+        let id = add_task(&world, "stopped", TaskStatus::InProgress, 0, |task| {
+            task.phase = TaskPhase::Coding;
+        })
+        .await;
+        assert!(world.task(id).await.queue_entry_refusal().is_none(), "the fixture passes the checks first");
+        let owner = OwnerThatRecordsRecoveryWhenStopped {
+            tasks: world.tasks.clone(),
+            storage: world.storage.clone(),
+            ended: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let verdict = enqueue_current(
+            &world.tasks,
+            &world.storage,
+            &world.authority,
+            Some(&owner),
+            id,
+        )
+        .await
+        .expect("the refusal is answered");
+
+        assert!(owner.ended.load(std::sync::atomic::Ordering::SeqCst), "the owner was ended first");
+        let EnqueueVerdict::Blocked(reason) = &verdict else {
+            panic!("the post-end refusal must block the entry: {verdict:?}");
+        };
+        assert!(reason.contains("Worker recovery"), "{reason}");
+        let memory = world.task(id).await;
+        let disk = world.persisted(id);
+        assert_eq!(serde_json::to_value(&memory).unwrap(), serde_json::to_value(&disk).unwrap());
+        assert_eq!(disk.status, TaskStatus::InProgress);
+        assert!(
+            !disk.activity.iter().any(|entry| matches!(entry.kind, slashit_activity::Kind::Moved { .. })),
+            "no move is recorded for a refused entry"
+        );
+        assert!(matches!(
+            disk.worker_handoff.as_ref().map(|h| &h.stage),
+            Some(crate::domain::WorkerHandoffStage::RecoveryRequired { reason, .. })
+                if reason.as_str() == "the run was stopped before its outcome was recorded"
+        ));
     }
 
     #[tokio::test]

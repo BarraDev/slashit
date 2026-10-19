@@ -198,18 +198,26 @@ pub(crate) async fn set_task_status(
 
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
-    let Some((old_status, unfinished_integration, queue_refusal)) = ({
+    let Some((old_status, unfinished_integration, queue_refusal, repeated_queue)) = ({
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_id).map(|t| {
             (
                 t.status.clone(),
                 t.integration_unfinished_refusal(),
                 crate::lifecycle::queue_move_refusal(t, &status),
+                crate::lifecycle::is_repeated_queue_move(t, &status),
             )
         })
     }) else {
         return Ok(None);
     };
+
+    // A request for the column a queued Task already holds is answered with the
+    // Task as it is. Nothing is reset, withdrawn or recorded, and nothing is
+    // written, so the error and recovery evidence it carries survives.
+    if repeated_queue {
+        return Ok(state.task.tasks.read().await.get(&task_id).cloned());
+    }
 
     // A pending local integration is recovered from the column it was made
     // in, so no move out of it is made until a person resumes or discards it.
@@ -1951,6 +1959,87 @@ mod lifecycle_ownership {
             .expect("no guard")
             .expect("exists");
         assert_eq!(done.status, TaskStatus::Done);
+    }
+
+    /// The Task as the board file holds it.
+    fn persisted_task(state: &crate::AppState, project_id: Uuid, task_id: Uuid) -> Task {
+        state
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task must be on disk")
+    }
+
+    /// The desktop twin of the IPC test: a repeated request for Queue returns
+    /// the Task as it is and writes nothing.
+    #[tokio::test]
+    async fn a_repeated_update_into_queue_keeps_the_evidence_a_queued_task_carries() {
+        let (_tmp, state) = test_state().await;
+        let executor = attach_test_executor(&state);
+        let project_id = Uuid::new_v4();
+        // Once without recovery evidence, where a reset would be written, and
+        // once with it, where the board refuses any write.
+        let mut seeded = Vec::new();
+        for with_recovery in [false, true] {
+            let mut task = create_test_task_full("queued with evidence", project_id, TaskStatus::Queue, 0);
+            task.error_message = Some("the last run failed".into());
+            task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
+            if with_recovery {
+                task.worker_handoff = Some(crate::domain::WorkerHandoff {
+                    task_id: task.id,
+                    project_id,
+                    repository_id: None,
+                    run: Some(1),
+                    branch: None,
+                    start_head: None,
+                    stage: crate::domain::WorkerHandoffStage::RecoveryRequired {
+                        reason: "the run was interrupted".into(),
+                        observed_commit: None,
+                    },
+                    acceptance: None,
+                });
+            }
+            // A fixed, old timestamp: any rewrite of the record moves it.
+            task.updated_at = chrono::DateTime::from_timestamp(0, 0).expect("the epoch");
+            let task_id = task.id;
+            let board = {
+                let mut tasks = state.task.tasks.write().await;
+                tasks.insert(task_id, task);
+                tasks.values().filter(|t| t.project_id == project_id).cloned().collect::<Vec<_>>()
+            };
+            state.storage.save_project_tasks(project_id, &board).expect("seed the board");
+            let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+            let memory_before = serde_json::to_value(state.task.tasks.read().await[&task_id].clone()).unwrap();
+            let disk_before = serde_json::to_value(persisted_task(&state, project_id, task_id)).unwrap();
+            seeded.push((with_recovery, task_id, cleaned_up, memory_before, disk_before));
+        }
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        for (with_recovery, task_id, cleaned_up, memory_before, disk_before) in seeded {
+            let answer = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::Queue, None)
+                .await
+                .unwrap_or_else(|error| panic!("with recovery {with_recovery}: a repeated request is answered, not refused: {error}"))
+                .expect("the Task exists");
+
+            assert_eq!(answer.status, TaskStatus::Queue);
+            assert!(
+                !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+                "with recovery {with_recovery}: a request that changes nothing must not end the owner"
+            );
+            let state = app.state::<crate::AppState>();
+            let memory_after = serde_json::to_value(state.task.tasks.read().await[&task_id].clone()).unwrap();
+            let disk_after = serde_json::to_value(persisted_task(&state, project_id, task_id)).unwrap();
+            assert_eq!(memory_after, memory_before, "with recovery {with_recovery}: memory is unchanged");
+            assert_eq!(disk_after, disk_before, "with recovery {with_recovery}: the record is not rewritten");
+            let written = persisted_task(&state, project_id, task_id);
+            assert_eq!(written.error_message.as_deref(), Some("the last run failed"));
+            assert!(written.human_review.is_approved());
+            assert_eq!(written.worker_handoff.is_some(), with_recovery);
+        }
     }
 
     #[tokio::test]

@@ -256,7 +256,7 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         Err(e) => return IpcResponse::error(e),
     };
 
-    let (old_status, unfinished_integration, queue_refusal) = match ctx
+    let (old_status, unfinished_integration, queue_refusal, repeated_queue) = match ctx
         .tasks
         .read()
         .await
@@ -266,12 +266,24 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
                 t.status.clone(),
                 t.integration_unfinished_refusal(),
                 crate::lifecycle::queue_move_refusal(t, &new_status),
+                crate::lifecycle::is_repeated_queue_move(t, &new_status),
             )
         })
     {
         Some(found) => found,
         None => return IpcResponse::error(format!("Task {task_id} not found")),
     };
+
+    // The same answer as the desktop `update_task_status`: a request for the
+    // column a queued Task already holds returns the Task as it is, and writes
+    // nothing, so its error and recovery evidence survives.
+    if repeated_queue {
+        let current = ctx.tasks.read().await.get(&task_uuid).cloned();
+        return match current {
+            Some(task) => task_summary_reply(ctx, &task).await,
+            None => IpcResponse::error(format!("Task {task_id} not found")),
+        };
+    }
 
     // Same as the desktop `update_task_status`: a pending local integration
     // keeps the task in the column it is recovered from.
@@ -340,18 +352,22 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
     };
 
     match crate::lifecycle::commit_task(&ctx.tasks, &ctx.storage, task_uuid, &amend).await {
-        Ok(Some(task)) => {
-            let projects = ctx.projects.read().await;
-            let pname = projects
-                .get(&task.project_id)
-                .map(|p| p.name.as_str())
-                .unwrap_or("?");
-            let summary = task_to_summary(&task, pname);
-            IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
-        }
+        Ok(Some(task)) => task_summary_reply(ctx, &task).await,
         Ok(None) => IpcResponse::error(format!("Task {task_id} not found")),
         Err(e) => IpcResponse::error(e),
     }
+}
+
+/// The reply that carries a Task's summary, for a move that wrote the Task or
+/// left it as it was.
+async fn task_summary_reply(ctx: &IpcContext, task: &crate::domain::Task) -> IpcResponse {
+    let projects = ctx.projects.read().await;
+    let pname = projects
+        .get(&task.project_id)
+        .map(|p| p.name.as_str())
+        .unwrap_or("?");
+    let summary = task_to_summary(task, pname);
+    IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
 }
 
 /// The handles [`crate::lifecycle::terminalize`] needs, out of an
@@ -1347,6 +1363,74 @@ mod lifecycle_ownership {
         let repeated = persisted(&ctx, project_id, task_id);
         assert_eq!(repeated.status, TaskStatus::Queue);
         assert_eq!(repeated.activity.len(), activity);
+    }
+
+    /// A repeated request for Queue, from a Task already in Queue, leaves the
+    /// Task exactly as it was: its error, approval and recovery evidence
+    /// survive, nothing is recorded, and the board is not rewritten. The
+    /// evidence is given once without recovery evidence, where a reset would
+    /// otherwise be written, and once with it, where the board refuses any
+    /// write.
+    #[tokio::test]
+    async fn a_repeated_move_into_queue_keeps_the_evidence_a_queued_task_carries() {
+        let (_tmp, ctx) = test_ctx().await;
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let project_id = Uuid::new_v4();
+        for with_recovery in [false, true] {
+            let mut task = create_test_task_full("queued with evidence", project_id, TaskStatus::Queue, 0);
+            task.error_message = Some("the last run failed".into());
+            task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
+            if with_recovery {
+                task.worker_handoff = Some(crate::domain::WorkerHandoff {
+                    task_id: task.id,
+                    project_id,
+                    repository_id: None,
+                    run: Some(1),
+                    branch: None,
+                    start_head: None,
+                    stage: crate::domain::WorkerHandoffStage::RecoveryRequired {
+                        reason: "the run was interrupted".into(),
+                        observed_commit: None,
+                    },
+                    acceptance: None,
+                });
+            }
+            // A fixed, old timestamp: any rewrite of the record moves it.
+            task.updated_at = chrono::DateTime::from_timestamp(0, 0).expect("the epoch");
+            let task_id = task.id;
+            let board = {
+                let mut tasks = ctx.tasks.write().await;
+                tasks.insert(task_id, task);
+                tasks.values().filter(|t| t.project_id == project_id).cloned().collect::<Vec<_>>()
+            };
+            ctx.storage.save_project_tasks(project_id, &board).expect("seed the board");
+            let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+            let memory_before = serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap();
+            let disk_before = serde_json::to_value(persisted(&ctx, project_id, task_id)).unwrap();
+
+            let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
+
+            assert!(answer.ok, "with recovery {with_recovery}: {answer:?}");
+            assert!(
+                !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+                "a request that changes nothing must not end the owner"
+            );
+            assert!(executor.is_task_running(task_id).await);
+            let memory_after = serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap();
+            let disk_after = serde_json::to_value(persisted(&ctx, project_id, task_id)).unwrap();
+            assert_eq!(memory_after, memory_before, "with recovery {with_recovery}: memory is unchanged");
+            assert_eq!(disk_after, disk_before, "with recovery {with_recovery}: the record is not rewritten");
+            let written = persisted(&ctx, project_id, task_id);
+            assert_eq!(written.error_message.as_deref(), Some("the last run failed"));
+            assert!(written.human_review.is_approved());
+            assert_eq!(written.worker_handoff.is_some(), with_recovery);
+            if with_recovery {
+                assert!(matches!(
+                    written.worker_handoff.as_ref().map(|h| &h.stage),
+                    Some(crate::domain::WorkerHandoffStage::RecoveryRequired { .. })
+                ));
+            }
+        }
     }
 
     #[tokio::test]
