@@ -3211,8 +3211,7 @@ impl TaskExecutor {
                     existing_branch,
                     Err(format!(
                         "it depends on the work on branch {branch}, which {why}, and that \
-                         branch no longer exists; restore the branch, or merge that work, \
-                         before starting this task"
+                         branch no longer exists; restore the branch before starting this task"
                     )),
                 );
             }
@@ -3234,14 +3233,14 @@ impl TaskExecutor {
                     let why = if recorded == RecordedPr::ClosedUnmerged {
                         "was closed without being merged, so that work was never delivered"
                     } else {
-                        "is not recorded as merged; move the dependency to PR Created so \
-                         SlashIt can record its merge, or restore the branch"
+                        "is not recorded as merged"
                     };
                     return (
                         existing_branch,
                         Err(format!(
                             "it depends on the work on branch {branch}, which no longer exists \
-                             locally, and the dependency's pull request {why}"
+                             locally, and the dependency's pull request {why}; restore the \
+                             branch before starting this task"
                         )),
                     );
                 }
@@ -3470,10 +3469,19 @@ impl TaskExecutor {
                 .dependency_work_is_in_the_base(task_id, *dependency_id, repo_path)
                 .await?
             {
+                // Local integration refuses a Task with a pull request, so only
+                // a Task with none can be integrated from here.
+                let advice = if recorded == RecordedPr::None {
+                    "Integrate that Task's approved work into the base, which needs its Human \
+                     Review approved, then start this Task again"
+                } else {
+                    "That Task is delivered through its pull request, which SlashIt does not \
+                     integrate locally, so this start stays refused"
+                };
                 return Err(format!(
                     "it depends on several Tasks, and the work on branch {branch} is not \
                      shown to be in the base, so the start would omit it; nothing was started. \
-                     Integrate that work into the base before starting this Task"
+                     {advice}"
                 ));
             }
         }
@@ -12035,12 +12043,50 @@ mod tests {
             refused.contains("task-local01") && refused.contains("completed locally"),
             "the reason has to name the branch and why: {refused}"
         );
+        assert!(
+            refused.contains("restore the branch") && !refused.contains("merge that work"),
+            "the reason has to name the recovery that works, and no other: {refused}"
+        );
         assert_eq!(
             refs_of(&repo),
             refs_before,
             "no branch may be created off the default base instead"
         );
         assert_eq!(worktree_count(&repo), 1);
+    }
+
+    /// The recovery the refusal names works: with the branch restored at the
+    /// commit it had, the start stacks on it and receives the dependency's
+    /// work, as it would have before the branch went missing.
+    #[tokio::test]
+    async fn restoring_the_branch_of_a_dependency_completed_locally_unblocks_the_start() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-local01").await;
+        let tip =
+            complete_dependency_locally(&executor, &repo, dependency_id, "task-local01").await;
+        git_in(&repo, &["branch", "-D", "task-local01"]);
+        let (_, refused) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        assert!(refused.is_err(), "the start is refused while the branch is gone");
+
+        git_in(&repo, &["branch", "task-local01", tip.as_str()]);
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let Acquired {
+            origin,
+            base_commit,
+            ..
+        } = acquired.expect("the restored branch is the stack parent");
+        assert_eq!(
+            origin,
+            Some(BranchOrigin::Stacked {
+                parent_branch: "task-local01".to_string()
+            })
+        );
+        assert_eq!(base_commit, Some(tip));
     }
 
     /// A Done dependency with no pull request and no local completion is not
