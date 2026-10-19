@@ -757,6 +757,89 @@ pub enum EnqueueVerdict {
     Blocked(String),
 }
 
+impl EnqueueVerdict {
+    /// Why a front door reports that `task_id` is not in Queue after its
+    /// request, or `None` when it is. `Queued` and `AlreadyQueued` both leave
+    /// the Task in Queue; every other verdict names the refusal. A `Blocked`
+    /// reason is passed on as it is, so it reads the same at every front door.
+    pub fn refusal(&self, task_id: Uuid) -> Option<String> {
+        match self {
+            Self::Queued(_) | Self::AlreadyQueued(_) => None,
+            Self::Missing => Some(format!("Task {task_id} not found")),
+            Self::OtherProject => Some("The Task belongs to another Project; nothing was changed".into()),
+            Self::Moved(status) => Some(format!(
+                "The Task is now in {status:?} instead of the column it was in; nothing was changed. \
+                 Check it on the board."
+            )),
+            Self::InputChanged => Some(
+                "The Task's input is no longer the one that was approved; nothing was changed".into(),
+            ),
+            Self::Blocked(reason) => Some(reason.clone()),
+        }
+    }
+}
+
+/// Whether `task` may enter Queue as the caller asked, and the reason it may
+/// not.
+///
+/// This is the one ordered list of refusals every queue entry is checked
+/// against. It reads only the Task and the request, so the write that applies
+/// it and any front door that checks ahead of ending an owner give the same
+/// answer.
+fn queue_entry_check(
+    task: &Task,
+    project_id: Uuid,
+    seen_in: &TaskStatus,
+    approval: Option<&InputApproval<'_>>,
+) -> Result<(), EnqueueVerdict> {
+    if task.project_id != project_id {
+        return Err(EnqueueVerdict::OtherProject);
+    }
+    if task.status == TaskStatus::Queue {
+        return Err(EnqueueVerdict::AlreadyQueued(task.title.clone()));
+    }
+    if task.status != *seen_in {
+        return Err(EnqueueVerdict::Moved(task.status.clone()));
+    }
+    if let Some(approval) = approval {
+        if crate::queue::prompt::approved_input_digest(task, approval.request) != approval.digest {
+            return Err(EnqueueVerdict::InputChanged);
+        }
+        // Repeating an approval must never repeat its run. A run that
+        // started under this approval is recorded, and outlives the binding.
+        if task.executed_approvals.iter().any(|e| e.approval_id == approval.id) {
+            return Err(EnqueueVerdict::Blocked("This approval already started a run of this Task".into()));
+        }
+        // A checkout is named only by an approved request, and only when it
+        // is the Task's own checkout as the Human saw it. An approval
+        // without a request, a request without its evidence (including
+        // one proposed before evidence existed), and evidence for another
+        // Task, checkout, branch, base or run are all refused here.
+        if approval.checkout.is_some() && approval.request.is_none() {
+            return Err(EnqueueVerdict::Blocked("A Task Checkout can only be reused by an additional request".into()));
+        }
+        if approval.checkout.is_some() && !task_holds_checkout(task) {
+            return Err(EnqueueVerdict::Blocked(
+                "This Task has no Task Checkout to reuse, so the request cannot name one".into(),
+            ));
+        }
+        if approval.request.is_some() && task_holds_checkout(task) {
+            if let Some(reason) = task.settled_checkout_refusal() {
+                return Err(EnqueueVerdict::Blocked(reason));
+            }
+            if !approval.checkout.is_some_and(|evidence| reuse_is_for_this_task(task, evidence)) {
+                return Err(EnqueueVerdict::Blocked(
+                    "This Task already has a Task Checkout, and the approved request does not name it, so it cannot run there".into(),
+                ));
+            }
+        }
+    }
+    match task.queue_entry_refusal() {
+        Some(reason) => Err(EnqueueVerdict::Blocked(reason)),
+        None => Ok(()),
+    }
+}
+
 /// Put a Task at the top of Queue provided it is still in `seen_in`, the
 /// column the caller saw it in.
 ///
@@ -770,7 +853,8 @@ pub enum EnqueueVerdict {
 /// The check and the change share the Task store's write, so the Task cannot
 /// move between them. The caller holds the Task's lifecycle lease. No owner is
 /// ended: a Task that is not in Queue or beyond has none, and any other
-/// `seen_in` is the caller's responsibility to refuse.
+/// `seen_in` is the caller's responsibility to refuse. [`enqueue_current`] is
+/// the front door for callers that have no column to name.
 ///
 /// `approval`, when given, names the `task_input_digest` a person approved. It
 /// is compared in the same write, so a Task edited since is refused as
@@ -791,124 +875,84 @@ pub async fn enqueue_leased(
     let revise = |staged: &mut HashMap<Uuid, Task>| -> bool {
         let (found, changed) = match staged.get_mut(&task_id) {
             None => (EnqueueVerdict::Missing, false),
-            Some(task) if task.project_id != project_id => (EnqueueVerdict::OtherProject, false),
-            Some(task) if task.status == TaskStatus::Queue => {
-                (EnqueueVerdict::AlreadyQueued(task.title.clone()), false)
-            }
-            Some(task) if task.status != *seen_in => (EnqueueVerdict::Moved(task.status.clone()), false),
-            Some(task)
-                if approval
-                    .as_ref()
-                    .is_some_and(|a| crate::queue::prompt::approved_input_digest(task, a.request) != a.digest) =>
-            {
-                (EnqueueVerdict::InputChanged, false)
-            }
-            // Repeating an approval must never repeat its run. A run that
-            // started under this approval is recorded, and outlives the binding.
-            Some(task)
-                if approval.as_ref().is_some_and(|a| task.executed_approvals.iter().any(|e| e.approval_id == a.id)) =>
-            {
-                (EnqueueVerdict::Blocked("This approval already started a run of this Task".into()), false)
-            }
-            // A checkout is named only by an approved request, and only when it
-            // is the Task's own checkout as the Human saw it. An approval
-            // without a request, a request without its evidence (including
-            // one proposed before evidence existed), and evidence for another
-            // Task, checkout, branch, base or run are all refused here.
-            Some(_)
-                if approval.as_ref().is_some_and(|a| a.checkout.is_some() && a.request.is_none()) =>
-            {
-                (EnqueueVerdict::Blocked("A Task Checkout can only be reused by an additional request".into()), false)
-            }
-            Some(task)
-                if approval.as_ref().is_some_and(|a| a.checkout.is_some()) && !task_holds_checkout(task) =>
-            {
-                (
-                    EnqueueVerdict::Blocked(
-                        "This Task has no Task Checkout to reuse, so the request cannot name one".into(),
-                    ),
-                    false,
-                )
-            }
-            Some(task)
-                if approval.as_ref().is_some_and(|a| a.request.is_some())
-                    && task_holds_checkout(task)
-                    && task.settled_checkout_refusal().is_some() =>
-            {
-                (
-                    EnqueueVerdict::Blocked(task.settled_checkout_refusal().unwrap_or_default()),
-                    false,
-                )
-            }
-            Some(task)
-                if approval.as_ref().is_some_and(|a| a.request.is_some())
-                    && task_holds_checkout(task)
-                    && !approval
-                        .as_ref()
-                        .and_then(|a| a.checkout)
-                        .is_some_and(|evidence| reuse_is_for_this_task(task, evidence)) =>
-            {
-                (
-                    EnqueueVerdict::Blocked(
-                        "This Task already has a Task Checkout, and the approved request does not name it, so it cannot run there".into(),
-                    ),
-                    false,
-                )
-            }
-            Some(task) if task.cleanup_in_flight => (
-                EnqueueVerdict::Blocked(
-                    "An earlier cleanup of this Task's checkout is unfinished, so it cannot run yet".into(),
-                ),
-                false,
-            ),
-            Some(task) if task.republish_pending_refusal().is_some() => (
-                EnqueueVerdict::Blocked(
-                    "A restack of this Task's published branch is unfinished, so it cannot run yet".into(),
-                ),
-                false,
-            ),
-            Some(task) if task.worker_recovery_refusal().is_some() => (
-                EnqueueVerdict::Blocked(task.worker_recovery_refusal().unwrap_or_default()),
-                false,
-            ),
-            Some(task) if task.integration_unfinished_refusal().is_some() => (
-                EnqueueVerdict::Blocked(
-                    "An integration of this Task into a local branch is unfinished, so it cannot run yet".into(),
-                ),
-                false,
-            ),
-            Some(task) => {
-                let from = task.status.clone();
-                task.status = TaskStatus::Queue;
-                task.record_move(&from);
-                if classify_status_transition(&from, &TaskStatus::Queue)
-                    == StatusTransitionEffect::ResetExecutionState
-                {
+            Some(task) => match queue_entry_check(task, project_id, seen_in, approval.as_ref()) {
+                Err(refusal) => (refusal, false),
+                Ok(()) => {
+                    let from = task.status.clone();
+                    task.status = TaskStatus::Queue;
+                    task.record_move(&from);
+                    // Every move into Queue resets execution state, the same
+                    // classification `classify_status_transition` gives it:
+                    // the stale phase, progress and error of an earlier run
+                    // are cleared, and an approval of the current changes is
+                    // withdrawn.
                     task.reset_execution_state();
+                    // After the move, which ends any earlier binding. The binding
+                    // is for the run this Queue transition leads to, in this same
+                    // write; a Task queued without an approval has none.
+                    task.approved_execution = approval.as_ref().map(|a| crate::domain::task::ApprovedExecution {
+                        approval_id: a.id,
+                        digest: a.digest.to_string(),
+                        for_run: task.next_run(),
+                        request: a.request.map(str::to_string),
+                        checkout: a.checkout.cloned(),
+                    });
+                    let title = task.title.clone();
+                    renumber_column(staged, project_id, task_id, &TaskStatus::Queue, 0);
+                    (EnqueueVerdict::Queued(title), true)
                 }
-                // After the move, which ends any earlier binding. The binding
-                // is for the run this Queue transition leads to, in this same
-                // write; a Task queued without an approval has none.
-                task.approved_execution = approval.as_ref().map(|a| crate::domain::task::ApprovedExecution {
-                    approval_id: a.id,
-                    digest: a.digest.to_string(),
-                    for_run: task.next_run(),
-                    request: a.request.map(str::to_string),
-                    checkout: a.checkout.cloned(),
-                });
-                let title = task.title.clone();
-                renumber_column(staged, project_id, task_id, &TaskStatus::Queue, 0);
-                (EnqueueVerdict::Queued(title), true)
-            }
+            },
         };
         *verdict.lock().unwrap() = found;
         changed
     };
-    match record_if_changed(tasks, storage, task_id, &revise).await {
+    // Typed, so a write the file holds but could not confirm durable is an
+    // error that says the change is in place, as every board writer's is.
+    match record_typed_if_changed(tasks, storage, task_id, &revise).await {
         Ok(_) => Ok(verdict.into_inner().unwrap()),
-        Err(_) if !tasks.read().await.contains_key(&task_id) => Ok(EnqueueVerdict::Missing),
-        Err(error) => Err(error),
+        Err(RecordWriteError::NotPublished(_)) if !tasks.read().await.contains_key(&task_id) => {
+            Ok(EnqueueVerdict::Missing)
+        }
+        Err(error) => Err(error.to_string()),
     }
+}
+
+/// Queue a Task for a front door that names no expected column and no
+/// approval: the desktop's Add to Queue, Requeue and bulk add, and the CLI's
+/// `slashit enqueue`.
+///
+/// Such a request has no column the caller saw, so the server reads the
+/// Task's column under its lease and applies the same refusals as every other
+/// queue entry. The refusals that need no owner to end are decided before any
+/// owner is ended, so those requests leave a running agent alone. The owner is
+/// ended only for a write that will be made, and the column is read again after
+/// that, because the ended run may record a status of its own before it stops.
+/// The write checks every refusal again, so one the ended run recorded is
+/// reported as a refusal; the owner has already stopped by then.
+///
+/// `running` is the executor's ownership handle, or `None` where no executor
+/// exists yet, as [`end_active_ownership`] takes it.
+pub async fn enqueue_current(
+    tasks: &Tasks,
+    storage: &Storage,
+    locks: &TaskLifecycleLocks,
+    running: Option<&dyn ExecutionOwnership>,
+    task_id: Uuid,
+) -> Result<EnqueueVerdict, String> {
+    let _lease = locks.acquire(task_id).await?;
+    let Some(task) = tasks.read().await.get(&task_id).cloned() else {
+        return Ok(EnqueueVerdict::Missing);
+    };
+    if task.status != TaskStatus::Queue {
+        if let Some(reason) = task.queue_entry_refusal() {
+            return Ok(EnqueueVerdict::Blocked(reason));
+        }
+        end_active_ownership(running, task_id).await?;
+    }
+    let Some(seen_in) = tasks.read().await.get(&task_id).map(|t| t.status.clone()) else {
+        return Ok(EnqueueVerdict::Missing);
+    };
+    enqueue_leased(tasks, storage, task.project_id, task_id, &seen_in, None).await
 }
 
 /// Select, amend and durably commit a task the caller does not yet have the id
@@ -3936,5 +3980,266 @@ mod tests {
         for task in &batch {
             assert_eq!(world.persisted(task.id).position, task.position);
         }
+    }
+
+    // Queue entry: one lifecycle contract for every front door that can put a
+    // Task in Queue without a column to compare against.
+
+    /// Add a Task of `status` at `position` to `world`'s board, shaped by
+    /// `shape`, and write the board.
+    async fn add_task(
+        world: &World,
+        title: &str,
+        status: TaskStatus,
+        position: i32,
+        shape: impl FnOnce(&mut Task),
+    ) -> Uuid {
+        let mut task = create_test_task_full(title, world.project_id, status, position);
+        shape(&mut task);
+        let id = task.id;
+        world.tasks.write().await.insert(id, task);
+        let board: Vec<Task> = world
+            .tasks
+            .read()
+            .await
+            .values()
+            .filter(|t| t.project_id == world.project_id)
+            .cloned()
+            .collect();
+        world
+            .storage
+            .save_project_tasks(world.project_id, &board)
+            .expect("write the board");
+        id
+    }
+
+    /// An owner that is running its Task and records whether anything ended it.
+    #[derive(Default)]
+    struct OwnerThatRecordsEnding {
+        ended: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionOwnership for OwnerThatRecordsEnding {
+        async fn is_task_running(&self, _task_id: Uuid) -> bool {
+            true
+        }
+
+        async fn end_ownership_under_lease(&self, _task_id: Uuid) -> Result<(), String> {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_errored_task_queued_from_a_front_door_sheds_the_stale_run() {
+        let world = world(true);
+        let id = add_task(&world, "failed", TaskStatus::Error, 0, |task| {
+            task.phase = TaskPhase::Coding;
+            task.phase_progress = 40;
+            task.overall_progress = 40;
+            task.error_message = Some("the last run failed".into());
+        })
+        .await;
+
+        let verdict = enqueue_current(&world.tasks, &world.storage, &world.authority, None, id)
+            .await
+            .expect("the enqueue is written");
+        assert!(matches!(verdict, EnqueueVerdict::Queued(_)), "{verdict:?}");
+
+        for task in [world.task(id).await, world.persisted(id)] {
+            assert_eq!(task.status, TaskStatus::Queue);
+            assert_eq!(task.phase, TaskPhase::Idle);
+            assert_eq!((task.phase_progress, task.overall_progress), (0, 0));
+            assert_eq!(task.error_message, None);
+            assert_eq!(task.position, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn queueing_a_reviewed_task_withdraws_its_approval() {
+        let world = world(true);
+        let id = add_task(&world, "reviewed", TaskStatus::HumanReview, 0, |task| {
+            task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
+        })
+        .await;
+        assert!(world.task(id).await.human_review.is_approved(), "the fixture is approved");
+
+        enqueue_current(&world.tasks, &world.storage, &world.authority, None, id)
+            .await
+            .expect("the enqueue is written");
+
+        for task in [world.task(id).await, world.persisted(id)] {
+            assert_eq!(task.status, TaskStatus::Queue);
+            assert!(!task.human_review.is_approved(), "the approval of the changes no longer holds");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_queued_task_lands_at_the_top_without_colliding_with_the_column() {
+        let world = world(true);
+        let first = add_task(&world, "first", TaskStatus::Queue, 0, |_| {}).await;
+        let second = add_task(&world, "second", TaskStatus::Queue, 1, |_| {}).await;
+        // Its Backlog position collides with a position already in Queue.
+        let entering = add_task(&world, "entering", TaskStatus::Backlog, 1, |_| {}).await;
+
+        enqueue_current(&world.tasks, &world.storage, &world.authority, None, entering)
+            .await
+            .expect("the enqueue is written");
+
+        let mut queue: Vec<Task> = world
+            .storage
+            .load_project_tasks(world.project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .filter(|t| t.status == TaskStatus::Queue)
+            .collect();
+        queue.sort_by_key(|t| t.position);
+        let order: Vec<(Uuid, i32)> = queue.iter().map(|t| (t.id, t.position)).collect();
+        assert_eq!(order, vec![(entering, 0), (first, 1), (second, 2)]);
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_a_column_the_task_has_left_changes_nothing() {
+        let world = world(true);
+        let id = add_task(&world, "running", TaskStatus::InProgress, 0, |_| {}).await;
+        let before = serde_json::to_value(world.task(id).await).unwrap();
+
+        let verdict = enqueue_leased(
+            &world.tasks,
+            &world.storage,
+            world.project_id,
+            id,
+            &TaskStatus::Backlog,
+            None,
+        )
+        .await
+        .expect("the request is answered");
+
+        assert_eq!(verdict, EnqueueVerdict::Moved(TaskStatus::InProgress));
+        assert_eq!(serde_json::to_value(world.task(id).await).unwrap(), before);
+        assert_eq!(serde_json::to_value(world.persisted(id)).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_requests_queue_a_task_once() {
+        let world = world(true);
+        let id = add_task(&world, "contested", TaskStatus::Backlog, 0, |_| {}).await;
+
+        let (first, second) = tokio::join!(
+            enqueue_current(&world.tasks, &world.storage, &world.authority, None, id),
+            enqueue_current(&world.tasks, &world.storage, &world.authority, None, id),
+        );
+        let mut verdicts = [first.expect("first request"), second.expect("second request")];
+        verdicts.sort_by_key(|v| matches!(v, EnqueueVerdict::AlreadyQueued(_)));
+        assert!(matches!(verdicts[0], EnqueueVerdict::Queued(_)), "{verdicts:?}");
+        assert!(matches!(verdicts[1], EnqueueVerdict::AlreadyQueued(_)), "{verdicts:?}");
+
+        let moves = world
+            .persisted(id)
+            .activity
+            .iter()
+            .filter(|entry| matches!(entry.kind, slashit_activity::Kind::Moved { .. }))
+            .count();
+        assert_eq!(moves, 1, "one move is recorded, not one per request");
+    }
+
+    /// A refused queue entry names its reason, ends no owner and writes
+    /// nothing, in memory or on disk.
+    async fn assert_queue_entry_refused(shape: impl FnOnce(&mut Task)) {
+        let world = world(true);
+        let id = add_task(&world, "refused", TaskStatus::InProgress, 0, shape).await;
+        let before = serde_json::to_value(world.task(id).await).unwrap();
+        let owner = OwnerThatRecordsEnding::default();
+
+        let verdict = enqueue_current(
+            &world.tasks,
+            &world.storage,
+            &world.authority,
+            Some(&owner),
+            id,
+        )
+        .await
+        .expect("the refusal is answered");
+
+        assert!(matches!(verdict, EnqueueVerdict::Blocked(_)), "{verdict:?}");
+        assert!(
+            !owner.ended.load(std::sync::atomic::Ordering::SeqCst),
+            "a refused entry must not end the owner"
+        );
+        assert_eq!(serde_json::to_value(world.task(id).await).unwrap(), before);
+        assert_eq!(serde_json::to_value(world.persisted(id)).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_cleanup_refuses_queue_entry() {
+        assert_queue_entry_refused(|task| task.cleanup_in_flight = true).await;
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_restack_refuses_queue_entry() {
+        assert_queue_entry_refused(|task| task.pending_republish = Some(pending_restack())).await;
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_run_that_needs_recovery_refuses_queue_entry() {
+        assert_queue_entry_refused(|task| {
+            task.worker_handoff = Some(crate::domain::WorkerHandoff {
+                task_id: task.id,
+                project_id: task.project_id,
+                repository_id: None,
+                run: Some(1),
+                branch: None,
+                start_head: None,
+                stage: crate::domain::WorkerHandoffStage::RecoveryRequired {
+                    reason: "the run was interrupted".into(),
+                    observed_commit: None,
+                },
+                acceptance: None,
+            });
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_integration_refuses_queue_entry() {
+        assert_queue_entry_refused(|task| {
+            task.status = TaskStatus::HumanReview;
+            task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
+            task.local_integration = Some(integration_record(crate::domain::IntegrationState::Pending));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_entry_the_board_file_refuses_is_reported_and_not_shown_as_queued() {
+        let world = world(true);
+        let id = add_task(&world, "backlog", TaskStatus::Backlog, 0, |_| {}).await;
+        world.block_persistence();
+
+        let result = enqueue_current(&world.tasks, &world.storage, &world.authority, None, id).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(world.task(id).await.status, TaskStatus::Backlog);
+    }
+
+    /// A queue entry the board file holds but could not confirm durable is in
+    /// Queue in memory and on disk, and the request says so: it does not report
+    /// a failure that did not happen, and it does not claim the change is
+    /// confirmed.
+    #[tokio::test]
+    async fn an_entry_published_but_not_durable_says_the_change_is_in_place() {
+        use slashit_durable_fs::{fault, Stage};
+        let world = world(true);
+        let id = add_task(&world, "entering", TaskStatus::Backlog, 0, |_| {}).await;
+
+        let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let result = enqueue_current(&world.tasks, &world.storage, &world.authority, None, id).await;
+        drop(fault);
+
+        let error = result.expect_err("the durability is unconfirmed, so the caller is told");
+        assert!(error.contains("not confirmed durable"), "{error}");
+        assert_eq!(world.task(id).await.status, TaskStatus::Queue);
+        assert_eq!(world.persisted(id).status, TaskStatus::Queue);
     }
 }

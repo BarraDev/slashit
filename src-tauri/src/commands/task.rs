@@ -646,9 +646,11 @@ pub async fn reorder_task(
 
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
-    let Some((project_id, old_status, unfinished_integration)) = ({
+    let Some((project_id, old_status, unfinished_integration, queue_refusal)) = ({
         let tasks = state.task.tasks.read().await;
-        tasks.get(&task_id).map(|t| (t.project_id, t.status.clone(), t.integration_unfinished_refusal()))
+        tasks
+            .get(&task_id)
+            .map(|t| (t.project_id, t.status.clone(), t.integration_unfinished_refusal(), t.queue_entry_refusal()))
     }) else {
         return Ok(None);
     };
@@ -668,6 +670,15 @@ pub async fn reorder_task(
     // changes no status and stays allowed.
     if old_status != target_status {
         if let Some(refusal) = unfinished_integration {
+            return Err(refusal);
+        }
+    }
+
+    // A card entering Queue by any gesture is refused for the same reasons as
+    // every other queue entry (`Task::queue_entry_refusal`), so a drag cannot
+    // queue what Add to Queue refuses. The drop position is still the card's.
+    if target_status == TaskStatus::Queue && old_status != TaskStatus::Queue {
+        if let Some(refusal) = queue_refusal {
             return Err(refusal);
         }
     }
@@ -722,6 +733,15 @@ pub async fn reorder_task(
             .get()
             .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
         crate::lifecycle::end_active_ownership(running, task_id).await?;
+        // Ending the owner can record a refusal of its own: a Worker stopped
+        // mid-run is left in recovery. The entry is checked again under the
+        // lease, before anything is written.
+        if target_status == TaskStatus::Queue {
+            let recorded = state.task.tasks.read().await.get(&task_id).and_then(|t| t.queue_entry_refusal());
+            if let Some(refusal) = recorded {
+                return Err(refusal);
+            }
+        }
     }
 
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
@@ -2061,6 +2081,35 @@ mod lifecycle_ownership {
             "moving a task out of its column must end its previous owner first"
         );
         assert!(!executor.is_task_running(task_id).await);
+    }
+
+    /// A card dragged into Queue meets the refusal that Add to Queue meets, so
+    /// the two gestures cannot queue different Tasks. Nothing is written.
+    #[tokio::test]
+    async fn a_drag_into_queue_is_refused_while_a_cleanup_is_unfinished() {
+        let (_tmp, state) = test_state().await;
+        let task_id = seed(&state, TaskStatus::Backlog).await;
+        state.task.tasks.write().await.get_mut(&task_id).expect("seeded").cleanup_in_flight = true;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let refused = reorder_task(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            Some(TaskStatus::Queue),
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an unfinished cleanup refuses the drag");
+
+        assert!(refused.contains("cleanup"), "{refused}");
+        let live = app.state::<crate::AppState>();
+        let task = live.task.tasks.read().await[&task_id].clone();
+        assert_eq!(task.status, TaskStatus::Backlog);
+        assert!(task.cleanup_in_flight, "the refusal leaves the record as it was");
     }
 
     /// A stale enqueue: the person saw the task in one column and asked to
