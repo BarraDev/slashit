@@ -88,19 +88,25 @@ pub async fn create_task(
     params: CreateTaskParams,
 ) -> Result<Task, String> {
     let project_id = Uuid::parse_str(&params.project_id).map_err(|e| e.to_string())?;
-    let dependencies = params.dependencies
-        .into_iter()
-        .filter_map(|d| Uuid::parse_str(&d).ok())
-        .collect();
+    let dependencies = crate::domain::task_dependencies::parse_requested(&params.dependencies)?;
+    let id = Uuid::new_v4();
+    // Checked against every Task first, so a Task of another Project is named
+    // as such. The write checks again against the Tasks it stages.
+    crate::domain::task_dependencies::check_targets(
+        &*state.task.tasks.read().await,
+        id,
+        project_id,
+        &dependencies,
+    )?;
 
     let new = NewTask {
-        id: Uuid::new_v4(),
+        id,
         project_id,
         title: params.title,
         description: params.description,
         model: params.model,
         planning_mode: params.planning_mode,
-        dependencies,
+        dependencies: dependencies.clone(),
         category: params.category.unwrap_or_default(),
         priority: params.priority.unwrap_or_default(),
         complexity: params.complexity.unwrap_or_default(),
@@ -110,14 +116,15 @@ pub async fn create_task(
         gitlab_issue_url: params.gitlab_issue_url,
         linear_ticket_id: params.linear_ticket_id,
     };
-    crate::lifecycle::create(
+    crate::lifecycle::create_checked(
         &state.task.project_gate,
         &state.task.tasks,
         &state.project.projects,
         &state.storage,
         project_id,
         move |existing| {
-            Task::new_backlog(existing, new)
+            crate::domain::task_dependencies::check_targets(existing, id, project_id, &dependencies)?;
+            Ok(Task::new_backlog(existing, new))
         },
     )
     .await
@@ -302,16 +309,79 @@ pub async fn set_task_dependencies(
     dependencies: Vec<String>,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let amend = move |staged: &mut HashMap<Uuid, Task>| {
-        if let Some(task) = staged.get_mut(&task_id) {
-            task.dependencies = dependencies
-                .clone()
-                .into_iter()
-                .filter_map(|d| Uuid::parse_str(&d).ok())
-                .collect();
+    let requested = crate::domain::task_dependencies::parse_requested(&dependencies)?;
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+
+    // Checked against every Task first, so a Task of another Project is named
+    // as such. The write checks again against the Tasks it stages.
+    {
+        let tasks = state.task.tasks.read().await;
+        if !tasks.contains_key(&task_id) {
+            return Ok(None);
+        }
+        dependency_change(&tasks, task_id, &requested)?;
+    }
+
+    let refusal = std::sync::Mutex::new(None::<String>);
+    let revise = |staged: &mut HashMap<Uuid, Task>| -> bool {
+        match dependency_change(staged, task_id, &requested) {
+            Ok(true) => {
+                if let Some(task) = staged.get_mut(&task_id) {
+                    task.dependencies = requested.clone();
+                }
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                *refusal.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                false
+            }
         }
     };
-    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
+    let written = crate::lifecycle::record_typed_if_changed(
+        &state.task.tasks,
+        &state.storage,
+        task_id,
+        &revise,
+    )
+    .await;
+    if let Some(error) = refusal.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        return Err(error);
+    }
+    match written {
+        Ok(_) => {}
+        Err(crate::lifecycle::RecordWriteError::NotPublished(_))
+            if !state.task.tasks.read().await.contains_key(&task_id) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    Ok(state.task.tasks.read().await.get(&task_id).cloned())
+}
+
+/// Whether `task_id`'s dependencies may become `requested` in `graph`, and
+/// whether they differ from what is recorded.
+///
+/// The one decision both the checks ahead of the write and the write itself
+/// make, so the two cannot disagree. A request that changes nothing is `false`
+/// and is never refused.
+fn dependency_change(
+    graph: &HashMap<Uuid, Task>,
+    task_id: Uuid,
+    requested: &[Uuid],
+) -> Result<bool, String> {
+    let Some(task) = graph.get(&task_id) else {
+        return Ok(false);
+    };
+    if let Some(refusal) = crate::domain::task_dependencies::change_refusal(task, requested) {
+        return Err(refusal);
+    }
+    if task.dependencies == requested {
+        return Ok(false);
+    }
+    crate::domain::task_dependencies::check_targets(graph, task_id, task.project_id, requested)?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -2673,5 +2743,340 @@ mod queue_entry_from_a_status_move {
         let repeated = persisted(&state, project_id, task_id);
         assert_eq!(repeated.status, TaskStatus::Queue);
         assert_eq!(repeated.activity.len(), activity);
+    }
+}
+
+/// The Task dependency contract at the commands that create and change it:
+/// valid requests are written, refused ones change nothing in memory or on
+/// disk, and recorded dependencies survive edits that do not name them.
+#[cfg(test)]
+mod task_dependency_contract {
+    use super::*;
+    use crate::commands::gui_admission::GuiMutation;
+    use crate::config::paths::{AppPaths, StateLocation};
+    use crate::config::Storage;
+    use crate::domain::{AgentConfig, AgentType, Project, ProjectScope, TaskStatus};
+    use crate::test_helpers::create_test_task_full;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tauri::Manager;
+
+    type App = tauri::App<tauri::test::MockRuntime>;
+
+    fn paths_in(tmp: &tempfile::TempDir) -> Arc<AppPaths> {
+        Arc::new(AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ))
+    }
+
+    /// A running application over a fresh state root, with two Projects that
+    /// each hold Tasks added by the caller.
+    async fn app_with(tasks: Vec<Task>, projects: &[Uuid]) -> (tempfile::TempDir, Arc<AppPaths>, App) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = paths_in(&tmp);
+        let (state, _report) = crate::app_core::build_state_with_paths(paths.clone())
+            .await
+            .expect("state should build under a fresh tempdir");
+        for id in projects {
+            state.project.projects.write().await.insert(*id, project(*id));
+        }
+        {
+            let mut memory = state.task.tasks.write().await;
+            for task in &tasks {
+                memory.insert(task.id, task.clone());
+            }
+            for id in projects {
+                let board: Vec<Task> = memory.values().filter(|t| t.project_id == *id).cloned().collect();
+                state.storage.save_project_tasks(*id, &board).expect("seed the board");
+            }
+        }
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        (tmp, paths, app)
+    }
+
+    fn project(id: Uuid) -> Project {
+        Project {
+            id,
+            name: "Dependency Project".to_string(),
+            repository_id: None,
+            scope: ProjectScope::Standalone,
+            state_location: StateLocation::External,
+            base: None,
+            agent_type: AgentType::ClaudeCode,
+            agent_config: AgentConfig {
+                agent_type: AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn task(project_id: Uuid, title: &str, status: TaskStatus, dependencies: Vec<Uuid>) -> Task {
+        let mut task = create_test_task_full(title, project_id, status, 0);
+        task.dependencies = dependencies;
+        task
+    }
+
+    /// Both copies of a Task: the one in memory and the one the board file holds.
+    async fn both_copies(app: &App, project_id: Uuid, task_id: Uuid) -> (serde_json::Value, serde_json::Value) {
+        let state = app.state::<crate::AppState>();
+        let memory = state.task.tasks.read().await[&task_id].clone();
+        let disk = state
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task must be on disk");
+        (serde_json::to_value(memory).unwrap(), serde_json::to_value(disk).unwrap())
+    }
+
+    /// The Tasks of `project_id` as the board file holds them, in id order.
+    fn board_ids(app: &App, project_id: Uuid) -> Vec<Uuid> {
+        let state = app.state::<crate::AppState>();
+        let mut ids: Vec<Uuid> = state
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    async fn create(app: &App, project_id: Uuid, dependencies: Vec<String>) -> Result<Task, String> {
+        create_task(
+            GuiMutation::untracked(),
+            app.state(),
+            CreateTaskParams {
+                project_id: project_id.to_string(),
+                title: "Dependent".to_string(),
+                description: None,
+                model: "default".to_string(),
+                planning_mode: false,
+                dependencies,
+                category: None,
+                priority: None,
+                complexity: None,
+                impact: None,
+                security_severity: None,
+                github_issue_url: None,
+                gitlab_issue_url: None,
+                linear_ticket_id: None,
+            },
+        )
+        .await
+    }
+
+    async fn set(app: &App, task_id: Uuid, dependencies: Vec<Uuid>) -> Result<Option<Task>, String> {
+        set_task_dependencies(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            dependencies.iter().map(Uuid::to_string).collect(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_new_task_with_one_dependency_is_written_with_it() {
+        let project_id = Uuid::new_v4();
+        let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
+        let (_tmp, _paths, app) = app_with(vec![parent.clone()], &[project_id]).await;
+
+        let created = create(&app, project_id, vec![parent.id.to_string()]).await.expect("a valid dependency is written");
+
+        assert_eq!(created.dependencies, vec![parent.id]);
+        let (memory, disk) = both_copies(&app, project_id, created.id).await;
+        assert_eq!(memory["dependencies"], serde_json::json!([parent.id]));
+        assert_eq!(disk["dependencies"], serde_json::json!([parent.id]));
+    }
+
+    #[tokio::test]
+    async fn a_new_task_refuses_each_bad_request_and_writes_nothing() {
+        let project_id = Uuid::new_v4();
+        let foreign_project = Uuid::new_v4();
+        let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
+        let other = task(project_id, "other", TaskStatus::Backlog, vec![]);
+        let foreign = task(foreign_project, "foreign", TaskStatus::Backlog, vec![]);
+        let (_tmp, _paths, app) = app_with(
+            vec![parent.clone(), other.clone(), foreign.clone()],
+            &[project_id, foreign_project],
+        )
+        .await;
+        let before_board = board_ids(&app, project_id);
+        let before_memory = app.state::<crate::AppState>().task.tasks.read().await.len();
+
+        let cases: Vec<(&str, Vec<String>, &str)> = vec![
+            ("malformed", vec!["not-a-task".to_string()], "not a valid Task identifier"),
+            ("duplicate", vec![parent.id.to_string(), parent.id.to_string()], "more than once"),
+            ("two dependencies", vec![parent.id.to_string(), other.id.to_string()], "one other Task"),
+            ("nonexistent", vec![Uuid::new_v4().to_string()], "not found in this Project"),
+            ("another Project", vec![foreign.id.to_string()], "belongs to another Project"),
+        ];
+        for (label, dependencies, expected) in cases {
+            let error = create(&app, project_id, dependencies).await.expect_err(label);
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+
+        assert_eq!(board_ids(&app, project_id), before_board, "no Task was written");
+        assert_eq!(app.state::<crate::AppState>().task.tasks.read().await.len(), before_memory);
+    }
+
+    #[tokio::test]
+    async fn a_dependency_can_be_set_and_cleared_on_a_backlog_task() {
+        let project_id = Uuid::new_v4();
+        let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
+        let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
+        let (_tmp, _paths, app) = app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
+
+        let set_once = set(&app, child.id, vec![parent.id]).await.expect("set").expect("the task exists");
+        assert_eq!(set_once.dependencies, vec![parent.id]);
+        assert_eq!(both_copies(&app, project_id, child.id).await.1["dependencies"], serde_json::json!([parent.id]));
+
+        let cleared = set(&app, child.id, vec![]).await.expect("clear").expect("the task exists");
+        assert!(cleared.dependencies.is_empty());
+        assert_eq!(both_copies(&app, project_id, child.id).await.1["dependencies"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_change_that_is_malformed_self_nonexistent_or_foreign_is_refused_unchanged() {
+        let project_id = Uuid::new_v4();
+        let foreign_project = Uuid::new_v4();
+        let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
+        let foreign = task(foreign_project, "foreign", TaskStatus::Backlog, vec![]);
+        let (_tmp, _paths, app) = app_with(vec![child.clone(), foreign.clone()], &[project_id, foreign_project]).await;
+        let before = both_copies(&app, project_id, child.id).await;
+
+        let self_error = set(&app, child.id, vec![child.id]).await.expect_err("self");
+        assert!(self_error.contains("itself"), "{self_error}");
+        let missing = set(&app, child.id, vec![Uuid::new_v4()]).await.expect_err("nonexistent");
+        assert!(missing.contains("not found in this Project"), "{missing}");
+        let foreign_error = set(&app, child.id, vec![foreign.id]).await.expect_err("foreign");
+        assert!(foreign_error.contains("another Project"), "{foreign_error}");
+        let malformed = set_task_dependencies(
+            GuiMutation::untracked(),
+            app.state(),
+            child.id.to_string(),
+            vec!["nope".to_string()],
+        )
+        .await
+        .expect_err("malformed");
+        assert!(malformed.contains("not a valid Task identifier"), "{malformed}");
+
+        assert_eq!(both_copies(&app, project_id, child.id).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_direct_or_indirect_cycle_is_refused_without_partial_mutation() {
+        let project_id = Uuid::new_v4();
+        let a = task(project_id, "a", TaskStatus::Backlog, vec![]);
+        let b = task(project_id, "b", TaskStatus::Backlog, vec![a.id]);
+        let c = task(project_id, "c", TaskStatus::Backlog, vec![b.id]);
+        let (_tmp, _paths, app) = app_with(vec![a.clone(), b.clone(), c.clone()], &[project_id]).await;
+        let before_a = both_copies(&app, project_id, a.id).await;
+        let before_b = both_copies(&app, project_id, b.id).await;
+
+        let direct = set(&app, a.id, vec![b.id]).await.expect_err("direct cycle");
+        assert!(direct.contains("depend on itself"), "{direct}");
+        let indirect = set(&app, a.id, vec![c.id]).await.expect_err("indirect cycle");
+        assert!(indirect.contains("depend on itself"), "{indirect}");
+
+        assert_eq!(both_copies(&app, project_id, a.id).await, before_a);
+        assert_eq!(both_copies(&app, project_id, b.id).await, before_b, "the cycle partner is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_task_with_a_checkout_keeps_its_dependency() {
+        let project_id = Uuid::new_v4();
+        let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
+        // Backlog isolates the checkout rule: a Task past Backlog is refused
+        // by its status before the checkout is looked at.
+        let mut running = task(project_id, "running", TaskStatus::Backlog, vec![]);
+        running.branch_name = Some("slashit/running".to_string());
+        let (_tmp, _paths, app) = app_with(vec![parent.clone(), running.clone()], &[project_id]).await;
+        let before = both_copies(&app, project_id, running.id).await;
+
+        let error = set(&app, running.id, vec![parent.id]).await.expect_err("a checkout exists");
+        assert!(error.contains("checkout"), "{error}");
+        assert_eq!(both_copies(&app, project_id, running.id).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_dependency_survives_edits_that_do_not_name_it() {
+        let project_id = Uuid::new_v4();
+        let parent_a = task(project_id, "a", TaskStatus::Backlog, vec![]);
+        let parent_b = task(project_id, "b", TaskStatus::Backlog, vec![]);
+        let legacy = task(project_id, "legacy", TaskStatus::Backlog, vec![parent_a.id, parent_b.id]);
+        let (_tmp, _paths, app) = app_with(vec![parent_a.clone(), parent_b.clone(), legacy.clone()], &[project_id]).await;
+
+        update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            UpdateTaskParams {
+                task_id: legacy.id.to_string(),
+                title: Some("renamed".to_string()),
+                description: None,
+                category: None,
+                priority: None,
+                complexity: None,
+                impact: None,
+                security_severity: None,
+                model: None,
+                planning_mode: None,
+            },
+        )
+        .await
+        .expect("an unrelated edit is written")
+        .expect("the task exists");
+
+        let (memory, disk) = both_copies(&app, project_id, legacy.id).await;
+        assert_eq!(memory["title"], "renamed");
+        assert_eq!(disk["dependencies"], serde_json::json!([parent_a.id, parent_b.id]));
+    }
+
+    #[tokio::test]
+    async fn a_multi_dependency_record_refuses_a_change_and_keeps_its_set() {
+        let project_id = Uuid::new_v4();
+        let parent_a = task(project_id, "a", TaskStatus::Backlog, vec![]);
+        let parent_b = task(project_id, "b", TaskStatus::Backlog, vec![]);
+        let legacy = task(project_id, "legacy", TaskStatus::Backlog, vec![parent_a.id, parent_b.id]);
+        let (_tmp, _paths, app) = app_with(vec![parent_a.clone(), parent_b.clone(), legacy.clone()], &[project_id]).await;
+        let before = both_copies(&app, project_id, legacy.id).await;
+
+        for requested in [vec![], vec![parent_a.id]] {
+            let error = set(&app, legacy.id, requested).await.expect_err("refused");
+            assert!(error.contains("more than one dependency"), "{error}");
+        }
+
+        assert_eq!(both_copies(&app, project_id, legacy.id).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_dependency_is_read_back_from_disk_by_a_new_process() {
+        let project_id = Uuid::new_v4();
+        let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
+        let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
+        let (_tmp, paths, app) = app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
+        set(&app, child.id, vec![parent.id]).await.expect("set");
+
+        let restarted = Storage::with_paths((*paths).clone());
+        let on_disk = restarted
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == child.id)
+            .expect("the task must be on disk");
+        assert_eq!(on_disk.dependencies, vec![parent.id]);
     }
 }

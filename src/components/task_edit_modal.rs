@@ -1,8 +1,9 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::callback::Callback;
+use crate::components::task_dependency::{self, choice_for, requested, DependencyChoice, DependencyField};
 use crate::models::{Task, TaskCategory, TaskPriority};
-use crate::services::{create_task, update_task, delete_task, agent_service::list_available_models, agent_service::ModelInfo};
+use crate::services::{create_task, update_task, delete_task, set_task_dependencies, agent_service::list_available_models, agent_service::ModelInfo};
 use uuid::Uuid;
 
 #[derive(Clone, PartialEq)]
@@ -16,6 +17,8 @@ pub fn TaskEditModal(
     #[prop(into)] show: Signal<bool>,
     set_show: WriteSignal<bool>,
     #[prop(into)] mode: Signal<TaskEditMode>,
+    /// Every Task on the board. The form offers the ones of its own Project.
+    #[prop(into)] tasks: Signal<Vec<Task>>,
     project_id: String,
     #[prop(into)] on_save: Callback<Task>,
     #[prop(into)] on_delete: Callback<Uuid>,
@@ -26,7 +29,26 @@ pub fn TaskEditModal(
     let (priority, set_priority) = signal(TaskPriority::Medium);
     let (model, set_model) = signal("default".to_string());
     let (planning_mode, set_planning_mode) = signal(false);
-    
+
+    // The Depends on choice: at most one Task of this Project. The form keeps
+    // the selection, and the save sends it only when it changed.
+    let dependency = RwSignal::new(None::<Uuid>);
+    let project_uuid = Uuid::parse_str(&project_id).ok();
+    let dependency_options = Signal::derive(move || {
+        let subject = match mode.get() {
+            TaskEditMode::Create => None,
+            TaskEditMode::Edit(task) => Some(task.id),
+        };
+        match project_uuid {
+            Some(project) => task_dependency::candidates(&tasks.get(), project, subject),
+            None => Vec::new(),
+        }
+    });
+    let dependency_choice = Signal::derive(move || match mode.get() {
+        TaskEditMode::Create => choice_for(None),
+        TaskEditMode::Edit(task) => choice_for(Some(&*task)),
+    });
+
     let (available_models, set_available_models) = signal(Vec::<ModelInfo>::new());
 
     // Load available models on mount
@@ -73,6 +95,7 @@ pub fn TaskEditModal(
                     set_model.set("default".to_string());
                     set_planning_mode.set(false);
                     set_title_touched.set(false);
+                    dependency.set(None);
                 }
                 TaskEditMode::Edit(task) => {
                     set_title.set(task.title.clone());
@@ -82,6 +105,7 @@ pub fn TaskEditModal(
                     set_model.set(task.model.clone());
                     set_planning_mode.set(task.planning_mode);
                     set_title_touched.set(true); // Already has content
+                    dependency.set(task.dependencies.first().copied());
                 }
             }
             set_error_msg.set(None);
@@ -305,6 +329,14 @@ pub fn TaskEditModal(
                             }}
                         </div>
 
+                        // Depends on
+                        <DependencyField
+                            candidates=dependency_options
+                            selected=dependency
+                            choice=dependency_choice
+                            disabled=Signal::derive(move || submitting.get())
+                        />
+
                         // Planning mode toggle
                         <div class="flex items-center gap-3">
                             <button
@@ -388,6 +420,18 @@ pub fn TaskEditModal(
                                     let model_val = model.get();
                                     let planning_val = planning_mode.get();
                                     let mode_val = mode.get();
+                                    let dependency_val = dependency.get();
+                                    // Sent only when the form can change the dependency and the selection
+                                    // differs from the recorded one; otherwise the record is left alone.
+                                    let edit_dependency = match &mode_val {
+                                        TaskEditMode::Edit(task)
+                                            if choice_for(Some(&**task)) == DependencyChoice::Open
+                                                && dependency_val != task.dependencies.first().copied() =>
+                                        {
+                                            Some(requested(dependency_val))
+                                        }
+                                        _ => None,
+                                    };
 
                                     spawn_local(async move {
                                         let result = match mode_val {
@@ -398,7 +442,7 @@ pub fn TaskEditModal(
                                                     description: if description_val.is_empty() { None } else { Some(description_val) },
                                                     model: model_val,
                                                     planning_mode: planning_val,
-                                                    dependencies: vec![],
+                                                    dependencies: requested(dependency_val),
                                                     category: Some(category_val),
                                                     priority: Some(priority_val),
                                                     complexity: None,
@@ -407,6 +451,15 @@ pub fn TaskEditModal(
                                                 }).await
                                             }
                                             TaskEditMode::Edit(task) => {
+                                                // The dependency is refused or written before the other fields, so
+                                                // a refusal leaves the Task as it was and the form as it is.
+                                                if let Some(wanted) = edit_dependency {
+                                                    if let Err(e) = set_task_dependencies(task.id.to_string(), wanted).await {
+                                                        set_error_msg.set(Some(e));
+                                                        set_submitting.set(false);
+                                                        return;
+                                                    }
+                                                }
                                                 update_task(crate::services::task_service::UpdateTaskParams {
                                                     task_id: task.id.to_string(),
                                                     title: Some(title_val),

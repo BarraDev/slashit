@@ -82,3 +82,5 @@
 # Complete and Integrate from Human Review: one heavy journey with a restart and a dependent task.
 2	local_integration::approved_work_is_completed_and_integrated_in_one_action_and_a_dependent_task_starts_from_it
 3	local_integration::a_destination_that_moves_while_the_confirmation_is_open_is_refused_and_needs_a_new_confirmation
+# Task dependency control: a dependent Task created through the Depends on control, its drawer link, and its branch base.
+1	task_dependencies::a_task_created_with_the_depends_on_control_starts_from_its_parents_branch

@@ -380,6 +380,9 @@ pub fn Kanban(
     let on_task_click = Callback::new(move |task: Task| drawer_task.set(Some(task.id)));
 
     let on_drawer_close = Callback::new(move |()| drawer_task.set(None));
+    // Opening another Task from the drawer's dependency list: the drawer is keyed
+    // by task, so the new id mounts a fresh drawer for that Task.
+    let on_drawer_open = Callback::new(move |id: Uuid| drawer_task.set(Some(id)));
     let on_drawer_edit = Callback::new(move |task: Task| {
         drawer_task.set(None);
         set_modal_mode.set(TaskEditMode::Edit(Box::new(task)));
@@ -682,6 +685,7 @@ pub fn Kanban(
                     run_status=Signal::derive(move || live_runs.with(|r| r.status(&id)))
                     on_close=on_drawer_close
                     on_edit=on_drawer_edit
+                    on_open=on_drawer_open
                     apply_task=apply_task
                     refresh_tasks=refresh_tasks
                 />
@@ -692,6 +696,7 @@ pub fn Kanban(
                 show=Signal::from(show_modal)
                 set_show=set_show_modal
                 mode=Signal::from(modal_mode)
+                tasks=Signal::from(tasks_signal)
                 project_id=project_id_modal
                 on_save=on_task_save
                 on_delete=on_task_delete

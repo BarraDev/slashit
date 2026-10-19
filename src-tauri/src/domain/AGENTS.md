@@ -11,6 +11,7 @@ Domain models shared across backend modules. These types define the core data st
 - **session.rs** - Chat session with agents
 - **storage_usage.rs** - Disk usage summary, what each total means, and the disk pressure policy
 - **task.rs** - Task definition with dependencies
+- **task_dependencies.rs** - The rules for the dependencies a person configures: parsing (refuses malformed, repeated and more-than-one identifiers), checks against the Project's Tasks (self, missing, other Project, cycles), and when a recorded set may change. Creation and `set_task_dependencies` both use it, so they decide alike. A Task with several recorded dependencies keeps them
 - **workspace.rs** - Workspace: the Product Workspace that groups Projects (not a Task Checkout; see `docs/architecture/product-model.md`)
 
 ## Serialization
