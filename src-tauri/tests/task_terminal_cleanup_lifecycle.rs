@@ -503,6 +503,9 @@ async fn build_fixture(name: &str) -> (Fixture, AppState) {
         .expect("state must build under a tempdir");
     // Not about disk pressure: independent of the host's free space.
     state.start_guard = slashit_ui_lib::test_helpers::plenty_of_disk();
+    // The successor acquisition below goes through the command, which starts
+    // checkouts through the executor, as the app's setup installs it.
+    slashit_ui_lib::test_helpers::attach_test_executor(&state);
 
     // The product's own worktree creation, so the checkout under test sits
     // exactly where the product would put it.
