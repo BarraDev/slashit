@@ -2726,7 +2726,9 @@ impl TaskExecutor {
     /// the user has taken back.
     ///
     /// Also what an explicit "check now" does (`commands::pr::refresh_pr_status`),
-    /// so asking by hand has exactly the background poll's consequences.
+    /// so asking by hand has exactly the background poll's consequences. The
+    /// exception is a reference already recorded as merged: it is not finished
+    /// again, and only its missing merge commit is written.
     ///
     /// `merge_commit` is the commit GitHub reported for a merged pull request.
     /// It is recorded with the merge, and never on its own.

@@ -5194,9 +5194,11 @@ async fn pr_statuses_for_project(
 /// `TaskExecutor::apply_polled_pr_state`). An open pull
 /// request never moves the task or ends its work, in any column. Merged and
 /// closed have consequences only where a delivered pull request lives (Pull
-/// Request Created, Human Review, Done): a merge finishes the task, and a
-/// closure is explained as its error. Anywhere else a closure is only
-/// recorded and a merge only shown, and an unchanged state writes nothing.
+/// Request Created, Human Review, Done): a newly observed merge finishes the
+/// task, and a closure is explained as its error. A reference already recorded
+/// as merged is not finished again; a refresh can only write its missing merge
+/// commit. Anywhere else a closure is only recorded and a merge only shown, and
+/// an unchanged state writes nothing.
 ///
 /// Answers with the refreshed cache entries; a failed refresh is in its
 /// entry's `error`, beside the last good status.

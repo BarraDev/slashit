@@ -109,8 +109,8 @@ record stores its parent and fork point (below).
   `MERGED` state, when the merge is observed by the background poll or by an
   explicit refresh of the Task's pull request. A merge recorded any other way,
   such as linking an existing pull request that is already merged, records no
-  commit. A start validates the commit against the base it resolves, the same
-  base the new branch is created at, and creates the branch at that commit.
+  commit. A start checks that the merge commit is an ancestor of the base it
+  resolves, and creates the new branch at that same resolved base commit.
   Nothing is fetched during the start. A merged reference with no recorded
   commit is refused, and Refresh on the dependency's Task card records the
   commit. A refresh writes only that commit; it does not finish the Task again.
