@@ -171,10 +171,12 @@ record stores its parent and fork point (below).
   exact-checkout decision. An older SlashIt version may drop this optional
   field when it saves a Task; the next version then treats the evidence as
   unknown and requalifies or refuses. A supported restack carries the record
-  forward in the same durable Task write only when every exact required commit
-  remains on the landed base. Otherwise restacking is refused before changing
-  the checkout. Dependency branch advances alone do not invalidate a supported
-  admission.
+  forward in the same durable Task write when exact required commits remain on
+  the landed base. For the exact stacked parent whose merge commit was just
+  verified, its old branch commit requirement may be replaced with that merge
+  commit when the old work is in the recorded fork. Other missing requirements
+  refuse before changing the checkout. Dependency branch advances alone do not
+  invalidate a supported admission.
 
   Admission validation is read-only and runs before reattaching an existing
   branch. A refusal leaves its refs, checkout, branch and user files in place.
