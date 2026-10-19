@@ -808,6 +808,19 @@ architecture work alike. They refine the rules above; they do not replace them.
 - **Evidence for findings.** A review finding states a reproduction, a reachable
   failure path, or a violated invariant, and it is checked against the current
   code before it is reported.
+- **Established behavior stability.** Treat established, previously released
+  behavior as stable. Modify existing shared behavior only for a reproduced
+  defect, a proven violated invariant, or an unavoidable requirement of an
+  explicitly authorized feature. Before changing it, identify affected callers,
+  established invariants, compatibility consequences, and narrower alternatives.
+  Passing tests or AI reviewer agreement alone is not sufficient justification.
+  Do not perform opportunistic refactoring or cleanup. If the required correction
+  exceeds the authorized scope, stop and request an explicit decision.
+- **Verify current state first.** Before proposing implementation work, check the
+  finding against the current intended base commit and relevant existing tests.
+  Historical documentation and older source revisions may explain past behavior,
+  but are not evidence of current implementation. Explicitly identify when a
+  reported defect has already been fixed.
 - **Coverage by risk.** Choose regression tests by the correctness and safety
   risk of the change, not by a fixed count. Behavior that protects data,
   authorization, or ownership needs tests for its failure and negative paths.
