@@ -2690,13 +2690,18 @@ impl TaskExecutor {
         for ((key, answer), task_ids) in answers.into_iter().zip(task_ids) {
             let Ok(status) = answer else { continue };
             for task_id in task_ids {
-                self.apply_polled_pr_state(
+                if let Err(message) = self.apply_polled_pr_state(
                     task_id,
                     &key,
                     status.state,
                     status.merge_commit.as_deref(),
-                )
-                .await;
+                ).await {
+                    self.events.agent_event(AgentEvent::Log {
+                        task_id: task_id.to_string(),
+                        level: LogLevel::Warn,
+                        message,
+                    });
+                }
             }
         }
     }
@@ -2738,11 +2743,11 @@ impl TaskExecutor {
         key: &crate::pr_status::PrKey,
         state: crate::pr_status::PrState,
         merge_commit: Option<&str>,
-    ) {
+    ) -> Result<(), String> {
         use crate::pr_status::PrState;
 
         let Some(recorded) = state.as_recorded() else {
-            return;
+            return Ok(());
         };
         // Answers are applied once a whole batch has settled, so a newer
         // reading may have landed in the meantime, say an open after a
@@ -2753,7 +2758,13 @@ impl TaskExecutor {
             .and_then(|e| e.status)
             .is_some_and(|s| s.state != state)
         {
-            return;
+            return Ok(());
+        }
+        // A recorded merge needs only its evidence repaired, even when
+        // cleanup prevents a lifecycle transition. A declined repair must be
+        // reported to an explicit refresh.
+        if state == PrState::Merged && self.merge_on_record(task_id, key).await {
+            return self.record_missing_merge_commit(task_id, key, merge_commit).await;
         }
         let lifecycle = {
             let tasks = self.tasks.read().await;
@@ -2761,19 +2772,11 @@ impl TaskExecutor {
                 // Its interrupted cleanup is reported on the task and only an
                 // explicit lifecycle action finishes it; see
                 // `polled_pull_requests`.
-                Some(t) if t.cleanup_in_flight => return,
+                Some(t) if t.cleanup_in_flight => return Ok(()),
                 Some(t) => in_pr_lifecycle(t),
-                None => return,
+                None => return Ok(()),
             }
         };
-        // A merge already on record is not finished again. The only thing it
-        // may lack is the commit it came with, which is written alone.
-        if state == PrState::Merged && self.merge_on_record(task_id, key).await {
-            if let Some(commit) = merge_commit {
-                self.record_missing_merge_commit(task_id, key, commit).await;
-            }
-            return;
-        }
         match state {
             PrState::Merged if lifecycle => {
                 self.complete_merged_task(task_id, key, recorded, merge_commit)
@@ -2782,6 +2785,7 @@ impl TaskExecutor {
             PrState::Merged => {}
             _ => self.record_pr_poll_state(task_id, key, recorded).await,
         }
+        Ok(())
     }
 
     /// Whether the task records `key`'s pull request as merged already.
@@ -2807,22 +2811,37 @@ impl TaskExecutor {
         &self,
         task_id: Uuid,
         key: &crate::pr_status::PrKey,
-        commit: &str,
-    ) {
+        commit: Option<&str>,
+    ) -> Result<(), String> {
+        {
+            let tasks = self.tasks.read().await;
+            let task = tasks.get(&task_id).ok_or("Task not found")?;
+            let missing = task.external_refs.iter().any(|r| {
+                matches!(r, ExternalRef::GithubPr { number, repo, state, merge_commit, .. }
+                    if *number == key.number && *repo == key.repo
+                        && state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("MERGED"))
+                        && !merge_commit.as_deref().is_some_and(crate::worktree::restack::is_full_object_id))
+            });
+            if !missing {
+                return Ok(());
+            }
+            if task.cleanup_in_flight {
+                return Err(format!("Pull request #{} merge commit was not recorded: Task cleanup is in flight; refresh once it finishes", key.number));
+            }
+        }
+        let commit = commit.filter(|c| crate::worktree::restack::is_full_object_id(c))
+            .ok_or_else(|| format!("Pull request #{} merge commit was not recorded: GitHub returned no usable merge commit; refresh again", key.number))?;
         // Declined while the task is busy, and said so; the next refresh asks
         // again.
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
-            self.events.agent_event(AgentEvent::Log {
-                task_id: task_id.to_string(),
-                level: LogLevel::Warn,
-                message: format!(
-                    "The merge commit of pull request #{} was not recorded, because the Task \
-                     is busy; refresh the pull request again once it is idle",
-                    key.number
-                ),
-            });
-            return;
+            return Err(format!(
+                "Pull request #{} merge commit was not recorded: Task is busy; refresh once it is idle",
+                key.number
+            ));
         };
+        if self.tasks.read().await.get(&task_id).is_some_and(|t| t.cleanup_in_flight) {
+            return Err(format!("Pull request #{} merge commit was not recorded: Task cleanup is in flight; refresh once it finishes", key.number));
+        }
         let key_owned = key.clone();
         let commit_owned = commit.to_string();
         let backfill = move |staged: &mut HashMap<Uuid, Task>| {
@@ -2847,19 +2866,10 @@ impl TaskExecutor {
             }
             missing
         };
-        if let Err(e) =
-            crate::lifecycle::record_if_changed(&self.tasks, &self.storage, task_id, &backfill).await
-        {
-            self.events.agent_event(AgentEvent::Log {
-                task_id: task_id.to_string(),
-                level: LogLevel::Warn,
-                message: format!(
-                    "The merge commit of pull request #{} was not recorded, and the next refresh \
-                     asks for it again: {e}",
-                    key.number
-                ),
-            });
-        }
+        crate::lifecycle::record_if_changed(&self.tasks, &self.storage, task_id, &backfill)
+            .await
+            .map_err(|e| format!("Could not record merge commit for pull request #{}: {e}", key.number))?;
+        Ok(())
     }
 
     /// Record a non-`MERGED` pull request state observed by the poll above.
@@ -8301,7 +8311,7 @@ mod tests {
                 crate::pr_status::PrState::Merged,
                 Some(merged),
             )
-            .await;
+            .await.expect("observation applies");
 
         for (seen, task) in [
             ("in memory", executor.tasks.read().await[&id].clone()),
@@ -8315,6 +8325,84 @@ mod tests {
             assert_eq!(task.status, status_before, "{seen}: the task is not finished again");
             assert_eq!(recorded_pr_state(&task).as_deref(), Some("MERGED"), "{seen}");
         }
+    }
+
+    #[tokio::test]
+    async fn merge_backfill_reports_write_failure_without_publishing_evidence() {
+        use slashit_durable_fs::{fault, Stage};
+        let (executor, _temps) = test_executor();
+        let (id, project) = seed_with_pr(&executor, TaskStatus::Done,
+            pr_ref("owner/repo", 7, Some("MERGED"))).await;
+        let before = executor.tasks.read().await[&id].clone();
+        let _fault = fault::fail_at(Stage::SyncTemp, std::io::ErrorKind::Other);
+        let error = executor.apply_polled_pr_state(id,
+            &crate::pr_status::PrKey::new("owner/repo", 7),
+            crate::pr_status::PrState::Merged,
+            Some("1111111111111111111111111111111111111111"))
+            .await.expect_err("failed persistence must reach the caller");
+        assert!(error.contains("Could not record merge commit"), "{error}");
+        assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![None]);
+        assert_eq!(recorded_merge_commits(&on_disk_task(&executor, project, id)), vec![None]);
+        assert_eq!(executor.tasks.read().await[&id].updated_at, before.updated_at);
+    }
+
+    #[tokio::test]
+    async fn merge_backfill_reports_unconfirmed_durability_and_adopts_the_visible_write() {
+        use slashit_durable_fs::{fault, Stage};
+        let (executor, _temps) = test_executor();
+        let (id, project) = seed_with_pr(&executor, TaskStatus::Done,
+            pr_ref("owner/repo", 7, Some("MERGED"))).await;
+        let commit = "1111111111111111111111111111111111111111";
+        let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = executor.apply_polled_pr_state(id,
+            &crate::pr_status::PrKey::new("owner/repo", 7),
+            crate::pr_status::PrState::Merged, Some(commit))
+            .await.expect_err("unconfirmed durability is not success");
+        assert!(crate::config::says_in_place_but_unconfirmed(&error), "{error}");
+        assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![Some(commit.into())]);
+        assert_eq!(recorded_merge_commits(&on_disk_task(&executor, project, id)), vec![Some(commit.into())]);
+    }
+
+    #[tokio::test]
+    async fn merge_backfill_distinguishes_a_busy_task_from_valid_existing_evidence() {
+        let (executor, temps) = test_executor();
+        let (id, _) = seed_with_pr(&executor, TaskStatus::Done,
+            pr_ref("owner/repo", 7, Some("MERGED"))).await;
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let commit = "1111111111111111111111111111111111111111";
+        let lease = executor.lifecycle.try_acquire(id).await.unwrap();
+        let error = executor.apply_polled_pr_state(id, &key,
+            crate::pr_status::PrState::Merged, Some(commit)).await.unwrap_err();
+        assert!(error.contains("busy"), "{error}");
+        assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![None]);
+        drop(lease);
+        executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Merged, Some(commit))
+            .await.unwrap();
+        let before = executor.tasks.read().await[&id].updated_at;
+        let _lease = executor.lifecycle.try_acquire(id).await.unwrap();
+        block_persistence(&temps[0]);
+        executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Merged, None)
+            .await.expect("valid evidence requires neither a lease nor a write");
+        assert_eq!(executor.tasks.read().await[&id].updated_at, before);
+    }
+
+    #[tokio::test]
+    async fn merge_backfill_reports_cleanup_and_missing_remote_evidence() {
+        let (executor, _temps) = test_executor();
+        let (id, _) = seed_with_pr(&executor, TaskStatus::Done,
+            pr_ref("owner/repo", 7, Some("MERGED"))).await;
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        for commit in [None, Some("main")] {
+            let error = executor.apply_polled_pr_state(id, &key,
+                crate::pr_status::PrState::Merged, commit).await.unwrap_err();
+            assert!(error.contains("no usable merge commit"), "{error}");
+        }
+        executor.tasks.write().await.get_mut(&id).unwrap().cleanup_in_flight = true;
+        let error = executor.apply_polled_pr_state(id, &key,
+            crate::pr_status::PrState::Merged,
+            Some("1111111111111111111111111111111111111111")).await.unwrap_err();
+        assert!(error.contains("cleanup"), "{error}");
+        assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![None]);
     }
 
     #[tokio::test]
@@ -9365,7 +9453,7 @@ mod tests {
                 crate::pr_status::PrState::Merged,
                 Some(merged),
             )
-            .await;
+            .await.expect("observation applies");
 
         for (seen, task) in [
             ("in memory", executor.tasks.read().await[&id].clone()),
@@ -9400,7 +9488,7 @@ mod tests {
                 crate::pr_status::PrState::Merged,
                 Some("1111111111111111111111111111111111111111"),
             )
-            .await;
+            .await.expect("observation applies");
 
         let task = executor.tasks.read().await[&id].clone();
         assert_eq!(recorded_pr_state(&task).as_deref(), Some("OPEN"));
@@ -9452,7 +9540,7 @@ mod tests {
                 crate::pr_status::PrState::Merged,
                 None,
             )
-            .await;
+            .await.expect("observation applies");
 
         let states = |task: &Task| -> Vec<(String, Option<String>)> {
             task.external_refs
@@ -9542,7 +9630,7 @@ mod tests {
                 crate::pr_status::PrState::Merged,
                 None,
             )
-            .await;
+            .await.expect("observation applies");
 
         for (seen, task) in [
             ("in memory", executor.tasks.read().await[&id].clone()),
@@ -9649,7 +9737,7 @@ mod tests {
             crate::pr_status::PrState::Closed,
             crate::pr_status::PrState::Open,
         ] {
-            executor.apply_polled_pr_state(id, &key, answer, None).await;
+            executor.apply_polled_pr_state(id, &key, answer, None).await.expect("observation applies");
         }
 
         for (seen, task) in [
@@ -9702,7 +9790,7 @@ mod tests {
                 crate::pr_status::PrState::Merged,
                 None,
             )
-            .await;
+            .await.expect("observation applies");
 
         let after = executor.tasks.read().await[&id].clone();
         assert_eq!(after.status, TaskStatus::PrCreated);
@@ -9757,7 +9845,7 @@ mod tests {
                 crate::pr_status::PrState::Merged,
                 None,
             )
-            .await;
+            .await.expect("observation applies");
 
         for (seen, task) in [
             ("in memory", executor.tasks.read().await[&id].clone()),
@@ -9995,7 +10083,7 @@ mod tests {
                 crate::pr_status::PrState::Merged,
                 None,
             )
-            .await;
+            .await.expect("observation applies");
 
         for (seen, task) in [
             ("in memory", executor.tasks.read().await[&id].clone()),
@@ -10074,6 +10162,29 @@ mod tests {
             recorded_pr_state(&executor.tasks.read().await[&id]).as_deref(),
             Some("OPEN")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_poll_keeps_processing_after_one_observation_cannot_persist() {
+        use slashit_durable_fs::{fault, Stage};
+        let dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh(dir.path(), &format!("*) {OPEN_FAILING} ;;"));
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(gh, Duration::from_secs(5)));
+        let (executor, _temps) = test_executor_with_prs(statuses);
+        let (first, _) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 1, None)).await;
+        let (second, _) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 2, None)).await;
+        let _fault = fault::fail_at(Stage::SyncTemp, std::io::ErrorKind::Other);
+        executor.poll_pull_requests().await;
+        let tasks = executor.tasks.read().await;
+        let states = [recorded_pr_state(&tasks[&first]), recorded_pr_state(&tasks[&second])];
+        assert_eq!(states.iter().filter(|s| s.as_deref() == Some("OPEN")).count(), 1,
+            "the other observation still persists after one write fails: {states:?}");
+        assert_eq!(states.iter().filter(|s| s.is_none()).count(), 1);
+        for number in [1, 2] {
+            assert!(executor.pr_statuses.get(&crate::pr_status::PrKey::new("o/r", number))
+                .unwrap().status.is_some());
+        }
     }
 
     #[cfg(unix)]
@@ -10263,7 +10374,7 @@ mod tests {
 
             executor
                 .apply_polled_pr_state(id, &key, crate::pr_status::PrState::Closed, None)
-                .await;
+                .await.expect("observation applies");
 
             let after = executor.tasks.read().await[&id].clone();
             assert_eq!(
@@ -10300,7 +10411,7 @@ mod tests {
             )
             .await;
 
-            executor.apply_polled_pr_state(id, &key, stale, None).await;
+            executor.apply_polled_pr_state(id, &key, stale, None).await.expect("observation applies");
 
             let after = executor.tasks.read().await[&id].clone();
             assert_eq!(
