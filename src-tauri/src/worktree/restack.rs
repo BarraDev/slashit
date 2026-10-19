@@ -161,10 +161,8 @@ pub async fn has_commit(dir: &Path, oid: &str) -> Result<bool, String> {
     let ran = run(dir, &["cat-file", "-e", &format!("{oid}^{{commit}}")], &[]).await?;
     match ran.code {
         Some(0) => Ok(true),
-        // Git reports a missing object as `Not a valid object name` (status
-        // 128 for this fully qualified expression). Other nonzero results,
-        // including an unreadable or damaged object database, are not absence.
-        Some(1) => Ok(false),
+        // This Git version reports an absent full object with this explicit
+        // diagnostic. Any other nonzero status is an inspection failure.
         Some(128) if ran.stderr.contains("Not a valid object name") => Ok(false),
         _ => Err(format!("git could not inspect commit {oid}: {}", ran.stderr)),
     }
