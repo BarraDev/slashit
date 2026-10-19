@@ -2058,6 +2058,52 @@ mod tests {
         let unsupported: Task = serde_json::from_value(unsupported).unwrap();
         assert_eq!(unsupported.checkout_admission.unwrap().format_version, 99);
     }
+
+    #[test]
+    fn checkout_admission_with_required_commits_round_trips_through_task_toml() {
+        use super::{CheckoutAdmission, DependencyAdmission, DependencyRequirement, Task};
+        let mut task = super::tests::startable_task();
+        let dependency = uuid::Uuid::new_v4();
+        let repository = uuid::Uuid::new_v4();
+        let commits = vec!["a".repeat(40), "b".repeat(40)];
+        task.dependencies = vec![dependency];
+        task.checkout_admission = Some(CheckoutAdmission {
+            format_version: CheckoutAdmission::FORMAT_VERSION,
+            policy_version: CheckoutAdmission::POLICY_VERSION,
+            task_id: task.id,
+            repository_id: repository,
+            branch: "task/checkout".into(),
+            admitted_commit: "c".repeat(40),
+            dependencies: vec![DependencyAdmission {
+                task_id: dependency,
+                requirement: DependencyRequirement::Commits(commits),
+            }],
+        });
+
+        // Task boards use this same production TOML serializer and Task
+        // deserializer inside ProjectTasksFile.
+        let encoded = toml::to_string_pretty(&task).expect("Task TOML serialization");
+        let restarted: Task = toml::from_str(&encoded).expect("Task TOML deserialization");
+
+        assert_eq!(
+            restarted.checkout_admission, task.checkout_admission,
+            "all attestation identity, version, dependency and commit fields survive"
+        );
+        let admission = restarted.checkout_admission.unwrap();
+        assert_eq!(admission.format_version, CheckoutAdmission::FORMAT_VERSION);
+        assert_eq!(admission.policy_version, CheckoutAdmission::POLICY_VERSION);
+        assert_eq!(admission.task_id, task.id);
+        assert_eq!(admission.repository_id, repository);
+        assert_eq!(admission.branch, "task/checkout");
+        assert_eq!(admission.admitted_commit, "c".repeat(40));
+        assert_eq!(
+            admission.dependencies,
+            vec![DependencyAdmission {
+                task_id: dependency,
+                requirement: DependencyRequirement::Commits(vec!["a".repeat(40), "b".repeat(40)]),
+            }]
+        );
+    }
     use super::*;
 
     /// A pre-rename persisted task record: `workspace_id` (the old field

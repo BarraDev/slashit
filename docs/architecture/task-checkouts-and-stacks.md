@@ -183,7 +183,11 @@ record stores its parent and fork point (below).
   New branch creation and explicit checkout creation use the same planner and
   persist admission with checkout identity; a failed or unconfirmed write
   follows the existing durable-write cleanup rules and never launches a
-  Worker without a durable run-start record.
+  Worker without a durable run-start record. Immediately before that record,
+  the captured execution HEAD is checked again against the admitted commit.
+  This narrows the gap after reattachment, but an external Git writer can
+  still move the branch after that last check and before the provider starts;
+  eliminating that residual race requires broader branch ownership or locking.
 
   A refusal creates no branch or worktree, and changes no dependency, branch,
   worktree or user branch. The executor then records the refusal as the Task's

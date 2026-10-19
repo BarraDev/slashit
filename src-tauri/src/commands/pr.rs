@@ -10325,6 +10325,39 @@ mod tests {
                     );
                     let (state, _tmp) = build_test_state().await;
                     let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                    let parent_task_id = seed_task(
+                        &state,
+                        landed.repo.checkout.to_str().unwrap(),
+                        Some("task-parent"),
+                        TaskStatus::Done,
+                    )
+                    .await;
+                    let repository_id = {
+                        let tasks = state.task.tasks.read().await;
+                        state.project.projects.read().await[&tasks[&task_id].project_id]
+                            .repository_id
+                            .unwrap()
+                    };
+                    let admission = crate::domain::task::CheckoutAdmission {
+                        format_version: crate::domain::task::CheckoutAdmission::FORMAT_VERSION,
+                        policy_version: crate::domain::task::CheckoutAdmission::POLICY_VERSION,
+                        task_id,
+                        repository_id,
+                        branch: "task-branch".into(),
+                        admitted_commit: landed.child_tip.clone(),
+                        dependencies: vec![crate::domain::task::DependencyAdmission {
+                            task_id: parent_task_id,
+                            requirement: crate::domain::task::DependencyRequirement::Commits(vec![
+                                landed.base_commit.clone(),
+                            ]),
+                        }],
+                    };
+                    {
+                        let mut tasks = state.task.tasks.write().await;
+                        let task = tasks.get_mut(&task_id).unwrap();
+                        task.dependencies = vec![parent_task_id];
+                        task.checkout_admission = Some(admission.clone());
+                    }
 
                     let result = create_pr_inner(&state, &task_id.to_string()).await;
 
@@ -10346,6 +10379,7 @@ mod tests {
                     let tasks = state.task.tasks.read().await;
                     assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(landed.base_commit.as_str()));
                     assert_eq!(tasks[&task_id].branch_origin, stacked_on_parent());
+                    assert_eq!(tasks[&task_id].checkout_admission.as_ref(), Some(&admission), "the required commit already on landed main keeps its admission intact");
                 }
             }
 
@@ -10378,6 +10412,82 @@ mod tests {
                 git(co, &["fetch", "-q", "origin"]);
                 assert_eq!(subjects(co, "origin/main..origin/task-branch"), ["B1", "B2"]);
                 assert_eq!(git(co, &["show", "origin/task-branch:a.txt"]), "v2");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_required_non_parent_commit_missing_from_landed_base_refuses_without_mutation() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec::new(Landing::Squash));
+                let mock = MockGh::setup_answering(
+                    CHILD_PR_URL,
+                    r#"{"state":"OPEN"}"#,
+                    &merged_parent_answers(&landed),
+                );
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                let parent_task_id = seed_task(
+                    &state,
+                    landed.repo.checkout.to_str().unwrap(),
+                    Some("task-parent"),
+                    TaskStatus::Done,
+                )
+                .await;
+                let other_dependency_id = seed_task(
+                    &state,
+                    landed.repo.checkout.to_str().unwrap(),
+                    Some("another-dependency-branch"),
+                    TaskStatus::Done,
+                )
+                .await;
+                let repository_id = {
+                    let tasks = state.task.tasks.read().await;
+                    state.project.projects.read().await[&tasks[&task_id].project_id]
+                        .repository_id
+                        .unwrap()
+                };
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.dependencies = vec![parent_task_id, other_dependency_id];
+                    task.checkout_admission = Some(crate::domain::task::CheckoutAdmission {
+                        format_version: crate::domain::task::CheckoutAdmission::FORMAT_VERSION,
+                        policy_version: crate::domain::task::CheckoutAdmission::POLICY_VERSION,
+                        task_id,
+                        repository_id,
+                        branch: "task-branch".into(),
+                        admitted_commit: landed.child_tip.clone(),
+                        dependencies: vec![
+                            crate::domain::task::DependencyAdmission {
+                                task_id: parent_task_id,
+                                requirement: crate::domain::task::DependencyRequirement::Commits(vec![landed.base_commit.clone()]),
+                            },
+                            crate::domain::task::DependencyAdmission {
+                                task_id: other_dependency_id,
+                                requirement: crate::domain::task::DependencyRequirement::Commits(vec![landed.pr_commits[0].clone()]),
+                            },
+                        ],
+                    });
+                }
+                let record_before = serde_json::to_value(&state.task.tasks.read().await[&task_id]).unwrap();
+                let refs_before = git(&landed.repo.checkout, &["for-each-ref", "--format=%(refname) %(objectname)"])
+                    .lines()
+                    .filter(|line| !line.starts_with("refs/remotes/"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err("unlanded required work refuses restack");
+
+                assert!(error.contains("admitted dependency work is not present on the landed base"), "{error}");
+                assert_untouched("missing required commit", &state, &landed, task_id, &mock).await;
+                let refs_after = git(&landed.repo.checkout, &["for-each-ref", "--format=%(refname) %(objectname)"])
+                    .lines()
+                    .filter(|line| !line.starts_with("refs/remotes/"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(refs_after, refs_before, "all local refs stay unchanged");
+                assert_eq!(serde_json::to_value(&state.task.tasks.read().await[&task_id]).unwrap(), record_before, "the complete Task record is unchanged");
+                assert!(landed.worktree.is_dir(), "the checkout is preserved");
+                assert_eq!(git(&landed.worktree, &["rev-parse", "HEAD"]), landed.child_tip);
             }
 
             /// When the parent was amended after the task forked from it, the
