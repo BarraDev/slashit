@@ -5201,7 +5201,9 @@ async fn pr_statuses_for_project(
 /// an unchanged state writes nothing.
 ///
 /// Answers with the refreshed cache entries; a failed refresh is in its
-/// entry's `error`, beside the last good status.
+/// entry's `error`, beside the last good status. A required merge-commit
+/// backfill that fails or is declined returns an error after all answers have
+/// been processed; a fresh cache entry does not confirm a persisted repair.
 #[tauri::command]
 pub async fn refresh_pr_status(
     _gui: GuiMutation,
@@ -5226,12 +5228,24 @@ pub async fn refresh_pr_status(
     };
     // Asked a few at a time, like the poll; applied in order afterwards, each
     // on its own answer, so a timeout on one never drops another's.
+    let mut errors = Vec::new();
     for (key, answer) in state.pr_statuses.refresh_each(keys.clone()).await {
-        if let (Ok(status), Some(executor)) = (answer, state.executor.get()) {
-            executor
-                .apply_polled_pr_state(task_uuid, &key, status.state, status.merge_commit.as_deref())
-                .await;
+        if let Ok(status) = answer {
+            match state.executor.get() {
+                Some(executor) => {
+                    if let Err(error) = executor
+                        .apply_polled_pr_state(task_uuid, &key, status.state, status.merge_commit.as_deref())
+                        .await
+                    {
+                        errors.push(error);
+                    }
+                }
+                None => errors.push(format!("Pull request #{} was refreshed, but its observation could not be recorded: executor is unavailable", key.number)),
+            }
         }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
     }
     Ok(state.pr_statuses.entries_for(keys.iter()))
 }
@@ -12319,6 +12333,70 @@ mod tests {
         mod pr_command_ownership {
             use super::*;
             use crate::test_helpers::attach_test_executor;
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn explicit_refresh_reports_partial_backfill_failure_after_processing_other_refs() {
+                use tauri::Manager;
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup("unused",
+                    r#"{"state":"MERGED","mergeCommit":{"oid":"1111111111111111111111111111111111111111"}}"#);
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let id = seed_task(&state, "/tmp", None, TaskStatus::InProgress).await;
+                let project = {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&id).unwrap();
+                    for number in [7, 8, 9] {
+                        task.external_refs.push(ExternalRef::GithubPr {
+                            number, repo: "owner/repo".into(),
+                            url: format!("https://github.com/owner/repo/pull/{number}"),
+                            state: Some(if number == 9 { "OPEN" } else { "MERGED" }.into()),
+                            merge_commit: None,
+                        });
+                    }
+                    task.project_id
+                };
+                state.storage.save_project_tasks(project,
+                    &[state.task.tasks.read().await[&id].clone()]).unwrap();
+                let lease = state.task_lifecycle_locks.try_acquire(id).await.unwrap();
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let error = refresh_pr_status(GuiMutation::untracked(), app.state(), id.to_string())
+                    .await.expect_err("both required backfills are busy");
+                assert!(error.contains("#7") && error.contains("#8"), "{error}");
+                let state = app.state::<crate::AppState>();
+                for number in [7, 8, 9] {
+                    assert!(state.pr_statuses.get(&crate::pr_status::PrKey::new("owner/repo", number))
+                        .unwrap().status.is_some(), "each answer was processed");
+                }
+                assert!(state.task.tasks.read().await[&id].external_refs.iter().all(|r|
+                    !matches!(r, ExternalRef::GithubPr { merge_commit: Some(_), .. })));
+                drop(lease);
+                let fault = slashit_durable_fs::fault::fail_at(
+                    slashit_durable_fs::Stage::SyncTemp, std::io::ErrorKind::Other);
+                let error = refresh_pr_status(GuiMutation::untracked(), app.state(), id.to_string())
+                    .await.expect_err("the first repair fails, but the next must still persist");
+                assert!(error.contains("#7") && !error.contains("#8"), "{error}");
+                drop(fault);
+                for task in [state.task.tasks.read().await[&id].clone(),
+                    state.storage.load_project_tasks(project).unwrap().into_iter().find(|t| t.id == id).unwrap()] {
+                    let commits: Vec<_> = task.external_refs.iter().filter_map(|r| match r {
+                        ExternalRef::GithubPr { merge_commit, .. } => Some(merge_commit.clone()), _ => None,
+                    }).collect();
+                    assert_eq!(commits, vec![None, Some("1111111111111111111111111111111111111111".into()), None]);
+                }
+                let entries = refresh_pr_status(GuiMutation::untracked(), app.state(), id.to_string())
+                    .await.expect("idle retry repairs the remaining recorded merge");
+                assert_eq!(entries.len(), 2);
+                let task = state.task.tasks.read().await[&id].clone();
+                assert_eq!(task.status, TaskStatus::InProgress, "new merges outside delivery stay unrecorded");
+                let evidence: Vec<_> = task.external_refs.iter().filter_map(|r| match r {
+                    ExternalRef::GithubPr { merge_commit, .. } => Some(merge_commit.clone()), _ => None,
+                }).collect();
+                assert_eq!(evidence, vec![Some("1111111111111111111111111111111111111111".into()),
+                    Some("1111111111111111111111111111111111111111".into()), None]);
+                let _ = executor;
+            }
 
             /// A stand-in `claude` for the PR-helper path: prints one valid
             /// `stream-json` init line (so `ClaudeRunner`'s reader has
