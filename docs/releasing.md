@@ -12,7 +12,7 @@ installer accepts, and what "signed" does and does not mean here.
 ## The short version
 
 1. Bump every version in [the table below](#1-bump-the-version) to the same value.
-2. Move the `[Unreleased]` section of `CHANGELOG.md` under the new version.
+2. Move the `[Unreleased]` section of `CHANGELOG.md` under the new version, and write its reference link (see [Version links](#version-links-in-changelogmd)).
 3. Commit, then tag `v<version>` and push the tag.
 4. Watch the run. The preflight job rejects a bad version in seconds.
 5. Download one artifact per platform, install it, launch it.
@@ -124,7 +124,8 @@ and tag again. Never move a tag that has already produced a published release.
 
 1. **`preflight`** (Ubuntu, seconds, no build) — the tag matches
    `tauri.conf.json`; all four manifests match it; the version is packageable
-   as an MSI; `CHANGELOG.md` has a `## [<version>]` section. Everything else
+   as an MSI; `CHANGELOG.md` has a `## [<version>]` section and its
+   `[<version>]: https://` link. Everything else
    waits on this job.
 2. **`release`** (four runners in parallel) — builds the frontend with Trunk
    and the app with `tauri-action`, then creates or updates a **draft** release
@@ -134,10 +135,40 @@ and tag again. Never move a tag that has already produced a published release.
    including whether this particular version will be reachable by the updater.
 
 The release body links the `CHANGELOG.md` at the tag, which is the curated
-account of the release, and a search for merged pull requests. The body does
-not list pull requests itself: the first release alone would list over 150 of
-them, and a list would bury the summary. Commits pushed straight to `main` have
-no pull request, so they appear only in `CHANGELOG.md`.
+account of the release. It does not list pull requests: GitHub's generated
+notes would list every merged pull request in the repository (over 150 for the
+first release), which describes the project's history rather than this version.
+Commits pushed straight to `main` have no pull request and appear only in
+`CHANGELOG.md`.
+
+### Version links in CHANGELOG.md
+
+Each version has a reference link at the foot of `CHANGELOG.md`, in Keep a
+Changelog form. Write it when you cut the release, in the same commit that moves
+`[Unreleased]` under the version:
+
+- The first release links to its tag:
+
+  ```
+  [0.1.0]: https://github.com/BarraDev/slashit/releases/tag/v0.1.0
+  [Unreleased]: https://github.com/BarraDev/slashit/compare/v0.1.0...HEAD
+  ```
+
+- Each later release links to the comparison with the tag before it:
+
+  ```
+  [0.1.1]: https://github.com/BarraDev/slashit/compare/v0.1.0...v0.1.1
+  [Unreleased]: https://github.com/BarraDev/slashit/compare/v0.1.1...HEAD
+  ```
+
+Use the release tags as the boundaries, not `main` or dates. The comparison is
+the authoritative list of commits for the release, and it is fixed once the tag
+exists. The preflight job refuses a tag without its `[<version>]: https://`
+definition.
+
+Individual noteworthy entries may link their pull request, for example
+`([#123](https://github.com/BarraDev/slashit/pull/123))`. Entries are not
+required to, and the changelog does not mirror the pull request list.
 
 The release is named from the git ref, not from `tauri-action`'s `__VERSION__`
 placeholder. `__VERSION__` resolves from `tauri.conf.json`, so a tag and an app

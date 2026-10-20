@@ -78,6 +78,13 @@ jobs:
             fail "CHANGELOG.md has no '## [$version]' section. Move the [Unreleased] entries under the new version, then retag. See docs/releasing.md."
           fi
 
+          # 5. The version's reference link at the foot of CHANGELOG.md names
+          #    its tag or its comparison with the previous tag. Tags never move,
+          #    so the link stays valid after publication.
+          if ! grep -Fq -- "[$version]: https://" CHANGELOG.md; then
+            fail "CHANGELOG.md has no '[$version]: https://' link definition at its foot. Add it, pointing at the tag or at the comparison with the previous tag. See docs/releasing.md."
+          fi
+
           echo "Version $version is releasable."
 
   release:
@@ -143,14 +150,12 @@ jobs:
           # string by construction -- it just cannot drift again.
           tagName: ${{ github.ref_name }}
           releaseName: 'SlashIt ${{ github.ref_name }}'
-          # The curated summary is the CHANGELOG.md at this tag. Commits pushed
-          # straight to main have no pull request, so CHANGELOG.md is the only
-          # place they appear. The pull request link is a search, not a list,
-          # so the release body stays short.
+          # The curated summary is the CHANGELOG.md at this tag. Its link
+          # reference for this version points at the comparison with the
+          # previous release, so the body needs no version-specific link of
+          # its own and no list of merged pull requests.
           releaseBody: |
             Curated summary: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md
-
-            Merged pull requests: ${{ github.server_url }}/${{ github.repository }}/pulls?q=is%3Apr+is%3Amerged
 
             Installers are not yet OS code-signed: Windows SmartScreen and
             macOS Gatekeeper will warn on first run.
