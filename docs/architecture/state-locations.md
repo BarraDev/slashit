@@ -43,6 +43,47 @@ The categories are not a matter of taste. Runtime files must not survive a
 reboot, logs must not be committed, and caches must be safe to delete — none
 of which is true of a directory inside a git repository.
 
+## Task board compatibility
+
+A Project's Task board is `tasks.toml`, layout `version = 1`. The layout version
+is not bumped for additive fields, so it cannot be the only guard: a build
+that does not know a newer field would parse the board, ignore that field, and
+write the board back without it. Each board read therefore compares the file
+with what this build would write back. A board whose next save would drop data
+is unreadable, as a board that does not parse is: it is skipped at startup with
+a warning, every save of that Project is refused with the file path and the
+reason, and its bytes are never changed. Other Projects load and save normally.
+
+Refused, because this build does not understand the data:
+
+- a Task field this build does not have, including an empty list or table under one;
+- an Activity entry of a kind this build does not know, which `slashit_activity::lenient`
+  would otherwise skip;
+- an unknown field inside a known Activity entry;
+- an unknown top-level key, or a layout version newer than 1.
+
+Tolerated by design, because the dropped value is either known history or a
+value this build already discards:
+
+- `workspace_id` is read as the legacy name of `worktree_id` and written under the new name;
+- retired fields (`approver`, `base_revision`, `conflicted`, `current_change_id`,
+  `pending_changes`, `spec_hash`) are dropped by a save, as before;
+- `activity`, `executed_approvals`, `dirty_paths` and `fixed_content` when empty,
+  and `tip_reconfirmed` and `completes_task` when `false`, which the model omits
+  on write;
+- a malformed `checkout_admission`, which its deserializer treats as unknown.
+
+Not protected:
+
+- unknown scalar values under a known name, or a known field whose meaning a
+  newer build changed: the comparison looks at presence, not values;
+- a newer build that reuses a retired name for different data;
+- the external write window that the save path already documents, between the
+  last check and the rename.
+
+Preserving unknown data through a rewrite is not implemented. Opening a board
+written by a newer SlashIt needs that version, or the data removed by hand.
+
 ## Choosing where the board lives
 
 Per project, in Settings → Storage:
