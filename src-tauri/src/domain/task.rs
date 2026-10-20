@@ -91,8 +91,9 @@ where
     D: serde::Deserializer<'de>,
 {
     // A bad optional attestation must not make the containing Task board
-    // unreadable. Treat malformed shapes as unknown; a later write may drop
-    // the malformed value, which remains unknown rather than positive proof.
+    // unreadable. Treat malformed shapes as unknown, never as proof. The
+    // storage boundary refuses to rewrite a board whose malformed value would
+    // be dropped, so the bytes on disk are never silently discarded.
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(serde_json::from_value(value).ok())
 }

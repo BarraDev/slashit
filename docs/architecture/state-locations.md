@@ -61,6 +61,9 @@ Refused, because this build does not understand the data:
   would otherwise skip;
 - an unknown field inside a known Activity entry;
 - an unknown top-level key, or a layout version newer than 1.
+- a malformed `checkout_admission`. Its deserializer reads it as unknown, never as
+  proof, but a rewrite would drop the bytes, so the board is refused. No released
+  build wrote this field, so no legacy shape is tolerated.
 
 Tolerated by design, because the dropped value is either known history or a
 value this build already discards:
@@ -70,8 +73,7 @@ value this build already discards:
   `pending_changes`, `spec_hash`) are dropped by a save, as before;
 - `activity`, `executed_approvals`, `dirty_paths` and `fixed_content` when empty,
   and `tip_reconfirmed` and `completes_task` when `false`, which the model omits
-  on write;
-- a malformed `checkout_admission`, which its deserializer treats as unknown.
+  on write.
 
 Not protected:
 

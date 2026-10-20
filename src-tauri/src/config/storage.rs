@@ -332,11 +332,6 @@ const OMITTED_WHEN_EMPTY: &[&str] = &[
     "completes_task",
 ];
 
-/// Fields whose deserializer deliberately treats a malformed value as unknown
-/// and discards it, so the board stays readable (see
-/// `deserialize_checkout_admission`). Their absence after a save is by design.
-const DISCARDED_WHEN_MALFORMED: &[&str] = &["checkout_admission"];
-
 /// What a save of `file` would drop from the bytes in `contents`, described for
 /// a person, or `None` when every key and list entry the file holds comes back
 /// in the typed model's own serialization.
@@ -419,7 +414,7 @@ fn collect_dropped(
 }
 
 fn absence_is_expected(key: &str, value: &toml::Value) -> bool {
-    if RETIRED_FIELDS.contains(&key) || DISCARDED_WHEN_MALFORMED.contains(&key) {
+    if RETIRED_FIELDS.contains(&key) {
         return true;
     }
     let empty = match value {
@@ -2012,9 +2007,10 @@ mod tests {
 
     #[test]
     fn a_board_from_an_older_build_still_loads_and_saves() {
-        // Older names and retired fields, empty fields written by older
-        // builds, and a malformed attestation that its deserializer discards
-        // by design. None of these may make the board unreadable.
+        // Older names and retired fields, and empty fields written by older
+        // builds. None of these may make the board unreadable. A malformed
+        // checkout_admission is not in this list: it refuses the rewrite (see
+        // `a_malformed_checkout_admission_refuses_the_rewrite_and_keeps_the_bytes`).
         let (storage, _dir) = create_test_storage();
         let project_id = Uuid::new_v4();
         let worktree = Uuid::new_v4();
@@ -2023,7 +2019,6 @@ mod tests {
             task.insert("workspace_id".into(), worktree.to_string().into());
             task.insert("spec_hash".into(), "retired".into());
             task.insert("activity".into(), toml::Value::Array(vec![]));
-            task.insert("checkout_admission".into(), "malformed".into());
             let integration = task["local_integration"].as_table_mut().unwrap();
             integration.insert("tip_reconfirmed".into(), false.into());
             integration.insert("completes_task".into(), false.into());
@@ -2034,7 +2029,7 @@ mod tests {
 
         let loaded = storage.load_project_tasks(project_id).expect("older board loads");
         assert_eq!(loaded[0].worktree_id, Some(worktree), "legacy workspace_id is still read");
-        assert!(loaded[0].checkout_admission.is_none(), "malformed attestation stays unknown");
+        assert!(loaded[0].checkout_admission.is_none(), "a Task with no attestation stays unknown");
 
         storage.save_project_tasks(project_id, &loaded).expect("older board saves");
         let saved = fs::read_to_string(&path).unwrap();
@@ -2066,6 +2061,36 @@ mod tests {
         storage.save_project_tasks(healthy, &more).unwrap();
         assert_eq!(storage.load_project_tasks(healthy).unwrap().len(), 2);
         assert_eq!(fs::read(&broken_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_malformed_checkout_admission_refuses_the_rewrite_and_keeps_the_bytes() {
+        // Nothing released ever wrote this field, so no legacy shape needs the
+        // malformed value tolerated. Its deserializer maps an unreadable value
+        // to `None`; a rewrite would then drop it silently. The board must stay
+        // unread and unchanged, and the diagnostic must name the Task and field.
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let bytes = board_text_edited(&valid_board_text(project_id), |table| {
+            let task = first_task_mut(table);
+            task.insert("id".into(), task_id.to_string().into());
+            task.insert("checkout_admission".into(), "a shape this build does not know".into());
+        });
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let error = storage.load_project_tasks(project_id).expect_err("malformed evidence refused");
+        let message = error.to_string();
+        assert!(message.contains("checkout_admission"), "{message}");
+        assert!(message.contains(&task_id.to_string()), "{message}");
+
+        let saved = storage
+            .save_project_tasks(project_id, &[crate::test_helpers::create_test_task("Fresh")])
+            .expect_err("a rewrite that would drop checkout_admission is refused");
+        assert!(saved.downcast_ref::<UnreadableTasksFile>().is_some());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
