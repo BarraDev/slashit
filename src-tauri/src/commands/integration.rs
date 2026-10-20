@@ -385,12 +385,7 @@ async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Resu
         .branch_name
         .clone()
         .ok_or("This task has no branch recorded, so there is no work to integrate.")?;
-    let branch_tip = git::branch_tip(repo, &branch).await?.ok_or_else(|| {
-        format!(
-            "The task's branch {branch} no longer exists, so its approved work cannot be shown to \
-             belong to it. Restore the branch to integrate it."
-        )
-    })?;
+    let branch_tip = git::branch_tip(repo, &branch).await?;
 
     let project_base = state.project.projects.read().await.get(&task.project_id).and_then(|p| p.base.clone());
     let local_is_base = project_base.as_ref().is_some_and(|b| b.prefers_local());
@@ -428,6 +423,37 @@ async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Resu
         }
         _ => {}
     }
+    let branch_tip = match branch_tip {
+        Some(branch_tip) => branch_tip,
+        None => {
+            let missing_branch = || {
+                format!(
+                    "The task's branch {branch} no longer exists, so its approved work cannot be shown to \
+                     belong to it. Restore the branch to integrate it."
+                )
+            };
+            // Recover only a completed-local Task with an exact approved
+            // commit, and never use this path to finish a Pending operation.
+            // The configured target must already contain that commit; the
+            // branch is never recreated or moved here.
+            if intent != Intent::AfterCompletion
+                || !task.completed_locally()
+                || task.local_integration.as_ref().is_some_and(|r| r.is_pending())
+            {
+                return Err(missing_branch());
+            }
+            let Some(approved) = task.human_review.approved_tip() else {
+                return Err(missing_branch());
+            };
+            if !crate::worktree::restack::has_commit(repo, approved).await? {
+                return Err(format!("The approved commit {approved} is not in this repository any more."));
+            }
+            if !is_ancestor(repo, approved, &target_tip).await? {
+                return Err(missing_branch());
+            }
+            approved.to_string()
+        }
+    };
     Ok(Prepared { task, repo_path, branch, branch_tip, target, target_tip, local_is_base })
 }
 
@@ -537,6 +563,7 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
 
     if let Some(record) = &p.task.local_integration {
         if record.state == IntegrationState::Integrated
+            && record.target_branch == p.target
             && record.approved_tip == approved
             && is_ancestor(repo, &approved, &p.target_tip).await?
         {
@@ -691,9 +718,17 @@ pub(crate) async fn complete_and_integrate(
 
     let task = current(state, task_id).await?;
     if task.completed_locally() {
-        let integrated = task.local_integration.as_ref().is_some_and(|r| {
+        let integrated = if let Some(record) = task.local_integration.as_ref().filter(|r| {
             r.state == IntegrationState::Integrated && task.human_review.approved_tip() == Some(r.approved_tip.as_str())
-        });
+        }) {
+            let repo_path = repo_path_of(state, task.project_id).await?;
+            match git::branch_tip(Path::new(&repo_path), &record.target_branch).await? {
+                Some(tip) => is_ancestor(Path::new(&repo_path), &record.approved_tip, &tip).await?,
+                None => false,
+            }
+        } else {
+            false
+        };
         return if integrated {
             Ok(task)
         } else {
@@ -746,6 +781,7 @@ async fn integrate_locked(
     }
     if let Some(record) = &p.task.local_integration {
         if record.state == IntegrationState::Integrated
+            && record.target_branch == p.target
             && record.approved_tip == approved
             && is_ancestor(repo, &approved, &p.target_tip).await?
         {
@@ -1141,6 +1177,10 @@ mod tests {
             .success()
     }
 
+    fn refs(repo: &Path) -> String {
+        git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
     /// Commit `file` on `branch`, leaving the primary checkout detached so no
     /// branch is checked out unless a test asks for it.
     fn commit_on(repo: &Path, branch: &str, file: &str, content: &str) -> String {
@@ -1309,7 +1349,9 @@ mod tests {
 
         // Asked again, it answers and does nothing.
         let again = integrate(&fx.state, fx.task_id, confirmation(&p)).await;
-        assert_eq!(preview(&fx.state, fx.task_id).await.unwrap().state, PreviewState::Integrated);
+        let verified = preview(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!(verified.state, PreviewState::Integrated);
+        assert!(complete_and_integrate(&fx.state, fx.task_id, confirmation(&verified)).await.is_ok());
         assert!(again.is_ok());
         assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
     }
@@ -1570,6 +1612,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deleted_task_branch_is_recovered_when_its_approved_commit_is_in_the_target() {
+        let fx = fixture().await;
+        git(&fx.repo, &["branch", "-f", "main", &fx.tip]);
+        git(&fx.repo, &["branch", "-D", &fx.branch]);
+        assert!(!ref_exists(&fx.repo, &format!("refs/heads/{}", fx.branch)));
+        assert!(is_ancestor(&fx.repo, &fx.tip, &tip_of(&fx.repo, "main")).await.unwrap());
+
+        let target_before = tip_of(&fx.repo, "main");
+        let refs_before = refs(&fx.repo);
+        let shown = preview(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!(shown.state, PreviewState::AlreadyContained);
+        assert_eq!(shown.approved_tip.as_deref(), Some(fx.tip.as_str()));
+        let done = integrate(&fx.state, fx.task_id, confirmation(&shown)).await.unwrap();
+        let record = done.local_integration.clone().expect("durable integration record");
+        assert_eq!(record.state, IntegrationState::Integrated);
+        assert_eq!(record.strategy, IntegrationStrategy::AlreadyContained);
+        assert_eq!(record.approved_tip, fx.tip);
+        assert_eq!(tip_of(&fx.repo, "main"), target_before, "confirmation moves no target");
+        assert_eq!(refs(&fx.repo), refs_before, "recognition creates or moves no Git refs");
+        assert!(!ref_exists(&fx.repo, &format!("refs/heads/{}", fx.branch)), "the Task branch stays deleted");
+        assert_eq!(on_disk(&fx, fx.task_id).local_integration, Some(record.clone()));
+
+        // Reload the durable board as startup does, then verify the record
+        // against Git again after the Task branch is still absent.
+        let (restarted, _) = crate::app_core::build_state_with_paths(std::sync::Arc::new(
+            crate::config::paths::AppPaths::with_roots(
+                fx._tmp.path().join("config"),
+                fx._tmp.path().join("data"),
+                fx._tmp.path().join("cache"),
+                fx._tmp.path().join("runtime"),
+            ),
+        ))
+        .await
+        .expect("restart state");
+        // The fixture's Project and repository are in memory only. Rehydrate
+        // them alongside the durable Task so the restarted state can verify
+        // integration against Git.
+        *restarted.repository.repositories.write().await = fx.state.repository.repositories.read().await.clone();
+        *restarted.project.projects.write().await = fx.state.project.projects.read().await.clone();
+        let restarted_tasks = restarted.storage.load_project_tasks(fx.project_id).unwrap();
+        restarted.task.tasks.write().await.extend(restarted_tasks.into_iter().map(|task| (task.id, task)));
+        assert_eq!(restarted.task.tasks.read().await.get(&fx.task_id).unwrap().local_integration, Some(record));
+        let verified = preview(&restarted, fx.task_id).await.unwrap();
+        assert_eq!(verified.state, PreviewState::Integrated);
+        assert!(complete_and_integrate(&restarted, fx.task_id, confirmation(&verified)).await.is_ok());
+
+        // The persisted Integrated flag is no substitute for current Git
+        // ancestry when the recorded target no longer holds the approval.
+        let parent = git(&fx.repo, &["rev-parse", &format!("{}^", fx.tip)]);
+        git(&fx.repo, &["update-ref", "refs/heads/main", &parent]);
+        let no_longer_contained = preview(&restarted, fx.task_id).await.unwrap();
+        assert_eq!(no_longer_contained.state, PreviewState::Refused);
+        assert!(no_longer_contained.reason.unwrap().contains("no longer exists"));
+        assert!(complete_and_integrate(&restarted, fx.task_id, confirmation(&verified)).await.unwrap_err().contains("without its approved work being integrated"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_unrelated_approved_commit_is_not_recovered_from_the_target_tree() {
+        for missing_object in [false, true] {
+            let fx = fixture().await;
+            git(&fx.repo, &["branch", "-f", "main", &fx.tip]);
+            let approved = if missing_object {
+                "f".repeat(40)
+            } else {
+                let later = commit_on(&fx.repo, &fx.branch, "later.txt", "later\n");
+                let task_id = fx.task_id;
+                let approved_later = later.clone();
+                let amend = move |tasks: &mut HashMap<Uuid, Task>| {
+                    tasks.get_mut(&task_id).unwrap().human_review.approve(Some(approved_later.clone()), chrono::Utc::now());
+                };
+                crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend).await.unwrap();
+                later
+            };
+            if missing_object {
+                let task_id = fx.task_id;
+                let missing_approved = approved.clone();
+                let amend = move |tasks: &mut HashMap<Uuid, Task>| {
+                    tasks.get_mut(&task_id).unwrap().human_review.approve(Some(missing_approved.clone()), chrono::Utc::now());
+                };
+                crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend).await.unwrap();
+            }
+            git(&fx.repo, &["branch", "-D", &fx.branch]);
+            let p = preview(&fx.state, fx.task_id).await.unwrap();
+            assert_eq!(p.state, PreviewState::Refused, "missing object: {missing_object}");
+            let reason = p.reason.unwrap();
+            assert!(
+                reason.contains(if missing_object { "not in this repository" } else { "no longer exists" }),
+                "{reason}"
+            );
+            assert!(fx.state.task.tasks.read().await.get(&fx.task_id).unwrap().local_integration.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn cherry_picked_equivalent_work_without_approved_ancestry_is_not_recovered() {
+        let fx = fixture().await;
+        commit_on(&fx.repo, "main", "other.txt", "other\n");
+        git(&fx.repo, &["checkout", "-q", "main"]);
+        git(&fx.repo, &["cherry-pick", &fx.tip]);
+        let target = tip_of(&fx.repo, "main");
+        git(&fx.repo, &["checkout", "-q", "--detach"]);
+        assert_ne!(target, fx.tip);
+        git(&fx.repo, &["branch", "-D", &fx.branch]);
+
+        let p = preview(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!(p.state, PreviewState::Refused);
+        assert!(p.reason.unwrap().contains("no longer exists"));
+    }
+
+    #[tokio::test]
+    async fn squashed_equivalent_work_without_approved_ancestry_is_not_recovered() {
+        let fx = fixture().await;
+        let parent = tip_of(&fx.repo, "main");
+        let tree = git(&fx.repo, &["rev-parse", &format!("{}^{{tree}}", fx.tip)]);
+        let squashed = git(&fx.repo, &["commit-tree", &tree, "-p", &parent, "-m", "squashed task"]);
+        git(&fx.repo, &["update-ref", "refs/heads/main", &squashed]);
+        git(&fx.repo, &["branch", "-D", &fx.branch]);
+        assert_eq!(git(&fx.repo, &["rev-parse", &format!("{}^{{tree}}", squashed)]), tree);
+        assert!(!is_ancestor(&fx.repo, &fx.tip, &squashed).await.unwrap());
+
+        let p = preview(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!(p.state, PreviewState::Refused);
+        assert!(p.reason.unwrap().contains("no longer exists"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_branch_does_not_override_task_origin_or_target_requirements() {
+        let fx = fixture().await;
+        git(&fx.repo, &["branch", "-f", "main", &fx.tip]);
+        let task_id = fx.task_id;
+        let amend = move |tasks: &mut HashMap<Uuid, Task>| {
+            tasks.get_mut(&task_id).unwrap().branch_origin = Some(BranchOrigin::LocalBase { branch: "other".into() });
+        };
+        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend).await.unwrap();
+        git(&fx.repo, &["branch", "-D", &fx.branch]);
+        let p = preview(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!(p.state, PreviewState::Refused);
+        assert!(p.reason.unwrap().contains("started from other"));
+
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().base =
+            Some(crate::domain::ProjectBase::LocalBranch { branch: "absent".into() });
+        fx.state.task.tasks.write().await.get_mut(&fx.task_id).unwrap().branch_origin =
+            Some(BranchOrigin::LocalBase { branch: "absent".into() });
+        let p = preview(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!(p.state, PreviewState::Refused);
+        assert!(p.reason.unwrap().contains("target branch absent does not exist"));
+    }
+
+    #[tokio::test]
+    async fn a_deleted_branch_requires_local_completion_and_a_commit_bound_approval() {
+        for no_approval in [false, true] {
+            let fx = fixture().await;
+            git(&fx.repo, &["branch", "-f", "main", &fx.tip]);
+            let task_id = fx.task_id;
+            let amend = move |tasks: &mut HashMap<Uuid, Task>| {
+                let review = &mut tasks.get_mut(&task_id).unwrap().human_review;
+                if no_approval {
+                    review.withdraw_approval();
+                } else {
+                    review.approve(None, chrono::Utc::now());
+                }
+            };
+            crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend).await.unwrap();
+            git(&fx.repo, &["branch", "-D", &fx.branch]);
+
+            let p = preview(&fx.state, fx.task_id).await.unwrap();
+            assert_eq!(p.state, PreviewState::Refused, "no current approval: {no_approval}");
+            let reason = p.reason.unwrap();
+            assert!(reason.contains(if no_approval { "no approval on record" } else { "branch " }), "{reason}");
+        }
+    }
+
+    #[tokio::test]
     async fn ineligible_tasks_are_refused_and_left_alone() {
         let fx = fixture().await;
         let before = tip_of(&fx.repo, "main");
@@ -1588,6 +1803,10 @@ mod tests {
         crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend).await.unwrap();
         let err = integrate(&fx.state, fx.task_id, confirm.clone()).await.unwrap_err();
         assert!(err.contains("completed locally"), "{err}");
+        git(&fx.repo, &["branch", "-D", &fx.branch]);
+        let p = preview(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!(p.state, PreviewState::Refused, "Done without the milestone stays ineligible");
+        assert!(p.reason.unwrap().contains("completed locally"));
 
         // A pull request.
         let with_pr = seed(&fx.state, fx.project_id, "task-a", Some(&fx.tip)).await;
@@ -1679,6 +1898,20 @@ mod tests {
         assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
         assert_eq!(tip_of(&fx.repo, "main"), plan.result);
         assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
+    }
+
+    #[tokio::test]
+    async fn a_pending_integration_with_a_deleted_task_branch_keeps_existing_recovery_behavior() {
+        let fx = fixture().await;
+        let plan = pending_unmoved(&fx).await;
+        git(&fx.repo, &["branch", "-D", &fx.branch]);
+
+        let p = preview(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!((p.state, p.observed.as_deref()), (PreviewState::Pending, Some("unmoved")));
+        let err = resume(&fx.state, fx.task_id).await.unwrap_err();
+        assert!(err.contains("no longer exists"), "{err}");
+        assert_eq!(tip_of(&fx.repo, "main"), plan.target_old);
+        assert_eq!(on_disk(&fx, fx.task_id).local_integration.unwrap().state, IntegrationState::Pending);
     }
 
     #[tokio::test]
