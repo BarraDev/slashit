@@ -71,6 +71,13 @@ jobs:
             [ "${BASH_REMATCH[5]}" -le 65535 ] || fail "MSI: prerelease number must be <= 65535 (got ${BASH_REMATCH[5]})."
           fi
 
+          # 4. The release text leads with the curated CHANGELOG.md section for
+          #    this version. Without it, the release would point readers at an
+          #    [Unreleased] section that says nothing has shipped yet.
+          if ! grep -Fq -- "## [$version]" CHANGELOG.md; then
+            fail "CHANGELOG.md has no '## [$version]' section. Move the [Unreleased] entries under the new version, then retag. See docs/releasing.md."
+          fi
+
           echo "Version $version is releasable."
 
   release:
@@ -136,11 +143,19 @@ jobs:
           # string by construction -- it just cannot drift again.
           tagName: ${{ github.ref_name }}
           releaseName: 'SlashIt ${{ github.ref_name }}'
+          # The curated summary is the CHANGELOG.md at this tag. The generated
+          # list below it covers merged pull requests only, so commits pushed
+          # straight to main appear in CHANGELOG.md and nowhere else.
           releaseBody: |
-            See CHANGELOG.md for what changed, and the assets below to install.
+            Curated summary: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md
 
             Installers are not yet OS code-signed: Windows SmartScreen and
             macOS Gatekeeper will warn on first run.
+          # Built by GitHub from the pull requests merged since the previous
+          # release, and placed after releaseBody. Only the matrix job that
+          # creates the draft uses this; the others find the draft and leave
+          # its body alone.
+          generateReleaseNotes: true
           # Drafts are deliberate. Nothing in this workflow verifies that the
           # artifacts install and launch, so a human checks them and presses
           # Publish. Note that a draft is invisible to the updater endpoint --

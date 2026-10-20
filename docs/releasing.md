@@ -124,13 +124,21 @@ and tag again. Never move a tag that has already produced a published release.
 
 1. **`preflight`** (Ubuntu, seconds, no build) — the tag matches
    `tauri.conf.json`; all four manifests match it; the version is packageable
-   as an MSI. Everything else waits on this job.
+   as an MSI; `CHANGELOG.md` has a `## [<version>]` section. Everything else
+   waits on this job.
 2. **`release`** (four runners in parallel) — builds the frontend with Trunk
    and the app with `tauri-action`, then creates or updates a **draft** release
    and uploads each platform's installers plus `latest.json`, the updater
    manifest.
 3. **`next-steps`** — writes the remaining manual steps into the run summary,
    including whether this particular version will be reachable by the updater.
+
+The release body opens with a link to the `CHANGELOG.md` at the tag, which is
+the curated account of the release. Below it, GitHub's generated notes list the
+merged pull requests since the previous release. Commits pushed straight to
+`main` have no pull request, so they appear only in `CHANGELOG.md`. The
+generated list is written once, when the draft is created, so a pull request
+merged after the tag is not in it.
 
 The release is named from the git ref, not from `tauri-action`'s `__VERSION__`
 placeholder. `__VERSION__` resolves from `tauri.conf.json`, so a tag and an app
