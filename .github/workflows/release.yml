@@ -143,19 +143,17 @@ jobs:
           # string by construction -- it just cannot drift again.
           tagName: ${{ github.ref_name }}
           releaseName: 'SlashIt ${{ github.ref_name }}'
-          # The curated summary is the CHANGELOG.md at this tag. The generated
-          # list below it covers merged pull requests only, so commits pushed
-          # straight to main appear in CHANGELOG.md and nowhere else.
+          # The curated summary is the CHANGELOG.md at this tag. Commits pushed
+          # straight to main have no pull request, so CHANGELOG.md is the only
+          # place they appear. The pull request link is a search, not a list,
+          # so the release body stays short.
           releaseBody: |
             Curated summary: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md
 
+            Merged pull requests: ${{ github.server_url }}/${{ github.repository }}/pulls?q=is%3Apr+is%3Amerged
+
             Installers are not yet OS code-signed: Windows SmartScreen and
             macOS Gatekeeper will warn on first run.
-          # Built by GitHub from the pull requests merged since the previous
-          # release, and placed after releaseBody. Only the matrix job that
-          # creates the draft uses this; the others find the draft and leave
-          # its body alone.
-          generateReleaseNotes: true
           # Drafts are deliberate. Nothing in this workflow verifies that the
           # artifacts install and launch, so a human checks them and presses
           # Publish. Note that a draft is invisible to the updater endpoint --

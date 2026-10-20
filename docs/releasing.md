@@ -133,12 +133,11 @@ and tag again. Never move a tag that has already produced a published release.
 3. **`next-steps`** — writes the remaining manual steps into the run summary,
    including whether this particular version will be reachable by the updater.
 
-The release body opens with a link to the `CHANGELOG.md` at the tag, which is
-the curated account of the release. Below it, GitHub's generated notes list the
-merged pull requests since the previous release. Commits pushed straight to
-`main` have no pull request, so they appear only in `CHANGELOG.md`. The
-generated list is written once, when the draft is created, so a pull request
-merged after the tag is not in it.
+The release body links the `CHANGELOG.md` at the tag, which is the curated
+account of the release, and a search for merged pull requests. The body does
+not list pull requests itself: the first release alone would list over 150 of
+them, and a list would bury the summary. Commits pushed straight to `main` have
+no pull request, so they appear only in `CHANGELOG.md`.
 
 The release is named from the git ref, not from `tauri-action`'s `__VERSION__`
 placeholder. `__VERSION__` resolves from `tauri.conf.json`, so a tag and an app
