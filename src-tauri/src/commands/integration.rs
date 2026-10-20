@@ -1646,22 +1646,26 @@ mod tests {
         ))
         .await
         .expect("restart state");
-        assert_eq!(
-            restarted.storage.load_project_tasks(fx.project_id).unwrap().into_iter().find(|t| t.id == fx.task_id).unwrap().local_integration,
-            Some(record)
-        );
-        let verified = preview(&fx.state, fx.task_id).await.unwrap();
+        // The fixture's Project and repository are in memory only. Rehydrate
+        // them alongside the durable Task so the restarted state can verify
+        // integration against Git.
+        *restarted.repository.repositories.write().await = fx.state.repository.repositories.read().await.clone();
+        *restarted.project.projects.write().await = fx.state.project.projects.read().await.clone();
+        let restarted_tasks = restarted.storage.load_project_tasks(fx.project_id).unwrap();
+        restarted.task.tasks.write().await.extend(restarted_tasks.into_iter().map(|task| (task.id, task)));
+        assert_eq!(restarted.task.tasks.read().await.get(&fx.task_id).unwrap().local_integration, Some(record));
+        let verified = preview(&restarted, fx.task_id).await.unwrap();
         assert_eq!(verified.state, PreviewState::Integrated);
-        assert!(complete_and_integrate(&fx.state, fx.task_id, confirmation(&verified)).await.is_ok());
+        assert!(complete_and_integrate(&restarted, fx.task_id, confirmation(&verified)).await.is_ok());
 
         // The persisted Integrated flag is no substitute for current Git
         // ancestry when the recorded target no longer holds the approval.
         let parent = git(&fx.repo, &["rev-parse", &format!("{}^", fx.tip)]);
         git(&fx.repo, &["update-ref", "refs/heads/main", &parent]);
-        let no_longer_contained = preview(&fx.state, fx.task_id).await.unwrap();
+        let no_longer_contained = preview(&restarted, fx.task_id).await.unwrap();
         assert_eq!(no_longer_contained.state, PreviewState::Refused);
         assert!(no_longer_contained.reason.unwrap().contains("no longer exists"));
-        assert!(complete_and_integrate(&fx.state, fx.task_id, confirmation(&verified)).await.unwrap_err().contains("without its approved work being integrated"));
+        assert!(complete_and_integrate(&restarted, fx.task_id, confirmation(&verified)).await.unwrap_err().contains("without its approved work being integrated"));
     }
 
     #[tokio::test]
