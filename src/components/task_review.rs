@@ -854,7 +854,7 @@ mod tests {
         );
 
         let mut entries = Vec::new();
-        slashit_activity::record(&mut entries, chrono::Utc::now(), slashit_activity::Kind::CompletedLocally);
+        slashit_activity::record(&mut entries, chrono::Utc::now(), slashit_activity::Kind::CompletedLocally {});
         t.activity = entries;
         assert!(t.completed_locally());
         let done = Delivery::CompletedLocally { branch: Some("task-1".into()) };

@@ -2307,7 +2307,7 @@ impl TaskExecutor {
                         .filter(|handoff| {
                             matches!(
                                 handoff.stage,
-                                crate::domain::task::WorkerHandoffStage::Started
+                                crate::domain::task::WorkerHandoffStage::Started {}
                             )
                         })
                         .map(|handoff| (task.id, handoff.run))
@@ -2326,7 +2326,7 @@ impl TaskExecutor {
                     handoff.run == run
                         && matches!(
                             handoff.stage,
-                            crate::domain::task::WorkerHandoffStage::Started
+                            crate::domain::task::WorkerHandoffStage::Started {}
                         )
                 })
             });
@@ -4343,7 +4343,7 @@ impl TaskExecutor {
                     branch: Some(branch.clone()),
                     start_head: Some(start_head.clone()),
                     acceptance: None,
-                    stage: crate::domain::task::WorkerHandoffStage::Started,
+                    stage: crate::domain::task::WorkerHandoffStage::Started {},
                 });
                 run.store(next, std::sync::atomic::Ordering::Relaxed);
             }
@@ -6072,7 +6072,7 @@ impl TaskExecutor {
                 stopped.worker_handoff.as_mut().filter(|handoff| {
                     matches!(
                         handoff.stage,
-                        crate::domain::task::WorkerHandoffStage::Started
+                        crate::domain::task::WorkerHandoffStage::Started {}
                     )
                 }) {
                 let reason = "The Worker was stopped before its provider and Git outcome were durably confirmed. Its Task Checkout was preserved for inspection.";
@@ -7692,7 +7692,7 @@ impl TaskExecutor {
                 if let Some(handoff) = task.worker_handoff.as_mut().filter(|h| h.run == Some(run)) {
                     if matches!(
                         handoff.stage,
-                        crate::domain::task::WorkerHandoffStage::Started
+                        crate::domain::task::WorkerHandoffStage::Started {}
                     ) {
                         handoff.stage =
                             crate::domain::task::WorkerHandoffStage::CommittedAwaitingReview {
@@ -7752,7 +7752,7 @@ impl TaskExecutor {
                         observed_commit,
                         ..
                     } => observed_commit.clone(),
-                    crate::domain::task::WorkerHandoffStage::Started => None,
+                    crate::domain::task::WorkerHandoffStage::Started {} => None,
                 })
             });
             let handoff = task
@@ -7882,7 +7882,7 @@ impl TaskExecutor {
                         handoff.run == run
                             && matches!(
                                 handoff.stage,
-                                crate::domain::task::WorkerHandoffStage::Started
+                                crate::domain::task::WorkerHandoffStage::Started {}
                             )
                     }) {
                         handoff.stage = crate::domain::task::WorkerHandoffStage::RecoveryRequired {
@@ -7903,7 +7903,7 @@ impl TaskExecutor {
                         handoff.run == run
                             && matches!(
                                 handoff.stage,
-                                crate::domain::task::WorkerHandoffStage::Started
+                                crate::domain::task::WorkerHandoffStage::Started {}
                             )
                     }) {
                         t.worker_handoff = None;
@@ -11250,7 +11250,7 @@ mod tests {
                 branch: Some("task-recovery".into()),
                 start_head: Some("a".repeat(40)),
                 acceptance: None,
-                stage: crate::domain::task::WorkerHandoffStage::Started,
+                stage: crate::domain::task::WorkerHandoffStage::Started {},
             });
             (task.id, task.project_id)
         };
@@ -11322,7 +11322,7 @@ mod tests {
                 branch: task.branch_name.clone(),
                 start_head: Some("a".repeat(40)),
                 acceptance: None,
-                stage: crate::domain::task::WorkerHandoffStage::Started,
+                stage: crate::domain::task::WorkerHandoffStage::Started {},
             });
             task.clone()
         };
@@ -12658,7 +12658,7 @@ mod tests {
 
         let mut tasks = executor.tasks.write().await;
         let dependency = tasks.get_mut(&dependency_id).unwrap();
-        dependency.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+        dependency.record_activity(crate::domain::task::ActivityKind::CompletedLocally {});
         *dependency = serde_json::from_str(&serde_json::to_string(&*dependency).unwrap()).unwrap();
         assert!(dependency.completed_locally());
         tip
@@ -13485,7 +13485,7 @@ mod tests {
         let tip = git_in(repo, &["rev-parse", branch]);
         let mut tasks = executor.tasks.write().await;
         let dependency = tasks.get_mut(&dependency_id).unwrap();
-        dependency.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+        dependency.record_activity(crate::domain::task::ActivityKind::CompletedLocally {});
         dependency.human_review.record_arrival();
         dependency
             .human_review
@@ -13675,7 +13675,7 @@ mod tests {
                 .await
                 .get_mut(&id)
                 .unwrap()
-                .record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+                .record_activity(crate::domain::task::ActivityKind::CompletedLocally {});
         }
         set_recorded_dependencies(&executor, task_id, vec![first_id, second_id]).await;
 
@@ -19504,7 +19504,7 @@ VERDICT: APPROVED"
                     branch: Some(WorktreeManager::branch_for_task(w.task_id)),
                     start_head: Some(w.main_tip.clone()),
                     acceptance: None,
-                    stage: crate::domain::task::WorkerHandoffStage::Started,
+                    stage: crate::domain::task::WorkerHandoffStage::Started {},
                 });
                 let board: Vec<_> = tasks
                     .values()
@@ -19733,7 +19733,7 @@ VERDICT: APPROVED"
                 .expect("durable start record remains");
             assert!(matches!(
                 handoff.stage,
-                crate::domain::task::WorkerHandoffStage::Started
+                crate::domain::task::WorkerHandoffStage::Started {}
             ));
             let tip = git_in(
                 &w.repo,
@@ -22144,7 +22144,7 @@ VERDICT: APPROVED"
         #[tokio::test]
         async fn editing_admission_is_refused_for_every_unresolved_handoff() {
             let stages = [
-                (TaskStatus::InProgress, WorkerHandoffStage::Started, false),
+                (TaskStatus::InProgress, WorkerHandoffStage::Started {}, false),
                 (
                     TaskStatus::InProgress,
                     WorkerHandoffStage::CommittedAwaitingReview { commit: commit() },
@@ -23441,7 +23441,7 @@ VERDICT: APPROVED"
                     branch: None,
                     start_head: None,
                     acceptance: None,
-                    stage: crate::domain::task::WorkerHandoffStage::Started,
+                    stage: crate::domain::task::WorkerHandoffStage::Started {},
                 });
             assert!(!matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
             assert_eq!(fx.task().await.status, TaskStatus::Backlog);

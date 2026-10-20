@@ -462,7 +462,7 @@ pub(crate) async fn complete_leased(
         if let Some(t) = staged.get_mut(&task_id) {
             t.overall_progress = 100;
             t.phase = crate::domain::task::TaskPhase::Complete;
-            t.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+            t.record_activity(crate::domain::task::ActivityKind::CompletedLocally {});
         }
     };
     let mut request = crate::lifecycle::TerminalizeRequest::new(TaskStatus::Done);
@@ -1134,7 +1134,7 @@ mod tests {
     }
 
     fn completions(task: &Task) -> usize {
-        task.activity.iter().filter(|e| e.kind == slashit_activity::Kind::CompletedLocally).count()
+        task.activity.iter().filter(|e| e.kind == slashit_activity::Kind::CompletedLocally {}).count()
     }
 
     #[tokio::test]

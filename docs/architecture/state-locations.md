@@ -43,6 +43,68 @@ The categories are not a matter of taste. Runtime files must not survive a
 reboot, logs must not be committed, and caches must be safe to delete — none
 of which is true of a directory inside a git repository.
 
+## Task board contract
+
+A Project's Task board is `tasks.toml`, layout `version = 1`. The persistent
+Rust types are the whole contract: a board is valid when they read it, and
+they read only what they declare. Every type reachable from the board refuses
+a key it does not declare (`deny_unknown_fields`), at the depth where the key
+appears, including inside tagged payloads. Nothing lists accepted or tolerated
+names a second time, and no name is permitted for having been used before.
+
+The layout version is not bumped for additive fields, so a build that does not
+know a newer field must not write the board back. It cannot: a board it cannot
+read is unreadable, and an unreadable board is skipped at startup with a
+warning, every save of that Project is refused with the file path and the
+parse error, and its bytes are never changed. Other Projects load and save
+normally.
+
+Refused, because this build does not understand the data:
+
+- a key no type declares, at any depth, with any value, including an empty list
+  or table and `false`;
+- an Activity entry of a kind this build does not know, or with a field it does
+  not know. The board reads Activity strictly; `slashit_activity::lenient` is
+  for readers that only display it;
+- a `checkout_admission` that does not parse, or that carries an undeclared
+  field. It is never read as unknown and never dropped by a later save;
+- a tag (`kind`, `type`, `state`, `ref_type`, `outcome`) this build does not
+  know;
+- a layout version newer than 1.
+
+Accepted by design:
+
+- a field the type lets a record omit (optional and defaulted fields), so
+  records written before a field existed still load;
+- `workspace_id`, the legacy name of `worktree_id`. It is read into
+  `worktree_id` and written back under the new name, so the value is kept.
+  This is the only alias.
+
+Records written by an earlier development build that this contract refuses
+(for example the removed `approver` and `spec_hash` fields of an old
+`human_review` table, which nothing ever populated) are not read. Nothing is
+migrated or rewritten automatically. An owner who has such a board removes
+the key by hand or recreates the Task.
+
+Two enums are written with empty braces (`WorkerHandoffStage::Started {}`,
+`Kind::CompletedLocally {}`) because serde ignores extra keys on a unit variant
+of an internally tagged enum even under `deny_unknown_fields`. The stored form
+is unchanged.
+
+Not protected:
+
+- a known field whose meaning a newer build changed under the same name and
+  type;
+- the external write window that the save path already documents, between the
+  last check and the rename.
+
+Preserving unknown data through a rewrite is not implemented. Opening a board
+written by a newer SlashIt needs that version, or the data removed by hand.
+
+`ExistingCheckoutEvidence` is also stored in Project Conversation files, so
+those refuse an undeclared field in it as well; a Conversation file that does
+not parse is already preserved untouched.
+
 ## Choosing where the board lives
 
 Per project, in Settings → Storage:

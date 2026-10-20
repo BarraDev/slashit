@@ -51,8 +51,12 @@ enum TasksFileState {
     Unreadable(UnreadableTasksFile),
 }
 
-/// Structure for storing tasks per project in TOML files
+/// Structure for storing tasks per project in TOML files.
+///
+/// Every persistent type below it refuses keys it does not declare, so a board
+/// that parses holds nothing a save would drop.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectTasksFile {
     pub version: u32,
     pub tasks: Vec<Task>,
@@ -1132,9 +1136,15 @@ impl Storage {
     /// Read one tasks file, applying reference migration.
     ///
     /// Only a missing file is `Absent`. Any other failure (permissions, bytes
-    /// that are not UTF-8, TOML that does not parse into the current types, a
-    /// layout version this build does not know) is `Unreadable`, because the
+    /// that are not UTF-8, TOML that does not parse into the current types, or
+    /// a layout version this build does not know) is `Unreadable`, because the
     /// file is there and holds something this run cannot account for.
+    ///
+    /// The persistent types are the whole contract. They refuse keys they do
+    /// not declare, Activity kinds they do not know and evidence that does not
+    /// parse, so a board that parses holds nothing a save would drop. A key a
+    /// newer build added is therefore as unreadable as a damaged file, and the
+    /// parse error names it.
     fn inspect_tasks_file(path: &Path) -> TasksFileState {
         let unreadable = |reason: String| {
             TasksFileState::Unreadable(UnreadableTasksFile {
@@ -1694,6 +1704,122 @@ mod tests {
                 "newer layout version",
                 valid.replacen("version = 1", "version = 2", 1).into_bytes(),
             ),
+            (
+                "unknown Task field",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table).insert("future_field".into(), "newer".into());
+                }),
+            ),
+            (
+                "unknown empty list on a Task",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table).insert("future_list".into(), toml::Value::Array(vec![]));
+                }),
+            ),
+            (
+                "unknown Activity kind",
+                board_text_edited(valid, unknown_activity_kind),
+            ),
+            (
+                "unknown false-valued field on a Task",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table).insert("future_flag".into(), false.into());
+                }),
+            ),
+            (
+                "unknown empty table on a Task",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table)
+                        .insert("future_table".into(), toml::Value::Table(toml::Table::new()));
+                }),
+            ),
+            (
+                "unknown field in the board envelope",
+                board_text_edited(valid, |table| {
+                    table.insert("future_envelope".into(), "newer".into());
+                }),
+            ),
+            (
+                "unknown field in a nested record",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table)["local_integration"]
+                        .as_table_mut()
+                        .unwrap()
+                        .insert("future_field".into(), "newer".into());
+                }),
+            ),
+            (
+                // The name belongs to a Human Review entry, not to an
+                // integration record: a name is never permission by itself.
+                "a field another record owns, in the wrong record",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table)["local_integration"]
+                        .as_table_mut()
+                        .unwrap()
+                        .insert("tip_reconfirmed".into(), false.into());
+                }),
+            ),
+            (
+                "a name an earlier build used, on a Task",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table).insert("spec_hash".into(), "retired".into());
+                    first_task_mut(table).insert("conflicted".into(), false.into());
+                }),
+            ),
+            (
+                "unknown field in a Human Review entry",
+                board_text_edited(valid, |table| {
+                    let entry: toml::Value = toml::from_str(
+                        "sequence = 1\narrival = 1\ndecision = \"approved\"\n\
+                         decided_at = \"2026-10-20T10:00:00Z\"\nfuture_field = false\n",
+                    )
+                    .unwrap();
+                    let review = first_task_mut(table)
+                        .entry("human_review")
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .unwrap();
+                    review.insert("arrivals".into(), 1_i64.into());
+                    review.insert("entries".into(), toml::Value::Array(vec![entry]));
+                }),
+            ),
+            (
+                "malformed checkout_admission",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table)
+                        .insert("checkout_admission".into(), "a shape this build does not know".into());
+                }),
+            ),
+            (
+                "checkout_admission with a field this build does not know",
+                board_text_edited(valid, |table| {
+                    let task_id = first_task_mut(table)["id"].as_str().unwrap().to_string();
+                    let admission: toml::Value = toml::from_str(&format!(
+                        "format_version = 1\npolicy_version = 1\ntask_id = \"{task_id}\"\n\
+                         repository_id = \"{}\"\nbranch = \"b\"\nadmitted_commit = \"c\"\n\
+                         dependencies = []\nfuture_field = []\n",
+                        Uuid::new_v4()
+                    ))
+                    .unwrap();
+                    first_task_mut(table).insert("checkout_admission".into(), admission);
+                }),
+            ),
+            (
+                "unknown field inside a known Activity entry",
+                board_text_edited(valid, |table| {
+                    let entry = slashit_activity::Entry {
+                        seq: 1,
+                        at: chrono::Utc::now(),
+                        kind: slashit_activity::Kind::Moved {
+                            from: slashit_activity::Column::Backlog,
+                            to: slashit_activity::Column::Queue,
+                        },
+                    };
+                    let mut entry = toml::Value::try_from(entry).unwrap();
+                    entry.as_table_mut().unwrap().insert("future_field".into(), "newer".into());
+                    first_task_mut(table).insert("activity".into(), toml::Value::Array(vec![entry]));
+                }),
+            ),
         ]
     }
 
@@ -1703,6 +1829,30 @@ mod tests {
             tasks: board_with_pending_integration(project_id),
         })
         .unwrap()
+    }
+
+    /// Edit a board through the TOML value model, so a test can put in data a
+    /// current build would not write.
+    fn board_text_edited(text: &str, edit: impl FnOnce(&mut toml::Table)) -> Vec<u8> {
+        let mut table: toml::Table = text.parse().unwrap();
+        edit(&mut table);
+        toml::to_string_pretty(&table).unwrap().into_bytes()
+    }
+
+    fn first_task_mut(table: &mut toml::Table) -> &mut toml::Table {
+        table["tasks"].as_array_mut().unwrap()[0].as_table_mut().unwrap()
+    }
+
+    /// A Task-level Activity list holding one entry of a kind this build does
+    /// not know, as a newer build would write it.
+    fn unknown_activity_kind(table: &mut toml::Table) {
+        let mut kind = toml::Table::new();
+        kind.insert("type".into(), "from_the_future".into());
+        let mut entry = toml::Table::new();
+        entry.insert("seq".into(), 1_i64.into());
+        entry.insert("at".into(), "2026-10-20T10:00:00Z".into());
+        entry.insert("kind".into(), kind.into());
+        first_task_mut(table).insert("activity".into(), toml::Value::Array(vec![entry.into()]));
     }
 
     #[test]
@@ -1823,6 +1973,120 @@ mod tests {
         storage.save_project_tasks(healthy, &more).unwrap();
         assert_eq!(storage.load_project_tasks(healthy).unwrap().len(), 2);
         assert_eq!(fs::read(&broken_path).unwrap(), b"tasks = [ not toml");
+    }
+
+    #[test]
+    fn a_legacy_worktree_key_and_explicit_empty_values_still_load_and_save() {
+        // The one renamed key (`workspace_id`) keeps its value, and values the
+        // model omits when empty are valid when a file spells them out. Nothing
+        // here is data a save would lose.
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let worktree = Uuid::new_v4();
+        let bytes = board_text_edited(&valid_board_text(project_id), |table| {
+            let task = first_task_mut(table);
+            task.insert("workspace_id".into(), worktree.to_string().into());
+            task.insert("activity".into(), toml::Value::Array(vec![]));
+            task.insert("executed_approvals".into(), toml::Value::Array(vec![]));
+            let integration = task["local_integration"].as_table_mut().unwrap();
+            integration.insert("completes_task".into(), false.into());
+            let entry: toml::Value = toml::from_str(
+                "sequence = 1\narrival = 1\ndecision = \"approved\"\n\
+                 decided_at = \"2026-10-20T10:00:00Z\"\ntip_reconfirmed = false\n",
+            )
+            .unwrap();
+            let review = task
+                .entry("human_review")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .unwrap();
+            review.insert("arrivals".into(), 1_i64.into());
+            review.insert("entries".into(), toml::Value::Array(vec![entry]));
+        });
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let loaded = storage.load_project_tasks(project_id).expect("board loads");
+        assert_eq!(loaded[0].worktree_id, Some(worktree), "legacy workspace_id is still read");
+        assert!(loaded[0].checkout_admission.is_none(), "a Task with no attestation stays unknown");
+        assert_eq!(loaded[0].human_review.entries.len(), 1);
+
+        storage.save_project_tasks(project_id, &loaded).expect("board saves");
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(&format!("worktree_id = \"{worktree}\"")), "value written under the new name");
+        assert!(!saved.contains("workspace_id"));
+        let reloaded = Storage::with_paths(storage.paths().clone());
+        let again = reloaded.load_project_tasks(project_id).unwrap();
+        assert_eq!(again[0].worktree_id, Some(worktree));
+        assert_eq!(again[0].human_review.entries.len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_field_in_one_board_does_not_stop_a_healthy_project() {
+        let (storage, _dir) = create_test_storage();
+        let broken = Uuid::new_v4();
+        let healthy = Uuid::new_v4();
+        storage.save_project_tasks(healthy, &board_with_pending_integration(healthy)).unwrap();
+        let broken_path = storage.tasks_path(broken);
+        fs::create_dir_all(broken_path.parent().unwrap()).unwrap();
+        let bytes = board_text_edited(&valid_board_text(broken), |table| {
+            first_task_mut(table).insert("future_field".into(), "newer".into());
+        });
+        fs::write(&broken_path, &bytes).unwrap();
+
+        let loaded = storage.load_all_tasks().unwrap();
+        assert_eq!(loaded.len(), 1, "the healthy project's Task still loads");
+        assert_eq!(storage.unreadable_task_files().unwrap(), vec![broken_path.clone()]);
+
+        let mut more = board_with_pending_integration(healthy);
+        more.push(crate::test_helpers::create_test_task("Second"));
+        storage.save_project_tasks(healthy, &more).unwrap();
+        assert_eq!(storage.load_project_tasks(healthy).unwrap().len(), 2);
+        assert_eq!(fs::read(&broken_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_valid_checkout_admission_loads_and_malformed_evidence_is_never_trusted() {
+        // Evidence that does not parse used to become "unknown" and was then
+        // dropped by the next save. It now makes the board unreadable, so the
+        // bytes stay and nothing is mistaken for an admission.
+        use crate::domain::task::{CheckoutAdmission, DependencyAdmission, DependencyRequirement};
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let mut admitted = crate::test_helpers::create_test_task("Admitted");
+        admitted.project_id = project_id;
+        admitted.checkout_admission = Some(CheckoutAdmission {
+            format_version: CheckoutAdmission::FORMAT_VERSION,
+            policy_version: CheckoutAdmission::POLICY_VERSION,
+            task_id: admitted.id,
+            repository_id: Uuid::new_v4(),
+            branch: "task/admitted".into(),
+            admitted_commit: "a".repeat(40),
+            dependencies: vec![DependencyAdmission {
+                task_id: Uuid::new_v4(),
+                requirement: DependencyRequirement::Branchless,
+            }],
+        });
+        storage.save_project_tasks(project_id, &[admitted.clone()]).unwrap();
+        let loaded = storage.load_project_tasks(project_id).unwrap();
+        assert_eq!(loaded[0].checkout_admission, admitted.checkout_admission);
+
+        let path = storage.tasks_path(project_id);
+        let bytes = board_text_edited(&valid_board_text(project_id), |table| {
+            first_task_mut(table)
+                .insert("checkout_admission".into(), "a shape this build does not know".into());
+        });
+        fs::write(&path, &bytes).unwrap();
+
+        let error = storage.load_project_tasks(project_id).expect_err("malformed evidence refused");
+        assert!(error.downcast_ref::<UnreadableTasksFile>().is_some());
+        assert!(error.to_string().contains("checkout_admission"), "{error}");
+        let saved = storage
+            .save_project_tasks(project_id, &[crate::test_helpers::create_test_task("Fresh")])
+            .expect_err("a rewrite that would drop the evidence is refused");
+        assert!(saved.downcast_ref::<UnreadableTasksFile>().is_some());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
@@ -2956,6 +3220,44 @@ user_name = "Test"
         assert!(!written.starts_with(&repo));
         assert!(!storage.legacy_tasks_path(project_id).exists());
         assert_eq!(storage.load_project_tasks(project_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unknown_data_refuses_a_routed_board_and_a_legacy_board_alike() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let project_id = Uuid::new_v4();
+        route_project_to(&storage, project_id, &repo);
+        let bytes = board_text_edited(&valid_board_text(project_id), |table| {
+            first_task_mut(table).insert("future_field".into(), "newer".into());
+        });
+
+        // The routed file, where a routed Project's board lives.
+        let routed = storage.tasks_path(project_id);
+        fs::create_dir_all(routed.parent().unwrap()).unwrap();
+        fs::write(&routed, &bytes).unwrap();
+        let error = storage.load_project_tasks(project_id).expect_err("routed board refused");
+        let message = error.to_string();
+        assert!(message.contains("future_field"), "{message}");
+        let saved = storage
+            .save_project_tasks(project_id, &[crate::test_helpers::create_test_task("Fresh")])
+            .expect_err("routed board not replaced");
+        assert!(saved.downcast_ref::<UnreadableTasksFile>().is_some());
+        assert_eq!(fs::read(&routed).unwrap(), bytes);
+        fs::remove_file(&routed).unwrap();
+
+        // The legacy file of a Project not yet migrated: the save must not
+        // shadow it with a routed board, and the legacy file must stay.
+        let legacy = storage.legacy_tasks_path(project_id);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, &bytes).unwrap();
+        assert!(storage.load_project_tasks(project_id).is_err());
+        assert!(storage
+            .save_project_tasks(project_id, &[crate::test_helpers::create_test_task("Fresh")])
+            .is_err());
+        assert_eq!(fs::read(&legacy).unwrap(), bytes);
+        assert!(!routed.exists(), "no routed board may be created over the legacy one");
     }
 
     #[test]

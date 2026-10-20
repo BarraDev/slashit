@@ -10,6 +10,9 @@ pub mod queue;
 pub mod storage;
 pub mod workspace_registry;
 
+#[cfg(test)]
+mod task_board_schema_tests;
+
 pub use queue::*;
 pub use storage::*;
 pub use workspace_registry::WorkspaceRegistry;

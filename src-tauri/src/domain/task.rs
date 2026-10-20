@@ -10,7 +10,7 @@ pub use slashit_activity::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "ref_type")]
+#[serde(tag = "ref_type", deny_unknown_fields)]
 pub enum ExternalRef {
     #[serde(rename = "github_issue")]
     GithubIssue {
@@ -45,6 +45,7 @@ pub enum ExternalRef {
 /// SlashIt admitted it. This is deliberately separate from Worker run and
 /// recovery records: neither proves dependency admission.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CheckoutAdmission {
     /// Version of this serialized record shape.
     pub format_version: u16,
@@ -70,31 +71,19 @@ impl CheckoutAdmission {
 
 /// The work one dependency required the admitted checkout to contain.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DependencyAdmission {
     pub task_id: Uuid,
     pub requirement: DependencyRequirement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", content = "commits", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "commits", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DependencyRequirement {
     /// The dependency had no recorded branch and therefore required no work.
     Branchless,
     /// These exact commits were required and verified at admission.
     Commits(Vec<String>),
-}
-
-fn deserialize_checkout_admission<'de, D>(
-    deserializer: D,
-) -> Result<Option<CheckoutAdmission>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    // A bad optional attestation must not make the containing Task board
-    // unreadable. Treat malformed shapes as unknown; a later write may drop
-    // the malformed value, which remains unknown rather than positive proof.
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).ok())
 }
 
 impl ExternalRef {
@@ -133,6 +122,7 @@ impl ExternalRef {
 /// A task that can be persisted to TOML files.
 /// Tasks are stored per-project in separate files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: Uuid,
     pub project_id: Uuid,
@@ -151,11 +141,10 @@ pub struct Task {
     pub last_observed_model: Option<String>,
     pub planning_mode: bool,
     pub dependencies: Vec<Uuid>,
-    /// Per-task git worktree. Renamed from `workspace_id`. Without the alias
-    /// a pre-rename record still deserializes (unknown fields are ignored),
-    /// but silently drops the reference — `worktree_id` defaults to `None`
-    /// since the old `workspace_id` key is never read. The alias makes the
-    /// legacy key populate this field instead of being discarded.
+    /// Per-task git worktree. Renamed from `workspace_id`. The board refuses
+    /// unknown keys, so without the alias a pre-rename record would be refused;
+    /// with it the legacy key populates this field and is written back under
+    /// the new name.
     #[serde(alias = "workspace_id", default)]
     pub worktree_id: Option<Uuid>,
     pub jj_change_id: Option<String>,
@@ -204,13 +193,11 @@ pub struct Task {
     pub branch_name: Option<String>,
 
     /// Versioned evidence of the dependency work this checkout held when it
-    /// was admitted. Missing or malformed evidence is unknown, never inferred
-    /// from the branch, `base_commit`, or Worker activity.
-    #[serde(
-        default,
-        deserialize_with = "deserialize_checkout_admission",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// was admitted. Missing evidence is unknown, never inferred from the
+    /// branch, `base_commit`, or Worker activity. Evidence that does not parse
+    /// is not unknown: it makes the board unreadable, so it is never trusted
+    /// and never dropped by a later write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_admission: Option<CheckoutAdmission>,
 
     /// The commit the task's worktree started from: the exact commit of the
@@ -316,13 +303,10 @@ pub struct Task {
     /// task may do from it. See [`slashit_activity`].
     ///
     /// A task written before this existed has none, and its timeline shows
-    /// only what the rest of its record proves. An entry a newer version
-    /// wrote is skipped rather than failing the load.
-    #[serde(
-        default,
-        deserialize_with = "slashit_activity::lenient",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    /// only what the rest of its record proves. An entry of a kind this
+    /// version does not know, or with a field it does not know, fails the
+    /// load: a skipped entry would be gone after the next save.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activity: Vec<ActivityEntry>,
 
     /// Durable evidence for the current or most recent coding Worker handoff.
@@ -378,6 +362,7 @@ pub const STALE_APPROVAL_REASON: &str = "This Task was edited after its queue re
 /// ([`Task::record_move`]). It is scoped to the run `for_run`; a binding left
 /// over from another attempt is dropped rather than honored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovedExecution {
     /// The Project action whose approval created this binding.
     pub approval_id: Uuid,
@@ -401,6 +386,7 @@ pub struct ApprovedExecution {
 
 /// Durable evidence that one run was started under one approval.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutedApproval {
     pub approval_id: Uuid,
     pub run: u32,
@@ -412,6 +398,7 @@ pub struct ExecutedApproval {
 
 /// Task-owned evidence that binds one coding run to its exact branch state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerHandoff {
     pub task_id: Uuid,
     pub project_id: Uuid,
@@ -443,6 +430,7 @@ pub struct WorkerHandoff {
 /// same run leaves no new entry to point at. Any change that Git can show, and
 /// any change to the reason, makes the launch refuse.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NewAttemptDecision {
     /// Client-generated identity of the decision, for idempotent retries.
     pub decision_id: Uuid,
@@ -472,6 +460,7 @@ pub struct NewAttemptDecision {
 /// A person's acceptance of one exact existing commit as the result of an
 /// interrupted coding run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerResultAcceptance {
     /// Client-generated identity of the decision, for idempotent retries.
     pub decision_id: Uuid,
@@ -485,9 +474,12 @@ pub struct WorkerResultAcceptance {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerHandoffStage {
-    Started,
+    /// Empty braces rather than a unit variant: serde ignores extra keys on a
+    /// unit variant of an internally tagged enum even under
+    /// `deny_unknown_fields`, and a record carrying one must not load.
+    Started {},
     CommittedAwaitingReview {
         commit: String,
     },
@@ -664,7 +656,7 @@ impl Task {
         self.worker_handoff
             .as_ref()
             .filter(|handoff| match &handoff.stage {
-                WorkerHandoffStage::Started
+                WorkerHandoffStage::Started {}
                 | WorkerHandoffStage::CommittedAwaitingReview { .. }
                 | WorkerHandoffStage::RecoveryRequired { .. } => true,
                 // A persisted later lifecycle state is itself evidence that
@@ -713,7 +705,7 @@ impl Task {
         }
         match self.worker_handoff.as_ref().map(|handoff| &handoff.stage) {
             None => None,
-            Some(WorkerHandoffStage::Started) => {
+            Some(WorkerHandoffStage::Started {}) => {
                 Some("This Task's last coding run never recorded its outcome, so its checkout cannot be reused".into())
             }
             Some(WorkerHandoffStage::CommittedAwaitingReview { .. }) => Some(
@@ -1184,6 +1176,7 @@ impl Task {
 /// branch is replayed onto (`onto`), and, once the replay is verified and the
 /// task's base is recorded, the tip it produced (`rewritten_tip`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PendingRepublish {
     /// The branch the task was stacked on, as `BranchOrigin::Stacked` names it.
     pub parent_branch: String,
@@ -1216,7 +1209,7 @@ pub struct PendingRepublish {
 /// What a task's branch currently starts from, as recorded on
 /// [`Task::branch_origin`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BranchOrigin {
     /// Starts from the repository's default base.
     ///
@@ -1253,6 +1246,7 @@ pub enum BranchOrigin {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PrReviewPlan {
     pub generated_at: chrono::DateTime<chrono::Utc>,
     pub pr_url: String,
@@ -1276,6 +1270,7 @@ pub struct PrReviewPlan {
 /// succeeded. It is what a later analysis compares the comment's current text
 /// with, instead of guessing from timestamps whether it was edited.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FixedContent {
     pub comment_id: u64,
     pub fingerprint: String,
@@ -1402,6 +1397,7 @@ impl PrReviewPlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PrReviewComment {
     pub id: Option<u64>,
     pub kind: PrCommentKind,
@@ -1460,6 +1456,7 @@ pub enum PrCommentKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PrReviewItem {
     #[serde(default)]
     pub comment_id: Option<u64>,
@@ -1562,6 +1559,7 @@ pub struct PrReviewItem {
 
 /// The checkout's tree before and after one fix agent ran.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FixEffect {
     pub before_tree: String,
     pub after_tree: String,
@@ -1588,6 +1586,7 @@ pub enum PrReviewDecision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PrReviewApplyResult {
     pub applied_at: chrono::DateTime<chrono::Utc>,
     pub agent_summary: String,
@@ -1744,6 +1743,7 @@ pub enum TaskPhase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Subtask {
     pub id: Uuid,
     pub title: String,
@@ -1751,6 +1751,7 @@ pub struct Subtask {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QaSignoff {
     pub status: QaStatus,
     pub issues_found: Vec<String>,
@@ -1787,6 +1788,7 @@ pub enum QaStatus {
 /// an earlier, never-populated shape whose keys are ignored, and loads as an
 /// empty record: no arrivals, no decisions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct HumanReviewRecord {
     /// How many times a run has carried the task into Human Review, plus
     /// the times an approval was withdrawn because the task went back to
@@ -1805,6 +1807,7 @@ pub struct HumanReviewRecord {
 
 /// One decision a person made at Human Review.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct HumanReviewEntry {
     /// Position in the task's review history, starting at 1.
     pub sequence: u32,
@@ -2022,7 +2025,7 @@ impl HumanReviewRecord {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn checkout_admission_survives_restart_and_bad_optional_evidence_becomes_unknown() {
+    fn checkout_admission_survives_restart_and_bad_evidence_refuses_the_record() {
         use super::{CheckoutAdmission, DependencyAdmission, DependencyRequirement, Task};
         let mut task = super::tests::startable_task();
         let dependency = uuid::Uuid::new_v4();
@@ -2048,10 +2051,20 @@ mod tests {
         let missing: Task = serde_json::from_value(missing).unwrap();
         assert!(missing.checkout_admission.is_none());
 
+        // Evidence that does not parse is neither trusted nor dropped: the
+        // record is refused, so a board holding it stays unreadable.
         let mut malformed: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         malformed["checkout_admission"] = serde_json::Value::String("unknown shape".into());
-        let malformed: Task = serde_json::from_value(malformed).unwrap();
-        assert!(malformed.checkout_admission.is_none());
+        assert!(serde_json::from_value::<Task>(malformed).is_err());
+
+        let mut extended: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        extended["checkout_admission"]["added_by_a_newer_build"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Task>(extended).is_err());
+
+        let mut requirement: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        requirement["checkout_admission"]["dependencies"][0]["requirement"]["kind"] =
+            serde_json::json!("from_the_future");
+        assert!(serde_json::from_value::<Task>(requirement).is_err());
 
         let mut unsupported: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         unsupported["checkout_admission"]["format_version"] = serde_json::json!(99);
@@ -2252,7 +2265,7 @@ mod tests {
             run: Some(1),
             branch: None,
             start_head: None,
-            stage: WorkerHandoffStage::Started,
+            stage: WorkerHandoffStage::Started {},
             acceptance: None,
         });
         assert!(!with_handoff.never_checked_out());
@@ -2438,7 +2451,7 @@ mod tests {
     fn a_new_attempt_decision_admits_nothing_once_the_recovery_is_no_longer_required() {
         let (mut task, _) = recovered_task_with_decision(1);
         task.new_attempt_confirmed = true;
-        task.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::Started;
+        task.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::Started {};
         assert!(!task.new_attempt_admits());
     }
 
@@ -2485,7 +2498,7 @@ mod tests {
         assert!(task.worker_recovery_refusal().is_some());
 
         for stage in [
-            WorkerHandoffStage::Started,
+            WorkerHandoffStage::Started {},
             WorkerHandoffStage::CommittedAwaitingReview {
                 commit: "b".repeat(40),
             },
@@ -2666,9 +2679,10 @@ mod tests {
         assert_eq!(toml::from_str::<Holder>(&toml_text).unwrap(), resolved);
     }
 
-    /// A board written before decisions were recorded -- with no
-    /// `human_review` at all, or with the earlier shape of that table that
-    /// nothing ever populated -- loads as a task nobody has reviewed yet.
+    /// A board written before decisions were recorded, with no `human_review`
+    /// at all, loads as a task nobody has reviewed yet. The earlier shape of
+    /// that table, which nothing ever populated, is not read: it is refused
+    /// like any other key this build does not declare.
     #[test]
     fn a_task_written_before_review_decisions_existed_has_an_empty_review_record() {
         assert!(!LEGACY_TASK_TOML.contains("human_review"));
@@ -2678,10 +2692,31 @@ mod tests {
         let earlier_shape = format!(
             "{LEGACY_TASK_TOML}\n[human_review]\napproved = true\napprover = \"someone\"\nfeedback = \"old\"\n"
         );
-        let task: Task = toml::from_str(&earlier_shape).expect("the earlier, unused shape");
-        assert_eq!(task.human_review, HumanReviewRecord::default());
         assert!(task.human_review.current_decision().is_none());
         assert!(task.human_review.pending_feedback().is_empty());
+        let error = toml::from_str::<Task>(&earlier_shape).expect_err("the earlier, unused shape");
+        assert!(error.message().contains("unknown field"), "{error}");
+    }
+
+    /// `Started` and `CompletedLocally` are written as empty struct variants so
+    /// that an extra key on them is refused. Their serialized form, which the
+    /// frontend's own models read over IPC, is what the unit variants wrote.
+    #[test]
+    fn the_empty_variants_keep_the_wire_shape_of_unit_variants() {
+        assert_eq!(
+            serde_json::to_string(&WorkerHandoffStage::Started {}).unwrap(),
+            r#"{"state":"started"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ActivityKind::CompletedLocally {}).unwrap(),
+            r#"{"type":"completed_locally"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkerHandoffStage>(r#"{"state":"started"}"#).unwrap(),
+            WorkerHandoffStage::Started {}
+        );
+        assert!(serde_json::from_str::<WorkerHandoffStage>(r#"{"state":"started","x":1}"#).is_err());
+        assert!(serde_json::from_str::<ActivityKind>(r#"{"type":"completed_locally","x":1}"#).is_err());
     }
 
     #[test]
@@ -2900,7 +2935,7 @@ mod tests {
             None,
             "a Done task not completed locally offers no Resume or Discard"
         );
-        done.record_activity(ActivityKind::CompletedLocally);
+        done.record_activity(ActivityKind::CompletedLocally {});
         assert_eq!(
             done.needs_you(false),
             Some(AttentionReason::IntegrationUnfinished)
@@ -2958,7 +2993,7 @@ mod tests {
             None,
             "not completed locally: no control to finish it"
         );
-        done.record_activity(ActivityKind::CompletedLocally);
+        done.record_activity(ActivityKind::CompletedLocally {});
         assert!(done.integration_unfinished_refusal().is_some());
 
         let mut stranded = startable_task();
@@ -2995,7 +3030,7 @@ mod tests {
         unfinished.local_integration = Some(integration(crate::domain::IntegrationState::Pending));
         let mut unfinished_done = startable_task();
         unfinished_done.status = TaskStatus::Done;
-        unfinished_done.record_activity(ActivityKind::CompletedLocally);
+        unfinished_done.record_activity(ActivityKind::CompletedLocally {});
         unfinished_done.local_integration =
             Some(integration(crate::domain::IntegrationState::Pending));
 

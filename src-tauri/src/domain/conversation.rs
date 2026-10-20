@@ -205,6 +205,7 @@ pub enum TaskMutation {
 /// Approval re-reads the checkout and refuses any difference, so the approved
 /// run starts only in the checkout the person was shown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExistingCheckoutEvidence {
     pub project_id: Uuid,
     pub task_id: Uuid,
@@ -852,6 +853,31 @@ mod tests {
         assert!(
             Conversation::parse_output(r#"{"type":"reply","text":"hi","task_id":"x"}"#).is_err()
         );
+    }
+
+    /// The same evidence is stored on a Task, whose board refuses keys it does
+    /// not declare, so a Conversation that holds it refuses them too.
+    #[test]
+    fn checkout_evidence_refuses_a_field_it_does_not_declare() {
+        let evidence = ExistingCheckoutEvidence {
+            project_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            repository_path: "/repo".into(),
+            checkout_path: "/repo/.checkouts/t".into(),
+            git_entry_identity: None,
+            branch: "task/t".into(),
+            branch_ref: "refs/heads/task/t".into(),
+            head: "a".repeat(40),
+            base_commit: "b".repeat(40),
+            run: 1,
+        };
+        let mut json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ExistingCheckoutEvidence>(json.clone()).unwrap(),
+            evidence
+        );
+        json["added_by_a_newer_build"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ExistingCheckoutEvidence>(json).is_err());
     }
 
     #[test]

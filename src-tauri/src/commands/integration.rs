@@ -1276,7 +1276,7 @@ mod tests {
         task.branch_name = Some(branch.to_string());
         task.human_review.record_arrival();
         task.human_review.approve(tip.map(str::to_string), chrono::Utc::now());
-        task.record_activity(ActivityKind::CompletedLocally);
+        task.record_activity(ActivityKind::CompletedLocally {});
         let id = task.id;
         state.task.tasks.write().await.insert(id, task);
         let all: Vec<Task> =
@@ -2649,7 +2649,7 @@ mod tests {
                 let amend = move |s: &mut HashMap<Uuid, Task>| {
                     let t = s.get_mut(&id).unwrap();
                     t.status = TaskStatus::HumanReview;
-                    t.activity.retain(|e| !matches!(e.kind, ActivityKind::CompletedLocally));
+                    t.activity.retain(|e| !matches!(e.kind, ActivityKind::CompletedLocally {}));
                     t.local_integration.as_mut().unwrap().completes_task = true;
                 };
                 crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend).await.unwrap();

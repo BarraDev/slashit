@@ -536,7 +536,7 @@ mod tests {
     fn a_task_that_completed_has_nothing_to_explain() {
         let mut done = task(TaskStatus::Done);
         let mut entries = Vec::new();
-        slashit_activity::record(&mut entries, chrono::Utc::now(), slashit_activity::Kind::CompletedLocally);
+        slashit_activity::record(&mut entries, chrono::Utc::now(), slashit_activity::Kind::CompletedLocally {});
         done.activity = entries;
         assert_eq!(not_completed_message(PREFIX, &done), None);
     }

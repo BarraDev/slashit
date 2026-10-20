@@ -927,7 +927,7 @@ mod tests {
         let fx = fixture().await;
         let request = fx.request(Uuid::new_v4()).await;
         fx.edit(|t| {
-            t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::Started;
+            t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::Started {};
         })
         .await;
 
@@ -974,7 +974,7 @@ mod tests {
             branch: Some(fx.branch.clone()),
             start_head: Some(fx.start.clone()),
             acceptance: None,
-            stage: WorkerHandoffStage::Started,
+            stage: WorkerHandoffStage::Started {},
         });
         fx.state
             .task
@@ -1348,7 +1348,7 @@ mod tests {
                 branch: t.branch_name.clone(),
                 start_head: Some(started_head.clone()),
                 acceptance: None,
-                stage: WorkerHandoffStage::Started,
+                stage: WorkerHandoffStage::Started {},
             });
         })
         .await;
@@ -1500,7 +1500,7 @@ mod tests {
             assert!(
                 matches!(
                     task.worker_handoff.as_ref().map(|h| &h.stage),
-                    Some(WorkerHandoffStage::Started)
+                    Some(WorkerHandoffStage::Started {})
                 ),
                 "{source}: {:?}",
                 task.worker_handoff
@@ -1664,7 +1664,7 @@ mod tests {
     #[tokio::test]
     async fn the_evidence_read_refuses_a_task_that_is_not_waiting_for_recovery() {
         let fx = fixture().await;
-        fx.edit(|t| t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::Started)
+        fx.edit(|t| t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::Started {})
             .await;
 
         let evidence = new_attempt_evidence(&fx.state, fx.task_id).await.unwrap();
