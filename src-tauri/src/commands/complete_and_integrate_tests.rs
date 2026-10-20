@@ -202,7 +202,7 @@ fn integrations(task: &Task) -> usize {
 }
 
 fn completions(task: &Task) -> usize {
-    count(task, |k| matches!(k, ActivityKind::CompletedLocally))
+    count(task, |k| matches!(k, ActivityKind::CompletedLocally {}))
 }
 
 /// Nothing happened: the target, the Task and its file are as they were.
@@ -239,7 +239,7 @@ fn assert_done_and_integrated(fx: &Fx, done: &Task, strategy: IntegrationStrateg
         .iter()
         .filter_map(|e| match &e.kind {
             ActivityKind::IntegratedLocally { .. } => Some("integrated"),
-            ActivityKind::CompletedLocally => Some("completed"),
+            ActivityKind::CompletedLocally {} => Some("completed"),
             _ => None,
         })
         .collect();

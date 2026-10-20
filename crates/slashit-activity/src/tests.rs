@@ -280,6 +280,63 @@ fn a_record_without_activity_or_with_unknown_entries_still_loads() {
     assert_eq!(loaded.activity[0].kind, Kind::RunCompleted { run: 1 });
 }
 
+/// What the backend's Task board reads: no `lenient`, so nothing is skipped.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct StrictHolder {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    activity: Vec<Entry>,
+}
+
+#[test]
+fn a_strict_list_keeps_every_entry_in_order_and_refuses_what_it_cannot_keep() {
+    let known = r#"activity = [
+        { seq = 1, at = "2026-09-29T14:01:00Z", kind = { type = "run_completed", run = 1 } },
+        { seq = 2, at = "2026-09-29T14:02:00Z", kind = { type = "completed_locally" } },
+        { seq = 3, at = "2026-09-29T14:03:00Z", kind = { type = "tool_used", run = 1, tool = "Read" } },
+    ]"#;
+    let loaded: StrictHolder = toml::from_str(known).unwrap();
+    assert_eq!(
+        loaded.activity.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        [1, 2, 3],
+        "nothing removed or reordered"
+    );
+    assert_eq!(loaded.activity[1].kind, Kind::CompletedLocally {});
+    assert_eq!(loaded.activity[2].kind, Kind::ToolUsed { run: 1, tool: "Read".into(), detail: None, count: 1 });
+    let text = toml::to_string(&loaded).unwrap();
+    assert_eq!(toml::from_str::<StrictHolder>(&text).unwrap(), loaded);
+
+    for (what, entry) in [
+        ("an unknown kind", r#"kind = { type = "from_a_newer_version" }"#),
+        ("an unknown field on an entry", r#"kind = { type = "run_completed", run = 1 }, future = true"#),
+        ("an unknown field on a kind", r#"kind = { type = "run_completed", run = 1, future = 1 }"#),
+        ("an unknown field on a kind with no fields", r#"kind = { type = "completed_locally", future = false }"#),
+        (
+            "an unknown field on a nested result",
+            r#"kind = { type = "run_result", run = 1, result = { outcome = "available", text = "x", future = [] } }"#,
+        ),
+    ] {
+        let text = format!(
+            "activity = [{{ seq = 1, at = \"2026-09-29T14:01:00Z\", {entry} }}]"
+        );
+        assert!(toml::from_str::<StrictHolder>(&text).is_err(), "{what} must be refused");
+    }
+}
+
+#[test]
+fn a_lenient_list_still_skips_what_it_does_not_know() {
+    // The Task board reads strictly; `lenient` serves readers that only
+    // display, which would rather show less than nothing. An entry with a field
+    // it does not declare is an entry it does not fully understand, so it is
+    // skipped like an unknown kind instead of being shown with the field lost.
+    let json = r#"{"activity":[
+        {"seq":1,"at":"2026-09-29T14:01:00Z","kind":{"type":"completed_locally","future":1}},
+        {"seq":2,"at":"2026-09-29T14:02:00Z","kind":{"type":"completed_locally"}}
+    ]}"#;
+    let loaded: Holder = serde_json::from_str(json).unwrap();
+    assert_eq!(loaded.activity.len(), 1);
+    assert_eq!(loaded.activity[0].seq, 2);
+}
+
 #[test]
 fn a_rows_kind_name_is_its_stored_type() {
     let kinds = [
@@ -305,7 +362,7 @@ fn a_rows_kind_name_is_its_stored_type() {
         Kind::PrLinked { url: String::new(), number: None },
         Kind::PrMerged { number: 1 },
         Kind::PrClosed { number: 1 },
-        Kind::CompletedLocally,
+        Kind::CompletedLocally {},
         Kind::IntegratedLocally { target: "main".into(), strategy: "fast_forward".into(), commit: "a".repeat(40) },
     ];
     let entries: Vec<Entry> =
@@ -450,11 +507,11 @@ fn the_next_run_counts_past_a_start_dropped_from_a_full_timeline() {
 fn a_local_completion_is_recorded_once_and_read_back() {
     let mut entries = Vec::new();
     assert!(!completed_locally(&entries));
-    assert!(record(&mut entries, t(1), Kind::CompletedLocally));
+    assert!(record(&mut entries, t(1), Kind::CompletedLocally {}));
     assert!(completed_locally(&entries));
 
     // Asked again, it is the same milestone.
-    assert!(!record(&mut entries, t(2), Kind::CompletedLocally));
+    assert!(!record(&mut entries, t(2), Kind::CompletedLocally {}));
     assert_eq!(entries.len(), 1);
 
     let items = timeline(t(0), [], &entries);

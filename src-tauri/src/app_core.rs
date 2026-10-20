@@ -793,7 +793,7 @@ fn migrate_task(task: &mut Task) -> bool {
         match task.worker_handoff.as_ref().map(|h| &h.stage) {
             Some(domain::task::WorkerHandoffStage::CommittedAwaitingReview { .. }) => {}
             Some(domain::task::WorkerHandoffStage::RecoveryRequired { .. }) => {}
-            Some(domain::task::WorkerHandoffStage::Started) => {
+            Some(domain::task::WorkerHandoffStage::Started {}) => {
                 mark_worker_recovery_required(
                     task,
                     run,
@@ -827,7 +827,7 @@ fn migrate_task(task: &mut Task) -> bool {
     if task.status != domain::TaskStatus::InProgress
         && matches!(
             task.worker_handoff.as_ref().map(|handoff| &handoff.stage),
-            Some(domain::task::WorkerHandoffStage::Started)
+            Some(domain::task::WorkerHandoffStage::Started {})
         )
     {
         let run = task.worker_handoff.as_ref().and_then(|handoff| handoff.run);
@@ -869,7 +869,7 @@ fn mark_worker_recovery_required(task: &mut Task, run: Option<u32>, reason: &str
             domain::task::WorkerHandoffStage::RecoveryRequired {
                 observed_commit, ..
             } => observed_commit.clone(),
-            domain::task::WorkerHandoffStage::Started => None,
+            domain::task::WorkerHandoffStage::Started {} => None,
         });
     let handoff = task
         .worker_handoff

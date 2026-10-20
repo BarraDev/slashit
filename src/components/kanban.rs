@@ -3195,7 +3195,7 @@ mod tests {
         assert!(offers_pr_sync(&finished, false), "an ordinary finished task still can link one");
 
         let mut local = finished;
-        slashit_activity::record(&mut local.activity, chrono::Utc::now(), slashit_activity::Kind::CompletedLocally);
+        slashit_activity::record(&mut local.activity, chrono::Utc::now(), slashit_activity::Kind::CompletedLocally {});
         assert!(local.completed_locally());
         assert!(!offers_pr_sync(&local, false));
     }

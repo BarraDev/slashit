@@ -13293,7 +13293,7 @@ mod tests {
                     tasks
                         .get_mut(&task_id)
                         .unwrap()
-                        .record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+                        .record_activity(crate::domain::task::ActivityKind::CompletedLocally {});
                 }
                 pin_pending_integration(&state, task_id, false).await;
                 let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();

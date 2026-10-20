@@ -118,7 +118,7 @@ mod tests {
         // An unfinished integration lists its project like any other reason,
         // for a task still in review and for one completed earlier.
         let mut unfinished = task(quiet, TaskStatus::Done, 0);
-        unfinished.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+        unfinished.record_activity(crate::domain::task::ActivityKind::CompletedLocally {});
         unfinished.local_integration = Some(crate::domain::LocalIntegration {
             state: crate::domain::IntegrationState::Pending,
             target_branch: "main".into(),

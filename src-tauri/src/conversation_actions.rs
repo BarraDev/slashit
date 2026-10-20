@@ -965,7 +965,7 @@ mod existing_checkout_tests {
         task.worktree_path = Some("/x".into());
         task.branch_name = Some("b".into());
         for stage in [
-            WorkerHandoffStage::Started,
+            WorkerHandoffStage::Started {},
             WorkerHandoffStage::CommittedAwaitingReview { commit: "c".into() },
             WorkerHandoffStage::RecoveryRequired { reason: "r".into(), observed_commit: None },
             WorkerHandoffStage::ResolvedToAiReview { commit: "c".into() },

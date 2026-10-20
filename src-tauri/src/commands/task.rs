@@ -2703,7 +2703,7 @@ mod queue_entry_from_a_status_move {
             run: Some(1),
             branch: None,
             start_head: None,
-            stage: WorkerHandoffStage::Started,
+            stage: WorkerHandoffStage::Started {},
             acceptance: None,
         });
         let (project_id, task_id) = seed(&state, task).await;

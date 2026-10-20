@@ -54,6 +54,7 @@ pub enum IntegrationState {
 /// current approved work is integrated is always asked of Git against that
 /// commit, never read from this record alone.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LocalIntegration {
     pub state: IntegrationState,
     /// The local branch that was advanced.

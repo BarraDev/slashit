@@ -116,7 +116,7 @@ pub enum AcceptWorkerResultOutcome {
 
 fn stage_name(stage: &WorkerHandoffStage) -> &'static str {
     match stage {
-        WorkerHandoffStage::Started => "started",
+        WorkerHandoffStage::Started {} => "started",
         WorkerHandoffStage::CommittedAwaitingReview { .. } => "committed_awaiting_review",
         WorkerHandoffStage::RecoveryRequired { .. } => "recovery_required",
         WorkerHandoffStage::ResolvedToAiReview { .. } => "resolved_to_ai_review",

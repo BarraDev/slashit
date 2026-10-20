@@ -931,7 +931,7 @@ pub(super) mod tests {
             completed_at: None,
             completes_task: false,
         });
-        task.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+        task.record_activity(crate::domain::task::ActivityKind::CompletedLocally {});
         let task_id = task.id;
         ctx.tasks.write().await.insert(task_id, task.clone());
         ctx.storage.save_project_tasks(project_id, &[task.clone()]).expect("seed the board");
@@ -1326,7 +1326,7 @@ mod lifecycle_ownership {
             run: Some(1),
             branch: None,
             start_head: None,
-            stage: crate::domain::WorkerHandoffStage::Started,
+            stage: crate::domain::WorkerHandoffStage::Started {},
             acceptance: None,
         });
         let task_id = seed_task(&ctx, task).await;

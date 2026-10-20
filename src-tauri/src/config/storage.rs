@@ -51,8 +51,12 @@ enum TasksFileState {
     Unreadable(UnreadableTasksFile),
 }
 
-/// Structure for storing tasks per project in TOML files
+/// Structure for storing tasks per project in TOML files.
+///
+/// Every persistent type below it refuses keys it does not declare, so a board
+/// that parses holds nothing a save would drop.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectTasksFile {
     pub version: u32,
     pub tasks: Vec<Task>,
@@ -306,123 +310,6 @@ fn migrate_task_refs(task: &mut Task) {
     if let Some(url) = task.gitlab_issue_url.as_ref() {
         task.external_refs.push(ExternalRef::GitlabIssue { url: url.clone() });
     }
-}
-
-/// Keys a Task or Activity entry carried in an earlier build and no longer
-/// has. A board that still holds one loads as before, and the next save drops
-/// it, as it always has. This tolerates history, not a future build's data.
-const RETIRED_FIELDS: &[&str] = &[
-    "approver",
-    "base_revision",
-    "conflicted",
-    "current_change_id",
-    "pending_changes",
-    "spec_hash",
-];
-
-/// Fields the typed model reads but omits on write when they are empty
-/// (`skip_serializing_if`). An absent key is not a loss when the file held the
-/// empty value.
-const OMITTED_WHEN_EMPTY: &[&str] = &[
-    "activity",
-    "executed_approvals",
-    "dirty_paths",
-    "fixed_content",
-    "tip_reconfirmed",
-    "completes_task",
-];
-
-/// What a save of `file` would drop from the bytes in `contents`, described for
-/// a person, or `None` when every key and list entry the file holds comes back
-/// in the typed model's own serialization.
-///
-/// The typed model reads more leniently than it writes: unknown fields are
-/// ignored, `slashit_activity::lenient` skips Activity entries of a kind it does
-/// not know, and a few fields are omitted when empty. A successful parse
-/// therefore proves nothing about what the file held. Scalar values are not
-/// compared, since they may be normalized on write; only data that is missing
-/// after a rewrite counts.
-fn data_a_save_would_drop(contents: &str, file: &ProjectTasksFile) -> Option<String> {
-    let mut original: toml::Table = match contents.parse() {
-        Ok(table) => table,
-        Err(e) => return Some(format!("it could not be re-read to check it ({e})")),
-    };
-    if let Some(toml::Value::Array(tasks)) = original.get_mut("tasks") {
-        for task in tasks.iter_mut().filter_map(toml::Value::as_table_mut) {
-            // `worktree_id` reads the legacy `workspace_id` key through a serde
-            // alias and writes it back under the new name, so the value is kept.
-            if let Some(legacy) = task.remove("workspace_id") {
-                task.entry("worktree_id").or_insert(legacy);
-            }
-        }
-    }
-    let rewritten = match toml::Value::try_from(file) {
-        Ok(value) => value,
-        Err(e) => return Some(format!("it could not be serialized to check it ({e})")),
-    };
-    let mut dropped = Vec::new();
-    collect_dropped(&toml::Value::Table(original), &rewritten, "", &mut dropped);
-    if dropped.is_empty() {
-        return None;
-    }
-    let shown = dropped.len().min(5);
-    let mut list = dropped[..shown].join(", ");
-    if dropped.len() > shown {
-        list.push_str(&format!(" and {} more", dropped.len() - shown));
-    }
-    Some(list)
-}
-
-fn collect_dropped(
-    original: &toml::Value,
-    rewritten: &toml::Value,
-    path: &str,
-    dropped: &mut Vec<String>,
-) {
-    match original {
-        toml::Value::Table(table) => {
-            for (key, value) in table {
-                let here = if path.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{path}.{key}")
-                };
-                match rewritten.get(key.as_str()) {
-                    Some(kept) => collect_dropped(value, kept, &here, dropped),
-                    None if absence_is_expected(key, value) => {}
-                    None => dropped.push(here),
-                }
-            }
-        }
-        toml::Value::Array(items) => {
-            let kept: &[toml::Value] = rewritten.as_array().map_or(&[][..], Vec::as_slice);
-            if kept.len() != items.len() {
-                let missing = items.len().saturating_sub(kept.len());
-                dropped.push(format!("{path} ({missing} of {} entries)", items.len()));
-                return;
-            }
-            for (index, (item, kept)) in items.iter().zip(kept).enumerate() {
-                let label = item
-                    .get("id")
-                    .and_then(toml::Value::as_str)
-                    .map_or_else(|| index.to_string(), str::to_string);
-                collect_dropped(item, kept, &format!("{path}[{label}]"), dropped);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn absence_is_expected(key: &str, value: &toml::Value) -> bool {
-    if RETIRED_FIELDS.contains(&key) {
-        return true;
-    }
-    let empty = match value {
-        toml::Value::Array(items) => items.is_empty(),
-        toml::Value::Boolean(set) => !set,
-        _ => false,
-    };
-    OMITTED_WHEN_EMPTY.contains(&key) && empty
 }
 
 #[derive(Clone)]
@@ -1249,10 +1136,15 @@ impl Storage {
     /// Read one tasks file, applying reference migration.
     ///
     /// Only a missing file is `Absent`. Any other failure (permissions, bytes
-    /// that are not UTF-8, TOML that does not parse into the current types, a
-    /// layout version this build does not know, or data a save would drop; see
-    /// [`data_a_save_would_drop`]) is `Unreadable`, because the file is there
-    /// and holds something this run cannot account for.
+    /// that are not UTF-8, TOML that does not parse into the current types, or
+    /// a layout version this build does not know) is `Unreadable`, because the
+    /// file is there and holds something this run cannot account for.
+    ///
+    /// The persistent types are the whole contract. They refuse keys they do
+    /// not declare, Activity kinds they do not know and evidence that does not
+    /// parse, so a board that parses holds nothing a save would drop. A key a
+    /// newer build added is therefore as unreadable as a damaged file, and the
+    /// parse error names it.
     fn inspect_tasks_file(path: &Path) -> TasksFileState {
         let unreadable = |reason: String| {
             TasksFileState::Unreadable(UnreadableTasksFile {
@@ -1271,12 +1163,6 @@ impl Storage {
                 file.version
             )),
             Ok(file) => {
-                if let Some(dropped) = data_a_save_would_drop(&contents, &file) {
-                    return unreadable(format!(
-                        "it holds data this SlashIt does not understand, which a save would drop: \
-                         {dropped}. A newer SlashIt may have written it"
-                    ));
-                }
                 let mut tasks = file.tasks;
                 for task in &mut tasks {
                     migrate_task_refs(task);
@@ -1835,6 +1721,90 @@ mod tests {
                 board_text_edited(valid, unknown_activity_kind),
             ),
             (
+                "unknown false-valued field on a Task",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table).insert("future_flag".into(), false.into());
+                }),
+            ),
+            (
+                "unknown empty table on a Task",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table)
+                        .insert("future_table".into(), toml::Value::Table(toml::Table::new()));
+                }),
+            ),
+            (
+                "unknown field in the board envelope",
+                board_text_edited(valid, |table| {
+                    table.insert("future_envelope".into(), "newer".into());
+                }),
+            ),
+            (
+                "unknown field in a nested record",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table)["local_integration"]
+                        .as_table_mut()
+                        .unwrap()
+                        .insert("future_field".into(), "newer".into());
+                }),
+            ),
+            (
+                // The name belongs to a Human Review entry, not to an
+                // integration record: a name is never permission by itself.
+                "a field another record owns, in the wrong record",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table)["local_integration"]
+                        .as_table_mut()
+                        .unwrap()
+                        .insert("tip_reconfirmed".into(), false.into());
+                }),
+            ),
+            (
+                "a name an earlier build used, on a Task",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table).insert("spec_hash".into(), "retired".into());
+                    first_task_mut(table).insert("conflicted".into(), false.into());
+                }),
+            ),
+            (
+                "unknown field in a Human Review entry",
+                board_text_edited(valid, |table| {
+                    let entry: toml::Value = toml::from_str(
+                        "sequence = 1\narrival = 1\ndecision = \"approved\"\n\
+                         decided_at = \"2026-10-20T10:00:00Z\"\nfuture_field = false\n",
+                    )
+                    .unwrap();
+                    let review = first_task_mut(table)
+                        .entry("human_review")
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .unwrap();
+                    review.insert("arrivals".into(), 1_i64.into());
+                    review.insert("entries".into(), toml::Value::Array(vec![entry]));
+                }),
+            ),
+            (
+                "malformed checkout_admission",
+                board_text_edited(valid, |table| {
+                    first_task_mut(table)
+                        .insert("checkout_admission".into(), "a shape this build does not know".into());
+                }),
+            ),
+            (
+                "checkout_admission with a field this build does not know",
+                board_text_edited(valid, |table| {
+                    let task_id = first_task_mut(table)["id"].as_str().unwrap().to_string();
+                    let admission: toml::Value = toml::from_str(&format!(
+                        "format_version = 1\npolicy_version = 1\ntask_id = \"{task_id}\"\n\
+                         repository_id = \"{}\"\nbranch = \"b\"\nadmitted_commit = \"c\"\n\
+                         dependencies = []\nfuture_field = []\n",
+                        Uuid::new_v4()
+                    ))
+                    .unwrap();
+                    first_task_mut(table).insert("checkout_admission".into(), admission);
+                }),
+            ),
+            (
                 "unknown field inside a known Activity entry",
                 board_text_edited(valid, |table| {
                     let entry = slashit_activity::Entry {
@@ -2006,37 +1976,50 @@ mod tests {
     }
 
     #[test]
-    fn a_board_from_an_older_build_still_loads_and_saves() {
-        // Older names and retired fields, and empty fields written by older
-        // builds. None of these may make the board unreadable. A malformed
-        // checkout_admission is not in this list: it refuses the rewrite (see
-        // `a_malformed_checkout_admission_refuses_the_rewrite_and_keeps_the_bytes`).
+    fn a_legacy_worktree_key_and_explicit_empty_values_still_load_and_save() {
+        // The one renamed key (`workspace_id`) keeps its value, and values the
+        // model omits when empty are valid when a file spells them out. Nothing
+        // here is data a save would lose.
         let (storage, _dir) = create_test_storage();
         let project_id = Uuid::new_v4();
         let worktree = Uuid::new_v4();
         let bytes = board_text_edited(&valid_board_text(project_id), |table| {
             let task = first_task_mut(table);
             task.insert("workspace_id".into(), worktree.to_string().into());
-            task.insert("spec_hash".into(), "retired".into());
             task.insert("activity".into(), toml::Value::Array(vec![]));
+            task.insert("executed_approvals".into(), toml::Value::Array(vec![]));
             let integration = task["local_integration"].as_table_mut().unwrap();
-            integration.insert("tip_reconfirmed".into(), false.into());
             integration.insert("completes_task".into(), false.into());
+            let entry: toml::Value = toml::from_str(
+                "sequence = 1\narrival = 1\ndecision = \"approved\"\n\
+                 decided_at = \"2026-10-20T10:00:00Z\"\ntip_reconfirmed = false\n",
+            )
+            .unwrap();
+            let review = task
+                .entry("human_review")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .unwrap();
+            review.insert("arrivals".into(), 1_i64.into());
+            review.insert("entries".into(), toml::Value::Array(vec![entry]));
         });
         let path = storage.tasks_path(project_id);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, &bytes).unwrap();
 
-        let loaded = storage.load_project_tasks(project_id).expect("older board loads");
+        let loaded = storage.load_project_tasks(project_id).expect("board loads");
         assert_eq!(loaded[0].worktree_id, Some(worktree), "legacy workspace_id is still read");
         assert!(loaded[0].checkout_admission.is_none(), "a Task with no attestation stays unknown");
+        assert_eq!(loaded[0].human_review.entries.len(), 1);
 
-        storage.save_project_tasks(project_id, &loaded).expect("older board saves");
+        storage.save_project_tasks(project_id, &loaded).expect("board saves");
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains(&format!("worktree_id = \"{worktree}\"")), "value written under the new name");
-        assert!(!saved.contains("spec_hash"), "a retired field is dropped as it always was");
+        assert!(!saved.contains("workspace_id"));
         let reloaded = Storage::with_paths(storage.paths().clone());
-        assert_eq!(reloaded.load_project_tasks(project_id).unwrap().len(), 1);
+        let again = reloaded.load_project_tasks(project_id).unwrap();
+        assert_eq!(again[0].worktree_id, Some(worktree));
+        assert_eq!(again[0].human_review.entries.len(), 1);
     }
 
     #[test]
@@ -2064,31 +2047,44 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_checkout_admission_refuses_the_rewrite_and_keeps_the_bytes() {
-        // Nothing released ever wrote this field, so no legacy shape needs the
-        // malformed value tolerated. Its deserializer maps an unreadable value
-        // to `None`; a rewrite would then drop it silently. The board must stay
-        // unread and unchanged, and the diagnostic must name the Task and field.
+    fn a_valid_checkout_admission_loads_and_malformed_evidence_is_never_trusted() {
+        // Evidence that does not parse used to become "unknown" and was then
+        // dropped by the next save. It now makes the board unreadable, so the
+        // bytes stay and nothing is mistaken for an admission.
+        use crate::domain::task::{CheckoutAdmission, DependencyAdmission, DependencyRequirement};
         let (storage, _dir) = create_test_storage();
         let project_id = Uuid::new_v4();
-        let task_id = Uuid::new_v4();
-        let bytes = board_text_edited(&valid_board_text(project_id), |table| {
-            let task = first_task_mut(table);
-            task.insert("id".into(), task_id.to_string().into());
-            task.insert("checkout_admission".into(), "a shape this build does not know".into());
+        let mut admitted = crate::test_helpers::create_test_task("Admitted");
+        admitted.project_id = project_id;
+        admitted.checkout_admission = Some(CheckoutAdmission {
+            format_version: CheckoutAdmission::FORMAT_VERSION,
+            policy_version: CheckoutAdmission::POLICY_VERSION,
+            task_id: admitted.id,
+            repository_id: Uuid::new_v4(),
+            branch: "task/admitted".into(),
+            admitted_commit: "a".repeat(40),
+            dependencies: vec![DependencyAdmission {
+                task_id: Uuid::new_v4(),
+                requirement: DependencyRequirement::Branchless,
+            }],
         });
+        storage.save_project_tasks(project_id, &[admitted.clone()]).unwrap();
+        let loaded = storage.load_project_tasks(project_id).unwrap();
+        assert_eq!(loaded[0].checkout_admission, admitted.checkout_admission);
+
         let path = storage.tasks_path(project_id);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = board_text_edited(&valid_board_text(project_id), |table| {
+            first_task_mut(table)
+                .insert("checkout_admission".into(), "a shape this build does not know".into());
+        });
         fs::write(&path, &bytes).unwrap();
 
         let error = storage.load_project_tasks(project_id).expect_err("malformed evidence refused");
-        let message = error.to_string();
-        assert!(message.contains("checkout_admission"), "{message}");
-        assert!(message.contains(&task_id.to_string()), "{message}");
-
+        assert!(error.downcast_ref::<UnreadableTasksFile>().is_some());
+        assert!(error.to_string().contains("checkout_admission"), "{error}");
         let saved = storage
             .save_project_tasks(project_id, &[crate::test_helpers::create_test_task("Fresh")])
-            .expect_err("a rewrite that would drop checkout_admission is refused");
+            .expect_err("a rewrite that would drop the evidence is refused");
         assert!(saved.downcast_ref::<UnreadableTasksFile>().is_some());
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
@@ -3233,9 +3229,7 @@ user_name = "Test"
         fs::create_dir_all(&repo).unwrap();
         let project_id = Uuid::new_v4();
         route_project_to(&storage, project_id, &repo);
-        let task_id = Uuid::new_v4();
         let bytes = board_text_edited(&valid_board_text(project_id), |table| {
-            first_task_mut(table).insert("id".into(), task_id.to_string().into());
             first_task_mut(table).insert("future_field".into(), "newer".into());
         });
 
@@ -3246,7 +3240,6 @@ user_name = "Test"
         let error = storage.load_project_tasks(project_id).expect_err("routed board refused");
         let message = error.to_string();
         assert!(message.contains("future_field"), "{message}");
-        assert!(message.contains(&task_id.to_string()), "{message}");
         let saved = storage
             .save_project_tasks(project_id, &[crate::test_helpers::create_test_task("Fresh")])
             .expect_err("routed board not replaced");

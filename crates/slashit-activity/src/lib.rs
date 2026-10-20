@@ -81,6 +81,7 @@ impl Column {
 
 /// One recorded milestone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Entry {
     /// Position in the task's history, starting at 1 and never reused, so two
     /// entries recorded at the same instant still have a fixed order.
@@ -93,7 +94,7 @@ pub struct Entry {
 /// the run's timeline keeps it. Only the provider's own final result text
 /// qualifies; streamed messages, tool calls and transcripts never do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunResult {
     /// The provider's final result, redacted, within [`MAX_RESULT_CHARS`].
     /// Whitespace runs, line breaks included, are kept as single spaces.
@@ -166,7 +167,7 @@ impl RunResult {
 /// reviews, each starting at 1, so a retry or a second review cycle reads as
 /// a new one rather than a repeat of the last.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Kind {
     /// A person moved the task: Start, Retry, Add to Queue, a drag, Move to,
     /// or a close. Also written when a task reaches Done by any route.
@@ -294,7 +295,11 @@ pub enum Kind {
     },
     /// A person completed approved changes locally: the task is Done, its
     /// Task Checkout is gone, and its branch was neither merged nor pushed.
-    CompletedLocally,
+    ///
+    /// Empty braces rather than a unit variant: serde ignores extra keys on a
+    /// unit variant of an internally tagged enum even under
+    /// `deny_unknown_fields`, and an entry carrying one must not load.
+    CompletedLocally {},
     /// A person integrated approved changes into a local branch. The Task's
     /// branch was kept, and nothing was pushed. `commit` is the commit the
     /// target branch was advanced to, `strategy` how (`fast_forward`,
@@ -337,7 +342,7 @@ impl Kind {
             Self::PrLinked { url, .. } => Identity::PrLinked(url),
             Self::PrMerged { number } => Identity::PrMerged(*number),
             Self::PrClosed { number } => Identity::PrClosed(*number),
-            Self::CompletedLocally => Identity::CompletedLocally,
+            Self::CompletedLocally {} => Identity::CompletedLocally,
             Self::IntegratedLocally { commit, .. } => Identity::IntegratedLocally(commit),
             Self::Moved { .. }
             | Self::ToolUsed { .. }
@@ -518,7 +523,7 @@ pub fn one_line(text: &str, max: usize) -> String {
 /// Whether a person completed the task locally: approved changes finished
 /// without a pull request, and never merged by SlashIt.
 pub fn completed_locally(entries: &[Entry]) -> bool {
-    entries.iter().any(|e| e.kind == Kind::CompletedLocally)
+    entries.iter().any(|e| e.kind == Kind::CompletedLocally {})
 }
 
 /// The number the next coding run gets: one past any run recorded, so a
@@ -565,10 +570,12 @@ pub fn next_review(entries: &[Entry]) -> u32 {
 }
 
 /// Read a task's entries leniently: an entry this version does not
-/// understand -- one a newer SlashIt wrote -- is skipped instead of failing
-/// the whole task, and a missing list is empty. A skipped entry is gone
-/// once this version writes the task back; losing history after a
-/// downgrade is accepted over refusing to load the board. For
+/// understand -- one a newer SlashIt wrote, or one with a field this version
+/// does not declare -- is skipped instead of failing the whole task, and a
+/// missing list is empty. For readers that only display a task, such as the
+/// frontend's copy, which is never written back: a skipped entry would be
+/// gone after the next save, so the backend's Task board does not use this
+/// and refuses such an entry instead. For
 /// `#[serde(default, deserialize_with = "slashit_activity::lenient")]`.
 pub fn lenient<'de, D>(deserializer: D) -> Result<Vec<Entry>, D::Error>
 where
@@ -705,7 +712,7 @@ impl Item<'_> {
                 | Kind::AiFixApplied { .. }
                 | Kind::PrLinked { .. }
                 | Kind::PrMerged { .. }
-                | Kind::CompletedLocally
+                | Kind::CompletedLocally {}
                 | Kind::IntegratedLocally { .. } => Tone::Good,
                 Kind::ReadyForReview { .. } => Tone::Attention,
                 Kind::Moved {
@@ -774,7 +781,7 @@ impl Item<'_> {
                 Kind::PrLinked { .. } => "pr_linked",
                 Kind::PrMerged { .. } => "pr_merged",
                 Kind::PrClosed { .. } => "pr_closed",
-                Kind::CompletedLocally => "completed_locally",
+                Kind::CompletedLocally {} => "completed_locally",
                 Kind::IntegratedLocally { .. } => "integrated_locally",
             },
         }
@@ -845,7 +852,7 @@ fn kind_title(kind: &Kind) -> String {
         Kind::PrLinked { .. } => "Pull request linked".to_string(),
         Kind::PrMerged { .. } => "Pull request merged".to_string(),
         Kind::PrClosed { .. } => "Pull request closed without merge".to_string(),
-        Kind::CompletedLocally => "Completed locally, not merged".to_string(),
+        Kind::CompletedLocally {} => "Completed locally, not merged".to_string(),
         Kind::IntegratedLocally { target, .. } => format!("Integrated into {target}"),
     }
 }
