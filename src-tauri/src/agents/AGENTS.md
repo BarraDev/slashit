@@ -38,10 +38,24 @@ the security boundary of the run:
   review-fix agent. It passes `--permission-mode auto` with no
   `--allowedTools` list, so the provider's classifier reviews each call. A
   Claude Code older than `AUTO_MIN_VERSION` is refused before launch
-  (`auto_unsupported_reason`). An unavailable Auto is never replaced by
-  bypass: with no approval list, a session the CLI moved to Manual denies
-  what needs approval. `permission_mode: None` (bypass) remains only for the
-  approved PR apply agent, which still needs review.
+  (`auto_unsupported_reason`); that check is a precondition only.
+- Auto is proven by the stream's `init` event, not by the launch. When the
+  CLI cannot run Auto (for example `permissions.disableAutoMode`) it starts
+  the session in `default` mode without an error. Its tool calls that need
+  approval are denied, yet the session still ends with `subtype: success`,
+  and the model can retry a denied call many times. The stdout reader
+  (`auto_mode_mismatch`) therefore stops an Auto run whose `init` does not
+  report `"auto"`, or reports no mode, and `wait()` returns that reason.
+- `permission_mode: None` (bypass) remains only for the approved PR apply
+  agent, which still needs review. An Auto run never falls back to it.
+- `isolate_customizations: true` for the coding Worker and the review-fix
+  agent: `--setting-sources project` (the user's settings, hooks, plugins and
+  `env` are not read), `--settings {"disableAllHooks":true}` (the project's
+  own hooks are off too), and `--strict-mcp-config`. The project's `CLAUDE.md`
+  still loads; the user's `CLAUDE.md` does not. `--safe-mode` and an empty
+  `--setting-sources` were rejected because both also drop the project
+  `CLAUDE.md`. Built-in CLI plugins load in every mode. Isolation does not
+  limit the filesystem; the Worker security report lists the remaining risks.
 - `disable_mcp: true` on every production run. Personal connectors from the
   user's Claude configuration are not loaded. The coding Worker and the
   review-fix agent changed from `false` in this unit.

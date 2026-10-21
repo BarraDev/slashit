@@ -5223,6 +5223,9 @@ impl TaskExecutor {
                 // the user's Claude configuration stay out of the run.
                 disable_mcp: true,
                 additional_dirs: claude_add_dirs.clone(),
+                // The user's hooks, plugins and settings, and the project's own
+                // hooks, stay out of the run. The project's CLAUDE.md still loads.
+                isolate_customizations: true,
             }, lease)
             .await
             {
@@ -6816,6 +6819,7 @@ impl TaskExecutor {
                         append_system_prompt: None,
                         disable_mcp: true,
                         additional_dirs: Vec::new(),
+                        isolate_customizations: false,
                     },
                     None,
                     &mut cancelled_for_claude,
@@ -7000,6 +7004,8 @@ impl TaskExecutor {
                                 append_system_prompt: Some(WORKER_SCRATCH_RULE.to_string()),
                                 disable_mcp: true,
                                 additional_dirs: Vec::new(),
+                                // As for the coding Worker: no user or project hooks or settings.
+                                isolate_customizations: true,
                             },
                             fix_lease,
                             &mut cancelled,
@@ -16303,16 +16309,18 @@ mod tests {
                 let script = format!(
                     "#!/bin/sh\n\
                      cat > /dev/null\n\
-                     printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-fixture\",\"model\":\"fixture-model\"}}\\n'\n\
                      role=review\n\
+                     mode=dontAsk\n\
                      prev=\n\
                      for a in \"$@\"; do\n\
                      \x20 if [ \"$prev\" = --allowedTools ]; then\n\
                      \x20   case \"$a\" in *Edit*) role=fix ;; esac\n\
                      \x20 fi\n\
                      \x20 if [ \"$prev\" = --permission-mode ] && [ \"$a\" = auto ]; then role=fix; fi\n\
+                     \x20 if [ \"$prev\" = --permission-mode ]; then mode=$a; fi\n\
                      \x20 prev=$a\n\
                      done\n\
+                     printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-fixture\",\"model\":\"fixture-model\",\"permissionMode\":\"%s\"}}\\n' \"$mode\"\n\
                      if [ \"$role\" = {block_role:?} ]; then\n\
                      \x20 printf '%s\\n' \"$$\" > {pidfile:?}\n\
                      \x20 exec sleep 300\n\
@@ -16491,7 +16499,8 @@ mod tests {
                     let script = format!(
                         "#!/bin/sh\n\
                          for a in \"$@\"; do printf '%s\\n' \"$a\" >> {args:?}; done\n\
-                         printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"model\":\"m\"}}\\n'\n\
+                         case \" $* \" in *\" --permission-mode auto \"*) mode=auto ;; *) mode=dontAsk ;; esac\n\
+                         printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"model\":\"m\",\"permissionMode\":\"%s\"}}\\n' \"$mode\"\n\
                          case \" $* \" in\n\
                          *\" --restricted \"*)\n\
                          cat > {review_prompt:?}\n\
@@ -19169,7 +19178,7 @@ VERDICT: APPROVED"
             }
             let _agent = crate::test_helpers::FakeProgram::install(
                 "claude",
-                "cat >/dev/null; printf 'work\\n' > agent_work.txt; \
+                "cat >/dev/null; printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}'; printf 'work\\n' > agent_work.txt; \
                  printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'",
             )
             .await;
@@ -19239,7 +19248,7 @@ VERDICT: APPROVED"
                 ]}})
             };
             let script = stream(&[
-                serde_json::json!({"type": "system", "subtype": "init", "session_id": "SESSION-abc123", "model": "m"}),
+                serde_json::json!({"type": "system", "subtype": "init", "session_id": "SESSION-abc123", "model": "m", "permissionMode": "auto"}),
                 serde_json::json!({"type": "assistant", "message": {"content": [
                     {"type": "text", "text": "THE AGENT SAYS THIS"}
                 ]}}),
@@ -19257,7 +19266,7 @@ VERDICT: APPROVED"
             let _agent = crate::test_helpers::FakeProgram::install(
                 "claude",
                 &format!(
-                    "cat >/dev/null; {script}printf 'work\\n' > agent_work.txt; \
+                    "cat >/dev/null; printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}}'; {script}printf 'work\\n' > agent_work.txt; \
                      printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'"
                 ),
             )
@@ -19333,7 +19342,7 @@ VERDICT: APPROVED"
             git_in(&w.repo, &["config", "user.name", "T"]);
             let _agent = crate::test_helpers::FakeProgram::install(
                 "claude",
-                "cat >/dev/null; printf 'work\\n' > agent_work.txt; \
+                "cat >/dev/null; printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}'; printf 'work\\n' > agent_work.txt; \
                  printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'",
             )
             .await;
@@ -19379,7 +19388,7 @@ VERDICT: APPROVED"
             let _agent = crate::test_helpers::FakeProgram::install(
                 "claude",
                 &format!(
-                    "cat >/dev/null; printf 'work\\n' > agent_work.txt; \
+                    "cat >/dev/null; printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}}'; printf 'work\\n' > agent_work.txt; \
                      printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{long}\"}}'"
                 ),
             )
@@ -19477,7 +19486,7 @@ VERDICT: APPROVED"
             }
             let _agent = crate::test_helpers::FakeProgram::install(
                 "claude",
-                "cat >/dev/null; printf 'retry work\\n' > retry-output.txt; printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'",
+                "cat >/dev/null; printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}'; printf 'retry work\\n' > retry-output.txt; printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'",
             )
             .await;
             assert_eq!(
@@ -19595,7 +19604,7 @@ VERDICT: APPROVED"
             w.restart().await;
             let _agent = crate::test_helpers::FakeProgram::install(
                 "claude",
-                "cat >/dev/null; printf 'work\\n' > agent_work.txt; \
+                "cat >/dev/null; printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}'; printf 'work\\n' > agent_work.txt; \
                  printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'",
             )
             .await;
@@ -19641,7 +19650,7 @@ VERDICT: APPROVED"
             let _agent = crate::test_helpers::FakeProgram::install(
                 "claude",
                 &format!(
-                    "cat >/dev/null; {}printf 'work\\n' > agent_work.txt; : > '{}'; \
+                    "cat >/dev/null; printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}}'; {}printf 'work\\n' > agent_work.txt; : > '{}'; \
                      while [ ! -e '{}' ]; do sleep 0.05; done; \
                      printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'",
                     stream(&[tool]),
@@ -21572,7 +21581,7 @@ VERDICT: APPROVED"
             let _agent = crate::test_helpers::FakeProgram::install(
                 "claude",
                 &format!(
-                    "cat >/dev/null; printf 'work\\n' > agent_work.txt; : > '{}'; \
+                    "cat >/dev/null; printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}}'; printf 'work\\n' > agent_work.txt; : > '{}'; \
                      while [ ! -e '{}' ]; do sleep 0.05; done; \
                      printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'",
                     started.display(),
@@ -22036,7 +22045,7 @@ VERDICT: APPROVED"
             let _agent = crate::test_helpers::FakeProgram::install(
                 "claude",
                 &format!(
-                    "cat >/dev/null; printf 'work\\n' > agent_work.txt; echo $$ > '{}'; sleep 60",
+                    "cat >/dev/null; printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}}'; printf 'work\\n' > agent_work.txt; echo $$ > '{}'; sleep 60",
                     pid_file.display()
                 ),
             )

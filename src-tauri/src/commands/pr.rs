@@ -3161,6 +3161,7 @@ fn pr_helper_run_config(
         append_system_prompt: Some(PR_HELPER_SYSTEM_RULES.to_string()),
         disable_mcp: true,
         additional_dirs: Vec::new(),
+        isolate_customizations: false,
     }
 }
 

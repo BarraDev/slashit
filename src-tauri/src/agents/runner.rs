@@ -58,6 +58,30 @@ pub fn auto_unsupported_reason(version_output: &str) -> Option<String> {
     }
 }
 
+/// Why an Auto run must stop, given its stream-json `init` event, or `None`
+/// when the event reports Auto.
+///
+/// The version gate above is a precondition, not proof. The CLI can still
+/// start a session in another mode (for example when the account, model or a
+/// setting makes Auto unavailable), and it does that without an error. The
+/// `init` event is the only place that reports the mode the session actually
+/// has, and it arrives before the first model request, so this check is what
+/// stops that fallback. A missing field counts as a mismatch: an unreported
+/// mode is not proof of Auto.
+pub fn auto_mode_mismatch(init: &serde_json::Value) -> Option<String> {
+    let reported = init.get("permissionMode").and_then(|mode| mode.as_str());
+    if reported == Some("auto") {
+        return None;
+    }
+    let shown = reported.map_or_else(|| "none".to_string(), |mode| format!("{mode:?}"));
+    Some(format!(
+        "Auto permission mode was not active: Claude Code reported permission mode {shown} \
+         instead of \"auto\", so the run was stopped before any tool could act. SlashIt does \
+         not fall back to bypassing permissions. Auto may be unavailable for this account, \
+         model or setting; check that and run again."
+    ))
+}
+
 /// Refuses an Auto launch when the `claude` on PATH is too old, by reading
 /// `claude --version` with the same environment the run gets.
 ///
@@ -354,7 +378,22 @@ pub struct ClaudeRunConfig {
     /// Used when running from a meta-workspace cwd so the agent can also
     /// read/write a specific project tree.
     pub additional_dirs: Vec<std::path::PathBuf>,
+    /// When true, the run reads only the project's settings and instruction
+    /// files (`--setting-sources project`) and disables every hook
+    /// (`--settings` with `disableAllHooks`). The user's settings are not
+    /// read, so their hooks, plugins and `env` do not reach the run, and MCP
+    /// servers come only from `--mcp-config` (as with `disable_mcp`). The
+    /// project's `CLAUDE.md` still loads. The project's own settings still
+    /// apply, including its `env` block; the CLI ignores a project's
+    /// `bypassPermissions` default and its allow rules in an untrusted
+    /// workspace. Filesystem access is not confined by this. Used by the
+    /// coding Worker and the review-fix agent.
+    pub isolate_customizations: bool,
 }
+
+/// The `--settings` value of an isolated run: every hook is off, including
+/// the project's own hooks, which are repository code.
+const ISOLATED_SETTINGS: &str = r#"{"disableAllHooks":true}"#;
 
 /// The Claude CLI arguments for `config`, in order, without the program.
 ///
@@ -438,7 +477,14 @@ pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
         push(extra);
     }
 
-    if strict_mcp {
+    if config.isolate_customizations {
+        push("--setting-sources");
+        push("project");
+        push("--settings");
+        push(ISOLATED_SETTINGS);
+    }
+    // Isolation includes the MCP servers the user's own configuration would add.
+    if strict_mcp || config.isolate_customizations {
         push("--strict-mcp-config");
     }
 
@@ -537,6 +583,21 @@ pub struct ClaudeRunner {
     /// Why the prompt did not reach the child, once [`Self::wait`] has found
     /// out. `None` until then, and after a run that received it.
     prompt_failure: Arc<RwLock<Option<String>>>,
+    /// The group leader's pid, for as long as the leader is unreaped and so
+    /// still names the group this runner spawned. [`Self::wait`] clears it
+    /// before it reaps, and `Drop` clears it. The stdout reader signals the
+    /// group only through this, under the lock, so it never signals a pid that
+    /// has been reaped and may be reissued. See [`Self::stop_for_mode_mismatch`].
+    leader_pid: Arc<std::sync::Mutex<Option<u32>>>,
+    /// Why the run was stopped at its start: the CLI reported a permission
+    /// mode other than the one the run asked for. Set by the stdout reader and
+    /// reported by [`Self::wait`] in place of the exit outcome.
+    mode_mismatch: Arc<RwLock<Option<String>>>,
+    /// Whether this run asked for Auto. See [`auto_mode_mismatch`].
+    expect_auto: bool,
+    /// Set by the stdout reader when the `init` event reports Auto. An Auto
+    /// run that exits cleanly without it has not shown that Auto was active.
+    auto_confirmed: Arc<AtomicBool>,
 }
 
 impl Drop for ClaudeRunner {
@@ -548,6 +609,10 @@ impl Drop for ClaudeRunner {
     /// so it never sees the prompt cut short by an EOF. `kill_on_drop` would
     /// only signal it after this returns, and only the leader.
     fn drop(&mut self) {
+        // Cleared first, so the reader can no longer signal the group.
+        if let Ok(mut pid) = self.leader_pid.lock() {
+            *pid = None;
+        }
         // Still unreaped while `id()` answers, so the group id is still the
         // one this runner spawned (see `wait`).
         #[cfg(unix)]
@@ -702,6 +767,10 @@ impl ClaudeRunner {
 
         let (event_tx, first_subscriber) = broadcast::channel(512);
         let prompt_written = Arc::new(AtomicBool::new(false));
+        let leader_pid = child.id();
+        // An Auto run is held to the mode it asked for; see `auto_mode_mismatch`.
+        let expect_auto =
+            matches!(&config.tools, ToolAccess::Full { permission_mode: Some(mode), .. } if mode == "auto");
 
         let runner = Self {
             child: Arc::new(Mutex::new(child)),
@@ -719,6 +788,10 @@ impl ClaudeRunner {
             prompt_writer: Mutex::new(None),
             prompt_written: prompt_written.clone(),
             prompt_failure: Arc::new(RwLock::new(None)),
+            leader_pid: Arc::new(std::sync::Mutex::new(leader_pid)),
+            mode_mismatch: Arc::new(RwLock::new(None)),
+            expect_auto,
+            auto_confirmed: Arc::new(AtomicBool::new(false)),
         };
 
         let handle = runner.start_reader(stdout);
@@ -900,6 +973,10 @@ impl ClaudeRunner {
                 Self::kill_process_group(pid);
             }
 
+            // `child.kill()` reaps, so the pid can be reissued from here on.
+            if let Ok(mut pid) = self.leader_pid.lock() {
+                *pid = None;
+            }
             child.kill().await.map_err(|e| format!("Failed to kill claude: {}", e))
         };
 
@@ -910,6 +987,26 @@ impl ClaudeRunner {
         }
 
         killed
+    }
+
+    /// Stop a run whose `init` event reported the wrong permission mode.
+    ///
+    /// Called from the stdout reader, which cannot take the child mutex:
+    /// [`Self::wait`] holds it for the whole wait. So this signals the group by
+    /// pid, and only while `leader_pid` still holds it. `wait()` clears that
+    /// under the same lock before it reaps, so the pid is never signalled after
+    /// it may have been reissued. The run then ends, and `wait()` reports
+    /// [`Self::mode_mismatch`]. Off Unix there is no group to signal; the run
+    /// is left to end on its own, and the mismatch is still reported.
+    fn stop_for_mode_mismatch(leader_pid: &std::sync::Mutex<Option<u32>>) {
+        #[cfg(unix)]
+        if let Ok(pid) = leader_pid.lock() {
+            if let Some(pid) = *pid {
+                Self::kill_process_group(pid);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = leader_pid;
     }
 
     /// Signal the whole group a spawned agent leads.
@@ -999,6 +1096,11 @@ impl ClaudeRunner {
         // child with a lot to say can still reach the exit waited for above.
         let stderr_handle = self.stderr_handle.lock().await.take();
 
+        // Cleared under the lock the reader signals through, before the reap:
+        // from here the pid can be reissued, so the reader must not signal it.
+        if let Ok(mut pid) = self.leader_pid.lock() {
+            *pid = None;
+        }
         let status = child.wait().await.map_err(|e| format!("Wait failed: {}", e))?;
 
         // Recorded before either of the two `Err` returns below so a caller
@@ -1033,6 +1135,12 @@ impl ClaudeRunner {
             let _ = handle.await;
         }
 
+        // Before the exit status is judged. A run stopped for its mode died
+        // because SlashIt stopped it, and the mode is the reason to report.
+        if let Some(reason) = self.mode_mismatch.read().await.clone() {
+            return Err(reason);
+        }
+
         if !status.success() {
             if !stderr_text.is_empty() {
                 self.accumulated_output.write().await.push_str(&format!("\n--- STDERR ---\n{}", stderr_text));
@@ -1064,6 +1172,14 @@ impl ClaudeRunner {
             return Err(event.as_ref().and_then(result_failure_reason).unwrap_or_else(|| "error".to_string()));
         }
 
+        // A clean exit is not proof of Auto. The mode is confirmed only by an
+        // `init` event that reports it, so one that never came is a failure.
+        if self.expect_auto && !self.auto_confirmed.load(Ordering::SeqCst) {
+            return Err("Auto permission mode was not confirmed: Claude Code finished without reporting \
+                        its permission mode. SlashIt does not fall back to bypassing permissions."
+                .to_string());
+        }
+
         Ok(true)
     }
 
@@ -1088,16 +1204,21 @@ impl ClaudeRunner {
     /// to reach through the child mutex to find its own stdout could not run
     /// while `wait()` held that mutex, which is both a deadlock (`wait()` joins
     /// this task) and, for a talkative child, a stalled pipe.
-    fn start_reader(
-        &self,
-        stdout: Option<tokio::process::ChildStdout>,
-    ) -> tauri::async_runtime::JoinHandle<()> {
+    ///
+    /// For an Auto run, the `init` event must report Auto. If it does not, the
+    /// reader records why and stops the run before any tool can act; if it
+    /// does, the reader confirms it. See [`auto_mode_mismatch`].
+    fn start_reader(&self, stdout: Option<tokio::process::ChildStdout>) -> tauri::async_runtime::JoinHandle<()> {
         let event_tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
         let accumulated_output = self.accumulated_output.clone();
         let result_event = self.result_event.clone();
         let result_is_error = self.result_is_error.clone();
         let raw_stdout = self.raw_stdout.clone();
+        let leader_pid = self.leader_pid.clone();
+        let mode_mismatch = self.mode_mismatch.clone();
+        let expect_auto = self.expect_auto;
+        let auto_confirmed = self.auto_confirmed.clone();
 
         tauri::async_runtime::spawn(async move {
             // Read stdout (NDJSON stream)
@@ -1121,6 +1242,18 @@ impl ClaudeRunner {
                     let parsed: Result<serde_json::Value, _> = serde_json::from_str(&line);
                     match parsed {
                         Ok(json) => {
+                            if expect_auto
+                                && json.get("type").and_then(|t| t.as_str()) == Some("system")
+                                && json.get("subtype").and_then(|t| t.as_str()) == Some("init")
+                            {
+                                match auto_mode_mismatch(&json) {
+                                    Some(reason) => {
+                                        *mode_mismatch.write().await = Some(reason);
+                                        Self::stop_for_mode_mismatch(&leader_pid);
+                                    }
+                                    None => auto_confirmed.store(true, Ordering::SeqCst),
+                                }
+                            }
                             if json.get("type").and_then(|t| t.as_str()) == Some("result") {
                                 if json.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
                                     result_is_error.store(true, Ordering::SeqCst);
@@ -1283,6 +1416,7 @@ mod lease_launch_tests {
             append_system_prompt: None,
             disable_mcp: true,
             additional_dirs: Vec::new(),
+            isolate_customizations: false,
         }
     }
 
@@ -1351,6 +1485,7 @@ mod args_tests {
             append_system_prompt: None,
             disable_mcp: false,
             additional_dirs: Vec::new(),
+            isolate_customizations: false,
         }
     }
 
@@ -1473,6 +1608,7 @@ mod launch_policy_tests {
             append_system_prompt: None,
             disable_mcp: true,
             additional_dirs: vec![],
+            isolate_customizations: false,
         }
     }
 
@@ -1495,6 +1631,39 @@ mod launch_policy_tests {
         assert!(!args.iter().any(|a| a == "--allowedTools"), "{args:?}");
         assert!(!args.iter().any(|a| a == "--tools" || a == "--restricted"), "{args:?}");
         assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+    }
+
+    #[test]
+    fn isolated_runs_read_only_the_project_and_disable_every_hook() {
+        let mut config = auto_config(vec![]);
+        config.isolate_customizations = true;
+        let args: Vec<String> = claude_args(&config).into_iter().map(|a| a.into_string().unwrap()).collect();
+        let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].as_str());
+        assert_eq!(at("--setting-sources"), Some("project"), "{args:?}");
+        assert_eq!(at("--settings"), Some(ISOLATED_SETTINGS), "{args:?}");
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+    }
+
+    #[test]
+    fn runs_that_are_not_isolated_keep_the_settings_their_user_configured() {
+        let args: Vec<String> =
+            claude_args(&auto_config(vec![])).into_iter().map(|a| a.into_string().unwrap()).collect();
+        assert!(!args.iter().any(|a| a == "--setting-sources" || a == "--settings"), "{args:?}");
+    }
+
+    #[test]
+    fn an_init_event_must_report_auto_and_a_missing_mode_is_not_proof() {
+        let auto = serde_json::json!({"type": "system", "subtype": "init", "permissionMode": "auto"});
+        assert_eq!(auto_mode_mismatch(&auto), None);
+
+        let manual = serde_json::json!({"type": "system", "subtype": "init", "permissionMode": "default"});
+        let reason = auto_mode_mismatch(&manual).expect("a Manual session is a mismatch");
+        assert!(reason.contains("\"default\""), "{reason}");
+        assert!(reason.contains("does not fall back to bypassing permissions"), "{reason}");
+
+        let unreported = serde_json::json!({"type": "system", "subtype": "init"});
+        let reason = auto_mode_mismatch(&unreported).expect("an unreported mode is not proof of Auto");
+        assert!(reason.contains("reported permission mode none"), "{reason}");
     }
 
     #[test]
@@ -1749,6 +1918,7 @@ mod tests {
                 append_system_prompt: None,
                 disable_mcp: false,
                 additional_dirs: Vec::new(),
+                isolate_customizations: false,
             }
         }
 
@@ -2703,6 +2873,7 @@ mod tests {
                 append_system_prompt: None,
                 disable_mcp: true,
                 additional_dirs: Vec::new(),
+                isolate_customizations: false,
             };
             let runner = ClaudeRunner::start_leased(config, None).await.expect("claude should start");
             let result = tokio::time::timeout(Duration::from_secs(120), runner.wait())
@@ -2712,6 +2883,93 @@ mod tests {
             assert_eq!(runner.prompt_failure().await, None, "{label}");
             assert!(runner.get_output().await.contains("PONG"), "{label}: {}", runner.get_output().await);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod mode_mismatch_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    /// A stand-in CLI that reports `mode` in its init event, then runs `tail`.
+    fn install_stub(dir: &std::path::Path, mode: &str, tail: &str) -> std::path::PathBuf {
+        let program = dir.join("claude");
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\n\
+             printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-mode\",\"permissionMode\":\"{mode}\"}}'\n\
+             {tail}\n"
+        );
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    fn auto_config(dir: &TempDir) -> ClaudeRunConfig {
+        ClaudeRunConfig {
+            prompt: "hello".to_string(),
+            working_dir: dir.path().to_string_lossy().into_owned(),
+            tools: ToolAccess::Full { auto_approve: Vec::new(), permission_mode: Some("auto".into()) },
+            max_turns: None,
+            max_budget_usd: None,
+            session_id: None,
+            resume_session: None,
+            model: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            disable_mcp: true,
+            additional_dirs: Vec::new(),
+            isolate_customizations: true,
+        }
+    }
+
+    /// A run that reports Manual where Auto was asked for is stopped at once.
+    /// The stand-in sleeps for a minute and would otherwise run that long.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auto_run_that_reports_manual_is_stopped_before_it_can_act() {
+        let dir = TempDir::new().expect("temp dir");
+        let program = install_stub(dir.path(), "default", "sleep 60");
+        let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())
+            .await
+            .expect("the run should be stopped, not left to finish its sleep");
+        assert!(started.elapsed() < Duration::from_secs(30), "stopped after {:?}", started.elapsed());
+        let reason = result.expect_err("a run that reports Manual must fail");
+        assert!(reason.contains("Auto permission mode was not active"), "{reason}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auto_run_that_reports_auto_is_not_stopped() {
+        let dir = TempDir::new().expect("temp dir");
+        let tail = "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'";
+        let program = install_stub(dir.path(), "auto", tail);
+        let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
+
+        let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())
+            .await
+            .expect("an Auto run should finish on its own");
+        assert_eq!(result, Ok(true));
+    }
+
+    /// A clean exit with no `init` event proves nothing about the mode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auto_run_that_never_reports_its_mode_is_not_a_success() {
+        let dir = TempDir::new().expect("temp dir");
+        let program = dir.path().join("claude");
+        let script = "#!/bin/sh\ncat > /dev/null\n\
+                      printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n";
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
+
+        let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())
+            .await
+            .expect("the stub exits at once");
+        let reason = result.expect_err("an unconfirmed Auto run must not succeed");
+        assert!(reason.contains("not confirmed"), "{reason}");
     }
 }
 
@@ -2744,6 +3002,7 @@ mod child_environment_tests {
             append_system_prompt: None,
             disable_mcp: true,
             additional_dirs: Vec::new(),
+            isolate_customizations: false,
         };
         let runner = ClaudeRunner::start_program(&program, config).await.expect("fixture should spawn");
         assert!(runner.wait().await.is_ok(), "fixture run should succeed");
