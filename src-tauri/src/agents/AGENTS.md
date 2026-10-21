@@ -60,11 +60,24 @@ the security boundary of the run:
   was meant to disable still runs. The project's `CLAUDE.md`
   still loads; the user's `CLAUDE.md` does not. `--safe-mode` and an empty
   `--setting-sources` were rejected because both also drop the project
-  `CLAUDE.md`. Built-in CLI plugins load in every mode. Isolation does not
-  limit the filesystem; the Worker security report lists the remaining risks.
+  `CLAUDE.md`. Built-in CLI plugins load in every mode.
+
+  Known limits of isolation, to revisit before any Worker runs on an
+  untrusted repository or without a person watching the run:
+  - Isolation does not limit the filesystem. The Worker can read and write
+    anything the user can, outside the Task Checkout.
+  - `PINNED_ENV` covers `PATH`, proxies, `NODE_OPTIONS`, `BASH_ENV`, `ENV`,
+    `LD_PRELOAD` and the provider switches. `GIT_*` variables, interpreter
+    variables such as `PYTHON*`, `HOME` and `CLAUDE_CONFIG_DIR` are not
+    pinned, so a repository's `env` block can set them for the CLI and the
+    tools it runs.
+  - The PR apply agent still runs with bypass (`permission_mode: None`).
+  - The Auto classifier verdict and real-CLI cancellation have not been
+    exercised in a live run. Both must be confirmed before unattended use.
+  - Built-in CLI plugins load, and the CLI's own telemetry and network
+    egress are not limited by this module.
 - `disable_mcp: true` on every production run. Personal connectors from the
-  user's Claude configuration are not loaded. The coding Worker and the
-  review-fix agent changed from `false` in this unit.
+  user's Claude configuration are not loaded.
 - The child starts from an empty environment (`env_clear`), then gets only
   `provider_env`: identity and PATH, locale, temp directories, proxy and CA
   settings, `ANTHROPIC_*`, and the provider selectors and credentials for

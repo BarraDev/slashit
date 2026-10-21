@@ -436,9 +436,10 @@ const HELPER_SETTINGS: &[&str] = &[
     "otelHeadersHelper",
 ];
 
-/// The optional provider telemetry an isolated run turns off. The CLI's
-/// Auto gate and the Bash classifier do not depend on it (checked on Claude
-/// Code 2.1.306 with a local stub).
+/// The optional provider telemetry an isolated run turns off. The CLI's Auto
+/// availability gate does not depend on it (checked on Claude Code 2.1.306
+/// with a local stub). The real Bash classifier verdict was not checked, so
+/// the first live Auto run must confirm that it still works with telemetry off.
 const ISOLATED_TELEMETRY_ENV: (&str, &str) = ("DISABLE_TELEMETRY", "1");
 
 /// The endpoint the CLI uses when `ANTHROPIC_BASE_URL` is not set.
