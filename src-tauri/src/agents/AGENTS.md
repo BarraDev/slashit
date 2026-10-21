@@ -34,6 +34,24 @@ the security boundary of the run:
   (`commands/pr.rs`) and the executor's AI review leg.
 - `ToolAccess::Full` is for agents that edit code: the coding agent, the
   approved PR apply agent and the review-fix agent. They have Bash.
+- `permission_mode: Some("auto")` is the policy for the coding Worker and the
+  review-fix agent. It passes `--permission-mode auto` with no
+  `--allowedTools` list, so the provider's classifier reviews each call. A
+  Claude Code older than `AUTO_MIN_VERSION` is refused before launch
+  (`auto_unsupported_reason`). An unavailable Auto is never replaced by
+  bypass: with no approval list, a session the CLI moved to Manual denies
+  what needs approval. `permission_mode: None` (bypass) remains only for the
+  approved PR apply agent, which still needs review.
+- `disable_mcp: true` on every production run. Personal connectors from the
+  user's Claude configuration are not loaded. The coding Worker and the
+  review-fix agent changed from `false` in this unit.
+- The child starts from an empty environment (`env_clear`), then gets only
+  `provider_env`: identity and PATH, locale, temp directories, proxy and CA
+  settings, `ANTHROPIC_*`, and the provider selectors and credentials for
+  Bedrock, Vertex, Foundry, and `CLAUDE_CODE_OAUTH_TOKEN`. `HOME` is passed
+  through, never replaced. Session identifiers, `CLAUDE_CODE_MESSAGING_*`,
+  and forge tokens are not passed. Add a name to `PROVIDER_ENV_NAMES` only
+  with a reason in the commit that adds it.
 
 `claude_args` builds the argument list; test capability changes there.
 

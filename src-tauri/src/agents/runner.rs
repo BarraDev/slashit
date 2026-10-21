@@ -25,6 +25,104 @@ pub const READ_ONLY_DENIED_TOOLS: &[&str] = &[
 /// The oldest Claude Code release that accepts `--restricted`.
 pub const RESTRICTED_MIN_VERSION: &str = "2.1.248";
 
+/// The oldest Claude Code release whose `--permission-mode auto` runs as
+/// requested. An older CLI does not refuse `auto`; it starts the session in
+/// Manual, so SlashIt checks the version before it launches a run.
+pub const AUTO_MIN_VERSION: &str = "2.1.283";
+
+/// Why an Auto run cannot start, given the output of `claude --version`
+/// (for example `2.1.306 (Claude Code)`). `None` means the CLI is new enough.
+pub fn auto_unsupported_reason(version_output: &str) -> Option<String> {
+    let found = version_output
+        .split_whitespace()
+        .find(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or("")
+        .trim_end_matches(|c: char| !c.is_ascii_digit());
+    let parse = |text: &str| -> Option<(u64, u64, u64)> {
+        let mut parts = text.split('.').map(str::parse::<u64>);
+        Some((parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?))
+    };
+    let minimum = parse(AUTO_MIN_VERSION).expect("AUTO_MIN_VERSION is a plain version");
+    match parse(found) {
+        Some(version) if version >= minimum => None,
+        Some(_) => Some(format!(
+            "Auto permission mode needs Claude Code v{AUTO_MIN_VERSION} or newer, but this \
+             install reports v{found}; update Claude Code. SlashIt does not fall back to \
+             bypassing permissions"
+        )),
+        None => Some(format!(
+            "SlashIt could not read the Claude Code version for Auto permission mode \
+             (it reported {version_output:?}); the run was not started and SlashIt does not \
+             fall back to bypassing permissions"
+        )),
+    }
+}
+
+/// Refuses an Auto launch when the `claude` on PATH is too old, by reading
+/// `claude --version` with the same environment the run gets.
+///
+/// Compiled out of test binaries: their fake CLIs answer every invocation with
+/// stream-json and do not report a version. The version rule itself is tested
+/// through [`auto_unsupported_reason`].
+async fn ensure_auto_supported() -> Result<(), String> {
+    #[cfg(test)]
+    {
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        let version = tokio::process::Command::new("claude")
+            .arg("--version")
+            .env_clear()
+            .envs(provider_env(std::env::vars_os()))
+            .output()
+            .await
+            .map_err(|e| format!("SlashIt could not run Claude Code to check its version: {e}"))?;
+        match auto_unsupported_reason(&String::from_utf8_lossy(&version.stdout)) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Environment variables a provider child receives. The child starts from an
+/// empty environment and gets only these, so it does not inherit the parent's
+/// Claude session identifiers, messaging tokens, or unrelated credentials.
+///
+/// `HOME` is kept because Claude Code reads its sign-in from `~/.claude`; it
+/// is not replaced. The provider settings are kept so that a Bedrock, Vertex
+/// or Foundry configuration, and a proxy or CA bundle, keep working.
+const PROVIDER_ENV_NAMES: &[&str] = &[
+    "HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TZ",
+    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
+    "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+];
+
+/// Name prefixes kept for the same reasons as [`PROVIDER_ENV_NAMES`]:
+/// `ANTHROPIC_` for the API endpoint and key, `LC_` for the locale.
+const PROVIDER_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "LC_"];
+
+/// The subset of `vars` that a provider child receives. See
+/// [`PROVIDER_ENV_NAMES`]. Names that are not valid UTF-8 are dropped.
+pub fn provider_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter()
+        .filter(|(name, _)| {
+            name.to_str().is_some_and(|name| {
+                PROVIDER_ENV_NAMES.contains(&name)
+                    || PROVIDER_ENV_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+            })
+        })
+        .collect()
+}
+
 /// Why a run failed, when `stderr` shows the CLI rejected `--restricted` as
 /// an unknown option: the CLI is older than [`RESTRICTED_MIN_VERSION`].
 /// [`ToolAccess::ReadOnly`] runs need the flag and never fall back to running
@@ -292,7 +390,11 @@ pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
             true
         }
         ToolAccess::Full { auto_approve, permission_mode } => {
-            if !auto_approve.is_empty() {
+            // Under `auto` the classifier decides each call, so an approval
+            // list would pre-approve tools it should review. Without the list,
+            // a session that silently fell back to Manual denies every call
+            // that needs approval instead of running it.
+            if !auto_approve.is_empty() && permission_mode.as_deref() != Some("auto") {
                 push("--allowedTools");
                 push(&auto_approve.join(","));
             }
@@ -468,6 +570,9 @@ impl ClaudeRunner {
         config: ClaudeRunConfig,
         lease: Option<ProviderLease>,
     ) -> Result<Self, String> {
+        if matches!(&config.tools, ToolAccess::Full { permission_mode: Some(mode), .. } if mode == "auto") {
+            ensure_auto_supported().await?;
+        }
         Self::start_leased_program("claude", config, lease).await
     }
 
@@ -501,6 +606,9 @@ impl ClaudeRunner {
         let mut cmd = Command::new(program);
 
         cmd.args(claude_args(&config));
+        // Start from an empty environment; see `provider_env` for what is kept.
+        cmd.env_clear();
+        cmd.envs(provider_env(std::env::vars_os()));
 
         cmd.current_dir(&config.working_dir);
         cmd.stdin(std::process::Stdio::piped());
@@ -1342,6 +1450,98 @@ mod args_tests {
                 "the prompt leaked into argv: {args:?}"
             );
             assert_ne!(value_of(&args, "--tools"), Some("Bash"), "{args:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod launch_policy_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn auto_config(auto_approve: Vec<String>) -> ClaudeRunConfig {
+        ClaudeRunConfig {
+            prompt: String::new(),
+            working_dir: ".".into(),
+            tools: ToolAccess::Full { auto_approve, permission_mode: Some("auto".into()) },
+            max_turns: None,
+            max_budget_usd: None,
+            session_id: None,
+            resume_session: None,
+            model: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            disable_mcp: true,
+            additional_dirs: vec![],
+        }
+    }
+
+    fn var(name: &str) -> (OsString, OsString) {
+        (name.into(), format!("value-of-{name}").into())
+    }
+
+    fn kept(vars: Vec<(OsString, OsString)>) -> Vec<String> {
+        provider_env(vars).into_iter().map(|(name, _)| name.into_string().unwrap()).collect()
+    }
+
+    #[test]
+    fn auto_passes_auto_and_never_bypass_or_an_approval_list() {
+        let args: Vec<String> = claude_args(&auto_config(vec!["Bash".into(), "Edit".into()]))
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert_eq!(args.iter().position(|a| a == "--permission-mode").map(|i| args[i + 1].as_str()), Some("auto"));
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--allowedTools"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--tools" || a == "--restricted"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+    }
+
+    #[test]
+    fn auto_refuses_old_or_unreadable_cli_versions_without_bypass() {
+        assert_eq!(auto_unsupported_reason("2.1.306 (Claude Code)\n"), None);
+        assert_eq!(auto_unsupported_reason("2.1.283"), None);
+        let old = auto_unsupported_reason("2.1.282 (Claude Code)").expect("too old");
+        assert!(old.contains(AUTO_MIN_VERSION) && old.contains("v2.1.282"), "{old}");
+        assert!(old.contains("does not fall back"), "{old}");
+        assert!(auto_unsupported_reason("").is_some());
+        assert!(auto_unsupported_reason("command not understood").is_some());
+    }
+
+    #[test]
+    fn provider_env_drops_session_metadata_and_unrelated_credentials() {
+        let vars = [
+            "HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "HTTPS_PROXY", "SSL_CERT_FILE",
+            "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_PID", "GH_TOKEN", "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "GIT_EDITOR", "DISPLAY",
+        ]
+        .map(var)
+        .to_vec();
+        let kept = kept(vars);
+        for name in ["HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "HTTPS_PROXY", "SSL_CERT_FILE",
+            "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK"]
+        {
+            assert!(kept.iter().any(|k| k == name), "{name} must be kept: {kept:?}");
+        }
+        for name in ["CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_PID", "GH_TOKEN", "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "GIT_EDITOR", "DISPLAY"]
+        {
+            assert!(!kept.iter().any(|k| k == name), "{name} must be dropped: {kept:?}");
+        }
+    }
+
+    #[test]
+    fn provider_env_keeps_values_unchanged_and_drops_non_utf8_names() {
+        let kept = provider_env([(OsString::from("HOME"), OsString::from("/home/u"))]);
+        assert_eq!(kept, vec![(OsString::from("HOME"), OsString::from("/home/u"))]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = OsString::from_vec(b"HOME\xff".to_vec());
+            assert!(provider_env([(bad, OsString::from("x"))]).is_empty());
         }
     }
 }
@@ -2511,6 +2711,81 @@ mod tests {
             assert_eq!(result, Ok(true), "{label}: {}", runner.get_output().await);
             assert_eq!(runner.prompt_failure().await, None, "{label}");
             assert!(runner.get_output().await.contains("PONG"), "{label}: {}", runner.get_output().await);
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod child_environment_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use tempfile::TempDir;
+
+    /// Shell-added variables that appear in any `sh` child, whatever the
+    /// environment it was started with.
+    const SHELL_ADDED: &[&str] = &["PWD", "SHLVL", "_", "OLDPWD"];
+
+    /// Starts the `env_echo` fixture through the real spawn path and returns
+    /// the names of the variables it saw, with their values.
+    async fn child_environment() -> Vec<(String, OsString)> {
+        let dir = TempDir::new().expect("temp dir");
+        let program = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/claude-cli/env_echo");
+        let config = ClaudeRunConfig {
+            prompt: "hello".to_string(),
+            working_dir: dir.path().to_string_lossy().into_owned(),
+            tools: ToolAccess::Full { auto_approve: Vec::new(), permission_mode: Some("auto".into()) },
+            max_turns: None,
+            max_budget_usd: None,
+            session_id: None,
+            resume_session: None,
+            model: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            disable_mcp: true,
+            additional_dirs: Vec::new(),
+        };
+        let runner = ClaudeRunner::start_program(&program, config).await.expect("fixture should spawn");
+        assert!(runner.wait().await.is_ok(), "fixture run should succeed");
+        let record = std::fs::read(dir.path().join("env")).expect("fixture records its environment");
+        record
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .filter_map(|entry| {
+                use std::os::unix::ffi::OsStrExt;
+                let text = std::ffi::OsStr::from_bytes(entry);
+                let (name, value) = text.to_str()?.split_once('=')?;
+                Some((name.to_string(), OsString::from(value)))
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_child_receives_only_the_provider_environment() {
+        let parent: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let allowed: BTreeSet<String> = provider_env(parent.clone())
+            .into_iter()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .collect();
+        let child = child_environment().await;
+        let child_names: BTreeSet<String> = child.iter().map(|(name, _)| name.clone()).collect();
+
+        for (name, _) in &parent {
+            let Some(name) = name.to_str() else { continue };
+            if allowed.contains(name) || SHELL_ADDED.contains(&name) {
+                continue;
+            }
+            assert!(!child_names.contains(name), "the provider child inherited {name}");
+        }
+        for name in &child_names {
+            assert!(
+                allowed.contains(name) || SHELL_ADDED.contains(&name.as_str()),
+                "the provider child has an unexpected variable {name}"
+            );
+        }
+        if let Some((_, home)) = parent.iter().find(|(name, _)| name == "HOME") {
+            let (_, child_home) = child.iter().find(|(name, _)| name == "HOME").expect("HOME is kept");
+            assert_eq!(child_home, home, "HOME is passed through, not replaced");
         }
     }
 }

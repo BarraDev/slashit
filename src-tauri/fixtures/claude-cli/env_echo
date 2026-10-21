@@ -1,0 +1,8 @@
+#!/bin/sh
+# The environment contract of a provider child: read stdin to EOF, record the
+# environment it was started with, NUL-terminated, in `env`, and answer.
+cat > /dev/null
+env -0 > env
+printf '{"type":"system","subtype":"init","session_id":"s-env","model":"fixture-model"}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-env","result":"ok"}\n'
+exit 0
