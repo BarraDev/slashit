@@ -7,8 +7,8 @@ use crate::components::{Kanban, bulk_actions::BulkActions, toast};
 use crate::components::task_board_notice::TaskBoardNotice;
 use crate::components::task_live::ResponseOrder;
 use crate::services::list_tasks;
-use crate::services::task_board_service::list_task_board_diagnostics;
-use crate::models::task_boards::for_project;
+use crate::services::task_board_service::read_board_status;
+use crate::models::task_boards::BoardStatus;
 use crate::models::Task;
 use uuid::Uuid;
 
@@ -151,12 +151,19 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
     // Task controls are made inert here; the backend still refuses any write.
     // Read once per mount: the Dashboard is rebuilt when the Project changes,
     // and the report only changes at the next start.
-    let (board_unreadable, set_board_unreadable) = signal(false);
-    let project_id_for_report = project_id.clone();
+    // The board's Task controls are live only after a successful read shows the
+    // Project's board is readable. A pending or failed read keeps them inert.
+    // The notice reads this same status, so the two cannot disagree. Read once
+    // per mount: the Dashboard is rebuilt when the Project changes, and the
+    // report only changes at the next start.
+    let board_status = RwSignal::new(BoardStatus::Pending);
+    let project_id_for_status = project_id.clone();
+    let board_writable = Memo::new(move |_| {
+        board_status.with(|status| status.project_board_writable(&project_id_for_status))
+    });
     spawn_local(async move {
-        if let Ok(found) = list_task_board_diagnostics().await {
-            set_board_unreadable.set(!for_project(&found, &project_id_for_report).is_empty());
-        }
+        // The Dashboard may have unmounted before the read answers.
+        board_status.try_set(read_board_status().await);
     });
 
     let project_id_for_bulk = project_id.clone();
@@ -166,7 +173,7 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
     view! {
         <div class="h-full flex flex-col">
             // A board that could not be read is never shown as an empty Project.
-            <TaskBoardNotice project_id=project_id_for_notice />
+            <TaskBoardNotice project_id=project_id_for_notice status=board_status />
             {move || {
                 let project_id_kanban = project_id_for_kanban.clone();
                 let project_id_bulk = project_id_for_bulk.clone();
@@ -211,11 +218,11 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
                             // The board is inert, not hidden, so its columns stay in view.
                             <div
                                 class="contents"
-                                inert=move || board_unreadable.get()
+                                inert=move || !board_writable.get()
                             >
                                 <div
                                     class="flex-1 min-h-0"
-                                    class:opacity-50=move || board_unreadable.get()
+                                    class:opacity-50=move || !board_writable.get()
                                 >
                                     <Kanban
                                         tasks=tasks

@@ -15,6 +15,26 @@ pub struct TaskBoardReport {
     pub project_loaded: bool,
 }
 
+/// What the diagnostic read established. Only a successful read can show that a
+/// Project's board is readable; a failed read proves nothing either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoardStatus {
+    /// No answer yet.
+    Pending,
+    /// The read answered with the unreadable boards, which may be none.
+    Read(Vec<TaskBoardReport>),
+    /// The read could not be completed, with the reason it gave.
+    Failed(String),
+}
+
+impl BoardStatus {
+    /// Whether a Project's own Task controls may change its board. Only a
+    /// successful read that lists no unreadable board for the Project allows it.
+    pub fn project_board_writable(&self, project_id: &str) -> bool {
+        matches!(self, Self::Read(reports) if for_project(reports, project_id).is_empty())
+    }
+}
+
 /// The reports a Project's own board shows: its loaded Project's boards only.
 pub fn for_project<'a>(
     reports: &'a [TaskBoardReport],
@@ -70,5 +90,36 @@ mod tests {
         let healthy: Vec<TaskBoardReport> = Vec::new();
         assert!(for_project(&healthy, LOADED).is_empty());
         assert!(unassociated(&healthy).is_empty());
+    }
+
+    #[test]
+    fn a_healthy_board_is_writable_after_a_successful_read() {
+        let status = BoardStatus::Read(Vec::new());
+        assert!(status.project_board_writable(LOADED));
+    }
+
+    #[test]
+    fn an_unreadable_board_is_not_writable_after_a_successful_read() {
+        let status = BoardStatus::Read(payload());
+        assert!(!status.project_board_writable(LOADED));
+    }
+
+    #[test]
+    fn a_healthy_project_stays_writable_beside_an_unreadable_one() {
+        let status = BoardStatus::Read(payload());
+        let other = "00000000-0000-0000-0000-000000000000";
+        assert!(status.project_board_writable(other));
+    }
+
+    #[test]
+    fn a_pending_board_is_not_writable() {
+        assert!(!BoardStatus::Pending.project_board_writable(LOADED));
+    }
+
+    #[test]
+    fn a_failed_read_is_not_taken_as_a_healthy_board() {
+        let status = BoardStatus::Failed("command failed".into());
+        assert!(!status.project_board_writable(LOADED));
+        assert!(!status.project_board_writable("00000000-0000-0000-0000-000000000000"));
     }
 }

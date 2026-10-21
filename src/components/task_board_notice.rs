@@ -4,53 +4,68 @@
 //! names the file, says the stored file was not overwritten and that Task
 //! changes wait for a repair, and puts the technical reason in a disclosure.
 //!
-//! The report is read once, when the notice mounts. The backend answers from
+//! The report is read once per mount: by the Dashboard for a Project, or by the
+//! application-level notice on its own. The backend answers from
 //! the startup load, so a file repaired while the app runs does not clear the
 //! warning; the next start does.
 
-use crate::models::task_boards::{for_project, unassociated, TaskBoardReport};
-use crate::services::task_board_service::list_task_board_diagnostics;
+use crate::models::task_boards::{for_project, unassociated, BoardStatus, TaskBoardReport};
+use crate::services::task_board_service::read_board_status;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 /// The unreadable boards of one Project (`Some`), or the boards that no loaded
 /// Project can show (`None`), which appear at application level.
+///
+/// A Project's notice takes the status its Dashboard read, so the warning and
+/// the board's inert state come from one answer. The application-level notice
+/// reads on its own.
 #[component]
-pub fn TaskBoardNotice(#[prop(optional)] project_id: Option<String>) -> impl IntoView {
-    let (reports, set_reports) = signal(Vec::<TaskBoardReport>::new());
-    let (read_error, set_read_error) = signal(None::<String>);
-
-    spawn_local(async move {
-        match list_task_board_diagnostics().await {
-            Ok(found) => set_reports.set(found),
-            Err(error) => set_read_error.set(Some(error)),
-        }
+pub fn TaskBoardNotice(
+    #[prop(optional)] project_id: Option<String>,
+    #[prop(optional)] status: Option<RwSignal<BoardStatus>>,
+) -> impl IntoView {
+    let status = status.unwrap_or_else(|| {
+        let own = RwSignal::new(BoardStatus::Pending);
+        spawn_local(async move {
+            // The notice may have unmounted before the read answers.
+            own.try_set(read_board_status().await);
+        });
+        own
     });
 
     let application_level = project_id.is_none();
     move || {
-        let found = reports.get();
-        let shown: Vec<TaskBoardReport> = match &project_id {
-            Some(id) => for_project(&found, id).into_iter().cloned().collect(),
-            None => unassociated(&found).into_iter().cloned().collect(),
+        let mut shown: Vec<TaskBoardReport> = Vec::new();
+        let mut failure = None::<String>;
+        match status.get() {
+            BoardStatus::Pending => {}
+            BoardStatus::Read(found) => {
+                shown = match &project_id {
+                    Some(id) => for_project(&found, id).into_iter().cloned().collect(),
+                    None => unassociated(&found).into_iter().cloned().collect(),
+                };
+            }
+            BoardStatus::Failed(error) => failure = Some(error),
+        }
+        // A failed read cannot say which boards exist. At application level it
+        // is reported as such; a Project says only that its status is unknown.
+        let (app_failure, unverified) = match (failure, application_level) {
+            (Some(error), true) => (Some(error), None),
+            (Some(error), false) => (None, Some(error)),
+            (None, _) => (None, None),
         };
-        // A failed read cannot say which boards exist, so it is reported at
-        // application level only, rather than as an empty Project.
-        let failure = if application_level {
-            read_error.get()
-        } else {
-            None
-        };
-        if shown.is_empty() && failure.is_none() {
+        if shown.is_empty() && app_failure.is_none() && unverified.is_none() {
             return ().into_any();
         }
         view! {
             <div class="flex flex-col gap-2 px-4 pt-3">
-                {failure.map(|error| view! {
+                {app_failure.map(|error| view! {
                     <p role="alert" class="text-sm text-amber-200">
                         "Could not check whether Task boards loaded: " {error}
                     </p>
                 })}
+                {unverified.map(unverified_notice)}
                 {shown
                     .into_iter()
                     .map(|report| board_notice(&report, !application_level))
@@ -58,6 +73,23 @@ pub fn TaskBoardNotice(#[prop(optional)] project_id: Option<String>) -> impl Int
             </div>
         }
         .into_any()
+    }
+}
+
+/// A Project whose board status could not be read. Its board stays inert, and
+/// the notice does not claim the board is healthy or unreadable.
+fn unverified_notice(error: String) -> impl IntoView {
+    view! {
+        <section role="alert" data-testid="task-board-status-unverified" class="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+            <h3 class="font-semibold text-amber-200">"Task board status could not be verified"</h3>
+            <p class="mt-1 text-white/70">
+                "SlashIt could not confirm whether this Project's Task board can be read, so its Task controls are unavailable. Restart SlashIt to check again."
+            </p>
+            <details class="mt-2 text-xs text-white/50">
+                <summary class="cursor-pointer">"Technical reason"</summary>
+                <p class="mt-1 break-words font-mono">{error}</p>
+            </details>
+        </section>
     }
 }
 

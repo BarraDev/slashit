@@ -3,7 +3,7 @@
 //! Uses the fallible `raw_invoke` binding, as the orphans service does, so a
 //! failed read says why instead of looking like an empty answer.
 
-use crate::models::task_boards::TaskBoardReport;
+use crate::models::task_boards::{BoardStatus, TaskBoardReport};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -11,6 +11,14 @@ use wasm_bindgen_futures::JsFuture;
 extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke)]
     fn raw_invoke(cmd: &str, args: JsValue) -> js_sys::Promise;
+}
+
+/// One diagnostic read, as the state a board's controls and notices use.
+pub async fn read_board_status() -> BoardStatus {
+    match list_task_board_diagnostics().await {
+        Ok(reports) => BoardStatus::Read(reports),
+        Err(error) => BoardStatus::Failed(error),
+    }
 }
 
 pub async fn list_task_board_diagnostics() -> Result<Vec<TaskBoardReport>, String> {

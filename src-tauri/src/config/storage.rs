@@ -1165,7 +1165,12 @@ fn parse_failure_reason(error: &toml::de::Error, contents: &str) -> String {
         .map(|span| {
             let before = contents.get(..span.start).unwrap_or(contents);
             let line = before.matches('\n').count() + 1;
-            let column = before.rsplit('\n').next().map_or(0, str::len) + 1;
+            // The span is a byte offset; the column counts characters.
+            let column = before
+                .rsplit('\n')
+                .next()
+                .map_or(0, |text| text.chars().count())
+                + 1;
             let line_start = before.rfind('\n').map_or(0, |at| at + 1);
             // Only a line that starts a key assignment names a key. Text inside
             // a multi-line string or an open array is file content.
@@ -3528,6 +3533,17 @@ user_name = "Test"
         let reason = &storage.task_board_diagnostics()[0].reason;
         assert!(reason.contains("unknown field"), "{reason}");
         assert!(reason.contains("from_a_newer_build"), "{reason}");
+    }
+
+    #[test]
+    fn a_parse_position_counts_characters_not_bytes() {
+        // Each "é" is two bytes, so the byte offset of `bogus` is three
+        // columns past its character column.
+        let contents = "label = \"é\"\ntasks = [\"ééé\", bogus]\n";
+        let error = toml::from_str::<toml::Table>(contents).unwrap_err();
+        let reason = parse_failure_reason(&error, contents);
+        assert!(reason.contains("at line 2, column 17"), "{reason}");
+        assert!(!reason.contains("column 20"), "{reason}");
     }
 
     #[test]
