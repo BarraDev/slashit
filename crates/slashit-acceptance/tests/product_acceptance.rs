@@ -74,6 +74,8 @@ mod queue_settings;
 mod stacked_tasks;
 #[path = "product_acceptance/storage.rs"]
 mod storage;
+#[path = "product_acceptance/unreadable_board.rs"]
+mod unreadable_board;
 #[path = "product_acceptance/task_runs.rs"]
 mod task_runs;
 #[path = "product_acceptance/task_dependencies.rs"]

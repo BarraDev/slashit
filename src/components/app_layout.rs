@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::callback::Callback;
+use crate::components::task_board_notice::TaskBoardNotice;
 use crate::components::{Sidebar, ProjectTabs, ProjectRail, ToastContainer};
 use crate::services::{get_project, get_project_path, appearance_service};
 
@@ -97,6 +98,9 @@ pub fn AppLayout(
                         }
                     }}
                 </Show>
+                // Boards no loaded Project can show. A Project's own board
+                // shows its unreadable board on that board.
+                <TaskBoardNotice />
                 <main class="flex-1 min-h-0 overflow-auto">
                     <div class="h-full max-w-[1800px] mx-auto p-6">
                         {children()}

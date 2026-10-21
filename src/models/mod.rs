@@ -13,6 +13,7 @@ pub mod storage_usage;
 pub mod repository_setup;
 pub mod integration;
 pub mod orphans;
+pub mod task_boards;
 pub mod conversation;
 
 pub use project::*;

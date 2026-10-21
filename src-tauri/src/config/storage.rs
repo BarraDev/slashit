@@ -43,6 +43,21 @@ impl std::fmt::Display for UnreadableTasksFile {
 
 impl std::error::Error for UnreadableTasksFile {}
 
+/// A Task board the last load could not read, as the application reports it.
+///
+/// It comes from the same inspection that decides whether a save may replace
+/// the file, so the warning and the write refusal cannot disagree. It names the
+/// file and the reason, never the file's contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskBoardDiagnostic {
+    /// The Project the board belongs to. A routed board is named by its
+    /// directory and a legacy board by its file name; `None` when neither names
+    /// a Project.
+    pub project_id: Option<Uuid>,
+    pub path: String,
+    pub reason: String,
+}
+
 /// What one Task file path holds. An absent file and an empty board are
 /// different answers, and neither is the same as a file that cannot be read.
 enum TasksFileState {
@@ -333,6 +348,11 @@ pub struct Storage {
     /// route change that moves the board does not lift the guard. Saves refuse
     /// until a load reads the project's file again.
     unloaded_boards: Arc<Mutex<HashMap<Uuid, PathBuf>>>,
+    /// The boards the last [`Self::load_all_tasks`] could not read. Kept as that
+    /// load saw them and never re-read, so a repair made on disk while the app
+    /// runs does not clear the warning: memory still lacks the board until the
+    /// next start.
+    load_diagnostics: Arc<Mutex<Vec<TaskBoardDiagnostic>>>,
     /// Serializes every read-modify-write transaction over `config_file`.
     ///
     /// `config.toml` is one shared persistence unit: each writer replaces a
@@ -700,6 +720,7 @@ impl Storage {
             config_file,
             routes: Arc::new(RwLock::new(HashMap::new())),
             unloaded_boards: Arc::new(Mutex::new(HashMap::new())),
+            load_diagnostics: Arc::new(Mutex::new(Vec::new())),
             config_tx: Arc::new(Mutex::new(())),
             config_unconfirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -1113,6 +1134,209 @@ pub fn board_write_published(error: &anyhow::Error) -> bool {
         .is_some_and(slashit_durable_fs::WriteError::is_published)
 }
 
+/// Only the `version` key, read without the strict board types, so a board
+/// whose other keys this build refuses can still say which layout it is.
+#[derive(Deserialize)]
+struct LayoutVersion {
+    version: u32,
+}
+
+/// The declared layout version of a board that the strict parse rejected.
+fn layout_version(contents: &str) -> Option<u32> {
+    toml::from_str::<LayoutVersion>(contents)
+        .ok()
+        .map(|layout| layout.version)
+}
+
+fn newer_layout_reason(version: u32) -> String {
+    format!(
+        "layout version {version} is newer than this SlashIt understands ({TASKS_FILE_VERSION})"
+    )
+}
+
+/// Why a board did not parse, without the text of the file.
+///
+/// The TOML error's `Display` quotes the offending source line, and serde's
+/// messages quote the rejected value, so neither is passed on. The position
+/// comes from the span, and the message is reduced to a fixed category.
+fn parse_failure_reason(error: &toml::de::Error, contents: &str) -> String {
+    let position = error
+        .span()
+        .map(|span| {
+            let before = contents.get(..span.start).unwrap_or(contents);
+            let line = before.matches('\n').count() + 1;
+            // The span is a byte offset; the column counts characters.
+            let column = before
+                .rsplit('\n')
+                .next()
+                .map_or(0, |text| text.chars().count())
+                + 1;
+            let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+            // Only a line that starts a key assignment names a key. Text inside
+            // a multi-line string or an open array is file content.
+            let key = contents
+                .lines()
+                .nth(line - 1)
+                .filter(|_| !starts_inside_value(contents, line_start))
+                .and_then(|text| text.split_once('='))
+                .map(|(key, _)| key.trim())
+                .filter(|key| {
+                    !key.is_empty()
+                        && key
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+                });
+            match key {
+                Some(key) => format!(" at line {line}, column {column} (key `{key}`)"),
+                None => format!(" at line {line}, column {column}"),
+            }
+        })
+        .unwrap_or_default();
+    let message = parse_failure_message(error.message());
+    format!("parse failed{position}: {message}")
+}
+
+/// Whether the line that starts at `line_start` begins inside a value: a
+/// multi-line string, or an array or inline table that is still open.
+///
+/// A small lexer over the text before the line, so it follows the TOML quoting
+/// and comment rules rather than the line's shape.
+fn starts_inside_value(contents: &str, line_start: usize) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Lex {
+        Code,
+        Comment,
+        Basic,
+        Literal,
+        MultiBasic,
+        MultiLiteral,
+    }
+    let bytes = contents.as_bytes();
+    let mut state = Lex::Code;
+    let mut depth = 0_usize;
+    let mut i = 0;
+    while i < line_start {
+        let rest = &bytes[i..];
+        let step = match state {
+            Lex::Code if rest.starts_with(b"\"\"\"") => {
+                state = Lex::MultiBasic;
+                3
+            }
+            Lex::Code if rest.starts_with(b"'''") => {
+                state = Lex::MultiLiteral;
+                3
+            }
+            Lex::Code => {
+                match bytes[i] {
+                    b'"' => state = Lex::Basic,
+                    b'\'' => state = Lex::Literal,
+                    b'#' => state = Lex::Comment,
+                    b'[' | b'{' => depth += 1,
+                    b']' | b'}' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                1
+            }
+            Lex::Comment => {
+                if bytes[i] == b'\n' {
+                    state = Lex::Code;
+                }
+                1
+            }
+            Lex::Basic => match bytes[i] {
+                b'\\' => 2,
+                b'"' | b'\n' => {
+                    state = Lex::Code;
+                    1
+                }
+                _ => 1,
+            },
+            Lex::Literal => {
+                if matches!(bytes[i], b'\'' | b'\n') {
+                    state = Lex::Code;
+                }
+                1
+            }
+            Lex::MultiBasic if rest.starts_with(b"\"\"\"") => {
+                state = Lex::Code;
+                3
+            }
+            Lex::MultiBasic if bytes[i] == b'\\' => 2,
+            Lex::MultiBasic => 1,
+            Lex::MultiLiteral if rest.starts_with(b"'''") => {
+                state = Lex::Code;
+                3
+            }
+            Lex::MultiLiteral => 1,
+        };
+        i += step;
+    }
+    depth > 0 || state != Lex::Code
+}
+
+/// The category of a parser message, with no text from the file.
+///
+/// A parser message quotes the value it rejected, and a value can hold any
+/// text, including the wording of the message itself. So a message is never
+/// trimmed or redacted. Its first line is matched against the fixed openings
+/// that TOML and serde produce, and the message becomes that category. The one
+/// piece of file text kept is a field name, and only when it is a plain
+/// identifier. Anything unrecognised becomes a generic category.
+fn parse_failure_message(message: &str) -> String {
+    let first = message.lines().next().unwrap_or_default();
+    for (opening, category) in KEYED_MESSAGES {
+        if let Some(rest) = first.strip_prefix(opening) {
+            return match plain_key(rest) {
+                Some(key) => format!("{category} `{key}`"),
+                None => category.to_owned(),
+            };
+        }
+    }
+    FIXED_MESSAGES
+        .iter()
+        .find(|(opening, _)| first.starts_with(opening))
+        .map_or("unrecognized TOML error", |(_, category)| category)
+        .to_owned()
+}
+
+/// Messages that name a field in backticks: the opening, then the category.
+const KEYED_MESSAGES: [(&str, &str); 4] = [
+    ("unknown field `", "unknown field"),
+    ("missing field `", "missing field"),
+    ("duplicate key `", "duplicate key"),
+    ("duplicate field `", "duplicate field"),
+];
+
+/// Messages with fixed wording. A more specific opening comes before a
+/// shorter one it extends.
+const FIXED_MESSAGES: [(&str, &str); 12] = [
+    ("invalid type", "invalid type"),
+    ("invalid value", "invalid value"),
+    ("invalid length", "invalid length"),
+    ("unknown variant", "unknown variant"),
+    ("invalid escape sequence", "invalid escape sequence"),
+    ("invalid table header", "invalid table header"),
+    ("invalid inline table", "invalid inline table"),
+    ("invalid table", "invalid table"),
+    ("invalid array", "invalid array"),
+    ("invalid string", "invalid string"),
+    ("invalid key", "invalid key"),
+    ("expected newline", "expected newline"),
+];
+
+/// The field name that starts `rest`, the text after an opening backtick.
+///
+/// The name must be a plain identifier, closed by a backtick that ends the
+/// message or is followed by a separator. Any other name is left out.
+fn plain_key(rest: &str) -> Option<&str> {
+    let (key, after) = rest.split_once('`')?;
+    let plain = !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    (plain && (after.is_empty() || after.starts_with([',', ' ']))).then_some(key)
+}
+
 /// Write a file durably and atomically with owner-only permissions.
 ///
 /// The protocol, its guarantee and its failure model live in
@@ -1158,10 +1382,9 @@ impl Storage {
             Err(e) => return unreadable(format!("read failed: {e}")),
         };
         match toml::from_str::<ProjectTasksFile>(&contents) {
-            Ok(file) if file.version > TASKS_FILE_VERSION => unreadable(format!(
-                "layout version {} is newer than this SlashIt understands ({TASKS_FILE_VERSION})",
-                file.version
-            )),
+            Ok(file) if file.version > TASKS_FILE_VERSION => {
+                unreadable(newer_layout_reason(file.version))
+            }
             Ok(file) => {
                 let mut tasks = file.tasks;
                 for task in &mut tasks {
@@ -1169,7 +1392,14 @@ impl Storage {
                 }
                 TasksFileState::Board(tasks)
             }
-            Err(e) => unreadable(format!("parse failed: {e}")),
+            // Only on this failure path: a newer layout usually also carries
+            // keys this build refuses, so the strict parse fails on those first.
+            Err(e) => match layout_version(&contents) {
+                Some(version) if version > TASKS_FILE_VERSION => {
+                    unreadable(newer_layout_reason(version))
+                }
+                _ => unreadable(parse_failure_reason(&e, &contents)),
+            },
         }
     }
 
@@ -1186,11 +1416,25 @@ impl Storage {
     /// tasks stay visible until the project that owns them is saved once.
     pub fn load_all_tasks(&self) -> Result<Vec<Task>> {
         let mut all_tasks = Vec::new();
+        let mut diagnostics = Vec::new();
         let mut unloaded = match self.unloaded_boards.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for (owner, source) in self.task_files()? {
+        let files = match self.task_files() {
+            Ok(files) => files,
+            Err(e) => {
+                // Without a listing, every board looks absent. Say so instead
+                // of showing an empty application.
+                self.record_load_diagnostics(vec![TaskBoardDiagnostic {
+                    project_id: None,
+                    path: self.legacy_tasks_dir().display().to_string(),
+                    reason: format!("the task files could not be listed: {e}"),
+                }]);
+                return Err(e);
+            }
+        };
+        for (owner, source) in files {
             match Self::inspect_tasks_file(&source) {
                 TasksFileState::Board(tasks) => {
                     if let Some(owner) = owner {
@@ -1201,13 +1445,36 @@ impl Storage {
                 TasksFileState::Absent => {}
                 TasksFileState::Unreadable(e) => {
                     eprintln!("Warning: {e}");
+                    diagnostics.push(TaskBoardDiagnostic {
+                        project_id: owner,
+                        path: source.display().to_string(),
+                        reason: e.reason,
+                    });
                     if let Some(owner) = owner {
                         unloaded.insert(owner, source);
                     }
                 }
             }
         }
+        self.record_load_diagnostics(diagnostics);
         Ok(all_tasks)
+    }
+
+    /// The Task boards the last [`Self::load_all_tasks`] could not read. Read
+    /// from that load's record, not from disk: the answer stays what memory
+    /// was built from until the application restarts.
+    pub fn task_board_diagnostics(&self) -> Vec<TaskBoardDiagnostic> {
+        match self.load_diagnostics.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn record_load_diagnostics(&self, diagnostics: Vec<TaskBoardDiagnostic>) {
+        match self.load_diagnostics.lock() {
+            Ok(mut guard) => *guard = diagnostics,
+            Err(poisoned) => *poisoned.into_inner() = diagnostics,
+        }
     }
 
     /// The board files [`Self::load_all_tasks`] reads that it cannot read or
@@ -3148,6 +3415,294 @@ user_name = "Test"
         let all_tasks = storage.load_all_tasks().expect("Should load all");
 
         assert_eq!(all_tasks.len(), 3);
+    }
+
+    // ==================== Task board diagnostics ====================
+
+    #[test]
+    fn an_unreadable_routed_board_is_reported_for_its_project_and_left_alone() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let broken = Uuid::new_v4();
+        route_project_to(&storage, broken, &repo);
+        let healthy = Uuid::new_v4();
+        storage
+            .save_project_tasks(healthy, &board_with_pending_integration(healthy))
+            .unwrap();
+
+        let path = storage.tasks_path(broken);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"tasks = [ not toml").unwrap();
+
+        // Startup: the load that the application makes once.
+        let loaded = storage.load_all_tasks().unwrap();
+        assert_eq!(loaded.len(), 1, "a healthy project keeps its tasks");
+        let diagnostics = storage.task_board_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].project_id, Some(broken));
+        assert_eq!(diagnostics[0].path, path.display().to_string());
+        assert!(
+            diagnostics[0].reason.starts_with("parse failed at line 1"),
+            "{:?}",
+            diagnostics[0]
+        );
+
+        assert_eq!(fs::read(&path).unwrap(), b"tasks = [ not toml");
+        let refusal = storage
+            .save_project_tasks(broken, &[crate::test_helpers::create_test_task("Refused")])
+            .expect_err("a save must not replace the board");
+        assert!(refusal.downcast_ref::<UnreadableTasksFile>().is_some());
+        assert_eq!(fs::read(&path).unwrap(), b"tasks = [ not toml");
+    }
+
+    #[test]
+    fn legacy_unreadable_boards_are_attributed_by_name_or_reported_unassociated() {
+        let (storage, _dir) = create_test_storage();
+        let owned = Uuid::new_v4();
+        let legacy = storage.legacy_tasks_dir();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join(format!("{owned}.toml")), "tasks = [ not toml").unwrap();
+        fs::write(legacy.join("hand-made.toml"), "version = 2\n").unwrap();
+        let missing_project = Uuid::new_v4();
+
+        storage.load_all_tasks().unwrap();
+        let mut diagnostics = storage.task_board_diagnostics();
+        diagnostics.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(diagnostics.len(), 2, "a missing file is not a diagnostic");
+        assert!(diagnostics.iter().any(|d| d.project_id == Some(owned)));
+        let unassociated = diagnostics.iter().find(|d| d.project_id.is_none()).unwrap();
+        assert!(unassociated.path.ends_with("hand-made.toml"));
+        assert!(!diagnostics
+            .iter()
+            .any(|d| d.project_id == Some(missing_project)));
+    }
+
+    #[test]
+    fn a_repaired_board_stays_reported_until_the_next_start() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"tasks = [ not toml").unwrap();
+        storage.load_all_tasks().unwrap();
+
+        // The file is repaired while the app runs. Memory was built without it.
+        fs::write(&path, valid_board_text(project_id)).unwrap();
+        assert_eq!(
+            storage.task_board_diagnostics().len(),
+            1,
+            "no re-read clears the warning"
+        );
+        assert!(storage
+            .save_project_tasks(project_id, &board_with_pending_integration(project_id))
+            .expect_err("a stale board must not replace the repaired file")
+            .downcast_ref::<UnreadableTasksFile>()
+            .is_some());
+
+        // After a restart the load reads the repaired file and reports nothing.
+        let restarted = Storage::with_paths(storage.paths().clone());
+        assert_eq!(restarted.load_all_tasks().unwrap().len(), 1);
+        assert!(restarted.task_board_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn a_newer_layout_is_named_before_its_unknown_fields() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let newer = board_text_edited(&valid_board_text(project_id), |table| {
+            table.insert("version".into(), 2_i64.into());
+            first_task_mut(table).insert("from_a_newer_build".into(), "kept".into());
+        });
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &newer).unwrap();
+
+        storage.load_all_tasks().unwrap();
+        let reason = &storage.task_board_diagnostics()[0].reason;
+        assert!(reason.contains("layout version 2 is newer"), "{reason}");
+        assert!(!reason.contains("unknown field"), "{reason}");
+
+        // A current-version board with the same unknown key is still refused
+        // as a strict-parse failure, and names the key.
+        let strict = board_text_edited(&valid_board_text(project_id), |table| {
+            first_task_mut(table).insert("from_a_newer_build".into(), "kept".into());
+        });
+        fs::write(&path, &strict).unwrap();
+        storage.load_all_tasks().unwrap();
+        let reason = &storage.task_board_diagnostics()[0].reason;
+        assert!(reason.contains("unknown field"), "{reason}");
+        assert!(reason.contains("from_a_newer_build"), "{reason}");
+    }
+
+    #[test]
+    fn a_parse_position_counts_characters_not_bytes() {
+        // Each "é" is two bytes, so the byte offset of `bogus` is three
+        // columns past its character column.
+        let contents = "label = \"é\"\ntasks = [\"ééé\", bogus]\n";
+        let error = toml::from_str::<toml::Table>(contents).unwrap_err();
+        let reason = parse_failure_reason(&error, contents);
+        assert!(reason.contains("at line 2, column 17"), "{reason}");
+        assert!(!reason.contains("column 20"), "{reason}");
+    }
+
+    #[test]
+    fn a_parse_reason_carries_no_file_content() {
+        // A value can hold the wording of the message itself, so a message
+        // is reduced to its category and never trimmed.
+        for message in [
+            "invalid type: string \"Secretword, expected Tail\", expected u32",
+            "invalid type: string \"a\\\"Secretword\\\"x\", expected u32",
+            "invalid value: integer `4242`, expected u32",
+            "unknown variant `Secretword, expected Tail`, expected one of `backlog`, `queue`",
+            "invalid escape sequence\nexpected `b`, `f`, `n`, `r`, `t`, `u`, `U`",
+            "Secretword, expected Tail",
+        ] {
+            let reason = parse_failure_message(message);
+            assert!(!reason.contains("Secretword"), "{message}: {reason}");
+            assert!(!reason.contains("Tail"), "{message}: {reason}");
+        }
+        assert_eq!(
+            parse_failure_message(
+                "invalid type: string \"Secretword, expected Tail\", expected u32"
+            ),
+            "invalid type"
+        );
+        assert_eq!(
+            parse_failure_message("invalid escape sequence\nexpected `b`, `f`"),
+            "invalid escape sequence"
+        );
+        assert_eq!(
+            parse_failure_message("Secretword, expected Tail"),
+            "unrecognized TOML error"
+        );
+
+        // A plain identifier is a field name and is kept. Any other quoted
+        // text is not, even when it is inside the name's backticks.
+        assert_eq!(
+            parse_failure_message(
+                "unknown field `from_a_newer_build`, expected `version` or `tasks`"
+            ),
+            "unknown field `from_a_newer_build`"
+        );
+        assert_eq!(
+            parse_failure_message("duplicate key `version` in document root"),
+            "duplicate key `version`"
+        );
+        assert_eq!(
+            parse_failure_message("unknown field `Secretword, expected Tail`, expected `version`"),
+            "unknown field"
+        );
+        assert_eq!(
+            parse_failure_message("unknown field `a`b`, expected `version`"),
+            "unknown field"
+        );
+
+        // Each board puts a value, or a line that looks like one, where the
+        // parser fails. None of its text may reach the reason.
+        let boards: [(&str, &str); 11] = [
+            ("title = 'Secretword plan\n", "single-quoted string"),
+            (
+                "note = \"\"\"\nSecretword = x \\q\n\"\"\"\n",
+                "line inside a multi-line string",
+            ),
+            (
+                "tasks = [\n  Secretword\n]\n",
+                "bare word inside an open array",
+            ),
+            ("version = 1\ntasks = []\nversion = 1\n", "duplicate key"),
+            (
+                "version = 1\ntasks = []\nnote = \"Secretword\" = 1\n",
+                "quoted value before a second assignment",
+            ),
+            (
+                "version = \"Secretword\"\ntasks = []\n",
+                "string where the version belongs",
+            ),
+            (
+                "version = \"Secretword, expected Tail\"\ntasks = []\n",
+                "string with the separator text where the version belongs",
+            ),
+            (
+                "version = 1\ntasks = []\n\"Secretword, expected Tail\" = 1\n",
+                "quoted root key with the separator text",
+            ),
+            (
+                "version = 1 Secretword, expected Tail\n",
+                "text after a complete value",
+            ),
+            (
+                "version = 1\ntasks = [ 'Secretword' 'Tail' ]\n",
+                "two literal strings in one array",
+            ),
+            (
+                "version = 99999999999999999999999\ntasks = []\n",
+                "integer beyond the range of the field",
+            ),
+        ];
+        for (contents, what) in boards {
+            let (storage, _dir) = create_test_storage();
+            let project_id = Uuid::new_v4();
+            let path = storage.tasks_path(project_id);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+            storage.load_all_tasks().unwrap();
+            let reason = &storage.task_board_diagnostics()[0].reason;
+            assert!(
+                reason.starts_with("parse failed at line"),
+                "{what}: {reason}"
+            );
+            assert!(!reason.contains("Secretword"), "{what}: {reason}");
+            assert!(!reason.contains("Tail"), "{what}: {reason}");
+            assert!(
+                !reason.contains("99999999999999999999999"),
+                "{what}: {reason}"
+            );
+        }
+
+        // An unknown value of an enum is quoted in the message, not the key.
+        // The value holds the separator text, which must not reach the reason.
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            board_text_edited(&valid_board_text(project_id), |table| {
+                first_task_mut(table)
+                    .insert("status".into(), "a\"Secretword, expected Tail`x".into());
+            }),
+        )
+        .unwrap();
+        storage.load_all_tasks().unwrap();
+        let reason = &storage.task_board_diagnostics()[0].reason;
+        assert!(reason.contains("(key `status`)"), "{reason}");
+        assert!(reason.ends_with(": unknown variant"), "{reason}");
+        assert!(!reason.contains("Secretword"), "{reason}");
+        assert!(!reason.contains("Tail"), "{reason}");
+    }
+
+    #[test]
+    fn the_startup_warning_and_the_save_refusal_text_carry_no_file_content() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "version = \"Secretword, expected Tail\"\ntasks = []\n",
+        )
+        .unwrap();
+
+        // Startup prints this `Display` text to the log, and a save refusal
+        // returns it to the caller.
+        let TasksFileState::Unreadable(unreadable) = Storage::inspect_tasks_file(&path) else {
+            panic!("the board must be unreadable");
+        };
+        let text = unreadable.to_string();
+        assert!(text.contains("parse failed at line 1"), "{text}");
+        assert!(!text.contains("Secretword"), "{text}");
+        assert!(!text.contains("Tail"), "{text}");
     }
 
     // ==================== State routing / migration Tests ====================

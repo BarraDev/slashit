@@ -45,6 +45,7 @@ Commands are registered in `lib.rs` using `tauri::generate_handler!`. All comman
 
 - `get_task_diff` - The patch of a Task's Git worktree against its base commit, in `commands/jj.rs`
 - `get_task_diff_stat` - The diffstat of the same range, in `commands/jj.rs`
+- `list_task_board_diagnostics` - The Task boards the startup load could not read, with the Project each belongs to and whether it is loaded, in `commands/task_boards.rs`. Read from that load's record, never from disk
 
 ## Two front ends, one backend
 
