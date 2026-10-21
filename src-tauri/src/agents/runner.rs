@@ -384,22 +384,27 @@ pub struct ClaudeRunConfig {
     /// read, so their hooks, plugins and `env` do not reach the run, and MCP
     /// servers come only from `--mcp-config` (as with `disable_mcp`). The
     /// project's `CLAUDE.md` still loads. The project's `env` block still
-    /// applies, except for the provider endpoint, routing, proxy and CA
-    /// variables and `apiKeyHelper`, which the run pins (see
-    /// [`PINNED_PROVIDER_ENV`]). The CLI ignores a project's
+    /// applies, except for the names the run pins (see [`PINNED_ENV`]): the
+    /// provider endpoint, routing, proxy and CA variables, the shell and
+    /// child-process inlets, and `DISABLE_TELEMETRY`. The project's command
+    /// helpers are pinned to empty (see [`HELPER_SETTINGS`]). The CLI ignores a project's
     /// `bypassPermissions` default and its allow rules in an untrusted
     /// workspace. Filesystem access is not confined by this. Used by the
     /// coding Worker and the review-fix agent.
     pub isolate_customizations: bool,
 }
 
-/// Provider settings an isolated run pins in `--settings`. The project's own
-/// `env` block outranks the environment SlashIt passes, so without a pin a
+/// Environment variables an isolated run pins in `--settings`. The project's
+/// own `env` block outranks the environment SlashIt passes, so without a pin a
 /// repository could send the API key to another endpoint, move the run to
-/// Bedrock, Vertex or Foundry, or route its traffic through its own proxy or
-/// CA bundle. Each name is pinned to the value the child receives, or to
-/// empty when the child receives none.
-const PINNED_PROVIDER_ENV: &[&str] = &[
+/// Bedrock, Vertex or Foundry, route its traffic through its own proxy or CA
+/// bundle, put code in front of every child process (`PATH`, `BASH_ENV`,
+/// `ENV`, `LD_PRELOAD`, `NODE_OPTIONS`), or wrap every shell command
+/// (`CLAUDE_CODE_SHELL_PREFIX`). Each name is pinned to the value the child
+/// receives, or to empty when the child receives none; `PATH` is always the
+/// value SlashIt chose.
+const PINNED_ENV: &[&str] = &[
+    "PATH",
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
@@ -412,7 +417,29 @@ const PINNED_PROVIDER_ENV: &[&str] = &[
     "all_proxy",
     "NODE_EXTRA_CA_CERTS",
     "NODE_OPTIONS",
+    "BASH_ENV",
+    "ENV",
+    "LD_PRELOAD",
+    "CLAUDE_CODE_SHELL_PREFIX",
 ];
+
+/// Settings that name a command the CLI runs. A repository can write them for
+/// a later launch, and the CLI runs some before the permission mode applies,
+/// so an isolated run pins each one to empty. An empty command does not run.
+/// `null` is not a pin: the CLI skips the invalid setting and the command
+/// still runs.
+const HELPER_SETTINGS: &[&str] = &[
+    "apiKeyHelper",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "gcpAuthRefresh",
+    "otelHeadersHelper",
+];
+
+/// The optional provider telemetry an isolated run turns off. The CLI's
+/// Auto gate and the Bash classifier do not depend on it (checked on Claude
+/// Code 2.1.306 with a local stub).
+const ISOLATED_TELEMETRY_ENV: (&str, &str) = ("DISABLE_TELEMETRY", "1");
 
 /// The endpoint the CLI uses when `ANTHROPIC_BASE_URL` is not set.
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
@@ -421,11 +448,9 @@ const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// environment the child receives (see [`provider_env`]).
 ///
 /// Every hook is off, including the project's own hooks, which are repository
-/// code. `apiKeyHelper` is pinned to empty because the CLI runs a project's
-/// helper command before the permission mode applies, in an untrusted
-/// workspace too, and a repository can write that setting for a later launch.
-/// `null` is not accepted here: the CLI skips the invalid setting and the
-/// helper still runs.
+/// code. Every [`HELPER_SETTINGS`] command is pinned to empty, because the CLI
+/// runs a project's helper before the permission mode applies, in an untrusted
+/// workspace too. Optional telemetry is off ([`ISOLATED_TELEMETRY_ENV`]).
 ///
 /// The pinned values are not secrets. A proxy URL with credentials in it is
 /// visible in the process list, as the child's own environment already is to
@@ -440,19 +465,21 @@ fn isolated_settings(child_env: &[(std::ffi::OsString, std::ffi::OsString)]) -> 
             .to_string()
     };
     let mut env = serde_json::Map::new();
-    for name in PINNED_PROVIDER_ENV {
+    for name in PINNED_ENV {
         let mut value = child_value(name);
         if *name == "ANTHROPIC_BASE_URL" && value.is_empty() {
             value = DEFAULT_ANTHROPIC_BASE_URL.to_string();
         }
         env.insert((*name).to_string(), value.into());
     }
-    serde_json::json!({
-        "disableAllHooks": true,
-        "apiKeyHelper": "",
-        "env": env,
-    })
-    .to_string()
+    env.insert(ISOLATED_TELEMETRY_ENV.0.to_string(), ISOLATED_TELEMETRY_ENV.1.into());
+    let mut settings = serde_json::Map::new();
+    settings.insert("disableAllHooks".to_string(), true.into());
+    for name in HELPER_SETTINGS {
+        settings.insert((*name).to_string(), "".into());
+    }
+    settings.insert("env".to_string(), env.into());
+    serde_json::Value::Object(settings).to_string()
 }
 
 /// The Claude CLI arguments for `config`, in order, without the program.
@@ -1734,6 +1761,27 @@ mod launch_policy_tests {
         assert_eq!(settings["env"]["CLAUDE_CODE_USE_BEDROCK"], "");
         // NODE_OPTIONS is not in the child's environment, so it is pinned empty.
         assert_eq!(settings["env"]["NODE_OPTIONS"], "");
+    }
+
+    #[test]
+    fn isolated_settings_pin_the_shell_and_child_process_inlets() {
+        let child = provider_env(vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]);
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child)).unwrap();
+        // The project cannot prepend its own directory to the child's PATH.
+        assert_eq!(settings["env"]["PATH"], "/usr/bin:/bin");
+        for name in ["BASH_ENV", "ENV", "LD_PRELOAD", "CLAUDE_CODE_SHELL_PREFIX"] {
+            assert_eq!(settings["env"][name], "", "{name} must be pinned empty");
+        }
+    }
+
+    #[test]
+    fn isolated_settings_disable_helpers_and_optional_telemetry() {
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[])).unwrap();
+        for name in HELPER_SETTINGS {
+            assert_eq!(settings[*name], "", "{name} must be pinned empty");
+        }
+        assert_eq!(settings["env"]["DISABLE_TELEMETRY"], "1");
+        assert_eq!(settings["disableAllHooks"], true);
     }
 
     #[test]

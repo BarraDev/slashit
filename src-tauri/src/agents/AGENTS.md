@@ -51,12 +51,13 @@ the security boundary of the run:
 - `isolate_customizations: true` for the coding Worker and the review-fix
   agent: `--setting-sources project` (the user's settings, hooks, plugins and
   `env` are not read), `--settings` from `isolated_settings` (every hook is
-  off, and the provider endpoint, routing, proxy, CA and `NODE_OPTIONS`
-  variables and `apiKeyHelper` are pinned), and `--strict-mcp-config`. The
-  project's `env` block outranks the environment SlashIt passes, so the pins
-  are what keep a repository from redirecting the API key or the provider;
-  a pin is a string value, because `null` is skipped as invalid and the
-  setting it was meant to disable still runs. The project's `CLAUDE.md`
+  off, `DISABLE_TELEMETRY` is `1`, the `PINNED_ENV` names are pinned to the
+  child's values or empty, and the `HELPER_SETTINGS` commands are pinned to
+  empty), and `--strict-mcp-config`. The project's `env` block outranks the
+  environment SlashIt passes, so the pins are what keep a repository from
+  redirecting the API key, the provider, the shell or child processes; a pin
+  is a string value, because `null` is skipped as invalid and the setting it
+  was meant to disable still runs. The project's `CLAUDE.md`
   still loads; the user's `CLAUDE.md` does not. `--safe-mode` and an empty
   `--setting-sources` were rejected because both also drop the project
   `CLAUDE.md`. Built-in CLI plugins load in every mode. Isolation does not
