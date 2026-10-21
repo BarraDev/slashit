@@ -121,6 +121,7 @@ const READ_ONLY: &[&str] = &[
     "list_sessions",
     "get_state_location",
     "list_tasks",
+    "list_task_board_diagnostics",
     "updater_status",
     "get_workflow_config",
     "list_workflows",

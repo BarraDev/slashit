@@ -43,6 +43,21 @@ impl std::fmt::Display for UnreadableTasksFile {
 
 impl std::error::Error for UnreadableTasksFile {}
 
+/// A Task board the last load could not read, as the application reports it.
+///
+/// It comes from the same inspection that decides whether a save may replace
+/// the file, so the warning and the write refusal cannot disagree. It names the
+/// file and the reason, never the file's contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskBoardDiagnostic {
+    /// The Project the board belongs to. A routed board is named by its
+    /// directory and a legacy board by its file name; `None` when neither names
+    /// a Project.
+    pub project_id: Option<Uuid>,
+    pub path: String,
+    pub reason: String,
+}
+
 /// What one Task file path holds. An absent file and an empty board are
 /// different answers, and neither is the same as a file that cannot be read.
 enum TasksFileState {
@@ -333,6 +348,11 @@ pub struct Storage {
     /// route change that moves the board does not lift the guard. Saves refuse
     /// until a load reads the project's file again.
     unloaded_boards: Arc<Mutex<HashMap<Uuid, PathBuf>>>,
+    /// The boards the last [`Self::load_all_tasks`] could not read. Kept as that
+    /// load saw them and never re-read, so a repair made on disk while the app
+    /// runs does not clear the warning: memory still lacks the board until the
+    /// next start.
+    load_diagnostics: Arc<Mutex<Vec<TaskBoardDiagnostic>>>,
     /// Serializes every read-modify-write transaction over `config_file`.
     ///
     /// `config.toml` is one shared persistence unit: each writer replaces a
@@ -700,6 +720,7 @@ impl Storage {
             config_file,
             routes: Arc::new(RwLock::new(HashMap::new())),
             unloaded_boards: Arc::new(Mutex::new(HashMap::new())),
+            load_diagnostics: Arc::new(Mutex::new(Vec::new())),
             config_tx: Arc::new(Mutex::new(())),
             config_unconfirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -1113,6 +1134,78 @@ pub fn board_write_published(error: &anyhow::Error) -> bool {
         .is_some_and(slashit_durable_fs::WriteError::is_published)
 }
 
+/// Only the `version` key, read without the strict board types, so a board
+/// whose other keys this build refuses can still say which layout it is.
+#[derive(Deserialize)]
+struct LayoutVersion {
+    version: u32,
+}
+
+/// The declared layout version of a board that the strict parse rejected.
+fn layout_version(contents: &str) -> Option<u32> {
+    toml::from_str::<LayoutVersion>(contents)
+        .ok()
+        .map(|layout| layout.version)
+}
+
+fn newer_layout_reason(version: u32) -> String {
+    format!(
+        "layout version {version} is newer than this SlashIt understands ({TASKS_FILE_VERSION})"
+    )
+}
+
+/// Why a board did not parse, without the text of the file.
+///
+/// The TOML error's `Display` quotes the offending source line, and serde's
+/// messages can quote a value, so neither is passed on. The position comes from
+/// the span and the message keeps its wording with quoted text removed.
+fn parse_failure_reason(error: &toml::de::Error, contents: &str) -> String {
+    let position = error
+        .span()
+        .map(|span| {
+            let before = contents.get(..span.start).unwrap_or(contents);
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().map_or(0, str::len) + 1;
+            let key = contents
+                .lines()
+                .nth(line - 1)
+                .and_then(|text| text.split('=').next())
+                .map(str::trim)
+                .filter(|key| {
+                    !key.is_empty()
+                        && key
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+                });
+            match key {
+                Some(key) => format!(" at line {line}, column {column} (key `{key}`)"),
+                None => format!(" at line {line}, column {column}"),
+            }
+        })
+        .unwrap_or_default();
+    let message = redact_quoted(error.message().lines().next().unwrap_or_default());
+    format!("parse failed{position}: {message}")
+}
+
+/// Replace every double-quoted run with `"..."`, so a message that echoes a
+/// value from the file does not carry it.
+fn redact_quoted(message: &str) -> String {
+    let mut redacted = String::with_capacity(message.len());
+    let mut inside = false;
+    for ch in message.chars() {
+        match (ch, inside) {
+            ('"', false) => {
+                inside = true;
+                redacted.push_str("\"...\"");
+            }
+            ('"', true) => inside = false,
+            (_, false) => redacted.push(ch),
+            (_, true) => {}
+        }
+    }
+    redacted
+}
+
 /// Write a file durably and atomically with owner-only permissions.
 ///
 /// The protocol, its guarantee and its failure model live in
@@ -1158,10 +1251,9 @@ impl Storage {
             Err(e) => return unreadable(format!("read failed: {e}")),
         };
         match toml::from_str::<ProjectTasksFile>(&contents) {
-            Ok(file) if file.version > TASKS_FILE_VERSION => unreadable(format!(
-                "layout version {} is newer than this SlashIt understands ({TASKS_FILE_VERSION})",
-                file.version
-            )),
+            Ok(file) if file.version > TASKS_FILE_VERSION => {
+                unreadable(newer_layout_reason(file.version))
+            }
             Ok(file) => {
                 let mut tasks = file.tasks;
                 for task in &mut tasks {
@@ -1169,7 +1261,14 @@ impl Storage {
                 }
                 TasksFileState::Board(tasks)
             }
-            Err(e) => unreadable(format!("parse failed: {e}")),
+            // Only on this failure path: a newer layout usually also carries
+            // keys this build refuses, so the strict parse fails on those first.
+            Err(e) => match layout_version(&contents) {
+                Some(version) if version > TASKS_FILE_VERSION => {
+                    unreadable(newer_layout_reason(version))
+                }
+                _ => unreadable(parse_failure_reason(&e, &contents)),
+            },
         }
     }
 
@@ -1186,11 +1285,25 @@ impl Storage {
     /// tasks stay visible until the project that owns them is saved once.
     pub fn load_all_tasks(&self) -> Result<Vec<Task>> {
         let mut all_tasks = Vec::new();
+        let mut diagnostics = Vec::new();
         let mut unloaded = match self.unloaded_boards.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for (owner, source) in self.task_files()? {
+        let files = match self.task_files() {
+            Ok(files) => files,
+            Err(e) => {
+                // Without a listing, every board looks absent. Say so instead
+                // of showing an empty application.
+                self.record_load_diagnostics(vec![TaskBoardDiagnostic {
+                    project_id: None,
+                    path: self.legacy_tasks_dir().display().to_string(),
+                    reason: format!("the task files could not be listed: {e}"),
+                }]);
+                return Err(e);
+            }
+        };
+        for (owner, source) in files {
             match Self::inspect_tasks_file(&source) {
                 TasksFileState::Board(tasks) => {
                     if let Some(owner) = owner {
@@ -1201,13 +1314,36 @@ impl Storage {
                 TasksFileState::Absent => {}
                 TasksFileState::Unreadable(e) => {
                     eprintln!("Warning: {e}");
+                    diagnostics.push(TaskBoardDiagnostic {
+                        project_id: owner,
+                        path: source.display().to_string(),
+                        reason: e.reason,
+                    });
                     if let Some(owner) = owner {
                         unloaded.insert(owner, source);
                     }
                 }
             }
         }
+        self.record_load_diagnostics(diagnostics);
         Ok(all_tasks)
+    }
+
+    /// The Task boards the last [`Self::load_all_tasks`] could not read. Read
+    /// from that load's record, not from disk: the answer stays what memory
+    /// was built from until the application restarts.
+    pub fn task_board_diagnostics(&self) -> Vec<TaskBoardDiagnostic> {
+        match self.load_diagnostics.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn record_load_diagnostics(&self, diagnostics: Vec<TaskBoardDiagnostic>) {
+        match self.load_diagnostics.lock() {
+            Ok(mut guard) => *guard = diagnostics,
+            Err(poisoned) => *poisoned.into_inner() = diagnostics,
+        }
     }
 
     /// The board files [`Self::load_all_tasks`] reads that it cannot read or
@@ -3148,6 +3284,142 @@ user_name = "Test"
         let all_tasks = storage.load_all_tasks().expect("Should load all");
 
         assert_eq!(all_tasks.len(), 3);
+    }
+
+    // ==================== Task board diagnostics ====================
+
+    #[test]
+    fn an_unreadable_routed_board_is_reported_for_its_project_and_left_alone() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let broken = Uuid::new_v4();
+        route_project_to(&storage, broken, &repo);
+        let healthy = Uuid::new_v4();
+        storage
+            .save_project_tasks(healthy, &board_with_pending_integration(healthy))
+            .unwrap();
+
+        let path = storage.tasks_path(broken);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"tasks = [ not toml").unwrap();
+
+        // Startup: the load that the application makes once.
+        let loaded = storage.load_all_tasks().unwrap();
+        assert_eq!(loaded.len(), 1, "a healthy project keeps its tasks");
+        let diagnostics = storage.task_board_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].project_id, Some(broken));
+        assert_eq!(diagnostics[0].path, path.display().to_string());
+        assert!(
+            diagnostics[0].reason.starts_with("parse failed at line 1"),
+            "{:?}",
+            diagnostics[0]
+        );
+
+        assert_eq!(fs::read(&path).unwrap(), b"tasks = [ not toml");
+        let refusal = storage
+            .save_project_tasks(broken, &[crate::test_helpers::create_test_task("Refused")])
+            .expect_err("a save must not replace the board");
+        assert!(refusal.downcast_ref::<UnreadableTasksFile>().is_some());
+        assert_eq!(fs::read(&path).unwrap(), b"tasks = [ not toml");
+    }
+
+    #[test]
+    fn legacy_unreadable_boards_are_attributed_by_name_or_reported_unassociated() {
+        let (storage, _dir) = create_test_storage();
+        let owned = Uuid::new_v4();
+        let legacy = storage.legacy_tasks_dir();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join(format!("{owned}.toml")), "tasks = [ not toml").unwrap();
+        fs::write(legacy.join("hand-made.toml"), "version = 2\n").unwrap();
+        let missing_project = Uuid::new_v4();
+
+        storage.load_all_tasks().unwrap();
+        let mut diagnostics = storage.task_board_diagnostics();
+        diagnostics.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(diagnostics.len(), 2, "a missing file is not a diagnostic");
+        assert!(diagnostics.iter().any(|d| d.project_id == Some(owned)));
+        let unassociated = diagnostics.iter().find(|d| d.project_id.is_none()).unwrap();
+        assert!(unassociated.path.ends_with("hand-made.toml"));
+        assert!(!diagnostics
+            .iter()
+            .any(|d| d.project_id == Some(missing_project)));
+    }
+
+    #[test]
+    fn a_repaired_board_stays_reported_until_the_next_start() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"tasks = [ not toml").unwrap();
+        storage.load_all_tasks().unwrap();
+
+        // The file is repaired while the app runs. Memory was built without it.
+        fs::write(&path, valid_board_text(project_id)).unwrap();
+        assert_eq!(
+            storage.task_board_diagnostics().len(),
+            1,
+            "no re-read clears the warning"
+        );
+        assert!(storage
+            .save_project_tasks(project_id, &board_with_pending_integration(project_id))
+            .expect_err("a stale board must not replace the repaired file")
+            .downcast_ref::<UnreadableTasksFile>()
+            .is_some());
+
+        // After a restart the load reads the repaired file and reports nothing.
+        let restarted = Storage::with_paths(storage.paths().clone());
+        assert_eq!(restarted.load_all_tasks().unwrap().len(), 1);
+        assert!(restarted.task_board_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn a_newer_layout_is_named_before_its_unknown_fields() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let newer = board_text_edited(&valid_board_text(project_id), |table| {
+            table.insert("version".into(), 2_i64.into());
+            first_task_mut(table).insert("from_a_newer_build".into(), "kept".into());
+        });
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &newer).unwrap();
+
+        storage.load_all_tasks().unwrap();
+        let reason = &storage.task_board_diagnostics()[0].reason;
+        assert!(reason.contains("layout version 2 is newer"), "{reason}");
+        assert!(!reason.contains("unknown field"), "{reason}");
+
+        // A current-version board with the same unknown key is still refused
+        // as a strict-parse failure, and names the key.
+        let strict = board_text_edited(&valid_board_text(project_id), |table| {
+            first_task_mut(table).insert("from_a_newer_build".into(), "kept".into());
+        });
+        fs::write(&path, &strict).unwrap();
+        storage.load_all_tasks().unwrap();
+        let reason = &storage.task_board_diagnostics()[0].reason;
+        assert!(reason.contains("unknown field"), "{reason}");
+        assert!(reason.contains("from_a_newer_build"), "{reason}");
+    }
+
+    #[test]
+    fn a_parse_reason_carries_no_quoted_file_content() {
+        assert_eq!(
+            redact_quoted("invalid type: string \"Private plan\", expected u32"),
+            "invalid type: string \"...\", expected u32"
+        );
+
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "version = 1\ntasks = []\ntitle = \"Private plan\n").unwrap();
+        storage.load_all_tasks().unwrap();
+        let reason = &storage.task_board_diagnostics()[0].reason;
+        assert!(reason.starts_with("parse failed at line 3"), "{reason}");
+        assert!(!reason.contains("Private plan"), "{reason}");
     }
 
     // ==================== State routing / migration Tests ====================

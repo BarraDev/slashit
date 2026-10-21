@@ -27,6 +27,7 @@ pub mod integration_service;
 pub mod repository_setup_service;
 pub mod orphans_service;
 pub mod conversation_service;
+pub mod task_board_service;
 
 pub use opener_service::{is_safe_link_destination, open_url_external, route_external_links};
 pub use repository_service::{list_repositories, pick_folder, check_is_git_repo};

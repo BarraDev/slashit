@@ -62,6 +62,7 @@ pub mod disk_usage;
 pub mod repository_setup;
 pub mod local_integration;
 pub mod orphan_reclaim;
+pub mod task_board_notice;
 
 pub use badge::*;
 pub use progress_bar::*;

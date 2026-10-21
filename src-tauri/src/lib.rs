@@ -511,6 +511,7 @@ pub fn run() {
             refresh_storage_usage,
             get_new_work_pause,
             scan_orphans,
+            list_task_board_diagnostics,
             reclaim_orphan_checkout,
             reclaim_orphan_branch,
             create_worktree,
