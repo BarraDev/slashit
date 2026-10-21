@@ -1166,11 +1166,15 @@ fn parse_failure_reason(error: &toml::de::Error, contents: &str) -> String {
             let before = contents.get(..span.start).unwrap_or(contents);
             let line = before.matches('\n').count() + 1;
             let column = before.rsplit('\n').next().map_or(0, str::len) + 1;
+            let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+            // Only a line that starts a key assignment names a key. Text inside
+            // a multi-line string or an open array is file content.
             let key = contents
                 .lines()
                 .nth(line - 1)
-                .and_then(|text| text.split('=').next())
-                .map(str::trim)
+                .filter(|_| !starts_inside_value(contents, line_start))
+                .and_then(|text| text.split_once('='))
+                .map(|(key, _)| key.trim())
                 .filter(|key| {
                     !key.is_empty()
                         && key
@@ -1183,27 +1187,123 @@ fn parse_failure_reason(error: &toml::de::Error, contents: &str) -> String {
             }
         })
         .unwrap_or_default();
-    let message = redact_quoted(error.message().lines().next().unwrap_or_default());
+    let message = redact_message(error.message().lines().next().unwrap_or_default());
     format!("parse failed{position}: {message}")
 }
 
-/// Replace every double-quoted run with `"..."`, so a message that echoes a
-/// value from the file does not carry it.
-fn redact_quoted(message: &str) -> String {
-    let mut redacted = String::with_capacity(message.len());
-    let mut inside = false;
-    for ch in message.chars() {
-        match (ch, inside) {
-            ('"', false) => {
-                inside = true;
-                redacted.push_str("\"...\"");
-            }
-            ('"', true) => inside = false,
-            (_, false) => redacted.push(ch),
-            (_, true) => {}
-        }
+/// Whether the line that starts at `line_start` begins inside a value: a
+/// multi-line string, or an array or inline table that is still open.
+///
+/// A small lexer over the text before the line, so it follows the TOML quoting
+/// and comment rules rather than the line's shape.
+fn starts_inside_value(contents: &str, line_start: usize) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Lex {
+        Code,
+        Comment,
+        Basic,
+        Literal,
+        MultiBasic,
+        MultiLiteral,
     }
-    redacted
+    let bytes = contents.as_bytes();
+    let mut state = Lex::Code;
+    let mut depth = 0_usize;
+    let mut i = 0;
+    while i < line_start {
+        let rest = &bytes[i..];
+        let step = match state {
+            Lex::Code if rest.starts_with(b"\"\"\"") => {
+                state = Lex::MultiBasic;
+                3
+            }
+            Lex::Code if rest.starts_with(b"'''") => {
+                state = Lex::MultiLiteral;
+                3
+            }
+            Lex::Code => {
+                match bytes[i] {
+                    b'"' => state = Lex::Basic,
+                    b'\'' => state = Lex::Literal,
+                    b'#' => state = Lex::Comment,
+                    b'[' | b'{' => depth += 1,
+                    b']' | b'}' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                1
+            }
+            Lex::Comment => {
+                if bytes[i] == b'\n' {
+                    state = Lex::Code;
+                }
+                1
+            }
+            Lex::Basic => match bytes[i] {
+                b'\\' => 2,
+                b'"' | b'\n' => {
+                    state = Lex::Code;
+                    1
+                }
+                _ => 1,
+            },
+            Lex::Literal => {
+                if matches!(bytes[i], b'\'' | b'\n') {
+                    state = Lex::Code;
+                }
+                1
+            }
+            Lex::MultiBasic if rest.starts_with(b"\"\"\"") => {
+                state = Lex::Code;
+                3
+            }
+            Lex::MultiBasic if bytes[i] == b'\\' => 2,
+            Lex::MultiBasic => 1,
+            Lex::MultiLiteral if rest.starts_with(b"'''") => {
+                state = Lex::Code;
+                3
+            }
+            Lex::MultiLiteral => 1,
+        };
+        i += step;
+    }
+    depth > 0 || state != Lex::Code
+}
+
+/// The message with the value it found removed.
+///
+/// Serde and TOML name the offending value in quotes or backticks. The text
+/// after `, expected` names what was wanted and is kept, and so are the key
+/// names in unknown, missing and duplicate messages: those are the field names
+/// the diagnostic is for.
+fn redact_message(message: &str) -> String {
+    if message.starts_with("expected ") {
+        return message.to_owned();
+    }
+    let split = message.find(", expected").unwrap_or(message.len());
+    let (found, wanted) = message.split_at(split);
+    let names_a_key = ["unknown field", "missing field", "duplicate "]
+        .iter()
+        .any(|prefix| found.starts_with(prefix));
+    if names_a_key {
+        message.to_owned()
+    } else {
+        format!("{}{wanted}", redact_quoted(found))
+    }
+}
+
+/// Replace the span from the first quote or backtick to the last one of the
+/// same kind with `"..."` or `` `...` ``. A value that holds its own delimiter
+/// is covered whole, and an unmatched delimiter drops the rest of the text.
+fn redact_quoted(text: &str) -> String {
+    let Some(open) = text.find(['"', '`']) else {
+        return text.to_owned();
+    };
+    let delimiter = char::from(text.as_bytes()[open]);
+    let rest = match text.rfind(delimiter) {
+        Some(close) if close > open => &text[close + 1..],
+        _ => "",
+    };
+    format!("{}{delimiter}...{delimiter}{rest}", &text[..open])
 }
 
 /// Write a file durably and atomically with owner-only permissions.
@@ -3405,21 +3505,85 @@ user_name = "Test"
     }
 
     #[test]
-    fn a_parse_reason_carries_no_quoted_file_content() {
+    fn a_parse_reason_carries_no_file_content() {
         assert_eq!(
-            redact_quoted("invalid type: string \"Private plan\", expected u32"),
+            redact_message("invalid type: string \"Private plan\", expected u32"),
             "invalid type: string \"...\", expected u32"
         );
+        assert_eq!(
+            redact_message("unknown variant `Secretword`, expected one of `backlog`, `queue`"),
+            "unknown variant `...`, expected one of `backlog`, `queue`"
+        );
+        assert_eq!(
+            redact_message("invalid value: integer `4242`, expected u32"),
+            "invalid value: integer `...`, expected u32"
+        );
+        assert_eq!(
+            redact_message("invalid type: string \"a\"Secretword\"x\", expected u32"),
+            "invalid type: string \"...\", expected u32"
+        );
+        assert_eq!(
+            redact_message("unknown field `from_a_newer_build`, expected `version` or `tasks`"),
+            "unknown field `from_a_newer_build`, expected `version` or `tasks`"
+        );
+        assert_eq!(redact_message("expected `.`, `=`"), "expected `.`, `=`");
 
+        // Each board puts a value, or a line that looks like one, where the
+        // parser fails. None of its text may reach the reason.
+        let boards: [(&str, &str); 6] = [
+            (
+                "title = 'Secretword plan\n",
+                "single-quoted string",
+            ),
+            (
+                "note = \"\"\"\nSecretword = x \\q\n\"\"\"\n",
+                "line inside a multi-line string",
+            ),
+            (
+                "tasks = [\n  Secretword\n]\n",
+                "bare word inside an open array",
+            ),
+            (
+                "version = 1\ntasks = []\nversion = 1\n",
+                "duplicate key",
+            ),
+            (
+                "version = 1\ntasks = []\nnote = \"Secretword\" = 1\n",
+                "quoted value before a second assignment",
+            ),
+            (
+                "version = \"Secretword\"\ntasks = []\n",
+                "string where the version belongs",
+            ),
+        ];
+        for (contents, what) in boards {
+            let (storage, _dir) = create_test_storage();
+            let project_id = Uuid::new_v4();
+            let path = storage.tasks_path(project_id);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+            storage.load_all_tasks().unwrap();
+            let reason = &storage.task_board_diagnostics()[0].reason;
+            assert!(reason.starts_with("parse failed at line"), "{what}: {reason}");
+            assert!(!reason.contains("Secretword"), "{what}: {reason}");
+        }
+
+        // An unknown value of an enum is quoted in the message, not the key.
         let (storage, _dir) = create_test_storage();
         let project_id = Uuid::new_v4();
         let path = storage.tasks_path(project_id);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "version = 1\ntasks = []\ntitle = \"Private plan\n").unwrap();
+        fs::write(
+            &path,
+            board_text_edited(&valid_board_text(project_id), |table| {
+                first_task_mut(table).insert("status".into(), "a\"Secretword\"x".into());
+            }),
+        )
+        .unwrap();
         storage.load_all_tasks().unwrap();
         let reason = &storage.task_board_diagnostics()[0].reason;
-        assert!(reason.starts_with("parse failed at line 3"), "{reason}");
-        assert!(!reason.contains("Private plan"), "{reason}");
+        assert!(reason.contains("(key `status`)"), "{reason}");
+        assert!(!reason.contains("Secretword"), "{reason}");
     }
 
     // ==================== State routing / migration Tests ====================

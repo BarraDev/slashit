@@ -69,13 +69,20 @@ fn board_notice(report: &TaskBoardReport, project_scoped: bool) -> impl IntoView
     };
     let path = report.path.clone();
     let reason = report.reason.clone();
+    // A Project's board is inert, so its own controls cannot be used. Elsewhere
+    // a Task change is only refused by the backend, and the notice says so.
+    let guidance = if project_scoped {
+        "The Task controls on this board are unavailable until the file is repaired. Task changes attempted from other screens are refused."
+    } else {
+        "Task changes for this board are refused until the file is repaired."
+    };
     view! {
-        <section role="alert" class="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+        <section role="alert" data-testid="task-board-notice" class="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
             <h3 class="font-semibold text-amber-200">{heading}</h3>
             <p class="mt-1 text-white/70">
                 "The stored file has not been overwritten, so the original data is still there. "
-                "Task changes are unavailable until the file is repaired. "
-                "Restart SlashIt after correcting the file."
+                {guidance}
+                " Restart SlashIt after correcting the file."
             </p>
             <p class="mt-2 text-white/60">
                 "File: " <code class="break-all text-white/80">{path}</code>

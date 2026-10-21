@@ -7,6 +7,8 @@ use crate::components::{Kanban, bulk_actions::BulkActions, toast};
 use crate::components::task_board_notice::TaskBoardNotice;
 use crate::components::task_live::ResponseOrder;
 use crate::services::list_tasks;
+use crate::services::task_board_service::list_task_board_diagnostics;
+use crate::models::task_boards::for_project;
 use crate::models::Task;
 use uuid::Uuid;
 
@@ -145,6 +147,18 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
         toast::success("Bulk action completed".to_string());
     });
 
+    // A board that could not be read at startup has no Tasks to act on. Its
+    // Task controls are made inert here; the backend still refuses any write.
+    // Read once per mount: the Dashboard is rebuilt when the Project changes,
+    // and the report only changes at the next start.
+    let (board_unreadable, set_board_unreadable) = signal(false);
+    let project_id_for_report = project_id.clone();
+    spawn_local(async move {
+        if let Ok(found) = list_task_board_diagnostics().await {
+            set_board_unreadable.set(!for_project(&found, &project_id_for_report).is_empty());
+        }
+    });
+
     let project_id_for_bulk = project_id.clone();
     let project_id_for_kanban = project_id.clone();
     let project_id_for_notice = project_id.clone();
@@ -156,7 +170,7 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
             {move || {
                 let project_id_kanban = project_id_for_kanban.clone();
                 let project_id_bulk = project_id_for_bulk.clone();
-                
+
                 if !has_project.get() {
                     // No project selected - show welcome state
                     view! {
@@ -194,24 +208,33 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
                 } else {
                     view! {
                         <>
-                            <div class="flex-1 min-h-0">
-                            <Kanban
-                                tasks=tasks
-                                set_tasks=set_tasks
-                                project_id=project_id_kanban
-                                selected_tasks=Signal::from(selected_tasks)
-                                set_selected_tasks=set_selected_tasks
-                                refresh_tasks=refresh_tasks
-                                apply_task=apply_task
-                            />
-                            </div>
+                            // The board is inert, not hidden, so its columns stay in view.
+                            <div
+                                class="contents"
+                                inert=move || board_unreadable.get()
+                            >
+                                <div
+                                    class="flex-1 min-h-0"
+                                    class:opacity-50=move || board_unreadable.get()
+                                >
+                                    <Kanban
+                                        tasks=tasks
+                                        set_tasks=set_tasks
+                                        project_id=project_id_kanban
+                                        selected_tasks=Signal::from(selected_tasks)
+                                        set_selected_tasks=set_selected_tasks
+                                        refresh_tasks=refresh_tasks
+                                        apply_task=apply_task
+                                    />
+                                </div>
 
-                            <BulkActions
-                                selected_tasks=selected_tasks.into()
-                                set_selected_tasks=set_selected_tasks
-                                project_id=project_id_bulk
-                                on_bulk_complete=on_bulk_complete
-                            />
+                                <BulkActions
+                                    selected_tasks=selected_tasks.into()
+                                    set_selected_tasks=set_selected_tasks
+                                    project_id=project_id_bulk
+                                    on_bulk_complete=on_bulk_complete
+                                />
+                            </div>
                         </>
                     }.into_any()
                 }
