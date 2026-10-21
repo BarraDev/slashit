@@ -383,17 +383,77 @@ pub struct ClaudeRunConfig {
     /// (`--settings` with `disableAllHooks`). The user's settings are not
     /// read, so their hooks, plugins and `env` do not reach the run, and MCP
     /// servers come only from `--mcp-config` (as with `disable_mcp`). The
-    /// project's `CLAUDE.md` still loads. The project's own settings still
-    /// apply, including its `env` block; the CLI ignores a project's
+    /// project's `CLAUDE.md` still loads. The project's `env` block still
+    /// applies, except for the provider endpoint, routing, proxy and CA
+    /// variables and `apiKeyHelper`, which the run pins (see
+    /// [`PINNED_PROVIDER_ENV`]). The CLI ignores a project's
     /// `bypassPermissions` default and its allow rules in an untrusted
     /// workspace. Filesystem access is not confined by this. Used by the
     /// coding Worker and the review-fix agent.
     pub isolate_customizations: bool,
 }
 
-/// The `--settings` value of an isolated run: every hook is off, including
-/// the project's own hooks, which are repository code.
-const ISOLATED_SETTINGS: &str = r#"{"disableAllHooks":true}"#;
+/// Provider settings an isolated run pins in `--settings`. The project's own
+/// `env` block outranks the environment SlashIt passes, so without a pin a
+/// repository could send the API key to another endpoint, move the run to
+/// Bedrock, Vertex or Foundry, or route its traffic through its own proxy or
+/// CA bundle. Each name is pinned to the value the child receives, or to
+/// empty when the child receives none.
+const PINNED_PROVIDER_ENV: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_OPTIONS",
+];
+
+/// The endpoint the CLI uses when `ANTHROPIC_BASE_URL` is not set.
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+
+/// The `--settings` value of an isolated run, built from `child_env`, the
+/// environment the child receives (see [`provider_env`]).
+///
+/// Every hook is off, including the project's own hooks, which are repository
+/// code. `apiKeyHelper` is pinned to empty because the CLI runs a project's
+/// helper command before the permission mode applies, in an untrusted
+/// workspace too, and a repository can write that setting for a later launch.
+/// `null` is not accepted here: the CLI skips the invalid setting and the
+/// helper still runs.
+///
+/// The pinned values are not secrets. A proxy URL with credentials in it is
+/// visible in the process list, as the child's own environment already is to
+/// a process of the same user.
+fn isolated_settings(child_env: &[(std::ffi::OsString, std::ffi::OsString)]) -> String {
+    let child_value = |name: &str| {
+        child_env
+            .iter()
+            .find(|(key, _)| key.to_str() == Some(name))
+            .and_then(|(_, value)| value.to_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut env = serde_json::Map::new();
+    for name in PINNED_PROVIDER_ENV {
+        let mut value = child_value(name);
+        if *name == "ANTHROPIC_BASE_URL" && value.is_empty() {
+            value = DEFAULT_ANTHROPIC_BASE_URL.to_string();
+        }
+        env.insert((*name).to_string(), value.into());
+    }
+    serde_json::json!({
+        "disableAllHooks": true,
+        "apiKeyHelper": "",
+        "env": env,
+    })
+    .to_string()
+}
 
 /// The Claude CLI arguments for `config`, in order, without the program.
 ///
@@ -478,10 +538,12 @@ pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
     }
 
     if config.isolate_customizations {
+        // Pinned against the same environment the child is started with.
+        let settings = isolated_settings(&provider_env(std::env::vars_os()));
         push("--setting-sources");
         push("project");
         push("--settings");
-        push(ISOLATED_SETTINGS);
+        push(&settings);
     }
     // Isolation includes the MCP servers the user's own configuration would add.
     if strict_mcp || config.isolate_customizations {
@@ -1640,8 +1702,47 @@ mod launch_policy_tests {
         let args: Vec<String> = claude_args(&config).into_iter().map(|a| a.into_string().unwrap()).collect();
         let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].as_str());
         assert_eq!(at("--setting-sources"), Some("project"), "{args:?}");
-        assert_eq!(at("--settings"), Some(ISOLATED_SETTINGS), "{args:?}");
+        let settings = at("--settings").expect("--settings");
+        assert!(settings.contains(r#""disableAllHooks":true"#), "{args:?}");
         assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+    }
+
+    #[test]
+    fn isolated_settings_pin_the_provider_the_child_receives() {
+        let child = provider_env(vec![
+            (
+                OsString::from("ANTHROPIC_BASE_URL"),
+                OsString::from("https://gateway.test"),
+            ),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://proxy.test:3128"),
+            ),
+            (
+                OsString::from("NODE_OPTIONS"),
+                OsString::from("--require /tmp/x.js"),
+            ),
+        ]);
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child)).unwrap();
+        assert_eq!(settings["disableAllHooks"], true);
+        assert_eq!(settings["apiKeyHelper"], "");
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://gateway.test"
+        );
+        assert_eq!(settings["env"]["HTTPS_PROXY"], "http://proxy.test:3128");
+        assert_eq!(settings["env"]["CLAUDE_CODE_USE_BEDROCK"], "");
+        // NODE_OPTIONS is not in the child's environment, so it is pinned empty.
+        assert_eq!(settings["env"]["NODE_OPTIONS"], "");
+    }
+
+    #[test]
+    fn isolated_settings_name_the_default_endpoint_when_the_child_has_none() {
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[])).unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            DEFAULT_ANTHROPIC_BASE_URL
+        );
     }
 
     #[test]
