@@ -13,11 +13,13 @@ use super::*;
 const NOTICE: &str = "[data-testid=\"task-board-notice\"]";
 const KANBAN: &str = "[data-testid=\"kanban-board\"]";
 
-/// A board the parser refuses: an enum value with no variant. The reason the
-/// application shows must name the field, never this value.
+/// A board the parser refuses: an enum value with no variant. The value holds
+/// the separator text a parser message uses, so a reason that trims at that
+/// text would show its tail. The reason the application shows must name the
+/// field, never this value.
 const UNREADABLE_BOARD: &str =
     "version = 1\n\n[[tasks]]\nid = \"00000000-0000-4000-8000-000000000001\"\n\
-title = \"Journey board\"\nstatus = \"Journey Secret Status\"\n";
+title = \"Journey board\"\nstatus = \"Journey Secret, expected Journey Tail\"\n";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_project_whose_task_board_cannot_be_read_says_so_and_takes_no_task_changes() {
@@ -194,8 +196,10 @@ fn check_notice_text(notice: &str, board: &Path) -> Result<()> {
             board.display()
         );
     }
-    if notice.contains("Journey Secret Status") {
-        bail!("the warning shows the value from the file: {notice:?}");
+    for secret in ["Journey Secret", "Journey Tail"] {
+        if notice.contains(secret) {
+            bail!("the warning shows the value from the file: {notice:?}");
+        }
     }
     Ok(())
 }

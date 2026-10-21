@@ -1157,8 +1157,8 @@ fn newer_layout_reason(version: u32) -> String {
 /// Why a board did not parse, without the text of the file.
 ///
 /// The TOML error's `Display` quotes the offending source line, and serde's
-/// messages can quote a value, so neither is passed on. The position comes from
-/// the span and the message keeps its wording with quoted text removed.
+/// messages quote the rejected value, so neither is passed on. The position
+/// comes from the span, and the message is reduced to a fixed category.
 fn parse_failure_reason(error: &toml::de::Error, contents: &str) -> String {
     let position = error
         .span()
@@ -1187,7 +1187,7 @@ fn parse_failure_reason(error: &toml::de::Error, contents: &str) -> String {
             }
         })
         .unwrap_or_default();
-    let message = redact_message(error.message().lines().next().unwrap_or_default());
+    let message = parse_failure_message(error.message());
     format!("parse failed{position}: {message}")
 }
 
@@ -1269,41 +1269,67 @@ fn starts_inside_value(contents: &str, line_start: usize) -> bool {
     depth > 0 || state != Lex::Code
 }
 
-/// The message with the value it found removed.
+/// The category of a parser message, with no text from the file.
 ///
-/// Serde and TOML name the offending value in quotes or backticks. The text
-/// after `, expected` names what was wanted and is kept, and so are the key
-/// names in unknown, missing and duplicate messages: those are the field names
-/// the diagnostic is for.
-fn redact_message(message: &str) -> String {
-    if message.starts_with("expected ") {
-        return message.to_owned();
+/// A parser message quotes the value it rejected, and a value can hold any
+/// text, including the wording of the message itself. So a message is never
+/// trimmed or redacted. Its first line is matched against the fixed openings
+/// that TOML and serde produce, and the message becomes that category. The one
+/// piece of file text kept is a field name, and only when it is a plain
+/// identifier. Anything unrecognised becomes a generic category.
+fn parse_failure_message(message: &str) -> String {
+    let first = message.lines().next().unwrap_or_default();
+    for (opening, category) in KEYED_MESSAGES {
+        if let Some(rest) = first.strip_prefix(opening) {
+            return match plain_key(rest) {
+                Some(key) => format!("{category} `{key}`"),
+                None => category.to_owned(),
+            };
+        }
     }
-    let split = message.find(", expected").unwrap_or(message.len());
-    let (found, wanted) = message.split_at(split);
-    let names_a_key = ["unknown field", "missing field", "duplicate "]
+    FIXED_MESSAGES
         .iter()
-        .any(|prefix| found.starts_with(prefix));
-    if names_a_key {
-        message.to_owned()
-    } else {
-        format!("{}{wanted}", redact_quoted(found))
-    }
+        .find(|(opening, _)| first.starts_with(opening))
+        .map_or("unrecognized TOML error", |(_, category)| category)
+        .to_owned()
 }
 
-/// Replace the span from the first quote or backtick to the last one of the
-/// same kind with `"..."` or `` `...` ``. A value that holds its own delimiter
-/// is covered whole, and an unmatched delimiter drops the rest of the text.
-fn redact_quoted(text: &str) -> String {
-    let Some(open) = text.find(['"', '`']) else {
-        return text.to_owned();
-    };
-    let delimiter = char::from(text.as_bytes()[open]);
-    let rest = match text.rfind(delimiter) {
-        Some(close) if close > open => &text[close + 1..],
-        _ => "",
-    };
-    format!("{}{delimiter}...{delimiter}{rest}", &text[..open])
+/// Messages that name a field in backticks: the opening, then the category.
+const KEYED_MESSAGES: [(&str, &str); 4] = [
+    ("unknown field `", "unknown field"),
+    ("missing field `", "missing field"),
+    ("duplicate key `", "duplicate key"),
+    ("duplicate field `", "duplicate field"),
+];
+
+/// Messages with fixed wording. A more specific opening comes before a
+/// shorter one it extends.
+const FIXED_MESSAGES: [(&str, &str); 12] = [
+    ("invalid type", "invalid type"),
+    ("invalid value", "invalid value"),
+    ("invalid length", "invalid length"),
+    ("unknown variant", "unknown variant"),
+    ("invalid escape sequence", "invalid escape sequence"),
+    ("invalid table header", "invalid table header"),
+    ("invalid inline table", "invalid inline table"),
+    ("invalid table", "invalid table"),
+    ("invalid array", "invalid array"),
+    ("invalid string", "invalid string"),
+    ("invalid key", "invalid key"),
+    ("expected newline", "expected newline"),
+];
+
+/// The field name that starts `rest`, the text after an opening backtick.
+///
+/// The name must be a plain identifier, closed by a backtick that ends the
+/// message or is followed by a separator. Any other name is left out.
+fn plain_key(rest: &str) -> Option<&str> {
+    let (key, after) = rest.split_once('`')?;
+    let plain = !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    (plain && (after.is_empty() || after.starts_with([',', ' ']))).then_some(key)
 }
 
 /// Write a file durably and atomically with owner-only permissions.
@@ -3506,35 +3532,60 @@ user_name = "Test"
 
     #[test]
     fn a_parse_reason_carries_no_file_content() {
+        // A value can hold the wording of the message itself, so a message
+        // is reduced to its category and never trimmed.
+        for message in [
+            "invalid type: string \"Secretword, expected Tail\", expected u32",
+            "invalid type: string \"a\\\"Secretword\\\"x\", expected u32",
+            "invalid value: integer `4242`, expected u32",
+            "unknown variant `Secretword, expected Tail`, expected one of `backlog`, `queue`",
+            "invalid escape sequence\nexpected `b`, `f`, `n`, `r`, `t`, `u`, `U`",
+            "Secretword, expected Tail",
+        ] {
+            let reason = parse_failure_message(message);
+            assert!(!reason.contains("Secretword"), "{message}: {reason}");
+            assert!(!reason.contains("Tail"), "{message}: {reason}");
+        }
         assert_eq!(
-            redact_message("invalid type: string \"Private plan\", expected u32"),
-            "invalid type: string \"...\", expected u32"
+            parse_failure_message(
+                "invalid type: string \"Secretword, expected Tail\", expected u32"
+            ),
+            "invalid type"
         );
         assert_eq!(
-            redact_message("unknown variant `Secretword`, expected one of `backlog`, `queue`"),
-            "unknown variant `...`, expected one of `backlog`, `queue`"
+            parse_failure_message("invalid escape sequence\nexpected `b`, `f`"),
+            "invalid escape sequence"
         );
         assert_eq!(
-            redact_message("invalid value: integer `4242`, expected u32"),
-            "invalid value: integer `...`, expected u32"
+            parse_failure_message("Secretword, expected Tail"),
+            "unrecognized TOML error"
+        );
+
+        // A plain identifier is a field name and is kept. Any other quoted
+        // text is not, even when it is inside the name's backticks.
+        assert_eq!(
+            parse_failure_message(
+                "unknown field `from_a_newer_build`, expected `version` or `tasks`"
+            ),
+            "unknown field `from_a_newer_build`"
         );
         assert_eq!(
-            redact_message("invalid type: string \"a\"Secretword\"x\", expected u32"),
-            "invalid type: string \"...\", expected u32"
+            parse_failure_message("duplicate key `version` in document root"),
+            "duplicate key `version`"
         );
         assert_eq!(
-            redact_message("unknown field `from_a_newer_build`, expected `version` or `tasks`"),
-            "unknown field `from_a_newer_build`, expected `version` or `tasks`"
+            parse_failure_message("unknown field `Secretword, expected Tail`, expected `version`"),
+            "unknown field"
         );
-        assert_eq!(redact_message("expected `.`, `=`"), "expected `.`, `=`");
+        assert_eq!(
+            parse_failure_message("unknown field `a`b`, expected `version`"),
+            "unknown field"
+        );
 
         // Each board puts a value, or a line that looks like one, where the
         // parser fails. None of its text may reach the reason.
-        let boards: [(&str, &str); 6] = [
-            (
-                "title = 'Secretword plan\n",
-                "single-quoted string",
-            ),
+        let boards: [(&str, &str); 11] = [
+            ("title = 'Secretword plan\n", "single-quoted string"),
             (
                 "note = \"\"\"\nSecretword = x \\q\n\"\"\"\n",
                 "line inside a multi-line string",
@@ -3543,10 +3594,7 @@ user_name = "Test"
                 "tasks = [\n  Secretword\n]\n",
                 "bare word inside an open array",
             ),
-            (
-                "version = 1\ntasks = []\nversion = 1\n",
-                "duplicate key",
-            ),
+            ("version = 1\ntasks = []\nversion = 1\n", "duplicate key"),
             (
                 "version = 1\ntasks = []\nnote = \"Secretword\" = 1\n",
                 "quoted value before a second assignment",
@@ -3554,6 +3602,26 @@ user_name = "Test"
             (
                 "version = \"Secretword\"\ntasks = []\n",
                 "string where the version belongs",
+            ),
+            (
+                "version = \"Secretword, expected Tail\"\ntasks = []\n",
+                "string with the separator text where the version belongs",
+            ),
+            (
+                "version = 1\ntasks = []\n\"Secretword, expected Tail\" = 1\n",
+                "quoted root key with the separator text",
+            ),
+            (
+                "version = 1 Secretword, expected Tail\n",
+                "text after a complete value",
+            ),
+            (
+                "version = 1\ntasks = [ 'Secretword' 'Tail' ]\n",
+                "two literal strings in one array",
+            ),
+            (
+                "version = 99999999999999999999999\ntasks = []\n",
+                "integer beyond the range of the field",
             ),
         ];
         for (contents, what) in boards {
@@ -3564,11 +3632,20 @@ user_name = "Test"
             fs::write(&path, contents).unwrap();
             storage.load_all_tasks().unwrap();
             let reason = &storage.task_board_diagnostics()[0].reason;
-            assert!(reason.starts_with("parse failed at line"), "{what}: {reason}");
+            assert!(
+                reason.starts_with("parse failed at line"),
+                "{what}: {reason}"
+            );
             assert!(!reason.contains("Secretword"), "{what}: {reason}");
+            assert!(!reason.contains("Tail"), "{what}: {reason}");
+            assert!(
+                !reason.contains("99999999999999999999999"),
+                "{what}: {reason}"
+            );
         }
 
         // An unknown value of an enum is quoted in the message, not the key.
+        // The value holds the separator text, which must not reach the reason.
         let (storage, _dir) = create_test_storage();
         let project_id = Uuid::new_v4();
         let path = storage.tasks_path(project_id);
@@ -3576,14 +3653,40 @@ user_name = "Test"
         fs::write(
             &path,
             board_text_edited(&valid_board_text(project_id), |table| {
-                first_task_mut(table).insert("status".into(), "a\"Secretword\"x".into());
+                first_task_mut(table)
+                    .insert("status".into(), "a\"Secretword, expected Tail`x".into());
             }),
         )
         .unwrap();
         storage.load_all_tasks().unwrap();
         let reason = &storage.task_board_diagnostics()[0].reason;
         assert!(reason.contains("(key `status`)"), "{reason}");
+        assert!(reason.ends_with(": unknown variant"), "{reason}");
         assert!(!reason.contains("Secretword"), "{reason}");
+        assert!(!reason.contains("Tail"), "{reason}");
+    }
+
+    #[test]
+    fn the_startup_warning_and_the_save_refusal_text_carry_no_file_content() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "version = \"Secretword, expected Tail\"\ntasks = []\n",
+        )
+        .unwrap();
+
+        // Startup prints this `Display` text to the log, and a save refusal
+        // returns it to the caller.
+        let TasksFileState::Unreadable(unreadable) = Storage::inspect_tasks_file(&path) else {
+            panic!("the board must be unreadable");
+        };
+        let text = unreadable.to_string();
+        assert!(text.contains("parse failed at line 1"), "{text}");
+        assert!(!text.contains("Secretword"), "{text}");
+        assert!(!text.contains("Tail"), "{text}");
     }
 
     // ==================== State routing / migration Tests ====================

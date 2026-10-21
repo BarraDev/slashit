@@ -59,8 +59,7 @@ mod tests {
                 project_id: Some(loaded),
                 path: "/data/slashit/projects/3f2b8c1e-6d4a-4b7e-9a1c-2d5e8f0a1b3c/tasks.toml"
                     .to_string(),
-                reason: "parse failed at line 5, column 22 (key `status`): invalid type: \
-                         string \"...\", expected struct TaskStatus"
+                reason: "parse failed at line 5, column 22 (key `status`): invalid type"
                     .to_string(),
             },
             TaskBoardDiagnostic {
