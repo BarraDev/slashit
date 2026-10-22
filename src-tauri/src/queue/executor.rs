@@ -1,4 +1,5 @@
-use crate::agents::runner::{ClaudeEvent, ClaudeRunConfig, ClaudeRunner, ToolAccess};
+use crate::agents::coding_run::{CodingRunEvent, CodingRunner};
+use crate::agents::runner::{ClaudeRunConfig, ToolAccess};
 use crate::domain::task::ActivityKind;
 use crate::domain::task::ExternalRef;
 use crate::domain::task::NewAttemptDecision;
@@ -1488,7 +1489,7 @@ impl RunEventDrain {
 }
 
 impl RunEventForwarder {
-    fn spawn(self, events: tokio::sync::broadcast::Receiver<ClaudeEvent>) -> RunEventDrain {
+    fn spawn(self, events: tokio::sync::broadcast::Receiver<CodingRunEvent>) -> RunEventDrain {
         let (request, drain) = tokio::sync::oneshot::channel();
         RunEventDrain {
             request,
@@ -1498,7 +1499,7 @@ impl RunEventForwarder {
 
     async fn forward(
         self,
-        mut events: tokio::sync::broadcast::Receiver<ClaudeEvent>,
+        mut events: tokio::sync::broadcast::Receiver<CodingRunEvent>,
         mut drain: tokio::sync::oneshot::Receiver<()>,
     ) {
         use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -1552,21 +1553,21 @@ impl RunEventForwarder {
         }
     }
 
-    async fn handle(&self, event: ClaudeEvent) {
+    async fn handle(&self, event: CodingRunEvent) {
         let task_id = self.task_id;
         let task_id_str = task_id.to_string();
         // Each entry is recorded before its event is emitted, so a listener
         // that reacts to the event by reading the output back finds the entry
         // already there.
         match &event {
-            ClaudeEvent::TextDelta { text } => {
+            CodingRunEvent::TextDelta { text } => {
                 record_output(&self.logs, self.execution_id, LogLevel::Info, text.clone()).await;
                 self.events.agent_event(AgentEvent::Output {
                     task_id: task_id_str,
                     text: text.clone(),
                 });
             }
-            ClaudeEvent::AssistantMessage { content } => {
+            CodingRunEvent::AssistantMessage { content } => {
                 for text in assistant_text_blocks(content) {
                     record_output(&self.logs, self.execution_id, LogLevel::Info, text.clone())
                         .await;
@@ -1576,7 +1577,7 @@ impl RunEventForwarder {
                     });
                 }
             }
-            ClaudeEvent::ToolUse { tool, input } => {
+            CodingRunEvent::ToolUse { tool, input } => {
                 // Only a complete call is buffered: a partial stream announces
                 // the same call once without its input before the whole
                 // message repeats it.
@@ -1599,7 +1600,7 @@ impl RunEventForwarder {
                     tool: tool.clone(),
                 });
             }
-            ClaudeEvent::SystemInit {
+            CodingRunEvent::SystemInit {
                 session_id, model, ..
             } => {
                 // The provider's report is evidence of what ran. It is kept as
@@ -1620,7 +1621,7 @@ impl RunEventForwarder {
                 )
                 .await;
             }
-            ClaudeEvent::Error { message } => {
+            CodingRunEvent::Error { message } => {
                 record_output(
                     &self.logs,
                     self.execution_id,
@@ -5207,7 +5208,7 @@ impl TaskExecutor {
             });
 
             // Start Claude runner
-            let runner = match ClaudeRunner::start_leased(ClaudeRunConfig {
+            let runner = match CodingRunner::start_claude(ClaudeRunConfig {
                 prompt,
                 working_dir: claude_cwd.clone(),
                 // Auto: the provider's classifier reviews each tool call. It
@@ -6170,7 +6171,7 @@ impl TaskExecutor {
         if *cancelled.borrow() {
             return Ok(None);
         }
-        let runner = ClaudeRunner::start_leased(config, lease).await?;
+        let runner = CodingRunner::start_claude(config, lease).await?;
         tokio::select! {
             biased;
             result = runner.wait() => {
@@ -8959,8 +8960,8 @@ mod tests {
 
     // --- a run's end, its tool calls and their buffer ---
 
-    fn tool_use(detail: &str) -> ClaudeEvent {
-        ClaudeEvent::ToolUse {
+    fn tool_use(detail: &str) -> CodingRunEvent {
+        CodingRunEvent::ToolUse {
             tool: "Bash".into(),
             input: Some(serde_json::json!({ "command": detail })),
         }
@@ -9007,7 +9008,7 @@ mod tests {
 
     /// Hands one provider report to run `run`'s forwarder, as the run does.
     async fn report_model(executor: &TaskExecutor, task_id: Uuid, run: u32, model: Option<&str>) {
-        let event = ClaudeEvent::SystemInit {
+        let event = CodingRunEvent::SystemInit {
             session_id: "session".into(),
             model: model.map(str::to_string),
             message: None,

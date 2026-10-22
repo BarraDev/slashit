@@ -4,10 +4,10 @@ Claude Code agent execution.
 
 ## Architecture
 
-- **mod.rs** - Declares the `roles` and `runner` modules
+- **mod.rs** - Declares the `coding_run`, `provider_lease`, `roles` and `runner` modules
+- **coding_run.rs** - `CodingRunner` and `CodingRunEvent`, the provider-neutral run boundary
 - **roles.rs** - `roles::AgentRole`, `AgentSlot` and `AgentSlotStatus`
-- **runner.rs** - `ClaudeRunner`, which runs the Claude Code CLI as a child
-  process and streams its output as `ClaudeEvent`s
+- **runner.rs** - `ClaudeRunner`, which runs the Claude Code CLI and streams `CodingRunEvent`s
 
 The Agent Communication Protocol client lives in `acp/`, not here.
 

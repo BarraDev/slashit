@@ -1,5 +1,5 @@
+use super::coding_run::CodingRunEvent;
 use super::provider_lease::ProviderLease;
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -892,39 +892,15 @@ pub fn claude_args(
     args
 }
 
-/// Events emitted by the Claude runner during execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ClaudeEvent {
-    /// Session initialized
-    #[serde(rename = "system_init")]
-    SystemInit { session_id: String, model: Option<String>, message: Option<String> },
-    /// Partial text output (streaming)
-    #[serde(rename = "text_delta")]
-    TextDelta { text: String },
-    /// Agent is using a tool
-    #[serde(rename = "tool_use")]
-    ToolUse { tool: String, input: Option<serde_json::Value> },
-    /// Full assistant message received
-    #[serde(rename = "assistant_message")]
-    AssistantMessage { content: serde_json::Value },
-    /// Final result
-    #[serde(rename = "result")]
-    Result { session_id: String, text: String, is_error: bool },
-    /// Error during execution
-    #[serde(rename = "error")]
-    Error { message: String },
-}
-
 /// Runs Claude Code CLI and streams events.
 pub struct ClaudeRunner {
     child: Arc<Mutex<Child>>,
-    event_tx: broadcast::Sender<ClaudeEvent>,
+    event_tx: broadcast::Sender<CodingRunEvent>,
     /// The receiver created with the channel, handed to the first
     /// [`subscribe`](Self::subscribe). The reader starts inside `start`, so a
     /// receiver made only when a caller subscribes afterwards would miss
     /// whatever the agent wrote first (its `system` line, its first words).
-    first_subscriber: std::sync::Mutex<Option<broadcast::Receiver<ClaudeEvent>>>,
+    first_subscriber: std::sync::Mutex<Option<broadcast::Receiver<CodingRunEvent>>>,
     session_id: Arc<Mutex<Option<String>>>,
     accumulated_output: Arc<RwLock<String>>,
     /// The last stream-json `result` event that reports a failure (see
@@ -1292,7 +1268,7 @@ impl ClaudeRunner {
     }
 
     /// Subscribe to events.
-    pub fn subscribe(&self) -> broadcast::Receiver<ClaudeEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<CodingRunEvent> {
         let first = match self.first_subscriber.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
@@ -1714,10 +1690,10 @@ impl ClaudeRunner {
                             if let Some(evt) = event {
                                 // Accumulate text from TextDelta and Result events
                                 match &evt {
-                                    ClaudeEvent::TextDelta { text } => {
+                                    CodingRunEvent::TextDelta { text } => {
                                         accumulated_output.write().await.push_str(text);
                                     }
-                                    ClaudeEvent::AssistantMessage { content } => {
+                                    CodingRunEvent::AssistantMessage { content } => {
                                         if let Some(arr) = content.as_array() {
                                             for block in arr {
                                                 if block.get("type").and_then(|t| t.as_str()) == Some("text") {
@@ -1728,7 +1704,7 @@ impl ClaudeRunner {
                                             }
                                         }
                                     }
-                                    ClaudeEvent::Result { text, .. } => {
+                                    CodingRunEvent::Result { text, .. } => {
                                         let mut output = accumulated_output.write().await;
                                         if !output.is_empty() {
                                             output.push('\n');
@@ -1743,7 +1719,7 @@ impl ClaudeRunner {
                         Err(_) => {
                             // Non-JSON line — treat as raw text
                             accumulated_output.write().await.push_str(&line);
-                            let _ = event_tx.send(ClaudeEvent::TextDelta {
+                            let _ = event_tx.send(CodingRunEvent::TextDelta {
                                 text: line,
                             });
                         }
@@ -1754,11 +1730,11 @@ impl ClaudeRunner {
     }
 }
 
-/// Parse a JSON line from Claude CLI stream-json output into a ClaudeEvent.
+/// Parse a JSON line from Claude CLI stream-json output into a CodingRunEvent.
 async fn parse_claude_event(
     json: &serde_json::Value,
     session_id: &Arc<Mutex<Option<String>>>,
-) -> Option<ClaudeEvent> {
+) -> Option<CodingRunEvent> {
     let msg_type = json.get("type")?.as_str()?;
 
     match msg_type {
@@ -1769,7 +1745,7 @@ async fn parse_claude_event(
             if let Some(ref s) = sid {
                 *session_id.lock().await = Some(s.clone());
             }
-            Some(ClaudeEvent::SystemInit {
+            Some(CodingRunEvent::SystemInit {
                 session_id: sid.unwrap_or_default(),
                 model,
                 message: Some(format!("system:{}", subtype)),
@@ -1788,13 +1764,13 @@ async fn parse_claude_event(
                         if block_type == "tool_use" {
                             let tool = block.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
                             let input = block.get("input").cloned();
-                            return Some(ClaudeEvent::ToolUse { tool, input });
+                            return Some(CodingRunEvent::ToolUse { tool, input });
                         }
                     }
                 }
             }
 
-            Some(ClaudeEvent::AssistantMessage { content })
+            Some(CodingRunEvent::AssistantMessage { content })
         }
 
         "result" => {
@@ -1806,7 +1782,7 @@ async fn parse_claude_event(
                 *session_id.lock().await = Some(sid.clone());
             }
 
-            Some(ClaudeEvent::Result { session_id: sid, text, is_error })
+            Some(CodingRunEvent::Result { session_id: sid, text, is_error })
         }
 
         // Stream events (content_block_delta with text_delta)
@@ -1815,7 +1791,7 @@ async fn parse_claude_event(
             let delta_type = delta.get("type").and_then(|t| t.as_str())?;
             if delta_type == "text_delta" {
                 let text = delta.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
-                Some(ClaudeEvent::TextDelta { text })
+                Some(CodingRunEvent::TextDelta { text })
             } else {
                 None
             }
@@ -1826,7 +1802,7 @@ async fn parse_claude_event(
             let block_type = block.get("type").and_then(|t| t.as_str())?;
             if block_type == "tool_use" {
                 let tool = block.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
-                Some(ClaudeEvent::ToolUse { tool, input: None })
+                Some(CodingRunEvent::ToolUse { tool, input: None })
             } else {
                 None
             }
@@ -3107,7 +3083,7 @@ mod tests {
         );
 
         match seen.first() {
-            Some(ClaudeEvent::SystemInit {
+            Some(CodingRunEvent::SystemInit {
                 session_id, model, ..
             }) => {
                 assert_eq!(session_id, "s-stream");
@@ -3117,14 +3093,14 @@ mod tests {
         }
     }
 
-    fn describe(event: &ClaudeEvent) -> &'static str {
+    fn describe(event: &CodingRunEvent) -> &'static str {
         match event {
-            ClaudeEvent::SystemInit { .. } => "system_init",
-            ClaudeEvent::TextDelta { .. } => "text_delta",
-            ClaudeEvent::ToolUse { .. } => "tool_use",
-            ClaudeEvent::AssistantMessage { .. } => "assistant_message",
-            ClaudeEvent::Result { .. } => "result",
-            ClaudeEvent::Error { .. } => "error",
+            CodingRunEvent::SystemInit { .. } => "system_init",
+            CodingRunEvent::TextDelta { .. } => "text_delta",
+            CodingRunEvent::ToolUse { .. } => "tool_use",
+            CodingRunEvent::AssistantMessage { .. } => "assistant_message",
+            CodingRunEvent::Result { .. } => "result",
+            CodingRunEvent::Error { .. } => "error",
         }
     }
 
