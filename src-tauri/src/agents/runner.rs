@@ -205,14 +205,45 @@ const PROVIDER_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "LC_"];
 pub fn provider_env(
     vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    provider_env_with(vars, env_names_ignore_case())
+}
+
+/// [`provider_env`] with the name comparison given explicitly, so both
+/// behaviors can be tested on any platform.
+fn provider_env_with(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    ignore_case: bool,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     vars.into_iter()
         .filter(|(name, _)| {
             name.to_str().is_some_and(|name| {
-                PROVIDER_ENV_NAMES.contains(&name)
-                    || PROVIDER_ENV_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+                PROVIDER_ENV_NAMES
+                    .iter()
+                    .any(|wanted| env_name_matches(name, wanted, ignore_case))
+                    || PROVIDER_ENV_PREFIXES.iter().any(|prefix| {
+                        name.get(..prefix.len())
+                            .is_some_and(|head| env_name_matches(head, prefix, ignore_case))
+                    })
             })
         })
         .collect()
+}
+
+/// Whether environment variable names are compared without regard to case.
+/// Windows keeps the casing it was given (`Path`, `SystemRoot`, `ComSpec`) and
+/// matches names case-insensitively, so a case-sensitive comparison would drop
+/// them. Unix names are case-sensitive.
+fn env_names_ignore_case() -> bool {
+    cfg!(windows)
+}
+
+/// Whether the environment variable name `actual` is `wanted`.
+fn env_name_matches(actual: &str, wanted: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        actual.eq_ignore_ascii_case(wanted)
+    } else {
+        actual == wanted
+    }
 }
 
 /// Why a run failed, when `stderr` shows the CLI rejected `--restricted` as
@@ -563,14 +594,31 @@ const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// `ANTHROPIC_CUSTOM_HEADERS` often carries a token. So this JSON never goes on
 /// the command line. [`IsolatedSettingsFile`] writes it to an owner-only file,
 /// and the run receives only that file's path.
+///
+/// `instruction_env` is the `--add-dir` instruction variable of the run (see
+/// [`additional_dirs_instruction_env`]). It is pinned here too: a project's
+/// `env` block outranks the process environment, so without the pin a
+/// repository could switch off the Task Checkout's own instruction files.
 fn isolated_settings(
     child_env: &[(std::ffi::OsString, std::ffi::OsString)],
     working_dir: &std::path::Path,
+    instruction_env: Option<(&str, &str)>,
+) -> String {
+    isolated_settings_with(child_env, working_dir, instruction_env, env_names_ignore_case())
+}
+
+/// [`isolated_settings`] with the name comparison given explicitly, so both
+/// behaviors can be tested on any platform.
+fn isolated_settings_with(
+    child_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    working_dir: &std::path::Path,
+    instruction_env: Option<(&str, &str)>,
+    ignore_case: bool,
 ) -> String {
     let child_value = |name: &str| {
         child_env
             .iter()
-            .find(|(key, _)| key.to_str() == Some(name))
+            .find(|(key, _)| key.to_str().is_some_and(|key| env_name_matches(key, name, ignore_case)))
             .and_then(|(_, value)| value.to_str())
             .unwrap_or("")
             .to_string()
@@ -594,6 +642,9 @@ fn isolated_settings(
         env.insert((*name).to_string(), value.into());
     }
     env.insert(ISOLATED_TELEMETRY_ENV.0.to_string(), ISOLATED_TELEMETRY_ENV.1.into());
+    if let Some((name, value)) = instruction_env {
+        env.insert(name.to_string(), value.into());
+    }
     let mut settings = serde_json::Map::new();
     settings.insert("disableAllHooks".to_string(), true.into());
     settings.insert("autoMemoryEnabled".to_string(), false.into());
@@ -634,10 +685,14 @@ const SETTINGS_FILE_FAILURE: &str =
 struct IsolatedSettingsFile(tempfile::TempPath);
 
 impl IsolatedSettingsFile {
-    /// Writes the settings of an isolated run for `child_env` and `working_dir`
-    /// into a new file in the system temporary directory.
-    fn create(child_env: &[(std::ffi::OsString, std::ffi::OsString)], working_dir: &std::path::Path) -> Result<Self, String> {
-        Self::create_in(&std::env::temp_dir(), child_env, working_dir)
+    /// Writes the settings of an isolated run for `child_env`, `working_dir`
+    /// and `instruction_env` into a new file in the system temporary directory.
+    fn create(
+        child_env: &[(std::ffi::OsString, std::ffi::OsString)],
+        working_dir: &std::path::Path,
+        instruction_env: Option<(&str, &str)>,
+    ) -> Result<Self, String> {
+        Self::create_in(&std::env::temp_dir(), child_env, working_dir, instruction_env)
     }
 
     /// [`Self::create`] in `dir`. Fails closed: if the file cannot be created
@@ -646,10 +701,11 @@ impl IsolatedSettingsFile {
         dir: &std::path::Path,
         child_env: &[(std::ffi::OsString, std::ffi::OsString)],
         working_dir: &std::path::Path,
+        instruction_env: Option<(&str, &str)>,
     ) -> Result<Self, String> {
         use std::io::Write;
 
-        let contents = isolated_settings(child_env, working_dir);
+        let contents = isolated_settings(child_env, working_dir, instruction_env);
         let mut file = tempfile::Builder::new()
             .prefix(SETTINGS_FILE_PREFIX)
             .suffix(".json")
@@ -1009,12 +1065,14 @@ impl ClaudeRunner {
 
         // Start from an empty environment; see `provider_env` for what is kept.
         let child_env = provider_env(std::env::vars_os());
+        let instruction_env = additional_dirs_instruction_env(&config);
         // Written before anything else is marked or spawned. If it cannot be
         // written securely the run does not start, and no file is left behind.
         let settings_file = if config.isolate_customizations {
             Some(IsolatedSettingsFile::create(
                 &child_env,
                 std::path::Path::new(&config.working_dir),
+                instruction_env,
             )?)
         } else {
             None
@@ -1022,7 +1080,7 @@ impl ClaudeRunner {
         cmd.args(claude_args(&config, settings_file.as_ref().map(IsolatedSettingsFile::path)));
         cmd.env_clear();
         cmd.envs(child_env);
-        if let Some((name, value)) = additional_dirs_instruction_env(&config) {
+        if let Some((name, value)) = instruction_env {
             cmd.env(name, value);
         }
 
@@ -1320,9 +1378,16 @@ impl ClaudeRunner {
         let killed = {
             let mut child = self.child.lock().await;
 
-            #[cfg(unix)]
+            // Before `child.kill()`, while the pid is still the leader's: the
+            // tree goes first, as on the mode-mismatch path. Windows has no
+            // process group, so `taskkill /T` walks the tree instead.
             if let Some(pid) = child.id() {
+                #[cfg(unix)]
                 Self::kill_process_group(pid);
+                #[cfg(windows)]
+                Self::kill_process_tree(pid);
+                #[cfg(not(any(unix, windows)))]
+                let _ = pid;
             }
 
             // `child.kill()` reaps, so the pid can be reissued from here on.
@@ -1886,6 +1951,7 @@ mod args_tests {
         let file = IsolatedSettingsFile::create(
             &provider_env(std::env::vars_os()),
             std::path::Path::new(&config.working_dir),
+            additional_dirs_instruction_env(config),
         )
         .expect("the settings file is written");
         let args: Vec<String> = claude_args(config, Some(file.path()))
@@ -1930,6 +1996,69 @@ mod args_tests {
     fn a_run_without_additional_dirs_leaves_the_instruction_environment_alone() {
         let cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
         assert_eq!(additional_dirs_instruction_env(&cfg), None);
+    }
+
+    /// The project's `env` block outranks the process environment, so an
+    /// isolated run pins the instruction variable in its settings file. A
+    /// repository cannot switch the checkout's own instructions off by setting
+    /// it to another value.
+    #[test]
+    fn an_isolated_run_with_additional_dirs_pins_their_instruction_variable() {
+        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        cfg.isolate_customizations = true;
+        cfg.additional_dirs = vec![std::path::PathBuf::from(".")];
+        let (_, settings) = isolated_args_and_settings(&cfg);
+        assert_eq!(settings["env"][ADDITIONAL_DIRS_CLAUDE_MD_ENV], "1", "{settings}");
+    }
+
+    #[test]
+    fn an_isolated_run_without_additional_dirs_does_not_pin_the_instruction_variable() {
+        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        cfg.isolate_customizations = true;
+        let (_, settings) = isolated_args_and_settings(&cfg);
+        assert!(settings["env"].get(ADDITIONAL_DIRS_CLAUDE_MD_ENV).is_none(), "{settings}");
+    }
+
+    /// Windows keeps the casing it was given (`Path`, `SystemRoot`, `ComSpec`),
+    /// and matches names without regard to case. Unix does not, so the same
+    /// names are not the provider's there. Both behaviors are tested on every
+    /// platform through the explicit flag.
+    #[test]
+    fn provider_env_matches_names_without_case_only_where_names_ignore_case() {
+        let vars = || {
+            [("Path", "C:\\bin"), ("SystemRoot", "C:\\Windows"), ("ComSpec", "cmd.exe"), ("anthropic_base_url", "https://gateway.test")]
+                .map(|(name, value)| (std::ffi::OsString::from(name), std::ffi::OsString::from(value)))
+        };
+        let kept: Vec<String> = provider_env_with(vars(), true)
+            .into_iter()
+            .map(|(name, _)| name.into_string().unwrap())
+            .collect();
+        assert_eq!(kept, ["Path", "SystemRoot", "ComSpec", "anthropic_base_url"]);
+        assert!(provider_env_with(vars(), false).is_empty());
+    }
+
+    #[test]
+    fn isolated_settings_pin_a_windows_path_under_its_stored_name() {
+        let child = provider_env_with(vec![(std::ffi::OsString::from("Path"), std::ffi::OsString::from("/usr/bin:/bin"))], true);
+        let folded: serde_json::Value = serde_json::from_str(&isolated_settings_with(
+            &child,
+            std::path::Path::new("/srv/checkout"),
+            None,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(folded["env"]["PATH"], "/usr/bin:/bin");
+
+        // Compared case-sensitively, `Path` is not `PATH`, so the pin is empty
+        // and the run would have no search path.
+        let exact: serde_json::Value = serde_json::from_str(&isolated_settings_with(
+            &child,
+            std::path::Path::new("/srv/checkout"),
+            None,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(exact["env"]["PATH"], "");
     }
 
     #[test]
@@ -2082,15 +2211,20 @@ mod launch_policy_tests {
     fn ancestor_instruction_excludes_list_every_directory_above_the_working_directory() {
         let excludes = ancestor_instruction_excludes(std::path::Path::new("/a/b/c"));
         let paths: Vec<&str> = excludes.iter().map(|v| v.as_str().unwrap()).collect();
-        // `/a/b`, `/a` and the root: every directory above `/a/b/c`.
+        // `/a/b`, `/a` and the root: every directory above `/a/b/c`. Compared as
+        // `Path`s with `join`, so the expected separator is the platform's.
         assert_eq!(paths.len(), 3 * ANCESTOR_INSTRUCTION_FILES.len(), "{paths:?}");
-        for dir in ["/a/b", "/a", ""] {
+        for dir in ["/a/b", "/a", "/"] {
             for name in ANCESTOR_INSTRUCTION_FILES {
-                let expected = format!("{dir}/{name}");
-                assert!(paths.contains(&expected.as_str()), "{expected} missing from {paths:?}");
+                let expected = std::path::Path::new(dir).join(name);
+                assert!(
+                    paths.iter().any(|p| std::path::Path::new(p) == expected),
+                    "{} missing from {paths:?}",
+                    expected.display()
+                );
             }
         }
-        assert!(!paths.iter().any(|p| p.starts_with("/a/b/c")), "{paths:?}");
+        assert!(!paths.iter().any(|p| std::path::Path::new(p).starts_with("/a/b/c")), "{paths:?}");
     }
 
     /// Creates the `--settings` file of an isolated run exactly as a run does,
@@ -2108,6 +2242,7 @@ mod launch_policy_tests {
         let file = IsolatedSettingsFile::create(
             &provider_env(std::env::vars_os()),
             std::path::Path::new(&working_dir),
+            None,
         )
         .expect("the settings file is written");
         let kept = file.0.keep().expect("the settings file is kept for the probe");
@@ -2130,7 +2265,7 @@ mod launch_policy_tests {
                 OsString::from("--require /tmp/x.js"),
             ),
         ]);
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"))).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
         assert_eq!(settings["disableAllHooks"], true);
         assert_eq!(settings["apiKeyHelper"], "");
         assert_eq!(
@@ -2149,7 +2284,7 @@ mod launch_policy_tests {
     #[test]
     fn isolated_settings_pin_endpoint_ca_and_loader_names_when_absent() {
         let settings: serde_json::Value =
-            serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"))).unwrap();
+            serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
         for name in [
             "ANTHROPIC_BEDROCK_BASE_URL",
             "ANTHROPIC_VERTEX_BASE_URL",
@@ -2176,7 +2311,7 @@ mod launch_policy_tests {
     #[test]
     fn isolated_settings_pin_every_provider_selector_and_skip_switch_when_absent() {
         let settings: serde_json::Value =
-            serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"))).unwrap();
+            serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
         for name in [
             "CLAUDE_CODE_USE_BEDROCK",
             "CLAUDE_CODE_USE_VERTEX",
@@ -2213,7 +2348,7 @@ mod launch_policy_tests {
             (OsString::from("CLAUDE_CODE_USE_ANTHROPIC_AWS"), OsString::from("1")),
         ]);
         let settings: serde_json::Value =
-            serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"))).unwrap();
+            serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
         assert_eq!(settings["env"]["CLAUDE_CODE_SKIP_VERTEX_AUTH"], "1");
         assert_eq!(settings["env"]["CLOUD_ML_REGION"], "europe-west1");
         assert_eq!(settings["env"]["CLAUDE_CODE_USE_ANTHROPIC_AWS"], "1");
@@ -2248,7 +2383,7 @@ mod launch_policy_tests {
         let at = |vars: Vec<(&str, &str)>| {
             let child = provider_env(vars.into_iter().map(|(n, v)| (OsString::from(n), OsString::from(v))));
             let settings: serde_json::Value =
-                serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"))).unwrap();
+                serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
             settings["env"]["CLAUDE_CONFIG_DIR"].as_str().unwrap().to_string()
         };
         assert_eq!(at(vec![("HOME", "/home/u")]), "/home/u/.claude");
@@ -2284,7 +2419,7 @@ mod launch_policy_tests {
     #[test]
     fn isolated_settings_pin_the_shell_and_child_process_inlets() {
         let child = provider_env(vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]);
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"))).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
         // The project cannot prepend its own directory to the child's PATH.
         assert_eq!(settings["env"]["PATH"], "/usr/bin:/bin");
         for name in ["BASH_ENV", "ENV", "LD_PRELOAD", "CLAUDE_CODE_SHELL_PREFIX"] {
@@ -2294,7 +2429,7 @@ mod launch_policy_tests {
 
     #[test]
     fn isolated_settings_disable_helpers_and_optional_telemetry() {
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"))).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
         for name in HELPER_SETTINGS {
             assert_eq!(settings[*name], "", "{name} must be pinned empty");
         }
@@ -2304,7 +2439,7 @@ mod launch_policy_tests {
 
     #[test]
     fn isolated_settings_name_the_default_endpoint_when_the_child_has_none() {
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"))).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
         assert_eq!(
             settings["env"]["ANTHROPIC_BASE_URL"],
             DEFAULT_ANTHROPIC_BASE_URL
@@ -2325,7 +2460,7 @@ mod launch_policy_tests {
     fn isolated_settings_file_is_owner_only_from_its_creation() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
-        let file = IsolatedSettingsFile::create_in(dir.path(), &[], std::path::Path::new("/srv/checkout")).unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &[], std::path::Path::new("/srv/checkout"), None).unwrap();
         let mode = std::fs::metadata(file.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let name = file.path().file_name().unwrap().to_string_lossy().into_owned();
@@ -2336,9 +2471,9 @@ mod launch_policy_tests {
     fn isolated_settings_file_holds_exactly_the_settings_the_run_pins() {
         let child = provider_env(vec![(OsString::from("ANTHROPIC_BASE_URL"), OsString::from("https://gateway.test"))]);
         let dir = tempfile::TempDir::new().unwrap();
-        let file = IsolatedSettingsFile::create_in(dir.path(), &child, std::path::Path::new("/srv/checkout")).unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &child, std::path::Path::new("/srv/checkout"), None).unwrap();
         let text = std::fs::read_to_string(file.path()).unwrap();
-        assert_eq!(text, isolated_settings(&child, std::path::Path::new("/srv/checkout")));
+        assert_eq!(text, isolated_settings(&child, std::path::Path::new("/srv/checkout"), None));
     }
 
     /// Deleting the file is what ends the credentials' life on disk, so it must
@@ -2346,7 +2481,7 @@ mod launch_policy_tests {
     #[test]
     fn isolated_settings_file_is_deleted_when_it_is_dropped() {
         let dir = tempfile::TempDir::new().unwrap();
-        let file = IsolatedSettingsFile::create_in(dir.path(), &[], std::path::Path::new("/srv/checkout")).unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &[], std::path::Path::new("/srv/checkout"), None).unwrap();
         let path = file.path().to_path_buf();
         assert!(path.is_file());
         drop(file);
@@ -2361,7 +2496,7 @@ mod launch_policy_tests {
         let child = provider_env(vec![(OsString::from("ANTHROPIC_CUSTOM_HEADERS"), OsString::from(secret))]);
         let dir = tempfile::TempDir::new().unwrap();
         let missing = dir.path().join("no-such-directory");
-        let err = IsolatedSettingsFile::create_in(&missing, &child, std::path::Path::new("/srv/checkout"))
+        let err = IsolatedSettingsFile::create_in(&missing, &child, std::path::Path::new("/srv/checkout"), None)
             .err()
             .expect("a file in a missing directory cannot be created");
         assert_eq!(err, SETTINGS_FILE_FAILURE);
@@ -2384,7 +2519,7 @@ mod launch_policy_tests {
             ),
         ]);
         let dir = tempfile::TempDir::new().unwrap();
-        let file = IsolatedSettingsFile::create_in(dir.path(), &child, std::path::Path::new("/srv/checkout")).unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &child, std::path::Path::new("/srv/checkout"), None).unwrap();
         assert!(std::fs::read_to_string(file.path()).unwrap().contains(secret));
 
         let mut config = auto_config(vec![]);
