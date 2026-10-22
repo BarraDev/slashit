@@ -693,6 +693,23 @@ fn ancestor_instruction_excludes(working_dir: &std::path::Path) -> Vec<serde_jso
         .collect()
 }
 
+/// The environment variable that makes Claude Code read `CLAUDE.md` from each
+/// `--add-dir` directory. Without it the CLI loads instruction files only from
+/// the working directory and its ancestors.
+///
+/// A workspace-backed run starts from the Workspace root and exposes the Task
+/// Checkout with `--add-dir`, so without this the checkout's own `CLAUDE.md`
+/// (and the `@AGENTS.md` it imports) never reaches the agent. Checked on
+/// Claude Code 2.1.308 with a local stub: with the variable set, the checkout's
+/// file loads, and its ancestors and sibling directories stay out.
+const ADDITIONAL_DIRS_CLAUDE_MD_ENV: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
+
+/// The environment a run needs for its `--add-dir` directories to contribute
+/// instruction files, or `None` when it has none.
+fn additional_dirs_instruction_env(config: &ClaudeRunConfig) -> Option<(&'static str, &'static str)> {
+    (!config.additional_dirs.is_empty()).then_some((ADDITIONAL_DIRS_CLAUDE_MD_ENV, "1"))
+}
+
 /// The Claude CLI arguments for `config`, in order, without the program.
 ///
 /// Separate from [`ClaudeRunner::start_program`] so the capability flags a
@@ -1005,6 +1022,9 @@ impl ClaudeRunner {
         cmd.args(claude_args(&config, settings_file.as_ref().map(IsolatedSettingsFile::path)));
         cmd.env_clear();
         cmd.envs(child_env);
+        if let Some((name, value)) = additional_dirs_instruction_env(&config) {
+            cmd.env(name, value);
+        }
 
         cmd.current_dir(&config.working_dir);
         cmd.stdin(std::process::Stdio::piped());
@@ -1894,6 +1914,22 @@ mod args_tests {
         for tool in ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Agent"] {
             assert!(denied.split(',').any(|d| d == tool), "{tool} should be denied, got {denied}");
         }
+    }
+
+    #[test]
+    fn a_run_with_additional_dirs_asks_the_cli_for_their_instruction_files() {
+        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        cfg.additional_dirs = vec![std::path::PathBuf::from(".")];
+        assert_eq!(
+            additional_dirs_instruction_env(&cfg),
+            Some((ADDITIONAL_DIRS_CLAUDE_MD_ENV, "1")),
+        );
+    }
+
+    #[test]
+    fn a_run_without_additional_dirs_leaves_the_instruction_environment_alone() {
+        let cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        assert_eq!(additional_dirs_instruction_env(&cfg), None);
     }
 
     #[test]
