@@ -50,12 +50,13 @@ the security boundary of the run:
   agent, which still needs review. An Auto run never falls back to it.
 - `isolate_customizations: true` for the coding Worker and the review-fix
   agent: `--setting-sources project` (the user's settings, hooks, plugins and
-  `env` are not read), `--settings` from `isolated_settings` (every hook is
-  off, `DISABLE_TELEMETRY` is `1`, the `PINNED_ENV` names are pinned to the
+  `env` are not read), `--settings <path>` (every hook is off,
+  `DISABLE_TELEMETRY` is `1`, the `PINNED_ENV` names are pinned to the
   child's values or empty, and the `HELPER_SETTINGS` commands are pinned to
-  empty), and `--strict-mcp-config`. The project's `env` block outranks the
-  environment SlashIt passes, so the pins are what keep a repository from
-  redirecting the API key, the provider, the shell or child processes; a pin
+  empty), and `--strict-mcp-config`. The file is an owner-only
+  `IsolatedSettingsFile`, deleted when the provider exits; argv is readable by
+  other users. The project's `env` block outranks the environment SlashIt
+  passes, so the pins keep a repository from redirecting the API key, the provider, the shell or child processes; a pin
   is a string value, because `null` is skipped as invalid and the setting it
   was meant to disable still runs. The project's `CLAUDE.md` still loads.
   Claude Code also reads instruction files from every directory above the

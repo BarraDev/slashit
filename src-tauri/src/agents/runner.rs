@@ -82,12 +82,19 @@ pub fn auto_mode_mismatch(init: &serde_json::Value) -> Option<String> {
     ))
 }
 
+/// How long `claude --version` may take before an Auto launch is refused. The
+/// query only prints a version string, so this is a failure bound: a CLI that
+/// has not answered by then is treated as unusable, and the Worker never starts.
+#[cfg(not(test))]
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Refuses an Auto launch when the `claude` on PATH is too old, by reading
 /// `claude --version` with the same environment the run gets.
 ///
 /// Compiled out of test binaries: their fake CLIs answer every invocation with
 /// stream-json and do not report a version. The version rule itself is tested
-/// through [`auto_unsupported_reason`].
+/// through [`auto_unsupported_reason`], and the probe's bound through
+/// [`read_claude_version`].
 async fn ensure_auto_supported() -> Result<(), String> {
     #[cfg(test)]
     {
@@ -95,16 +102,66 @@ async fn ensure_auto_supported() -> Result<(), String> {
     }
     #[cfg(not(test))]
     {
-        let version = tokio::process::Command::new("claude")
-            .arg("--version")
-            .env_clear()
-            .envs(provider_env(std::env::vars_os()))
-            .output()
-            .await
-            .map_err(|e| format!("SlashIt could not run Claude Code to check its version: {e}"))?;
-        match auto_unsupported_reason(&String::from_utf8_lossy(&version.stdout)) {
+        let version = read_claude_version("claude", provider_env(std::env::vars_os()), VERSION_PROBE_TIMEOUT).await?;
+        match auto_unsupported_reason(&version) {
             Some(reason) => Err(reason),
             None => Ok(()),
+        }
+    }
+}
+
+/// Runs `program --version` with exactly `env` and returns what it printed.
+///
+/// The probe waits at most `limit`. A process still running then is killed and
+/// reaped before this returns, so a hung probe cannot outlive the launch that
+/// asked for it. Cancelling the caller drops the child, and `kill_on_drop` ends
+/// it; the runtime then reaps it in the background.
+#[cfg(any(not(test), unix))]
+async fn read_claude_version(
+    program: impl AsRef<std::ffi::OsStr>,
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    limit: std::time::Duration,
+) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut child = Command::new(program)
+        .arg("--version")
+        .env_clear()
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("SlashIt could not run Claude Code to check its version: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "SlashIt could not read the Claude Code version output".to_string())?;
+
+    let answer = tokio::time::timeout(limit, async {
+        let mut out = Vec::new();
+        stdout.read_to_end(&mut out).await?;
+        child.wait().await?;
+        Ok::<Vec<u8>, std::io::Error>(out)
+    })
+    .await;
+
+    match answer {
+        Ok(Ok(out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
+        Ok(Err(e)) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(format!("SlashIt could not read the Claude Code version: {e}"))
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(format!(
+                "Claude Code did not answer `claude --version` within {limit:?}, so the Auto run was \
+                 not started. Check that `claude --version` finishes in a terminal, then run again. \
+                 SlashIt does not fall back to bypassing permissions"
+            ))
         }
     }
 }
@@ -480,9 +537,10 @@ const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// directories above the checkout are excluded by path (see
 /// [`ancestor_instruction_excludes`]).
 ///
-/// The pinned values are not secrets. A proxy URL with credentials in it is
-/// visible in the process list, as the child's own environment already is to
-/// a process of the same user.
+/// The pinned values can be secrets: a proxy URL can carry credentials, and
+/// `ANTHROPIC_CUSTOM_HEADERS` often carries a token. So this JSON never goes on
+/// the command line. [`IsolatedSettingsFile`] writes it to an owner-only file,
+/// and the run receives only that file's path.
 fn isolated_settings(
     child_env: &[(std::ffi::OsString, std::ffi::OsString)],
     working_dir: &std::path::Path,
@@ -528,6 +586,64 @@ fn isolated_settings(
     serde_json::Value::Object(settings).to_string()
 }
 
+/// Prefix of the name of an isolated run's settings file. The rest of the name
+/// is random, so the file cannot be predicted or pre-created.
+const SETTINGS_FILE_PREFIX: &str = "slashit-claude-settings-";
+
+/// Why an isolated run did not start because its settings file could not be
+/// written. It names no path and no content: the content holds pinned
+/// credentials and endpoints.
+const SETTINGS_FILE_FAILURE: &str =
+    "SlashIt could not write the Claude Code settings file securely, so the run was not started.";
+
+/// The `--settings` file of one isolated run.
+///
+/// It is created owner-only: `tempfile` opens it with `create_new` (`O_EXCL`)
+/// under a random name, so an existing file or symlink at that name is never
+/// followed, and the mode is `0600` from the first byte. It is written once,
+/// closed before the CLI reads it, and deleted when this value is dropped. The
+/// runner holds it until the provider has exited, so a normal finish, an error,
+/// a cancellation and a runner dropped mid-run all remove it.
+///
+/// The argument list carries only the path. Any local user can read another
+/// process's argv through `/proc/<pid>/cmdline`, so the settings must not be
+/// there. On Windows the file lives in the user's temporary directory, whose
+/// default access control belongs to that user; no explicit DACL is set.
+struct IsolatedSettingsFile(tempfile::TempPath);
+
+impl IsolatedSettingsFile {
+    /// Writes the settings of an isolated run for `child_env` and `working_dir`
+    /// into a new file in the system temporary directory.
+    fn create(child_env: &[(std::ffi::OsString, std::ffi::OsString)], working_dir: &std::path::Path) -> Result<Self, String> {
+        Self::create_in(&std::env::temp_dir(), child_env, working_dir)
+    }
+
+    /// [`Self::create`] in `dir`. Fails closed: if the file cannot be created
+    /// or written, nothing is left behind and the caller must not launch.
+    fn create_in(
+        dir: &std::path::Path,
+        child_env: &[(std::ffi::OsString, std::ffi::OsString)],
+        working_dir: &std::path::Path,
+    ) -> Result<Self, String> {
+        use std::io::Write;
+
+        let contents = isolated_settings(child_env, working_dir);
+        let mut file = tempfile::Builder::new()
+            .prefix(SETTINGS_FILE_PREFIX)
+            .suffix(".json")
+            .tempfile_in(dir)
+            .map_err(|_| SETTINGS_FILE_FAILURE.to_string())?;
+        // An error here drops `file`, which deletes it.
+        file.write_all(contents.as_bytes())
+            .map_err(|_| SETTINGS_FILE_FAILURE.to_string())?;
+        Ok(Self(file.into_temp_path()))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
 /// Instruction files that Claude Code reads from each directory above the
 /// working directory, as well as the working directory itself.
 const ANCESTOR_INSTRUCTION_FILES: &[&str] = &[
@@ -565,7 +681,21 @@ fn ancestor_instruction_excludes(working_dir: &std::path::Path) -> Vec<serde_jso
 /// argument is capped at `MAX_ARG_STRLEN` (128 KiB on Linux) and is readable
 /// by any local process through `/proc/<pid>/cmdline`, and a prompt carries
 /// review comments, diffs and task descriptions of any size.
-pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
+///
+/// `settings_file` is the `--settings` file of an isolated run (see
+/// [`IsolatedSettingsFile`]). It must be `Some` when `isolate_customizations`
+/// is set, and the caller keeps the file alive until the run has exited. Only
+/// its path is added to the arguments.
+///
+/// # Panics
+///
+/// If `isolate_customizations` is set and `settings_file` is `None`. Passing no
+/// settings file would start the run without its isolation, so the caller that
+/// builds an isolated run is the one that must supply it.
+pub fn claude_args(
+    config: &ClaudeRunConfig,
+    settings_file: Option<&std::path::Path>,
+) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     let mut push = |a: &str| args.push(a.into());
 
@@ -637,20 +767,19 @@ pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
         push(extra);
     }
 
+    // From here on the arguments are pushed directly, not through `push`:
+    // the settings path is an `OsStr`, which the closure above does not take.
     if config.isolate_customizations {
-        // Pinned against the same environment the child is started with.
-        let settings = isolated_settings(
-            &provider_env(std::env::vars_os()),
-            std::path::Path::new(&config.working_dir),
-        );
-        push("--setting-sources");
-        push("project");
-        push("--settings");
-        push(&settings);
+        let settings = settings_file
+            .expect("an isolated run is launched with its settings file; see `claude_args`");
+        args.push("--setting-sources".into());
+        args.push("project".into());
+        args.push("--settings".into());
+        args.push(settings.as_os_str().to_owned());
     }
     // Isolation includes the MCP servers the user's own configuration would add.
     if strict_mcp || config.isolate_customizations {
-        push("--strict-mcp-config");
+        args.push("--strict-mcp-config".into());
     }
 
     for dir in &config.additional_dirs {
@@ -763,6 +892,10 @@ pub struct ClaudeRunner {
     /// Set by the stdout reader when the `init` event reports Auto. An Auto
     /// run that exits cleanly without it has not shown that Auto was active.
     auto_confirmed: Arc<AtomicBool>,
+    /// The `--settings` file of an isolated run. Held until the provider has
+    /// exited (see [`Self::wait`]), and deleted when this runner is dropped
+    /// whatever happened before that.
+    settings_file: std::sync::Mutex<Option<IsolatedSettingsFile>>,
 }
 
 impl Drop for ClaudeRunner {
@@ -835,10 +968,21 @@ impl ClaudeRunner {
     ) -> Result<Self, String> {
         let mut cmd = Command::new(program);
 
-        cmd.args(claude_args(&config));
         // Start from an empty environment; see `provider_env` for what is kept.
+        let child_env = provider_env(std::env::vars_os());
+        // Written before anything else is marked or spawned. If it cannot be
+        // written securely the run does not start, and no file is left behind.
+        let settings_file = if config.isolate_customizations {
+            Some(IsolatedSettingsFile::create(
+                &child_env,
+                std::path::Path::new(&config.working_dir),
+            )?)
+        } else {
+            None
+        };
+        cmd.args(claude_args(&config, settings_file.as_ref().map(IsolatedSettingsFile::path)));
         cmd.env_clear();
-        cmd.envs(provider_env(std::env::vars_os()));
+        cmd.envs(child_env);
 
         cmd.current_dir(&config.working_dir);
         cmd.stdin(std::process::Stdio::piped());
@@ -957,6 +1101,7 @@ impl ClaudeRunner {
             mode_mismatch: Arc::new(RwLock::new(None)),
             expect_auto,
             auto_confirmed: Arc::new(AtomicBool::new(false)),
+            settings_file: std::sync::Mutex::new(settings_file),
         };
 
         let handle = runner.start_reader(stdout);
@@ -1312,6 +1457,13 @@ impl ClaudeRunner {
         // bounding it belongs with cancellation rather than here, but at least
         // `kill()` is no longer queued behind a caller stuck waiting on output.
         drop(child);
+
+        // The provider has exited, so the isolated run's settings file has no
+        // reader left. Deleting it here, not only when the runner is dropped,
+        // keeps the file's life to the run's own.
+        if let Ok(mut settings) = self.settings_file.lock() {
+            settings.take();
+        }
 
         // Wait for the stdout reader to drain before callers read accumulated_output.
         // Without this, get_output() can race the reader and return partial/empty text.
@@ -1674,15 +1826,32 @@ mod args_tests {
     }
 
     fn args(config: &ClaudeRunConfig) -> Vec<String> {
-        claude_args(config)
+        claude_args(config, None)
             .into_iter()
             .map(|a| a.into_string().expect("utf-8 arg"))
             .collect()
     }
 
-    fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    pub(super) fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         let at = args.iter().position(|a| a == flag)?;
         args.get(at + 1).map(String::as_str)
+    }
+
+    /// The arguments of an isolated run, and the settings its `--settings` file
+    /// holds, read back the way the CLI will read them. The file is created as
+    /// a run creates it, and is deleted when this returns.
+    pub(super) fn isolated_args_and_settings(config: &ClaudeRunConfig) -> (Vec<String>, serde_json::Value) {
+        let file = IsolatedSettingsFile::create(
+            &provider_env(std::env::vars_os()),
+            std::path::Path::new(&config.working_dir),
+        )
+        .expect("the settings file is written");
+        let args: Vec<String> = claude_args(config, Some(file.path()))
+            .into_iter()
+            .map(|a| a.into_string().expect("utf-8 arg"))
+            .collect();
+        let text = std::fs::read_to_string(file.path()).expect("the settings file is readable");
+        (args, serde_json::from_str(&text).expect("the settings file is JSON"))
     }
 
     #[test]
@@ -1775,6 +1944,7 @@ mod args_tests {
 
 #[cfg(test)]
 mod launch_policy_tests {
+    use super::args_tests::{isolated_args_and_settings, value_of};
     use super::*;
     use std::ffi::OsString;
 
@@ -1806,7 +1976,7 @@ mod launch_policy_tests {
 
     #[test]
     fn auto_passes_auto_and_never_bypass_or_an_approval_list() {
-        let args: Vec<String> = claude_args(&auto_config(vec!["Bash".into(), "Edit".into()]))
+        let args: Vec<String> = claude_args(&auto_config(vec!["Bash".into(), "Edit".into()]), None)
             .into_iter()
             .map(|a| a.into_string().unwrap())
             .collect();
@@ -1821,11 +1991,9 @@ mod launch_policy_tests {
     fn isolated_runs_read_only_the_project_and_disable_every_hook() {
         let mut config = auto_config(vec![]);
         config.isolate_customizations = true;
-        let args: Vec<String> = claude_args(&config).into_iter().map(|a| a.into_string().unwrap()).collect();
-        let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].as_str());
-        assert_eq!(at("--setting-sources"), Some("project"), "{args:?}");
-        let settings = at("--settings").expect("--settings");
-        assert!(settings.contains(r#""disableAllHooks":true"#), "{args:?}");
+        let (args, settings) = isolated_args_and_settings(&config);
+        assert_eq!(value_of(&args, "--setting-sources"), Some("project"), "{args:?}");
+        assert_eq!(settings["disableAllHooks"], true, "{args:?}");
         assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
     }
 
@@ -1834,9 +2002,7 @@ mod launch_policy_tests {
         let mut config = auto_config(vec![]);
         config.isolate_customizations = true;
         config.working_dir = "/home/owner/.local/share/slashit/worktrees/p/t".into();
-        let args: Vec<String> = claude_args(&config).into_iter().map(|a| a.into_string().unwrap()).collect();
-        let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].as_str());
-        let settings: serde_json::Value = serde_json::from_str(at("--settings").expect("--settings")).unwrap();
+        let (args, settings) = isolated_args_and_settings(&config);
         assert_eq!(settings["autoMemoryEnabled"], false, "{args:?}");
         let excludes: Vec<&str> = settings["claudeMdExcludes"]
             .as_array()
@@ -1869,22 +2035,25 @@ mod launch_policy_tests {
         assert!(!paths.iter().any(|p| p.starts_with("/a/b/c")), "{paths:?}");
     }
 
-    /// Writes the `--settings` value of an isolated run to the file named by
-    /// `SLASHIT_ISOLATED_SETTINGS_OUT`, for a probe that runs the real CLI with
-    /// the exact value the product sends. Ignored by default, and a no-op
-    /// unless the variable is set.
+    /// Creates the `--settings` file of an isolated run exactly as a run does,
+    /// keeps it, and writes its path to the file named by
+    /// `SLASHIT_ISOLATED_SETTINGS_OUT`, for a probe that runs the real CLI on it.
+    /// Ignored by default, and a no-op unless the variable is set. The probe
+    /// deletes the kept file itself.
     #[test]
     #[ignore]
     fn write_isolated_settings_for_a_real_cli_probe() {
         let Ok(out) = std::env::var("SLASHIT_ISOLATED_SETTINGS_OUT") else {
             return;
         };
-        let mut config = auto_config(vec![]);
-        config.isolate_customizations = true;
-        config.working_dir = std::env::var("SLASHIT_ISOLATED_WORKING_DIR").expect("SLASHIT_ISOLATED_WORKING_DIR");
-        let args: Vec<String> = claude_args(&config).into_iter().map(|a| a.into_string().unwrap()).collect();
-        let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].clone());
-        std::fs::write(out, at("--settings").expect("--settings")).unwrap();
+        let working_dir = std::env::var("SLASHIT_ISOLATED_WORKING_DIR").expect("SLASHIT_ISOLATED_WORKING_DIR");
+        let file = IsolatedSettingsFile::create(
+            &provider_env(std::env::vars_os()),
+            std::path::Path::new(&working_dir),
+        )
+        .expect("the settings file is written");
+        let kept = file.0.keep().expect("the settings file is kept for the probe");
+        std::fs::write(out, kept.to_string_lossy().as_bytes()).unwrap();
     }
 
     #[test]
@@ -2016,8 +2185,87 @@ mod launch_policy_tests {
     #[test]
     fn runs_that_are_not_isolated_keep_the_settings_their_user_configured() {
         let args: Vec<String> =
-            claude_args(&auto_config(vec![])).into_iter().map(|a| a.into_string().unwrap()).collect();
+            claude_args(&auto_config(vec![]), None).into_iter().map(|a| a.into_string().unwrap()).collect();
         assert!(!args.iter().any(|a| a == "--setting-sources" || a == "--settings"), "{args:?}");
+    }
+
+    /// The settings file is created owner-only, so no other local user can read
+    /// it at any point, and it holds exactly the settings the run pins.
+    #[cfg(unix)]
+    #[test]
+    fn isolated_settings_file_is_owner_only_from_its_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &[], std::path::Path::new("/srv/checkout")).unwrap();
+        let mode = std::fs::metadata(file.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let name = file.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(SETTINGS_FILE_PREFIX) && name.ends_with(".json"), "{name}");
+    }
+
+    #[test]
+    fn isolated_settings_file_holds_exactly_the_settings_the_run_pins() {
+        let child = provider_env(vec![(OsString::from("ANTHROPIC_BASE_URL"), OsString::from("https://gateway.test"))]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &child, std::path::Path::new("/srv/checkout")).unwrap();
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(text, isolated_settings(&child, std::path::Path::new("/srv/checkout")));
+    }
+
+    /// Deleting the file is what ends the credentials' life on disk, so it must
+    /// happen as soon as the value holding it is dropped.
+    #[test]
+    fn isolated_settings_file_is_deleted_when_it_is_dropped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &[], std::path::Path::new("/srv/checkout")).unwrap();
+        let path = file.path().to_path_buf();
+        assert!(path.is_file());
+        drop(file);
+        assert!(!path.exists(), "{path:?} outlived its run");
+    }
+
+    /// A settings file that cannot be written stops the run. The error names
+    /// neither the path nor the content, because the content holds credentials.
+    #[test]
+    fn a_settings_file_that_cannot_be_written_fails_closed_without_its_content() {
+        let secret = "SECRET-HEADER-9c1e";
+        let child = provider_env(vec![(OsString::from("ANTHROPIC_CUSTOM_HEADERS"), OsString::from(secret))]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("no-such-directory");
+        let err = IsolatedSettingsFile::create_in(&missing, &child, std::path::Path::new("/srv/checkout"))
+            .err()
+            .expect("a file in a missing directory cannot be created");
+        assert_eq!(err, SETTINGS_FILE_FAILURE);
+        assert!(!err.contains(secret) && !err.contains("no-such-directory"), "{err}");
+    }
+
+    /// The settings do carry the pinned secrets, so the file is where they
+    /// belong. The argument list must carry neither them nor the settings' keys.
+    #[test]
+    fn settings_secrets_never_reach_the_argument_list() {
+        let secret = "SECRET-HEADER-7f3a";
+        let child = provider_env(vec![
+            (
+                OsString::from("ANTHROPIC_CUSTOM_HEADERS"),
+                OsString::from(format!("Authorization: Bearer {secret}")),
+            ),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from(format!("http://user:{secret}@proxy.test:3128")),
+            ),
+        ]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &child, std::path::Path::new("/srv/checkout")).unwrap();
+        assert!(std::fs::read_to_string(file.path()).unwrap().contains(secret));
+
+        let mut config = auto_config(vec![]);
+        config.isolate_customizations = true;
+        let args: Vec<String> = claude_args(&config, Some(file.path()))
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert!(!args.iter().any(|a| a.contains(secret) || a.contains("disableAllHooks")), "{args:?}");
+        assert_eq!(value_of(&args, "--settings"), file.path().to_str(), "{args:?}");
     }
 
     #[test]
@@ -3044,7 +3292,7 @@ mod tests {
             let fixture = Fixture::new(STDIN_ECHO);
             let prompt = "PROMPT-MARKER: review this change\n--tools Bash\n";
             let config = fixture.config_with_prompt(prompt, tools);
-            let expected_argv: Vec<Vec<u8>> = claude_args(&config)
+            let expected_argv: Vec<Vec<u8>> = claude_args(&config, None)
                 .into_iter()
                 .map(|a| a.into_encoded_bytes())
                 .collect();
@@ -3061,6 +3309,110 @@ mod tests {
             assert_eq!(fixture.recorded_prompt(), prompt.as_bytes(), "{label}");
             assert_eq!(runner.get_output().await, prompt.len().to_string(), "{label}");
         }
+    }
+
+    /// The settings path an isolated run was given, from its recorded argv.
+    fn settings_path_in(argv: &[Vec<u8>]) -> std::path::PathBuf {
+        let at = argv.iter().position(|a| a == b"--settings").expect("--settings is passed");
+        let path = String::from_utf8(argv[at + 1].clone()).expect("the path is text");
+        std::path::PathBuf::from(path)
+    }
+
+    /// An isolated run is given its settings by path only. The file is still
+    /// there while the provider is running, and it is gone once the run is over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_isolated_run_is_given_its_settings_by_path_and_the_file_is_deleted_after_it() {
+        let fixture = Fixture::new(STDIN_ECHO);
+        let mut config = fixture.config();
+        config.isolate_customizations = true;
+        let runner = fixture.start_with(config).await;
+        assert_eq!(bounded("isolated", &runner).await, Ok(true));
+
+        let argv = fixture.recorded_argv();
+        assert_eq!(value_of_bytes(&argv, b"--setting-sources"), Some(&b"project"[..]), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a.windows(b"disableAllHooks".len()).any(|w| w == b"disableAllHooks")),
+            "the settings JSON reached argv"
+        );
+        let path = settings_path_in(&argv);
+        assert!(path.file_name().unwrap().to_string_lossy().starts_with(SETTINGS_FILE_PREFIX), "{path:?}");
+        assert!(!path.exists(), "{path:?} outlived its run");
+    }
+
+    /// A runner dropped before its run ends still removes the settings file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runner_dropped_before_its_run_ends_deletes_the_settings_file() {
+        let fixture = Fixture::new(STDIN_ECHO);
+        let mut config = fixture.config();
+        config.isolate_customizations = true;
+        let runner = fixture.start_with(config).await;
+
+        let argv_file = fixture.dir.path().join("argv");
+        let started = std::time::Instant::now();
+        let argv = loop {
+            if let Ok(raw) = std::fs::read(&argv_file) {
+                if raw.ends_with(&[0]) && raw.windows(b"--settings".len()).any(|w| w == b"--settings") {
+                    break fixture.recorded_argv();
+                }
+            }
+            assert!(started.elapsed() < DEADLINE, "the fixture never recorded its argv");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let path = settings_path_in(&argv);
+        drop(runner);
+        assert!(!path.exists(), "{path:?} outlived its runner");
+    }
+
+    fn value_of_bytes<'a>(argv: &'a [Vec<u8>], flag: &[u8]) -> Option<&'a [u8]> {
+        let at = argv.iter().position(|a| a == flag)?;
+        argv.get(at + 1).map(Vec::as_slice)
+    }
+
+    /// The version probe reads what the CLI prints.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_version_probe_reads_what_the_cli_prints() {
+        let fixture = Fixture::new("version_ok");
+        let version = read_claude_version(&fixture.program, Vec::new(), DEADLINE).await.unwrap();
+        assert_eq!(version, "2.1.307 (Claude Code)\n");
+        assert_eq!(auto_unsupported_reason(&version), None);
+    }
+
+    /// A CLI that never answers `--version` is stopped and reaped within the
+    /// bound, and the error says what to do. The fixture records its pid first,
+    /// so the test can check that the process is gone once the probe returns.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_version_probe_that_never_answers_is_stopped_and_reaped() {
+        let fixture = Fixture::new("version_hangs");
+        let env = vec![
+            (std::ffi::OsString::from("HOME"), fixture.dir.path().as_os_str().to_owned()),
+            (std::ffi::OsString::from("PATH"), std::env::var_os("PATH").unwrap_or_default()),
+        ];
+        let limit = Duration::from_millis(500);
+        let program = fixture.program.clone();
+        let probe = tokio::spawn(async move { read_claude_version(program, env, limit).await });
+
+        // The fixture writes its pid before it blocks; wait for that first, so
+        // the probe is known to have a live child when its bound expires.
+        let pid_file = fixture.dir.path().join("version-probe.pid");
+        let started = std::time::Instant::now();
+        let pid: libc::pid_t = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|t| t.trim().parse().ok()) {
+                break pid;
+            }
+            assert!(started.elapsed() < DEADLINE, "the hanging fixture never started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let outcome = tokio::time::timeout(DEADLINE, probe).await.expect("the probe returns within its bound");
+        let err = outcome.unwrap().expect_err("a probe that never answers fails");
+        assert!(err.contains("did not answer") && err.contains("not started"), "{err}");
+        assert!(err.contains("does not fall back"), "{err}");
+
+        // Reaped: a zombie would still answer `kill(pid, 0)`, so ESRCH is the
+        // proof that the process has been collected.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the version probe (pid {pid}) was left running");
     }
 
     #[tokio::test(flavor = "multi_thread")]

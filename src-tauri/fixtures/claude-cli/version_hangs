@@ -1,0 +1,4 @@
+#!/bin/sh
+# Never answers `--version`: records its own pid where the test can find it, then blocks.
+printf '%s\n' "$$" > "$HOME/version-probe.pid"
+exec sleep 300
