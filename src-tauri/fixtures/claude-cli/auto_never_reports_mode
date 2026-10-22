@@ -1,0 +1,4 @@
+#!/bin/sh
+# An Auto run that never reports its mode: a successful result with no init event.
+cat > /dev/null
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'

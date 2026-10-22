@@ -1058,7 +1058,7 @@ mod tests {
             "kept"
         );
         assert!(agent_invoked(&agent).await, "the provider starts once");
-        assert_eq!(agent.invocations().matches("claude").count(), 1);
+        assert_eq!(agent.launches("claude"), 1);
 
         // Repeating the same authorization never starts a second run.
         let again = executor.start_new_attempt(fx.task_id, id).await;
@@ -1140,7 +1140,7 @@ mod tests {
         let second = executor.start_new_attempt(fx.task_id, id).await.unwrap_err();
 
         assert!(second.contains("already has an agent"), "{second}");
-        assert_eq!(agent.invocations().matches("claude").count(), 1);
+        assert_eq!(agent.launches("claude"), 1);
         executor.stop_task(fx.task_id).await.unwrap();
         assert!(!executor.is_task_running(fx.task_id).await);
     }
@@ -1170,7 +1170,7 @@ mod tests {
         );
         assert_eq!(handoff.run, Some(2));
         assert_eq!(
-            agent.invocations().matches("claude").count(),
+            agent.launches("claude"),
             1,
             "the restarted process launches no second Worker"
         );
@@ -1396,7 +1396,7 @@ mod tests {
         assert!(agent_invoked(&agent).await);
         let started = task_in(&state, fx.task_id).await;
         assert_eq!(started.worker_handoff.as_ref().and_then(|h| h.run), Some(3));
-        assert_eq!(agent.invocations().matches("claude").count(), 1, "exactly one new run");
+        assert_eq!(agent.launches("claude"), 1, "exactly one new run");
         executor.stop_task(fx.task_id).await.unwrap();
     }
 

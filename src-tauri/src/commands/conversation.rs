@@ -452,7 +452,7 @@ pub async fn send_project_message(
         prompt, working_dir: working_directory.path.clone(), tools: ToolAccess::ReadOnly, max_turns: Some(4), max_budget_usd: None,
         session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
         system_prompt: Some(COORDINATOR_SYSTEM_PROMPT.into()),
-        append_system_prompt: None, disable_mcp: true, additional_dirs: vec![],
+        append_system_prompt: None, disable_mcp: true, additional_dirs: vec![], isolate_customizations: false,
     }).await?;
     let mut updated = state
         .storage
@@ -893,7 +893,7 @@ async fn continue_from_worker_result(
         prompt, working_dir: working_directory.path.clone(), tools: ToolAccess::ReadOnly, max_turns: Some(4), max_budget_usd: None,
         session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
         system_prompt: Some(FOLLOW_UP_SYSTEM_PROMPT.into()),
-        append_system_prompt: None, disable_mcp: true, additional_dirs: vec![],
+        append_system_prompt: None, disable_mcp: true, additional_dirs: vec![], isolate_customizations: false,
     }).await?;
     match output {
         CoordinatorOutput::Reply { text } => {

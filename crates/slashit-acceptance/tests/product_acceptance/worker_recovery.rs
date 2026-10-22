@@ -128,10 +128,7 @@ async fn committed_handoff_journey(context: &TestContext) -> Result<()> {
     let coding = runs
         .iter()
         .filter(|run| {
-            run.prompt.is_some()
-                && run
-                    .flag("--allowedTools")
-                    .is_some_and(|tools| tools.to_string_lossy().contains("Bash"))
+            run.is_coding_run()
         })
         .count();
     if coding != 1 {
@@ -361,10 +358,7 @@ async fn ambiguous_handoff_journey(context: &TestContext) -> Result<()> {
     let runs = agent_runs(&agent)?
         .iter()
         .filter(|run| {
-            run.prompt.is_some()
-                && run
-                    .flag("--allowedTools")
-                    .is_some_and(|tools| tools.to_string_lossy().contains("Bash"))
+            run.is_coding_run()
         })
         .count();
     if runs != 1 {
@@ -568,10 +562,7 @@ async fn accept_result_journey(context: &TestContext) -> Result<()> {
     let coding = agent_runs(&agent)?
         .iter()
         .filter(|run| {
-            run.prompt.is_some()
-                && run
-                    .flag("--allowedTools")
-                    .is_some_and(|tools| tools.to_string_lossy().contains("Bash"))
+            run.is_coding_run()
         })
         .count();
     if coding != 1 {
@@ -893,10 +884,7 @@ fn coding_runs(agent: &FakeAgent) -> Result<usize> {
     Ok(agent_runs(agent)?
         .iter()
         .filter(|run| {
-            run.prompt.is_some()
-                && run
-                    .flag("--allowedTools")
-                    .is_some_and(|tools| tools.to_string_lossy().contains("Bash"))
+            run.is_coding_run()
         })
         .count())
 }

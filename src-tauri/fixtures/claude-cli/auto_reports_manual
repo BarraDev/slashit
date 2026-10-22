@@ -1,0 +1,6 @@
+#!/bin/sh
+# An Auto run whose init event reports the default mode, so the run is stopped
+# before it can act. The sleep would outlast the test if it were not stopped.
+cat > /dev/null
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-mode","permissionMode":"default"}'
+sleep 60

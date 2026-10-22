@@ -1,0 +1,3 @@
+#!/bin/sh
+# Answers `--version` the way the CLI does.
+printf '2.1.307 (Claude Code)\n'

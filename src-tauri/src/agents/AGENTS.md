@@ -34,6 +34,68 @@ the security boundary of the run:
   (`commands/pr.rs`) and the executor's AI review leg.
 - `ToolAccess::Full` is for agents that edit code: the coding agent, the
   approved PR apply agent and the review-fix agent. They have Bash.
+- `permission_mode: Some("auto")` is the policy for the coding Worker and the
+  review-fix agent. It passes `--permission-mode auto` with no
+  `--allowedTools` list, so the provider's classifier reviews each call. A
+  Claude Code older than `AUTO_MIN_VERSION` is refused before launch
+  (`auto_unsupported_reason`); that check is a precondition only.
+- Auto is proven by the stream's `init` event, not by the launch. When the
+  CLI cannot run Auto (for example `permissions.disableAutoMode`) it starts
+  the session in `default` mode without an error. Its tool calls that need
+  approval are denied, yet the session still ends with `subtype: success`,
+  and the model can retry a denied call many times. The stdout reader
+  (`auto_mode_mismatch`) therefore stops an Auto run whose `init` does not
+  report `"auto"`, or reports no mode, and `wait()` returns that reason.
+- `permission_mode: None` (bypass) remains only for the approved PR apply
+  agent, which still needs review. An Auto run never falls back to it.
+- `isolate_customizations: true` for the coding Worker and the review-fix
+  agent: `--setting-sources project` (the user's settings, hooks, plugins and
+  `env` are not read), `--settings <path>` (every hook is off,
+  `DISABLE_TELEMETRY` is `1`, the `PINNED_ENV` names are pinned to the
+  child's values or empty, and the `HELPER_SETTINGS` commands are pinned to
+  empty), and `--strict-mcp-config`. The file is an owner-only
+  `IsolatedSettingsFile`, deleted when the provider exits; argv is readable by
+  other users. The project's `env` block outranks the environment SlashIt
+  passes, so the pins keep a repository from redirecting the API key, the provider, the shell or child processes; a pin
+  is a string value, because `null` is skipped as invalid and the setting it
+  was meant to disable still runs. The project's `CLAUDE.md` still loads.
+  Claude Code also reads instruction files from every directory above the
+  working directory; a Task Checkout sits under the user's home, so
+  `~/.claude/CLAUDE.md` would load through that walk. `claudeMdExcludes` lists
+  each ancestor's CLAUDE.md and CLAUDE.local.md, plain and dot-claude forms,
+  by absolute path. `autoMemoryEnabled` is `false`. `--setting-sources` and
+  `CLAUDE_CONFIG_DIR` do not stop the walk. `--safe-mode` and an empty
+  `--setting-sources` were rejected because both also drop the project
+  `CLAUDE.md`. Built-in CLI plugins load in
+  every mode.
+
+  Known limits of isolation, to revisit before any Worker runs on an
+  untrusted repository or without a person watching the run:
+  - Isolation does not limit the filesystem. The Worker can read and write
+    anything the user can, outside the Task Checkout.
+  - `PINNED_ENV` covers endpoints, proxies, CA bundles, loaders, `PATH`, all
+    provider selectors and skip switches, and `CLOUD_ML_REGION`. Not pinned:
+    git's inlets, `HOME`, credential names, `PYTHON*`.
+  - The PR apply agent still runs with bypass (`permission_mode: None`).
+  - The Auto classifier verdict and real-CLI cancellation have not been
+    exercised in a live run. Both must be confirmed before unattended use.
+  - Built-in CLI plugins load, and the CLI's own telemetry and network
+    egress are not limited by this module.
+  - Skills: in the tested launch shape, synthetic skills in `HOME`, in
+    `CLAUDE_CONFIG_DIR` and in ancestor directories did not load. Four of
+    thirteen skill names in a real run were not traced to a source, so skill
+    isolation is not verified beyond that test.
+- `disable_mcp: true` on every production run. Personal connectors from the
+  user's Claude configuration are not loaded.
+- The child starts from an empty environment (`env_clear`), then gets only
+  `provider_env`: identity and PATH, locale, temp directories, proxy and CA
+  settings, `ANTHROPIC_*`, and the provider selectors and credentials for
+  Bedrock (including its bearer token, role and web-identity variables),
+  Vertex, Foundry, and `CLAUDE_CODE_OAUTH_TOKEN`, and on Windows the profile
+  and system variables (`USERPROFILE`, `SYSTEMROOT`, and the like). `HOME` is
+  passed through, never replaced. Session identifiers, `CLAUDE_CODE_MESSAGING_*`,
+  and forge tokens are not passed. Add a name to `PROVIDER_ENV_NAMES` only
+  with a reason in the commit that adds it.
 
 `claude_args` builds the argument list; test capability changes there.
 

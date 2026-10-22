@@ -25,6 +25,227 @@ pub const READ_ONLY_DENIED_TOOLS: &[&str] = &[
 /// The oldest Claude Code release that accepts `--restricted`.
 pub const RESTRICTED_MIN_VERSION: &str = "2.1.248";
 
+/// The oldest Claude Code release whose `--permission-mode auto` runs as
+/// requested. An older CLI does not refuse `auto`; it starts the session in
+/// Manual, so SlashIt checks the version before it launches a run.
+pub const AUTO_MIN_VERSION: &str = "2.1.283";
+
+/// Why an Auto run cannot start, given the output of `claude --version`
+/// (for example `2.1.306 (Claude Code)`). `None` means the CLI is new enough.
+pub fn auto_unsupported_reason(version_output: &str) -> Option<String> {
+    let found = version_output
+        .split_whitespace()
+        .find(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or("")
+        .trim_end_matches(|c: char| !c.is_ascii_digit());
+    let parse = |text: &str| -> Option<(u64, u64, u64)> {
+        let mut parts = text.split('.').map(str::parse::<u64>);
+        Some((parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?))
+    };
+    let minimum = parse(AUTO_MIN_VERSION).expect("AUTO_MIN_VERSION is a plain version");
+    match parse(found) {
+        Some(version) if version >= minimum => None,
+        Some(_) => Some(format!(
+            "Auto permission mode needs Claude Code v{AUTO_MIN_VERSION} or newer, but this \
+             install reports v{found}; update Claude Code. SlashIt does not fall back to \
+             bypassing permissions"
+        )),
+        None => Some(format!(
+            "SlashIt could not read the Claude Code version for Auto permission mode \
+             (it reported {version_output:?}); the run was not started and SlashIt does not \
+             fall back to bypassing permissions"
+        )),
+    }
+}
+
+/// Why an Auto run must stop, given its stream-json `init` event, or `None`
+/// when the event reports Auto.
+///
+/// The version gate above is a precondition, not proof. The CLI can still
+/// start a session in another mode (for example when the account, model or a
+/// setting makes Auto unavailable), and it does that without an error. The
+/// `init` event is the only place that reports the mode the session actually
+/// has, and it arrives before the first model request, so this check is what
+/// stops that fallback. A missing field counts as a mismatch: an unreported
+/// mode is not proof of Auto.
+pub fn auto_mode_mismatch(init: &serde_json::Value) -> Option<String> {
+    let reported = init.get("permissionMode").and_then(|mode| mode.as_str());
+    if reported == Some("auto") {
+        return None;
+    }
+    let shown = reported.map_or_else(|| "none".to_string(), |mode| format!("{mode:?}"));
+    Some(format!(
+        "Auto permission mode was not active: Claude Code reported permission mode {shown} \
+         instead of \"auto\", so the run was stopped before any tool could act. SlashIt does \
+         not fall back to bypassing permissions. Auto may be unavailable for this account, \
+         model or setting; check that and run again."
+    ))
+}
+
+/// How long `claude --version` may take before an Auto launch is refused. The
+/// query only prints a version string, so this is a failure bound: a CLI that
+/// has not answered by then is treated as unusable, and the Worker never starts.
+#[cfg(not(test))]
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Refuses an Auto launch when the `claude` on PATH is too old, by reading
+/// `claude --version` with the same environment the run gets.
+///
+/// Compiled out of test binaries: their fake CLIs answer every invocation with
+/// stream-json and do not report a version. The version rule itself is tested
+/// through [`auto_unsupported_reason`], and the probe's bound through
+/// [`read_claude_version`].
+async fn ensure_auto_supported() -> Result<(), String> {
+    #[cfg(test)]
+    {
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        let version = read_claude_version("claude", provider_env(std::env::vars_os()), VERSION_PROBE_TIMEOUT).await?;
+        match auto_unsupported_reason(&version) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Runs `program --version` with exactly `env` and returns what it printed.
+///
+/// The probe waits at most `limit`. A process still running then is killed and
+/// reaped before this returns, so a hung probe cannot outlive the launch that
+/// asked for it. Cancelling the caller drops the child, and `kill_on_drop` ends
+/// it; the runtime then reaps it in the background.
+#[cfg(any(not(test), unix))]
+async fn read_claude_version(
+    program: impl AsRef<std::ffi::OsStr>,
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    limit: std::time::Duration,
+) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut child = Command::new(program)
+        .arg("--version")
+        .env_clear()
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("SlashIt could not run Claude Code to check its version: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "SlashIt could not read the Claude Code version output".to_string())?;
+
+    let answer = tokio::time::timeout(limit, async {
+        let mut out = Vec::new();
+        stdout.read_to_end(&mut out).await?;
+        child.wait().await?;
+        Ok::<Vec<u8>, std::io::Error>(out)
+    })
+    .await;
+
+    match answer {
+        Ok(Ok(out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
+        Ok(Err(e)) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(format!("SlashIt could not read the Claude Code version: {e}"))
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(format!(
+                "Claude Code did not answer `claude --version` within {limit:?}, so the Auto run was \
+                 not started. Check that `claude --version` finishes in a terminal, then run again. \
+                 SlashIt does not fall back to bypassing permissions"
+            ))
+        }
+    }
+}
+
+/// Environment variables a provider child receives. The child starts from an
+/// empty environment and gets only these, so it does not inherit the parent's
+/// Claude session identifiers, messaging tokens, or unrelated credentials.
+///
+/// `HOME` is kept because Claude Code reads its sign-in from `~/.claude`; it
+/// is not replaced. The provider settings are kept so that a Bedrock, Vertex
+/// or Foundry configuration, and a proxy or CA bundle, keep working.
+const PROVIDER_ENV_NAMES: &[&str] = &[
+    "HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TZ",
+    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_VERTEX_AUTH", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH", "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH", "CLOUD_ML_REGION",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
+    "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
+    "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CA_BUNDLE",
+    // Windows has no HOME: the profile is USERPROFILE (or HOMEDRIVE and
+    // HOMEPATH), and Claude Code reads its sign-in from there. The system
+    // variables are needed for any Windows process to start.
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "USERNAME", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
+];
+
+/// Name prefixes kept for the same reasons as [`PROVIDER_ENV_NAMES`]:
+/// `ANTHROPIC_` for the API endpoint and key, `LC_` for the locale.
+const PROVIDER_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "LC_"];
+
+/// The subset of `vars` that a provider child receives. See
+/// [`PROVIDER_ENV_NAMES`]. Names that are not valid UTF-8 are dropped.
+pub fn provider_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    provider_env_with(vars, env_names_ignore_case())
+}
+
+/// [`provider_env`] with the name comparison given explicitly, so both
+/// behaviors can be tested on any platform.
+fn provider_env_with(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    ignore_case: bool,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter()
+        .filter(|(name, _)| {
+            name.to_str().is_some_and(|name| {
+                PROVIDER_ENV_NAMES
+                    .iter()
+                    .any(|wanted| env_name_matches(name, wanted, ignore_case))
+                    || PROVIDER_ENV_PREFIXES.iter().any(|prefix| {
+                        name.get(..prefix.len())
+                            .is_some_and(|head| env_name_matches(head, prefix, ignore_case))
+                    })
+            })
+        })
+        .collect()
+}
+
+/// Whether environment variable names are compared without regard to case.
+/// Windows keeps the casing it was given (`Path`, `SystemRoot`, `ComSpec`) and
+/// matches names case-insensitively, so a case-sensitive comparison would drop
+/// them. Unix names are case-sensitive.
+fn env_names_ignore_case() -> bool {
+    cfg!(windows)
+}
+
+/// Whether the environment variable name `actual` is `wanted`.
+fn env_name_matches(actual: &str, wanted: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        actual.eq_ignore_ascii_case(wanted)
+    } else {
+        actual == wanted
+    }
+}
+
 /// Why a run failed, when `stderr` shows the CLI rejected `--restricted` as
 /// an unknown option: the CLI is older than [`RESTRICTED_MIN_VERSION`].
 /// [`ToolAccess::ReadOnly`] runs need the flag and never fall back to running
@@ -256,6 +477,293 @@ pub struct ClaudeRunConfig {
     /// Used when running from a meta-workspace cwd so the agent can also
     /// read/write a specific project tree.
     pub additional_dirs: Vec<std::path::PathBuf>,
+    /// When true, the run reads only the project's settings and instruction
+    /// files (`--setting-sources project`) and disables every hook
+    /// (`--settings` with `disableAllHooks`). The user's settings are not
+    /// read, so their hooks, plugins and `env` do not reach the run, and MCP
+    /// servers come only from `--mcp-config` (as with `disable_mcp`). The
+    /// project's `CLAUDE.md` still loads. The project's `env` block still
+    /// applies, except for the names the run pins (see [`PINNED_ENV`]): the
+    /// provider endpoint, routing, proxy and CA variables, the shell and
+    /// child-process inlets, and `DISABLE_TELEMETRY`. The project's command
+    /// helpers are pinned to empty (see [`HELPER_SETTINGS`]). The CLI ignores a project's
+    /// `bypassPermissions` default and its allow rules in an untrusted
+    /// workspace. Filesystem access is not confined by this. Used by the
+    /// coding Worker and the review-fix agent.
+    pub isolate_customizations: bool,
+}
+
+/// Environment variables an isolated run pins in `--settings`. The project's
+/// own `env` block outranks the environment SlashIt passes, so without a pin a
+/// repository could send the API key to another endpoint, move the run to
+/// Bedrock, Vertex or Foundry, route its traffic through its own proxy or CA
+/// bundle, put code in front of every child process (`PATH`, `BASH_ENV`,
+/// `ENV`, `LD_PRELOAD`, `NODE_OPTIONS`), or wrap every shell command
+/// (`CLAUDE_CODE_SHELL_PREFIX`), or skip a provider's cloud sign-in
+/// (`CLAUDE_CODE_SKIP_*_AUTH`). Each name is pinned to the value the child
+/// receives, or to empty when the child receives none; `PATH` is always the
+/// value SlashIt chose. The CLI treats a skip switch as on when it is any
+/// non-empty string, so a repository's `"0"` or `"false"` would enable it, and
+/// an empty pin is what switches it off. The routing list covers every provider
+/// in the CLI's own provider table (Claude Code 2.1.308): Bedrock, Vertex,
+/// Foundry, Anthropic AWS, Anthropic Google Cloud and Mantle.
+const PINNED_ENV: &[&str] = &[
+    "PATH",
+    "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_MANTLE",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    "CLOUD_ML_REGION",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "AWS_CA_BUNDLE",
+    "NODE_OPTIONS",
+    "BASH_ENV",
+    "ENV",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "CLAUDE_CODE_SHELL_PREFIX",
+];
+
+/// Settings that name a command the CLI runs. A repository can write them for
+/// a later launch, and the CLI runs some before the permission mode applies,
+/// so an isolated run pins each one to empty. An empty command does not run.
+/// `null` is not a pin: the CLI skips the invalid setting and the command
+/// still runs.
+const HELPER_SETTINGS: &[&str] = &[
+    "apiKeyHelper",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "gcpAuthRefresh",
+    "otelHeadersHelper",
+];
+
+/// The optional provider telemetry an isolated run turns off. The CLI's Auto
+/// availability gate does not depend on it (checked on Claude Code 2.1.306
+/// with a local stub). The real Bash classifier verdict was not checked, so
+/// the first live Auto run must confirm that it still works with telemetry off.
+const ISOLATED_TELEMETRY_ENV: (&str, &str) = ("DISABLE_TELEMETRY", "1");
+
+/// The endpoint the CLI uses when `ANTHROPIC_BASE_URL` is not set.
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+
+/// The `--settings` value of an isolated run, built from `child_env`, the
+/// environment the child receives (see [`provider_env`]).
+///
+/// Every hook is off, including the project's own hooks, which are repository
+/// code. Every [`HELPER_SETTINGS`] command is pinned to empty, because the CLI
+/// runs a project's helper before the permission mode applies, in an untrusted
+/// workspace too. Optional telemetry is off ([`ISOLATED_TELEMETRY_ENV`]).
+///
+/// Auto memory is off, because the CLI would otherwise load the notes it keeps
+/// for a project from the configuration directory. Instruction files in the
+/// directories above the checkout are excluded by path (see
+/// [`ancestor_instruction_excludes`]).
+///
+/// The pinned values can be secrets: a proxy URL can carry credentials, and
+/// `ANTHROPIC_CUSTOM_HEADERS` often carries a token. So this JSON never goes on
+/// the command line. [`IsolatedSettingsFile`] writes it to an owner-only file,
+/// and the run receives only that file's path.
+///
+/// `instruction_env` is the `--add-dir` instruction variable of the run (see
+/// [`additional_dirs_instruction_env`]). It is pinned here too: a project's
+/// `env` block outranks the process environment, so without the pin a
+/// repository could switch off the Task Checkout's own instruction files.
+fn isolated_settings(
+    child_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    working_dir: &std::path::Path,
+    instruction_env: Option<(&str, &str)>,
+) -> String {
+    isolated_settings_with(child_env, working_dir, instruction_env, env_names_ignore_case())
+}
+
+/// [`isolated_settings`] with the name comparison given explicitly, so both
+/// behaviors can be tested on any platform.
+fn isolated_settings_with(
+    child_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    working_dir: &std::path::Path,
+    instruction_env: Option<(&str, &str)>,
+    ignore_case: bool,
+) -> String {
+    let child_value = |name: &str| {
+        child_env
+            .iter()
+            .find(|(key, _)| key.to_str().is_some_and(|key| env_name_matches(key, name, ignore_case)))
+            .and_then(|(_, value)| value.to_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut env = serde_json::Map::new();
+    for name in PINNED_ENV {
+        let mut value = child_value(name);
+        if *name == "ANTHROPIC_BASE_URL" && value.is_empty() {
+            value = DEFAULT_ANTHROPIC_BASE_URL.to_string();
+        }
+        // An empty CLAUDE_CONFIG_DIR would point the CLI at an empty directory,
+        // so an absent one pins to the CLI's default, `~/.claude`.
+        if *name == "CLAUDE_CONFIG_DIR" && value.is_empty() {
+            let home = [child_value("HOME"), child_value("USERPROFILE")]
+                .into_iter()
+                .find(|home| !home.is_empty());
+            if let Some(home) = home {
+                value = std::path::Path::new(&home).join(".claude").to_string_lossy().into_owned();
+            }
+        }
+        env.insert((*name).to_string(), value.into());
+    }
+    env.insert(ISOLATED_TELEMETRY_ENV.0.to_string(), ISOLATED_TELEMETRY_ENV.1.into());
+    if let Some((name, value)) = instruction_env {
+        env.insert(name.to_string(), value.into());
+    }
+    let mut settings = serde_json::Map::new();
+    settings.insert("disableAllHooks".to_string(), true.into());
+    settings.insert("autoMemoryEnabled".to_string(), false.into());
+    settings.insert(
+        "claudeMdExcludes".to_string(),
+        serde_json::Value::Array(ancestor_instruction_excludes(working_dir)),
+    );
+    for name in HELPER_SETTINGS {
+        settings.insert((*name).to_string(), "".into());
+    }
+    settings.insert("env".to_string(), env.into());
+    serde_json::Value::Object(settings).to_string()
+}
+
+/// Prefix of the name of an isolated run's settings file. The rest of the name
+/// is random, so the file cannot be predicted or pre-created.
+const SETTINGS_FILE_PREFIX: &str = "slashit-claude-settings-";
+
+/// Why an isolated run did not start because its settings file could not be
+/// written. It names no path and no content: the content holds pinned
+/// credentials and endpoints.
+const SETTINGS_FILE_FAILURE: &str =
+    "SlashIt could not write the Claude Code settings file securely, so the run was not started.";
+
+/// The `--settings` file of one isolated run.
+///
+/// It is created owner-only: `tempfile` opens it with `create_new` (`O_EXCL`)
+/// under a random name, so an existing file or symlink at that name is never
+/// followed, and the mode is `0600` from the first byte. It is written once,
+/// closed before the CLI reads it, and deleted when this value is dropped. The
+/// runner holds it until the provider has exited, so a normal finish, an error,
+/// a cancellation and a runner dropped mid-run all remove it.
+///
+/// The argument list carries only the path. Any local user can read another
+/// process's argv through `/proc/<pid>/cmdline`, so the settings must not be
+/// there. On Windows the file lives in the user's temporary directory, whose
+/// default access control belongs to that user; no explicit DACL is set.
+struct IsolatedSettingsFile(tempfile::TempPath);
+
+impl IsolatedSettingsFile {
+    /// Writes the settings of an isolated run for `child_env`, `working_dir`
+    /// and `instruction_env` into a new file in the system temporary directory.
+    fn create(
+        child_env: &[(std::ffi::OsString, std::ffi::OsString)],
+        working_dir: &std::path::Path,
+        instruction_env: Option<(&str, &str)>,
+    ) -> Result<Self, String> {
+        Self::create_in(&std::env::temp_dir(), child_env, working_dir, instruction_env)
+    }
+
+    /// [`Self::create`] in `dir`. Fails closed: if the file cannot be created
+    /// or written, nothing is left behind and the caller must not launch.
+    fn create_in(
+        dir: &std::path::Path,
+        child_env: &[(std::ffi::OsString, std::ffi::OsString)],
+        working_dir: &std::path::Path,
+        instruction_env: Option<(&str, &str)>,
+    ) -> Result<Self, String> {
+        use std::io::Write;
+
+        let contents = isolated_settings(child_env, working_dir, instruction_env);
+        let mut file = tempfile::Builder::new()
+            .prefix(SETTINGS_FILE_PREFIX)
+            .suffix(".json")
+            .tempfile_in(dir)
+            .map_err(|_| SETTINGS_FILE_FAILURE.to_string())?;
+        // An error here drops `file`, which deletes it.
+        file.write_all(contents.as_bytes())
+            .map_err(|_| SETTINGS_FILE_FAILURE.to_string())?;
+        Ok(Self(file.into_temp_path()))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// Instruction files that Claude Code reads from each directory above the
+/// working directory, as well as the working directory itself.
+const ANCESTOR_INSTRUCTION_FILES: &[&str] = &[
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    ".claude/CLAUDE.md",
+    ".claude/CLAUDE.local.md",
+];
+
+/// The absolute paths of the instruction files in every directory above
+/// `working_dir`, for `claudeMdExcludes`.
+///
+/// Claude Code loads these from ancestors of the working directory, and the
+/// `--setting-sources` and `CLAUDE_CONFIG_DIR` settings do not stop it. A Task
+/// Checkout sits under the user's home directory, so the user's own
+/// `~/.claude/CLAUDE.md` is one of them. Checked on Claude Code 2.1.307 with a
+/// local stub: the user's file reached the request, and excluding its path
+/// removed it. The checkout's own instruction files are not excluded.
+fn ancestor_instruction_excludes(working_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    working_dir
+        .ancestors()
+        .skip(1)
+        .flat_map(|dir| ANCESTOR_INSTRUCTION_FILES.iter().map(move |name| dir.join(name)))
+        .filter_map(|path| path.to_str().map(|text| text.to_string().into()))
+        .collect()
+}
+
+/// The environment variable that makes Claude Code read `CLAUDE.md` from each
+/// `--add-dir` directory. Without it the CLI loads instruction files only from
+/// the working directory and its ancestors.
+///
+/// A workspace-backed run starts from the Workspace root and exposes the Task
+/// Checkout with `--add-dir`, so without this the checkout's own `CLAUDE.md`
+/// (and the `@AGENTS.md` it imports) never reaches the agent. Checked on
+/// Claude Code 2.1.308 with a local stub: with the variable set, the checkout's
+/// file loads, and its ancestors and sibling directories stay out.
+const ADDITIONAL_DIRS_CLAUDE_MD_ENV: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
+
+/// The environment a run needs for its `--add-dir` directories to contribute
+/// instruction files, or `None` when it has none.
+fn additional_dirs_instruction_env(config: &ClaudeRunConfig) -> Option<(&'static str, &'static str)> {
+    (!config.additional_dirs.is_empty()).then_some((ADDITIONAL_DIRS_CLAUDE_MD_ENV, "1"))
 }
 
 /// The Claude CLI arguments for `config`, in order, without the program.
@@ -268,7 +776,21 @@ pub struct ClaudeRunConfig {
 /// argument is capped at `MAX_ARG_STRLEN` (128 KiB on Linux) and is readable
 /// by any local process through `/proc/<pid>/cmdline`, and a prompt carries
 /// review comments, diffs and task descriptions of any size.
-pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
+///
+/// `settings_file` is the `--settings` file of an isolated run (see
+/// [`IsolatedSettingsFile`]). It must be `Some` when `isolate_customizations`
+/// is set, and the caller keeps the file alive until the run has exited. Only
+/// its path is added to the arguments.
+///
+/// # Panics
+///
+/// If `isolate_customizations` is set and `settings_file` is `None`. Passing no
+/// settings file would start the run without its isolation, so the caller that
+/// builds an isolated run is the one that must supply it.
+pub fn claude_args(
+    config: &ClaudeRunConfig,
+    settings_file: Option<&std::path::Path>,
+) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     let mut push = |a: &str| args.push(a.into());
 
@@ -292,7 +814,11 @@ pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
             true
         }
         ToolAccess::Full { auto_approve, permission_mode } => {
-            if !auto_approve.is_empty() {
+            // Under `auto` the classifier decides each call, so an approval
+            // list would pre-approve tools it should review. Without the list,
+            // a session that silently fell back to Manual denies every call
+            // that needs approval instead of running it.
+            if !auto_approve.is_empty() && permission_mode.as_deref() != Some("auto") {
                 push("--allowedTools");
                 push(&auto_approve.join(","));
             }
@@ -336,8 +862,19 @@ pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
         push(extra);
     }
 
-    if strict_mcp {
-        push("--strict-mcp-config");
+    // From here on the arguments are pushed directly, not through `push`:
+    // the settings path is an `OsStr`, which the closure above does not take.
+    if config.isolate_customizations {
+        let settings = settings_file
+            .expect("an isolated run is launched with its settings file; see `claude_args`");
+        args.push("--setting-sources".into());
+        args.push("project".into());
+        args.push("--settings".into());
+        args.push(settings.as_os_str().to_owned());
+    }
+    // Isolation includes the MCP servers the user's own configuration would add.
+    if strict_mcp || config.isolate_customizations {
+        args.push("--strict-mcp-config".into());
     }
 
     for dir in &config.additional_dirs {
@@ -435,6 +972,25 @@ pub struct ClaudeRunner {
     /// Why the prompt did not reach the child, once [`Self::wait`] has found
     /// out. `None` until then, and after a run that received it.
     prompt_failure: Arc<RwLock<Option<String>>>,
+    /// The group leader's pid, for as long as the leader is unreaped and so
+    /// still names the group this runner spawned. [`Self::wait`] clears it
+    /// before it reaps, and `Drop` clears it. The stdout reader signals the
+    /// group only through this, under the lock, so it never signals a pid that
+    /// has been reaped and may be reissued. See [`Self::stop_for_mode_mismatch`].
+    leader_pid: Arc<std::sync::Mutex<Option<u32>>>,
+    /// Why the run was stopped at its start: the CLI reported a permission
+    /// mode other than the one the run asked for. Set by the stdout reader and
+    /// reported by [`Self::wait`] in place of the exit outcome.
+    mode_mismatch: Arc<RwLock<Option<String>>>,
+    /// Whether this run asked for Auto. See [`auto_mode_mismatch`].
+    expect_auto: bool,
+    /// Set by the stdout reader when the `init` event reports Auto. An Auto
+    /// run that exits cleanly without it has not shown that Auto was active.
+    auto_confirmed: Arc<AtomicBool>,
+    /// The `--settings` file of an isolated run. Held until the provider has
+    /// exited (see [`Self::wait`]), and deleted when this runner is dropped
+    /// whatever happened before that.
+    settings_file: std::sync::Mutex<Option<IsolatedSettingsFile>>,
 }
 
 impl Drop for ClaudeRunner {
@@ -446,6 +1002,10 @@ impl Drop for ClaudeRunner {
     /// so it never sees the prompt cut short by an EOF. `kill_on_drop` would
     /// only signal it after this returns, and only the leader.
     fn drop(&mut self) {
+        // Cleared first, so the reader can no longer signal the group.
+        if let Ok(mut pid) = self.leader_pid.lock() {
+            *pid = None;
+        }
         // Still unreaped while `id()` answers, so the group id is still the
         // one this runner spawned (see `wait`).
         #[cfg(unix)]
@@ -468,6 +1028,9 @@ impl ClaudeRunner {
         config: ClaudeRunConfig,
         lease: Option<ProviderLease>,
     ) -> Result<Self, String> {
+        if matches!(&config.tools, ToolAccess::Full { permission_mode: Some(mode), .. } if mode == "auto") {
+            ensure_auto_supported().await?;
+        }
         Self::start_leased_program("claude", config, lease).await
     }
 
@@ -500,7 +1063,26 @@ impl ClaudeRunner {
     ) -> Result<Self, String> {
         let mut cmd = Command::new(program);
 
-        cmd.args(claude_args(&config));
+        // Start from an empty environment; see `provider_env` for what is kept.
+        let child_env = provider_env(std::env::vars_os());
+        let instruction_env = additional_dirs_instruction_env(&config);
+        // Written before anything else is marked or spawned. If it cannot be
+        // written securely the run does not start, and no file is left behind.
+        let settings_file = if config.isolate_customizations {
+            Some(IsolatedSettingsFile::create(
+                &child_env,
+                std::path::Path::new(&config.working_dir),
+                instruction_env,
+            )?)
+        } else {
+            None
+        };
+        cmd.args(claude_args(&config, settings_file.as_ref().map(IsolatedSettingsFile::path)));
+        cmd.env_clear();
+        cmd.envs(child_env);
+        if let Some((name, value)) = instruction_env {
+            cmd.env(name, value);
+        }
 
         cmd.current_dir(&config.working_dir);
         cmd.stdin(std::process::Stdio::piped());
@@ -594,6 +1176,10 @@ impl ClaudeRunner {
 
         let (event_tx, first_subscriber) = broadcast::channel(512);
         let prompt_written = Arc::new(AtomicBool::new(false));
+        let leader_pid = child.id();
+        // An Auto run is held to the mode it asked for; see `auto_mode_mismatch`.
+        let expect_auto =
+            matches!(&config.tools, ToolAccess::Full { permission_mode: Some(mode), .. } if mode == "auto");
 
         let runner = Self {
             child: Arc::new(Mutex::new(child)),
@@ -611,6 +1197,11 @@ impl ClaudeRunner {
             prompt_writer: Mutex::new(None),
             prompt_written: prompt_written.clone(),
             prompt_failure: Arc::new(RwLock::new(None)),
+            leader_pid: Arc::new(std::sync::Mutex::new(leader_pid)),
+            mode_mismatch: Arc::new(RwLock::new(None)),
+            expect_auto,
+            auto_confirmed: Arc::new(AtomicBool::new(false)),
+            settings_file: std::sync::Mutex::new(settings_file),
         };
 
         let handle = runner.start_reader(stdout);
@@ -787,11 +1378,22 @@ impl ClaudeRunner {
         let killed = {
             let mut child = self.child.lock().await;
 
-            #[cfg(unix)]
+            // Before `child.kill()`, while the pid is still the leader's: the
+            // tree goes first, as on the mode-mismatch path. Windows has no
+            // process group, so `taskkill /T` walks the tree instead.
             if let Some(pid) = child.id() {
+                #[cfg(unix)]
                 Self::kill_process_group(pid);
+                #[cfg(windows)]
+                Self::kill_process_tree(pid);
+                #[cfg(not(any(unix, windows)))]
+                let _ = pid;
             }
 
+            // `child.kill()` reaps, so the pid can be reissued from here on.
+            if let Ok(mut pid) = self.leader_pid.lock() {
+                *pid = None;
+            }
             child.kill().await.map_err(|e| format!("Failed to kill claude: {}", e))
         };
 
@@ -802,6 +1404,45 @@ impl ClaudeRunner {
         }
 
         killed
+    }
+
+    /// Stop a run whose `init` event reported the wrong permission mode.
+    ///
+    /// Called from the stdout reader, which cannot take the child mutex:
+    /// [`Self::wait`] holds it for the whole wait. So this signals the group by
+    /// pid, and only while `leader_pid` still holds it. `wait()` clears that
+    /// under the same lock before it reaps, so the pid is never signalled after
+    /// it may have been reissued. The run then ends, and `wait()` reports
+    /// [`Self::mode_mismatch`]. On Windows the process tree is killed instead,
+    /// because there is no process group to signal.
+    fn stop_for_mode_mismatch(leader_pid: &std::sync::Mutex<Option<u32>>) {
+        if let Ok(pid) = leader_pid.lock() {
+            if let Some(pid) = *pid {
+                #[cfg(unix)]
+                Self::kill_process_group(pid);
+                #[cfg(windows)]
+                Self::kill_process_tree(pid);
+                #[cfg(not(any(unix, windows)))]
+                let _ = pid;
+            }
+        }
+    }
+
+    /// Kill the process `pid` and every descendant it started. `taskkill /T`
+    /// walks the tree, which Windows does not do for a plain kill. Best-effort,
+    /// like [`Self::kill_process_group`]: a tree that has already gone is the
+    /// outcome asked for. The call blocks for the duration of `taskkill`.
+    #[cfg(windows)]
+    fn kill_process_tree(pid: u32) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 
     /// Signal the whole group a spawned agent leads.
@@ -891,6 +1532,11 @@ impl ClaudeRunner {
         // child with a lot to say can still reach the exit waited for above.
         let stderr_handle = self.stderr_handle.lock().await.take();
 
+        // Cleared under the lock the reader signals through, before the reap:
+        // from here the pid can be reissued, so the reader must not signal it.
+        if let Ok(mut pid) = self.leader_pid.lock() {
+            *pid = None;
+        }
         let status = child.wait().await.map_err(|e| format!("Wait failed: {}", e))?;
 
         // Recorded before either of the two `Err` returns below so a caller
@@ -919,10 +1565,23 @@ impl ClaudeRunner {
         // `kill()` is no longer queued behind a caller stuck waiting on output.
         drop(child);
 
+        // The provider has exited, so the isolated run's settings file has no
+        // reader left. Deleting it here, not only when the runner is dropped,
+        // keeps the file's life to the run's own.
+        if let Ok(mut settings) = self.settings_file.lock() {
+            settings.take();
+        }
+
         // Wait for the stdout reader to drain before callers read accumulated_output.
         // Without this, get_output() can race the reader and return partial/empty text.
         if let Some(handle) = self.reader_handle.lock().await.take() {
             let _ = handle.await;
+        }
+
+        // Before the exit status is judged. A run stopped for its mode died
+        // because SlashIt stopped it, and the mode is the reason to report.
+        if let Some(reason) = self.mode_mismatch.read().await.clone() {
+            return Err(reason);
         }
 
         if !status.success() {
@@ -956,6 +1615,14 @@ impl ClaudeRunner {
             return Err(event.as_ref().and_then(result_failure_reason).unwrap_or_else(|| "error".to_string()));
         }
 
+        // A clean exit is not proof of Auto. The mode is confirmed only by an
+        // `init` event that reports it, so one that never came is a failure.
+        if self.expect_auto && !self.auto_confirmed.load(Ordering::SeqCst) {
+            return Err("Auto permission mode was not confirmed: Claude Code finished without reporting \
+                        its permission mode. SlashIt does not fall back to bypassing permissions."
+                .to_string());
+        }
+
         Ok(true)
     }
 
@@ -980,16 +1647,21 @@ impl ClaudeRunner {
     /// to reach through the child mutex to find its own stdout could not run
     /// while `wait()` held that mutex, which is both a deadlock (`wait()` joins
     /// this task) and, for a talkative child, a stalled pipe.
-    fn start_reader(
-        &self,
-        stdout: Option<tokio::process::ChildStdout>,
-    ) -> tauri::async_runtime::JoinHandle<()> {
+    ///
+    /// For an Auto run, the `init` event must report Auto. If it does not, the
+    /// reader records why and stops the run before any tool can act; if it
+    /// does, the reader confirms it. See [`auto_mode_mismatch`].
+    fn start_reader(&self, stdout: Option<tokio::process::ChildStdout>) -> tauri::async_runtime::JoinHandle<()> {
         let event_tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
         let accumulated_output = self.accumulated_output.clone();
         let result_event = self.result_event.clone();
         let result_is_error = self.result_is_error.clone();
         let raw_stdout = self.raw_stdout.clone();
+        let leader_pid = self.leader_pid.clone();
+        let mode_mismatch = self.mode_mismatch.clone();
+        let expect_auto = self.expect_auto;
+        let auto_confirmed = self.auto_confirmed.clone();
 
         tauri::async_runtime::spawn(async move {
             // Read stdout (NDJSON stream)
@@ -1013,6 +1685,18 @@ impl ClaudeRunner {
                     let parsed: Result<serde_json::Value, _> = serde_json::from_str(&line);
                     match parsed {
                         Ok(json) => {
+                            if expect_auto
+                                && json.get("type").and_then(|t| t.as_str()) == Some("system")
+                                && json.get("subtype").and_then(|t| t.as_str()) == Some("init")
+                            {
+                                match auto_mode_mismatch(&json) {
+                                    Some(reason) => {
+                                        *mode_mismatch.write().await = Some(reason);
+                                        Self::stop_for_mode_mismatch(&leader_pid);
+                                    }
+                                    None => auto_confirmed.store(true, Ordering::SeqCst),
+                                }
+                            }
                             if json.get("type").and_then(|t| t.as_str()) == Some("result") {
                                 if json.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
                                     result_is_error.store(true, Ordering::SeqCst);
@@ -1175,6 +1859,7 @@ mod lease_launch_tests {
             append_system_prompt: None,
             disable_mcp: true,
             additional_dirs: Vec::new(),
+            isolate_customizations: false,
         }
     }
 
@@ -1243,19 +1928,38 @@ mod args_tests {
             append_system_prompt: None,
             disable_mcp: false,
             additional_dirs: Vec::new(),
+            isolate_customizations: false,
         }
     }
 
     fn args(config: &ClaudeRunConfig) -> Vec<String> {
-        claude_args(config)
+        claude_args(config, None)
             .into_iter()
             .map(|a| a.into_string().expect("utf-8 arg"))
             .collect()
     }
 
-    fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    pub(super) fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         let at = args.iter().position(|a| a == flag)?;
         args.get(at + 1).map(String::as_str)
+    }
+
+    /// The arguments of an isolated run, and the settings its `--settings` file
+    /// holds, read back the way the CLI will read them. The file is created as
+    /// a run creates it, and is deleted when this returns.
+    pub(super) fn isolated_args_and_settings(config: &ClaudeRunConfig) -> (Vec<String>, serde_json::Value) {
+        let file = IsolatedSettingsFile::create(
+            &provider_env(std::env::vars_os()),
+            std::path::Path::new(&config.working_dir),
+            additional_dirs_instruction_env(config),
+        )
+        .expect("the settings file is written");
+        let args: Vec<String> = claude_args(config, Some(file.path()))
+            .into_iter()
+            .map(|a| a.into_string().expect("utf-8 arg"))
+            .collect();
+        let text = std::fs::read_to_string(file.path()).expect("the settings file is readable");
+        (args, serde_json::from_str(&text).expect("the settings file is JSON"))
     }
 
     #[test]
@@ -1276,6 +1980,85 @@ mod args_tests {
         for tool in ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Agent"] {
             assert!(denied.split(',').any(|d| d == tool), "{tool} should be denied, got {denied}");
         }
+    }
+
+    #[test]
+    fn a_run_with_additional_dirs_asks_the_cli_for_their_instruction_files() {
+        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        cfg.additional_dirs = vec![std::path::PathBuf::from(".")];
+        assert_eq!(
+            additional_dirs_instruction_env(&cfg),
+            Some((ADDITIONAL_DIRS_CLAUDE_MD_ENV, "1")),
+        );
+    }
+
+    #[test]
+    fn a_run_without_additional_dirs_leaves_the_instruction_environment_alone() {
+        let cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        assert_eq!(additional_dirs_instruction_env(&cfg), None);
+    }
+
+    /// The project's `env` block outranks the process environment, so an
+    /// isolated run pins the instruction variable in its settings file. A
+    /// repository cannot switch the checkout's own instructions off by setting
+    /// it to another value.
+    #[test]
+    fn an_isolated_run_with_additional_dirs_pins_their_instruction_variable() {
+        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        cfg.isolate_customizations = true;
+        cfg.additional_dirs = vec![std::path::PathBuf::from(".")];
+        let (_, settings) = isolated_args_and_settings(&cfg);
+        assert_eq!(settings["env"][ADDITIONAL_DIRS_CLAUDE_MD_ENV], "1", "{settings}");
+    }
+
+    #[test]
+    fn an_isolated_run_without_additional_dirs_does_not_pin_the_instruction_variable() {
+        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        cfg.isolate_customizations = true;
+        let (_, settings) = isolated_args_and_settings(&cfg);
+        assert!(settings["env"].get(ADDITIONAL_DIRS_CLAUDE_MD_ENV).is_none(), "{settings}");
+    }
+
+    /// Windows keeps the casing it was given (`Path`, `SystemRoot`, `ComSpec`),
+    /// and matches names without regard to case. Unix does not, so the same
+    /// names are not the provider's there. Both behaviors are tested on every
+    /// platform through the explicit flag.
+    #[test]
+    fn provider_env_matches_names_without_case_only_where_names_ignore_case() {
+        let vars = || {
+            [("Path", "C:\\bin"), ("SystemRoot", "C:\\Windows"), ("ComSpec", "cmd.exe"), ("anthropic_base_url", "https://gateway.test")]
+                .map(|(name, value)| (std::ffi::OsString::from(name), std::ffi::OsString::from(value)))
+        };
+        let kept: Vec<String> = provider_env_with(vars(), true)
+            .into_iter()
+            .map(|(name, _)| name.into_string().unwrap())
+            .collect();
+        assert_eq!(kept, ["Path", "SystemRoot", "ComSpec", "anthropic_base_url"]);
+        assert!(provider_env_with(vars(), false).is_empty());
+    }
+
+    #[test]
+    fn isolated_settings_pin_a_windows_path_under_its_stored_name() {
+        let child = provider_env_with(vec![(std::ffi::OsString::from("Path"), std::ffi::OsString::from("/usr/bin:/bin"))], true);
+        let folded: serde_json::Value = serde_json::from_str(&isolated_settings_with(
+            &child,
+            std::path::Path::new("/srv/checkout"),
+            None,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(folded["env"]["PATH"], "/usr/bin:/bin");
+
+        // Compared case-sensitively, `Path` is not `PATH`, so the pin is empty
+        // and the run would have no search path.
+        let exact: serde_json::Value = serde_json::from_str(&isolated_settings_with(
+            &child,
+            std::path::Path::new("/srv/checkout"),
+            None,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(exact["env"]["PATH"], "");
     }
 
     #[test]
@@ -1342,6 +2125,473 @@ mod args_tests {
                 "the prompt leaked into argv: {args:?}"
             );
             assert_ne!(value_of(&args, "--tools"), Some("Bash"), "{args:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod launch_policy_tests {
+    use super::args_tests::{isolated_args_and_settings, value_of};
+    use super::*;
+    use std::ffi::OsString;
+
+    fn auto_config(auto_approve: Vec<String>) -> ClaudeRunConfig {
+        ClaudeRunConfig {
+            prompt: String::new(),
+            working_dir: ".".into(),
+            tools: ToolAccess::Full { auto_approve, permission_mode: Some("auto".into()) },
+            max_turns: None,
+            max_budget_usd: None,
+            session_id: None,
+            resume_session: None,
+            model: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            disable_mcp: true,
+            additional_dirs: vec![],
+            isolate_customizations: false,
+        }
+    }
+
+    fn var(name: &str) -> (OsString, OsString) {
+        (name.into(), format!("value-of-{name}").into())
+    }
+
+    fn kept(vars: Vec<(OsString, OsString)>) -> Vec<String> {
+        provider_env(vars).into_iter().map(|(name, _)| name.into_string().unwrap()).collect()
+    }
+
+    #[test]
+    fn auto_passes_auto_and_never_bypass_or_an_approval_list() {
+        let args: Vec<String> = claude_args(&auto_config(vec!["Bash".into(), "Edit".into()]), None)
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert_eq!(args.iter().position(|a| a == "--permission-mode").map(|i| args[i + 1].as_str()), Some("auto"));
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--allowedTools"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--tools" || a == "--restricted"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+    }
+
+    #[test]
+    fn isolated_runs_read_only_the_project_and_disable_every_hook() {
+        let mut config = auto_config(vec![]);
+        config.isolate_customizations = true;
+        let (args, settings) = isolated_args_and_settings(&config);
+        assert_eq!(value_of(&args, "--setting-sources"), Some("project"), "{args:?}");
+        assert_eq!(settings["disableAllHooks"], true, "{args:?}");
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+    }
+
+    #[test]
+    fn isolated_runs_exclude_instruction_files_above_the_checkout() {
+        let mut config = auto_config(vec![]);
+        config.isolate_customizations = true;
+        config.working_dir = "/home/owner/.local/share/slashit/worktrees/p/t".into();
+        let (args, settings) = isolated_args_and_settings(&config);
+        assert_eq!(settings["autoMemoryEnabled"], false, "{args:?}");
+        let excludes: Vec<&str> = settings["claudeMdExcludes"]
+            .as_array()
+            .expect("claudeMdExcludes")
+            .iter()
+            .map(|v| v.as_str().expect("path"))
+            .collect();
+        assert!(excludes.contains(&"/home/owner/.claude/CLAUDE.md"), "{excludes:?}");
+        assert!(excludes.contains(&"/home/owner/CLAUDE.md"), "{excludes:?}");
+        assert!(
+            excludes.contains(&"/home/owner/.local/share/slashit/worktrees/p/.claude/CLAUDE.local.md"),
+            "{excludes:?}"
+        );
+        let checkout = "/home/owner/.local/share/slashit/worktrees/p/t";
+        assert!(!excludes.iter().any(|p| p.starts_with(checkout)), "{excludes:?}");
+    }
+
+    #[test]
+    fn ancestor_instruction_excludes_list_every_directory_above_the_working_directory() {
+        let excludes = ancestor_instruction_excludes(std::path::Path::new("/a/b/c"));
+        let paths: Vec<&str> = excludes.iter().map(|v| v.as_str().unwrap()).collect();
+        // `/a/b`, `/a` and the root: every directory above `/a/b/c`. Compared as
+        // `Path`s with `join`, so the expected separator is the platform's.
+        assert_eq!(paths.len(), 3 * ANCESTOR_INSTRUCTION_FILES.len(), "{paths:?}");
+        for dir in ["/a/b", "/a", "/"] {
+            for name in ANCESTOR_INSTRUCTION_FILES {
+                let expected = std::path::Path::new(dir).join(name);
+                assert!(
+                    paths.iter().any(|p| std::path::Path::new(p) == expected),
+                    "{} missing from {paths:?}",
+                    expected.display()
+                );
+            }
+        }
+        assert!(!paths.iter().any(|p| std::path::Path::new(p).starts_with("/a/b/c")), "{paths:?}");
+    }
+
+    /// Creates the `--settings` file of an isolated run exactly as a run does,
+    /// keeps it, and writes its path to the file named by
+    /// `SLASHIT_ISOLATED_SETTINGS_OUT`, for a probe that runs the real CLI on it.
+    /// Ignored by default, and a no-op unless the variable is set. The probe
+    /// deletes the kept file itself.
+    #[test]
+    #[ignore]
+    fn write_isolated_settings_for_a_real_cli_probe() {
+        let Ok(out) = std::env::var("SLASHIT_ISOLATED_SETTINGS_OUT") else {
+            return;
+        };
+        let working_dir = std::env::var("SLASHIT_ISOLATED_WORKING_DIR").expect("SLASHIT_ISOLATED_WORKING_DIR");
+        let file = IsolatedSettingsFile::create(
+            &provider_env(std::env::vars_os()),
+            std::path::Path::new(&working_dir),
+            None,
+        )
+        .expect("the settings file is written");
+        let kept = file.0.keep().expect("the settings file is kept for the probe");
+        std::fs::write(out, kept.to_string_lossy().as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn isolated_settings_pin_the_provider_the_child_receives() {
+        let child = provider_env(vec![
+            (
+                OsString::from("ANTHROPIC_BASE_URL"),
+                OsString::from("https://gateway.test"),
+            ),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://proxy.test:3128"),
+            ),
+            (
+                OsString::from("NODE_OPTIONS"),
+                OsString::from("--require /tmp/x.js"),
+            ),
+        ]);
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
+        assert_eq!(settings["disableAllHooks"], true);
+        assert_eq!(settings["apiKeyHelper"], "");
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://gateway.test"
+        );
+        assert_eq!(settings["env"]["HTTPS_PROXY"], "http://proxy.test:3128");
+        assert_eq!(settings["env"]["CLAUDE_CODE_USE_BEDROCK"], "");
+        // NODE_OPTIONS is not in the child's environment, so it is pinned empty.
+        assert_eq!(settings["env"]["NODE_OPTIONS"], "");
+    }
+
+    /// A repository's own `env` block outranks the environment SlashIt passes,
+    /// so every endpoint, CA and loader name must be pinned even when the child
+    /// does not receive it. An unpinned name would let the project set it.
+    #[test]
+    fn isolated_settings_pin_endpoint_ca_and_loader_names_when_absent() {
+        let settings: serde_json::Value =
+            serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
+        for name in [
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "ANTHROPIC_VERTEX_BASE_URL",
+            "ANTHROPIC_FOUNDRY_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "NO_PROXY",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "AWS_CA_BUNDLE",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+        ] {
+            assert_eq!(settings["env"][name], "", "{name} must be pinned empty");
+        }
+    }
+
+    /// Every provider selector, endpoint and skip switch in the CLI's provider
+    /// table is pinned, so a repository cannot switch the provider, redirect
+    /// its endpoint, or enable a skip switch when the child does not have one.
+    #[test]
+    fn isolated_settings_pin_every_provider_selector_and_skip_switch_when_absent() {
+        let settings: serde_json::Value =
+            serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
+        for name in [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+            "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+            "CLAUDE_CODE_USE_MANTLE",
+            "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+            "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+            "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+            "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+            "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+            "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "ANTHROPIC_VERTEX_BASE_URL",
+            "ANTHROPIC_FOUNDRY_BASE_URL",
+            "ANTHROPIC_AWS_BASE_URL",
+            "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+            "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+            "CLOUD_ML_REGION",
+        ] {
+            assert_eq!(settings["env"][name], "", "{name} must be pinned empty");
+        }
+    }
+
+    /// A skip switch or region the user configured reaches the child, and the
+    /// pin carries that exact value, so a supported gateway setup keeps working.
+    /// A name the user did not configure is pinned empty, which is off.
+    #[test]
+    fn isolated_settings_keep_the_user_configured_skip_switch_and_region() {
+        let child = provider_env(vec![
+            (OsString::from("CLAUDE_CODE_SKIP_VERTEX_AUTH"), OsString::from("1")),
+            (OsString::from("CLOUD_ML_REGION"), OsString::from("europe-west1")),
+            (OsString::from("CLAUDE_CODE_USE_ANTHROPIC_AWS"), OsString::from("1")),
+        ]);
+        let settings: serde_json::Value =
+            serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
+        assert_eq!(settings["env"]["CLAUDE_CODE_SKIP_VERTEX_AUTH"], "1");
+        assert_eq!(settings["env"]["CLOUD_ML_REGION"], "europe-west1");
+        assert_eq!(settings["env"]["CLAUDE_CODE_USE_ANTHROPIC_AWS"], "1");
+        assert_eq!(settings["env"]["CLAUDE_CODE_SKIP_BEDROCK_AUTH"], "");
+    }
+
+    /// The skip switches, the region and the selectors of the other providers
+    /// reach the child from the user's environment; an unrelated name does not.
+    #[test]
+    fn provider_env_keeps_the_skip_switches_region_and_selectors() {
+        let names = [
+            "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+            "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+            "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+            "CLOUD_ML_REGION",
+            "CLAUDE_CODE_USE_MANTLE",
+            "CLAUDE_CODE_SKIP_UNRELATED_AUTH",
+        ];
+        let kept = provider_env(names.map(|n| (OsString::from(n), OsString::from("1"))));
+        let kept: std::collections::BTreeSet<String> =
+            kept.into_iter().map(|(n, _)| n.into_string().unwrap()).collect();
+        for name in &names[..5] {
+            assert!(kept.contains(*name), "{name} must reach the provider child");
+        }
+        assert!(!kept.contains("CLAUDE_CODE_SKIP_UNRELATED_AUTH"));
+    }
+
+    /// An absent `CLAUDE_CONFIG_DIR` pins to the CLI's default, not to an empty
+    /// directory. A set one pins to its own value.
+    #[test]
+    fn isolated_settings_pin_the_config_dir_to_its_default_or_its_value() {
+        let at = |vars: Vec<(&str, &str)>| {
+            let child = provider_env(vars.into_iter().map(|(n, v)| (OsString::from(n), OsString::from(v))));
+            let settings: serde_json::Value =
+                serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
+            settings["env"]["CLAUDE_CONFIG_DIR"].as_str().unwrap().to_string()
+        };
+        assert_eq!(at(vec![("HOME", "/home/u")]), "/home/u/.claude");
+        assert_eq!(at(vec![("HOME", "/home/u"), ("CLAUDE_CONFIG_DIR", "/cfg")]), "/cfg");
+        assert_eq!(at(vec![]), "");
+    }
+
+    /// The Windows profile and system variables, and the Bedrock credential and
+    /// CA variables, must reach the child. Without them a Windows run cannot find
+    /// its sign-in, and a Bedrock run cannot authenticate.
+    #[test]
+    fn provider_env_keeps_the_windows_profile_and_bedrock_credentials() {
+        let names = [
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "SYSTEMROOT",
+            "PATHEXT",
+            "COMSPEC",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_ROLE_ARN",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CA_BUNDLE",
+        ];
+        let kept = provider_env(names.map(|n| (OsString::from(n), OsString::from("v"))));
+        let kept: std::collections::BTreeSet<String> =
+            kept.into_iter().map(|(n, _)| n.into_string().unwrap()).collect();
+        for name in names {
+            assert!(kept.contains(name), "{name} must reach the provider child");
+        }
+    }
+
+    #[test]
+    fn isolated_settings_pin_the_shell_and_child_process_inlets() {
+        let child = provider_env(vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]);
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
+        // The project cannot prepend its own directory to the child's PATH.
+        assert_eq!(settings["env"]["PATH"], "/usr/bin:/bin");
+        for name in ["BASH_ENV", "ENV", "LD_PRELOAD", "CLAUDE_CODE_SHELL_PREFIX"] {
+            assert_eq!(settings["env"][name], "", "{name} must be pinned empty");
+        }
+    }
+
+    #[test]
+    fn isolated_settings_disable_helpers_and_optional_telemetry() {
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
+        for name in HELPER_SETTINGS {
+            assert_eq!(settings[*name], "", "{name} must be pinned empty");
+        }
+        assert_eq!(settings["env"]["DISABLE_TELEMETRY"], "1");
+        assert_eq!(settings["disableAllHooks"], true);
+    }
+
+    #[test]
+    fn isolated_settings_name_the_default_endpoint_when_the_child_has_none() {
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            DEFAULT_ANTHROPIC_BASE_URL
+        );
+    }
+
+    #[test]
+    fn runs_that_are_not_isolated_keep_the_settings_their_user_configured() {
+        let args: Vec<String> =
+            claude_args(&auto_config(vec![]), None).into_iter().map(|a| a.into_string().unwrap()).collect();
+        assert!(!args.iter().any(|a| a == "--setting-sources" || a == "--settings"), "{args:?}");
+    }
+
+    /// The settings file is created owner-only, so no other local user can read
+    /// it at any point, and it holds exactly the settings the run pins.
+    #[cfg(unix)]
+    #[test]
+    fn isolated_settings_file_is_owner_only_from_its_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &[], std::path::Path::new("/srv/checkout"), None).unwrap();
+        let mode = std::fs::metadata(file.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let name = file.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(SETTINGS_FILE_PREFIX) && name.ends_with(".json"), "{name}");
+    }
+
+    #[test]
+    fn isolated_settings_file_holds_exactly_the_settings_the_run_pins() {
+        let child = provider_env(vec![(OsString::from("ANTHROPIC_BASE_URL"), OsString::from("https://gateway.test"))]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &child, std::path::Path::new("/srv/checkout"), None).unwrap();
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(text, isolated_settings(&child, std::path::Path::new("/srv/checkout"), None));
+    }
+
+    /// Deleting the file is what ends the credentials' life on disk, so it must
+    /// happen as soon as the value holding it is dropped.
+    #[test]
+    fn isolated_settings_file_is_deleted_when_it_is_dropped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &[], std::path::Path::new("/srv/checkout"), None).unwrap();
+        let path = file.path().to_path_buf();
+        assert!(path.is_file());
+        drop(file);
+        assert!(!path.exists(), "{path:?} outlived its run");
+    }
+
+    /// A settings file that cannot be written stops the run. The error names
+    /// neither the path nor the content, because the content holds credentials.
+    #[test]
+    fn a_settings_file_that_cannot_be_written_fails_closed_without_its_content() {
+        let secret = "SECRET-HEADER-9c1e";
+        let child = provider_env(vec![(OsString::from("ANTHROPIC_CUSTOM_HEADERS"), OsString::from(secret))]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("no-such-directory");
+        let err = IsolatedSettingsFile::create_in(&missing, &child, std::path::Path::new("/srv/checkout"), None)
+            .err()
+            .expect("a file in a missing directory cannot be created");
+        assert_eq!(err, SETTINGS_FILE_FAILURE);
+        assert!(!err.contains(secret) && !err.contains("no-such-directory"), "{err}");
+    }
+
+    /// The settings do carry the pinned secrets, so the file is where they
+    /// belong. The argument list must carry neither them nor the settings' keys.
+    #[test]
+    fn settings_secrets_never_reach_the_argument_list() {
+        let secret = "SECRET-HEADER-7f3a";
+        let child = provider_env(vec![
+            (
+                OsString::from("ANTHROPIC_CUSTOM_HEADERS"),
+                OsString::from(format!("Authorization: Bearer {secret}")),
+            ),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from(format!("http://user:{secret}@proxy.test:3128")),
+            ),
+        ]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = IsolatedSettingsFile::create_in(dir.path(), &child, std::path::Path::new("/srv/checkout"), None).unwrap();
+        assert!(std::fs::read_to_string(file.path()).unwrap().contains(secret));
+
+        let mut config = auto_config(vec![]);
+        config.isolate_customizations = true;
+        let args: Vec<String> = claude_args(&config, Some(file.path()))
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert!(!args.iter().any(|a| a.contains(secret) || a.contains("disableAllHooks")), "{args:?}");
+        assert_eq!(value_of(&args, "--settings"), file.path().to_str(), "{args:?}");
+    }
+
+    #[test]
+    fn an_init_event_must_report_auto_and_a_missing_mode_is_not_proof() {
+        let auto = serde_json::json!({"type": "system", "subtype": "init", "permissionMode": "auto"});
+        assert_eq!(auto_mode_mismatch(&auto), None);
+
+        let manual = serde_json::json!({"type": "system", "subtype": "init", "permissionMode": "default"});
+        let reason = auto_mode_mismatch(&manual).expect("a Manual session is a mismatch");
+        assert!(reason.contains("\"default\""), "{reason}");
+        assert!(reason.contains("does not fall back to bypassing permissions"), "{reason}");
+
+        let unreported = serde_json::json!({"type": "system", "subtype": "init"});
+        let reason = auto_mode_mismatch(&unreported).expect("an unreported mode is not proof of Auto");
+        assert!(reason.contains("reported permission mode none"), "{reason}");
+    }
+
+    #[test]
+    fn auto_refuses_old_or_unreadable_cli_versions_without_bypass() {
+        assert_eq!(auto_unsupported_reason("2.1.306 (Claude Code)\n"), None);
+        assert_eq!(auto_unsupported_reason("2.1.283"), None);
+        let old = auto_unsupported_reason("2.1.282 (Claude Code)").expect("too old");
+        assert!(old.contains(AUTO_MIN_VERSION) && old.contains("v2.1.282"), "{old}");
+        assert!(old.contains("does not fall back"), "{old}");
+        assert!(auto_unsupported_reason("").is_some());
+        assert!(auto_unsupported_reason("command not understood").is_some());
+    }
+
+    #[test]
+    fn provider_env_drops_session_metadata_and_unrelated_credentials() {
+        let vars = [
+            "HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "HTTPS_PROXY", "SSL_CERT_FILE",
+            "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_PID", "GH_TOKEN", "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "GIT_EDITOR", "DISPLAY",
+        ]
+        .map(var)
+        .to_vec();
+        let kept = kept(vars);
+        for name in ["HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "HTTPS_PROXY", "SSL_CERT_FILE",
+            "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK"]
+        {
+            assert!(kept.iter().any(|k| k == name), "{name} must be kept: {kept:?}");
+        }
+        for name in ["CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_PID", "GH_TOKEN", "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "GIT_EDITOR", "DISPLAY"]
+        {
+            assert!(!kept.iter().any(|k| k == name), "{name} must be dropped: {kept:?}");
+        }
+    }
+
+    #[test]
+    fn provider_env_keeps_values_unchanged_and_drops_non_utf8_names() {
+        let kept = provider_env([(OsString::from("HOME"), OsString::from("/home/u"))]);
+        assert_eq!(kept, vec![(OsString::from("HOME"), OsString::from("/home/u"))]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = OsString::from_vec(b"HOME\xff".to_vec());
+            assert!(provider_env([(bad, OsString::from("x"))]).is_empty());
         }
     }
 }
@@ -1549,6 +2799,7 @@ mod tests {
                 append_system_prompt: None,
                 disable_mcp: false,
                 additional_dirs: Vec::new(),
+                isolate_customizations: false,
             }
         }
 
@@ -2305,7 +3556,7 @@ mod tests {
             let fixture = Fixture::new(STDIN_ECHO);
             let prompt = "PROMPT-MARKER: review this change\n--tools Bash\n";
             let config = fixture.config_with_prompt(prompt, tools);
-            let expected_argv: Vec<Vec<u8>> = claude_args(&config)
+            let expected_argv: Vec<Vec<u8>> = claude_args(&config, None)
                 .into_iter()
                 .map(|a| a.into_encoded_bytes())
                 .collect();
@@ -2322,6 +3573,110 @@ mod tests {
             assert_eq!(fixture.recorded_prompt(), prompt.as_bytes(), "{label}");
             assert_eq!(runner.get_output().await, prompt.len().to_string(), "{label}");
         }
+    }
+
+    /// The settings path an isolated run was given, from its recorded argv.
+    fn settings_path_in(argv: &[Vec<u8>]) -> std::path::PathBuf {
+        let at = argv.iter().position(|a| a == b"--settings").expect("--settings is passed");
+        let path = String::from_utf8(argv[at + 1].clone()).expect("the path is text");
+        std::path::PathBuf::from(path)
+    }
+
+    /// An isolated run is given its settings by path only. The file is still
+    /// there while the provider is running, and it is gone once the run is over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_isolated_run_is_given_its_settings_by_path_and_the_file_is_deleted_after_it() {
+        let fixture = Fixture::new(STDIN_ECHO);
+        let mut config = fixture.config();
+        config.isolate_customizations = true;
+        let runner = fixture.start_with(config).await;
+        assert_eq!(bounded("isolated", &runner).await, Ok(true));
+
+        let argv = fixture.recorded_argv();
+        assert_eq!(value_of_bytes(&argv, b"--setting-sources"), Some(&b"project"[..]), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a.windows(b"disableAllHooks".len()).any(|w| w == b"disableAllHooks")),
+            "the settings JSON reached argv"
+        );
+        let path = settings_path_in(&argv);
+        assert!(path.file_name().unwrap().to_string_lossy().starts_with(SETTINGS_FILE_PREFIX), "{path:?}");
+        assert!(!path.exists(), "{path:?} outlived its run");
+    }
+
+    /// A runner dropped before its run ends still removes the settings file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runner_dropped_before_its_run_ends_deletes_the_settings_file() {
+        let fixture = Fixture::new(STDIN_ECHO);
+        let mut config = fixture.config();
+        config.isolate_customizations = true;
+        let runner = fixture.start_with(config).await;
+
+        let argv_file = fixture.dir.path().join("argv");
+        let started = std::time::Instant::now();
+        let argv = loop {
+            if let Ok(raw) = std::fs::read(&argv_file) {
+                if raw.ends_with(&[0]) && raw.windows(b"--settings".len()).any(|w| w == b"--settings") {
+                    break fixture.recorded_argv();
+                }
+            }
+            assert!(started.elapsed() < DEADLINE, "the fixture never recorded its argv");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let path = settings_path_in(&argv);
+        drop(runner);
+        assert!(!path.exists(), "{path:?} outlived its runner");
+    }
+
+    fn value_of_bytes<'a>(argv: &'a [Vec<u8>], flag: &[u8]) -> Option<&'a [u8]> {
+        let at = argv.iter().position(|a| a == flag)?;
+        argv.get(at + 1).map(Vec::as_slice)
+    }
+
+    /// The version probe reads what the CLI prints.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_version_probe_reads_what_the_cli_prints() {
+        let fixture = Fixture::new("version_ok");
+        let version = read_claude_version(&fixture.program, Vec::new(), DEADLINE).await.unwrap();
+        assert_eq!(version, "2.1.307 (Claude Code)\n");
+        assert_eq!(auto_unsupported_reason(&version), None);
+    }
+
+    /// A CLI that never answers `--version` is stopped and reaped within the
+    /// bound, and the error says what to do. The fixture records its pid first,
+    /// so the test can check that the process is gone once the probe returns.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_version_probe_that_never_answers_is_stopped_and_reaped() {
+        let fixture = Fixture::new("version_hangs");
+        let env = vec![
+            (std::ffi::OsString::from("HOME"), fixture.dir.path().as_os_str().to_owned()),
+            (std::ffi::OsString::from("PATH"), std::env::var_os("PATH").unwrap_or_default()),
+        ];
+        let limit = Duration::from_millis(500);
+        let program = fixture.program.clone();
+        let probe = tokio::spawn(async move { read_claude_version(program, env, limit).await });
+
+        // The fixture writes its pid before it blocks; wait for that first, so
+        // the probe is known to have a live child when its bound expires.
+        let pid_file = fixture.dir.path().join("version-probe.pid");
+        let started = std::time::Instant::now();
+        let pid: libc::pid_t = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|t| t.trim().parse().ok()) {
+                break pid;
+            }
+            assert!(started.elapsed() < DEADLINE, "the hanging fixture never started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let outcome = tokio::time::timeout(DEADLINE, probe).await.expect("the probe returns within its bound");
+        let err = outcome.unwrap().expect_err("a probe that never answers fails");
+        assert!(err.contains("did not answer") && err.contains("not started"), "{err}");
+        assert!(err.contains("does not fall back"), "{err}");
+
+        // Reaped: a zombie would still answer `kill(pid, 0)`, so ESRCH is the
+        // proof that the process has been collected.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the version probe (pid {pid}) was left running");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2503,6 +3858,7 @@ mod tests {
                 append_system_prompt: None,
                 disable_mcp: true,
                 additional_dirs: Vec::new(),
+                isolate_customizations: false,
             };
             let runner = ClaudeRunner::start_leased(config, None).await.expect("claude should start");
             let result = tokio::time::timeout(Duration::from_secs(120), runner.wait())
@@ -2511,6 +3867,158 @@ mod tests {
             assert_eq!(result, Ok(true), "{label}: {}", runner.get_output().await);
             assert_eq!(runner.prompt_failure().await, None, "{label}");
             assert!(runner.get_output().await.contains("PONG"), "{label}: {}", runner.get_output().await);
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod mode_mismatch_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    /// A checked-in stand-in CLI. The scripts are not written by the test
+    /// because a script written and run at once can fail with `ETXTBSY`: a
+    /// concurrent fork in this test binary can hold the write descriptor until
+    /// its `exec`. See `Fixture::new` for the same rule.
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/claude-cli").join(name)
+    }
+
+    fn auto_config(dir: &TempDir) -> ClaudeRunConfig {
+        ClaudeRunConfig {
+            prompt: "hello".to_string(),
+            working_dir: dir.path().to_string_lossy().into_owned(),
+            tools: ToolAccess::Full { auto_approve: Vec::new(), permission_mode: Some("auto".into()) },
+            max_turns: None,
+            max_budget_usd: None,
+            session_id: None,
+            resume_session: None,
+            model: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            disable_mcp: true,
+            additional_dirs: Vec::new(),
+            isolate_customizations: true,
+        }
+    }
+
+    /// A run that reports Manual where Auto was asked for is stopped at once.
+    /// The stand-in sleeps for a minute and would otherwise run that long.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auto_run_that_reports_manual_is_stopped_before_it_can_act() {
+        let dir = TempDir::new().expect("temp dir");
+        let program = fixture("auto_reports_manual");
+        let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())
+            .await
+            .expect("the run should be stopped, not left to finish its sleep");
+        assert!(started.elapsed() < Duration::from_secs(30), "stopped after {:?}", started.elapsed());
+        let reason = result.expect_err("a run that reports Manual must fail");
+        assert!(reason.contains("Auto permission mode was not active"), "{reason}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auto_run_that_reports_auto_is_not_stopped() {
+        let dir = TempDir::new().expect("temp dir");
+        let program = fixture("auto_reports_auto");
+        let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
+
+        let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())
+            .await
+            .expect("an Auto run should finish on its own");
+        assert_eq!(result, Ok(true));
+    }
+
+    /// A clean exit with no `init` event proves nothing about the mode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auto_run_that_never_reports_its_mode_is_not_a_success() {
+        let dir = TempDir::new().expect("temp dir");
+        let program = fixture("auto_never_reports_mode");
+        let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
+
+        let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())
+            .await
+            .expect("the stub exits at once");
+        let reason = result.expect_err("an unconfirmed Auto run must not succeed");
+        assert!(reason.contains("not confirmed"), "{reason}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod child_environment_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use tempfile::TempDir;
+
+    /// Shell-added variables that appear in any `sh` child, whatever the
+    /// environment it was started with.
+    const SHELL_ADDED: &[&str] = &["PWD", "SHLVL", "_", "OLDPWD"];
+
+    /// Starts the `env_echo` fixture through the real spawn path and returns
+    /// the names of the variables it saw, with their values.
+    async fn child_environment() -> Vec<(String, OsString)> {
+        let dir = TempDir::new().expect("temp dir");
+        let program = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/claude-cli/env_echo");
+        let config = ClaudeRunConfig {
+            prompt: "hello".to_string(),
+            working_dir: dir.path().to_string_lossy().into_owned(),
+            tools: ToolAccess::Full { auto_approve: Vec::new(), permission_mode: Some("auto".into()) },
+            max_turns: None,
+            max_budget_usd: None,
+            session_id: None,
+            resume_session: None,
+            model: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            disable_mcp: true,
+            additional_dirs: Vec::new(),
+            isolate_customizations: false,
+        };
+        let runner = ClaudeRunner::start_program(&program, config).await.expect("fixture should spawn");
+        assert!(runner.wait().await.is_ok(), "fixture run should succeed");
+        let record = std::fs::read(dir.path().join("env")).expect("fixture records its environment");
+        record
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .filter_map(|entry| {
+                use std::os::unix::ffi::OsStrExt;
+                let text = std::ffi::OsStr::from_bytes(entry);
+                let (name, value) = text.to_str()?.split_once('=')?;
+                Some((name.to_string(), OsString::from(value)))
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_child_receives_only_the_provider_environment() {
+        let parent: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let allowed: BTreeSet<String> = provider_env(parent.clone())
+            .into_iter()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .collect();
+        let child = child_environment().await;
+        let child_names: BTreeSet<String> = child.iter().map(|(name, _)| name.clone()).collect();
+
+        for (name, _) in &parent {
+            let Some(name) = name.to_str() else { continue };
+            if allowed.contains(name) || SHELL_ADDED.contains(&name) {
+                continue;
+            }
+            assert!(!child_names.contains(name), "the provider child inherited {name}");
+        }
+        for name in &child_names {
+            assert!(
+                allowed.contains(name) || SHELL_ADDED.contains(&name.as_str()),
+                "the provider child has an unexpected variable {name}"
+            );
+        }
+        if let Some((_, home)) = parent.iter().find(|(name, _)| name == "HOME") {
+            let (_, child_home) = child.iter().find(|(name, _)| name == "HOME").expect("HOME is kept");
+            assert_eq!(child_home, home, "HOME is passed through, not replaced");
         }
     }
 }

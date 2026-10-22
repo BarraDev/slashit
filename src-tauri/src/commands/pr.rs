@@ -3161,6 +3161,7 @@ fn pr_helper_run_config(
         append_system_prompt: Some(PR_HELPER_SYSTEM_RULES.to_string()),
         disable_mcp: true,
         additional_dirs: Vec::new(),
+        isolate_customizations: false,
     }
 }
 
@@ -6827,7 +6828,7 @@ mod tests {
         assert_eq!(config.tools, ToolAccess::ReadOnly);
         assert_eq!(config.append_system_prompt.as_deref(), Some(PR_HELPER_SYSTEM_RULES));
 
-        let args: Vec<String> = claude_args(&config)
+        let args: Vec<String> = claude_args(&config, None)
             .into_iter()
             .map(|a| a.into_string().unwrap())
             .collect();

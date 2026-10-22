@@ -27,11 +27,15 @@ done
 # The session id is echoed back, so the caller can tie this run to the one it
 # asked for rather than to any run at all. The prompt flag is noted in the same
 # pass: it is what separates an agent run from `--version`, which a real CLI
-# also answers without doing any work. The allowed tools are what tell the
-# coding agent (the only role given Bash) from the review and fix agents.
+# also answers without doing any work. The allowed tools, where a run has an
+# approval list, tell the coding agent (the only role given Bash) from the
+# review and fix agents; a run under Auto has no list, so its prompt decides.
 session=""
 take_next=""
 take_tools=""
+take_mode=""
+mode=""
+has_tools=""
 is_run=""
 is_coding=""
 for arg in "$@"; do
@@ -40,7 +44,13 @@ for arg in "$@"; do
         take_next=""
         continue
     fi
+    if [ -n "$take_mode" ]; then
+        mode="$arg"
+        take_mode=""
+        continue
+    fi
     if [ -n "$take_tools" ]; then
+        has_tools="yes"
         case "$arg" in
             *Bash*) is_coding="yes" ;;
         esac
@@ -50,19 +60,10 @@ for arg in "$@"; do
     case "$arg" in
         --session-id) take_next="yes" ;;
         --allowedTools) take_tools="yes" ;;
+        --permission-mode) take_mode="yes" ;;
         -p) is_run="yes" ;;
     esac
 done
-
-# Progress mode, when a journey asked for it: a coding run narrates what it is
-# doing the way Claude Code does without partial messages -- whole `assistant`
-# messages, one holding text and one naming a tool -- so the product's own
-# stream parser and live events are what a journey watches. Only coding runs
-# narrate; the review and fix agents answer exactly as they always did.
-progress=""
-if [ -n "$SLASHIT_FAKE_AGENT_PROGRESS" ] && [ -n "$is_run" ] && [ -n "$is_coding" ]; then
-    progress="yes"
-fi
 
 say() {
     printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"%s"}]}}\n' "$1"
@@ -82,6 +83,26 @@ if [ -n "$is_run" ]; then
     cat > "$prompt_file"
 fi
 
+# A Worker under Auto passes no approval list, so a run without one is the
+# coding Worker, unless its prompt is the review-fix prompt. The fix prompt
+# opens with the review findings; see `build_fix_prompt` in the product.
+if [ -n "$is_run" ] && [ -z "$has_tools" ] && [ "$mode" = "auto" ]; then
+    case "$(head -n 1 "$prompt_file")" in
+        "The following issues were found during code review"*) ;;
+        *) is_coding="yes" ;;
+    esac
+fi
+
+# Progress mode, when a journey asked for it: a coding run narrates what it is
+# doing the way Claude Code does without partial messages -- whole `assistant`
+# messages, one holding text and one naming a tool -- so the product's own
+# stream parser and live events are what a journey watches. Only coding runs
+# narrate; the review and fix agents answer exactly as they always did.
+progress=""
+if [ -n "$SLASHIT_FAKE_AGENT_PROGRESS" ] && [ -n "$is_run" ] && [ -n "$is_coding" ]; then
+    progress="yes"
+fi
+
 # Written in a staging directory and moved into place, because the test polls
 # this directory while the agent is running: `mktemp` creates the file before
 # anything is in it, so a reader could otherwise see a record that exists but
@@ -93,7 +114,15 @@ record=$(mktemp "$staging/XXXXXX")
 printf '%s\0' "$PWD" "$@" > "$record"
 mv "$record" "$SLASHIT_FAKE_AGENT_MARKERS/invocation-$position"
 
-printf '{"type":"system","subtype":"init","session_id":"%s","model":"slashit-fake-agent"}\n' "$session"
+# A version probe answers with a version line first. The real CLI prints
+# `2.1.283 (Claude Code)` for `--version`, and the runner's Auto gate reads the
+# first version-shaped token, so the probe passes only if this line is new
+# enough. The init line reports the permission mode the run was launched with,
+# as the real CLI does, so an Auto run is confirmed by its own stream.
+if [ -z "$is_run" ]; then
+    printf '%s\n' "2.1.283 (Claude Code)"
+fi
+printf '{"type":"system","subtype":"init","session_id":"%s","model":"slashit-fake-agent","permissionMode":"%s"}\n' "$session" "${mode:-default}"
 
 if [ -n "$progress" ]; then
     say "fake agent step one: reading the task"
