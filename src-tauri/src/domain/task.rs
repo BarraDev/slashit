@@ -133,6 +133,10 @@ pub struct Task {
     /// `"default"` value for provider default. Only a person's explicit
     /// configuration changes it. A run's report never does.
     pub model: String,
+    /// Which coding Worker runs this Task. A stored Task with no `provider`
+    /// runs with Claude. Only a person's explicit choice changes it.
+    #[serde(default, skip_serializing_if = "CodingProvider::is_default")]
+    pub provider: CodingProvider,
     /// The model the provider most recently reported for one of this Task's
     /// runs. It is evidence of what ran, never configuration: approvals,
     /// proposals and launches read `model` only. `None` until a run reports a
@@ -888,6 +892,7 @@ impl Task {
             model: new.model,
             last_observed_model: None,
             planning_mode: new.planning_mode,
+            provider: Default::default(),
             dependencies: new.dependencies,
             worktree_id: None,
             jj_change_id: None,
@@ -1636,6 +1641,40 @@ pub struct PrReviewApplyResult {
     /// evidence (`in_reply_to_id`) rather than a guess.
     #[serde(default)]
     pub auto_reply: Option<bool>,
+}
+
+/// The coding Worker that runs a Task. Claude Code is the default, and the
+/// only provider that existing Tasks have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodingProvider {
+    #[default]
+    Claude,
+    /// OpenCode, over the Agent Client Protocol.
+    OpenCode,
+}
+
+impl CodingProvider {
+    /// True for the default provider, which is omitted from stored Tasks.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The name shown to a person.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::OpenCode => "OpenCode",
+        }
+    }
+
+    /// The agent type recorded with the run's execution.
+    pub fn agent_type(self) -> &'static str {
+        match self {
+            Self::Claude => "claude-code",
+            Self::OpenCode => "opencode",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

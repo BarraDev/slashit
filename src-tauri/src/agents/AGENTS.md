@@ -5,7 +5,7 @@ Claude Code agent execution.
 ## Architecture
 
 - **mod.rs** - Declares the `coding_run`, `provider_lease`, `roles` and `runner` modules
-- **coding_run.rs** - `CodingRunner` and `CodingRunEvent`, the provider-neutral run boundary
+- **coding_run.rs** - `CodingRunner` and `CodingRunEvent`, the provider-neutral run boundary, over `runner.rs` (Claude) and `opencode_run.rs` (OpenCode over ACP)
 - **roles.rs** - `roles::AgentRole`, `AgentSlot` and `AgentSlotStatus`
 - **runner.rs** - `ClaudeRunner`, which runs the Claude Code CLI and streams `CodingRunEvent`s
 

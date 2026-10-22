@@ -1,6 +1,8 @@
 use crate::agents::coding_run::{CodingRunEvent, CodingRunner};
+use crate::agents::opencode_run::OpenCodeRunConfig;
 use crate::agents::runner::{ClaudeRunConfig, ToolAccess};
 use crate::domain::task::ActivityKind;
+use crate::domain::task::CodingProvider;
 use crate::domain::task::ExternalRef;
 use crate::domain::task::NewAttemptDecision;
 use crate::domain::{
@@ -32,6 +34,42 @@ fn worker_scratch_rule(checkout: &str) -> String {
     )
 }
 
+/// Starts an OpenCode Worker for a Task. Each input OpenCode cannot honor is
+/// refused here; none is dropped silently. That covers a Claude model name and
+/// the extra directories a meta-workspace run needs.
+async fn start_opencode_run(
+    prompt: String,
+    working_dir: String,
+    model: Option<String>,
+    no_additional_dirs: bool,
+    lease: Option<crate::agents::provider_lease::ProviderLease>,
+) -> Result<CodingRunner, String> {
+    if let Some(model) = model {
+        return Err(format!(
+            "OpenCode does not take the Claude model {model}. Set this Task's model to default, or run it with Claude."
+        ));
+    }
+    if !no_additional_dirs {
+        return Err(
+            "This Task's workspace needs extra directories, which an OpenCode run cannot reach yet. Run it with Claude."
+                .to_string(),
+        );
+    }
+    // OpenCode has no system-prompt slot, so the rule Claude receives as an
+    // appended system prompt is sent ahead of the Task prompt.
+    let prompt = format!("{}\n\n{prompt}", worker_scratch_rule(&working_dir));
+    CodingRunner::start_opencode(
+        OpenCodeRunConfig {
+            prompt,
+            working_dir: std::path::PathBuf::from(working_dir),
+            program: crate::agents::opencode_run::OPENCODE_PROGRAM.to_string(),
+            args: vec!["acp".to_string()],
+        },
+        lease,
+    )
+    .await
+}
+
 /// A coding run whose start is on disk.
 #[derive(Debug)]
 struct RunStart {
@@ -46,6 +84,8 @@ struct RunStart {
     /// approved input was compared against), never re-read afterwards.
     prompt: String,
     model: Option<String>,
+    /// The coding Worker the run starts, from the same snapshot.
+    provider: CodingProvider,
 }
 
 #[derive(Debug)]
@@ -1507,7 +1547,7 @@ impl RunEventForwarder {
             tokio::select! {
                 received = events.recv() => match received {
                     Ok(event) => self.handle(event).await,
-                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Lagged(missed)) => self.note_lag(missed).await,
                     Err(RecvError::Closed) => return,
                 },
                 // Asked to drain, or dropped by a run that ended without
@@ -1518,7 +1558,7 @@ impl RunEventForwarder {
                     for _ in 0..events.len() {
                         match events.try_recv() {
                             Ok(event) => self.handle(event).await,
-                            Err(TryRecvError::Lagged(_)) => {}
+                            Err(TryRecvError::Lagged(missed)) => self.note_lag(missed).await,
                             Err(TryRecvError::Empty | TryRecvError::Closed) => return,
                         }
                     }
@@ -1526,6 +1566,23 @@ impl RunEventForwarder {
                 }
             }
         }
+    }
+
+    /// Records that events were dropped because this forwarder fell behind the
+    /// run. Those events never reach the run's log or its tool timeline, so the
+    /// gap is written to the log rather than passed over. The run's final
+    /// result does not come through this forwarder and is unaffected.
+    async fn note_lag(&self, missed: u64) {
+        record_output(
+            &self.logs,
+            self.execution_id,
+            LogLevel::Warn,
+            format!(
+                "{missed} events from this run were not forwarded because the log fell behind, \
+                 so the tool activity recorded for it may be incomplete."
+            ),
+        )
+        .await;
     }
 
     /// Durably records `observed` as the Task's latest observed model. The
@@ -4256,7 +4313,7 @@ impl TaskExecutor {
         let run = std::sync::atomic::AtomicU32::new(0);
         let consumed = std::sync::atomic::AtomicBool::new(false);
         let stale = std::sync::atomic::AtomicBool::new(false);
-        let launch_input: std::sync::Mutex<Option<(String, Option<String>)>> = std::sync::Mutex::new(None);
+        let launch_input: std::sync::Mutex<Option<(String, Option<String>, CodingProvider)>> = std::sync::Mutex::new(None);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
                 // The one comparison of an approved input with the Task that
@@ -4298,6 +4355,7 @@ impl TaskExecutor {
                         approved.as_ref().and_then(|binding| binding.request.as_deref()),
                     ),
                     model,
+                    t.provider,
                 ));
                 if let Some(decision) = new_attempt {
                     // Only the decision the person made may start this run, and
@@ -4444,7 +4502,7 @@ impl TaskExecutor {
             // `record` fails for a task that is not on the board, so a
             // successful write always ran the amend on it.
             Ok(()) => {
-                let (prompt, model) = launch_input
+                let (prompt, model, provider) = launch_input
                     .into_inner()
                     .unwrap_or_else(|p| p.into_inner())
                     .expect("a recorded start always captured its launch input");
@@ -4454,6 +4512,7 @@ impl TaskExecutor {
                     lease,
                     prompt,
                     model,
+                    provider,
                 })
             }
             Err(error) => {
@@ -5063,6 +5122,7 @@ impl TaskExecutor {
             lease,
             prompt,
             model: task_model,
+            provider,
         } = match self
             .record_run_start_for(task_id, &repo_path, acquired, authorized.as_ref())
             .await
@@ -5189,7 +5249,7 @@ impl TaskExecutor {
                 id: execution_id,
                 worktree_id: None,
                 task_id: Some(task_id),
-                agent_type: "claude-code".to_string(),
+                agent_type: provider.agent_type().to_string(),
                 status: AgentStatus::Starting,
                 started_at: now,
                 stopped_at: None,
@@ -5204,11 +5264,21 @@ impl TaskExecutor {
             events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Info,
-                message: format!("Starting Claude agent in {}", working_dir),
+                message: format!("Starting {} agent in {}", provider.label(), working_dir),
             });
 
-            // Start Claude runner
-            let runner = match CodingRunner::start_claude(ClaudeRunConfig {
+            // Start the Task's coding Worker. Claude keeps its own configuration.
+            let started = if provider == CodingProvider::OpenCode {
+                start_opencode_run(
+                    prompt,
+                    claude_cwd.clone(),
+                    task_model,
+                    claude_add_dirs.is_empty(),
+                    lease,
+                )
+                .await
+            } else {
+            CodingRunner::start_claude(ClaudeRunConfig {
                 prompt,
                 working_dir: claude_cwd.clone(),
                 // Auto: the provider's classifier reviews each tool call. It
@@ -5234,10 +5304,11 @@ impl TaskExecutor {
                 isolate_customizations: true,
             }, lease)
             .await
-            {
+            };
+            let runner = match started {
                 Ok(r) => r,
                 Err(e) => {
-                    let msg = format!("Failed to start claude: {}", e);
+                    let msg = format!("Failed to start {}: {}", provider.label(), e);
                     record_output(&logs, execution_id, LogLevel::Error, msg.clone()).await;
                     let ended = RunEnd {
                         run,
@@ -18581,6 +18652,93 @@ VERDICT: APPROVED"
                 t.base_commit.clone(),
                 t.branch_origin.clone(),
             )
+        }
+
+        /// An OpenCode Task, selected on the persisted Task, runs through the
+        /// executor and the ACP adapter, not a Claude process. A stand-in
+        /// `opencode` records the frames it receives and then runs the ACP
+        /// fixture, so no model is called. The changes it makes are committed,
+        /// the run is recorded with its provider, and its lease is released.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn an_opencode_task_runs_through_the_acp_adapter_and_settles_in_ai_review() {
+            let w = world(Class::Created).await;
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let task = tasks.get_mut(&w.task_id).unwrap();
+                task.provider = CodingProvider::OpenCode;
+                // OpenCode takes no Claude model, so the Task uses the default.
+                task.model = "default".to_string();
+                let board: Vec<_> = tasks
+                    .values()
+                    .filter(|task| task.project_id == w.project_id)
+                    .cloned()
+                    .collect();
+                w.executor
+                    .storage
+                    .save_project_tasks(w.project_id, &board)
+                    .expect("persist the provider choice");
+            }
+            let fixture = {
+                let exe = std::env::current_exe().expect("test executable path");
+                exe.parent()
+                    .and_then(std::path::Path::parent)
+                    .expect("target/debug directory")
+                    .join("acp_fixture_agent")
+            };
+            let frames = w.temps[0].path().join("opencode-frames.jsonl");
+            let agent = crate::test_helpers::FakeProgram::install(
+                "opencode",
+                &format!(
+                    "printf 'opencode work\\n' > opencode-output.txt\n\
+                     tee {frames:?} | {fixture:?} ok\n"
+                ),
+            )
+            .await;
+            // The AI reviewer is a Claude run. It is stood in for, so reaching
+            // review cannot start a real model.
+            agent.add(
+                "claude",
+                "cat >/dev/null; printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"VERDICT: APPROVED\"}'",
+            );
+
+            assert_eq!(
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(true)
+            );
+            let task = settled(&w).await;
+            assert_eq!(task.status, TaskStatus::AiReview, "error: {:?}", task.error_message);
+            assert_eq!(agent.launches("opencode"), 1, "one OpenCode run");
+            assert_eq!(agent.launches("claude"), 0, "the Worker never ran as Claude");
+
+            let executions = w.executor.executions.read().await;
+            assert!(
+                executions.values().any(|e| e.agent_type == "opencode"),
+                "the run is recorded under its provider"
+            );
+            drop(executions);
+
+            let kinds = kinds(&task);
+            assert!(kinds.iter().any(|k| matches!(k, ActivityKind::RunStarted { .. })));
+            assert!(kinds.iter().any(|k| matches!(k, ActivityKind::RunCompleted { .. })));
+
+            // The ACP session was created in the Task Checkout, and the prompt
+            // reached the agent with the scratch rule ahead of it.
+            let checkout = task.worktree_path.clone().expect("the Task has a checkout");
+            let wire = std::fs::read_to_string(&frames).expect("frames were recorded");
+            assert!(wire.contains("\"method\":\"session/new\""), "{wire}");
+            assert!(wire.contains(&format!("\"cwd\":\"{checkout}\"")), "{wire}");
+            assert!(wire.contains("\"method\":\"session/prompt\""), "{wire}");
+            assert!(wire.contains("Keep scratch, cache and intermediate files"), "{wire}");
+
+            // The Worker's change is committed, and no lease holds the checkout.
+            let committed = git_in(
+                std::path::Path::new(&checkout),
+                &["show", "--name-only", "--format=", "HEAD"],
+            );
+            assert!(committed.contains("opencode-output.txt"), "{committed}");
+            crate::agents::provider_lease::prove_absent(&w.executor.provider_lease_path(w.task_id))
+                .expect("the provider has ended and its lease is free");
         }
 
         /// A repository with a published default base and a dependency branch

@@ -170,6 +170,7 @@ mod tests {
                 status: TaskStatus::InProgress,
                 model: "test".to_string(),
                 planning_mode: false,
+                provider: Default::default(),
                 dependencies: Vec::new(),
                 worktree_id: None,
                 jj_change_id: None,

@@ -3,6 +3,7 @@ use leptos::task::spawn_local;
 use leptos::callback::Callback;
 use crate::components::task_dependency::{self, choice_for, requested, DependencyChoice, DependencyField};
 use crate::models::{Task, TaskCategory, TaskPriority};
+use crate::models::task::CodingProvider;
 use crate::services::{create_task, update_task, delete_task, set_task_dependencies, agent_service::list_available_models, agent_service::ModelInfo};
 use uuid::Uuid;
 
@@ -28,6 +29,7 @@ pub fn TaskEditModal(
     let (category, set_category) = signal(TaskCategory::Feature);
     let (priority, set_priority) = signal(TaskPriority::Medium);
     let (model, set_model) = signal("default".to_string());
+    let (provider, set_provider) = signal(CodingProvider::Claude);
     let (planning_mode, set_planning_mode) = signal(false);
 
     // The Depends on choice: at most one Task of this Project. The form keeps
@@ -93,6 +95,7 @@ pub fn TaskEditModal(
                     set_category.set(TaskCategory::Feature);
                     set_priority.set(TaskPriority::Medium);
                     set_model.set("default".to_string());
+                    set_provider.set(CodingProvider::Claude);
                     set_planning_mode.set(false);
                     set_title_touched.set(false);
                     dependency.set(None);
@@ -103,6 +106,7 @@ pub fn TaskEditModal(
                     set_category.set(task.category.clone());
                     set_priority.set(task.priority.clone());
                     set_model.set(task.model.clone());
+                    set_provider.set(task.provider);
                     set_planning_mode.set(task.planning_mode);
                     set_title_touched.set(true); // Already has content
                     dependency.set(task.dependencies.first().copied());
@@ -292,6 +296,29 @@ pub fn TaskEditModal(
                             </div>
                         </div>
 
+                        // Coding Worker. Changed on an existing Task only: a new
+                        // Task is created with Claude, as before.
+                        {move || match mode.get() {
+                            TaskEditMode::Edit(_) => view! {
+                                <div>
+                                    <label class="block text-sm font-medium text-white/70 mb-1.5">"Coding Worker"</label>
+                                    <select
+                                        on:change=move |ev| set_provider.set(match event_target_value(&ev).as_str() {
+                                            "opencode" => CodingProvider::OpenCode,
+                                            _ => CodingProvider::Claude,
+                                        })
+                                        class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                                        disabled=move || submitting.get()
+                                    >
+                                        <option value="claude" selected=move || provider.get() == CodingProvider::Claude>"Claude Code"</option>
+                                        <option value="opencode" selected=move || provider.get() == CodingProvider::OpenCode>"OpenCode"</option>
+                                    </select>
+                                </div>
+                            }
+                            .into_any(),
+                            TaskEditMode::Create => ().into_any(),
+                        }}
+
                         // AI Model
                         <div>
                             <label class="block text-sm font-medium text-white/70 mb-1.5">"AI Model"</label>
@@ -418,6 +445,7 @@ pub fn TaskEditModal(
                                     let category_val = category.get();
                                     let priority_val = priority.get();
                                     let model_val = model.get();
+                                    let provider_val = provider.get();
                                     let planning_val = planning_mode.get();
                                     let mode_val = mode.get();
                                     let dependency_val = dependency.get();
@@ -470,6 +498,7 @@ pub fn TaskEditModal(
                                                     impact: None,
                                                     security_severity: None,
                                                     model: Some(model_val),
+                                                    provider: Some(provider_val),
                                                     planning_mode: Some(planning_val),
                                                 }).await.map(|opt| opt.unwrap_or(*task))
                                             }

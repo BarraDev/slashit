@@ -604,6 +604,7 @@ pub fn create_test_task(title: &str) -> Task {
         status: TaskStatus::Backlog,
         model: "test-model".to_string(),
         planning_mode: false,
+        provider: Default::default(),
         dependencies: Vec::new(),
         worktree_id: None,
         jj_change_id: None,

@@ -171,6 +171,7 @@ pub async fn import_jira_issues(
             status: TaskStatus::Backlog,
             model: "default".to_string(),
             planning_mode: false,
+            provider: Default::default(),
             dependencies: Vec::new(),
             worktree_id: None,
             jj_change_id: None,

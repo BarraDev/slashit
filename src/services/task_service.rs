@@ -90,6 +90,7 @@ pub struct UpdateTaskParams {
     pub impact: Option<TaskImpact>,
     pub security_severity: Option<SecuritySeverity>,
     pub model: Option<String>,
+    pub provider: Option<crate::models::task::CodingProvider>,
     pub planning_mode: Option<bool>,
 }
 
@@ -105,6 +106,7 @@ pub async fn update_task(params: UpdateTaskParams) -> Result<Option<Task>, Strin
             "impact": params.impact,
             "securitySeverity": params.security_severity,
             "model": params.model,
+            "provider": params.provider,
             "planningMode": params.planning_mode,
         }
     })).unwrap();

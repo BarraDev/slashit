@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use super::opencode_run::{OpenCodeRunConfig, OpenCodeRunner};
 use super::provider_lease::ProviderLease;
 use super::runner::{ClaudeRunConfig, ClaudeRunner};
 
@@ -46,6 +47,7 @@ pub enum CodingRunEvent {
 /// [`ClaudeRunner`] for what each one guarantees.
 pub enum CodingRunner {
     Claude(ClaudeRunner),
+    OpenCode(OpenCodeRunner),
 }
 
 impl CodingRunner {
@@ -58,10 +60,19 @@ impl CodingRunner {
         ClaudeRunner::start_leased(config, lease).await.map(Self::Claude)
     }
 
+    /// Start an OpenCode run over ACP. See [`OpenCodeRunner::start`].
+    pub async fn start_opencode(
+        config: OpenCodeRunConfig,
+        lease: Option<ProviderLease>,
+    ) -> Result<Self, String> {
+        OpenCodeRunner::start(config, lease).await.map(Self::OpenCode)
+    }
+
     /// Subscribe to the run's events. See [`ClaudeRunner::subscribe`].
     pub fn subscribe(&self) -> broadcast::Receiver<CodingRunEvent> {
         match self {
             Self::Claude(runner) => runner.subscribe(),
+            Self::OpenCode(runner) => runner.subscribe(),
         }
     }
 
@@ -69,6 +80,7 @@ impl CodingRunner {
     pub async fn wait(&self) -> Result<bool, String> {
         match self {
             Self::Claude(runner) => runner.wait().await,
+            Self::OpenCode(runner) => runner.wait().await,
         }
     }
 
@@ -76,6 +88,7 @@ impl CodingRunner {
     pub async fn get_output(&self) -> String {
         match self {
             Self::Claude(runner) => runner.get_output().await,
+            Self::OpenCode(runner) => runner.get_output().await,
         }
     }
 
@@ -83,6 +96,7 @@ impl CodingRunner {
     pub async fn final_result_text(&self) -> Result<String, String> {
         match self {
             Self::Claude(runner) => runner.final_result_text().await,
+            Self::OpenCode(runner) => runner.final_result_text().await,
         }
     }
 
@@ -90,6 +104,7 @@ impl CodingRunner {
     pub async fn kill(&self) -> Result<(), String> {
         match self {
             Self::Claude(runner) => runner.kill().await,
+            Self::OpenCode(runner) => runner.kill().await,
         }
     }
 }
