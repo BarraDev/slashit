@@ -219,7 +219,6 @@ async fn journey(context: &TestContext) -> Result<()> {
     // fake agent rather than a real one.
     let agent = FakeAgent::install(&root)?;
     let _gh = FakeGh::install(&root, &agent)?;
-    present_a_plausible_claude_version(&agent)?;
     context.set_child_env("PATH", agent.path_value());
     context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
     // One device pixel per CSS pixel whatever the host's desktop scaling is.
@@ -240,26 +239,6 @@ async fn journey(context: &TestContext) -> Result<()> {
     let shots = place_tasks_and_capture(session.driver(), &board_project, &out).await;
     context.close_session(session, "capture", &shots).await?;
     shots
-}
-
-/// The sidebar footer shows what `claude --version` prints, and the fixture
-/// answers every call, that one included, with an agent event. Put a small
-/// wrapper in front of it that answers only `--version` and hands everything
-/// else to the fixture unchanged.
-fn present_a_plausible_claude_version(agent: &FakeAgent) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let link = agent.executable();
-    let fixture = std::fs::read_link(link).context("the fake agent is not a link to its fixture")?;
-    std::fs::remove_file(link)?;
-    std::fs::write(
-        link,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.0 (Claude Code)'; exit 0; fi\nexec '{}' \"$@\"\n",
-            fixture.display()
-        ),
-    )?;
-    std::fs::set_permissions(link, std::fs::Permissions::from_mode(0o755))?;
-    Ok(())
 }
 
 async fn create_data(driver: &WebDriver) -> Result<String> {

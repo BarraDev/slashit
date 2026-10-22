@@ -112,6 +112,11 @@ impl Session {
         // instead of bounding it.
         let deadline = Instant::now() + PROVIDER_TIMEOUT + NATIVE_DRIVER_TIMEOUT + SESSION_TIMEOUT;
 
+        // The application's agent runs start with a cleared environment, so
+        // the fake agent's controls are published into its entry instead of
+        // being inherited. See `fake_agent::publish_controls`.
+        crate::fake_agent::publish_controls(child_env)?;
+
         let mut provider = Provider::spawn(env.native_driver(), log_path, deadline, |command| {
             // The journey's own variables go on first so the state root's go
             // on last and win. Isolation is not something a test should be

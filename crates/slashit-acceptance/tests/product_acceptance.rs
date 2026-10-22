@@ -2910,13 +2910,12 @@ fn agent_runs(agent: &FakeAgent) -> Result<Vec<fake_agent::Invocation>> {
         .collect())
 }
 
-/// Which of the executor's three agent roles produced a run, told apart by
-/// the exact `--allowedTools` set the executor gives each one
-/// (`queue::executor`): the coding agent is the only one with `Bash`; the fix
-/// agent is the only other one with `Edit`; the review agent has neither.
-/// There is no role marker to read directly -- this is the one durable,
-/// external difference between them a fixture that only echoes a fixed
-/// string back can still be told apart by.
+/// Which of the executor's three agent roles produced a run. The review agent
+/// is the only read-only run and carries an approval list. The coding and fix
+/// runs both run under Auto with no list, so the fix run is identified by its
+/// prompt (see [`fake_agent::Invocation::is_fix_run`]). There is no role marker
+/// to read directly; these are the durable, external differences a fixture
+/// that only echoes a fixed string back can be told apart by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentRole {
     Execution,
@@ -2925,17 +2924,18 @@ enum AgentRole {
 }
 
 fn agent_role(invocation: &fake_agent::Invocation) -> Result<AgentRole> {
-    let tools = invocation
-        .flag("--allowedTools")
-        .context("an agent run had no --allowedTools flag")?
-        .to_string_lossy();
-    Ok(if tools.contains("Bash") {
-        AgentRole::Execution
-    } else if tools.contains("Edit") {
-        AgentRole::Fix
+    if invocation.is_coding_run() {
+        Ok(AgentRole::Execution)
+    } else if invocation.is_fix_run() {
+        Ok(AgentRole::Fix)
     } else {
-        AgentRole::Review
-    })
+        // The review agent is the only read-only run, and it always carries
+        // an approval list.
+        invocation
+            .flag("--allowedTools")
+            .context("an agent run that is neither coding nor fix had no --allowedTools flag")?;
+        Ok(AgentRole::Review)
+    }
 }
 
 /// Assert the whole journey ran exactly `execution` coding runs, `review`
