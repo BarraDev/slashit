@@ -176,7 +176,11 @@ async fn read_claude_version(
 const PROVIDER_ENV_NAMES: &[&str] = &[
     "HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TZ",
     "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_VERTEX_AUTH", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH", "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH", "CLOUD_ML_REGION",
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "all_proxy", "no_proxy",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
@@ -464,9 +468,14 @@ pub struct ClaudeRunConfig {
 /// Bedrock, Vertex or Foundry, route its traffic through its own proxy or CA
 /// bundle, put code in front of every child process (`PATH`, `BASH_ENV`,
 /// `ENV`, `LD_PRELOAD`, `NODE_OPTIONS`), or wrap every shell command
-/// (`CLAUDE_CODE_SHELL_PREFIX`). Each name is pinned to the value the child
+/// (`CLAUDE_CODE_SHELL_PREFIX`), or skip a provider's cloud sign-in
+/// (`CLAUDE_CODE_SKIP_*_AUTH`). Each name is pinned to the value the child
 /// receives, or to empty when the child receives none; `PATH` is always the
-/// value SlashIt chose.
+/// value SlashIt chose. The CLI treats a skip switch as on when it is any
+/// non-empty string, so a repository's `"0"` or `"false"` would enable it, and
+/// an empty pin is what switches it off. The routing list covers every provider
+/// in the CLI's own provider table (Claude Code 2.1.308): Bedrock, Vertex,
+/// Foundry, Anthropic AWS, Anthropic Google Cloud and Mantle.
 const PINNED_ENV: &[&str] = &[
     "PATH",
     "CLAUDE_CONFIG_DIR",
@@ -478,6 +487,19 @@ const PINNED_ENV: &[&str] = &[
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_MANTLE",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    "CLOUD_ML_REGION",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -2110,6 +2132,77 @@ mod launch_policy_tests {
         ] {
             assert_eq!(settings["env"][name], "", "{name} must be pinned empty");
         }
+    }
+
+    /// Every provider selector, endpoint and skip switch in the CLI's provider
+    /// table is pinned, so a repository cannot switch the provider, redirect
+    /// its endpoint, or enable a skip switch when the child does not have one.
+    #[test]
+    fn isolated_settings_pin_every_provider_selector_and_skip_switch_when_absent() {
+        let settings: serde_json::Value =
+            serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"))).unwrap();
+        for name in [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+            "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+            "CLAUDE_CODE_USE_MANTLE",
+            "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+            "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+            "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+            "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+            "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+            "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "ANTHROPIC_VERTEX_BASE_URL",
+            "ANTHROPIC_FOUNDRY_BASE_URL",
+            "ANTHROPIC_AWS_BASE_URL",
+            "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+            "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+            "CLOUD_ML_REGION",
+        ] {
+            assert_eq!(settings["env"][name], "", "{name} must be pinned empty");
+        }
+    }
+
+    /// A skip switch or region the user configured reaches the child, and the
+    /// pin carries that exact value, so a supported gateway setup keeps working.
+    /// A name the user did not configure is pinned empty, which is off.
+    #[test]
+    fn isolated_settings_keep_the_user_configured_skip_switch_and_region() {
+        let child = provider_env(vec![
+            (OsString::from("CLAUDE_CODE_SKIP_VERTEX_AUTH"), OsString::from("1")),
+            (OsString::from("CLOUD_ML_REGION"), OsString::from("europe-west1")),
+            (OsString::from("CLAUDE_CODE_USE_ANTHROPIC_AWS"), OsString::from("1")),
+        ]);
+        let settings: serde_json::Value =
+            serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"))).unwrap();
+        assert_eq!(settings["env"]["CLAUDE_CODE_SKIP_VERTEX_AUTH"], "1");
+        assert_eq!(settings["env"]["CLOUD_ML_REGION"], "europe-west1");
+        assert_eq!(settings["env"]["CLAUDE_CODE_USE_ANTHROPIC_AWS"], "1");
+        assert_eq!(settings["env"]["CLAUDE_CODE_SKIP_BEDROCK_AUTH"], "");
+    }
+
+    /// The skip switches, the region and the selectors of the other providers
+    /// reach the child from the user's environment; an unrelated name does not.
+    #[test]
+    fn provider_env_keeps_the_skip_switches_region_and_selectors() {
+        let names = [
+            "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+            "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+            "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+            "CLOUD_ML_REGION",
+            "CLAUDE_CODE_USE_MANTLE",
+            "CLAUDE_CODE_SKIP_UNRELATED_AUTH",
+        ];
+        let kept = provider_env(names.map(|n| (OsString::from(n), OsString::from("1"))));
+        let kept: std::collections::BTreeSet<String> =
+            kept.into_iter().map(|(n, _)| n.into_string().unwrap()).collect();
+        for name in &names[..5] {
+            assert!(kept.contains(*name), "{name} must reach the provider child");
+        }
+        assert!(!kept.contains("CLAUDE_CODE_SKIP_UNRELATED_AUTH"));
     }
 
     /// An absent `CLAUDE_CONFIG_DIR` pins to the CLI's default, not to an empty

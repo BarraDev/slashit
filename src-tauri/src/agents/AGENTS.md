@@ -73,9 +73,9 @@ the security boundary of the run:
   untrusted repository or without a person watching the run:
   - Isolation does not limit the filesystem. The Worker can read and write
     anything the user can, outside the Task Checkout.
-  - `PINNED_ENV` covers endpoints, proxies, CA bundles, loaders, `PATH` and
-    the provider switches; `CLAUDE_CONFIG_DIR` pins to `<HOME>/.claude` when
-    absent. `GIT_*`, `PYTHON*` and `HOME` are not pinned.
+  - `PINNED_ENV` covers endpoints, proxies, CA bundles, loaders, `PATH`, all
+    provider selectors and skip switches, and `CLOUD_ML_REGION`. Not pinned:
+    git's inlets, `HOME`, credential names, `PYTHON*`.
   - The PR apply agent still runs with bypass (`permission_mode: None`).
   - The Auto classifier verdict and real-CLI cancellation have not been
     exercised in a live run. Both must be confirmed before unattended use.

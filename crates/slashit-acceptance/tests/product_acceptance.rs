@@ -2955,6 +2955,17 @@ fn assert_agent_roles(
     let runs = agent_runs(agent)?;
     let roles = runs.iter().map(agent_role).collect::<Result<Vec<_>>>()?;
 
+    // Coding and review-fix runs must be bare Auto launches. The review run is
+    // the read-only one and keeps its approval list, so it is not checked here.
+    for (run, role) in runs.iter().zip(&roles) {
+        if *role == AgentRole::Review {
+            continue;
+        }
+        if let Some(violation) = run.auto_contract_violation() {
+            bail!("{journey}: a {role:?} run broke the Auto contract: {violation}");
+        }
+    }
+
     let expected: Vec<AgentRole> = std::iter::repeat_n(AgentRole::Execution, execution)
         .chain(std::iter::repeat_n(AgentRole::Review, review))
         .chain(std::iter::repeat_n(AgentRole::Fix, fix))

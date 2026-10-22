@@ -320,6 +320,25 @@ impl Invocation {
             }
         }
     }
+
+    /// Why this launch breaks the Auto contract that coding and review-fix runs
+    /// must meet, or `None` when it meets it: `--permission-mode auto` and no
+    /// `--allowedTools` list. An approval list is the fallback the product must
+    /// not use for these roles, so it is a violation even when the mode is
+    /// `auto`. The broader predicates above still identify runs for recovery.
+    pub fn auto_contract_violation(&self) -> Option<String> {
+        if self.has_flag("--allowedTools") {
+            return Some(format!(
+                "it carried --allowedTools {:?}, an approval list Auto runs must not use",
+                self.flag("--allowedTools").unwrap_or_default()
+            ));
+        }
+        match self.flag("--permission-mode") {
+            Some(mode) if mode == "auto" => None,
+            Some(mode) => Some(format!("it ran with --permission-mode {mode:?}, not auto")),
+            None => Some("it had no --permission-mode, so it did not request auto".to_string()),
+        }
+    }
 }
 
 /// How the review-fix prompt opens (`build_fix_prompt` in the product). Also
@@ -1575,5 +1594,57 @@ mod tests {
         assert_eq!(resolve_on_path(EXECUTABLE, &empty), None);
 
         std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    fn launch(args: &[&str], prompt: &str) -> Invocation {
+        Invocation {
+            working_dir: PathBuf::new(),
+            args: args.iter().map(OsString::from).collect(),
+            prompt: Some(prompt.to_string()),
+        }
+    }
+
+    /// The bare Auto launch the product sends a coding run is accepted.
+    #[test]
+    fn a_bare_auto_launch_meets_the_auto_contract() {
+        let run = launch(&["-p", "--permission-mode", "auto", "--session-id", "s"], "do the task");
+        assert_eq!(run.auto_contract_violation(), None);
+    }
+
+    /// An approval list is rejected even when the mode says auto: the product
+    /// must not fall back to one for a coding or review-fix run.
+    #[test]
+    fn an_approval_list_fails_the_auto_contract_even_under_auto() {
+        let run = launch(
+            &["-p", "--permission-mode", "auto", "--allowedTools", "Read Edit Bash"],
+            "do the task",
+        );
+        let violation = run.auto_contract_violation().expect("the launch must be rejected");
+        assert!(violation.contains("--allowedTools"), "{violation}");
+    }
+
+    /// A launch in any other mode, including the default, is rejected.
+    #[test]
+    fn a_non_auto_mode_fails_the_auto_contract() {
+        let run = launch(&["-p", "--permission-mode", "default"], "do the task");
+        let violation = run.auto_contract_violation().expect("the launch must be rejected");
+        assert!(violation.contains("default"), "{violation}");
+    }
+
+    /// A launch that names no permission mode did not request Auto, so it is
+    /// rejected rather than treated as a bare launch.
+    #[test]
+    fn a_launch_without_a_permission_mode_fails_the_auto_contract() {
+        let run = launch(&["-p"], "do the task");
+        assert!(run.auto_contract_violation().is_some());
+    }
+
+    /// The broader role predicates still accept an approval-list coding run,
+    /// because recovery tests depend on them. Only the contract rejects it.
+    #[test]
+    fn the_broad_role_predicates_still_see_an_approval_list_coding_run() {
+        let run = launch(&["-p", "--allowedTools", "Bash"], "do the task");
+        assert!(run.is_coding_run());
+        assert!(run.auto_contract_violation().is_some());
     }
 }
