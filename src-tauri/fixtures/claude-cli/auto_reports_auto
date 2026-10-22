@@ -1,0 +1,5 @@
+#!/bin/sh
+# An Auto run whose init event reports Auto, then a successful result.
+cat > /dev/null
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-mode","permissionMode":"auto"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'

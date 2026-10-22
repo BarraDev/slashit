@@ -306,13 +306,18 @@ impl Invocation {
 
     /// Whether this is the review-fix run. Under Auto it has no approval list,
     /// so its prompt, which opens with [`FIX_PROMPT_OPENING`], identifies it.
+    /// Without an approval list and outside Auto the launch is not a review-fix
+    /// run, because the product only starts one under Auto.
     pub fn is_fix_run(&self) -> bool {
         match self.flag("--allowedTools") {
             Some(tools) => tools.to_string_lossy().contains("Edit"),
-            None => self
-                .prompt
-                .as_deref()
-                .is_some_and(|prompt| prompt.starts_with(FIX_PROMPT_OPENING)),
+            None => {
+                self.flag("--permission-mode") == Some(OsStr::new("auto"))
+                    && self
+                        .prompt
+                        .as_deref()
+                        .is_some_and(|prompt| prompt.starts_with(FIX_PROMPT_OPENING))
+            }
         }
     }
 }

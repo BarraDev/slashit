@@ -72,11 +72,9 @@ the security boundary of the run:
   untrusted repository or without a person watching the run:
   - Isolation does not limit the filesystem. The Worker can read and write
     anything the user can, outside the Task Checkout.
-  - `PINNED_ENV` covers `PATH`, proxies, `NODE_OPTIONS`, `BASH_ENV`, `ENV`,
-    `LD_PRELOAD` and the provider switches. `GIT_*` variables, interpreter
-    variables such as `PYTHON*`, `HOME` and `CLAUDE_CONFIG_DIR` are not
-    pinned, so a repository's `env` block can set them for the CLI and the
-    tools it runs.
+  - `PINNED_ENV` covers endpoints, proxies, CA bundles, loaders, `PATH` and
+    the provider switches; `CLAUDE_CONFIG_DIR` pins to `<HOME>/.claude` when
+    absent. `GIT_*`, `PYTHON*` and `HOME` are not pinned.
   - The PR apply agent still runs with bypass (`permission_mode: None`).
   - The Auto classifier verdict and real-CLI cancellation have not been
     exercised in a live run. Both must be confirmed before unattended use.
@@ -91,8 +89,10 @@ the security boundary of the run:
 - The child starts from an empty environment (`env_clear`), then gets only
   `provider_env`: identity and PATH, locale, temp directories, proxy and CA
   settings, `ANTHROPIC_*`, and the provider selectors and credentials for
-  Bedrock, Vertex, Foundry, and `CLAUDE_CODE_OAUTH_TOKEN`. `HOME` is passed
-  through, never replaced. Session identifiers, `CLAUDE_CODE_MESSAGING_*`,
+  Bedrock (including its bearer token, role and web-identity variables),
+  Vertex, Foundry, and `CLAUDE_CODE_OAUTH_TOKEN`, and on Windows the profile
+  and system variables (`USERPROFILE`, `SYSTEMROOT`, and the like). `HOME` is
+  passed through, never replaced. Session identifiers, `CLAUDE_CODE_MESSAGING_*`,
   and forge tokens are not passed. Add a name to `PROVIDER_ENV_NAMES` only
   with a reason in the commit that adds it.
 

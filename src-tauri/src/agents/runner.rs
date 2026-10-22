@@ -126,6 +126,13 @@ const PROVIDER_ENV_NAMES: &[&str] = &[
     "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
     "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE",
     "AWS_SHARED_CREDENTIALS_FILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
+    "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CA_BUNDLE",
+    // Windows has no HOME: the profile is USERPROFILE (or HOMEDRIVE and
+    // HOMEPATH), and Claude Code reads its sign-in from there. The system
+    // variables are needed for any Windows process to start.
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "USERNAME", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
 ];
 
 /// Name prefixes kept for the same reasons as [`PROVIDER_ENV_NAMES`]:
@@ -405,21 +412,36 @@ pub struct ClaudeRunConfig {
 /// value SlashIt chose.
 const PINNED_ENV: &[&str] = &[
     "PATH",
+    "CLAUDE_CONFIG_DIR",
     "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
+    "NO_PROXY",
     "http_proxy",
     "https_proxy",
     "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "AWS_CA_BUNDLE",
     "NODE_OPTIONS",
     "BASH_ENV",
     "ENV",
     "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
     "CLAUDE_CODE_SHELL_PREFIX",
 ];
 
@@ -478,6 +500,16 @@ fn isolated_settings(
         let mut value = child_value(name);
         if *name == "ANTHROPIC_BASE_URL" && value.is_empty() {
             value = DEFAULT_ANTHROPIC_BASE_URL.to_string();
+        }
+        // An empty CLAUDE_CONFIG_DIR would point the CLI at an empty directory,
+        // so an absent one pins to the CLI's default, `~/.claude`.
+        if *name == "CLAUDE_CONFIG_DIR" && value.is_empty() {
+            let home = [child_value("HOME"), child_value("USERPROFILE")]
+                .into_iter()
+                .find(|home| !home.is_empty());
+            if let Some(home) = home {
+                value = std::path::Path::new(&home).join(".claude").to_string_lossy().into_owned();
+            }
         }
         env.insert((*name).to_string(), value.into());
     }
@@ -1129,17 +1161,36 @@ impl ClaudeRunner {
     /// pid, and only while `leader_pid` still holds it. `wait()` clears that
     /// under the same lock before it reaps, so the pid is never signalled after
     /// it may have been reissued. The run then ends, and `wait()` reports
-    /// [`Self::mode_mismatch`]. Off Unix there is no group to signal; the run
-    /// is left to end on its own, and the mismatch is still reported.
+    /// [`Self::mode_mismatch`]. On Windows the process tree is killed instead,
+    /// because there is no process group to signal.
     fn stop_for_mode_mismatch(leader_pid: &std::sync::Mutex<Option<u32>>) {
-        #[cfg(unix)]
         if let Ok(pid) = leader_pid.lock() {
             if let Some(pid) = *pid {
+                #[cfg(unix)]
                 Self::kill_process_group(pid);
+                #[cfg(windows)]
+                Self::kill_process_tree(pid);
+                #[cfg(not(any(unix, windows)))]
+                let _ = pid;
             }
         }
-        #[cfg(not(unix))]
-        let _ = leader_pid;
+    }
+
+    /// Kill the process `pid` and every descendant it started. `taskkill /T`
+    /// walks the tree, which Windows does not do for a plain kill. Best-effort,
+    /// like [`Self::kill_process_group`]: a tree that has already gone is the
+    /// outcome asked for. The call blocks for the duration of `taskkill`.
+    #[cfg(windows)]
+    fn kill_process_tree(pid: u32) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 
     /// Signal the whole group a spawned agent leads.
@@ -1863,6 +1914,73 @@ mod launch_policy_tests {
         assert_eq!(settings["env"]["CLAUDE_CODE_USE_BEDROCK"], "");
         // NODE_OPTIONS is not in the child's environment, so it is pinned empty.
         assert_eq!(settings["env"]["NODE_OPTIONS"], "");
+    }
+
+    /// A repository's own `env` block outranks the environment SlashIt passes,
+    /// so every endpoint, CA and loader name must be pinned even when the child
+    /// does not receive it. An unpinned name would let the project set it.
+    #[test]
+    fn isolated_settings_pin_endpoint_ca_and_loader_names_when_absent() {
+        let settings: serde_json::Value =
+            serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"))).unwrap();
+        for name in [
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "ANTHROPIC_VERTEX_BASE_URL",
+            "ANTHROPIC_FOUNDRY_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "NO_PROXY",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "AWS_CA_BUNDLE",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+        ] {
+            assert_eq!(settings["env"][name], "", "{name} must be pinned empty");
+        }
+    }
+
+    /// An absent `CLAUDE_CONFIG_DIR` pins to the CLI's default, not to an empty
+    /// directory. A set one pins to its own value.
+    #[test]
+    fn isolated_settings_pin_the_config_dir_to_its_default_or_its_value() {
+        let at = |vars: Vec<(&str, &str)>| {
+            let child = provider_env(vars.into_iter().map(|(n, v)| (OsString::from(n), OsString::from(v))));
+            let settings: serde_json::Value =
+                serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"))).unwrap();
+            settings["env"]["CLAUDE_CONFIG_DIR"].as_str().unwrap().to_string()
+        };
+        assert_eq!(at(vec![("HOME", "/home/u")]), "/home/u/.claude");
+        assert_eq!(at(vec![("HOME", "/home/u"), ("CLAUDE_CONFIG_DIR", "/cfg")]), "/cfg");
+        assert_eq!(at(vec![]), "");
+    }
+
+    /// The Windows profile and system variables, and the Bedrock credential and
+    /// CA variables, must reach the child. Without them a Windows run cannot find
+    /// its sign-in, and a Bedrock run cannot authenticate.
+    #[test]
+    fn provider_env_keeps_the_windows_profile_and_bedrock_credentials() {
+        let names = [
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "SYSTEMROOT",
+            "PATHEXT",
+            "COMSPEC",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_ROLE_ARN",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CA_BUNDLE",
+        ];
+        let kept = provider_env(names.map(|n| (OsString::from(n), OsString::from("v"))));
+        let kept: std::collections::BTreeSet<String> =
+            kept.into_iter().map(|(n, _)| n.into_string().unwrap()).collect();
+        for name in names {
+            assert!(kept.contains(name), "{name} must reach the provider child");
+        }
     }
 
     #[test]
@@ -3140,21 +3258,15 @@ mod tests {
 #[cfg(all(test, unix))]
 mod mode_mismatch_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
-    /// A stand-in CLI that reports `mode` in its init event, then runs `tail`.
-    fn install_stub(dir: &std::path::Path, mode: &str, tail: &str) -> std::path::PathBuf {
-        let program = dir.join("claude");
-        let script = format!(
-            "#!/bin/sh\ncat > /dev/null\n\
-             printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-mode\",\"permissionMode\":\"{mode}\"}}'\n\
-             {tail}\n"
-        );
-        std::fs::write(&program, script).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        program
+    /// A checked-in stand-in CLI. The scripts are not written by the test
+    /// because a script written and run at once can fail with `ETXTBSY`: a
+    /// concurrent fork in this test binary can hold the write descriptor until
+    /// its `exec`. See `Fixture::new` for the same rule.
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/claude-cli").join(name)
     }
 
     fn auto_config(dir: &TempDir) -> ClaudeRunConfig {
@@ -3180,7 +3292,7 @@ mod mode_mismatch_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_auto_run_that_reports_manual_is_stopped_before_it_can_act() {
         let dir = TempDir::new().expect("temp dir");
-        let program = install_stub(dir.path(), "default", "sleep 60");
+        let program = fixture("auto_reports_manual");
         let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
 
         let started = Instant::now();
@@ -3195,8 +3307,7 @@ mod mode_mismatch_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_auto_run_that_reports_auto_is_not_stopped() {
         let dir = TempDir::new().expect("temp dir");
-        let tail = "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'";
-        let program = install_stub(dir.path(), "auto", tail);
+        let program = fixture("auto_reports_auto");
         let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
 
         let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())
@@ -3209,11 +3320,7 @@ mod mode_mismatch_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_auto_run_that_never_reports_its_mode_is_not_a_success() {
         let dir = TempDir::new().expect("temp dir");
-        let program = dir.path().join("claude");
-        let script = "#!/bin/sh\ncat > /dev/null\n\
-                      printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n";
-        std::fs::write(&program, script).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = fixture("auto_never_reports_mode");
         let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
 
         let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())

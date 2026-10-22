@@ -20,11 +20,16 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Appended to a coding Worker's system prompt. It asks for scratch output to
-/// stay in the Task Checkout. This is an instruction, not a filesystem
+/// stay in the Task Checkout at `checkout`, not in the workspace root, which
+/// can hold other Tasks' files. This is an instruction, not a filesystem
 /// boundary: the provider can still write elsewhere if it ignores it.
-const WORKER_SCRATCH_RULE: &str = "Keep scratch, cache and intermediate files for this task inside the \
-    working directory. Do not write them to your home directory outside it or to /tmp, and remove \
-    any scratch file you created before you finish.";
+fn worker_scratch_rule(checkout: &str) -> String {
+    format!(
+        "Keep scratch, cache and intermediate files for this task inside its Task Checkout, \
+         {checkout}. Do not write them to your home directory outside it or to /tmp, and remove \
+         any scratch file you created before you finish."
+    )
+}
 
 /// A coding run whose start is on disk.
 #[derive(Debug)]
@@ -5218,7 +5223,7 @@ impl TaskExecutor {
                 resume_session: None,
                 model: task_model,
                 system_prompt: None,
-                append_system_prompt: Some(WORKER_SCRATCH_RULE.to_string()),
+                append_system_prompt: Some(worker_scratch_rule(&working_dir)),
                 // A Worker needs no MCP servers, so personal connectors from
                 // the user's Claude configuration stay out of the run.
                 disable_mcp: true,
@@ -7001,7 +7006,7 @@ impl TaskExecutor {
                                 resume_session: None,
                                 model: None,
                                 system_prompt: None,
-                                append_system_prompt: Some(WORKER_SCRATCH_RULE.to_string()),
+                                append_system_prompt: Some(worker_scratch_rule(&working_dir)),
                                 disable_mcp: true,
                                 additional_dirs: Vec::new(),
                                 // As for the coding Worker: no user or project hooks or settings.
