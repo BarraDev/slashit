@@ -275,6 +275,15 @@ impl FakeProgram {
     pub fn invocations(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
+
+    /// How many times `name` was launched. Each launch logs one line that
+    /// starts with the program name, followed by its arguments. A substring
+    /// count would also match the arguments, such as a `--settings` value that
+    /// contains `claudeMdExcludes`.
+    pub fn launches(&self, name: &str) -> usize {
+        let prefix = format!("{name} ");
+        self.invocations().lines().filter(|line| line.starts_with(&prefix)).count()
+    }
 }
 
 /// The entries of `path` with the programs in `hidden` taken off them: a

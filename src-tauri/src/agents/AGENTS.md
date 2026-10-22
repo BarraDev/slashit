@@ -57,10 +57,16 @@ the security boundary of the run:
   environment SlashIt passes, so the pins are what keep a repository from
   redirecting the API key, the provider, the shell or child processes; a pin
   is a string value, because `null` is skipped as invalid and the setting it
-  was meant to disable still runs. The project's `CLAUDE.md`
-  still loads; the user's `CLAUDE.md` does not. `--safe-mode` and an empty
+  was meant to disable still runs. The project's `CLAUDE.md` still loads.
+  Claude Code also reads instruction files from every directory above the
+  working directory; a Task Checkout sits under the user's home, so
+  `~/.claude/CLAUDE.md` would load through that walk. `claudeMdExcludes` lists
+  each ancestor's CLAUDE.md and CLAUDE.local.md, plain and dot-claude forms,
+  by absolute path. `autoMemoryEnabled` is `false`. `--setting-sources` and
+  `CLAUDE_CONFIG_DIR` do not stop the walk. `--safe-mode` and an empty
   `--setting-sources` were rejected because both also drop the project
-  `CLAUDE.md`. Built-in CLI plugins load in every mode.
+  `CLAUDE.md`. Built-in CLI plugins load in
+  every mode.
 
   Known limits of isolation, to revisit before any Worker runs on an
   untrusted repository or without a person watching the run:
@@ -76,6 +82,10 @@ the security boundary of the run:
     exercised in a live run. Both must be confirmed before unattended use.
   - Built-in CLI plugins load, and the CLI's own telemetry and network
     egress are not limited by this module.
+  - Skills: in the tested launch shape, synthetic skills in `HOME`, in
+    `CLAUDE_CONFIG_DIR` and in ancestor directories did not load. Four of
+    thirteen skill names in a real run were not traced to a source, so skill
+    isolation is not verified beyond that test.
 - `disable_mcp: true` on every production run. Personal connectors from the
   user's Claude configuration are not loaded.
 - The child starts from an empty environment (`env_clear`), then gets only

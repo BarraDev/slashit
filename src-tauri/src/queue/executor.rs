@@ -18875,7 +18875,7 @@ VERDICT: APPROVED"
                 assert_eq!(task.approved_execution, None, "one approval admits one run");
                 assert_eq!(run_starts(&task), 1);
             }
-            assert_eq!(agent.invocations().matches("claude").count(), 1, "launched exactly once");
+            assert_eq!(agent.launches("claude"), 1, "launched exactly once");
         }
 
         #[tokio::test]
@@ -19100,7 +19100,7 @@ VERDICT: APPROVED"
                 assert_eq!(task.executed_approvals[0].run, 1);
                 assert_eq!(run_starts(&task), 1);
             }
-            assert_eq!(agent.invocations().matches("claude").count(), 1, "launched exactly once");
+            assert_eq!(agent.launches("claude"), 1, "launched exactly once");
         }
 
         /// A request altered after approval fails the Task closed before any launch.

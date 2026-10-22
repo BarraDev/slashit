@@ -453,10 +453,18 @@ const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// runs a project's helper before the permission mode applies, in an untrusted
 /// workspace too. Optional telemetry is off ([`ISOLATED_TELEMETRY_ENV`]).
 ///
+/// Auto memory is off, because the CLI would otherwise load the notes it keeps
+/// for a project from the configuration directory. Instruction files in the
+/// directories above the checkout are excluded by path (see
+/// [`ancestor_instruction_excludes`]).
+///
 /// The pinned values are not secrets. A proxy URL with credentials in it is
 /// visible in the process list, as the child's own environment already is to
 /// a process of the same user.
-fn isolated_settings(child_env: &[(std::ffi::OsString, std::ffi::OsString)]) -> String {
+fn isolated_settings(
+    child_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    working_dir: &std::path::Path,
+) -> String {
     let child_value = |name: &str| {
         child_env
             .iter()
@@ -476,11 +484,43 @@ fn isolated_settings(child_env: &[(std::ffi::OsString, std::ffi::OsString)]) -> 
     env.insert(ISOLATED_TELEMETRY_ENV.0.to_string(), ISOLATED_TELEMETRY_ENV.1.into());
     let mut settings = serde_json::Map::new();
     settings.insert("disableAllHooks".to_string(), true.into());
+    settings.insert("autoMemoryEnabled".to_string(), false.into());
+    settings.insert(
+        "claudeMdExcludes".to_string(),
+        serde_json::Value::Array(ancestor_instruction_excludes(working_dir)),
+    );
     for name in HELPER_SETTINGS {
         settings.insert((*name).to_string(), "".into());
     }
     settings.insert("env".to_string(), env.into());
     serde_json::Value::Object(settings).to_string()
+}
+
+/// Instruction files that Claude Code reads from each directory above the
+/// working directory, as well as the working directory itself.
+const ANCESTOR_INSTRUCTION_FILES: &[&str] = &[
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    ".claude/CLAUDE.md",
+    ".claude/CLAUDE.local.md",
+];
+
+/// The absolute paths of the instruction files in every directory above
+/// `working_dir`, for `claudeMdExcludes`.
+///
+/// Claude Code loads these from ancestors of the working directory, and the
+/// `--setting-sources` and `CLAUDE_CONFIG_DIR` settings do not stop it. A Task
+/// Checkout sits under the user's home directory, so the user's own
+/// `~/.claude/CLAUDE.md` is one of them. Checked on Claude Code 2.1.307 with a
+/// local stub: the user's file reached the request, and excluding its path
+/// removed it. The checkout's own instruction files are not excluded.
+fn ancestor_instruction_excludes(working_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    working_dir
+        .ancestors()
+        .skip(1)
+        .flat_map(|dir| ANCESTOR_INSTRUCTION_FILES.iter().map(move |name| dir.join(name)))
+        .filter_map(|path| path.to_str().map(|text| text.to_string().into()))
+        .collect()
 }
 
 /// The Claude CLI arguments for `config`, in order, without the program.
@@ -567,7 +607,10 @@ pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
 
     if config.isolate_customizations {
         // Pinned against the same environment the child is started with.
-        let settings = isolated_settings(&provider_env(std::env::vars_os()));
+        let settings = isolated_settings(
+            &provider_env(std::env::vars_os()),
+            std::path::Path::new(&config.working_dir),
+        );
         push("--setting-sources");
         push("project");
         push("--settings");
@@ -1736,6 +1779,64 @@ mod launch_policy_tests {
     }
 
     #[test]
+    fn isolated_runs_exclude_instruction_files_above_the_checkout() {
+        let mut config = auto_config(vec![]);
+        config.isolate_customizations = true;
+        config.working_dir = "/home/owner/.local/share/slashit/worktrees/p/t".into();
+        let args: Vec<String> = claude_args(&config).into_iter().map(|a| a.into_string().unwrap()).collect();
+        let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].as_str());
+        let settings: serde_json::Value = serde_json::from_str(at("--settings").expect("--settings")).unwrap();
+        assert_eq!(settings["autoMemoryEnabled"], false, "{args:?}");
+        let excludes: Vec<&str> = settings["claudeMdExcludes"]
+            .as_array()
+            .expect("claudeMdExcludes")
+            .iter()
+            .map(|v| v.as_str().expect("path"))
+            .collect();
+        assert!(excludes.contains(&"/home/owner/.claude/CLAUDE.md"), "{excludes:?}");
+        assert!(excludes.contains(&"/home/owner/CLAUDE.md"), "{excludes:?}");
+        assert!(
+            excludes.contains(&"/home/owner/.local/share/slashit/worktrees/p/.claude/CLAUDE.local.md"),
+            "{excludes:?}"
+        );
+        let checkout = "/home/owner/.local/share/slashit/worktrees/p/t";
+        assert!(!excludes.iter().any(|p| p.starts_with(checkout)), "{excludes:?}");
+    }
+
+    #[test]
+    fn ancestor_instruction_excludes_list_every_directory_above_the_working_directory() {
+        let excludes = ancestor_instruction_excludes(std::path::Path::new("/a/b/c"));
+        let paths: Vec<&str> = excludes.iter().map(|v| v.as_str().unwrap()).collect();
+        // `/a/b`, `/a` and the root: every directory above `/a/b/c`.
+        assert_eq!(paths.len(), 3 * ANCESTOR_INSTRUCTION_FILES.len(), "{paths:?}");
+        for dir in ["/a/b", "/a", ""] {
+            for name in ANCESTOR_INSTRUCTION_FILES {
+                let expected = format!("{dir}/{name}");
+                assert!(paths.contains(&expected.as_str()), "{expected} missing from {paths:?}");
+            }
+        }
+        assert!(!paths.iter().any(|p| p.starts_with("/a/b/c")), "{paths:?}");
+    }
+
+    /// Writes the `--settings` value of an isolated run to the file named by
+    /// `SLASHIT_ISOLATED_SETTINGS_OUT`, for a probe that runs the real CLI with
+    /// the exact value the product sends. Ignored by default, and a no-op
+    /// unless the variable is set.
+    #[test]
+    #[ignore]
+    fn write_isolated_settings_for_a_real_cli_probe() {
+        let Ok(out) = std::env::var("SLASHIT_ISOLATED_SETTINGS_OUT") else {
+            return;
+        };
+        let mut config = auto_config(vec![]);
+        config.isolate_customizations = true;
+        config.working_dir = std::env::var("SLASHIT_ISOLATED_WORKING_DIR").expect("SLASHIT_ISOLATED_WORKING_DIR");
+        let args: Vec<String> = claude_args(&config).into_iter().map(|a| a.into_string().unwrap()).collect();
+        let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].clone());
+        std::fs::write(out, at("--settings").expect("--settings")).unwrap();
+    }
+
+    #[test]
     fn isolated_settings_pin_the_provider_the_child_receives() {
         let child = provider_env(vec![
             (
@@ -1751,7 +1852,7 @@ mod launch_policy_tests {
                 OsString::from("--require /tmp/x.js"),
             ),
         ]);
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child)).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"))).unwrap();
         assert_eq!(settings["disableAllHooks"], true);
         assert_eq!(settings["apiKeyHelper"], "");
         assert_eq!(
@@ -1767,7 +1868,7 @@ mod launch_policy_tests {
     #[test]
     fn isolated_settings_pin_the_shell_and_child_process_inlets() {
         let child = provider_env(vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]);
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child)).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"))).unwrap();
         // The project cannot prepend its own directory to the child's PATH.
         assert_eq!(settings["env"]["PATH"], "/usr/bin:/bin");
         for name in ["BASH_ENV", "ENV", "LD_PRELOAD", "CLAUDE_CODE_SHELL_PREFIX"] {
@@ -1777,7 +1878,7 @@ mod launch_policy_tests {
 
     #[test]
     fn isolated_settings_disable_helpers_and_optional_telemetry() {
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[])).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"))).unwrap();
         for name in HELPER_SETTINGS {
             assert_eq!(settings[*name], "", "{name} must be pinned empty");
         }
@@ -1787,7 +1888,7 @@ mod launch_policy_tests {
 
     #[test]
     fn isolated_settings_name_the_default_endpoint_when_the_child_has_none() {
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[])).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"))).unwrap();
         assert_eq!(
             settings["env"]["ANTHROPIC_BASE_URL"],
             DEFAULT_ANTHROPIC_BASE_URL
