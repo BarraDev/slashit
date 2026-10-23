@@ -1,26 +1,14 @@
 # AGENTS.md (src-tauri/src/agents)
 
-Claude Code and OpenCode coding-run execution.
+Claude Code and OpenCode coding-run execution. The Agent Communication Protocol client lives in `acp/`, not here.
 
 ## Architecture
 
 - **mod.rs** - Declares the `coding_run`, `opencode_run`, `provider_lease`, `roles` and `runner` modules
 - **coding_run.rs** - `CodingRunner` and `CodingRunEvent`, the provider-neutral run boundary, over `runner.rs` (Claude) and `opencode_run.rs` (OpenCode over ACP)
-- **opencode_run.rs** - `OpenCodeRunner`: one `opencode acp` process per run, its pinned permission policy (`OPENCODE_POLICY_CONTENT`), and its per-run configuration directory. Its module doc holds the known limits.
+- **opencode_run.rs** - `OpenCodeRunner`: one `opencode acp` process per run under `OPENCODE_POLICY_CONTENT` (read, glob, grep and edit only). Not an OS sandbox, `read` follows symlinks, Unix only. Read its module doc before changing the policy or the configuration directory's lifecycle.
 - **roles.rs** - `roles::AgentRole`, `AgentSlot` and `AgentSlotStatus`
 - **runner.rs** - `ClaudeRunner`, which runs the Claude Code CLI and streams `CodingRunEvent`s
-
-The Agent Communication Protocol client lives in `acp/`, not here.
-
-## OpenCode policy
-
-An OpenCode run starts with `OPENCODE_POLICY_CONTENT` and project configuration disabled. Read, glob, grep and edit are allowed, and every other tool is denied, including shell, web fetch, subagents and the code runtime. Paths outside the Task Checkout are refused as written. Three limits apply, and they are not closed:
-
-- It is not an OS sandbox. The policy governs the tools OpenCode offers.
-- `read` follows a symbolic link inside the checkout to a file outside it.
-- Only Unix runs are supported. The provider lease and the process-group checks exist there.
-
-The per-run configuration directory is removed only after its process has been reaped. Read the `opencode_run.rs` module doc before changing the policy or the directory's lifecycle.
 
 ## Tools and permissions
 
