@@ -623,18 +623,30 @@ fn TaskSummary(task: Task) -> impl IntoView {
             })}
             {task.qa_signoff.clone().map(|signoff| view! { <AiReviewSection signoff=signoff /> })}
             {(task.status == crate::models::TaskStatus::HumanReview && task.qa_signoff.is_none()).then(|| {
-                let manual = task.review_mode == crate::models::task::ReviewMode::Manual;
+                let note = no_ai_review_note(&task);
                 view! {
-                    <p data-testid="task-drawer-no-ai-review" class="text-white/60">
-                        {if manual {
-                            "No AI Review ran: Manual review mode is selected. Inspect the changes yourself; nothing has been approved."
-                        } else {
-                            "No AI Review ran for these changes. Nothing has been approved by AI."
-                        }}
-                    </p>
+                    <p data-testid="task-drawer-no-ai-review" class="text-white/60">{note}</p>
                 }
             })}
         </section>
+    }
+}
+
+/// What the drawer says when a Human Review has no AI verdict. A run whose
+/// review mode could not be confirmed (its record was rebuilt) is not
+/// described as Manual: Manual was never chosen for that run, and the Task's
+/// configured mode says nothing about how the run started.
+fn no_ai_review_note(task: &Task) -> &'static str {
+    let unconfirmed = task
+        .worker_handoff
+        .as_ref()
+        .is_some_and(|handoff| handoff.review_mode_unproven);
+    if unconfirmed {
+        "No AI Review ran for these changes. Their review mode could not be confirmed, so AI Review was withheld. Nothing has been approved by AI."
+    } else if task.review_mode == crate::models::task::ReviewMode::Manual {
+        "No AI Review ran: Manual review mode is selected. Inspect the changes yourself; nothing has been approved."
+    } else {
+        "No AI Review ran for these changes. Nothing has been approved by AI."
     }
 }
 
@@ -746,5 +758,48 @@ mod tests {
         let note = retry_note(&failed_task(None));
         assert!(!note.contains("continues"), "{note}");
         assert!(note.contains("Retry puts the task back in the queue."));
+    }
+
+    fn human_review_task(review_mode: crate::models::task::ReviewMode, unproven: bool) -> Task {
+        use crate::models::task::{ReviewMode, WorkerHandoff, WorkerHandoffStage};
+        let mut task = failed_task(None);
+        task.status = TaskStatus::HumanReview;
+        task.review_mode = review_mode;
+        task.worker_handoff = Some(WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            review_mode: ReviewMode::Manual,
+            review_mode_unproven: unproven,
+            stage: WorkerHandoffStage::Started,
+            acceptance: None,
+        });
+        task
+    }
+
+    #[test]
+    fn an_unconfirmed_run_is_not_described_as_manual_even_when_the_task_is_manual() {
+        use crate::models::task::ReviewMode;
+        let note = no_ai_review_note(&human_review_task(ReviewMode::Manual, true));
+        assert!(note.contains("could not be confirmed"), "{note}");
+        assert!(!note.contains("Manual"), "{note}");
+        assert!(!note.contains("selected"), "{note}");
+    }
+
+    #[test]
+    fn a_confirmed_manual_run_still_says_manual_was_selected() {
+        use crate::models::task::ReviewMode;
+        let note = no_ai_review_note(&human_review_task(ReviewMode::Manual, false));
+        assert!(note.contains("Manual review mode is selected"), "{note}");
+    }
+
+    #[test]
+    fn an_automatic_task_without_manual_mode_says_no_ai_review_ran() {
+        use crate::models::task::ReviewMode;
+        let note = no_ai_review_note(&human_review_task(ReviewMode::Automatic, false));
+        assert_eq!(note, "No AI Review ran for these changes. Nothing has been approved by AI.");
     }
 }
