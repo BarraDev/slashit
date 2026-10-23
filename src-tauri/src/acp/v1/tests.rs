@@ -609,8 +609,9 @@ async fn a_burst_of_kill_requests_starts_one_leader_wait() {
     let mut exit = owned.exit.clone();
     exit.wait_for(Option::is_some).await.expect("the supervisor reports");
     let report = exit.borrow().clone();
-    let status = report.expect("a report").expect("the child was reaped");
-    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    let exit = report.expect("a report").expect("the child was reaped");
+    assert_eq!(exit.status.signal(), Some(libc::SIGKILL), "{:?}", exit.status);
+    assert_eq!(exit.group, process::GroupEnd::Ended);
     assert_eq!(owned.leader_waits.load(Ordering::SeqCst), 1);
 }
 

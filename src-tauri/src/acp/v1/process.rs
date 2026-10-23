@@ -26,7 +26,99 @@ use tokio::sync::{mpsc, watch};
 const STDERR_TAIL_LINES: usize = 20;
 
 /// What the supervisor reports once the child has been reaped.
-pub(super) type ExitReport = Option<Result<ExitStatus, String>>;
+pub(super) type ExitReport = Option<Result<Exit, String>>;
+
+/// A reaped child and what became of its process group.
+#[derive(Debug, Clone)]
+pub(super) struct Exit {
+    pub status: ExitStatus,
+    pub group: GroupEnd,
+}
+
+/// Whether the child's process group is known to be ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum GroupEnd {
+    /// SIGKILL was delivered to the group, or the group was already empty.
+    /// On a platform without process groups, the leader alone is ended.
+    Ended,
+    /// The group could not be signalled, or its ownership could not be
+    /// verified, so processes it left behind may still be running.
+    Unconfirmed(String),
+}
+
+/// What one leader wait observed.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WaitOutcome {
+    /// The leader has exited and is still unreaped.
+    Exited,
+    /// The wait was interrupted by a signal. Nothing is known, so it is retried.
+    Interrupted,
+    /// The leader's state cannot be observed. Its group must not be signalled.
+    Failed(String),
+}
+
+/// The kernel calls behind supervision. Production uses `SystemKernel`. Tests
+/// inject faults through this seam, so the error paths run without signalling
+/// any real process group.
+pub(super) trait Kernel: Send + Sync + 'static {
+    /// One `waitid(P_PID, pid, WEXITED | WNOWAIT)`. Leaves the leader unreaped.
+    fn wait_leader(&self, pid: u32) -> WaitOutcome;
+    /// `killpg(pid, SIGKILL)`. A group that is already gone counts as ended.
+    fn kill_group(&self, pid: u32) -> Result<(), String>;
+}
+
+/// The operating system's process calls.
+pub(super) struct SystemKernel;
+
+#[cfg(unix)]
+impl Kernel for SystemKernel {
+    fn wait_leader(&self, pid: u32) -> WaitOutcome {
+        // Safety: `siginfo_t` is plain data and `waitid` fills it in.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let status = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if status == 0 {
+            return WaitOutcome::Exited;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINTR) {
+            WaitOutcome::Interrupted
+        } else {
+            WaitOutcome::Failed(format!("waitid: {error}"))
+        }
+    }
+
+    fn kill_group(&self, pid: u32) -> Result<(), String> {
+        // Safety: callers signal only a group whose leader is still unreaped
+        // (see `Group`), so the group id still belongs to this process.
+        if unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(format!("killpg: {error}"))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Kernel for SystemKernel {
+    fn wait_leader(&self, _pid: u32) -> WaitOutcome {
+        WaitOutcome::Exited
+    }
+
+    fn kill_group(&self, _pid: u32) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 /// Requests the supervisor understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +171,16 @@ pub(super) fn spawn(
     spec: &SpawnSpec,
     lease: Option<ProviderLease>,
     held: Box<dyn Send>,
+) -> Result<Owned, AcpError> {
+    spawn_with(spec, lease, held, Arc::new(SystemKernel))
+}
+
+/// `spawn`, with the kernel calls supplied by the caller.
+pub(super) fn spawn_with(
+    spec: &SpawnSpec,
+    lease: Option<ProviderLease>,
+    held: Box<dyn Send>,
+    kernel: Arc<dyn Kernel>,
 ) -> Result<Owned, AcpError> {
     if !spec.cwd.is_absolute() {
         return Err(AcpError::InvalidWorkingDirectory(
@@ -150,6 +252,7 @@ pub(super) fn spawn(
         control_rx,
         exit_tx,
         leader_waits.clone(),
+        kernel,
         held,
     ));
 
@@ -167,12 +270,65 @@ pub(super) fn spawn(
 /// Ends a child that no supervisor owns, and drops `held` only once the child
 /// has been reaped. Used when a start fails after the spawn.
 fn end_unsupervised(mut child: Child, pid: Option<u32>, held: Box<dyn Send>) {
-    kill_group(pid);
+    // The child is still unreaped here, so its group id is ours to signal.
+    if let Some(pid) = pid {
+        let _ = SystemKernel.kill_group(pid);
+    }
     let _ = child.start_kill();
     tokio::spawn(async move {
         let _ = child.wait().await;
         drop(held);
     });
+}
+
+/// The supervisor's view of the child's process group. A group is signalled
+/// only while its id is known to belong to this process: before the leader
+/// has been reaped, and only if no earlier wait failed to observe the leader.
+struct Group {
+    kernel: Arc<dyn Kernel>,
+    pid: Option<u32>,
+    trusted: bool,
+    end: GroupEnd,
+}
+
+impl Group {
+    fn new(kernel: Arc<dyn Kernel>, pid: Option<u32>) -> Self {
+        let mut group = Self {
+            kernel,
+            pid,
+            trusted: true,
+            end: GroupEnd::Ended,
+        };
+        if pid.is_none() {
+            group.distrust("the child's process id is unknown".into());
+        }
+        group
+    }
+
+    /// Ends the group's remaining processes, if its ownership still holds.
+    fn signal(&mut self) {
+        let Some(pid) = self.pid else { return };
+        if !self.trusted {
+            return;
+        }
+        if let Err(reason) = self.kernel.kill_group(pid) {
+            self.note_unconfirmed(reason);
+        }
+    }
+
+    /// Records that the group's ownership can no longer be verified, so it
+    /// is never signalled again.
+    fn distrust(&mut self, reason: String) {
+        self.trusted = false;
+        self.note_unconfirmed(reason);
+    }
+
+    /// Keeps the first reason the group could not be confirmed ended.
+    fn note_unconfirmed(&mut self, reason: String) {
+        if self.end == GroupEnd::Ended {
+            self.end = GroupEnd::Unconfirmed(reason);
+        }
+    }
 }
 
 /// Owns the child. Ends its process group on request or when every handle is
@@ -184,31 +340,42 @@ async fn supervise(
     mut control: mpsc::UnboundedReceiver<Control>,
     exit: watch::Sender<ExitReport>,
     leader_waits: Arc<AtomicUsize>,
+    kernel: Arc<dyn Kernel>,
     _held: Box<dyn Send>,
 ) {
     // One leader wait for the child's whole life. Each request below only
     // loops back to the select; it never starts another wait, so a burst of
     // requests cannot pile up blocked threads. The reap is gated on the
     // leader, so the group is ended before the reap lets its id go.
-    let mut leader = Box::pin(leader_exited(pid, leader_waits));
+    let mut group = Group::new(kernel.clone(), pid);
+    let mut leader = Box::pin(leader_exited(kernel, pid, leader_waits));
     let mut leader_done = false;
     let mut control_open = true;
     loop {
         tokio::select! {
-            () = &mut leader, if !leader_done => leader_done = true,
+            outcome = &mut leader, if !leader_done => {
+                leader_done = true;
+                match outcome {
+                    Ok(()) => group.signal(),
+                    Err(reason) => group.distrust(reason),
+                }
+            }
             status = child.wait(), if leader_done => {
-                let report = status.map_err(|error| excerpt(&error.to_string()));
+                let report = match status {
+                    Ok(status) => Ok(Exit { status, group: group.end.clone() }),
+                    Err(error) => Err(excerpt(&error.to_string())),
+                };
                 let _ = exit.send(Some(report));
                 return;
             }
             command = control.recv(), if control_open => match command {
                 Some(Control::Kill) => {
-                    kill_group(pid);
+                    group.signal();
                     let _ = child.start_kill();
                 }
                 None => {
                     control_open = false;
-                    kill_group(pid);
+                    group.signal();
                     let _ = child.start_kill();
                 }
             },
@@ -216,52 +383,39 @@ async fn supervise(
     }
 }
 
-/// Completes once the leader has exited, after its process group has been
-/// ended.
+/// Completes once the leader has exited, without reaping it. The caller then
+/// ends the leader's process group before the reap lets the id go.
 ///
 /// On Unix the leader is waited for without reaping, so its process group id
-/// still belongs to this process. Whatever the leader left running in that
-/// group is ended before the reap lets the id go. The blocking wait is
-/// started here, once per child, and is not cancelled by the caller.
-#[cfg(unix)]
-async fn leader_exited(pid: Option<u32>, leader_waits: Arc<AtomicUsize>) {
-    let Some(pid) = pid else { return };
+/// still belongs to this process. The blocking wait is started here, once per
+/// child, and is not cancelled by the caller. Interrupted waits are retried
+/// inside that one blocking task.
+///
+/// Resolves to `Err` when the leader's state cannot be observed. The group
+/// must then not be signalled, because its id may no longer belong to this
+/// process.
+async fn leader_exited(
+    kernel: Arc<dyn Kernel>,
+    pid: Option<u32>,
+    leader_waits: Arc<AtomicUsize>,
+) -> Result<(), String> {
+    let Some(pid) = pid else {
+        return Err("the child's process id is unknown".into());
+    };
     leader_waits.fetch_add(1, Ordering::SeqCst);
-    let _ = tokio::task::spawn_blocking(move || {
-        // Safety: `siginfo_t` is plain data and `waitid` fills it in.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            );
+    let waited = tokio::task::spawn_blocking(move || loop {
+        match kernel.wait_leader(pid) {
+            WaitOutcome::Exited => return Ok(()),
+            WaitOutcome::Interrupted => continue,
+            WaitOutcome::Failed(reason) => return Err(reason),
         }
     })
     .await;
-    kill_group(Some(pid));
-}
-
-#[cfg(not(unix))]
-async fn leader_exited(_pid: Option<u32>, _leader_waits: Arc<AtomicUsize>) {}
-
-/// Ends the child's process group. Best-effort: a group that has already gone
-/// is the outcome being asked for.
-#[cfg(unix)]
-fn kill_group(pid: Option<u32>) {
-    if let Some(pid) = pid {
-        // Safety: `pid` is the leader of a group this process created with
-        // `process_group(0)`, so the group id equals the pid. Callers ensure
-        // the leader has not been reaped, so the id still belongs to us.
-        unsafe {
-            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-        }
+    match waited {
+        Ok(result) => result,
+        Err(error) => Err(format!("the leader wait did not finish: {error}")),
     }
 }
-
-#[cfg(not(unix))]
-fn kill_group(_pid: Option<u32>) {}
 
 /// Writes queued frames to stdin. `None` closes stdin, which is the spec's
 /// signal to end the session, and the agent sees end of input.
@@ -356,4 +510,164 @@ where
 
 pub(super) fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    const LONG: Duration = Duration::from_secs(30);
+
+    /// One scripted leader wait.
+    enum Step {
+        Exited,
+        Interrupted,
+        Failed(&'static str),
+        Panic,
+    }
+
+    /// Replays a script of leader waits and counts the group signals. It never
+    /// sends a real signal, so no process group is touched by these tests.
+    struct Scripted {
+        waits: StdMutex<VecDeque<Step>>,
+        kill_error: Option<&'static str>,
+        wait_calls: AtomicUsize,
+        kill_calls: AtomicUsize,
+    }
+
+    impl Scripted {
+        fn new(steps: Vec<Step>, kill_error: Option<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                waits: StdMutex::new(steps.into()),
+                kill_error,
+                wait_calls: AtomicUsize::new(0),
+                kill_calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl Kernel for Scripted {
+        fn wait_leader(&self, _pid: u32) -> WaitOutcome {
+            self.wait_calls.fetch_add(1, SeqCst);
+            let step = lock(&self.waits)
+                .pop_front()
+                .unwrap_or(Step::Failed("the script ran out"));
+            match step {
+                Step::Exited => WaitOutcome::Exited,
+                Step::Interrupted => WaitOutcome::Interrupted,
+                Step::Failed(reason) => WaitOutcome::Failed(reason.to_string()),
+                Step::Panic => panic!("injected waitid fault"),
+            }
+        }
+
+        fn kill_group(&self, _pid: u32) -> Result<(), String> {
+            self.kill_calls.fetch_add(1, SeqCst);
+            self.kill_error.map_or(Ok(()), |reason| Err(reason.to_string()))
+        }
+    }
+
+    fn spec(program: &str, args: &[&str]) -> SpawnSpec {
+        SpawnSpec {
+            program: program.to_string(),
+            args: args.iter().map(ToString::to_string).collect(),
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+            clear_env: false,
+            request_timeout: LONG,
+            permission_timeout: LONG,
+        }
+    }
+
+    /// Spawns a child under `kernel` and returns its reaped report.
+    async fn reaped(kernel: Arc<Scripted>, spec: &SpawnSpec) -> Exit {
+        let owned = spawn_with(spec, None, Box::new(()), kernel).expect("spawn");
+        let mut exit = owned.exit.clone();
+        let report = tokio::time::timeout(LONG, exit.wait_for(Option::is_some))
+            .await
+            .expect("the supervisor reports in time")
+            .expect("the supervisor is running")
+            .clone();
+        report.expect("a report").expect("the child was reaped")
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_wait_is_retried_before_the_group_is_ended() {
+        let kernel = Scripted::new(vec![Step::Interrupted, Step::Interrupted, Step::Exited], None);
+        let exit = reaped(kernel.clone(), &spec("sh", &["-c", "exit 3"])).await;
+        assert_eq!(kernel.wait_calls.load(SeqCst), 3);
+        assert_eq!(kernel.kill_calls.load(SeqCst), 1);
+        assert_eq!(exit.group, GroupEnd::Ended);
+        assert_eq!(exit.status.code(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_failed_leader_wait_never_signals_the_group() {
+        for failure in ["waitid: No child processes (ECHILD)", "waitid: Invalid argument (EINVAL)"] {
+            let kernel = Scripted::new(vec![Step::Failed(failure)], None);
+            let exit = reaped(kernel.clone(), &spec("sh", &["-c", "exit 0"])).await;
+            assert_eq!(kernel.kill_calls.load(SeqCst), 0, "{failure}");
+            assert_eq!(exit.group, GroupEnd::Unconfirmed(failure.to_string()));
+            assert!(exit.status.success(), "the leader is still reaped: {failure}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_leader_wait_never_signals_the_group() {
+        let kernel = Scripted::new(vec![Step::Panic], None);
+        let exit = reaped(kernel.clone(), &spec("sh", &["-c", "exit 0"])).await;
+        assert_eq!(kernel.kill_calls.load(SeqCst), 0);
+        assert!(
+            matches!(&exit.group, GroupEnd::Unconfirmed(reason) if reason.contains("did not finish")),
+            "{:?}",
+            exit.group
+        );
+        assert!(exit.status.success());
+    }
+
+    #[tokio::test]
+    async fn a_failed_group_signal_is_reported_as_unconfirmed() {
+        let kernel = Scripted::new(vec![Step::Exited], Some("killpg: Operation not permitted (EPERM)"));
+        let exit = reaped(kernel.clone(), &spec("sh", &["-c", "exit 0"])).await;
+        assert_eq!(kernel.kill_calls.load(SeqCst), 1);
+        assert_eq!(
+            exit.group,
+            GroupEnd::Unconfirmed("killpg: Operation not permitted (EPERM)".to_string())
+        );
+    }
+
+    #[test]
+    fn a_distrusted_group_is_never_signalled_again() {
+        let kernel = Scripted::new(Vec::new(), None);
+        let mut group = Group::new(kernel.clone(), Some(4242));
+        // Before the leader is known to have failed, the group is ours.
+        group.signal();
+        group.distrust("waitid: No child processes (ECHILD)".to_string());
+        group.signal();
+        group.signal();
+        assert_eq!(kernel.kill_calls.load(SeqCst), 1);
+        assert_eq!(
+            group.end,
+            GroupEnd::Unconfirmed("waitid: No child processes (ECHILD)".to_string())
+        );
+    }
+
+    #[test]
+    fn a_group_without_a_known_leader_is_never_signalled() {
+        let kernel = Scripted::new(Vec::new(), None);
+        let mut group = Group::new(kernel.clone(), None);
+        group.signal();
+        assert_eq!(kernel.kill_calls.load(SeqCst), 0);
+        assert!(matches!(group.end, GroupEnd::Unconfirmed(_)));
+    }
+
+    #[test]
+    fn the_first_unconfirmed_reason_is_kept() {
+        let kernel = Scripted::new(Vec::new(), Some("killpg: EPERM"));
+        let mut group = Group::new(kernel, Some(4242));
+        group.signal();
+        group.distrust("waitid: EINVAL".to_string());
+        assert_eq!(group.end, GroupEnd::Unconfirmed("killpg: EPERM".to_string()));
+    }
 }

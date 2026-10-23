@@ -651,7 +651,13 @@ async fn wait_for_exit(
 ) -> Result<ExitStatus, String> {
     match exit.wait_for(Option::is_some).await {
         Ok(report) => match report.clone() {
-            Some(result) => result,
+            Some(Ok(process::Exit { status, group: process::GroupEnd::Ended })) => Ok(status),
+            Some(Ok(process::Exit { status, group: process::GroupEnd::Unconfirmed(reason) })) => {
+                Err(format!(
+                    "the provider exited ({status:?}), but its process group may still be running: {reason}"
+                ))
+            }
+            Some(Err(reason)) => Err(reason),
             None => Err("the exit status is not available".to_string()),
         },
         Err(_) => Err("the supervisor stopped without a status".to_string()),
@@ -844,4 +850,36 @@ fn handle_notification(shared: &Arc<Shared>, method: &str, params: &Value) {
             method: frame::excerpt(method).chars().take(64).collect(),
         },
     );
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    /// A reaped leader whose group could not be confirmed ended is an error,
+    /// whatever the leader's own status was.
+    #[tokio::test]
+    async fn an_unconfirmed_group_is_an_error_even_when_the_leader_exited_cleanly() {
+        let (tx, mut rx) = watch::channel::<process::ExitReport>(None);
+        tx.send(Some(Ok(process::Exit {
+            status: ExitStatus::from_raw(0),
+            group: process::GroupEnd::Unconfirmed("killpg: Operation not permitted".into()),
+        })))
+        .expect("the receiver is held");
+        let error = wait_for_exit(&mut rx).await.expect_err("an unconfirmed group fails");
+        assert!(error.contains("killpg: Operation not permitted"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_ended_group_reports_the_leader_status() {
+        let (tx, mut rx) = watch::channel::<process::ExitReport>(None);
+        tx.send(Some(Ok(process::Exit {
+            status: ExitStatus::from_raw(0),
+            group: process::GroupEnd::Ended,
+        })))
+        .expect("the receiver is held");
+        let status = wait_for_exit(&mut rx).await.expect("an ended group reports its status");
+        assert!(status.success());
+    }
 }

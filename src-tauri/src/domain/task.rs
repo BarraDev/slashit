@@ -1074,6 +1074,19 @@ impl Task {
         true
     }
 
+    /// Add what became of the checkout taken for a refused launch, once cleanup
+    /// has run. The Task must still be the one `fail_refused_launch` left with
+    /// this refusal and nothing else, so a Task moved meanwhile is not
+    /// rewritten. Returns whether the outcome was recorded.
+    pub fn note_refused_launch_cleanup(&mut self, refusal: &str, outcome: &str) -> bool {
+        if self.status != TaskStatus::Error || self.error_message.as_deref() != Some(refusal) {
+            return false;
+        }
+        self.error_message = Some(format!("{refusal} {outcome}"));
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: outcome.to_string() });
+        true
+    }
+
     /// Record that the task moved from `from` to its current status, when
     /// that is a move at all.
     pub fn record_move(&mut self, from: &TaskStatus) {

@@ -254,7 +254,18 @@ impl OpenCodeRunner {
                 };
                 // The turn is over, so OpenCode has nothing more to say. Its
                 // input closes, and it is given a grace period to exit.
-                let _ = self.connection.shutdown(EXIT_GRACE).await;
+                // A process that is not confirmed ended fails the run, even when
+                // its turn finished: its tools may still be running.
+                let ended = self.connection.shutdown(EXIT_GRACE).await;
+                let result = match (result, ended) {
+                    (result, Ok(_)) => result,
+                    (Ok(()), Err(e)) => {
+                        Err(format!("the OpenCode process could not be confirmed ended: {e}"))
+                    }
+                    (Err(turn), Err(e)) => Err(format!(
+                        "{turn}; the OpenCode process could not be confirmed ended: {e}"
+                    )),
+                };
                 if let Some(reader) = self.reader.lock().await.take() {
                     let _ = reader.await;
                 }

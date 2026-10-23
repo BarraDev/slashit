@@ -60,6 +60,40 @@ impl StartFailure {
 /// Claude for every Task, so an OpenCode Task that reaches review can still
 /// invoke a Claude model, billed separately from OpenCode. The test suite
 /// stands that Claude in with a fake program, so no test calls a model.
+/// Where a Task's Project stood in its Workspace when a launch read it. A
+/// start commits only while the Project still stands exactly here (see
+/// `TaskExecutor::record_run_start_for`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Membership {
+    /// The Task's Project, or `None` when the Task is not on the board.
+    project_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+    /// The registered root of that Workspace, when it is registered.
+    root: Option<std::path::PathBuf>,
+}
+
+/// The Project map and the workspace registry, read-locked by a start from its
+/// membership check until the start's write is published.
+type MembershipGuards<'a> = (
+    tokio::sync::RwLockReadGuard<'a, HashMap<Uuid, crate::domain::Project>>,
+    tokio::sync::RwLockReadGuard<'a, crate::config::WorkspaceRegistry>,
+);
+
+impl Membership {
+    /// The membership of `project_id` as the two registries hold it.
+    fn of(
+        project_id: Uuid,
+        projects: &HashMap<Uuid, crate::domain::Project>,
+        registry: &crate::config::WorkspaceRegistry,
+    ) -> Self {
+        let workspace_id = projects.get(&project_id).and_then(|p| p.scope.workspace_id());
+        let root = workspace_id
+            .and_then(|id| registry.get(&id))
+            .map(|ws| ws.root_path.as_path().to_path_buf());
+        Self { project_id: Some(project_id), workspace_id, root }
+    }
+}
+
 /// What an OpenCode run cannot honor, decided from inputs known before the
 /// durable start. `None` when the run may start. The durable start calls this
 /// on the same Task snapshot it records, and `start_opencode_run` calls it
@@ -4257,7 +4291,10 @@ impl TaskExecutor {
         repo_path: &str,
         acquired: Acquired,
     ) -> Result<RunStart, RunStartError> {
-        self.record_run_start_for(task_id, repo_path, acquired, None, true)
+        let membership =
+            Self::read_membership(&self.tasks, &self.projects, &self.workspace_registry, task_id)
+                .await;
+        self.record_run_start_for(task_id, repo_path, acquired, None, true, &membership)
             .await
     }
 
@@ -4269,6 +4306,12 @@ impl TaskExecutor {
     /// `no_additional_dirs` says the workspace needs no extra directory. It is
     /// decided by the caller before this write, so an OpenCode Task that needs
     /// one is refused here, with no run recorded.
+    ///
+    /// `membership` is what that decision read. The write commits only while
+    /// the Project still reads the same, checked under the tasks lock and
+    /// published before the membership guards are released. An attach or detach
+    /// therefore lands before the check (and refuses the start) or after the
+    /// commit (and leaves the run as decided); it never lands between them.
     async fn record_run_start_for(
         &self,
         task_id: Uuid,
@@ -4276,6 +4319,7 @@ impl TaskExecutor {
         acquired: Acquired,
         new_attempt: Option<&NewAttemptDecision>,
         no_additional_dirs: bool,
+        membership: &Membership,
     ) -> Result<RunStart, RunStartError> {
         let (branch, start_head) =
             match Self::checkout_branch_head(&acquired.info.path, &acquired.info.branch).await {
@@ -4368,8 +4412,28 @@ impl TaskExecutor {
         let launch_input: std::sync::Mutex<Option<(String, Option<String>, CodingProvider)>> = std::sync::Mutex::new(None);
         let refused_launch = std::sync::atomic::AtomicBool::new(false);
         let refusal: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let membership_changed = std::sync::atomic::AtomicBool::new(false);
+        // The membership read guards, held from the check to the publish. Taken
+        // and dropped in this function only, never across an await.
+        let membership_pinned: std::sync::Mutex<Option<MembershipGuards<'_>>> =
+            std::sync::Mutex::new(None);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
+                // Membership is checked before anything else, under the tasks
+                // lock. `try_read` never waits, so no lock is taken here that
+                // is not already free: a contended read refuses the start.
+                let (Ok(projects), Ok(registry)) =
+                    (self.projects.try_read(), self.workspace_registry.try_read())
+                else {
+                    membership_changed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                };
+                if Membership::of(t.project_id, &projects, &registry) != *membership {
+                    membership_changed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                *membership_pinned.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((projects, registry));
                 // The one comparison of an approved input with the Task that
                 // will run, in the write that starts the run. A binding that
                 // differs or was made for another run fails the Task closed
@@ -4544,19 +4608,45 @@ impl TaskExecutor {
                 )));
             }
         }
-        match crate::lifecycle::record_typed(&self.tasks, &self.storage, task_id, &amend).await {
+        let recorded = crate::lifecycle::record_typed(&self.tasks, &self.storage, task_id, &amend).await;
+        // The write has been published, so the membership guards end here.
+        drop(membership_pinned.lock().unwrap_or_else(|p| p.into_inner()).take());
+        match recorded {
+            // The Project's membership changed, or could not be read unchanged,
+            // so the start was not committed and nothing was launched. The Task's
+            // content is left as it was, with its approval, and the checkout this
+            // call created is taken back. This arm comes before the write's error
+            // arms, so a write that failed to publish durably is not reported as a
+            // visible start here: the refusal wrote no start, whatever the write said.
+            _ if membership_changed.load(std::sync::atomic::Ordering::Relaxed) => {
+                let cleanup = self
+                    .worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                Err(RunStartError::Refused(format!(
+                    "The Workspace membership of this Task's Project changed, or could not be confirmed unchanged, before its start was recorded; nothing was recorded or launched, so the start can be asked for again. {cleanup}"
+                )))
+            }
             // The Worker cannot run this Task as asked. The Task is failed with
             // the refusal and nothing was started; a checkout this call created
             // is taken back.
             Ok(()) if refused_launch.load(std::sync::atomic::Ordering::Relaxed) => {
-                self.worktree_manager
-                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
-                    .await;
                 let message = refusal
                     .into_inner()
                     .unwrap_or_else(|p| p.into_inner())
                     .unwrap_or_default();
-                Err(RunStartError::Unlaunchable(message))
+                // What cleanup did is part of the refusal: a checkout it kept
+                // is named, with the reason, and recorded on the Task.
+                let cleanup = self
+                    .worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                let cleanup = self
+                    .record_cleanup_outcome(task_id, cleanup, |task, outcome| {
+                        task.note_refused_launch_cleanup(&message, outcome)
+                    })
+                    .await;
+                Err(RunStartError::Unlaunchable(format!("{message} {cleanup}")))
             }
             // The Task no longer holds what was approved. Nothing was started;
             // a checkout this call created is taken back.
@@ -4886,10 +4976,26 @@ impl TaskExecutor {
     /// write fails or the Task no longer shows the refusal, the text says so,
     /// rather than leaving the outcome recorded nowhere.
     async fn note_stale_cleanup(&self, task_id: Uuid, outcome: String) -> String {
+        self.record_cleanup_outcome(task_id, outcome, |task, outcome| {
+            task.note_stale_cleanup(outcome)
+        })
+        .await
+    }
+
+    /// Record on the Task what the cleanup of a refused start left behind, so
+    /// it survives a restart. `note` decides whether the Task still shows that
+    /// refusal. Returns the text the refusal reports; when that write fails or
+    /// the Task no longer shows the refusal, the text says so.
+    async fn record_cleanup_outcome(
+        &self,
+        task_id: Uuid,
+        outcome: String,
+        note: impl Fn(&mut Task, &str) -> bool + Send + Sync,
+    ) -> String {
         let noted = std::sync::atomic::AtomicBool::new(false);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
-                noted.store(t.note_stale_cleanup(&outcome), std::sync::atomic::Ordering::Relaxed);
+                noted.store(note(t, &outcome), std::sync::atomic::Ordering::Relaxed);
             }
         };
         match crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend).await {
@@ -5198,17 +5304,15 @@ impl TaskExecutor {
         }
         // If the project is attached to a workspace, run Claude from the
         // workspace root and expose the task's working dir via --add-dir so
-        // the agent inherits the workspace's instruction files. Resolved before
-        // the durable start, because an OpenCode run that needs those extra
-        // directories is refused in that write.
-        let (claude_cwd, claude_add_dirs) = Self::resolve_workspace_launch(
-            &self.tasks,
-            &self.projects,
-            &self.workspace_registry,
-            task_id,
-            &acquired.info.path,
-        )
-        .await;
+        // the agent inherits the workspace's instruction files. Read before
+        // the durable start, which commits only while membership still reads
+        // the same. An OpenCode run that needs those extra directories is
+        // refused in that write.
+        let membership =
+            Self::read_membership(&self.tasks, &self.projects, &self.workspace_registry, task_id)
+                .await;
+        let (claude_cwd, claude_add_dirs) =
+            Self::launch_for_membership(&membership, &acquired.info.path);
         let RunStart {
             working_dir,
             run,
@@ -5223,6 +5327,7 @@ impl TaskExecutor {
                 acquired,
                 authorized.as_ref(),
                 claude_add_dirs.is_empty(),
+                &membership,
             )
             .await
         {
@@ -7675,6 +7780,36 @@ impl TaskExecutor {
 
     // --- Helpers ---
 
+    /// Reads a Task's membership. The Project map and the registry are read
+    /// one after the other, never nested, so the result may mix two moments.
+    /// [`Self::record_run_start_for`] checks the whole value again before it
+    /// commits, so a mixed reading can only refuse a start, never admit one.
+    async fn read_membership(
+        tasks: &Tasks,
+        projects: &Arc<RwLock<HashMap<Uuid, crate::domain::Project>>>,
+        workspace_registry: &Arc<RwLock<crate::config::WorkspaceRegistry>>,
+        task_id: Uuid,
+    ) -> Membership {
+        let project_id = tasks.read().await.get(&task_id).map(|t| t.project_id);
+        let Some(project_id) = project_id else {
+            return Membership { project_id: None, workspace_id: None, root: None };
+        };
+        let workspace_id = projects
+            .read()
+            .await
+            .get(&project_id)
+            .and_then(|p| p.scope.workspace_id());
+        let root = match workspace_id {
+            Some(id) => workspace_registry
+                .read()
+                .await
+                .get(&id)
+                .map(|ws| ws.root_path.as_path().to_path_buf()),
+            None => None,
+        };
+        Membership { project_id: Some(project_id), workspace_id, root }
+    }
+
     /// Resolve agent launch context.
     ///
     /// If the task's project is attached to a workspace *and that
@@ -7687,44 +7822,16 @@ impl TaskExecutor {
     /// unaffected by the workspace root disappearing, so launching from it
     /// directly is strictly safer than erroring out from underneath a task
     /// whose own working directory is still perfectly valid.
-    async fn resolve_workspace_launch(
-        tasks: &Tasks,
-        projects: &Arc<RwLock<HashMap<Uuid, crate::domain::Project>>>,
-        workspace_registry: &Arc<RwLock<crate::config::WorkspaceRegistry>>,
-        task_id: Uuid,
+    fn launch_for_membership(
+        membership: &Membership,
         task_working_dir: &str,
     ) -> (String, Vec<std::path::PathBuf>) {
-        let project_id = {
-            let tasks_r = tasks.read().await;
-            tasks_r.get(&task_id).map(|t| t.project_id)
-        };
-        let Some(project_id) = project_id else {
-            return (task_working_dir.to_string(), Vec::new());
-        };
-
-        let workspace_id = {
-            let projects_r = projects.read().await;
-            projects_r
-                .get(&project_id)
-                .and_then(|p| p.scope.workspace_id())
-        };
-        let Some(workspace_id) = workspace_id else {
-            return (task_working_dir.to_string(), Vec::new());
-        };
-
-        let root_path = {
-            let registry_r = workspace_registry.read().await;
-            registry_r
-                .get(&workspace_id)
-                .map(|ws| ws.root_path.as_path().to_path_buf())
-        };
-
-        match root_path {
-            Some(root) if root.is_dir() => (
+        match membership.root.as_ref().filter(|root| root.is_dir()) {
+            Some(root) => (
                 root.to_string_lossy().to_string(),
                 vec![std::path::PathBuf::from(task_working_dir)],
             ),
-            _ => (task_working_dir.to_string(), Vec::new()),
+            None => (task_working_dir.to_string(), Vec::new()),
         }
     }
 
@@ -8560,14 +8667,10 @@ mod tests {
         let task_id = task.id;
         let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
 
-        let (root, extra_dirs) = TaskExecutor::resolve_workspace_launch(
-            &tasks,
-            &projects,
-            &Arc::new(RwLock::new(registry)),
-            task_id,
-            "/tmp/task-working-dir",
-        )
-        .await;
+        let registry = Arc::new(RwLock::new(registry));
+        let membership = TaskExecutor::read_membership(&tasks, &projects, &registry, task_id).await;
+        let (root, extra_dirs) =
+            TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir");
 
         assert_eq!(
             root,
@@ -8612,14 +8715,10 @@ mod tests {
         let task_id = task.id;
         let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
 
-        let (root, extra_dirs) = TaskExecutor::resolve_workspace_launch(
-            &tasks,
-            &projects,
-            &Arc::new(RwLock::new(registry)),
-            task_id,
-            "/tmp/task-working-dir",
-        )
-        .await;
+        let registry = Arc::new(RwLock::new(registry));
+        let membership = TaskExecutor::read_membership(&tasks, &projects, &registry, task_id).await;
+        let (root, extra_dirs) =
+            TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir");
 
         assert_eq!(
             root, "/tmp/task-working-dir",
@@ -19484,6 +19583,217 @@ VERDICT: APPROVED"
             }
         }
 
+        /// A Task whose Worker is OpenCode with a Claude model. OpenCode cannot
+        /// take that model, so every start of the Task is refused before a run
+        /// is recorded or a provider launched.
+        async fn refused_launch_world() -> World {
+            let w = world(Class::Created).await;
+            let id = w.task_id;
+            crate::lifecycle::commit_task(&w.executor.tasks, &w.executor.storage, id, &move |staged: &mut HashMap<Uuid, Task>| {
+                let task = staged.get_mut(&id).unwrap();
+                task.provider = CodingProvider::OpenCode;
+                task.model = "claude-sonnet-4".to_string();
+            })
+            .await
+            .unwrap();
+            w
+        }
+
+        /// A refused launch of a checkout this call created, which nothing
+        /// touched, takes that checkout back. The refusal says so, on the Task
+        /// and after a restart.
+        #[tokio::test]
+        async fn a_refused_launch_reports_a_checkout_that_was_taken_back() {
+            let w = refused_launch_world().await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let worktree = acquired.info.path.clone();
+            let branch = acquired.info.branch.clone();
+
+            let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
+            let Err(RunStartError::Unlaunchable(message)) = refused else { panic!("{refused:?}") };
+            assert!(message.contains("does not take the Claude model"), "{message}");
+            assert!(message.contains("was removed again"), "{message}");
+            assert!(!std::path::Path::new(&worktree).exists(), "the created checkout is gone");
+            let branch_ref = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+                .current_dir(&w.repo)
+                .status()
+                .expect("spawn git");
+            assert!(!branch_ref.success(), "the branch this call created is gone too");
+
+            w.restart().await;
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.status, TaskStatus::Error);
+                assert_eq!(task.error_message.as_deref(), Some(message.as_str()));
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+                assert!(task.activity.iter().any(|e| matches!(
+                    &e.kind,
+                    ActivityKind::RunFailed { run: None, reason } if reason.contains("was removed again")
+                )));
+            }
+        }
+
+        /// A checkout that gained a commit nobody recorded is kept, and the
+        /// refusal names its path and branch, on the Task and after a restart.
+        /// Its contents are not touched.
+        #[tokio::test]
+        async fn a_refused_launch_keeps_a_checkout_that_gained_work_and_names_it() {
+            let w = refused_launch_world().await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let worktree = acquired.info.path.clone();
+            let branch = acquired.info.branch.clone();
+            git_in(std::path::Path::new(&worktree), &["commit", "-q", "--allow-empty", "-m", "work nobody recorded"]);
+
+            let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
+            let Err(RunStartError::Unlaunchable(message)) = refused else { panic!("{refused:?}") };
+            assert!(message.contains("does not take the Claude model"), "{message}");
+            assert!(message.contains("were kept"), "{message}");
+            assert!(message.contains(&worktree), "the retained checkout is named: {message}");
+            assert!(std::path::Path::new(&worktree).is_dir(), "the checkout is still there");
+            git_in(&w.repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+
+            w.restart().await;
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.error_message.as_deref(), Some(message.as_str()));
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+                assert!(task.activity.iter().any(|e| matches!(
+                    &e.kind,
+                    ActivityKind::RunFailed { run: None, reason } if reason.contains(&worktree)
+                )));
+            }
+        }
+
+        /// Cleanup that git refuses, because the checkout holds an untracked
+        /// file, is reported as a failure with git's reason. The checkout and
+        /// its file are left in place, and the refusal says so after a restart.
+        #[tokio::test]
+        async fn a_refused_launch_reports_a_checkout_cleanup_could_not_remove() {
+            let w = refused_launch_world().await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let worktree = acquired.info.path.clone();
+            let branch = acquired.info.branch.clone();
+            let scratch = std::path::Path::new(&worktree).join("unrecorded.txt");
+            std::fs::write(&scratch, "not yet committed").unwrap();
+
+            let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
+            let Err(RunStartError::Unlaunchable(message)) = refused else { panic!("{refused:?}") };
+            assert!(message.contains("could not be proven gone"), "{message}");
+            assert!(message.contains("untracked files"), "git's reason is kept: {message}");
+            assert!(message.contains(&worktree), "the retained checkout is named: {message}");
+            assert!(message.contains("was kept as well"), "{message}");
+            assert_eq!(std::fs::read_to_string(&scratch).unwrap(), "not yet committed", "nothing was deleted");
+            git_in(&w.repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+
+            w.restart().await;
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.error_message.as_deref(), Some(message.as_str()));
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+            }
+        }
+
+        /// Moves the World's Project into a Workspace, as an attach does.
+        async fn attach_project(w: &World) {
+            w.executor.projects.write().await.get_mut(&w.project_id).unwrap().scope =
+                ProjectScope::InWorkspace { workspace_id: Uuid::new_v4() };
+        }
+
+        async fn decided_membership(w: &World) -> Membership {
+            TaskExecutor::read_membership(&w.executor.tasks, &w.executor.projects, &w.executor.workspace_registry, w.task_id).await
+        }
+
+        /// Ordering one: the Project is attached after the launch read its
+        /// membership and before the start is written. The start is refused,
+        /// nothing is recorded or launched, the approval is kept, and a
+        /// checkout this call created is taken back.
+        #[tokio::test]
+        async fn a_membership_change_before_the_start_commits_refuses_it() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let worktree = acquired.info.path.clone();
+            let decided = decided_membership(&w).await;
+            attach_project(&w).await;
+
+            let refused = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, None, true, &decided).await;
+            let Err(RunStartError::Refused(message)) = refused else { panic!("{refused:?}") };
+            assert!(message.contains("Workspace membership"), "{message}");
+            assert!(message.contains("was removed again"), "{message}");
+            assert!(!std::path::Path::new(&worktree).exists(), "the created checkout is taken back");
+
+            w.restart().await;
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+                assert!(task.approved_execution.is_some(), "the approval is kept for the next start");
+                assert!(task.executed_approvals.is_empty(), "no approval was spent");
+            }
+        }
+
+        /// Ordering two: the Project is attached after the start committed. The
+        /// run stays as it was decided: the start is recorded, its approval is
+        /// spent, and it runs in the checkout it was decided for.
+        #[tokio::test]
+        async fn a_membership_change_after_the_start_commits_leaves_the_run_as_decided() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let worktree = acquired.info.path.clone();
+            let decided = decided_membership(&w).await;
+
+            let start = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, None, true, &decided).await;
+            let start = start.expect("the start commits against the decided membership");
+            assert_eq!(start.working_dir, worktree, "the run is in the checkout it was decided for");
+            attach_project(&w).await;
+            assert!(
+                w.executor.projects.read().await[&w.project_id].scope.workspace_id().is_some(),
+                "the membership did change"
+            );
+
+            w.restart().await;
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(run_starts(&task), 1, "the start was recorded");
+                assert_eq!(task.executed_approvals.len(), 1, "the approval was spent by that start");
+            }
+        }
+
+        /// A start that cannot read membership without waiting for it is
+        /// refused. The registry is held here, so the check cannot confirm the
+        /// membership it decided on, and it must not commit on that basis.
+        #[tokio::test]
+        async fn a_start_that_cannot_confirm_membership_without_waiting_is_refused() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let worktree = acquired.info.path.clone();
+            let decided = decided_membership(&w).await;
+
+            let held = w.executor.workspace_registry.write().await;
+            // The guard is held by this task, so a start that waited for it would hang.
+            let refused = tokio::time::timeout(
+                Duration::from_secs(10),
+                w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, None, true, &decided),
+            )
+            .await
+            .expect("the start does not wait for a contended registry");
+            drop(held);
+            let Err(RunStartError::Refused(message)) = refused else { panic!("{refused:?}") };
+            assert!(message.contains("could not be confirmed unchanged"), "{message}");
+            assert!(!std::path::Path::new(&worktree).exists(), "the created checkout is taken back");
+
+            w.restart().await;
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+            }
+        }
+
         #[tokio::test]
         async fn the_prompt_handed_to_the_provider_is_the_snapshot_the_start_was_recorded_from() {
             let w = world(Class::Created).await;
@@ -19514,7 +19824,8 @@ VERDICT: APPROVED"
                 dirty_paths: Vec::new(),
                 authorized_at: chrono::Utc::now(),
             };
-            let result = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, Some(&decision), true).await;
+            let membership = TaskExecutor::read_membership(&w.executor.tasks, &w.executor.projects, &w.executor.workspace_registry, w.task_id).await;
+            let result = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, Some(&decision), true, &membership).await;
             assert!(result.is_err(), "no recorded recovery authorizes this attempt");
             assert!(w.on_disk().approved_execution.is_some() || w.in_memory().await.approved_execution.is_some());
         }
