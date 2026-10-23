@@ -13,6 +13,19 @@ pub enum TaskEditMode {
     Edit(Box<Task>),
 }
 
+/// Whether `model` is an OpenCode model id, `provider/model`: both parts are
+/// present, and the id has no whitespace or control characters. The backend
+/// applies the same rule before it starts a run.
+fn is_opencode_model_id(model: &str) -> bool {
+    let Some((provider, name)) = model.split_once('/') else {
+        return false;
+    };
+    !provider.is_empty()
+        && !name.is_empty()
+        && model.len() <= 200
+        && model.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
 #[component]
 pub fn TaskEditModal(
     #[prop(into)] show: Signal<bool>,
@@ -458,6 +471,14 @@ pub fn TaskEditModal(
                                         set_error_msg.set(Some("Task title is required".to_string()));
                                         return;
                                     }
+                                    // An OpenCode run needs its model as provider/model. The backend
+                                    // refuses any other id when the run starts, so the form refuses it first.
+                                    if provider.get() == CodingProvider::OpenCode && !is_opencode_model_id(model.get().trim()) {
+                                        set_error_msg.set(Some(
+                                            "OpenCode needs its model as provider/model, for example ollama/llama3.2:3b".to_string(),
+                                        ));
+                                        return;
+                                    }
 
                                     set_submitting.set(true);
                                     set_error_msg.set(None);
@@ -575,5 +596,23 @@ pub fn TaskEditModal(
                 </div>
             </div>
         </Show>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_opencode_model_id;
+
+    #[test]
+    fn an_opencode_model_is_provider_and_model_without_whitespace() {
+        assert!(is_opencode_model_id("ollama/llama3.2:3b"));
+        assert!(is_opencode_model_id("ollama/dcostenco/prism-coder:4b"));
+        assert!(!is_opencode_model_id("default"));
+        assert!(!is_opencode_model_id("sonnet"));
+        assert!(!is_opencode_model_id(""));
+        assert!(!is_opencode_model_id("ollama/"));
+        assert!(!is_opencode_model_id("/llama3.2:3b"));
+        assert!(!is_opencode_model_id("ollama/llama 3"));
+        assert!(!is_opencode_model_id("ollama/llama\n3"));
     }
 }
