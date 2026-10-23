@@ -263,6 +263,10 @@ pub struct WorkerHandoff {
     /// Absent on older records and for Automatic runs.
     #[serde(default, skip_serializing_if = "ReviewMode::is_default")]
     pub review_mode: ReviewMode,
+    /// Mirrors the backend field: the run's record was rebuilt without its
+    /// evidence, so `review_mode` is not what the run started under.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub review_mode_unproven: bool,
     pub stage: WorkerHandoffStage,
     /// Mirrors the backend field: the human decision that resolved this
     /// run's recovery. Kept so a task round-trips through the frontend whole.
@@ -1172,6 +1176,7 @@ mod tests {
             branch: None,
             start_head: None,
             review_mode: ReviewMode::Manual,
+            review_mode_unproven: false,
             stage: WorkerHandoffStage::Started {},
             acceptance: None,
         };
@@ -1179,6 +1184,32 @@ mod tests {
         assert_eq!(value["review_mode"], "manual");
         let loaded: WorkerHandoff = serde_json::from_value(value).unwrap();
         assert_eq!(loaded.review_mode, ReviewMode::Manual);
+    }
+
+    /// A run whose record was rebuilt after it was lost carries the unproven
+    /// flag, and the frontend model must read it, or the Task cannot load.
+    #[test]
+    fn an_unproven_run_handoff_round_trips_through_the_frontend_model() {
+        let handoff = WorkerHandoff {
+            task_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            review_mode: ReviewMode::Manual,
+            review_mode_unproven: true,
+            stage: WorkerHandoffStage::RecoveryRequired {
+                reason: "run record lost".to_string(),
+                observed_commit: None,
+            },
+            acceptance: None,
+        };
+        let value = serde_json::to_value(&handoff).unwrap();
+        assert_eq!(value["review_mode_unproven"], true);
+        let loaded: WorkerHandoff = serde_json::from_value(value).unwrap();
+        assert!(loaded.review_mode_unproven);
+        assert_eq!(loaded, handoff);
     }
 
     fn task_json(status: &str, review: serde_json::Value, pr_url: Option<&str>) -> Task {
