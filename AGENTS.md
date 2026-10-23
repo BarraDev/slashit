@@ -78,9 +78,7 @@ slashit-app/
     └── tauri.conf.json
 ```
 
-Module layout and conventions live in the nested docs: `src/AGENTS.md` for
-the frontend, `src-tauri/src/AGENTS.md` for the backend (see the list at the
-end). Dependencies and versions are in the `Cargo.toml` files.
+Module layout and conventions live in the nested docs listed at the end; dependency versions are in the `Cargo.toml` files.
 
 ## Tauri + Leptos Configuration
 
@@ -236,15 +234,17 @@ rather than leaving it for a follow-up.
 Tool and session provenance belongs in private working notes, not in the
 repository's public history.
 
+## Async, concurrency and reliable state
+
+Before changing async lifecycles, shared state, IPC, subprocesses, persistence or approval policy, read [async-safety.md](docs/engineering/async-safety.md) (the binding rules) and [concurrency-standard.md](docs/engineering/concurrency-standard.md) (the reference).
+
 ## Nested AGENTS.md
 
-This project has additional `AGENTS.md` files in subdirectories with module-specific guidance:
-
+Module guidance (each is also a `CLAUDE.md` stub containing only `@AGENTS.md`):
 - `src/AGENTS.md` -- Frontend (Leptos/WASM) patterns
 - `src-tauri/src/AGENTS.md` -- Backend (Tauri v2) overview
 - `src-tauri/src/domain/AGENTS.md` -- Domain models conventions
-- `src-tauri/src/agents/AGENTS.md` -- Claude Code agent execution
+- `src-tauri/src/agents/AGENTS.md` -- Agent execution (Claude and OpenCode)
 
-Each is also exposed as a `CLAUDE.md` stub containing only `@AGENTS.md`.
 `docs/agent-docs.toml` maps every other module directory to the parent
 `AGENTS.md` that covers it; `scripts/check-agent-docs.sh` enforces both.
