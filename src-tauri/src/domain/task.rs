@@ -1044,6 +1044,21 @@ impl Task {
         self.approved_execution = None;
     }
 
+    /// Fail the Task because its Worker cannot launch what it asks for, decided
+    /// before any run started. No run is recorded and the run number is not
+    /// spent, so the next attempt is the same run. The approval binding ends
+    /// with the failure, as it does for a stale approval: a person re-approves.
+    pub fn fail_refused_launch(&mut self, reason: &str) {
+        let from = self.status.clone();
+        self.status = TaskStatus::Error;
+        self.phase = TaskPhase::Failed;
+        self.worker_handoff_confirmed = false;
+        self.error_message = Some(reason.to_string());
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: reason.to_string() });
+        self.record_move(&from);
+        self.approved_execution = None;
+    }
+
     /// Add what became of the checkout taken for a stale refusal, once cleanup
     /// has run. The Task must still be the one `fail_stale_approval` left
     /// (failed closed, with the stale reason and nothing else), so a Task moved

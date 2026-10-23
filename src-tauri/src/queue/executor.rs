@@ -60,6 +60,33 @@ impl StartFailure {
 /// Claude for every Task, so an OpenCode Task that reaches review can still
 /// invoke a Claude model, billed separately from OpenCode. The test suite
 /// stands that Claude in with a fake program, so no test calls a model.
+/// What an OpenCode run cannot honor, decided from inputs known before the
+/// durable start. `None` when the run may start. The durable start calls this
+/// on the same Task snapshot it records, and `start_opencode_run` calls it
+/// again as a defense: it must agree with the earlier decision.
+fn opencode_refusal(model: Option<&str>, no_additional_dirs: bool) -> Option<String> {
+    // The OpenCode Worker's process group and provider lease exist only on
+    // Unix. Elsewhere, a tool process could outlive its run, so none starts.
+    if !cfg!(unix) {
+        return Some(
+            "OpenCode Tasks run only on Unix for now: SlashIt cannot yet end the OpenCode process tree or hold its provider lease on this platform. Run this Task with Claude."
+                .to_string(),
+        );
+    }
+    if let Some(model) = model {
+        return Some(format!(
+            "OpenCode does not take the Claude model {model}. Set this Task's model to default, or run it with Claude."
+        ));
+    }
+    if !no_additional_dirs {
+        return Some(
+            "This Task's workspace needs extra directories, which an OpenCode run cannot reach yet. Run it with Claude."
+                .to_string(),
+        );
+    }
+    None
+}
+
 async fn start_opencode_run(
     prompt: String,
     working_dir: String,
@@ -67,25 +94,8 @@ async fn start_opencode_run(
     no_additional_dirs: bool,
     lease: Option<crate::agents::provider_lease::ProviderLease>,
 ) -> Result<CodingRunner, StartFailure> {
-    // The OpenCode Worker's process group and provider lease exist only on
-    // Unix. Elsewhere, a tool process could outlive its run, so none starts.
-    if !cfg!(unix) {
-        drop((prompt, working_dir, model, no_additional_dirs, lease));
-        return Err(StartFailure::refused(
-            "OpenCode Tasks run only on Unix for now: SlashIt cannot yet end the OpenCode process tree or hold its provider lease on this platform. Run this Task with Claude."
-                .to_string(),
-        ));
-    }
-    if let Some(model) = model {
-        return Err(StartFailure::refused(format!(
-            "OpenCode does not take the Claude model {model}. Set this Task's model to default, or run it with Claude."
-        )));
-    }
-    if !no_additional_dirs {
-        return Err(StartFailure::refused(
-            "This Task's workspace needs extra directories, which an OpenCode run cannot reach yet. Run it with Claude."
-                .to_string(),
-        ));
+    if let Some(message) = opencode_refusal(model.as_deref(), no_additional_dirs) {
+        return Err(StartFailure::refused(message));
     }
     // OpenCode has no system-prompt slot, so the rule Claude receives as an
     // appended system prompt is sent ahead of the Task prompt.
@@ -130,12 +140,16 @@ enum RunStartError {
     /// created it, and the outcome of that cleanup travels with the refusal:
     /// `None` when no checkout was taken.
     StaleApproval(Option<String>),
+    /// The Worker cannot run what the Task asks for. The Task was failed in the
+    /// write that would have recorded the start, so no run started and nothing
+    /// was consumed. The message is the refusal's own text.
+    Unlaunchable(String),
 }
 
 impl std::fmt::Display for RunStartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Refused(message) => f.write_str(message),
+            Self::Refused(message) | Self::Unlaunchable(message) => f.write_str(message),
             Self::StaleApproval(None) => f.write_str(crate::domain::task::STALE_APPROVAL_REASON),
             Self::StaleApproval(Some(cleanup)) => {
                 write!(f, "{} {cleanup}", crate::domain::task::STALE_APPROVAL_REASON)
@@ -4243,7 +4257,7 @@ impl TaskExecutor {
         repo_path: &str,
         acquired: Acquired,
     ) -> Result<RunStart, RunStartError> {
-        self.record_run_start_for(task_id, repo_path, acquired, None)
+        self.record_run_start_for(task_id, repo_path, acquired, None, true)
             .await
     }
 
@@ -4251,12 +4265,17 @@ impl TaskExecutor {
     /// the authorization is consumed in the same board write that records the
     /// run's start, and only if the Task still matches it. Otherwise nothing is
     /// written and the checkout is left as it was.
+    ///
+    /// `no_additional_dirs` says the workspace needs no extra directory. It is
+    /// decided by the caller before this write, so an OpenCode Task that needs
+    /// one is refused here, with no run recorded.
     async fn record_run_start_for(
         &self,
         task_id: Uuid,
         repo_path: &str,
         acquired: Acquired,
         new_attempt: Option<&NewAttemptDecision>,
+        no_additional_dirs: bool,
     ) -> Result<RunStart, RunStartError> {
         let (branch, start_head) =
             match Self::checkout_branch_head(&acquired.info.path, &acquired.info.branch).await {
@@ -4347,6 +4366,8 @@ impl TaskExecutor {
         let consumed = std::sync::atomic::AtomicBool::new(false);
         let stale = std::sync::atomic::AtomicBool::new(false);
         let launch_input: std::sync::Mutex<Option<(String, Option<String>, CodingProvider)>> = std::sync::Mutex::new(None);
+        let refused_launch = std::sync::atomic::AtomicBool::new(false);
+        let refusal: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
                 // The one comparison of an approved input with the Task that
@@ -4359,6 +4380,19 @@ impl TaskExecutor {
                     t.fail_stale_approval();
                     stale.store(true, std::sync::atomic::Ordering::Relaxed);
                     return;
+                }
+                // An OpenCode run that cannot launch as asked is refused in this
+                // write, on the snapshot it would record: nothing is consumed and
+                // no run number is spent, so the next attempt is the same run.
+                // Its approval ends with the failure, as a stale approval's does.
+                if t.provider == CodingProvider::OpenCode {
+                    let model = if t.model.is_empty() || t.model == "default" { None } else { Some(t.model.as_str()) };
+                    if let Some(message) = opencode_refusal(model, no_additional_dirs) {
+                        t.fail_refused_launch(&message);
+                        *refusal.lock().unwrap_or_else(|p| p.into_inner()) = Some(message);
+                        refused_launch.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
                 }
                 // Only a binding that matches this run authorizes its request.
                 // An unbound Task runs as an ordinary Task.
@@ -4511,6 +4545,19 @@ impl TaskExecutor {
             }
         }
         match crate::lifecycle::record_typed(&self.tasks, &self.storage, task_id, &amend).await {
+            // The Worker cannot run this Task as asked. The Task is failed with
+            // the refusal and nothing was started; a checkout this call created
+            // is taken back.
+            Ok(()) if refused_launch.load(std::sync::atomic::Ordering::Relaxed) => {
+                self.worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                let message = refusal
+                    .into_inner()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .unwrap_or_default();
+                Err(RunStartError::Unlaunchable(message))
+            }
             // The Task no longer holds what was approved. Nothing was started;
             // a checkout this call created is taken back.
             Ok(()) if stale.load(std::sync::atomic::Ordering::Relaxed) => {
@@ -5149,6 +5196,19 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
+        // If the project is attached to a workspace, run Claude from the
+        // workspace root and expose the task's working dir via --add-dir so
+        // the agent inherits the workspace's instruction files. Resolved before
+        // the durable start, because an OpenCode run that needs those extra
+        // directories is refused in that write.
+        let (claude_cwd, claude_add_dirs) = Self::resolve_workspace_launch(
+            &self.tasks,
+            &self.projects,
+            &self.workspace_registry,
+            task_id,
+            &acquired.info.path,
+        )
+        .await;
         let RunStart {
             working_dir,
             run,
@@ -5157,7 +5217,13 @@ impl TaskExecutor {
             model: task_model,
             provider,
         } = match self
-            .record_run_start_for(task_id, &repo_path, acquired, authorized.as_ref())
+            .record_run_start_for(
+                task_id,
+                &repo_path,
+                acquired,
+                authorized.as_ref(),
+                claude_add_dirs.is_empty(),
+            )
             .await
         {
                 Ok(start) => {
@@ -5172,7 +5238,10 @@ impl TaskExecutor {
                     });
                     // Failed closed on the Task: it is no longer waiting, so no
                     // backoff is needed to keep the scheduler off it.
-                    if matches!(error, RunStartError::StaleApproval(_)) {
+                    if matches!(
+                        error,
+                        RunStartError::StaleApproval(_) | RunStartError::Unlaunchable(_)
+                    ) {
                         return Err(message);
                     }
                     // A failed handoff write must not be overwritten by an
@@ -5226,18 +5295,6 @@ impl TaskExecutor {
             phase: TaskPhase::Coding,
             progress: RUN_START_PROGRESS,
         });
-
-        // If the project is attached to a workspace, run Claude from the
-        // workspace root and expose the task's working dir via --add-dir so
-        // the agent inherits the workspace's instruction files.
-        let (claude_cwd, claude_add_dirs) = Self::resolve_workspace_launch(
-            &self.tasks,
-            &self.projects,
-            &self.workspace_registry,
-            task_id,
-            &working_dir,
-        )
-        .await;
 
         let tasks = self.tasks.clone();
         let executions = self.executions.clone();
@@ -18893,6 +18950,36 @@ VERDICT: APPROVED"
                 .expect("the provider has ended and its lease is free");
         }
 
+        /// OpenCode cannot take a Claude model, so the Task is refused. The
+        /// refusal is decided in the write that would record the start, so no
+        /// run starts on the timeline and the run number is not spent.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn an_opencode_task_with_a_claude_model_is_refused_before_its_run_starts() {
+            let (w, agent) = opencode_task_running("ok").await;
+            w.executor.tasks.write().await.get_mut(&w.task_id).unwrap().model =
+                "claude-sonnet-4".to_string();
+            let started = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(
+                matches!(&started, Err(message) if message.contains("does not take the Claude model")),
+                "{started:?}"
+            );
+            let task = settled(&w).await;
+            assert_eq!(task.status, TaskStatus::Error, "{:?}", task.error_message);
+            let message = task.error_message.clone().unwrap_or_default();
+            assert!(message.contains("does not take the Claude model"), "{message}");
+            assert!(
+                !task
+                    .activity
+                    .iter()
+                    .any(|entry| matches!(entry.kind, ActivityKind::RunStarted { .. })),
+                "a refused launch must not record a started run: {:?}",
+                task.activity
+            );
+            assert_eq!(task.next_run(), 1, "the run number is not spent");
+            assert_eq!(agent.launches("opencode"), 0, "no OpenCode process ran");
+        }
+
         /// The Worker was refused a permission, then finished the change through
         /// an operation it was allowed. The change is committed and the Task
         /// reaches AI review, and the refusal stays in the run's log.
@@ -19427,7 +19514,7 @@ VERDICT: APPROVED"
                 dirty_paths: Vec::new(),
                 authorized_at: chrono::Utc::now(),
             };
-            let result = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, Some(&decision)).await;
+            let result = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, Some(&decision), true).await;
             assert!(result.is_err(), "no recorded recovery authorizes this attempt");
             assert!(w.on_disk().approved_execution.is_some() || w.in_memory().await.approved_execution.is_some());
         }
