@@ -67,9 +67,14 @@ pub(super) struct Owned {
 /// provider that cannot be recorded is ended before anything can use it. The
 /// child leads its own process group, so ending the run ends the tools it
 /// started too. See `agents::provider_lease`.
+///
+/// `held` is dropped only after the child has been reaped, on every path that
+/// starts one. A caller puts there what the child reads, such as its
+/// configuration directory.
 pub(super) fn spawn(
     spec: &SpawnSpec,
     lease: Option<ProviderLease>,
+    held: Box<dyn Send>,
 ) -> Result<Owned, AcpError> {
     if !spec.cwd.is_absolute() {
         return Err(AcpError::InvalidWorkingDirectory(
@@ -118,30 +123,23 @@ pub(super) fn spawn(
         if let Err(message) = recorded {
             // The group is ended here, while the lock is still held, so no
             // provider runs that a later attempt could not account for.
-            kill_group(pid);
-            let _ = child.start_kill();
+            end_unsupervised(child, pid, held);
             return Err(AcpError::Spawn(excerpt(&format!(
                 "the provider's lease could not be recorded, so it was ended: {message}"
             ))));
         }
     }
 
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| AcpError::Spawn("no stdin pipe".into()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AcpError::Spawn("no stdout pipe".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AcpError::Spawn("no stderr pipe".into()))?;
+    let (Some(stdin), Some(stdout), Some(stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        end_unsupervised(child, pid, held);
+        return Err(AcpError::Spawn("the provider's pipes were not captured".into()));
+    };
 
     let (control, control_rx) = mpsc::unbounded_channel();
     let (exit_tx, exit_rx) = watch::channel(None);
-    tokio::spawn(supervise(child, pid, control_rx, exit_tx));
+    tokio::spawn(supervise(child, pid, control_rx, exit_tx, held));
 
     Ok(Owned {
         stdin,
@@ -152,13 +150,26 @@ pub(super) fn spawn(
     })
 }
 
+/// Ends a child that no supervisor owns, and drops `held` only once the child
+/// has been reaped. Used when a start fails after the spawn.
+fn end_unsupervised(mut child: Child, pid: Option<u32>, held: Box<dyn Send>) {
+    kill_group(pid);
+    let _ = child.start_kill();
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+        drop(held);
+    });
+}
+
 /// Owns the child. Ends its process group on request or when every handle is
-/// gone, and reports the status once it has been reaped.
+/// gone, and reports the status once it has been reaped. `_held` is dropped
+/// after that report, so what it holds outlives the process.
 async fn supervise(
     mut child: Child,
     pid: Option<u32>,
     mut control: mpsc::UnboundedReceiver<Control>,
     exit: watch::Sender<ExitReport>,
+    _held: Box<dyn Send>,
 ) {
     let mut control_open = true;
     loop {

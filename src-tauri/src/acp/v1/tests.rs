@@ -52,7 +52,7 @@ fn spec(scenario: &str, request_timeout: Duration, permission_timeout: Duration)
 }
 
 fn start(scenario: &str) -> Connection {
-    Connection::spawn_leased(&spec(scenario, LONG, LONG), None).expect("spawn fixture")
+    Connection::spawn_holding(&spec(scenario, LONG, LONG), None, Box::new(())).expect("spawn fixture")
 }
 
 /// Waits for the next event that satisfies `matches`, skipping the rest.
@@ -311,7 +311,7 @@ async fn streamed_updates_are_typed_and_unknown_events_are_not_actions() {
 
 #[tokio::test]
 async fn permission_without_a_decision_is_cancelled_by_timeout() {
-    let conn = Connection::spawn_leased(&spec("permission", LONG, Duration::from_millis(100)), None).unwrap();
+    let conn = Connection::spawn_holding(&spec("permission", LONG, Duration::from_millis(100)), None, Box::new(())).unwrap();
     conn.initialize().await.unwrap();
     let session = conn.new_session(&std::env::temp_dir()).await.unwrap();
     let mut events = conn.take_events().unwrap();
@@ -343,7 +343,7 @@ async fn permission_without_a_decision_is_cancelled_by_timeout() {
 #[tokio::test]
 async fn permission_decisions_must_name_an_offered_option_of_the_matching_kind() {
     let (conn, session) = {
-        let conn = Connection::spawn_leased(&spec("permission", LONG, LONG), None).unwrap();
+        let conn = Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
         conn.initialize().await.unwrap();
         let session = conn.new_session(&std::env::temp_dir()).await.unwrap();
         (conn, session)
@@ -386,7 +386,7 @@ async fn permission_decisions_must_name_an_offered_option_of_the_matching_kind()
 
 #[tokio::test]
 async fn an_explicit_reject_selects_only_the_reject_option() {
-    let conn = Connection::spawn_leased(&spec("permission", LONG, LONG), None).unwrap();
+    let conn = Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
     conn.initialize().await.unwrap();
     let session = conn.new_session(&std::env::temp_dir()).await.unwrap();
     let mut events = conn.take_events().unwrap();
@@ -421,7 +421,7 @@ async fn an_explicit_reject_selects_only_the_reject_option() {
 
 #[tokio::test]
 async fn cancel_answers_pending_permission_and_ends_the_turn_as_cancelled() {
-    let conn = Connection::spawn_leased(&spec("permission", LONG, LONG), None).unwrap();
+    let conn = Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
     conn.initialize().await.unwrap();
     let session = conn.new_session(&std::env::temp_dir()).await.unwrap();
     let mut events = conn.take_events().unwrap();
@@ -491,7 +491,7 @@ async fn a_cancel_is_written_while_a_request_is_waiting_for_its_reply() {
 
 #[tokio::test]
 async fn a_request_times_out_when_the_agent_is_silent() {
-    let conn = Connection::spawn_leased(&spec("silent", Duration::from_millis(150), LONG), None).unwrap();
+    let conn = Connection::spawn_holding(&spec("silent", Duration::from_millis(150), LONG), None, Box::new(())).unwrap();
     conn.initialize().await.unwrap();
     let error = conn.new_session(&std::env::temp_dir()).await.unwrap_err();
     assert_eq!(
@@ -633,7 +633,7 @@ async fn a_failed_connection_ends_the_processes_its_agent_started() {
         request_timeout: LONG,
         permission_timeout: LONG,
     };
-    let conn = Connection::spawn_leased(&spec, None).expect("spawn");
+    let conn = Connection::spawn_holding(&spec, None, Box::new(())).expect("spawn");
     assert!(conn.initialize().await.is_err(), "a malformed frame must fail");
     let pid: i32 = std::fs::read_to_string(&pid_file)
         .expect("the agent recorded its grandchild")
@@ -647,4 +647,113 @@ async fn a_failed_connection_ends_the_processes_its_agent_started() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("the grandchild {pid} outlived its failed connection");
+}
+
+/// Stands in for a run's configuration directory. It reports, when it is
+/// released, whether the child holding the same lease has ended. The child
+/// inherits the lease and releases it only when it exits, so `prove_absent`
+/// observes the end of the process.
+#[cfg(unix)]
+struct ReleaseProbe {
+    lease: PathBuf,
+    released: Option<tokio::sync::oneshot::Sender<bool>>,
+}
+
+#[cfg(unix)]
+impl Drop for ReleaseProbe {
+    fn drop(&mut self) {
+        if let Some(released) = self.released.take() {
+            let ended = crate::agents::provider_lease::prove_absent(&self.lease).is_ok();
+            let _ = released.send(ended);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn probe(dir: &Path) -> (PathBuf, ReleaseProbe, tokio::sync::oneshot::Receiver<bool>) {
+    let lease = dir.join("lease");
+    let (released, ended) = tokio::sync::oneshot::channel();
+    let probe = ReleaseProbe {
+        lease: lease.clone(),
+        released: Some(released),
+    };
+    (lease, probe, ended)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_held_resource_is_released_only_after_a_dropped_child_has_ended() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (lease_path, held, ended) = probe(dir.path());
+    let lease = crate::agents::provider_lease::acquire(&lease_path)
+        .expect("acquire")
+        .expect("unix lease");
+    let conn = Connection::spawn_holding(
+        &spec("ignore-eof", LONG, LONG),
+        Some(lease),
+        Box::new(held),
+    )
+    .expect("spawn");
+    drop(conn);
+    // The child ignores the end of its input, and this test has not yielded
+    // since the kill was requested, so the child is still running.
+    assert!(
+        crate::agents::provider_lease::prove_absent(&lease_path).is_err(),
+        "the child ended before its connection was dropped"
+    );
+    let ended_when_released = tokio::time::timeout(LONG, ended)
+        .await
+        .expect("the held resource was never released")
+        .expect("the held resource was dropped without a result");
+    assert!(
+        ended_when_released,
+        "the held resource was released while the child was still running"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_held_resource_is_released_only_after_a_shut_down_child_has_ended() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (lease_path, held, ended) = probe(dir.path());
+    let lease = crate::agents::provider_lease::acquire(&lease_path)
+        .expect("acquire")
+        .expect("unix lease");
+    let conn = Connection::spawn_holding(&spec("ok", LONG, LONG), Some(lease), Box::new(held))
+        .expect("spawn");
+    conn.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    let ended_when_released = tokio::time::timeout(LONG, ended)
+        .await
+        .expect("the held resource was never released")
+        .expect("the held resource was dropped without a result");
+    assert!(
+        ended_when_released,
+        "the held resource was released while the child was still running"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_held_resource_is_released_only_after_a_child_that_failed_to_initialize_has_ended() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (lease_path, held, ended) = probe(dir.path());
+    let lease = crate::agents::provider_lease::acquire(&lease_path)
+        .expect("acquire")
+        .expect("unix lease");
+    let conn = Connection::spawn_holding(
+        &spec("bad-version", LONG, LONG),
+        Some(lease),
+        Box::new(held),
+    )
+    .expect("spawn");
+    assert!(conn.initialize().await.is_err(), "the bad version must fail");
+    drop(conn);
+    let ended_when_released = tokio::time::timeout(LONG, ended)
+        .await
+        .expect("the held resource was never released")
+        .expect("the held resource was dropped without a result");
+    assert!(
+        ended_when_released,
+        "the held resource was released while the child was still running"
+    );
 }

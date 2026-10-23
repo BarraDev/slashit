@@ -140,13 +140,11 @@ pub struct OpenCodeRunner {
     outcome: OnceCell<Result<(), String>>,
     /// One entry per permission request this run refused, in arrival order.
     refusals: Refusals,
-    /// The empty configuration directory OpenCode was started with. Removed
-    /// when the run is dropped. A kill is requested, not awaited, on that path
-    /// and on a start that fails after the spawn, so the process may still be
-    /// exiting when the directory is removed. OpenCode reads no configuration
-    /// from a missing directory, so nothing is read from the user's home in that
-    /// window.
-    _config_dir: tempfile::TempDir,
+    /// The configuration directory OpenCode was started with, for the tests
+    /// that check when it is removed. The process supervisor owns the
+    /// directory and removes it only after the process has been reaped.
+    #[cfg(test)]
+    config_path: std::path::PathBuf,
 }
 
 /// The refused permission requests of one run, shared with its event reader.
@@ -156,7 +154,9 @@ impl OpenCodeRunner {
     /// Starts the process, initializes the protocol, creates a session and
     /// sends the prompt. `lease`, when present, is held by the process for
     /// its whole life. An error here means no session started, and the
-    /// process was ended.
+    /// process was ended. The configuration directory is handed to the
+    /// process supervisor, which removes it once the process has been reaped,
+    /// so no path, including a kill or a failed start, removes it earlier.
     pub async fn start(
         config: OpenCodeRunConfig,
         lease: Option<ProviderLease>,
@@ -181,7 +181,8 @@ impl OpenCodeRunner {
             request_timeout: REQUEST_TIMEOUT,
             permission_timeout: PERMISSION_TIMEOUT,
         };
-        let connection = Connection::spawn_leased(&spec, lease).map_err(|e| e.to_string())?;
+        let connection = Connection::spawn_holding(&spec, lease, Box::new(config_dir))
+            .map_err(|e| e.to_string())?;
         connection.initialize().await.map_err(|e| e.to_string())?;
         let session = connection
             .new_session(&config.working_dir)
@@ -225,7 +226,8 @@ impl OpenCodeRunner {
             reader: Mutex::new(Some(reader)),
             outcome: OnceCell::new(),
             refusals,
-            _config_dir: config_dir,
+            #[cfg(test)]
+            config_path: std::path::PathBuf::from(config_path),
         })
     }
 
@@ -668,5 +670,98 @@ mod tests {
         assert_eq!(run.wait().await, Ok(true));
         crate::agents::provider_lease::prove_absent(&path)
             .expect("the provider has ended and nothing holds the lease");
+    }
+
+    /// Polls until `done` holds. The wait is bounded so that a missing event
+    /// fails the test; it never decides an outcome by itself.
+    #[cfg(unix)]
+    async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    #[cfg(unix)]
+    fn lease_at(path: &std::path::Path) -> crate::agents::provider_lease::ProviderLease {
+        crate::agents::provider_lease::acquire(path)
+            .expect("acquire")
+            .expect("unix lease")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_live_run_keeps_its_configuration_until_its_agent_has_ended() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lease_path = dir.path().join("lease");
+        let run = OpenCodeRunner::start(fixture("ignore-eof"), Some(lease_at(&lease_path)))
+            .await
+            .expect("start");
+        let config = run.config_path.clone();
+        drop(run);
+        // This test runs on a single-threaded runtime and has not yielded since
+        // the kill was requested, so the agent is still running and its
+        // configuration is in place.
+        assert!(crate::agents::provider_lease::prove_absent(&lease_path).is_err());
+        assert!(config.is_dir(), "the configuration was removed while the agent ran");
+        eventually("the dropped run's agent did not end", || {
+            crate::agents::provider_lease::prove_absent(&lease_path).is_ok()
+        })
+        .await;
+        eventually("the configuration was not removed after its agent ended", || {
+            !config.exists()
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_finished_run_removes_its_configuration_once_its_agent_has_ended() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lease_path = dir.path().join("lease");
+        let run = OpenCodeRunner::start(fixture("ok"), Some(lease_at(&lease_path)))
+            .await
+            .expect("start");
+        let config = run.config_path.clone();
+        assert_eq!(run.wait().await, Ok(true));
+        crate::agents::provider_lease::prove_absent(&lease_path)
+            .expect("the agent has ended once its run has");
+        eventually("the finished run's configuration was not removed", || !config.exists()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_run_removes_its_configuration_once_its_agent_has_been_reaped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lease_path = dir.path().join("lease");
+        let run = OpenCodeRunner::start(fixture("permission"), Some(lease_at(&lease_path)))
+            .await
+            .expect("start");
+        let config = run.config_path.clone();
+        // `kill` returns once the agent has been reaped.
+        let _ = run.kill().await;
+        crate::agents::provider_lease::prove_absent(&lease_path)
+            .expect("kill returned while the agent was still running");
+        eventually("the cancelled run's configuration was not removed", || !config.exists()).await;
+        let _ = run.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_start_ends_its_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lease_path = dir.path().join("lease");
+        let error = OpenCodeRunner::start(fixture("bad-version"), Some(lease_at(&lease_path)))
+            .await
+            .err()
+            .expect("start must fail");
+        assert!(error.contains("protocol version"), "{error}");
+        eventually("the failed start's agent was not ended", || {
+            crate::agents::provider_lease::prove_absent(&lease_path).is_ok()
+        })
+        .await;
     }
 }

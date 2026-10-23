@@ -229,13 +229,16 @@ impl EventStream {
 impl Connection {
     /// Starts the agent process for a provider that owns a lease, or for a
     /// test with none. The lease is marked, inherited and recorded around the
-    /// spawn, and it is held by the child until the process is reaped. See
-    /// `process::spawn`.
-    pub fn spawn_leased(
+    /// spawn, and it is held by the child until the process has exited. `held`
+    /// is dropped only after the child has been reaped, on a kill, a shutdown
+    /// and a start that fails after the spawn alike. A run puts there the
+    /// configuration directory the child was started with. See `process::spawn`.
+    pub fn spawn_holding(
         spec: &SpawnSpec,
         lease: Option<crate::agents::provider_lease::ProviderLease>,
+        held: Box<dyn Send>,
     ) -> Result<Self, AcpError> {
-        let owned = process::spawn(spec, lease)?;
+        let owned = process::spawn(spec, lease, held)?;
         let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let (events, events_rx) = mpsc::unbounded_channel();
         process::spawn_writer(owned.stdin, outbound_rx);
