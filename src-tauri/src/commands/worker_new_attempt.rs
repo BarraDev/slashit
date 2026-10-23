@@ -741,6 +741,7 @@ mod tests {
                 reason: "interrupted".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         task.record_activity(ActivityKind::RunStarted {
             run: 1,
@@ -977,6 +978,7 @@ mod tests {
             start_head: Some(fx.start.clone()),
             acceptance: None,
             stage: WorkerHandoffStage::Started {},
+            review_mode_unproven: false,
         });
         fx.state
             .task
@@ -1352,6 +1354,7 @@ mod tests {
                 start_head: Some(started_head.clone()),
                 acceptance: None,
                 stage: WorkerHandoffStage::Started {},
+                review_mode_unproven: false,
             });
         })
         .await;

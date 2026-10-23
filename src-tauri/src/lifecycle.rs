@@ -4243,6 +4243,7 @@ mod tests {
                     observed_commit: None,
                 },
                 acceptance: None,
+                review_mode_unproven: false,
             });
         })
         .await;
@@ -4289,6 +4290,7 @@ mod tests {
                             observed_commit: None,
                         },
                         acceptance: None,
+                        review_mode_unproven: false,
                     });
                 }
             };

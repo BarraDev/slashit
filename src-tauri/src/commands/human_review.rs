@@ -816,6 +816,56 @@ mod tests {
     /// Changes cannot be requested while an earlier cleanup of the Task's
     /// checkout is unfinished: the Task would enter Queue with that work still
     /// pending. Nothing is recorded, and the Task stays in Human Review.
+    /// A Manual run sent back with changes, and sent back again after its
+    /// next arrival, keeps the Manual mode on the Task and on its run record.
+    /// Requesting changes never changes how a run is reviewed.
+    #[tokio::test]
+    async fn changes_requested_on_a_manual_run_keep_its_mode_across_both_rounds() {
+        use crate::domain::task::{ReviewMode, WorkerHandoff, WorkerHandoffStage};
+        let (_tmp, state) = test_state().await;
+        let (project_id, task_id) = seed_in_review(&state).await;
+        let seed = move |staged: &mut HashMap<Uuid, Task>| {
+            let t = staged.get_mut(&task_id).unwrap();
+            t.review_mode = ReviewMode::Manual;
+            t.worker_handoff = Some(WorkerHandoff {
+                task_id,
+                project_id,
+                repository_id: None,
+                run: Some(1),
+                branch: t.branch_name.clone(),
+                start_head: None,
+                acceptance: None,
+                review_mode: ReviewMode::Manual,
+                review_mode_unproven: false,
+                stage: WorkerHandoffStage::ResolvedToAiReview {
+                    commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                },
+            });
+        };
+        crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &seed)
+            .await
+            .unwrap();
+
+        request_changes(&state, task_id, "Count lines.").await.expect("first request");
+        let first = on_disk(&state, project_id, task_id);
+        assert_eq!(first.status, TaskStatus::Queue);
+        assert_eq!(first.review_mode, ReviewMode::Manual, "the Task keeps its mode");
+        let handoff = first.worker_handoff.as_ref().expect("the run record is kept");
+        assert_eq!(handoff.review_mode, ReviewMode::Manual, "the run keeps its mode");
+        assert!(!handoff.review_mode_unproven);
+
+        // The next arrival and request come from the same Manual Task.
+        arrive_again(&state, task_id).await;
+        request_changes(&state, task_id, "And bytes.").await.expect("second request");
+        let second = on_disk(&state, project_id, task_id);
+        assert_eq!(second.review_mode, ReviewMode::Manual);
+        assert_eq!(
+            second.worker_handoff.as_ref().map(|h| h.review_mode),
+            Some(ReviewMode::Manual)
+        );
+        assert_eq!(second.human_review.entries.len(), 2, "both rounds are recorded");
+    }
+
     #[tokio::test]
     async fn changes_cannot_be_requested_while_a_cleanup_is_unfinished() {
         let (_tmp, state) = test_state().await;

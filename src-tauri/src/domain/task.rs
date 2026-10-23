@@ -426,6 +426,13 @@ pub struct WorkerHandoff {
     /// started under. A handoff written before this field existed is Automatic.
     #[serde(default, skip_serializing_if = "ReviewMode::is_default")]
     pub review_mode: ReviewMode,
+    /// Set when this record was rebuilt for a run whose own record was lost, so
+    /// `review_mode` is not evidence of the mode the run started under. Such a
+    /// run is held in Manual review, and no automatic reviewer starts for it,
+    /// until a person decides. A record written before this field existed is
+    /// proven, so the field defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub review_mode_unproven: bool,
     /// The one human decision that resolved this run's recovery, if any. It
     /// lives and dies with the handoff of the run it resolved: the next run
     /// replaces the whole record, and a stale run is refused by its run
@@ -2367,6 +2374,7 @@ mod tests {
             start_head: None,
             stage: WorkerHandoffStage::Started {},
             acceptance: None,
+            review_mode_unproven: false,
         });
         assert!(!with_handoff.never_checked_out());
     }
@@ -2521,6 +2529,7 @@ mod tests {
                 reason: "interrupted".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         let decision = NewAttemptDecision {
             decision_id: Uuid::new_v4(),
@@ -2594,6 +2603,7 @@ mod tests {
                 reason: "exact commit unknown".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         assert!(!task.is_ready_to_execute());
         assert_eq!(task.needs_you(false), Some(AttentionReason::Recovery));
@@ -2633,6 +2643,7 @@ mod tests {
             stage: WorkerHandoffStage::ResolvedToAiReview {
                 commit: "b".repeat(40),
             },
+            review_mode_unproven: false,
         });
         task.record_activity_at(completed_at, ActivityKind::RunCompleted { run: 1 });
         task.human_review.record_arrival();
@@ -2663,6 +2674,7 @@ mod tests {
             stage: WorkerHandoffStage::ResolvedToAiReview {
                 commit: "b".repeat(40),
             },
+            review_mode_unproven: false,
         });
         task.human_review.record_arrival();
         task.human_review.push(
@@ -2817,6 +2829,7 @@ mod tests {
             acceptance: None,
             stage: WorkerHandoffStage::Started {},
             review_mode: ReviewMode::Automatic,
+            review_mode_unproven: false,
         };
         let stored = serde_json::to_value(&handoff).unwrap();
         assert!(stored.get("review_mode").is_none(), "a run's default is not written");

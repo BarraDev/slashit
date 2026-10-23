@@ -881,14 +881,16 @@ fn mark_worker_recovery_required(task: &mut Task, run: Option<u32>, reason: &str
             branch: task.branch_name.clone(),
             start_head: None,
             acceptance: None,
-            // A record recreated for a run whose own record is gone: the Task's
-            // configured mode is the only evidence left, so a Manual Task is not
-            // sent to AI Review by default.
-            review_mode: task.review_mode,
+            // A record recreated for a run whose own record is gone. The Task's
+            // configured mode is not evidence of the mode the run started under,
+            // so it is not copied here. The run is held in Manual review, which
+            // starts no automatic reviewer, until a person decides.
+            review_mode: domain::task::ReviewMode::Manual,
             stage: domain::task::WorkerHandoffStage::RecoveryRequired {
                 reason: reason.to_string(),
                 observed_commit: observed_commit.clone(),
             },
+            review_mode_unproven: true,
         });
     handoff.run = run.or(handoff.run);
     handoff.stage = domain::task::WorkerHandoffStage::RecoveryRequired {
@@ -1601,6 +1603,100 @@ mod tests {
         assert_eq!(task.activity.len(), 1);
     }
 
+    /// A Coding Task with no run record, recovered while the Task is
+    /// configured in `configured_at_recovery`. Once the record is lost, the
+    /// mode the run started under is not stored anywhere, so the recovery sees
+    /// only the Task's current configuration.
+    fn recovered_without_a_run_record(
+        configured_at_recovery: domain::task::ReviewMode,
+    ) -> domain::task::WorkerHandoff {
+        let mut task = task_with(
+            domain::TaskStatus::InProgress,
+            domain::TaskPhase::Coding,
+            "default",
+        );
+        task.review_mode = configured_at_recovery;
+        assert!(migrate_task(&mut task));
+        task.worker_handoff.expect("recovery writes a record")
+    }
+
+    #[test]
+    fn a_missing_run_record_is_held_in_manual_review_whatever_the_task_mode_is() {
+        use domain::task::ReviewMode::{Automatic, Manual};
+        // A Manual run whose Task is edited to Automatic, and an Automatic
+        // run whose Task is edited to Manual, reach the same outcome: no
+        // automatic reviewer, and the record says the mode is unproven.
+        for configured in [Automatic, Manual] {
+            let handoff = recovered_without_a_run_record(configured);
+            assert_eq!(handoff.review_mode, Manual, "configured {configured:?}");
+            assert!(handoff.review_mode_unproven, "configured {configured:?}");
+        }
+    }
+
+    #[test]
+    fn a_held_run_is_still_held_after_a_restart_before_its_review_decision() {
+        use domain::task::ReviewMode::Manual;
+        let mut task = task_with(
+            domain::TaskStatus::InProgress,
+            domain::TaskPhase::Coding,
+            "default",
+        );
+        assert!(migrate_task(&mut task));
+        let stored = serde_json::to_string(&task).expect("serialize");
+        let mut restarted: Task = serde_json::from_str(&stored).expect("deserialize");
+        let handoff = restarted.worker_handoff.as_ref().expect("record survives");
+        assert_eq!(handoff.review_mode, Manual);
+        assert!(handoff.review_mode_unproven);
+        // The restart does not repeat the recovery or change the record.
+        assert!(!migrate_task(&mut restarted));
+        assert!(restarted.worker_handoff.as_ref().unwrap().review_mode_unproven);
+    }
+
+    #[test]
+    fn a_surviving_run_record_keeps_its_own_mode_through_recovery() {
+        use domain::task::ReviewMode::{Automatic, Manual};
+        for run_mode in [Automatic, Manual] {
+            let mut task = task_with(
+                domain::TaskStatus::InProgress,
+                domain::TaskPhase::Coding,
+                "default",
+            );
+            task.review_mode = run_mode;
+            task.worker_handoff = Some(domain::task::WorkerHandoff {
+                task_id: task.id,
+                project_id: task.project_id,
+                repository_id: None,
+                run: Some(1),
+                branch: None,
+                start_head: None,
+                acceptance: None,
+                review_mode: run_mode,
+                review_mode_unproven: false,
+                stage: domain::task::WorkerHandoffStage::Started {},
+            });
+            // The Task is then edited to the other mode before recovery.
+            task.review_mode = if run_mode == Automatic { Manual } else { Automatic };
+            assert!(migrate_task(&mut task));
+            let handoff = task.worker_handoff.as_ref().unwrap();
+            assert_eq!(handoff.review_mode, run_mode, "the run's own record decides");
+            assert!(!handoff.review_mode_unproven, "an existing record is proven");
+        }
+    }
+
+    #[test]
+    fn a_record_written_before_provenance_is_read_as_proven() {
+        let stored = serde_json::json!({
+            "task_id": uuid::Uuid::nil(),
+            "project_id": uuid::Uuid::nil(),
+            "run": 1,
+            "stage": { "state": "started" },
+        });
+        let handoff: domain::task::WorkerHandoff =
+            serde_json::from_value(stored).expect("legacy record");
+        assert!(!handoff.review_mode_unproven);
+        assert_eq!(handoff.review_mode, domain::task::ReviewMode::Automatic);
+    }
+
     #[test]
     fn an_orphaned_ai_review_keeps_its_stage_and_is_not_requeued_as_coding() {
         let mut task = task_with(
@@ -1636,6 +1732,7 @@ mod tests {
             stage: domain::task::WorkerHandoffStage::CommittedAwaitingReview {
                 commit: "b".repeat(40),
             },
+            review_mode_unproven: false,
         });
 
         assert!(!migrate_task(&mut task));
@@ -1821,6 +1918,7 @@ mod tests {
             start_head: Some(commit.clone()),
             acceptance: None,
             stage: domain::task::WorkerHandoffStage::ResolvedToAiReview { commit },
+            review_mode_unproven: false,
         });
         // Recorded location no longer exists -- the trigger for adoption.
         task.worktree_path = Some(

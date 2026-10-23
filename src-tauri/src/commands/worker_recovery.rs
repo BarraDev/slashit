@@ -1029,6 +1029,7 @@ mod tests {
                 reason: "interrupted".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         task.record_activity(ActivityKind::RunStarted {
             run: 1,
@@ -2007,6 +2008,37 @@ mod tests {
         assert_eq!(skipped(&again), 1, "a duplicate signal records nothing new");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_whose_review_mode_is_unproven_never_reaches_an_automatic_reviewer() {
+        let fx = fixture().await;
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let executor = fx.state.executor.get().unwrap().clone();
+        // The Task is configured Automatic, but the run's record was rebuilt
+        // without its evidence, so the mode the run started under is unknown.
+        assert_eq!(
+            fx.task().await.review_mode,
+            crate::domain::task::ReviewMode::Automatic
+        );
+        executor.mark_run_unproven_for_test(fx.task_id).await;
+
+        executor.spawn_review_for_test(fx.task_id).await;
+
+        let task = fx.task().await;
+        assert_eq!(task.status, TaskStatus::HumanReview, "a person decides");
+        assert!(task.qa_signoff.is_none(), "no AI verdict is invented");
+        assert!(
+            !task
+                .activity
+                .iter()
+                .any(|e| matches!(e.kind, ActivityKind::AiReviewStarted { .. })),
+            "no automatic reviewer was admitted"
+        );
+        assert_eq!(fx.on_disk().status, TaskStatus::HumanReview, "durable");
+    }
+
     #[tokio::test]
     async fn review_admission_records_the_start_durably_and_a_later_fix_commit_is_not_recovery() {
         let fx = fixture().await;
@@ -2634,6 +2666,7 @@ mod tests {
                 reason: "r".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         task.worker_handoff_confirmed = true;
         let decision = WorkerResultAcceptance {

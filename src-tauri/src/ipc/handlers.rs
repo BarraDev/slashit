@@ -1329,6 +1329,7 @@ mod lifecycle_ownership {
             start_head: None,
             stage: crate::domain::WorkerHandoffStage::Started {},
             acceptance: None,
+            review_mode_unproven: false,
         });
         let task_id = seed_task(&ctx, task).await;
         let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
@@ -1395,6 +1396,7 @@ mod lifecycle_ownership {
                         observed_commit: None,
                     },
                     acceptance: None,
+                    review_mode_unproven: false,
                 });
             }
             // A fixed, old timestamp: any rewrite of the record moves it.

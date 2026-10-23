@@ -783,6 +783,7 @@ mod existing_checkout_tests {
             start_head: None,
             stage,
             acceptance: None,
+            review_mode_unproven: false,
         }
     }
 

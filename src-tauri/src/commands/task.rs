@@ -2084,6 +2084,7 @@ mod lifecycle_ownership {
                         observed_commit: None,
                     },
                     acceptance: None,
+                    review_mode_unproven: false,
                 });
             }
             // A fixed, old timestamp: any rewrite of the record moves it.
@@ -2720,6 +2721,7 @@ mod queue_entry_from_a_status_move {
             start_head: None,
             stage: WorkerHandoffStage::Started {},
             acceptance: None,
+            review_mode_unproven: false,
         });
         let (project_id, task_id) = seed(&state, task).await;
         let executor = crate::test_helpers::attach_test_executor(&state);

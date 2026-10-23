@@ -1495,6 +1495,7 @@ pub(crate) mod tests {
                 reason: "evidence that must survive".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         let task_id = task.id;
         rig.ctx.storage.save_project_tasks(project_id, std::slice::from_ref(&task)).unwrap();

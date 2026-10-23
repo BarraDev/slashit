@@ -17268,6 +17268,7 @@ mod recovery_admission_tests {
                 reason: "interrupted".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         let id = task.id;
         state.task.tasks.write().await.insert(id, task.clone());

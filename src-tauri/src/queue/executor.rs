@@ -2295,6 +2295,22 @@ impl TaskExecutor {
         }
     }
 
+    /// Makes the current run's record the rebuilt kind that recovery writes
+    /// when the original record is lost: Manual, and unproven.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn mark_run_unproven_for_test(&self, task_id: Uuid) {
+        if let Some(handoff) = self
+            .tasks
+            .write()
+            .await
+            .get_mut(&task_id)
+            .and_then(|t| t.worker_handoff.as_mut())
+        {
+            handoff.review_mode = crate::domain::task::ReviewMode::Manual;
+            handoff.review_mode_unproven = true;
+        }
+    }
+
     async fn check_and_execute(&self) {
         // Closed admission means shutdown has begun. Nothing below may start
         // an owner, and the reconciliations are the poller's own work, not
@@ -4603,6 +4619,7 @@ impl TaskExecutor {
                     // Fixed here, under the same write that records the start,
                     // so this run's review cannot follow a later edit.
                     review_mode: t.review_mode,
+                    review_mode_unproven: false,
                 });
                 run.store(next, std::sync::atomic::Ordering::Relaxed);
             }
@@ -8193,13 +8210,15 @@ impl TaskExecutor {
                     branch: task.branch_name.clone(),
                     start_head: None,
                     acceptance: None,
-                    // A record recreated for a run whose own record is gone: the Task's
-                    // configured mode is the only evidence left.
-                    review_mode: task.review_mode,
+                    // A record recreated for a run whose own record is gone. The
+                    // Task's configured mode is not copied: it is not evidence of
+                    // the mode the run started under. See `mark_worker_recovery_required`.
+                    review_mode: crate::domain::task::ReviewMode::Manual,
                     stage: crate::domain::task::WorkerHandoffStage::RecoveryRequired {
                         reason: reason.clone(),
                         observed_commit: observed_commit.clone(),
                     },
+                    review_mode_unproven: true,
                 });
             handoff.run = run.or(handoff.run);
             handoff.stage = crate::domain::task::WorkerHandoffStage::RecoveryRequired {
@@ -11178,6 +11197,7 @@ mod tests {
             acceptance: None,
             stage: crate::domain::task::WorkerHandoffStage::Started {},
             review_mode,
+            review_mode_unproven: false,
         }
     }
 
@@ -11197,6 +11217,17 @@ mod tests {
         task.worker_handoff = Some(run_record(Manual));
         task.review_mode = Automatic;
         assert!(current_run_is_manual(&task), "a Manual run stays Manual after an edit");
+
+        // A record rebuilt after its run's record was lost is held in Manual
+        // whatever the Task is configured to, so no automatic reviewer starts.
+        let mut unproven = run_record(Manual);
+        unproven.review_mode_unproven = true;
+        task.worker_handoff = Some(unproven);
+        task.review_mode = Automatic;
+        assert!(
+            current_run_is_manual(&task),
+            "an unproven run is held in Manual, never sent to an automatic reviewer"
+        );
     }
 
     // --- transition_to_human_review ---
@@ -11711,6 +11742,7 @@ mod tests {
                 start_head: Some("a".repeat(40)),
                 acceptance: None,
                 stage: crate::domain::task::WorkerHandoffStage::Started {},
+                review_mode_unproven: false,
             });
             (task.id, task.project_id)
         };
@@ -11784,6 +11816,7 @@ mod tests {
                 start_head: Some("a".repeat(40)),
                 acceptance: None,
                 stage: crate::domain::task::WorkerHandoffStage::Started {},
+                review_mode_unproven: false,
             });
             task.clone()
         };
@@ -11849,6 +11882,7 @@ mod tests {
                 stage: crate::domain::task::WorkerHandoffStage::CommittedAwaitingReview {
                     commit: "b".repeat(40),
                 },
+                review_mode_unproven: false,
             });
         }
         let started = executor.tasks.read().await[&id].clone();
@@ -18253,6 +18287,7 @@ VERDICT: APPROVED"
                 stage: crate::domain::task::WorkerHandoffStage::ResolvedToAiReview {
                     commit: base_commit.clone(),
                 },
+                review_mode_unproven: false,
             });
             task.worker_handoff_confirmed = true;
             let task_id = task.id;
@@ -20487,6 +20522,7 @@ VERDICT: APPROVED"
                     start_head: Some(w.main_tip.clone()),
                     acceptance: None,
                     stage: crate::domain::task::WorkerHandoffStage::Started {},
+                    review_mode_unproven: false,
                 });
                 let board: Vec<_> = tasks
                     .values()
@@ -23086,6 +23122,7 @@ VERDICT: APPROVED"
                 start_head: None,
                 acceptance: None,
                 stage,
+                review_mode_unproven: false,
             }
         }
 
@@ -24426,6 +24463,7 @@ VERDICT: APPROVED"
                     start_head: None,
                     acceptance: None,
                     stage: crate::domain::task::WorkerHandoffStage::Started {},
+                    review_mode_unproven: false,
                 });
             assert!(!matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
             assert_eq!(fx.task().await.status, TaskStatus::Backlog);
@@ -24455,6 +24493,7 @@ VERDICT: APPROVED"
                 stage: crate::domain::task::WorkerHandoffStage::ResolvedToAiReview {
                     commit: git_in(&fx.checkout, &["rev-parse", "HEAD"]),
                 },
+                review_mode_unproven: false,
             });
             task.human_review.record_arrival();
             task.human_review.push(

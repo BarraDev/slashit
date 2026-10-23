@@ -313,6 +313,7 @@ fn full_task(project_id: Uuid) -> Task {
             observed_commit: Some(commit('c')),
             decided_at: at(11),
         }),
+        review_mode_unproven: true,
     });
     task.new_attempt = Some(NewAttemptDecision {
         decision_id: Uuid::new_v4(),
@@ -359,6 +360,7 @@ fn variant_tasks(project_id: Uuid) -> Vec<Task> {
             start_head: None,
             stage,
             acceptance: None,
+            review_mode_unproven: false,
         });
         task
     };
