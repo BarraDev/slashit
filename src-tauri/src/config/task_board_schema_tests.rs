@@ -138,6 +138,7 @@ fn full_task(project_id: Uuid) -> Task {
     task.description = Some("described".into());
     task.last_observed_model = Some("observed".into());
     task.provider = crate::domain::task::CodingProvider::OpenCode;
+    task.review_mode = crate::domain::task::ReviewMode::Manual;
     task.dependencies = vec![Uuid::new_v4()];
     task.worktree_id = Some(Uuid::new_v4());
     task.jj_change_id = Some("change".into());
@@ -304,6 +305,7 @@ fn full_task(project_id: Uuid) -> Task {
         run: Some(1),
         branch: Some("task/full".into()),
         start_head: Some(commit('a')),
+        review_mode: crate::domain::task::ReviewMode::Manual,
         stage: WorkerHandoffStage::Started {},
         acceptance: Some(WorkerResultAcceptance {
             decision_id: Uuid::new_v4(),
@@ -348,6 +350,7 @@ fn variant_tasks(project_id: Uuid) -> Vec<Task> {
         let mut task = crate::test_helpers::create_test_task("Variant");
         task.project_id = project_id;
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id,
             repository_id: None,

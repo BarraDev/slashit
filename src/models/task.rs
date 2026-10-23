@@ -69,6 +69,16 @@ pub enum CodingProvider {
     OpenCode,
 }
 
+/// How a Task's finished coding run is reviewed. Mirrors the backend's
+/// `ReviewMode`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewMode {
+    #[default]
+    Automatic,
+    Manual,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: Uuid,
@@ -80,6 +90,10 @@ pub struct Task {
     /// Which coding Worker runs the Task. Absent on older records: Claude.
     #[serde(default)]
     pub provider: CodingProvider,
+    /// How the Task's coding runs are reviewed. Absent on older records:
+    /// Automatic.
+    #[serde(default)]
+    pub review_mode: ReviewMode,
     /// Evidence only: the model the provider last reported for a run. It never
     /// changes `model`, the configured policy.
     #[serde(default)]

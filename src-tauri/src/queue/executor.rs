@@ -705,6 +705,16 @@ pub(crate) struct Acquired {
     pub(crate) checkout_admission: Option<crate::domain::task::CheckoutAdmission>,
 }
 
+/// Whether the Task's current run was started in Manual review mode. Only the
+/// run's own record decides this, never the Task's configured mode, so an edit
+/// made after the run started cannot change it. A Task with no current run
+/// record is not Manual.
+fn current_run_is_manual(task: &Task) -> bool {
+    task.worker_handoff
+        .as_ref()
+        .is_some_and(|handoff| handoff.review_mode == crate::domain::task::ReviewMode::Manual)
+}
+
 /// Whether `task` sits where a delivered pull request lives, so that the
 /// poll may finish it when the pull request merges and record a failure when
 /// it closes.
@@ -2264,6 +2274,25 @@ impl TaskExecutor {
     #[cfg(all(test, unix))]
     pub(crate) async fn spawn_review_for_test(&self, task_id: Uuid) {
         self.spawn_review(task_id).await;
+    }
+
+    /// Stands in for the run-start write that fixes a run's review mode, so a
+    /// test can start a run in a chosen mode without launching a Worker.
+    #[cfg(test)]
+    pub(crate) async fn start_run_in_review_mode_for_test(
+        &self,
+        task_id: Uuid,
+        review_mode: crate::domain::task::ReviewMode,
+    ) {
+        if let Some(handoff) = self
+            .tasks
+            .write()
+            .await
+            .get_mut(&task_id)
+            .and_then(|t| t.worker_handoff.as_mut())
+        {
+            handoff.review_mode = review_mode;
+        }
     }
 
     async fn check_and_execute(&self) {
@@ -4571,6 +4600,9 @@ impl TaskExecutor {
                     start_head: Some(start_head.clone()),
                     acceptance: None,
                     stage: crate::domain::task::WorkerHandoffStage::Started {},
+                    // Fixed here, under the same write that records the start,
+                    // so this run's review cannot follow a later edit.
+                    review_mode: t.review_mode,
                 });
                 run.store(next, std::sync::atomic::Ordering::Relaxed);
             }
@@ -6940,6 +6972,48 @@ impl TaskExecutor {
             .get(&task_id)
             .map_or(1, Task::next_review);
 
+        // A run started in Manual mode is not followed by an AI review. The
+        // decision comes from the run's own record, which the run-start write
+        // fixed, so a later change to the Task's mode cannot reach it. Nothing
+        // here starts a reviewer, a review-fix agent or CodeRabbit, and no
+        // QA signoff is written, because none was produced.
+        let (manual_run, manual_already_settled) = {
+            let tasks = self.tasks.read().await;
+            tasks.get(&task_id).map_or((false, false), |t| {
+                let manual = current_run_is_manual(t);
+                (
+                    manual && t.status == TaskStatus::AiReview,
+                    manual && t.status != TaskStatus::AiReview,
+                )
+            })
+        };
+        // A Manual run that already left AI Review was decided by an earlier
+        // signal. Falling through would start an automatic review for it, so a
+        // duplicate signal stops here and records nothing.
+        if manual_already_settled {
+            return;
+        }
+        if manual_run {
+            let trail = vec![(
+                chrono::Utc::now(),
+                ActivityKind::AiReviewSkipped {
+                    review,
+                    reason: "Manual review mode was selected, so AI Review was not run"
+                        .to_string(),
+                },
+            )];
+            Self::transition_to_human_review(
+                &self.tasks,
+                &self.storage,
+                &self.events,
+                task_id,
+                None,
+                trail,
+            )
+            .await;
+            return;
+        }
+
         // The task's own worktree, or no review at all.
         //
         // This used to fall back to the repository path, and a review is not a
@@ -8119,6 +8193,9 @@ impl TaskExecutor {
                     branch: task.branch_name.clone(),
                     start_head: None,
                     acceptance: None,
+                    // A record recreated for a run whose own record is gone: the Task's
+                    // configured mode is the only evidence left.
+                    review_mode: task.review_mode,
                     stage: crate::domain::task::WorkerHandoffStage::RecoveryRequired {
                         reason: reason.clone(),
                         observed_commit: observed_commit.clone(),
@@ -11087,6 +11164,41 @@ mod tests {
         }
     }
 
+    // --- review mode snapshot ---
+
+    /// A run record in the given mode, as the run-start write creates it.
+    fn run_record(review_mode: crate::domain::task::ReviewMode) -> crate::domain::task::WorkerHandoff {
+        crate::domain::task::WorkerHandoff {
+            task_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            acceptance: None,
+            stage: crate::domain::task::WorkerHandoffStage::Started {},
+            review_mode,
+        }
+    }
+
+    #[test]
+    fn a_run_is_manual_only_by_its_own_record_never_by_the_configured_mode() {
+        use crate::domain::task::ReviewMode::{Automatic, Manual};
+        let mut task = create_test_task_full("subject", Uuid::new_v4(), TaskStatus::AiReview, 0);
+        assert!(!current_run_is_manual(&task), "no run record is not Manual");
+
+        // The Task is edited to Manual after its Automatic run started. The run
+        // keeps its own mode, so its review is not redirected.
+        task.review_mode = Manual;
+        task.worker_handoff = Some(run_record(Automatic));
+        assert!(!current_run_is_manual(&task), "an Automatic run stays Automatic after an edit");
+
+        // A Manual run keeps Manual even after the Task is edited back.
+        task.worker_handoff = Some(run_record(Manual));
+        task.review_mode = Automatic;
+        assert!(current_run_is_manual(&task), "a Manual run stays Manual after an edit");
+    }
+
     // --- transition_to_human_review ---
 
     #[tokio::test]
@@ -11590,6 +11702,7 @@ mod tests {
             let task = tasks.get_mut(&id).unwrap();
             task.phase = TaskPhase::Coding;
             task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                review_mode: Default::default(),
                 task_id: id,
                 project_id,
                 repository_id: None,
@@ -11662,6 +11775,7 @@ mod tests {
             task.worktree_path = Some("/preserved/task-checkout".into());
             task.branch_name = Some("task-stop-recovery".into());
             task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                review_mode: Default::default(),
                 task_id: id,
                 project_id,
                 repository_id: None,
@@ -11724,6 +11838,7 @@ mod tests {
                 addressing_feedback: false,
             });
             task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                review_mode: Default::default(),
                 task_id: id,
                 project_id,
                 repository_id: None,
@@ -18127,6 +18242,7 @@ VERDICT: APPROVED"
             let mut task =
                 reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
             task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                review_mode: Default::default(),
                 task_id: task.id,
                 project_id: task.project_id,
                 repository_id: None,
@@ -20362,6 +20478,7 @@ VERDICT: APPROVED"
                 let task = tasks.get_mut(&w.task_id).unwrap();
                 task.status = TaskStatus::InProgress;
                 task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                    review_mode: Default::default(),
                     task_id: w.task_id,
                     project_id: w.project_id,
                     repository_id: None,
@@ -22960,6 +23077,7 @@ VERDICT: APPROVED"
 
         fn handoff(task: &Task, stage: WorkerHandoffStage) -> WorkerHandoff {
             WorkerHandoff {
+                review_mode: Default::default(),
                 task_id: task.id,
                 project_id: task.project_id,
                 repository_id: None,
@@ -24299,6 +24417,7 @@ VERDICT: APPROVED"
             let evidence = fx.evidence().await;
             fx.executor.tasks.write().await.get_mut(&fx.task_id).unwrap().worker_handoff =
                 Some(crate::domain::task::WorkerHandoff {
+                    review_mode: Default::default(),
                     task_id: fx.task_id,
                     project_id: fx.project_id,
                     repository_id: None,
@@ -24325,6 +24444,7 @@ VERDICT: APPROVED"
             );
             task.record_activity_at(completed_at, ActivityKind::RunCompleted { run: 1 });
             task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                review_mode: Default::default(),
                 task_id: fx.task_id,
                 project_id: fx.project_id,
                 repository_id: None,

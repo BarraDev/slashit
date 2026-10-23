@@ -1320,6 +1320,7 @@ mod lifecycle_ownership {
         // Task is In Progress.
         let mut task = create_test_task_full("running", project_id, TaskStatus::InProgress, 0);
         task.worker_handoff = Some(crate::domain::WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id,
             repository_id: None,
@@ -1382,6 +1383,7 @@ mod lifecycle_ownership {
             task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
             if with_recovery {
                 task.worker_handoff = Some(crate::domain::WorkerHandoff {
+                    review_mode: Default::default(),
                     task_id: task.id,
                     project_id,
                     repository_id: None,

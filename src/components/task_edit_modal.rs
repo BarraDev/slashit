@@ -3,7 +3,7 @@ use leptos::task::spawn_local;
 use leptos::callback::Callback;
 use crate::components::task_dependency::{self, choice_for, requested, DependencyChoice, DependencyField};
 use crate::models::{Task, TaskCategory, TaskPriority};
-use crate::models::task::CodingProvider;
+use crate::models::task::{CodingProvider, ReviewMode};
 use crate::services::{create_task, update_task, delete_task, set_task_dependencies, agent_service::list_available_models, agent_service::ModelInfo};
 use uuid::Uuid;
 
@@ -43,6 +43,7 @@ pub fn TaskEditModal(
     let (priority, set_priority) = signal(TaskPriority::Medium);
     let (model, set_model) = signal("default".to_string());
     let (provider, set_provider) = signal(CodingProvider::Claude);
+    let (review_mode, set_review_mode) = signal(ReviewMode::Automatic);
     let (planning_mode, set_planning_mode) = signal(false);
 
     // The Depends on choice: at most one Task of this Project. The form keeps
@@ -109,6 +110,7 @@ pub fn TaskEditModal(
                     set_priority.set(TaskPriority::Medium);
                     set_model.set("default".to_string());
                     set_provider.set(CodingProvider::Claude);
+                    set_review_mode.set(ReviewMode::Automatic);
                     set_planning_mode.set(false);
                     set_title_touched.set(false);
                     dependency.set(None);
@@ -120,6 +122,7 @@ pub fn TaskEditModal(
                     set_priority.set(task.priority.clone());
                     set_model.set(task.model.clone());
                     set_provider.set(task.provider);
+                    set_review_mode.set(task.review_mode);
                     set_planning_mode.set(task.planning_mode);
                     set_title_touched.set(true); // Already has content
                     dependency.set(task.dependencies.first().copied());
@@ -341,6 +344,38 @@ pub fn TaskEditModal(
                             TaskEditMode::Create => ().into_any(),
                         }}
 
+                        // Review mode. Changed on an existing Task only; a new Task is
+                        // Automatic. A run keeps the mode it started with.
+                        {move || match mode.get() {
+                            TaskEditMode::Edit(_) => view! {
+                                <div>
+                                    <label class="block text-sm font-medium text-white/70 mb-1.5">"Review"</label>
+                                    <select
+                                        on:change=move |ev| {
+                                            let next = match event_target_value(&ev).as_str() {
+                                                "manual" => ReviewMode::Manual,
+                                                _ => ReviewMode::Automatic,
+                                            };
+                                            set_review_mode.set(next);
+                                        }
+                                        class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                                        disabled=move || submitting.get()
+                                    >
+                                        <option value="automatic" selected=move || review_mode.get() == ReviewMode::Automatic>"Automatic: AI Review runs after each coding run"</option>
+                                        <option value="manual" selected=move || review_mode.get() == ReviewMode::Manual>"Manual: no AI Review; you inspect the changes"</option>
+                                    </select>
+                                    <p class="mt-1 text-xs text-white/50">
+                                        {move || match review_mode.get() {
+                                            ReviewMode::Automatic => "A finished coding run starts AI Review automatically.",
+                                            ReviewMode::Manual => "A finished coding run goes straight to Human Review. AI Review does not run, so you must inspect the changes yourself. Nothing is approved or published automatically.",
+                                        }}
+                                    </p>
+                                </div>
+                            }
+                            .into_any(),
+                            TaskEditMode::Create => ().into_any(),
+                        }}
+
                         // AI Model
                         <div>
                             <label class="block text-sm font-medium text-white/70 mb-1.5">"AI Model"</label>
@@ -490,6 +525,7 @@ pub fn TaskEditModal(
                                     let category_val = category.get();
                                     let priority_val = priority.get();
                                     let provider_val = provider.get();
+                                    let review_mode_val = review_mode.get();
                                     // OpenCode saves the provider/model id typed in the form, so a
                                     // Claude model left in the form is never saved with it.
                                     let model_val = if provider_val == CodingProvider::OpenCode {
@@ -550,6 +586,7 @@ pub fn TaskEditModal(
                                                     security_severity: None,
                                                     model: Some(model_val),
                                                     provider: Some(provider_val),
+                                                    review_mode: Some(review_mode_val),
                                                     planning_mode: Some(planning_val),
                                                 }).await.map(|opt| opt.unwrap_or(*task))
                                             }

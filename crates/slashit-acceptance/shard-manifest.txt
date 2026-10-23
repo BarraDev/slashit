@@ -85,3 +85,4 @@
 # Task dependency control: a dependent Task created through the Depends on control, its drawer link, and its branch base.
 1	task_dependencies::a_task_created_with_the_depends_on_control_starts_from_its_parents_branch
 3	unreadable_board::a_project_whose_task_board_cannot_be_read_says_so_and_takes_no_task_changes
+2	manual_review::a_manual_task_reaches_human_review_without_any_ai_review

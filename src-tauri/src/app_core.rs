@@ -881,6 +881,10 @@ fn mark_worker_recovery_required(task: &mut Task, run: Option<u32>, reason: &str
             branch: task.branch_name.clone(),
             start_head: None,
             acceptance: None,
+            // A record recreated for a run whose own record is gone: the Task's
+            // configured mode is the only evidence left, so a Manual Task is not
+            // sent to AI Review by default.
+            review_mode: task.review_mode,
             stage: domain::task::WorkerHandoffStage::RecoveryRequired {
                 reason: reason.to_string(),
                 observed_commit: observed_commit.clone(),
@@ -1621,6 +1625,7 @@ mod tests {
             addressing_feedback: false,
         });
         task.worker_handoff = Some(domain::task::WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id: task.project_id,
             repository_id: None,
@@ -1807,6 +1812,7 @@ mod tests {
         .trim()
         .to_string();
         task.worker_handoff = Some(domain::task::WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id: project.id,
             repository_id: Some(repository.id),

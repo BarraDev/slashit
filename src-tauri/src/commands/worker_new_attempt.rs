@@ -729,6 +729,7 @@ mod tests {
         task.phase = TaskPhase::Idle;
         task.error_message = Some("interrupted".into());
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id,
             repository_id: Some(repository_id),
@@ -967,6 +968,7 @@ mod tests {
         other.branch_name = Some(fx.branch.clone());
         other.worktree_path = Some(fx.checkout_path());
         other.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: other.id,
             project_id: fx.project_id,
             repository_id: Some(fx.repository_id),
@@ -1341,6 +1343,7 @@ mod tests {
                 addressing_feedback: false,
             });
             t.worker_handoff = Some(WorkerHandoff {
+                review_mode: Default::default(),
                 task_id: t.id,
                 project_id: t.project_id,
                 repository_id: Some(fx.repository_id),

@@ -4231,6 +4231,7 @@ mod tests {
     async fn an_interrupted_run_that_needs_recovery_refuses_queue_entry() {
         assert_queue_entry_refused(|task| {
             task.worker_handoff = Some(crate::domain::WorkerHandoff {
+                review_mode: Default::default(),
                 task_id: task.id,
                 project_id: task.project_id,
                 repository_id: None,
@@ -4276,6 +4277,7 @@ mod tests {
             let amend = move |staged: &mut HashMap<Uuid, Task>| {
                 if let Some(task) = staged.get_mut(&task_id) {
                     task.worker_handoff = Some(crate::domain::WorkerHandoff {
+                        review_mode: Default::default(),
                         task_id,
                         project_id: task.project_id,
                         repository_id: None,

@@ -17256,6 +17256,7 @@ mod recovery_admission_tests {
             0,
         );
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id,
             repository_id: None,

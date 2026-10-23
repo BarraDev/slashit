@@ -1483,6 +1483,7 @@ pub(crate) mod tests {
         task.worktree_path = Some(checkout.to_string_lossy().to_string());
         task.branch_name = Some("task-branch".into());
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id,
             repository_id: None,

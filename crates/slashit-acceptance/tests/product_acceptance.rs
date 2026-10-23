@@ -58,6 +58,8 @@ mod developer_tools;
 mod human_review;
 #[path = "product_acceptance/local_first.rs"]
 mod local_first;
+#[path = "product_acceptance/manual_review.rs"]
+mod manual_review;
 #[path = "product_acceptance/local_integration.rs"]
 mod local_integration;
 #[path = "product_acceptance/main_window.rs"]

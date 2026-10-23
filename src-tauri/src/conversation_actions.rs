@@ -774,6 +774,7 @@ mod existing_checkout_tests {
 
     fn handoff(stage: WorkerHandoffStage) -> WorkerHandoff {
         WorkerHandoff {
+            review_mode: Default::default(),
             task_id: Uuid::nil(),
             project_id: Uuid::nil(),
             repository_id: None,

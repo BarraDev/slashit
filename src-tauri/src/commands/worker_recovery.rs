@@ -1017,6 +1017,7 @@ mod tests {
         task.phase = TaskPhase::Idle;
         task.error_message = Some("interrupted".into());
         task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id,
             repository_id: Some(repository_id),
@@ -1961,6 +1962,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_manual_run_reaches_human_review_without_an_ai_review_and_stays_there() {
+        let fx = fixture().await;
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let executor = fx.state.executor.get().unwrap().clone();
+        // The run was started in Manual mode, and its run record says so.
+        executor
+            .start_run_in_review_mode_for_test(
+                fx.task_id,
+                crate::domain::task::ReviewMode::Manual,
+            )
+            .await;
+
+        executor.spawn_review_for_test(fx.task_id).await;
+
+        let task = fx.task().await;
+        assert_eq!(task.status, TaskStatus::HumanReview);
+        assert!(task.qa_signoff.is_none(), "no AI verdict is invented");
+        let skipped = |task: &Task| {
+            task.activity
+                .iter()
+                .filter(|e| matches!(e.kind, ActivityKind::AiReviewSkipped { review: 1, .. }))
+                .count()
+        };
+        assert_eq!(skipped(&task), 1);
+        assert!(
+            !task
+                .activity
+                .iter()
+                .any(|e| matches!(e.kind, ActivityKind::AiReviewStarted { .. })),
+            "no reviewer was admitted"
+        );
+        assert_eq!(fx.on_disk().status, TaskStatus::HumanReview, "durable");
+
+        // A duplicate or retried review signal finds the Task already settled:
+        // nothing is recorded twice and nothing is admitted.
+        executor.spawn_review_for_test(fx.task_id).await;
+        let again = fx.task().await;
+        assert_eq!(again.status, TaskStatus::HumanReview);
+        assert_eq!(skipped(&again), 1, "a duplicate signal records nothing new");
+    }
+
+    #[tokio::test]
     async fn review_admission_records_the_start_durably_and_a_later_fix_commit_is_not_recovery() {
         let fx = fixture().await;
         accept_result(&fx.state, fx.request(Uuid::new_v4()))
@@ -2575,6 +2620,7 @@ mod tests {
         task.branch_name = Some("b".into());
         task.worktree_path = Some("/c".into());
         task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+            review_mode: Default::default(),
             task_id: request.task_id,
             project_id: request.project_id,
             repository_id: Some(request.repository_id),

@@ -597,6 +597,7 @@ pub async fn attach_test_executor_ipc(
 /// Create a test task with default values
 pub fn create_test_task(title: &str) -> Task {
     Task {
+        review_mode: Default::default(),
         id: Uuid::new_v4(),
         project_id: Uuid::new_v4(),
         title: title.to_string(),

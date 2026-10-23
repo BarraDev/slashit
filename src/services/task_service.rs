@@ -91,6 +91,7 @@ pub struct UpdateTaskParams {
     pub security_severity: Option<SecuritySeverity>,
     pub model: Option<String>,
     pub provider: Option<crate::models::task::CodingProvider>,
+    pub review_mode: Option<crate::models::task::ReviewMode>,
     pub planning_mode: Option<bool>,
 }
 
@@ -107,6 +108,7 @@ pub async fn update_task(params: UpdateTaskParams) -> Result<Option<Task>, Strin
             "securitySeverity": params.security_severity,
             "model": params.model,
             "provider": params.provider,
+            "reviewMode": params.review_mode,
             "planningMode": params.planning_mode,
         }
     })).unwrap();

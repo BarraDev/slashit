@@ -622,6 +622,18 @@ fn TaskSummary(task: Task) -> impl IntoView {
                 <p data-testid="task-drawer-description" class="text-white/60 whitespace-pre-wrap break-words line-clamp-6">{d}</p>
             })}
             {task.qa_signoff.clone().map(|signoff| view! { <AiReviewSection signoff=signoff /> })}
+            {(task.status == crate::models::TaskStatus::HumanReview && task.qa_signoff.is_none()).then(|| {
+                let manual = task.review_mode == crate::models::task::ReviewMode::Manual;
+                view! {
+                    <p data-testid="task-drawer-no-ai-review" class="text-white/60">
+                        {if manual {
+                            "No AI Review ran: Manual review mode is selected. Inspect the changes yourself; nothing has been approved."
+                        } else {
+                            "No AI Review ran for these changes. Nothing has been approved by AI."
+                        }}
+                    </p>
+                }
+            })}
         </section>
     }
 }

@@ -163,6 +163,7 @@ mod tests {
         let mut task_store = tasks.write().await;
         for i in 0..2 {
             let task = Task {
+                review_mode: Default::default(),
                 id: Uuid::new_v4(),
                 project_id: Uuid::new_v4(),
                 title: format!("Task {}", i),
