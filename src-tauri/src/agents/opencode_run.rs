@@ -49,7 +49,8 @@ use super::runner::provider_env;
 use crate::acp::v1::connection::{AgentEvent, Connection, EventStream, SessionRef};
 use crate::acp::v1::process::SpawnSpec;
 use crate::acp::v1::types::{
-    PermissionDecision, PermissionKind, PermissionOption, SessionUpdate, StopReason,
+    config_option_value, PermissionDecision, PermissionKind, PermissionOption, SessionUpdate,
+    StopReason,
 };
 
 /// The program a run starts. A test passes its fake agent instead.
@@ -120,6 +121,10 @@ pub struct OpenCodeRunConfig {
     pub program: String,
     /// The program's arguments: `["acp"]` in production.
     pub args: Vec<String>,
+    /// The model the run must use, as `provider/model`. Required: a run
+    /// without one would use OpenCode's own default, which SlashIt does not
+    /// choose and may bill, so [`OpenCodeRunner::start`] refuses it.
+    pub model: Option<String>,
 }
 
 /// A running OpenCode session. Dropping it ends the process and its group.
@@ -150,6 +155,30 @@ pub struct OpenCodeRunner {
 /// The refused permission requests of one run, shared with its event reader.
 type Refusals = Arc<std::sync::Mutex<Vec<String>>>;
 
+/// Selects `model` for the session and checks that OpenCode now reports it as
+/// the current model. OpenCode refuses a model it does not know, with an
+/// error. A reply that reports another model, or no model, is refused too, so
+/// a run never proceeds on a model SlashIt did not choose.
+async fn select_model(
+    connection: &Connection,
+    session: &SessionRef,
+    model: &str,
+) -> Result<(), String> {
+    let result = connection
+        .set_session_config_option(session, "model", model)
+        .await
+        .map_err(|e| format!("OpenCode did not accept the model {model}: {e}"))?;
+    match config_option_value(&result, "model") {
+        Some(current) if current == model => Ok(()),
+        Some(current) => Err(format!(
+            "OpenCode reports the model {current}, not the selected model {model}"
+        )),
+        None => Err(format!(
+            "OpenCode did not report a current model after {model} was selected"
+        )),
+    }
+}
+
 impl OpenCodeRunner {
     /// Starts the process, initializes the protocol, creates a session and
     /// sends the prompt. `lease`, when present, is held by the process for
@@ -161,6 +190,11 @@ impl OpenCodeRunner {
         config: OpenCodeRunConfig,
         lease: Option<ProviderLease>,
     ) -> Result<Self, String> {
+        // Checked before anything starts, so a run without a model never
+        // spawns OpenCode.
+        let model = config.model.clone().ok_or_else(|| {
+            "This OpenCode run names no model, so it was not started. SlashIt does not run OpenCode's default model.".to_string()
+        })?;
         // Empty and private to this run, so the user's global OpenCode
         // configuration is not read (see `policy_env`).
         let config_dir = tempfile::Builder::new()
@@ -188,6 +222,9 @@ impl OpenCodeRunner {
             .new_session(&config.working_dir)
             .await
             .map_err(|e| e.to_string())?;
+        // The model is selected before the prompt is sent, and the run stops
+        // here unless OpenCode reports that model as the current one.
+        select_model(&connection, &session, &model).await?;
         let stream = connection
             .take_events()
             .ok_or_else(|| "the OpenCode event stream was already taken".to_string())?;
@@ -204,7 +241,7 @@ impl OpenCodeRunner {
         ));
         let _ = events.send(CodingRunEvent::SystemInit {
             session_id: session.id().to_string(),
-            model: None,
+            model: Some(model),
             message: None,
         });
 
@@ -513,8 +550,13 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             args: vec![scenario.to_string()],
+            model: Some(FIXTURE_MODEL.into()),
         }
     }
+
+    /// The local model the fixture runs select. A `provider/model` id that a
+    /// test host can name, and that no paid provider serves.
+    const FIXTURE_MODEL: &str = "ollama/llama3.2:3b";
 
     /// Everything the run sent before it finished. `wait` joins the reader, so
     /// nothing more arrives after it returns.
@@ -547,6 +589,55 @@ mod tests {
         assert_eq!(run.get_output().await, "hello");
         assert_eq!(run.final_result_text().await.as_deref(), Ok("hello"));
         assert!(run.refused_permissions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_selected_model_is_set_before_the_prompt_and_reported_at_start() {
+        let run = OpenCodeRunner::start(fixture("model-echo"), None)
+            .await
+            .expect("start");
+        let mut events = run.subscribe();
+        assert_eq!(run.wait().await, Ok(true));
+        let seen = sent(&mut events);
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            CodingRunEvent::SystemInit { model: Some(m), .. } if m == FIXTURE_MODEL
+        )));
+        // The fixture records the selection and echoes it from the prompt turn,
+        // so the prompt was answered after the selection.
+        assert_eq!(run.get_output().await, format!("model={FIXTURE_MODEL}"));
+    }
+
+    #[tokio::test]
+    async fn a_model_the_agent_refuses_fails_the_start_and_no_prompt_is_sent() {
+        let error = match OpenCodeRunner::start(fixture("model-refuse"), None).await {
+            Err(error) => error,
+            Ok(_) => panic!("a refused model must not start a run"),
+        };
+        assert!(error.contains("did not accept the model"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_model_the_agent_does_not_report_as_current_fails_the_start() {
+        let error = match OpenCodeRunner::start(fixture("model-mismatch"), None).await {
+            Err(error) => error,
+            Ok(_) => panic!("a model the agent did not report must not start a run"),
+        };
+        assert!(error.contains("reports the model"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_model_is_refused_before_any_process_starts() {
+        let mut config = fixture("ok");
+        config.model = None;
+        // A program that does not exist: a spawn attempt would fail with a
+        // different message, so this message proves nothing was spawned.
+        config.program = "/nonexistent/slashit-opencode-probe".into();
+        let error = match OpenCodeRunner::start(config, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("a run with no model must not start"),
+        };
+        assert!(error.contains("names no model"), "{error}");
     }
 
     #[tokio::test]

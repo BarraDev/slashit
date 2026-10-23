@@ -324,6 +324,25 @@ impl Connection {
         })
     }
 
+    /// Sets one configuration option of a session with
+    /// `session/set_config_option` and returns the agent's result. The result
+    /// lists the options as the agent now reports them, so the caller must
+    /// check the value it asked for against it (see
+    /// [`types::config_option_value`]); an accepted reply is not proof.
+    pub async fn set_session_config_option(
+        &self,
+        session: &SessionRef,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Value, AcpError> {
+        self.require_initialized()?;
+        self.request(
+            "session/set_config_option",
+            json!({"sessionId": session.id(), "configId": config_id, "value": value}),
+        )
+        .await
+    }
+
     /// Runs one prompt turn with a single text block and waits for its stop reason.
     ///
     /// On timeout the turn is cancelled with `session/cancel`, and the
