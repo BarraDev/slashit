@@ -134,6 +134,21 @@ fn frame_rejects_invalid_shapes_with_bounded_reasons() {
 }
 
 #[test]
+fn frame_excerpt_redacts_a_value_written_in_the_next_token() {
+    for (text, secret) in [
+        ("failed password: hunter2", "hunter2"),
+        ("body {\"token\": \"abc\"}", "abc"),
+        ("header Authorization: Bearer xyz987", "xyz987"),
+    ] {
+        let shown = frame::excerpt(text);
+        assert!(!shown.contains(secret), "{text} leaked as {shown}");
+        assert!(shown.contains("[redacted]"), "{text} became {shown}");
+    }
+    let bearer = frame::excerpt("Authorization: Bearer xyz987");
+    assert!(bearer.contains("Bearer"), "the scheme stays visible: {bearer}");
+}
+
+#[test]
 fn frame_excerpt_redacts_secrets_and_bounds_length() {
     let text = "error token=abc123 and \"api_key\":\"hunter2\" then Bearer xyz987 ok sk-0123456789abcdefXYZ";
     let shown = frame::excerpt(text);
@@ -604,16 +619,24 @@ fn legacy_client_initialize_is_blocked_by_the_child_lock() {
     );
 }
 
-/// Whether a process still runs. A zombie has exited, and so is not running.
+/// Whether a process still runs. `kill` with signal 0 finds a pid that exists,
+/// and a zombie also exists, so on Linux `/proc` excludes a zombie. A process
+/// that another process has reaped no longer exists, whatever the platform.
+#[cfg(unix)]
 fn process_is_running(pid: i32) -> bool {
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat
+    // Safety: signal 0 sends nothing. It only checks that the pid exists.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        let state = stat
             .rsplit(')')
             .next()
-            .and_then(|rest| rest.trim_start().chars().next())
-            .is_some_and(|state| state != 'Z' && state != 'X'),
-        Err(_) => false,
+            .and_then(|rest| rest.trim_start().chars().next());
+        return !matches!(state, Some('Z' | 'X'));
     }
+    true
 }
 
 #[cfg(unix)]

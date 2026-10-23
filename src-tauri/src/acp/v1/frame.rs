@@ -169,14 +169,21 @@ pub fn excerpt(text: &str) -> String {
 
 fn redact(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
+    // Set after a token whose value is the next token, as in `password:` or
+    // `"token":`, and after a `Bearer` or `Basic` scheme.
     let mut redact_next = false;
     for token in text.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
         if redact_next {
+            if lower == "bearer" || lower == "basic" {
+                // The scheme stays visible, and the credential after it is redacted.
+                out.push(token.to_string());
+                continue;
+            }
             out.push(REDACTED.to_string());
             redact_next = false;
             continue;
         }
-        let lower = token.to_ascii_lowercase();
         if lower == "bearer" || lower == "basic" {
             out.push(token.to_string());
             redact_next = true;
@@ -185,7 +192,14 @@ fn redact(text: &str) -> String {
         if let Some(position) = token.find(['=', ':']) {
             let name = &token[..position];
             if is_sensitive_name(name) {
-                out.push(format!("{name}{}{REDACTED}", &token[position..=position]));
+                let separator = &token[position..=position];
+                if position + 1 == token.len() {
+                    // The value is in the next token, so that one is redacted too.
+                    out.push(format!("{name}{separator}"));
+                    redact_next = true;
+                } else {
+                    out.push(format!("{name}{separator}{REDACTED}"));
+                }
                 continue;
             }
         }

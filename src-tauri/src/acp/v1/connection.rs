@@ -604,9 +604,14 @@ fn queue_or_fail(shared: &Arc<Shared>, bytes: Vec<u8>) -> Result<(), AcpError> {
     }
 }
 
+/// Queues an event for the consumer. The count goes up before the send, so the
+/// consumer's decrement can never run first, and it comes back down when the
+/// receiver is gone, so an undelivered event does not count toward the limit.
 fn emit(shared: &Arc<Shared>, event: AgentEvent) {
-    let _ = shared.events.send(event);
     shared.event_backlog.fetch_add(1, Ordering::SeqCst);
+    if shared.events.send(event).is_err() {
+        shared.event_backlog.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Marks the connection failed, answers every waiter with the error, and

@@ -34,6 +34,24 @@ fn worker_scratch_rule(checkout: &str) -> String {
     )
 }
 
+/// Why a coding run did not start. A refusal is decided before any process is
+/// spawned, so no provider runs behind it. A failure after the attempt to
+/// start may have left a process, and it keeps the recovery rules.
+struct StartFailure {
+    message: String,
+    refused_before_spawn: bool,
+}
+
+impl StartFailure {
+    fn refused(message: String) -> Self {
+        Self { message, refused_before_spawn: true }
+    }
+
+    fn failed(message: String) -> Self {
+        Self { message, refused_before_spawn: false }
+    }
+}
+
 /// Starts an OpenCode Worker for a Task. Each input OpenCode cannot honor is
 /// refused here; none is dropped silently. That covers a Claude model name and
 /// the extra directories a meta-workspace run needs.
@@ -48,26 +66,26 @@ async fn start_opencode_run(
     model: Option<String>,
     no_additional_dirs: bool,
     lease: Option<crate::agents::provider_lease::ProviderLease>,
-) -> Result<CodingRunner, String> {
+) -> Result<CodingRunner, StartFailure> {
     // The OpenCode Worker's process group and provider lease exist only on
     // Unix. Elsewhere, a tool process could outlive its run, so none starts.
     if !cfg!(unix) {
         drop((prompt, working_dir, model, no_additional_dirs, lease));
-        return Err(
+        return Err(StartFailure::refused(
             "OpenCode Tasks run only on Unix for now: SlashIt cannot yet end the OpenCode process tree or hold its provider lease on this platform. Run this Task with Claude."
                 .to_string(),
-        );
-    }
-    if let Some(model) = model {
-        return Err(format!(
-            "OpenCode does not take the Claude model {model}. Set this Task's model to default, or run it with Claude."
         ));
     }
+    if let Some(model) = model {
+        return Err(StartFailure::refused(format!(
+            "OpenCode does not take the Claude model {model}. Set this Task's model to default, or run it with Claude."
+        )));
+    }
     if !no_additional_dirs {
-        return Err(
+        return Err(StartFailure::refused(
             "This Task's workspace needs extra directories, which an OpenCode run cannot reach yet. Run it with Claude."
                 .to_string(),
-        );
+        ));
     }
     // OpenCode has no system-prompt slot, so the rule Claude receives as an
     // appended system prompt is sent ahead of the Task prompt.
@@ -82,6 +100,7 @@ async fn start_opencode_run(
         lease,
     )
     .await
+    .map_err(StartFailure::failed)
 }
 
 /// A coding run whose start is on disk.
@@ -5318,24 +5337,28 @@ impl TaskExecutor {
                 isolate_customizations: true,
             }, lease)
             .await
+            .map_err(StartFailure::failed)
             };
             let runner = match started {
                 Ok(r) => r,
                 Err(e) => {
-                    let msg = format!("Failed to start {}: {}", provider.label(), e);
+                    let msg = format!("Failed to start {}: {}", provider.label(), e.message);
                     record_output(&logs, execution_id, LogLevel::Error, msg.clone()).await;
                     let ended = RunEnd {
                         run,
                         tools: take_run_tools(&run_tools, task_id),
                         timeline_reason: None,
                     };
-                    Self::set_task_error_static(
+                    // A refusal left no process behind, so the Task is not
+                    // sent to recovery for a provider that never ran.
+                    Self::set_task_error_static_with_provider_exit(
                         &tasks,
                         &storage,
                         &events,
                         task_id,
                         &msg,
                         Some(ended),
+                        e.refused_before_spawn,
                     )
                     .await;
                     // This early return skips the removal after `runner.wait()`
@@ -5425,7 +5448,16 @@ impl TaskExecutor {
                             let refused = runner.refused_permissions();
                             if !refused.is_empty() {
                                 let listed = refused.join(", ");
-                                let base = tasks.read().await.get(&task_id).and_then(|t| t.base_commit.clone());
+                                // This run's own starting commit. The Task's base commit
+                                // predates the commits of earlier runs, which would look
+                                // like work this run did not do.
+                                let base = tasks.read().await.get(&task_id).and_then(|t| {
+                                    t.worker_handoff
+                                        .as_ref()
+                                        .filter(|handoff| handoff.run == Some(run))
+                                        .and_then(|handoff| handoff.start_head.clone())
+                                        .or_else(|| t.base_commit.clone())
+                                });
                                 let message = match crate::worktree::checkout_has_work(&working_dir_for_commit, base.as_deref()).await {
                                     Ok(true) => {
                                         record_output(
@@ -7960,8 +7992,9 @@ impl TaskExecutor {
 
     /// Record a terminal provider failure separately from an interruption or
     /// a failed Git/evidence boundary. Only `runner.wait()`'s terminal error
-    /// uses `provider_exited_without_commit`: that process is joined and the
-    /// Git commit operation was not entered.
+    /// and a launch refused before any process was spawned use
+    /// `provider_exited_without_commit`: no provider process is left running,
+    /// and the Git commit operation was not entered.
     async fn set_task_error_static_with_provider_exit(
         tasks: &Tasks,
         storage: &crate::config::Storage,

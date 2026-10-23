@@ -69,7 +69,9 @@ pub async fn commit_checkout_even_if_empty(
 /// whose only commits are already in `base`, holds no work. Nothing is staged
 /// or written.
 pub async fn checkout_has_work(working_dir: &str, base: Option<&str>) -> Result<bool, String> {
-    let status = git(working_dir, &["status", "--porcelain"])
+    // `--untracked-files=normal` overrides `status.showUntrackedFiles=no`, which
+    // would otherwise hide a new file that the run created.
+    let status = git(working_dir, &["status", "--porcelain", "--untracked-files=normal"])
         .await
         .map_err(|e| format!("git status failed: {e}"))?;
     if !status.is_empty() {

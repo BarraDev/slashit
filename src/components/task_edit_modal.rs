@@ -308,11 +308,8 @@ pub fn TaskEditModal(
                                                 "opencode" => CodingProvider::OpenCode,
                                                 _ => CodingProvider::Claude,
                                             };
-                                            // Switching to OpenCode resets a Claude model: OpenCode
-                                            // takes only the default, and the start refuses any other.
-                                            if next == CodingProvider::OpenCode {
-                                                set_model.set("default".to_string());
-                                            }
+                                            // The model is kept, so switching back to Claude restores it.
+                                            // Saving with OpenCode stores the default model.
                                             set_provider.set(next);
                                         }
                                         class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"

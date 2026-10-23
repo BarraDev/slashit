@@ -208,13 +208,7 @@ impl OpenCodeRunner {
             message: None,
         });
 
-        let turn = tokio::spawn(run_turn(
-            connection.clone(),
-            session.clone(),
-            config.prompt,
-            events.clone(),
-            output.clone(),
-        ));
+        let turn = tokio::spawn(run_turn(connection.clone(), session.clone(), config.prompt));
 
         Ok(Self {
             connection,
@@ -264,6 +258,21 @@ impl OpenCodeRunner {
                 if let Some(reader) = self.reader.lock().await.take() {
                     let _ = reader.await;
                 }
+                // The terminal event follows the reader, so its text holds every
+                // update of the turn, and no update follows it.
+                match &result {
+                    Ok(()) => {
+                        let text = self.output.read().await.clone();
+                        let _ = self.events.send(CodingRunEvent::Result {
+                            session_id: self.session.id().to_string(),
+                            text,
+                            is_error: false,
+                        });
+                    }
+                    Err(message) => {
+                        let _ = self.events.send(CodingRunEvent::Error { message: message.clone() });
+                    }
+                }
                 result
             })
             .await;
@@ -305,36 +314,17 @@ impl Drop for OpenCodeRunner {
     }
 }
 
-/// Runs the single prompt turn and reports how it ended.
-async fn run_turn(
-    connection: Connection,
-    session: SessionRef,
-    prompt: String,
-    events: broadcast::Sender<CodingRunEvent>,
-    output: Arc<RwLock<String>>,
-) -> Result<(), String> {
-    let result = match connection.prompt(&session, &prompt, TURN_TIMEOUT).await {
+/// Runs the single prompt turn and reports how it ended. The terminal event is
+/// sent by `wait`, once the event reader has delivered the turn's updates.
+async fn run_turn(connection: Connection, session: SessionRef, prompt: String) -> Result<(), String> {
+    match connection.prompt(&session, &prompt, TURN_TIMEOUT).await {
         Ok(turn) if turn.stop_reason == StopReason::EndTurn => Ok(()),
         Ok(turn) => Err(format!(
             "OpenCode ended the turn without finishing it (stop reason: {})",
             stop_reason_name(turn.stop_reason)
         )),
         Err(error) => Err(error.to_string()),
-    };
-    match &result {
-        Ok(()) => {
-            let text = output.read().await.clone();
-            let _ = events.send(CodingRunEvent::Result {
-                session_id: session.id().to_string(),
-                text,
-                is_error: false,
-            });
-        }
-        Err(message) => {
-            let _ = events.send(CodingRunEvent::Error { message: message.clone() });
-        }
     }
-    result
 }
 
 /// Maps ACP events to [`CodingRunEvent`]s and answers permission requests.
