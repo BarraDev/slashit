@@ -545,6 +545,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_model_change_after_approval_changes_the_opencode_digest() {
+        // The rendered prompt carries "- Model: <id>" for any model but
+        // `default`, and the digest covers the prompt. So a switch between two
+        // explicit models, or from `default` to one, changes the approved input.
+        let mut opencode = crate::test_helpers::create_test_task("Model bound");
+        opencode.provider = crate::domain::task::CodingProvider::OpenCode;
+        opencode.model = "ollama/llama3.2:3b".into();
+        let approved = task_input_digest(&opencode);
+        let mut other = opencode.clone();
+        other.model = "ollama/gemma3:4b".into();
+        assert_ne!(approved, task_input_digest(&other));
+        let mut from_default = opencode.clone();
+        from_default.model = "default".into();
+        assert_ne!(approved, task_input_digest(&from_default));
+    }
+
     /// The Worker chosen first, then approved. The approval covers that Worker.
     #[test]
     fn an_approval_given_under_the_chosen_worker_matches_it_and_not_the_other() {

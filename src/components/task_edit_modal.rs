@@ -13,6 +13,19 @@ pub enum TaskEditMode {
     Edit(Box<Task>),
 }
 
+/// Whether `model` is an OpenCode model id, `provider/model`: both parts are
+/// present, and the id has no whitespace or control characters. The backend
+/// applies the same rule before it starts a run.
+fn is_opencode_model_id(model: &str) -> bool {
+    let Some((provider, name)) = model.split_once('/') else {
+        return false;
+    };
+    !provider.is_empty()
+        && !name.is_empty()
+        && model.len() <= 200
+        && model.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
 #[component]
 pub fn TaskEditModal(
     #[prop(into)] show: Signal<bool>,
@@ -309,7 +322,11 @@ pub fn TaskEditModal(
                                                 _ => CodingProvider::Claude,
                                             };
                                             // The model is kept, so switching back to Claude restores it.
-                                            // Saving with OpenCode stores the default model.
+                                            // Saving with OpenCode stores the provider/model typed in the AI Model field.
+                                            // A provider/model id is not a Claude model, so it is not kept for Claude.
+                                            if next == CodingProvider::Claude && model.get().contains('/') {
+                                                set_model.set("default".to_string());
+                                            }
                                             set_provider.set(next);
                                         }
                                         class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
@@ -327,10 +344,23 @@ pub fn TaskEditModal(
                         // AI Model
                         <div>
                             <label class="block text-sm font-medium text-white/70 mb-1.5">"AI Model"</label>
+                            // OpenCode names its model as provider/model. The run starts
+                            // only on that exact id, and it is part of the approved input.
+                            <input
+                                type="text"
+                                placeholder="provider/model, for example ollama/llama3.2:3b"
+                                prop:value=move || model.get()
+                                on:input=move |ev| set_model.set(event_target_value(&ev))
+                                class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                                hidden=move || provider.get() != CodingProvider::OpenCode
+                                disabled=move || submitting.get()
+                            />
+
                             <select
                                 on:change=move |ev| set_model.set(event_target_value(&ev))
                                 class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                                 disabled=move || submitting.get() || provider.get() == CodingProvider::OpenCode
+                                hidden=move || provider.get() == CodingProvider::OpenCode
                             >
                                 {move || {
                                     let models = available_models.get();
@@ -441,6 +471,14 @@ pub fn TaskEditModal(
                                         set_error_msg.set(Some("Task title is required".to_string()));
                                         return;
                                     }
+                                    // An OpenCode run needs its model as provider/model. The backend
+                                    // refuses any other id when the run starts, so the form refuses it first.
+                                    if provider.get() == CodingProvider::OpenCode && !is_opencode_model_id(model.get().trim()) {
+                                        set_error_msg.set(Some(
+                                            "OpenCode needs its model as provider/model, for example ollama/llama3.2:3b".to_string(),
+                                        ));
+                                        return;
+                                    }
 
                                     set_submitting.set(true);
                                     set_error_msg.set(None);
@@ -452,10 +490,10 @@ pub fn TaskEditModal(
                                     let category_val = category.get();
                                     let priority_val = priority.get();
                                     let provider_val = provider.get();
-                                    // OpenCode takes only the default model, so a Claude
-                                    // model left in the form is never saved with it.
+                                    // OpenCode saves the provider/model id typed in the form, so a
+                                    // Claude model left in the form is never saved with it.
                                     let model_val = if provider_val == CodingProvider::OpenCode {
-                                        "default".to_string()
+                                        model.get().trim().to_string()
                                     } else {
                                         model.get()
                                     };
@@ -558,5 +596,23 @@ pub fn TaskEditModal(
                 </div>
             </div>
         </Show>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_opencode_model_id;
+
+    #[test]
+    fn an_opencode_model_is_provider_and_model_without_whitespace() {
+        assert!(is_opencode_model_id("ollama/llama3.2:3b"));
+        assert!(is_opencode_model_id("ollama/dcostenco/prism-coder:4b"));
+        assert!(!is_opencode_model_id("default"));
+        assert!(!is_opencode_model_id("sonnet"));
+        assert!(!is_opencode_model_id(""));
+        assert!(!is_opencode_model_id("ollama/"));
+        assert!(!is_opencode_model_id("/llama3.2:3b"));
+        assert!(!is_opencode_model_id("ollama/llama 3"));
+        assert!(!is_opencode_model_id("ollama/llama\n3"));
     }
 }

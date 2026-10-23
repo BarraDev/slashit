@@ -94,6 +94,19 @@ impl Membership {
     }
 }
 
+/// Whether `model` is an OpenCode model id, `provider/model`: both parts are
+/// present, and the id has no whitespace or control characters. A Claude alias
+/// such as `sonnet` has no provider part, so it is not one.
+fn is_opencode_model_id(model: &str) -> bool {
+    let Some((provider, name)) = model.split_once('/') else {
+        return false;
+    };
+    !provider.is_empty()
+        && !name.is_empty()
+        && model.len() <= 200
+        && model.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
 /// What an OpenCode run cannot honor, decided from inputs known before the
 /// durable start. `None` when the run may start. The durable start calls this
 /// on the same Task snapshot it records, and `start_opencode_run` calls it
@@ -107,10 +120,21 @@ fn opencode_refusal(model: Option<&str>, no_additional_dirs: bool) -> Option<Str
                 .to_string(),
         );
     }
-    if let Some(model) = model {
-        return Some(format!(
-            "OpenCode does not take the Claude model {model}. Set this Task's model to default, or run it with Claude."
-        ));
+    // A run names its model explicitly. OpenCode's default is never used:
+    // it is not chosen by SlashIt and may bill a provider.
+    match model {
+        None => {
+            return Some(
+                "This OpenCode Task names no model. Choose one as provider/model, for example ollama/llama3.2:3b. SlashIt does not run OpenCode's default model."
+                    .to_string(),
+            )
+        }
+        Some(model) if !is_opencode_model_id(model) => {
+            return Some(format!(
+                "OpenCode takes a model as provider/model, for example ollama/llama3.2:3b, and {model} is not one. Choose an OpenCode model for this Task, or run it with Claude."
+            ))
+        }
+        Some(_) => {}
     }
     if !no_additional_dirs {
         return Some(
@@ -140,6 +164,7 @@ async fn start_opencode_run(
             working_dir: std::path::PathBuf::from(working_dir),
             program: crate::agents::opencode_run::OPENCODE_PROGRAM.to_string(),
             args: vec!["acp".to_string()],
+            model,
         },
         lease,
     )
@@ -18910,8 +18935,8 @@ VERDICT: APPROVED"
                 let mut tasks = w.executor.tasks.write().await;
                 let task = tasks.get_mut(&w.task_id).unwrap();
                 task.provider = CodingProvider::OpenCode;
-                // OpenCode takes no Claude model, so the Task uses the default.
-                task.model = "default".to_string();
+                // An OpenCode run names its model, so the Task selects a local one.
+                task.model = "ollama/llama3.2:3b".to_string();
                 let board: Vec<_> = tasks
                     .values()
                     .filter(|task| task.project_id == w.project_id)
@@ -18996,7 +19021,7 @@ VERDICT: APPROVED"
                 let mut tasks = w.executor.tasks.write().await;
                 let task = tasks.get_mut(&w.task_id).unwrap();
                 task.provider = CodingProvider::OpenCode;
-                task.model = "default".to_string();
+                task.model = "ollama/llama3.2:3b".to_string();
                 let board: Vec<_> = tasks
                     .values()
                     .filter(|task| task.project_id == w.project_id)
@@ -19049,6 +19074,26 @@ VERDICT: APPROVED"
                 .expect("the provider has ended and its lease is free");
         }
 
+        /// A run names its model as provider/model. A missing, Claude or
+        /// malformed model is refused, so no run starts on a model SlashIt did
+        /// not choose.
+        #[cfg(unix)]
+        #[test]
+        fn opencode_takes_only_an_explicit_provider_model_id() {
+            // No model is never OpenCode's default.
+            assert!(opencode_refusal(None, true).is_some());
+            // A Claude alias has no provider part.
+            assert!(opencode_refusal(Some("sonnet"), true).is_some());
+            assert!(opencode_refusal(Some("claude-sonnet-4"), true).is_some());
+            // An empty part, or whitespace, is not a model id.
+            assert!(opencode_refusal(Some("ollama/"), true).is_some());
+            assert!(opencode_refusal(Some("/llama3.2:3b"), true).is_some());
+            assert!(opencode_refusal(Some("ollama/llama 3"), true).is_some());
+            // A provider/model id may start, including a model that has its own slash.
+            assert!(opencode_refusal(Some("ollama/llama3.2:3b"), true).is_none());
+            assert!(opencode_refusal(Some("ollama/dcostenco/prism-coder:4b"), true).is_none());
+        }
+
         /// OpenCode cannot take a Claude model, so the Task is refused. The
         /// refusal is decided in the write that would record the start, so no
         /// run starts on the timeline and the run number is not spent.
@@ -19060,13 +19105,13 @@ VERDICT: APPROVED"
                 "claude-sonnet-4".to_string();
             let started = w.executor.spawn_task_execution(w.task_id, None).await;
             assert!(
-                matches!(&started, Err(message) if message.contains("does not take the Claude model")),
+                matches!(&started, Err(message) if message.contains("takes a model as provider/model")),
                 "{started:?}"
             );
             let task = settled(&w).await;
             assert_eq!(task.status, TaskStatus::Error, "{:?}", task.error_message);
             let message = task.error_message.clone().unwrap_or_default();
-            assert!(message.contains("does not take the Claude model"), "{message}");
+            assert!(message.contains("takes a model as provider/model"), "{message}");
             assert!(
                 !task
                     .activity
@@ -19612,7 +19657,7 @@ VERDICT: APPROVED"
 
             let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
             let Err(RunStartError::Unlaunchable(message)) = refused else { panic!("{refused:?}") };
-            assert!(message.contains("does not take the Claude model"), "{message}");
+            assert!(message.contains("takes a model as provider/model"), "{message}");
             assert!(message.contains("was removed again"), "{message}");
             assert!(!std::path::Path::new(&worktree).exists(), "the created checkout is gone");
             let branch_ref = std::process::Command::new("git")
@@ -19648,7 +19693,7 @@ VERDICT: APPROVED"
 
             let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
             let Err(RunStartError::Unlaunchable(message)) = refused else { panic!("{refused:?}") };
-            assert!(message.contains("does not take the Claude model"), "{message}");
+            assert!(message.contains("takes a model as provider/model"), "{message}");
             assert!(message.contains("were kept"), "{message}");
             assert!(message.contains(&worktree), "the retained checkout is named: {message}");
             assert!(std::path::Path::new(&worktree).is_dir(), "the checkout is still there");

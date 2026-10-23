@@ -68,6 +68,20 @@ pub enum StopReason {
     Cancelled,
 }
 
+/// The value the agent reports as current for the configuration option
+/// `config_id`, in a `session/new` or `session/set_config_option` result.
+/// `None` when the option is absent or its current value is not a string.
+pub fn config_option_value(result: &Value, config_id: &str) -> Option<String> {
+    result
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some(config_id))?
+        .get("currentValue")?
+        .as_str()
+        .map(str::to_string)
+}
+
 pub fn parse_stop_reason(value: &str) -> Option<StopReason> {
     match value {
         "end_turn" => Some(StopReason::EndTurn),
@@ -406,6 +420,23 @@ mod tests {
 
         let empty = json!({"sessionId": "s", "toolCall": {"toolCallId": "t1"}, "options": []});
         assert_eq!(parse_permission_request(&empty), None);
+    }
+
+    #[test]
+    fn config_option_value_reads_only_the_named_option() {
+        let result = json!({"configOptions": [
+            {"id": "mode", "currentValue": "auto"},
+            {"id": "model", "currentValue": "ollama/llama3.2:3b"},
+        ]});
+        assert_eq!(
+            config_option_value(&result, "model").as_deref(),
+            Some("ollama/llama3.2:3b")
+        );
+        assert_eq!(config_option_value(&result, "thought_level"), None);
+        assert_eq!(config_option_value(&json!({"configOptions": []}), "model"), None);
+        assert_eq!(config_option_value(&json!({}), "model"), None);
+        let not_a_string = json!({"configOptions": [{"id": "model", "currentValue": 3}]});
+        assert_eq!(config_option_value(&not_a_string, "model"), None);
     }
 
     #[test]

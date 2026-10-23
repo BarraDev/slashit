@@ -6,7 +6,7 @@ Claude Code and OpenCode coding-run execution. The Agent Communication Protocol 
 
 - **mod.rs** - Declares the `coding_run`, `opencode_run`, `provider_lease`, `roles` and `runner` modules
 - **coding_run.rs** - `CodingRunner` and `CodingRunEvent`, the provider-neutral run boundary, over `runner.rs` (Claude) and `opencode_run.rs` (OpenCode over ACP)
-- **opencode_run.rs** - `OpenCodeRunner`: one `opencode acp` process per run under `OPENCODE_POLICY_CONTENT` (read, glob, grep and edit only). Not an OS sandbox, `read` follows symlinks, Unix only. Read its module doc before changing the policy or the configuration directory's lifecycle.
+- **opencode_run.rs** - `OpenCodeRunner`: one `opencode acp` process per run under `OPENCODE_POLICY_CONTENT` (read, glob, grep and edit only). Not an OS sandbox, `read` follows symlinks, Unix only. Read its module doc before changing the policy or the configuration directory's lifecycle. A run always names a `provider/model`: it selects it with `session/set_config_option` before the prompt and stops unless OpenCode reports that model as current. OpenCode's own default is never used.
 - **roles.rs** - `roles::AgentRole`, `AgentSlot` and `AgentSlotStatus`
 - **runner.rs** - `ClaudeRunner`, which runs the Claude Code CLI and streams `CodingRunEvent`s
 

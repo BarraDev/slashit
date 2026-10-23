@@ -12,6 +12,13 @@
 //! - `exit-on-prompt`: exits with status 3 when it receives session/prompt.
 //! - `ignore-eof`: keeps running after stdin closes, so the client must kill it.
 //! - `stop-reading`: answers initialize, then never reads stdin again.
+//! - `model-echo`: answers session/set_config_option with the value it was
+//!   given, then, in the prompt turn, echoes the model it recorded as `model=<id>`.
+//! - `model-refuse`: answers session/set_config_option with an error, as
+//!   OpenCode does for a model it does not know.
+//! - `model-mismatch`: answers session/set_config_option reporting another model.
+//!
+//! Every other scenario accepts session/set_config_option and reports the value.
 //!
 //! Set `ACP_FIXTURE_TRACE=1` to copy every frame it receives to stderr.
 
@@ -141,6 +148,29 @@ fn dispatch(io: &mut Io, scenario: &str, message: &Value) {
             ),
         },
         ("session/load" | "session/resume", Some(id)) => respond(io, &id, json!({})),
+        ("session/set_config_option", Some(id)) => {
+            let value = message["params"]["value"].as_str().unwrap_or("");
+            match scenario {
+                "model-refuse" => io.send(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32602, "message": format!("model not found: {value}")},
+                })),
+                "model-mismatch" => respond(
+                    io,
+                    &id,
+                    json!({"configOptions": [{"id": "model", "currentValue": "opencode/flint-40b-free"}]}),
+                ),
+                _ => {
+                    *SELECTED_MODEL.lock().unwrap_or_else(|p| p.into_inner()) = Some(value.to_string());
+                    respond(
+                        io,
+                        &id,
+                        json!({"configOptions": [{"id": "model", "currentValue": value}]}),
+                    )
+                }
+            }
+        }
         ("session/prompt", Some(id)) => {
             let session = message["params"]["sessionId"].clone();
             match scenario {
@@ -148,6 +178,7 @@ fn dispatch(io: &mut Io, scenario: &str, message: &Value) {
                 "permission" | "permission-then-edit" => {
                     permission_turn(io, &id, &session, scenario)
                 }
+                "model-echo" => echo_model_turn(io, &id, &session),
                 _ => stream_turn(io, &id, &session),
             }
         }
@@ -162,6 +193,19 @@ fn dispatch(io: &mut Io, scenario: &str, message: &Value) {
         })),
         _ => {}
     }
+}
+
+/// The model the last session/set_config_option selected in this process.
+static SELECTED_MODEL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn echo_model_turn(io: &mut Io, id: &Value, session: &Value) {
+    let model = SELECTED_MODEL
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
+    io.text_update(session, &format!("model={model}"));
+    respond(io, id, json!({"stopReason": "end_turn"}));
 }
 
 fn stream_turn(io: &mut Io, id: &Value, session: &Value) {
