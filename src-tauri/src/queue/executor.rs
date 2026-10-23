@@ -18663,6 +18663,8 @@ VERDICT: APPROVED"
         #[tokio::test]
         async fn an_opencode_task_runs_through_the_acp_adapter_and_settles_in_ai_review() {
             let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
             {
                 let mut tasks = w.executor.tasks.write().await;
                 let task = tasks.get_mut(&w.task_id).unwrap();
