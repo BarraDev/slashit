@@ -15,6 +15,7 @@ use super::frame::excerpt;
 use crate::agents::provider_lease::ProviderLease;
 use std::collections::VecDeque;
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -58,6 +59,9 @@ pub(super) struct Owned {
     pub stderr: ChildStderr,
     pub control: mpsc::UnboundedSender<Control>,
     pub exit: watch::Receiver<ExitReport>,
+    /// Leader waits this child has started. Test evidence of the waiter bound.
+    #[cfg(test)]
+    pub leader_waits: Arc<AtomicUsize>,
 }
 
 /// Starts the child and hands its pipes to separate owners.
@@ -139,7 +143,15 @@ pub(super) fn spawn(
 
     let (control, control_rx) = mpsc::unbounded_channel();
     let (exit_tx, exit_rx) = watch::channel(None);
-    tokio::spawn(supervise(child, pid, control_rx, exit_tx, held));
+    let leader_waits = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(supervise(
+        child,
+        pid,
+        control_rx,
+        exit_tx,
+        leader_waits.clone(),
+        held,
+    ));
 
     Ok(Owned {
         stdin,
@@ -147,6 +159,8 @@ pub(super) fn spawn(
         stderr,
         control,
         exit: exit_rx,
+        #[cfg(test)]
+        leader_waits,
     })
 }
 
@@ -169,12 +183,20 @@ async fn supervise(
     pid: Option<u32>,
     mut control: mpsc::UnboundedReceiver<Control>,
     exit: watch::Sender<ExitReport>,
+    leader_waits: Arc<AtomicUsize>,
     _held: Box<dyn Send>,
 ) {
+    // One leader wait for the child's whole life. Each request below only
+    // loops back to the select; it never starts another wait, so a burst of
+    // requests cannot pile up blocked threads. The reap is gated on the
+    // leader, so the group is ended before the reap lets its id go.
+    let mut leader = Box::pin(leader_exited(pid, leader_waits));
+    let mut leader_done = false;
     let mut control_open = true;
     loop {
         tokio::select! {
-            status = exit_ready(&mut child, pid) => {
+            () = &mut leader, if !leader_done => leader_done = true,
+            status = child.wait(), if leader_done => {
                 let report = status.map_err(|error| excerpt(&error.to_string()));
                 let _ = exit.send(Some(report));
                 return;
@@ -194,36 +216,35 @@ async fn supervise(
     }
 }
 
-/// Completes once the child has exited and been reaped, and returns its status.
+/// Completes once the leader has exited, after its process group has been
+/// ended.
 ///
 /// On Unix the leader is waited for without reaping, so its process group id
 /// still belongs to this process. Whatever the leader left running in that
-/// group is ended before the reap lets the id go.
+/// group is ended before the reap lets the id go. The blocking wait is
+/// started here, once per child, and is not cancelled by the caller.
 #[cfg(unix)]
-async fn exit_ready(child: &mut Child, pid: Option<u32>) -> std::io::Result<ExitStatus> {
-    if let Some(pid) = pid {
-        let _ = tokio::task::spawn_blocking(move || {
-            // Safety: `siginfo_t` is plain data and `waitid` fills it in.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid as libc::id_t,
-                    &mut info,
-                    libc::WEXITED | libc::WNOWAIT,
-                );
-            }
-        })
-        .await;
-        kill_group(Some(pid));
-    }
-    child.wait().await
+async fn leader_exited(pid: Option<u32>, leader_waits: Arc<AtomicUsize>) {
+    let Some(pid) = pid else { return };
+    leader_waits.fetch_add(1, Ordering::SeqCst);
+    let _ = tokio::task::spawn_blocking(move || {
+        // Safety: `siginfo_t` is plain data and `waitid` fills it in.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            );
+        }
+    })
+    .await;
+    kill_group(Some(pid));
 }
 
 #[cfg(not(unix))]
-async fn exit_ready(child: &mut Child, _pid: Option<u32>) -> std::io::Result<ExitStatus> {
-    child.wait().await
-}
+async fn leader_exited(_pid: Option<u32>, _leader_waits: Arc<AtomicUsize>) {}
 
 /// Ends the child's process group. Best-effort: a group that has already gone
 /// is the outcome being asked for.

@@ -10,7 +10,7 @@ use super::connection::{
     AcpError, AgentEvent, Connection, EventStream, ResolutionReason, SessionRef,
 };
 use super::frame::{self, FrameError, Message};
-use super::process::{read_line_bounded, LineRead, SpawnSpec};
+use super::process::{self, read_line_bounded, Control, LineRead, SpawnSpec};
 use super::types::{
     PermissionDecision, PermissionOutcome, SessionUpdate, StopReason, ToolCallStatus,
 };
@@ -582,6 +582,36 @@ async fn dropping_the_last_handle_kills_the_agent() {
     })
     .await;
     assert!(matches!(closed, AgentEvent::Closed { .. }));
+}
+
+/// Owners may ask for a kill any number of times, and each request is queued
+/// before the supervisor runs, so every one arrives while the child is alive.
+/// The supervisor must still wait on the child once, not once per request.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_burst_of_kill_requests_starts_one_leader_wait() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::atomic::Ordering;
+
+    let spec = SpawnSpec {
+        program: "sleep".to_string(),
+        args: vec!["30".to_string()],
+        cwd: std::env::temp_dir(),
+        env: Vec::new(),
+        clear_env: false,
+        request_timeout: LONG,
+        permission_timeout: LONG,
+    };
+    let owned = process::spawn(&spec, None, Box::new(())).expect("spawn");
+    for _ in 0..50 {
+        owned.control.send(Control::Kill).expect("the supervisor is running");
+    }
+    let mut exit = owned.exit.clone();
+    exit.wait_for(Option::is_some).await.expect("the supervisor reports");
+    let report = exit.borrow().clone();
+    let status = report.expect("a report").expect("the child was reaped");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    assert_eq!(owned.leader_waits.load(Ordering::SeqCst), 1);
 }
 
 /// Reproduces the suspected defect in the legacy client (`acp/client.rs`).
