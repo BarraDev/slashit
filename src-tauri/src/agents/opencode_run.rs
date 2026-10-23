@@ -11,19 +11,22 @@
 //! times out.
 //!
 //! Permission policy: [`OPENCODE_POLICY_CONTENT`] denies every tool except
-//! reads, searches and edits, and it denies any path outside the Task
-//! Checkout. A denied tool is removed from the model's tool list, so it issues
-//! no request. OpenCode is started under [`policy_env`], which also points its
-//! global configuration at an empty directory that this run owns, and turns off
-//! the repository's own configuration. The user's global configuration would
-//! otherwise override the policy: its agent permissions win over the inline
-//! policy, and its plugins and commands run inside the Worker.
+//! reads, searches and edits, and it refuses reads, writes, searches and
+//! globs whose path is outside the Task Checkout. A denied tool is removed from
+//! the model's tool list, so it issues no request. OpenCode is started under
+//! [`policy_env`], which also points its global configuration at an empty
+//! directory that this run owns, and turns off the repository's own
+//! configuration. The user's global configuration would otherwise override the
+//! policy: its agent permissions win over the inline policy, and its plugins
+//! load inside the Worker.
 //!
-//! Each tool and path rule was checked against OpenCode 2.0.32 with a scripted
-//! model and no paid provider. Shell, network fetch, subagents and the code
-//! runtime are not allowed, so none of them can run. A path outside the
-//! checkout is refused, but a symbolic link inside the checkout is followed:
-//! the path check does not see its target. That residual is not closed here.
+//! The policy was checked against OpenCode 2.0.32 with a scripted model and no
+//! paid provider, for the tools the model was offered (read, glob, grep, edit,
+//! write, shell, execute, webfetch, subagent) and for the scenarios named
+//! there. Known gaps: a symbolic link inside the checkout is followed by `read`,
+//! because the path check does not see its target, and that is not closed here.
+//! Global commands and the `question`, `skill` and `websearch` tools were not
+//! exercised individually.
 //!
 //! SlashIt has no interactive approval path yet, so nothing is approved. A
 //! request that arrives anyway is refused, and a request with no reject option
@@ -68,21 +71,22 @@ const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// The OpenCode permission policy every run is started under. Denied tools are
 /// removed from the model's list, so a denied call is never offered. The
 /// allowed tools are read, glob, grep and edit (OpenCode's `edit` permission
-/// also covers `write`). `external_directory` denies any path outside the Task
-/// Checkout, including a relative `../` path. Shell, network fetch, subagents,
-/// questions, skills and the code runtime (`execute`) are all denied. An inline
-/// policy outranks the project's `opencode.json`, and [`policy_env`] turns that
-/// file off as well.
+/// also covers `write`). `external_directory` refuses paths outside the Task
+/// Checkout, including a relative `../` path, for the file tools that were
+/// checked. Shell, network fetch, subagents and the code runtime (`execute`) are
+/// not offered, because they are denied by default. An inline policy outranks
+/// the project's `opencode.json`, and [`policy_env`] turns that file off as well.
 pub const OPENCODE_POLICY_CONTENT: &str = r#"{"permission":{"*":"deny","read":"allow","glob":"allow","grep":"allow","edit":"allow","external_directory":"deny"}}"#;
 
 /// The variables that pin the OpenCode policy for one process. The Task
 /// Checkout is written by a model, so a repository's `opencode.json` must not
 /// decide the policy. With project configuration off, that file is not read,
 /// and neither are the MCP servers it declares, nor the project's plugins and
-/// commands. Those run before any request. `config_dir` replaces the user's
-/// global configuration directory, so the user's global permissions, agent
-/// overrides, plugins and commands are not read either. It must be empty and
-/// owned by this run.
+/// commands. Probes showed the MCP server and the project plugin starting
+/// without any prompt, and a project command's shell substitution running when
+/// the prompt named it. `config_dir` replaces the user's global configuration
+/// directory, so the user's global permissions, agent overrides and plugins are
+/// not read either. It must be empty and owned by this run.
 pub fn policy_env(config_dir: &str) -> Vec<(String, String)> {
     vec![
         ("OPENCODE_DISABLE_PROJECT_CONFIG".to_string(), "1".to_string()),
@@ -137,7 +141,11 @@ pub struct OpenCodeRunner {
     /// One entry per permission request this run refused, in arrival order.
     refusals: Refusals,
     /// The empty configuration directory OpenCode was started with. Removed
-    /// when the run is dropped, after the process has been ended.
+    /// when the run is dropped. A kill is requested, not awaited, on that path
+    /// and on a start that fails after the spawn, so the process may still be
+    /// exiting when the directory is removed. OpenCode reads no configuration
+    /// from a missing directory, so nothing is read from the user's home in that
+    /// window.
     _config_dir: tempfile::TempDir,
 }
 
