@@ -51,9 +51,11 @@ cut short must not be recorded as failed if its effect may have happened.
 
 ## 3. State and commit points
 
-- A Task change is durable when `lifecycle::commit_task` returns `Ok`. Its
-  documentation says a missing Task is `Ok(None)` in the normal case, and an
-  error only when a delete races the write.
+- A Task change is durable when `lifecycle::commit_task` returns `Ok`. A
+  missing Task is `Ok(None)` in the normal case. `commit_task` returns an error
+  when the Task carries a worker recovery refusal, which fails closed for every
+  caller of this transition, and when `record` fails. A delete that races the
+  write is one such `record` failure, and nothing is written.
 - Files are replaced with `slashit_durable_fs::write_atomic`. It stages a
   temporary file, syncs it, renames it, and syncs the directory. Code that
   writes Task or config state directly, without this path, must justify why.

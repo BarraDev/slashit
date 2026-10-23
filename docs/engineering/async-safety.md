@@ -25,7 +25,7 @@ decision follows the normal validation only.
    accepted, persisted, running, completed, failed, cancelled and
    outcome-unknown. Do not report completion from a scheduled or enqueued
    operation.
-2. **Name the owner of every spawned critical operation.** Someone must
+2. **Name the owner of every spawned operation.** Someone must
    observe its result, cancel it, and wait for it or account for it at
    shutdown. A detached task needs a written lifecycle reason in the code.
 3. **Protect logical operations, not memory accesses.** Two atomic operations
@@ -59,7 +59,7 @@ decision follows the normal validation only.
 
 ## Review gate
 
-A change in the trigger list needs a review record in the pull request
+A change that matches the trigger list needs a review record in the pull request
 description or a linked private report. It states, in this order:
 
 ```text
@@ -75,8 +75,8 @@ Verdict: APPROVE / REQUEST CHANGES / INCONCLUSIVE
 
 Reviewers check the record against the diff. A reviewer who finds a rule
 broken by the diff, and not by the description alone, requests changes. A
-missing record for a trigger-listed change is itself a reason to request
-changes.
+missing record for a change that matches the trigger list is itself a reason
+to request changes.
 
 ## Tools
 
