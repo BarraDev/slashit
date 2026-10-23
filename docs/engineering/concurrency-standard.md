@@ -69,10 +69,12 @@ recomputes the digest in the same write that records the start.
 
 The digest must cover every field that changes what runs. On `main`, the digest
 covers the prompt, the model and any additional request, but not the Coding
-Worker. The branch for PR #243 adds the Worker to the digest for a non-default
-Worker, so a Worker change after approval returns `Differs` and the start fails
-closed. That change is not on `main` until PR #243 merges. The Claude digest
-formula is kept, so approvals for existing Claude Tasks still match.
+Worker, because `main` runs only the Claude Worker.
+
+Open item, to remove when PR #243 merges: that PR adds the Worker to the digest
+for a non-default Worker, so a Worker change after approval returns `Differs`
+and the start fails closed. The Claude digest formula is kept, so approvals
+for existing Claude Tasks still match.
 
 A value changed after approval that is not covered by the digest is a defect.
 Check each new field that the prompt, the model, the Worker or the checkout
@@ -80,18 +82,19 @@ depends on against the digest before merging.
 
 ## 5. Subprocesses and cancellation
 
-- A cancellation or timeout ends the process group, then reports the outcome
-  as unknown if the effect may have happened. It does not claim rollback.
+- A cancellation or timeout ends the process group. A user stop settles the
+  Task to `Backlog` and records it as stopped, not as failed. It does not roll
+  back effects already made in the Task Checkout. An ambiguous failure, where
+  an effect may have happened, is reported as outcome unknown.
 - Output pipes must be drained or redirected. A child that fills an undrained
   pipe blocks, and that can look like a hang.
 - A Worker that the policy refuses must end its run in a state the executor
   classifies. A refused permission request is not a success. The executor
   decides from the checkout whether work was done.
 
-Behavior of the OpenCode Worker, which is on the PR #243 branch and not yet on
-`main`, is pinned by the process environment (`policy_env` in
-`src-tauri/src/agents/opencode_run.rs` on that branch). Its evidence and
-limits are in that pull request's review record, not here.
+Open item, to remove when PR #243 merges: the OpenCode Worker exists only on
+that pull request's branch. Its permission behavior and its limits are in that
+pull request's review record, not here.
 
 ## 6. IPC and correlation
 
@@ -133,9 +136,12 @@ Test helpers that matter:
   not reentrant. A test that installs two fake commands with `FakeProgram`
   deadlocks on its second install. Install one and add the rest with
   `FakeProgram::add`.
-- A negative control is required for a claimed ordering test. Remove the fix
-  temporarily, confirm the test fails, restore the fix, and record both
-  results. A test that passes both ways does not guard the bug.
+- A regression test for a fixed ordering defect needs a negative control.
+  Remove the fix temporarily, confirm the test fails, restore the fix, and
+  record both results. A test that passes both ways does not guard the bug.
+  A new ordering test with no fix to remove forces its adverse order with a
+  barrier or an injected error, as rule 9 of the async-safety rules requires,
+  and a negative control is then optional.
 - A test that waits must bound the wait and fail with a message. A bounded
   polling loop with a deadline is acceptable. A fixed sleep is not evidence.
 

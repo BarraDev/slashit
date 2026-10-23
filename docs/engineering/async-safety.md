@@ -33,8 +33,9 @@ decision follows the normal validation only.
    must happen under one lock, one transaction, one version comparison or one
    owner. A lock inside one process does not protect another process.
 4. **Bind approvals to the exact input and identity they authorize.** An
-   approval names the request version, the input, the Worker and the run. A
-   change to any of them after approval must refuse the start, and the
+   approval names the input (by its digest), the run and, once a Task can run
+   on more than one Worker, the Worker. A change to any of them after approval
+   must refuse the start, and the
    refusal must survive a restart.
 5. **Make cancellation and timeout honest.** A timeout does not roll back
    effects that already happened. After an ambiguous failure, report the
