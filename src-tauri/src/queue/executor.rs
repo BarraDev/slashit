@@ -715,6 +715,14 @@ fn current_run_is_manual(task: &Task) -> bool {
         .is_some_and(|handoff| handoff.review_mode == crate::domain::task::ReviewMode::Manual)
 }
 
+/// Whether the current run's record was rebuilt without its evidence, so the
+/// mode it started under is unknown rather than chosen.
+fn run_mode_is_unproven(task: &Task) -> bool {
+    task.worker_handoff
+        .as_ref()
+        .is_some_and(|handoff| handoff.review_mode_unproven)
+}
+
 /// Whether `task` sits where a delivered pull request lives, so that the
 /// poll may finish it when the pull request merges and record a failure when
 /// it closes.
@@ -6994,13 +7002,14 @@ impl TaskExecutor {
         // fixed, so a later change to the Task's mode cannot reach it. Nothing
         // here starts a reviewer, a review-fix agent or CodeRabbit, and no
         // QA signoff is written, because none was produced.
-        let (manual_run, manual_already_settled) = {
+        let (manual_run, manual_already_settled, mode_unproven) = {
             let tasks = self.tasks.read().await;
-            tasks.get(&task_id).map_or((false, false), |t| {
+            tasks.get(&task_id).map_or((false, false, false), |t| {
                 let manual = current_run_is_manual(t);
                 (
                     manual && t.status == TaskStatus::AiReview,
                     manual && t.status != TaskStatus::AiReview,
+                    run_mode_is_unproven(t),
                 )
             })
         };
@@ -7011,12 +7020,18 @@ impl TaskExecutor {
             return;
         }
         if manual_run {
+            // A rebuilt record does not know the mode its run started under, so
+            // the skip must not say that Manual was chosen for it.
+            let reason = if mode_unproven {
+                "The original review mode could not be confirmed, so automatic AI Review was withheld for safety"
+            } else {
+                "Manual review mode was selected, so AI Review was not run"
+            };
             let trail = vec![(
                 chrono::Utc::now(),
                 ActivityKind::AiReviewSkipped {
                     review,
-                    reason: "Manual review mode was selected, so AI Review was not run"
-                        .to_string(),
+                    reason: reason.to_string(),
                 },
             )];
             Self::transition_to_human_review(

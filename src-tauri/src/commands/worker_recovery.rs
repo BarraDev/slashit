@@ -2036,6 +2036,27 @@ mod tests {
                 .any(|e| matches!(e.kind, ActivityKind::AiReviewStarted { .. })),
             "no automatic reviewer was admitted"
         );
+        // The skip is recorded, but it must not claim that Manual was selected:
+        // the mode of this run was never confirmed.
+        let reasons: Vec<&str> = task
+            .activity
+            .iter()
+            .filter_map(|e| match &e.kind {
+                ActivityKind::AiReviewSkipped { reason, .. } => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons.len(), 1, "one skip is recorded");
+        assert!(
+            reasons[0].contains("could not be confirmed"),
+            "the skip says the mode is unknown: {}",
+            reasons[0]
+        );
+        assert!(
+            !reasons[0].contains("selected"),
+            "the skip does not claim Manual was chosen: {}",
+            reasons[0]
+        );
         assert_eq!(fx.on_disk().status, TaskStatus::HumanReview, "durable");
     }
 
