@@ -2278,7 +2278,7 @@ impl TaskExecutor {
 
     /// Stands in for the run-start write that fixes a run's review mode, so a
     /// test can start a run in a chosen mode without launching a Worker.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn start_run_in_review_mode_for_test(
         &self,
         task_id: Uuid,

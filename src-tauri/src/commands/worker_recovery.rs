@@ -1961,6 +1961,8 @@ mod tests {
         );
     }
 
+    // `spawn_review_for_test` exists only on Unix, where the review path runs.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_manual_run_reaches_human_review_without_an_ai_review_and_stays_there() {
         let fx = fixture().await;
