@@ -10,19 +10,29 @@
 //! turn that does not end with `end_turn` is a failure, and so is a turn that
 //! times out.
 //!
-//! Permission policy: every permission request is refused. OpenCode is started
-//! under [`policy_env`], which asks before actions that would otherwise run
-//! without a request. Without that pin, OpenCode 2.0.32's default `build` agent
-//! ran the shell tool with no request in a live probe, and a project
-//! `opencode.json` is merged into the resolved permissions. Only the shell tool
-//! was exercised live, so other tools are not claimed here. SlashIt has no
-//! interactive approval path yet, so nothing is approved. A request with no
-//! reject option is cancelled. The connection itself cancels a
-//! request that gets no answer in time, and nothing is ever approved by a
-//! timeout, a dropped answer or a closed connection. Each refusal is recorded
-//! on the run ([`OpenCodeRunner::refused_permissions`]). A turn that still ends
-//! with `end_turn` is `Ok`, so the executor decides from the checkout whether
-//! the Task was finished.
+//! Permission policy: [`OPENCODE_POLICY_CONTENT`] denies every tool except
+//! reads, searches and edits, and it denies any path outside the Task
+//! Checkout. A denied tool is removed from the model's tool list, so it issues
+//! no request. OpenCode is started under [`policy_env`], which also points its
+//! global configuration at an empty directory that this run owns, and turns off
+//! the repository's own configuration. The user's global configuration would
+//! otherwise override the policy: its agent permissions win over the inline
+//! policy, and its plugins and commands run inside the Worker.
+//!
+//! Each tool and path rule was checked against OpenCode 2.0.32 with a scripted
+//! model and no paid provider. Shell, network fetch, subagents and the code
+//! runtime are not allowed, so none of them can run. A path outside the
+//! checkout is refused, but a symbolic link inside the checkout is followed:
+//! the path check does not see its target. That residual is not closed here.
+//!
+//! SlashIt has no interactive approval path yet, so nothing is approved. A
+//! request that arrives anyway is refused, and a request with no reject option
+//! is cancelled. The connection itself cancels a request that gets no answer in
+//! time, and nothing is ever approved by a timeout, a dropped answer or a closed
+//! connection. Each refusal is recorded on the run
+//! ([`OpenCodeRunner::refused_permissions`]). A turn that still ends with
+//! `end_turn` is `Ok`, so the executor decides from the checkout whether the
+//! Task was finished.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,22 +65,29 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// upper bound on an answer that never comes.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// The OpenCode configuration every run is started under: ask before each
-/// action, and refuse each request (see the permission policy above). Inline
-/// configuration outranks the project's `opencode.json`, and [`policy_env`]
-/// turns that file off as well. One live probe on OpenCode 2.0.32 found that a
-/// project allow did not override this policy.
-pub const OPENCODE_POLICY_CONTENT: &str = r#"{"permission":{"*":"ask"}}"#;
+/// The OpenCode permission policy every run is started under. Denied tools are
+/// removed from the model's list, so a denied call is never offered. The
+/// allowed tools are read, glob, grep and edit (OpenCode's `edit` permission
+/// also covers `write`). `external_directory` denies any path outside the Task
+/// Checkout, including a relative `../` path. Shell, network fetch, subagents,
+/// questions, skills and the code runtime (`execute`) are all denied. An inline
+/// policy outranks the project's `opencode.json`, and [`policy_env`] turns that
+/// file off as well.
+pub const OPENCODE_POLICY_CONTENT: &str = r#"{"permission":{"*":"deny","read":"allow","glob":"allow","grep":"allow","edit":"allow","external_directory":"deny"}}"#;
 
 /// The variables that pin the OpenCode policy for one process. The Task
 /// Checkout is written by a model, so a repository's `opencode.json` must not
 /// decide the policy. With project configuration off, that file is not read,
-/// and neither are the MCP servers it declares. Those start a command at
-/// session creation, before any request.
-pub fn policy_env() -> [(&'static str, &'static str); 2] {
-    [
-        ("OPENCODE_DISABLE_PROJECT_CONFIG", "1"),
-        ("OPENCODE_CONFIG_CONTENT", OPENCODE_POLICY_CONTENT),
+/// and neither are the MCP servers it declares, nor the project's plugins and
+/// commands. Those run before any request. `config_dir` replaces the user's
+/// global configuration directory, so the user's global permissions, agent
+/// overrides, plugins and commands are not read either. It must be empty and
+/// owned by this run.
+pub fn policy_env(config_dir: &str) -> Vec<(String, String)> {
+    vec![
+        ("OPENCODE_DISABLE_PROJECT_CONFIG".to_string(), "1".to_string()),
+        ("OPENCODE_CONFIG_DIR".to_string(), config_dir.to_string()),
+        ("OPENCODE_CONFIG_CONTENT".to_string(), OPENCODE_POLICY_CONTENT.to_string()),
     ]
 }
 
@@ -79,12 +96,13 @@ pub fn policy_env() -> [(&'static str, &'static str); 2] {
 /// variables are never passed, so a user's setting cannot replace the policy.
 pub fn opencode_spawn_env(
     parent: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    config_dir: &str,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = provider_env(parent)
         .into_iter()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect();
-    env.extend(policy_env().into_iter().map(|(name, value)| (name.to_string(), value.to_string())));
+    env.extend(policy_env(config_dir));
     env
 }
 
@@ -118,6 +136,9 @@ pub struct OpenCodeRunner {
     outcome: OnceCell<Result<(), String>>,
     /// One entry per permission request this run refused, in arrival order.
     refusals: Refusals,
+    /// The empty configuration directory OpenCode was started with. Removed
+    /// when the run is dropped, after the process has been ended.
+    _config_dir: tempfile::TempDir,
 }
 
 /// The refused permission requests of one run, shared with its event reader.
@@ -132,11 +153,22 @@ impl OpenCodeRunner {
         config: OpenCodeRunConfig,
         lease: Option<ProviderLease>,
     ) -> Result<Self, String> {
+        // Empty and private to this run, so the user's global OpenCode
+        // configuration is not read (see `policy_env`).
+        let config_dir = tempfile::Builder::new()
+            .prefix("slashit-opencode-config-")
+            .tempdir()
+            .map_err(|e| format!("The OpenCode configuration directory could not be created: {e}"))?;
+        let config_path = config_dir
+            .path()
+            .to_str()
+            .ok_or_else(|| "The OpenCode configuration directory path is not UTF-8".to_string())?
+            .to_string();
         let spec = SpawnSpec {
             program: config.program.clone(),
             args: config.args.clone(),
             cwd: config.working_dir.clone(),
-            env: opencode_spawn_env(std::env::vars_os()),
+            env: opencode_spawn_env(std::env::vars_os(), &config_path),
             clear_env: true,
             request_timeout: REQUEST_TIMEOUT,
             permission_timeout: PERMISSION_TIMEOUT,
@@ -185,6 +217,7 @@ impl OpenCodeRunner {
             reader: Mutex::new(Some(reader)),
             outcome: OnceCell::new(),
             refusals,
+            _config_dir: config_dir,
         })
     }
 
@@ -392,19 +425,40 @@ mod tests {
             ("HOME", "/home/worker"),
             ("PATH", "/usr/bin"),
             ("OPENCODE_CONFIG_CONTENT", r#"{"permission":{"*":"allow"}}"#),
+            ("OPENCODE_CONFIG_DIR", "/home/worker/.config/opencode"),
             ("OPENCODE_DISABLE_PROJECT_CONFIG", "0"),
             ("OPENCODE_CONFIG", "/tmp/elsewhere.json"),
         ]
         .map(|(name, value)| (OsString::from(name), OsString::from(value)));
         let env: std::collections::HashMap<String, String> =
-            opencode_spawn_env(parent).into_iter().collect();
+            opencode_spawn_env(parent, "/run/slashit-config").into_iter().collect();
 
         assert_eq!(env.get("HOME").map(String::as_str), Some("/home/worker"));
         assert_eq!(env.get("OPENCODE_DISABLE_PROJECT_CONFIG").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("OPENCODE_CONFIG_DIR").map(String::as_str),
+            Some("/run/slashit-config"),
+            "the user's global configuration directory is replaced by the run's own"
+        );
         assert!(!env.contains_key("OPENCODE_CONFIG"), "the user's config file is not passed");
-        let content: serde_json::Value =
-            serde_json::from_str(&env["OPENCODE_CONFIG_CONTENT"]).expect("the policy is JSON");
-        assert_eq!(content, serde_json::json!({"permission": {"*": "ask"}}));
+        assert_eq!(env["OPENCODE_CONFIG_CONTENT"], OPENCODE_POLICY_CONTENT);
+    }
+
+    #[test]
+    fn the_policy_denies_by_default_and_allows_only_checkout_reads_and_edits() {
+        let policy: serde_json::Value =
+            serde_json::from_str(OPENCODE_POLICY_CONTENT).expect("the policy is JSON");
+        assert_eq!(
+            policy,
+            serde_json::json!({"permission": {
+                "*": "deny",
+                "read": "allow",
+                "glob": "allow",
+                "grep": "allow",
+                "edit": "allow",
+                "external_directory": "deny"
+            }})
+        );
     }
 
     #[test]
