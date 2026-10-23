@@ -1,15 +1,14 @@
 # AGENTS.md (src-tauri/src/agents)
 
-Claude Code agent execution.
+Claude Code and OpenCode coding-run execution. The Agent Communication Protocol client lives in `acp/`, not here.
 
 ## Architecture
 
-- **mod.rs** - Declares the `coding_run`, `provider_lease`, `roles` and `runner` modules
-- **coding_run.rs** - `CodingRunner` and `CodingRunEvent`, the provider-neutral run boundary
+- **mod.rs** - Declares the `coding_run`, `opencode_run`, `provider_lease`, `roles` and `runner` modules
+- **coding_run.rs** - `CodingRunner` and `CodingRunEvent`, the provider-neutral run boundary, over `runner.rs` (Claude) and `opencode_run.rs` (OpenCode over ACP)
+- **opencode_run.rs** - `OpenCodeRunner`: one `opencode acp` process per run under `OPENCODE_POLICY_CONTENT` (read, glob, grep and edit only). Not an OS sandbox, `read` follows symlinks, Unix only. Read its module doc before changing the policy or the configuration directory's lifecycle.
 - **roles.rs** - `roles::AgentRole`, `AgentSlot` and `AgentSlotStatus`
 - **runner.rs** - `ClaudeRunner`, which runs the Claude Code CLI and streams `CodingRunEvent`s
-
-The Agent Communication Protocol client lives in `acp/`, not here.
 
 ## Tools and permissions
 

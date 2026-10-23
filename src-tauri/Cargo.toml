@@ -15,6 +15,16 @@ default-run = "slashit-ui"
 name = "slashit_ui_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# The fake ACP agent that the ACP v1 tests spawn. A binary rather than an
+# example so that every `cargo test` builds it to the same path. It is a
+# test fixture, not a product binary, and `test`/`doc` are off so no harness
+# runs it.
+[[bin]]
+name = "acp_fixture_agent"
+path = "tests/fixtures/acp_fixture_agent.rs"
+test = false
+doc = false
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

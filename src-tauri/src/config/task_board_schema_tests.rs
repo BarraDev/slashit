@@ -137,6 +137,7 @@ fn full_task(project_id: Uuid) -> Task {
     task.project_id = project_id;
     task.description = Some("described".into());
     task.last_observed_model = Some("observed".into());
+    task.provider = crate::domain::task::CodingProvider::OpenCode;
     task.dependencies = vec![Uuid::new_v4()];
     task.worktree_id = Some(Uuid::new_v4());
     task.jj_change_id = Some("change".into());

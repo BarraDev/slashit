@@ -3,7 +3,7 @@ use crate::domain::{
     Task, NewTask, TaskStatus, TaskCategory, TaskPriority, TaskComplexity,
     TaskImpact, SecuritySeverity, TaskPhase, Subtask,
 };
-use crate::domain::task::ExternalRef;
+use crate::domain::task::{CodingProvider, ExternalRef};
 use crate::lifecycle::{classify_status_transition, StatusTransitionEffect};
 use uuid::Uuid;
 use std::collections::HashMap;
@@ -623,6 +623,9 @@ pub struct UpdateTaskParams {
     pub impact: Option<TaskImpact>,
     pub security_severity: Option<SecuritySeverity>,
     pub model: Option<String>,
+    /// The coding Worker for the Task. Applied only when given, so an edit
+    /// that does not name it leaves the Task's provider as it was.
+    pub provider: Option<CodingProvider>,
     pub planning_mode: Option<bool>,
 }
 
@@ -658,6 +661,9 @@ pub async fn update_task(
             }
             if let Some(m) = params.model.clone() {
                 task.model = m;
+            }
+            if let Some(provider) = params.provider {
+                task.provider = provider;
             }
             if let Some(p) = params.planning_mode {
                 task.planning_mode = p;
@@ -3034,6 +3040,7 @@ mod task_dependency_contract {
                 impact: None,
                 security_severity: None,
                 model: None,
+                provider: None,
                 planning_mode: None,
             },
         )

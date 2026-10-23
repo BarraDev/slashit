@@ -133,6 +133,10 @@ pub struct Task {
     /// `"default"` value for provider default. Only a person's explicit
     /// configuration changes it. A run's report never does.
     pub model: String,
+    /// Which coding Worker runs this Task. A stored Task with no `provider`
+    /// runs with Claude. Only a person's explicit choice changes it.
+    #[serde(default, skip_serializing_if = "CodingProvider::is_default")]
+    pub provider: CodingProvider,
     /// The model the provider most recently reported for one of this Task's
     /// runs. It is evidence of what ran, never configuration: approvals,
     /// proposals and launches read `model` only. `None` until a run reports a
@@ -888,6 +892,7 @@ impl Task {
             model: new.model,
             last_observed_model: None,
             planning_mode: new.planning_mode,
+            provider: Default::default(),
             dependencies: new.dependencies,
             worktree_id: None,
             jj_change_id: None,
@@ -1039,6 +1044,21 @@ impl Task {
         self.approved_execution = None;
     }
 
+    /// Fail the Task because its Worker cannot launch what it asks for, decided
+    /// before any run started. No run is recorded and the run number is not
+    /// spent, so the next attempt is the same run. The approval binding ends
+    /// with the failure, as it does for a stale approval: a person re-approves.
+    pub fn fail_refused_launch(&mut self, reason: &str) {
+        let from = self.status.clone();
+        self.status = TaskStatus::Error;
+        self.phase = TaskPhase::Failed;
+        self.worker_handoff_confirmed = false;
+        self.error_message = Some(reason.to_string());
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: reason.to_string() });
+        self.record_move(&from);
+        self.approved_execution = None;
+    }
+
     /// Add what became of the checkout taken for a stale refusal, once cleanup
     /// has run. The Task must still be the one `fail_stale_approval` left
     /// (failed closed, with the stale reason and nothing else), so a Task moved
@@ -1050,6 +1070,19 @@ impl Task {
             return false;
         }
         self.error_message = Some(format!("{STALE_APPROVAL_REASON} {outcome}"));
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: outcome.to_string() });
+        true
+    }
+
+    /// Add what became of the checkout taken for a refused launch, once cleanup
+    /// has run. The Task must still be the one `fail_refused_launch` left with
+    /// this refusal and nothing else, so a Task moved meanwhile is not
+    /// rewritten. Returns whether the outcome was recorded.
+    pub fn note_refused_launch_cleanup(&mut self, refusal: &str, outcome: &str) -> bool {
+        if self.status != TaskStatus::Error || self.error_message.as_deref() != Some(refusal) {
+            return false;
+        }
+        self.error_message = Some(format!("{refusal} {outcome}"));
         self.record_activity(ActivityKind::RunFailed { run: None, reason: outcome.to_string() });
         true
     }
@@ -1636,6 +1669,40 @@ pub struct PrReviewApplyResult {
     /// evidence (`in_reply_to_id`) rather than a guess.
     #[serde(default)]
     pub auto_reply: Option<bool>,
+}
+
+/// The coding Worker that runs a Task. Claude Code is the default, and the
+/// only provider that existing Tasks have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodingProvider {
+    #[default]
+    Claude,
+    /// OpenCode, over the Agent Client Protocol.
+    OpenCode,
+}
+
+impl CodingProvider {
+    /// True for the default provider, which is omitted from stored Tasks.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The name shown to a person.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::OpenCode => "OpenCode",
+        }
+    }
+
+    /// The agent type recorded with the run's execution.
+    pub fn agent_type(self) -> &'static str {
+        match self {
+            Self::Claude => "claude-code",
+            Self::OpenCode => "opencode",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

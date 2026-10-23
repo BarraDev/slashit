@@ -60,6 +60,15 @@ impl ExternalRef {
     }
 }
 
+/// The coding Worker that runs a Task. Mirrors the backend's `CodingProvider`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CodingProvider {
+    #[default]
+    Claude,
+    OpenCode,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: Uuid,
@@ -68,6 +77,9 @@ pub struct Task {
     pub description: Option<String>,
     pub status: TaskStatus,
     pub model: String,
+    /// Which coding Worker runs the Task. Absent on older records: Claude.
+    #[serde(default)]
+    pub provider: CodingProvider,
     /// Evidence only: the model the provider last reported for a run. It never
     /// changes `model`, the configured policy.
     #[serde(default)]
