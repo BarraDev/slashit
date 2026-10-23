@@ -1,9 +1,10 @@
 //! ACP v1 over stdio: the spec-conformant transport and protocol layer.
 //!
-//! Status: milestone 1 of the modern ACP work. This module is compiled only
-//! for tests (see `acp/mod.rs`), so it is not reachable from any Tauri command
-//! or from `TaskExecutor`. It is verified against the fixture agent
-//! (`tests/fixtures/acp_fixture_agent.rs`) and the tests in `tests.rs`.
+//! The OpenCode Worker runs through this module (see `agents::opencode_run`).
+//! `TaskExecutor` reaches it only through `CodingRunner`, never directly. The
+//! fixture agent (`tests/fixtures/acp_fixture_agent.rs`) is a binary of this
+//! package that `cargo test` builds; no product path runs it, and the tests in
+//! `tests.rs` drive it.
 //!
 //! Spec pages used, verified 2026-10-21:
 //! - https://agentclientprotocol.com/protocol/transports (newline framing, stdout/stderr rules)

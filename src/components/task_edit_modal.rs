@@ -303,10 +303,18 @@ pub fn TaskEditModal(
                                 <div>
                                     <label class="block text-sm font-medium text-white/70 mb-1.5">"Coding Worker"</label>
                                     <select
-                                        on:change=move |ev| set_provider.set(match event_target_value(&ev).as_str() {
-                                            "opencode" => CodingProvider::OpenCode,
-                                            _ => CodingProvider::Claude,
-                                        })
+                                        on:change=move |ev| {
+                                            let next = match event_target_value(&ev).as_str() {
+                                                "opencode" => CodingProvider::OpenCode,
+                                                _ => CodingProvider::Claude,
+                                            };
+                                            // Switching to OpenCode resets a Claude model: OpenCode
+                                            // takes only the default, and the start refuses any other.
+                                            if next == CodingProvider::OpenCode {
+                                                set_model.set("default".to_string());
+                                            }
+                                            set_provider.set(next);
+                                        }
                                         class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                                         disabled=move || submitting.get()
                                     >
@@ -325,12 +333,14 @@ pub fn TaskEditModal(
                             <select
                                 on:change=move |ev| set_model.set(event_target_value(&ev))
                                 class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                                disabled=move || submitting.get()
+                                disabled=move || submitting.get() || provider.get() == CodingProvider::OpenCode
                             >
                                 {move || {
                                     let models = available_models.get();
                                     let current = model.get();
-                                    let items: Vec<ModelInfo> = if models.is_empty() {
+                                    let items: Vec<ModelInfo> = if provider.get() == CodingProvider::OpenCode {
+                                        vec![ModelInfo { id: "default".to_string(), name: "OpenCode default".to_string(), alias: None }]
+                                    } else if models.is_empty() {
                                         vec![ModelInfo { id: "default".to_string(), name: "Default (auto)".to_string(), alias: None }]
                                     } else {
                                         models
@@ -444,8 +454,14 @@ pub fn TaskEditModal(
                                     let description_val = description.get();
                                     let category_val = category.get();
                                     let priority_val = priority.get();
-                                    let model_val = model.get();
                                     let provider_val = provider.get();
+                                    // OpenCode takes only the default model, so a Claude
+                                    // model left in the form is never saved with it.
+                                    let model_val = if provider_val == CodingProvider::OpenCode {
+                                        "default".to_string()
+                                    } else {
+                                        model.get()
+                                    };
                                     let planning_val = planning_mode.get();
                                     let mode_val = mode.get();
                                     let dependency_val = dependency.get();

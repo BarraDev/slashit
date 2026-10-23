@@ -37,6 +37,11 @@ fn worker_scratch_rule(checkout: &str) -> String {
 /// Starts an OpenCode Worker for a Task. Each input OpenCode cannot honor is
 /// refused here; none is dropped silently. That covers a Claude model name and
 /// the extra directories a meta-workspace run needs.
+///
+/// Only the coding run uses OpenCode. AI review and review-fix still run on
+/// Claude for every Task, so an OpenCode Task that reaches review can still
+/// invoke a Claude model, billed separately from OpenCode. The test suite
+/// stands that Claude in with a fake program, so no test calls a model.
 async fn start_opencode_run(
     prompt: String,
     working_dir: String,
@@ -44,6 +49,15 @@ async fn start_opencode_run(
     no_additional_dirs: bool,
     lease: Option<crate::agents::provider_lease::ProviderLease>,
 ) -> Result<CodingRunner, String> {
+    // The OpenCode Worker's process group and provider lease exist only on
+    // Unix. Elsewhere, a tool process could outlive its run, so none starts.
+    if !cfg!(unix) {
+        drop((prompt, working_dir, model, no_additional_dirs, lease));
+        return Err(
+            "OpenCode Tasks run only on Unix for now: SlashIt cannot yet end the OpenCode process tree or hold its provider lease on this platform. Run this Task with Claude."
+                .to_string(),
+        );
+    }
     if let Some(model) = model {
         return Err(format!(
             "OpenCode does not take the Claude model {model}. Set this Task's model to default, or run it with Claude."
@@ -5404,6 +5418,44 @@ impl TaskExecutor {
                             let result = slashit_activity::RunResult::from_provider(
                                 runner.final_result_text().await,
                             );
+                            // A permission the Worker was refused does not
+                            // make a clean end a success. The run goes on to
+                            // commit and review only when its checkout holds
+                            // work; with no work, nothing was done.
+                            let refused = runner.refused_permissions();
+                            if !refused.is_empty() {
+                                let listed = refused.join(", ");
+                                let base = tasks.read().await.get(&task_id).and_then(|t| t.base_commit.clone());
+                                let message = match crate::worktree::checkout_has_work(&working_dir_for_commit, base.as_deref()).await {
+                                    Ok(true) => {
+                                        record_output(
+                                            &logs,
+                                            execution_id,
+                                            LogLevel::Warn,
+                                            format!(
+                                                "The Worker was refused {} permission request(s) ({listed}). Its checkout holds work, so the run goes to AI review, which checks that work.",
+                                                refused.len()
+                                            ),
+                                        ).await;
+                                        None
+                                    }
+                                    Ok(false) => Some(format!(
+                                        "The Worker was refused {} permission request(s) ({listed}) and left no changes in the Task Checkout, so the Task is not complete and was not sent to AI review.",
+                                        refused.len()
+                                    )),
+                                    Err(error) => Some(format!(
+                                        "The Worker was refused {} permission request(s) ({listed}), and the Task Checkout could not be read to see whether work was done ({error}). The Task was not sent to AI review.",
+                                        refused.len()
+                                    )),
+                                };
+                                if let Some(message) = message {
+                                    record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
+                                    let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id), timeline_reason: None };
+                                    Self::set_task_error_static(&tasks, &storage, &events, task_id, &message, Some(ended)).await;
+                                    ending = Some(AgentEvent::Error { task_id: task_id.to_string(), message });
+                                    break 'finished;
+                                }
+                            }
                             // A run whose work could not be committed has
                             // not finished its task: it fails the same way a
                             // failed run does, and is not reviewed.
@@ -18743,6 +18795,105 @@ VERDICT: APPROVED"
                 .expect("the provider has ended and its lease is free");
         }
 
+        /// An OpenCode Task whose stand-in `opencode` runs the ACP fixture with
+        /// `scenario`. The AI reviewer is stood in for too, so reaching review
+        /// cannot start a real model.
+        #[cfg(target_os = "linux")]
+        async fn opencode_task_running(scenario: &str) -> (World, crate::test_helpers::FakeProgram) {
+            let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let task = tasks.get_mut(&w.task_id).unwrap();
+                task.provider = CodingProvider::OpenCode;
+                task.model = "default".to_string();
+                let board: Vec<_> = tasks
+                    .values()
+                    .filter(|task| task.project_id == w.project_id)
+                    .cloned()
+                    .collect();
+                w.executor
+                    .storage
+                    .save_project_tasks(w.project_id, &board)
+                    .expect("persist the provider choice");
+            }
+            let fixture = {
+                let exe = std::env::current_exe().expect("test executable path");
+                exe.parent()
+                    .and_then(std::path::Path::parent)
+                    .expect("target/debug directory")
+                    .join("acp_fixture_agent")
+            };
+            let frames = w.temps[0].path().join("opencode-frames.jsonl");
+            let agent = crate::test_helpers::FakeProgram::install(
+                "opencode",
+                &format!("tee {frames:?} | {fixture:?} {scenario}\n"),
+            )
+            .await;
+            agent.add(
+                "claude",
+                "cat >/dev/null; printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"VERDICT: APPROVED\"}'",
+            );
+            (w, agent)
+        }
+
+        /// The Worker was refused a permission and ended its turn without
+        /// changing anything. That is not a finished Task: it settles in error,
+        /// is never committed or sent to AI review, and its lease is released.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_refused_permission_with_no_changes_is_not_a_finished_task() {
+            let (w, agent) = opencode_task_running("permission").await;
+            assert_eq!(
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(true)
+            );
+            let task = settled(&w).await;
+            assert_eq!(task.status, TaskStatus::Error, "{:?}", task.error_message);
+            let message = task.error_message.clone().unwrap_or_default();
+            assert!(message.contains("refused 1 permission request"), "{message}");
+            assert!(message.contains("tool call tc-1"), "{message}");
+            assert!(message.contains("not sent to AI review"), "{message}");
+            assert_eq!(agent.launches("claude"), 0, "a refused run is not reviewed");
+            crate::agents::provider_lease::prove_absent(&w.executor.provider_lease_path(w.task_id))
+                .expect("the provider has ended and its lease is free");
+        }
+
+        /// The Worker was refused a permission, then finished the change through
+        /// an operation it was allowed. The change is committed and the Task
+        /// reaches AI review, and the refusal stays in the run's log.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_refused_permission_the_worker_worked_around_still_reaches_review() {
+            let (w, agent) = opencode_task_running("permission-then-edit").await;
+            assert_eq!(
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(true)
+            );
+            let task = settled(&w).await;
+            assert_eq!(task.status, TaskStatus::AiReview, "error: {:?}", task.error_message);
+            assert_eq!(agent.launches("claude"), 0, "the AI reviewer has not run yet");
+
+            let checkout = task.worktree_path.clone().expect("the Task has a checkout");
+            let committed = git_in(
+                std::path::Path::new(&checkout),
+                &["show", "--name-only", "--format=", "HEAD"],
+            );
+            assert!(committed.contains("permitted-change.txt"), "{committed}");
+            let wire = std::fs::read_to_string(w.temps[0].path().join("opencode-frames.jsonl"))
+                .expect("frames were recorded");
+            assert!(wire.contains("\"optionId\":\"reject-once\""), "the refusal was sent: {wire}");
+
+            let logs = w.executor.logs.read().await;
+            assert!(
+                logs.values()
+                    .flatten()
+                    .any(|entry| entry.message.contains("refused 1 permission request")),
+                "the refusal is recorded in the run's log"
+            );
+        }
+
         /// A repository with a published default base and a dependency branch
         /// one commit past it, a pending task set up for `class`, and the
         /// board seeded on disk.
@@ -19067,6 +19218,64 @@ VERDICT: APPROVED"
             }
             assert_eq!(agent.invocations(), "", "no provider launch");
             assert_eq!(refs_of(&w.repo), before_refs, "no branch created");
+        }
+
+        async fn set_worker(w: &World, provider: CodingProvider) {
+            let id = w.task_id;
+            crate::lifecycle::commit_task(&w.executor.tasks, &w.executor.storage, id, &move |staged: &mut HashMap<Uuid, Task>| {
+                staged.get_mut(&id).unwrap().provider = provider;
+            })
+            .await
+            .unwrap();
+        }
+
+        /// Ordering A: the Task was approved to run under Claude, and its Worker
+        /// was switched to OpenCode before the start. The approval names Claude,
+        /// so neither Worker is launched.
+        #[tokio::test]
+        async fn a_worker_change_after_approval_is_refused_before_any_worker_starts() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            set_worker(&w, CodingProvider::OpenCode).await;
+            // One install per test: a second one would wait on the PATH lock held by the first.
+            let agent = crate::test_helpers::FakeProgram::install("claude", "sleep 20").await;
+            agent.add("opencode", "sleep 20");
+            let before_refs = refs_of(&w.repo);
+
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await.expect_err("refused");
+            assert!(refused.contains("edited after its queue request was approved"), "{refused}");
+
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.status, TaskStatus::Error);
+                assert_eq!(task.approved_execution, None);
+                assert_eq!(task.provider, CodingProvider::OpenCode, "the Worker choice is kept");
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+                assert_eq!(task.error_message.as_deref(), Some(crate::domain::task::STALE_APPROVAL_REASON));
+            }
+            assert_eq!(agent.launches("claude"), 0, "no Claude launch");
+            assert_eq!(agent.launches("opencode"), 0, "no OpenCode launch");
+            assert_eq!(refs_of(&w.repo), before_refs, "no branch created");
+        }
+
+        /// Ordering B: the Worker was chosen first and the Task approved after.
+        /// The approval names OpenCode, so the run starts under it with the
+        /// approved input.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_worker_chosen_before_approval_starts_under_that_worker() {
+            let (w, _agent) = opencode_task_running("ok").await;
+            approve_current_input(&w, 1).await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            let task = settled(&w).await;
+            assert_ne!(task.error_message.as_deref(), Some(crate::domain::task::STALE_APPROVAL_REASON));
+            assert_eq!(run_starts(&task), 1, "the approved run started");
+            assert_eq!(task.executed_approvals.len(), 1, "the approval was spent by that start");
+            assert!(
+                w.temps[0].path().join("opencode-frames.jsonl").exists(),
+                "the run went to OpenCode"
+            );
         }
 
         #[tokio::test]

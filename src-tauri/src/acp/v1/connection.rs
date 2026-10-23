@@ -424,6 +424,13 @@ impl Connection {
         Ok(())
     }
 
+    /// Asks the supervisor to kill the child's process group now, without the
+    /// protocol shutdown. Clones of a connection keep it alive, so dropping the
+    /// last one does not reach this on its own.
+    pub fn force_kill(&self) {
+        let _ = self.shared().control.send(Control::Kill);
+    }
+
     /// Closes stdin, waits up to `grace` for the agent to exit, kills it if
     /// it has not, and reaps it. Returns the exit status.
     pub async fn shutdown(&self, grace: Duration) -> Result<ExitStatus, AcpError> {
@@ -651,6 +658,14 @@ async fn read_loop(shared: Arc<Shared>, mut stdout: BufReader<ChildStdout>) {
         match process::read_line_bounded(&mut stdout, &mut line, frame::MAX_FRAME_BYTES).await {
             Ok(LineRead::Line { truncated: false }) => {
                 if !dispatch(&shared, &line) {
+                    // The connection failed or was shut down while this frame
+                    // was in flight. Report the close here too: the event
+                    // stream ends on `Closed`, and nothing else sends it.
+                    fail(
+                        &shared,
+                        AcpError::Closed("the connection was shut down".into()),
+                        false,
+                    );
                     return;
                 }
             }

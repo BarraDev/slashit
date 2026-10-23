@@ -93,6 +93,13 @@ pub async fn start_agent(
         )?;
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_id).ok_or("Task not found")?;
+        // This path starts Claude only. An OpenCode Task must not run here
+        // under the wrong Worker; it runs through the queue.
+        if task.provider == crate::domain::task::CodingProvider::OpenCode {
+            return Err(
+                "This Task's Coding Worker is OpenCode, and this command starts only Claude. Start the Task through its queue instead.".into(),
+            );
+        }
         task.worktree_path.clone().ok_or(
             "This task has no worktree of its own, so there is nowhere to run an agent. \
              Attach a worktree to the task first.",

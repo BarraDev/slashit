@@ -119,7 +119,32 @@ pub fn build_task_prompt(task: &Task, project_path: Option<&str>) -> String {
 /// proposal refuse safely and need a new proposal.
 pub fn task_input_digest(task: &Task) -> String {
     use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(build_task_prompt(task, None).as_bytes()))
+    let prompt = build_task_prompt(task, None);
+    match provider_identity(task) {
+        // The default provider keeps the digest it always had, so an approval
+        // recorded for a Claude Task still matches.
+        None => hex::encode(Sha256::digest(prompt.as_bytes())),
+        Some(provider) => {
+            let mut hasher = Sha256::new();
+            hasher.update(b"slashit.task-input.v2\0");
+            for field in [prompt.as_bytes(), provider.as_bytes()] {
+                hasher.update((field.len() as u64).to_be_bytes());
+                hasher.update(field);
+            }
+            hex::encode(hasher.finalize())
+        }
+    }
+}
+
+/// The Coding Worker an approval is bound to, when it is not the default. The
+/// Worker decides what runs, so a change of Worker is a change of the input
+/// that was approved. An exhaustive match, so a new provider must say how it
+/// is named here.
+fn provider_identity(task: &Task) -> Option<&'static str> {
+    match task.provider {
+        crate::domain::task::CodingProvider::Claude => None,
+        crate::domain::task::CodingProvider::OpenCode => Some("opencode"),
+    }
 }
 
 /// The fingerprint of the input an approval names. With no additional request
@@ -127,17 +152,27 @@ pub fn task_input_digest(task: &Task) -> String {
 /// meaning. With a request it covers the exact rendered run instructions (the
 /// execution checkout path excluded, since it is SlashIt's choice and not part
 /// of the Task), the request text verbatim, and the Task's effective model,
-/// which the run's launch uses. Each field is length-prefixed, so no field's
-/// bytes can be read as the boundary of another.
+/// which the run's launch uses. For a non-default Worker it also covers that
+/// Worker, so a Task whose Worker changed after approval no longer matches.
+/// Each field is length-prefixed, so no field's bytes can be read as the
+/// boundary of another.
 pub fn approved_input_digest(task: &Task, approved_request: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
     let Some(request) = approved_request else {
         return task_input_digest(task);
     };
     let rendered = build_run_prompt(task, None, Some(request));
+    let mut fields: Vec<&[u8]> = vec![rendered.as_bytes(), task.model.as_bytes(), request.as_bytes()];
+    let domain: &[u8] = match provider_identity(task) {
+        None => b"slashit.execute-request.v1\0",
+        Some(provider) => {
+            fields.push(provider.as_bytes());
+            b"slashit.execute-request.v2\0"
+        }
+    };
     let mut hasher = Sha256::new();
-    hasher.update(b"slashit.execute-request.v1\0");
-    for field in [rendered.as_bytes(), task.model.as_bytes(), request.as_bytes()] {
+    hasher.update(domain);
+    for field in fields {
         hasher.update((field.len() as u64).to_be_bytes());
         hasher.update(field);
     }
@@ -463,6 +498,90 @@ mod tests {
         });
         assert_eq!(check_approved_input(&task), ApprovedInputCheck::Superseded);
         assert!(check_approved_input(&task).refuses_start());
+    }
+
+    /// The Claude digests recorded before the Worker was part of them.
+    fn claude_digest_v1(task: &Task, request: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let rendered = build_run_prompt(task, None, Some(request));
+        let mut hasher = Sha256::new();
+        hasher.update(b"slashit.execute-request.v1\0");
+        for field in [rendered.as_bytes(), task.model.as_bytes(), request.as_bytes()] {
+            hasher.update((field.len() as u64).to_be_bytes());
+            hasher.update(field);
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    #[test]
+    fn a_claude_task_keeps_the_digests_it_always_had() {
+        use sha2::{Digest, Sha256};
+        let task = crate::test_helpers::create_test_task("Claude digests");
+        assert_eq!(task.provider, crate::domain::task::CodingProvider::Claude);
+        assert_eq!(
+            task_input_digest(&task),
+            hex::encode(Sha256::digest(build_task_prompt(&task, None).as_bytes())),
+        );
+        assert_eq!(approved_input_digest(&task, Some("extra")), claude_digest_v1(&task, "extra"));
+    }
+
+    /// A Task approved while it ran under Claude, then switched to OpenCode.
+    #[test]
+    fn a_provider_change_after_approval_refuses_the_start_with_or_without_a_request() {
+        for request in [None, Some("extra")] {
+            let mut task = crate::test_helpers::create_test_task("Switched");
+            task.approved_execution = Some(crate::domain::task::ApprovedExecution {
+                approval_id: uuid::Uuid::new_v4(),
+                digest: approved_input_digest(&task, request),
+                for_run: task.next_run(),
+                request: request.map(str::to_string),
+                checkout: None,
+            });
+            assert_eq!(check_approved_input(&task), ApprovedInputCheck::Matches);
+
+            task.provider = crate::domain::task::CodingProvider::OpenCode;
+            assert_eq!(check_approved_input(&task), ApprovedInputCheck::Differs, "request {request:?}");
+            assert!(check_approved_input(&task).refuses_start());
+        }
+    }
+
+    /// The Worker chosen first, then approved. The approval covers that Worker.
+    #[test]
+    fn an_approval_given_under_the_chosen_worker_matches_it_and_not_the_other() {
+        let mut task = crate::test_helpers::create_test_task("Chosen first");
+        task.provider = crate::domain::task::CodingProvider::OpenCode;
+        task.approved_execution = Some(crate::domain::task::ApprovedExecution {
+            approval_id: uuid::Uuid::new_v4(),
+            digest: approved_input_digest(&task, Some("extra")),
+            for_run: task.next_run(),
+            request: Some("extra".into()),
+            checkout: None,
+        });
+        assert_eq!(check_approved_input(&task), ApprovedInputCheck::Matches);
+
+        let mut claude = task.clone();
+        claude.provider = crate::domain::task::CodingProvider::Claude;
+        assert_eq!(check_approved_input(&claude), ApprovedInputCheck::Differs);
+        assert_ne!(task_input_digest(&task), task_input_digest(&claude));
+    }
+
+    /// The binding is persisted with the Task, and the Worker is part of what
+    /// is persisted. A restart that reloads the switched Task still refuses.
+    #[test]
+    fn a_provider_change_is_still_refused_after_the_task_is_reloaded() {
+        let mut task = crate::test_helpers::create_test_task("Reloaded");
+        task.approved_execution = Some(crate::domain::task::ApprovedExecution {
+            approval_id: uuid::Uuid::new_v4(),
+            digest: approved_input_digest(&task, None),
+            for_run: task.next_run(),
+            request: None,
+            checkout: None,
+        });
+        task.provider = crate::domain::task::CodingProvider::OpenCode;
+        let stored = serde_json::to_string(&task).expect("serialize");
+        let reloaded: Task = serde_json::from_str(&stored).expect("deserialize");
+        assert_eq!(reloaded.provider, crate::domain::task::CodingProvider::OpenCode);
+        assert_eq!(check_approved_input(&reloaded), ApprovedInputCheck::Differs);
     }
 
     #[test]

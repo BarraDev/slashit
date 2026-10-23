@@ -5,6 +5,8 @@
 //! - `bad-version`: answers initialize with protocolVersion 2.
 //! - `permission`: a prompt asks for permission, echoes the decision as a
 //!   text update, then answers with the stop reason. A cancel forces `cancelled`.
+//! - `permission-then-edit`: as `permission`, and after a refusal it writes
+//!   `permitted-change.txt` in its working directory before it ends the turn.
 //! - `silent`: never answers session/new. Echoes a `cancel-seen` update on session/cancel.
 //! - `bad-json`: writes a non-JSON line on stdout in answer to session/new.
 //! - `exit-on-prompt`: exits with status 3 when it receives session/prompt.
@@ -115,6 +117,14 @@ fn main() {
             thread::sleep(Duration::from_secs(3600));
         }
     }
+    if scenario == "notify-after-eof" {
+        // A frame that arrives only after the client has closed its input.
+        io.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "fixture-session-1", "update": {"sessionUpdate": "mystery_event"}}
+        }));
+    }
 }
 
 fn dispatch(io: &mut Io, scenario: &str, message: &Value) {
@@ -135,7 +145,9 @@ fn dispatch(io: &mut Io, scenario: &str, message: &Value) {
             let session = message["params"]["sessionId"].clone();
             match scenario {
                 "exit-on-prompt" => std::process::exit(3),
-                "permission" => permission_turn(io, &id, &session),
+                "permission" | "permission-then-edit" => {
+                    permission_turn(io, &id, &session, scenario)
+                }
                 _ => stream_turn(io, &id, &session),
             }
         }
@@ -170,7 +182,7 @@ fn stream_turn(io: &mut Io, id: &Value, session: &Value) {
     respond(io, id, json!({"stopReason": "end_turn"}));
 }
 
-fn permission_turn(io: &mut Io, id: &Value, session: &Value) {
+fn permission_turn(io: &mut Io, id: &Value, session: &Value, scenario: &str) {
     io.text_update(session, "working");
     io.send(&json!({
         "jsonrpc": "2.0",
@@ -200,6 +212,12 @@ fn permission_turn(io: &mut Io, id: &Value, session: &Value) {
                 None => format!("perm-outcome={kind}"),
             };
             io.text_update(session, &text);
+            // After the refusal, the fixture finishes the change through an
+            // operation it was allowed to run: the Task's work still lands.
+            if scenario == "permission-then-edit" {
+                std::fs::write("permitted-change.txt", "written after a refusal\n")
+                    .expect("the fixture writes in its working directory");
+            }
             let stop = if cancelled || kind != "selected" {
                 "cancelled"
             } else {

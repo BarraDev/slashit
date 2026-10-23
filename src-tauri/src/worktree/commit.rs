@@ -64,6 +64,29 @@ pub async fn commit_checkout_even_if_empty(
         .ok_or_else(|| "git made no commit".to_string())
 }
 
+/// Whether the checkout holds work that is not in its base yet: an edit that is
+/// not committed, or a commit past `base`. A checkout that is unchanged, or
+/// whose only commits are already in `base`, holds no work. Nothing is staged
+/// or written.
+pub async fn checkout_has_work(working_dir: &str, base: Option<&str>) -> Result<bool, String> {
+    let status = git(working_dir, &["status", "--porcelain"])
+        .await
+        .map_err(|e| format!("git status failed: {e}"))?;
+    if !status.is_empty() {
+        return Ok(true);
+    }
+    let Some(base) = base else {
+        return Ok(false);
+    };
+    let ahead = git(working_dir, &["rev-list", "--count", &format!("{base}..HEAD")])
+        .await
+        .map_err(|e| format!("git rev-list failed: {e}"))?;
+    let ahead: u64 = ahead
+        .parse()
+        .map_err(|_| format!("git rev-list printed an unexpected count: {ahead}"))?;
+    Ok(ahead > 0)
+}
+
 async fn commit(
     working_dir: &str,
     branch: &str,

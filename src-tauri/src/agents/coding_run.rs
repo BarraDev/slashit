@@ -92,6 +92,16 @@ impl CodingRunner {
         }
     }
 
+    /// The permission requests this run refused. See
+    /// [`OpenCodeRunner::refused_permissions`]. A Claude run decides its own
+    /// permissions in `auto` mode and reports no refusals here.
+    pub fn refused_permissions(&self) -> Vec<String> {
+        match self {
+            Self::Claude(_) => Vec::new(),
+            Self::OpenCode(runner) => runner.refused_permissions(),
+        }
+    }
+
     /// The run's final result text. See [`ClaudeRunner::final_result_text`].
     pub async fn final_result_text(&self) -> Result<String, String> {
         match self {

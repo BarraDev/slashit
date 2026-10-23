@@ -10,12 +10,19 @@
 //! turn that does not end with `end_turn` is a failure, and so is a turn that
 //! times out.
 //!
-//! Permission policy: every permission request is refused. OpenCode asks
-//! before tools it does not auto-approve, and SlashIt has no interactive
-//! approval path for that yet, so nothing is approved by default. A request
-//! with no reject option is cancelled. The connection itself cancels a
+//! Permission policy: every permission request is refused. OpenCode is started
+//! under [`policy_env`], which asks before actions that would otherwise run
+//! without a request. Without that pin, OpenCode 2.0.32's default `build` agent
+//! ran the shell tool with no request in a live probe, and a project
+//! `opencode.json` is merged into the resolved permissions. Only the shell tool
+//! was exercised live, so other tools are not claimed here. SlashIt has no
+//! interactive approval path yet, so nothing is approved. A request with no
+//! reject option is cancelled. The connection itself cancels a
 //! request that gets no answer in time, and nothing is ever approved by a
-//! timeout, a dropped answer or a closed connection.
+//! timeout, a dropped answer or a closed connection. Each refusal is recorded
+//! on the run ([`OpenCodeRunner::refused_permissions`]). A turn that still ends
+//! with `end_turn` is `Ok`, so the executor decides from the checkout whether
+//! the Task was finished.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +55,39 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// upper bound on an answer that never comes.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// The OpenCode configuration every run is started under: ask before each
+/// action, and refuse each request (see the permission policy above). Inline
+/// configuration outranks the project's `opencode.json`, and [`policy_env`]
+/// turns that file off as well. One live probe on OpenCode 2.0.32 found that a
+/// project allow did not override this policy.
+pub const OPENCODE_POLICY_CONTENT: &str = r#"{"permission":{"*":"ask"}}"#;
+
+/// The variables that pin the OpenCode policy for one process. The Task
+/// Checkout is written by a model, so a repository's `opencode.json` must not
+/// decide the policy. With project configuration off, that file is not read,
+/// and neither are the MCP servers it declares. Those start a command at
+/// session creation, before any request.
+pub fn policy_env() -> [(&'static str, &'static str); 2] {
+    [
+        ("OPENCODE_DISABLE_PROJECT_CONFIG", "1"),
+        ("OPENCODE_CONFIG_CONTENT", OPENCODE_POLICY_CONTENT),
+    ]
+}
+
+/// The environment one OpenCode process is started with: the provider
+/// allowlist from `parent`, plus [`policy_env`]. The parent's own `OPENCODE_*`
+/// variables are never passed, so a user's setting cannot replace the policy.
+pub fn opencode_spawn_env(
+    parent: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = provider_env(parent)
+        .into_iter()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    env.extend(policy_env().into_iter().map(|(name, value)| (name.to_string(), value.to_string())));
+    env
+}
+
 /// What a run needs to start. The prompt is written to the agent's session
 /// and never passed as an argument.
 pub struct OpenCodeRunConfig {
@@ -76,7 +116,12 @@ pub struct OpenCodeRunner {
     reader: Mutex<Option<JoinHandle<()>>>,
     /// The run's outcome, set by the first `wait`. Later waits read it.
     outcome: OnceCell<Result<(), String>>,
+    /// One entry per permission request this run refused, in arrival order.
+    refusals: Refusals,
 }
+
+/// The refused permission requests of one run, shared with its event reader.
+type Refusals = Arc<std::sync::Mutex<Vec<String>>>;
 
 impl OpenCodeRunner {
     /// Starts the process, initializes the protocol, creates a session and
@@ -91,10 +136,7 @@ impl OpenCodeRunner {
             program: config.program.clone(),
             args: config.args.clone(),
             cwd: config.working_dir.clone(),
-            env: provider_env(std::env::vars_os())
-                .into_iter()
-                .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-                .collect(),
+            env: opencode_spawn_env(std::env::vars_os()),
             clear_env: true,
             request_timeout: REQUEST_TIMEOUT,
             permission_timeout: PERMISSION_TIMEOUT,
@@ -111,11 +153,13 @@ impl OpenCodeRunner {
 
         let (events, first) = broadcast::channel(512);
         let output = Arc::new(RwLock::new(String::new()));
+        let refusals: Refusals = Arc::new(std::sync::Mutex::new(Vec::new()));
         let reader = tokio::spawn(forward_events(
             stream,
             connection.clone(),
             events.clone(),
             output.clone(),
+            refusals.clone(),
         ));
         let _ = events.send(CodingRunEvent::SystemInit {
             session_id: session.id().to_string(),
@@ -140,7 +184,15 @@ impl OpenCodeRunner {
             turn: Mutex::new(Some(turn)),
             reader: Mutex::new(Some(reader)),
             outcome: OnceCell::new(),
+            refusals,
         })
+    }
+
+    /// The permission requests this run refused, one entry each, in arrival
+    /// order. A refusal does not end the run: OpenCode may still finish the
+    /// Task another way, so the caller decides what the refusals mean.
+    pub fn refused_permissions(&self) -> Vec<String> {
+        self.refusals.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Subscribe to the run's events. See [`CodingRunEvent`].
@@ -199,6 +251,17 @@ impl OpenCodeRunner {
     }
 }
 
+impl Drop for OpenCodeRunner {
+    /// A run dropped while live ends its process group. The event reader holds
+    /// a clone of the connection, so the connection's own drop would never run
+    /// first. A run whose `wait` has finished has nothing left to kill.
+    fn drop(&mut self) {
+        if self.outcome.get().is_none() {
+            self.connection.force_kill();
+        }
+    }
+}
+
 /// Runs the single prompt turn and reports how it ended.
 async fn run_turn(
     connection: Connection,
@@ -238,6 +301,7 @@ async fn forward_events(
     connection: Connection,
     events: broadcast::Sender<CodingRunEvent>,
     output: Arc<RwLock<String>>,
+    refusals: Refusals,
 ) {
     while let Some(event) = stream.recv().await {
         match event {
@@ -267,6 +331,10 @@ async fn forward_events(
                 options,
                 ..
             } => {
+                refusals
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(format!("tool call {tool_call_id}"));
                 let _ = events.send(CodingRunEvent::Error {
                     message: format!(
                         "OpenCode asked permission for {tool_call_id}, and SlashIt refused it. \
@@ -315,6 +383,28 @@ mod tests {
             name: id.to_string(),
             kind,
         }
+    }
+
+    #[test]
+    fn the_spawn_env_pins_the_policy_and_drops_the_users_opencode_variables() {
+        use std::ffi::OsString;
+        let parent = [
+            ("HOME", "/home/worker"),
+            ("PATH", "/usr/bin"),
+            ("OPENCODE_CONFIG_CONTENT", r#"{"permission":{"*":"allow"}}"#),
+            ("OPENCODE_DISABLE_PROJECT_CONFIG", "0"),
+            ("OPENCODE_CONFIG", "/tmp/elsewhere.json"),
+        ]
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+        let env: std::collections::HashMap<String, String> =
+            opencode_spawn_env(parent).into_iter().collect();
+
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/worker"));
+        assert_eq!(env.get("OPENCODE_DISABLE_PROJECT_CONFIG").map(String::as_str), Some("1"));
+        assert!(!env.contains_key("OPENCODE_CONFIG"), "the user's config file is not passed");
+        let content: serde_json::Value =
+            serde_json::from_str(&env["OPENCODE_CONFIG_CONTENT"]).expect("the policy is JSON");
+        assert_eq!(content, serde_json::json!({"permission": {"*": "ask"}}));
     }
 
     #[test]
@@ -391,6 +481,7 @@ mod tests {
         // Thoughts are not the answer, so they are not in the output.
         assert_eq!(run.get_output().await, "hello");
         assert_eq!(run.final_result_text().await.as_deref(), Ok("hello"));
+        assert!(run.refused_permissions().is_empty());
     }
 
     #[tokio::test]
@@ -409,6 +500,33 @@ mod tests {
             e,
             CodingRunEvent::Error { message } if message.contains("refused")
         )));
+        assert_eq!(run.refused_permissions(), vec!["tool call tc-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_recorded_even_when_the_turn_ends_normally() {
+        // The turn ends with end_turn after the refusal, so `wait` is Ok. The
+        // refusal is still on the run, for the executor to judge.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = fixture("permission-then-edit");
+        config.working_dir = dir.path().to_path_buf();
+        let run = OpenCodeRunner::start(config, None).await.expect("start");
+        assert_eq!(run.wait().await, Ok(true));
+        assert_eq!(run.refused_permissions(), vec!["tool call tc-1".to_string()]);
+        assert!(dir.path().join("permitted-change.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_arrives_after_the_input_closes_does_not_hang_wait() {
+        // The turn ends normally, `wait` closes the agent's input, and the
+        // agent sends one more frame before it exits. `wait` must still return.
+        let run = OpenCodeRunner::start(fixture("notify-after-eof"), None)
+            .await
+            .expect("start");
+        let outcome = tokio::time::timeout(Duration::from_secs(30), run.wait())
+            .await
+            .expect("wait must return once the agent has exited");
+        assert_eq!(outcome, Ok(true));
     }
 
     #[tokio::test]
@@ -449,6 +567,29 @@ mod tests {
         })
         .await
         .expect("kill and wait must complete");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_live_run_ends_its_agent() {
+        // `ignore-eof` keeps running after its input closes, so only a kill
+        // can end it. Dropping the run must send that kill.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lease");
+        let lease = crate::agents::provider_lease::acquire(&path)
+            .expect("acquire")
+            .expect("unix lease");
+        let run = OpenCodeRunner::start(fixture("ignore-eof"), Some(lease))
+            .await
+            .expect("start");
+        drop(run);
+        let released = tokio::time::timeout(Duration::from_secs(10), async {
+            while crate::agents::provider_lease::prove_absent(&path).is_err() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "the dropped run's agent is still alive");
     }
 
     #[cfg(unix)]

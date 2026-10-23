@@ -19,7 +19,7 @@ pub mod vcs_init;
 
 pub use branch::{checked_base_branch, checked_task_branch, looks_like_task_branch};
 pub use default_base::{resolve_default_base, ResolvedBase};
-pub use commit::{commit_checkout, commit_checkout_even_if_empty, CheckoutCommit};
+pub use commit::{checkout_has_work, commit_checkout, commit_checkout_even_if_empty, CheckoutCommit};
 pub use diff::{task_diff, TaskDiff, TaskDiffError};
 pub use manager::{
     carries_locked_registration_notice, locked_registration_notice, CheckoutRegistration,
