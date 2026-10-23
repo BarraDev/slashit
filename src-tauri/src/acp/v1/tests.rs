@@ -703,10 +703,15 @@ async fn a_failed_connection_ends_the_processes_its_agent_started() {
     panic!("the grandchild {pid} outlived its failed connection");
 }
 
-/// Stands in for a run's configuration directory. It reports, when it is
-/// released, whether the child holding the same lease has ended. The child
-/// inherits the lease and releases it only when it exits, so `prove_absent`
-/// observes the end of the process.
+/// Stands in for a run's configuration directory. When it is released, it
+/// reports whether the child recorded in the same lease has been reaped.
+///
+/// The check reads the recorded process id, not the lease lock. The lock is
+/// released only when every copy of the descriptor is closed, and a fork in
+/// another test thread can hold a copy for a moment after the child is gone.
+/// Reading the lock once at this point fails on a child that has ended, which
+/// is noise rather than a violation. A reaped leader answers `ESRCH`, while an
+/// unreaped zombie still answers, so this tells the two apart deterministically.
 #[cfg(unix)]
 struct ReleaseProbe {
     lease: PathBuf,
@@ -717,10 +722,24 @@ struct ReleaseProbe {
 impl Drop for ReleaseProbe {
     fn drop(&mut self) {
         if let Some(released) = self.released.take() {
-            let ended = crate::agents::provider_lease::prove_absent(&self.lease).is_ok();
-            let _ = released.send(ended);
+            let _ = released.send(leader_reaped(&self.lease));
         }
     }
+}
+
+/// Whether the process recorded in `lease` has been reaped. An unreadable
+/// record, or one that holds no pid, is not evidence that the child ended.
+#[cfg(unix)]
+fn leader_reaped(lease: &Path) -> bool {
+    let Some(pid) = std::fs::read_to_string(lease)
+        .ok()
+        .and_then(|recorded| recorded.trim().parse::<i32>().ok())
+    else {
+        return false;
+    };
+    // Safety: signal 0 only tests whether the process exists.
+    let probed = unsafe { libc::kill(pid, 0) };
+    probed == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(unix)]
