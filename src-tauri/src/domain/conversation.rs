@@ -580,6 +580,12 @@ pub enum EntryKind {
     RunFailed {
         role: Role,
         message: String,
+        /// True when the failure left the Human message it answers unanswered,
+        /// so an explicit Retry may run the Coordinator for that message again.
+        /// Absent from Conversations saved before this field existed, which
+        /// keeps those failures visible without making them retryable.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        retryable: bool,
     },
     ProjectActionProposed {
         action_id: Uuid,
@@ -701,6 +707,23 @@ pub const DECISION_SCOPE: &str = "this_proposal_only";
 /// How the Coordinator must read decisions in `recent_history`.
 pub const HISTORY_SEMANTICS: &str = "A decision entry records the Human's answer to one specific earlier proposal and applies to that proposal only. It is not a standing instruction. A rejected proposal never forbids a later proposal. When the current message explicitly asks for the same or an equivalent change again, treat it as a new request and propose it again; SlashIt will ask for a new approval.";
 
+fn is_retryable_failure(kind: &EntryKind) -> bool {
+    matches!(kind, EntryKind::RunFailed { role: Role::Coordinator, retryable: true, .. })
+}
+
+/// Entries that record a Human decision or its application to an earlier
+/// proposal. They never answer a Human message.
+fn is_proposal_decision(kind: &EntryKind) -> bool {
+    matches!(
+        kind,
+        EntryKind::ActionDecision { .. }
+            | EntryKind::ProjectActionDecision { .. }
+            | EntryKind::ProjectActionApplied { .. }
+            | EntryKind::ProjectActionRefused { .. }
+            | EntryKind::ActionWithdrawn { .. }
+    )
+}
+
 fn decision_label(approved: bool) -> &'static str {
     if approved { "approved" } else { "rejected" }
 }
@@ -740,6 +763,31 @@ impl Conversation {
         self.actions
             .iter()
             .any(|action| action.status == ActionStatus::Returned && !action.coordinator_replied)
+    }
+
+    /// The Human message that the Coordinator has not answered, when every entry
+    /// after it is a retryable Coordinator failure. Retry re-runs the
+    /// Coordinator for this message without saving it again. Returns the
+    /// message's index and text.
+    pub fn retryable_human_turn(&self) -> Option<(usize, &str)> {
+        let index = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry.kind, EntryKind::HumanMessage { .. }))?;
+        let EntryKind::HumanMessage { text } = &self.entries[index].kind else {
+            return None;
+        };
+        // Decisions and applications refer to earlier proposals, so they do not
+        // answer this message. Any other entry after it does.
+        let mut failed = false;
+        for entry in &self.entries[index + 1..] {
+            if is_retryable_failure(&entry.kind) {
+                failed = true;
+            } else if !is_proposal_decision(&entry.kind) {
+                return None;
+            }
+        }
+        failed.then_some((index, text.as_str()))
     }
 
     pub fn validate_text(value: &str) -> Result<(), String> {
@@ -819,7 +867,7 @@ impl Conversation {
                     serde_json::json!({"kind":"action_decision","approved":approved,"decision":decision_label(*approved),"scope":DECISION_SCOPE,"target_task_id":action.target_task_id,"target_task_title":action.target_task_title.chars().take(500).collect::<String>(),"request":request.as_deref().unwrap_or(&action.request).chars().take(3000).collect::<String>()})),
                 EntryKind::WorkerStarted { action_id } => Some(serde_json::json!({"kind":"worker_started","action_id":action_id})),
                 EntryKind::WorkerResult { action_id, result } => Some(serde_json::json!({"kind":"worker_result","action_id":action_id,"result":result.chars().take(3000).collect::<String>()})),
-                EntryKind::RunFailed { role, message } => Some(serde_json::json!({"kind":"run_failed","role":role,"message":message.chars().take(1000).collect::<String>()})),
+                EntryKind::RunFailed { role, message, .. } => Some(serde_json::json!({"kind":"run_failed","role":role,"message":message.chars().take(1000).collect::<String>()})),
                 EntryKind::ProjectActionProposed { action_id } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_proposed","action_id":action_id,"summary":action.mutation.summary()})),
                 EntryKind::ProjectActionDecision { action_id, approved } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_decision","action_id":action_id,"approved":approved,"decision":decision_label(*approved),"scope":DECISION_SCOPE,"summary":action.mutation.summary()})),
                 EntryKind::ProjectActionApplied { action_id, task_id } => Some(match self.project_action(*action_id).and_then(|action| action.outcome.as_ref()) {
@@ -1082,5 +1130,105 @@ mod tests {
             .expect("the withdrawal is projected");
         assert_eq!(withdrawal["scope"], "this_proposal_only");
         assert!(withdrawal["note"].as_str().unwrap().contains("Nothing was started"));
+    }
+
+    fn entry(kind: EntryKind) -> Entry {
+        Entry { id: Uuid::new_v4(), role: Role::Human, kind, created_at: Utc::now() }
+    }
+
+    fn human(text: &str) -> EntryKind {
+        EntryKind::HumanMessage { text: text.into() }
+    }
+
+    fn retryable_failure() -> EntryKind {
+        EntryKind::RunFailed { role: Role::Coordinator, message: "failed".into(), retryable: true }
+    }
+
+    fn conversation_with(kinds: Vec<EntryKind>) -> Conversation {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.entries = kinds.into_iter().map(entry).collect();
+        conversation
+    }
+
+    #[test]
+    fn a_retryable_failure_after_an_unanswered_message_is_retryable() {
+        let conversation = conversation_with(vec![human("first"), retryable_failure()]);
+        assert_eq!(conversation.retryable_human_turn(), Some((0, "first")));
+    }
+
+    #[test]
+    fn repeated_retryable_failures_keep_the_same_message_retryable() {
+        let conversation = conversation_with(vec![human("first"), retryable_failure(), retryable_failure()]);
+        assert_eq!(conversation.retryable_human_turn(), Some((0, "first")));
+    }
+
+    #[test]
+    fn an_answered_message_or_a_refusal_is_not_retryable() {
+        let answered = conversation_with(vec![human("first"), EntryKind::CoordinatorReply { text: "ok".into() }]);
+        assert_eq!(answered.retryable_human_turn(), None);
+
+        let refused = conversation_with(vec![
+            human("first"),
+            EntryKind::RunFailed { role: Role::Coordinator, message: "retired".into(), retryable: false },
+        ]);
+        assert_eq!(refused.retryable_human_turn(), None);
+    }
+
+    #[test]
+    fn a_newer_message_after_a_failure_makes_only_the_newer_one_retryable() {
+        let conversation = conversation_with(vec![human("first"), retryable_failure(), human("second")]);
+        assert_eq!(conversation.retryable_human_turn(), None, "the newest message has no failure yet");
+
+        let failed_again = conversation_with(vec![human("first"), retryable_failure(), human("second"), retryable_failure()]);
+        assert_eq!(failed_again.retryable_human_turn(), Some((2, "second")));
+    }
+
+    #[test]
+    fn a_saved_failure_without_the_flag_decodes_as_not_retryable_and_is_not_written_back() {
+        let legacy: EntryKind = serde_json::from_value(serde_json::json!({
+            "kind": "run_failed", "role": "coordinator", "message": "older"
+        }))
+        .expect("a pre-flag failure should decode");
+        assert!(matches!(legacy, EntryKind::RunFailed { retryable: false, .. }));
+
+        let refusal = EntryKind::RunFailed { role: Role::Coordinator, message: "x".into(), retryable: false };
+        let saved = serde_json::to_value(&refusal).unwrap();
+        assert!(saved.get("retryable").is_none(), "non-retryable entries keep the old shape");
+    }
+
+    #[test]
+    fn a_decision_on_an_earlier_proposal_does_not_stop_a_failed_message_from_being_retried() {
+        let decision = EntryKind::ProjectActionDecision { action_id: Uuid::new_v4(), approved: true };
+        let applied = EntryKind::ProjectActionApplied { action_id: Uuid::new_v4(), task_id: Uuid::new_v4() };
+        let conversation = conversation_with(vec![
+            human("first"),
+            retryable_failure(),
+            decision,
+            applied,
+        ]);
+        assert_eq!(conversation.retryable_human_turn(), Some((0, "first")));
+    }
+
+    #[test]
+    fn a_refused_approval_of_an_earlier_proposal_does_not_stop_a_failed_message_from_being_retried() {
+        let decision = EntryKind::ProjectActionDecision { action_id: Uuid::new_v4(), approved: true };
+        let refused = EntryKind::ProjectActionRefused { action_id: Uuid::new_v4(), reason: "The Task no longer exists".into() };
+        let conversation = conversation_with(vec![
+            human("first"),
+            retryable_failure(),
+            decision,
+            refused,
+        ]);
+        assert_eq!(conversation.retryable_human_turn(), Some((0, "first")));
+    }
+
+    #[test]
+    fn a_reply_after_a_failure_answers_the_message() {
+        let conversation = conversation_with(vec![
+            human("first"),
+            retryable_failure(),
+            EntryKind::CoordinatorReply { text: "done".into() },
+        ]);
+        assert_eq!(conversation.retryable_human_turn(), None);
     }
 }

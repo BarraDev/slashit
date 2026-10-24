@@ -83,9 +83,15 @@ before any provider runs.
 
 After restart no Run is considered live. A run that may have partially changed
 its checkout is recorded as needing recovery and is not replayed silently. A
-legacy Coordinator run interrupted by a restart can be retried from saved
-Conversation state. A legacy Worker result that is already durable is mediated,
-never rerun. This prevents automatic replay; it does not promise exactly-once
+failed or interrupted ordinary Coordinator run is recorded as a retryable
+`RunFailed` entry, and its Human message stays saved and unanswered. An explicit
+Retry re-runs the Coordinator for that saved message only, never saves it a
+second time, and is refused when the Conversation has moved on. Sending a newer
+message ends that Retry: the earlier message stays unanswered, and only the newer
+one is answered. A Conversation write that fails before it is published saves
+nothing and sends nothing; one that is published but not confirmed durable is
+reported as saved and unconfirmed, and never sent again automatically. A legacy Worker
+result that is already durable is mediated, never rerun. This prevents automatic replay; it does not promise exactly-once
 external or repository side effects across crashes.
 
 ### Coordinator Task capabilities

@@ -79,6 +79,9 @@ pub struct Snapshot {
     pub worker_live: bool,
     pub run_status: Option<AgentStatus>,
     pub continuation_error: Option<String>,
+    /// True when `retry_project_message` would re-run the Coordinator for the
+    /// unanswered Human message. The UI shows Retry from this flag alone.
+    pub turn_retry_available: bool,
     /// What each recent approved action's Task run has become. Built from the
     /// Task records at read time and never stored in the Conversation.
     pub executions: Vec<ExecutionView>,
@@ -141,6 +144,7 @@ async fn snapshot(
         .iter()
         .any(|action| action.status == ActionStatus::Running)
         && live;
+    let turn_retry_available = !live && conversation.retryable_human_turn().is_some();
     let executions = task_executions(state, &conversation).await;
     Snapshot {
         conversation,
@@ -148,6 +152,7 @@ async fn snapshot(
         worker_live,
         run_status: live.then_some(AgentStatus::Running),
         continuation_error,
+        turn_retry_available,
         executions,
     }
 }
@@ -267,6 +272,9 @@ pub async fn get_project_conversation(
         let mut changed = false;
         let mut interrupted_worker = false;
         if !run_live {
+            // Checked before the Worker record is added, so that record cannot hide an
+            // unanswered Human message from the check below.
+            let unanswered = ends_with_unanswered_message(&conversation);
             for action in &mut conversation.actions {
                 if action.status == ActionStatus::Running {
                     action.status = ActionStatus::Interrupted;
@@ -278,17 +286,11 @@ pub async fn get_project_conversation(
                 conversation.push(Role::Worker, EntryKind::RunFailed {
                     role: Role::Worker,
                     message: "The application restarted while this Worker may have been changing its Task Checkout. The Worker was not replayed, and direct delegation is retired, so no new attempt starts from this record. Inspect the checkout if it may have changed.".into(),
+                    retryable: false,
                 });
             }
-            if conversation
-                .entries
-                .last()
-                .is_some_and(|entry| matches!(entry.kind, EntryKind::HumanMessage { .. }))
-            {
-                conversation.push(Role::Coordinator, EntryKind::RunFailed {
-                    role: Role::Coordinator,
-                    message: "The previous Coordinator run ended before a reply was recorded. Send a fresh message to continue from the saved Conversation.".into(),
-                });
+            if unanswered {
+                conversation.push(Role::Coordinator, unanswered_turn_failure());
                 changed = true;
             }
         }
@@ -407,6 +409,12 @@ pub async fn send_project_message(
     if conversation.has_unmediated_worker_result() {
         return Err("A saved Worker result must be reviewed by the Coordinator before sending another message".into());
     }
+    // A previous message whose run ended without a recorded failure gets that
+    // failure now, in the same save as this message, so it is never left
+    // unanswered once a newer message exists.
+    if ends_with_unanswered_message(&conversation) {
+        conversation.push(Role::Coordinator, unanswered_turn_failure());
+    }
     let prior_history = conversation.clone();
     conversation.push(
         Role::Human,
@@ -414,12 +422,28 @@ pub async fn send_project_message(
             text: message.clone(),
         },
     );
-    let current_entry_id = conversation.entries.last().map(|entry| entry.id);
     state
         .storage
         .save_conversation(&conversation)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| human_save_failure(&error))?;
+    answer_human_message(&state, &project, &prior_history, &message).await
+}
 
+/// Runs the Coordinator for one saved Human message and records its outcome.
+/// `prior_history` is the Conversation before that message, so the message is
+/// projected once, as the current message, and never again as history.
+///
+/// The caller holds the Project Conversation lock. A provider, parse, or lookup
+/// failure is recorded as a retryable `RunFailed` entry, so the message is never
+/// left unanswered and invisible. A failure to save a reply is returned as an
+/// error and records nothing.
+async fn answer_human_message(
+    state: &AppState,
+    project: &crate::domain::Project,
+    prior_history: &Conversation,
+    message: &str,
+) -> Result<Snapshot, String> {
+    let project_id = project.id;
     let tasks = state.task.tasks.read().await;
     let mut project_tasks: Vec<_> = tasks
         .values()
@@ -435,35 +459,71 @@ pub async fn send_project_message(
     let root = project.repository_path(&repositories);
     drop(repositories);
     let projection = prior_history.coordinator_projection_before(
-        &message,
+        message,
         &project.name,
         root.as_deref(),
         &task_index,
-        current_entry_id,
+        None,
     );
     let prompt = format!("Project context projection (JSON):\n{}\n\nReturn exactly one JSON object. {} Do not use markdown fences. Every non-reply type is only a proposal; SlashIt requires explicit human approval before anything changes or any Worker starts.", projection, OUTPUT_SCHEMAS);
-    let working_directory = coordinator_working_directory(root.as_deref())?;
-    let executor = state
-        .executor
-        .get()
-        .ok_or("Task executor is not ready")?
-        .clone();
-    let (output, run_lease) = coordinator_turn(&state, &executor, conversation.id, project_id, &prompt, |prompt| ClaudeRunConfig {
+    // Failures before the provider starts are recorded like run failures, so the
+    // Human message never stays unanswered and invisible.
+    let working_directory = match coordinator_working_directory(root.as_deref()) {
+        Ok(directory) => directory,
+        Err(reason) => return record_failed_turn(state, project_id, &reason).await,
+    };
+    let executor = match state.executor.get() {
+        Some(executor) => executor.clone(),
+        None => return record_failed_turn(state, project_id, "Task executor is not ready").await,
+    };
+    let answer = coordinator_turn(state, &executor, prior_history.id, project_id, &prompt, |prompt| ClaudeRunConfig {
         prompt, working_dir: working_directory.path.clone(), tools: ToolAccess::ReadOnly, max_turns: Some(4), max_budget_usd: None,
         session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
         system_prompt: Some(COORDINATOR_SYSTEM_PROMPT.into()),
         append_system_prompt: None, disable_mcp: true, additional_dirs: vec![], isolate_customizations: false,
-    }).await?;
+    }).await;
+    let (output, run_lease) = match answer {
+        Ok(answer) => answer,
+        Err(reason) => return record_failed_turn(state, project_id, &reason).await,
+    };
     let mut updated = state
         .storage
         .load_primary_conversation(project_id)
         .map_err(|e| e.to_string())?
         .ok_or("Conversation disappeared")?;
+    let recorded = record_coordinator_output(state, project_id, &mut updated, output).await;
+    if let Err(reason) = recorded {
+        drop(run_lease);
+        return record_failed_turn(state, project_id, &reason).await;
+    }
+    // A reply that cannot be saved is not a failed provider run. It is returned
+    // as an error and nothing is recorded, so the Human message stays unanswered
+    // and the reopen reconciliation records the failure once storage works.
+    let saved = state.storage.save_conversation(&updated);
+    drop(run_lease);
+    saved.map_err(|error| reply_save_failure(&error))?;
+    Ok(snapshot(state, updated, None).await)
+}
+
+/// Records one Coordinator output in the Conversation. Proposals are validated
+/// here and a refused proposal is recorded as a non-retryable refusal. A lookup
+/// as the final answer is an error, which the caller records as a retryable
+/// failure.
+async fn record_coordinator_output(
+    state: &AppState,
+    project_id: Uuid,
+    conversation: &mut Conversation,
+    output: CoordinatorOutput,
+) -> Result<(), String> {
     match output {
         CoordinatorOutput::Reply { text } => {
-            updated.push(Role::Coordinator, EntryKind::CoordinatorReply { text })
+            conversation.push(Role::Coordinator, EntryKind::CoordinatorReply { text });
+            Ok(())
         }
-        CoordinatorOutput::DelegateToTask { .. } => record_retired_delegation(&mut updated),
+        CoordinatorOutput::DelegateToTask { .. } => {
+            record_retired_delegation(conversation);
+            Ok(())
+        }
         output @ (
             CoordinatorOutput::CreateTask { .. }
             | CoordinatorOutput::EditTask { .. }
@@ -471,24 +531,157 @@ pub async fn send_project_message(
             | CoordinatorOutput::EnqueueTask { .. }
             | CoordinatorOutput::ExecuteRequest { .. }
         ) => {
-            let checkout = proposal_checkout(&state, project_id, &output).await?;
+            // A checkout that cannot be inspected is a transient failure, so it ends the
+            // turn as a retryable failure. Only a refused proposal is a refusal.
+            let checkout = proposal_checkout(state, project_id, &output).await?;
             let tasks = state.task.tasks.read().await;
-            conversation_actions::record_proposal(&mut updated, project_id, output, &tasks, checkout)?;
+            record_proposal_or_refusal(conversation, project_id, output, &tasks, Ok(checkout));
+            Ok(())
         }
         CoordinatorOutput::InspectTask { .. }
         | CoordinatorOutput::ListTasks { .. }
         | CoordinatorOutput::InspectTaskActivity { .. }
         | CoordinatorOutput::InspectTaskPullRequest { .. }
         | CoordinatorOutput::InspectProject {} => {
-            return Err("Coordinator ended its turn with a lookup instead of a response".into());
+            Err("Coordinator ended its turn with a lookup instead of a response".into())
         }
     }
-    state
+}
+
+/// Records a failed Coordinator run for the unanswered Human message. The entry
+/// is durable at failure time and retryable. It names the reason and does not
+/// repeat the message. A failure to save it is reported with the run failure, so
+/// the caller can tell that the run failed and that the failure was not kept.
+async fn record_failed_turn(state: &AppState, project_id: Uuid, reason: &str) -> Result<Snapshot, String> {
+    let mut conversation = state
         .storage
-        .save_conversation(&updated)
-        .map_err(|error| error.to_string())?;
-    drop(run_lease);
-    Ok(snapshot(&state, updated, None).await)
+        .load_primary_conversation(project_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("Conversation disappeared")?;
+    let message = coordinator_failure_message(reason);
+    conversation.push(
+        Role::Coordinator,
+        EntryKind::RunFailed {
+            role: Role::Coordinator,
+            message: message.clone(),
+            retryable: true,
+        },
+    );
+    match state.storage.save_conversation(&conversation) {
+        Ok(()) => Ok(snapshot(state, conversation, None).await),
+        Err(error) if crate::config::conversation_write_published(&error) => Err(format!(
+            "{message} The failure is saved, but SlashIt could not confirm that it reached stable storage. Reload the Conversation before retrying."
+        )),
+        Err(error) => Err(format!(
+            "{message} SlashIt could not record this failure, so reload the Conversation before retrying: {error}"
+        )),
+    }
+}
+
+/// The error for a send whose Human message could not be saved. A published
+/// message is already in the Conversation, so the text says it was saved and
+/// asks for a reload instead of a second send. Nothing was sent to the
+/// Coordinator in either case.
+fn human_save_failure(error: &anyhow::Error) -> String {
+    if crate::config::conversation_write_published(error) {
+        "Your message was saved, but SlashIt could not confirm that it reached stable storage. Reload the Conversation to see it. Do not send it again: the Coordinator has not answered it, and Retry asks for it after the reload.".into()
+    } else {
+        "Your message was not saved and was not sent to the Coordinator.".into()
+    }
+}
+
+/// The error for a Coordinator reply that could not be saved. The reply is
+/// either visible without a confirmed write, or missing; the message stays
+/// unanswered in the second case, and reopening records it for Retry.
+fn reply_save_failure(error: &anyhow::Error) -> String {
+    if crate::config::conversation_write_published(error) {
+        "The Coordinator replied, but SlashIt could not confirm that the reply reached stable storage. Reload the Conversation to see it. Do not send the message again.".into()
+    } else {
+        "The Coordinator replied, but the reply could not be saved, so it is not in the Conversation. Reload the Conversation: the message is recorded as unanswered, and Retry asks the Coordinator again.".into()
+    }
+}
+
+/// True when the newest entry is a Human message that nothing has answered, so
+/// its Coordinator run ended without a recorded failure.
+fn ends_with_unanswered_message(conversation: &Conversation) -> bool {
+    conversation
+        .entries
+        .last()
+        .is_some_and(|entry| matches!(entry.kind, EntryKind::HumanMessage { .. }))
+}
+
+/// The retryable failure recorded for a Human message whose run ended without a
+/// recorded failure, such as a save that failed or an application restart.
+fn unanswered_turn_failure() -> EntryKind {
+    EntryKind::RunFailed {
+        role: Role::Coordinator,
+        message: "The previous Coordinator run ended before a reply was recorded. Retry asks the Coordinator again for the saved message, until you send a newer message. A newer message is answered on its own.".into(),
+        retryable: true,
+    }
+}
+
+/// The Human-facing text for a failed Coordinator run. The reason is cut to a
+/// bounded length, and a turn-limit failure gets its own explanation.
+fn coordinator_failure_message(reason: &str) -> String {
+    const REASON_CHARS: usize = 500;
+    let reason: String = reason.chars().take(REASON_CHARS).collect();
+    let turn_limit = if reason.contains("error_max_turns") {
+        " The Coordinator used up its provider turns before it answered."
+    } else {
+        ""
+    };
+    format!(
+        "The Coordinator did not return a reply: {reason}.{turn_limit} Your message is saved. Retry asks the Coordinator again for it, without saving the message a second time, until you send a newer message."
+    )
+}
+
+/// Explicit, idempotent retry of the Human message that the Coordinator has not
+/// answered. The saved message is reused exactly, and nothing new is saved for
+/// it. The request is refused unless the caller saw the current revision, so a
+/// second click after the first has changed the Conversation does nothing.
+#[tauri::command]
+pub async fn retry_project_message(
+    _gui: GuiMutation,
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    conversation_id: String,
+    revision: u64,
+) -> Result<Snapshot, String> {
+    let project_id = parse_id(&project_id, "Project id")?;
+    let conversation_id = parse_id(&conversation_id, "Conversation id")?;
+    let lock = state.conversation.project_lock(project_id);
+    let _guard = lock
+        .try_lock()
+        .map_err(|_| "A Conversation mutation or continuation is already active".to_string())?;
+    let project = project_after_lock(&state.project.projects, project_id).await?;
+    let conversation = state
+        .storage
+        .load_primary_conversation(project_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("Conversation not found")?;
+    if conversation.id != conversation_id || conversation.project_id != project_id {
+        return Err("Conversation does not belong to this Project".into());
+    }
+    if conversation.revision != revision {
+        return Err("Conversation changed; reload before retrying".into());
+    }
+    if state
+        .executor
+        .get()
+        .is_some_and(|executor| executor.project_run_is_live(conversation_id))
+    {
+        return Err("A Conversation run is already active".into());
+    }
+    if conversation.has_unmediated_worker_result() {
+        return Err("A saved Worker result must be reviewed by the Coordinator before sending another message".into());
+    }
+    let Some((human_index, message)) = conversation.retryable_human_turn() else {
+        return Err("No failed Coordinator turn is waiting for a retry".into());
+    };
+    let message = message.to_owned();
+    let mut prior_history = conversation.clone();
+    prior_history.entries.truncate(human_index);
+    answer_human_message(&state, &project, &prior_history, &message).await
 }
 
 /// One Coordinator turn: runs the Coordinator and answers its read-only
@@ -799,21 +992,22 @@ fn record_retired_delegation(conversation: &mut Conversation) {
         EntryKind::RunFailed {
             role: Role::Coordinator,
             message: RETIRED_DELEGATION_REFUSAL.into(),
+            retryable: false,
         },
     );
 }
 
-/// Record a follow-up's Project-action proposal, or the reason it was refused.
+/// Record a Coordinator turn's Project-action proposal, or the reason it was
+/// refused.
 ///
 /// `record_proposal` only reads the in-memory Task set and validates, writing
 /// to the Conversation only once the proposal is valid, so every error it
 /// returns is the same on every attempt: an unknown Task, another Project's
-/// Task, a move or edit that changes nothing or is not available. Retrying the
-/// follow-up cannot fix that and would spend another provider run to get the
-/// same refusal, so it ends the follow-up with a visible failure entry
-/// instead. Transient failures (provider, persistence) never pass through
-/// here; they keep their own retryable and persistence errors.
-fn record_followup_proposal(
+/// Task, a move or edit that changes nothing or is not available. Retrying
+/// cannot fix that and would spend another provider run to get the same
+/// refusal, so the refusal is a visible, non-retryable entry. Transient
+/// failures (provider, persistence) never pass through here.
+fn record_proposal_or_refusal(
     conversation: &mut Conversation,
     project_id: Uuid,
     output: CoordinatorOutput,
@@ -829,6 +1023,7 @@ fn record_followup_proposal(
             EntryKind::RunFailed {
                 role: Role::Coordinator,
                 message: format!("The Coordinator's proposal was refused and nothing was recorded: {reason}"),
+                retryable: false,
             },
         );
     }
@@ -909,7 +1104,7 @@ async fn continue_from_worker_result(
         ) => {
             let checkout = proposal_checkout(state, project_id, &output).await;
             let tasks = state.task.tasks.read().await;
-            record_followup_proposal(&mut conversation, project_id, output, &tasks, checkout);
+            record_proposal_or_refusal(&mut conversation, project_id, output, &tasks, checkout);
         }
         CoordinatorOutput::InspectTask { .. }
         | CoordinatorOutput::ListTasks { .. }
@@ -938,7 +1133,7 @@ async fn continue_from_worker_result(
 mod tests {
     use super::{
         can_reject, preserve_saved_conversation, project_after_lock,
-        record_followup_proposal, record_retired_delegation, ContinuationError,
+        record_proposal_or_refusal, record_retired_delegation, ContinuationError,
     };
     use crate::domain::conversation::{ActionStatus, Conversation, EntryKind, Role, TaskAction};
     use uuid::Uuid;
@@ -1007,7 +1202,7 @@ mod tests {
         assert!(conversation.project_actions.is_empty(), "no proposal is recorded");
         assert_eq!(conversation.revision, revision + 1);
         match &conversation.entries.last().unwrap().kind {
-            EntryKind::RunFailed { role: Role::Coordinator, message } => {
+            EntryKind::RunFailed { role: Role::Coordinator, message, .. } => {
                 assert!(message.contains("retired"), "{message}");
                 assert!(message.len() <= 600, "bounded: {}", message.len());
                 assert!(!message.contains("do it") && !message.contains("change a.txt"));
@@ -1117,7 +1312,7 @@ mod tests {
         for json in proposals {
             let mut conversation = Conversation::new(project_id);
             let output = Conversation::parse_output(&json).unwrap();
-            record_followup_proposal(&mut conversation, project_id, output, &tasks, Ok(None));
+            record_proposal_or_refusal(&mut conversation, project_id, output, &tasks, Ok(None));
             assert!(conversation.project_actions.is_empty(), "{json}");
             assert!(conversation.actions.is_empty(), "{json}");
             assert_eq!(refusals(&conversation), 1, "{json}");
@@ -1134,7 +1329,7 @@ mod tests {
         let json = format!(r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#, queued.id);
         let mut conversation = Conversation::new(project_id);
 
-        record_followup_proposal(&mut conversation, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
+        record_proposal_or_refusal(&mut conversation, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
 
         assert_eq!(conversation.project_actions.len(), 1);
         assert_eq!(conversation.project_actions[0].status, crate::domain::conversation::ProjectActionStatus::Proposed);
@@ -1154,7 +1349,7 @@ mod tests {
         // keeps the saved Conversation, which carries neither the proposal nor
         // the reply mark, so the follow-up stays retryable.
         let mut attempt = saved.clone();
-        record_followup_proposal(&mut attempt, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
+        record_proposal_or_refusal(&mut attempt, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
         assert_eq!(attempt.project_actions.len(), 1);
         assert!(preserve_saved_conversation(
             saved.clone(),
@@ -1164,7 +1359,7 @@ mod tests {
         assert!(saved.project_actions.is_empty(), "a failed save publishes nothing");
 
         let mut retry = saved;
-        record_followup_proposal(&mut retry, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
+        record_proposal_or_refusal(&mut retry, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
         assert_eq!(retry.project_actions.len(), 1, "exactly one proposal after the retry");
     }
 
@@ -1529,7 +1724,7 @@ mod tests {
                     .iter()
                     .filter(|entry| matches!(
                         &entry.kind,
-                        EntryKind::RunFailed { role: Role::Coordinator, message } if message.contains("retired")
+                        EntryKind::RunFailed { role: Role::Coordinator, message, .. } if message.contains("retired")
                     ))
                     .count()
             }
@@ -1992,6 +2187,564 @@ mod tests {
             .await
             .expect("the second read succeeds");
             assert_eq!(fx.conversation().revision, after.revision);
+        }
+    }
+
+    // The fake provider is a shell script, and `FakeProgram` exists only on unix.
+    #[cfg(unix)]
+    mod ordinary_turn {
+        use super::*;
+        use crate::commands::conversation::Snapshot;
+        use crate::commands::gui_admission::GuiMutation;
+        use tauri::Manager;
+
+        enum Step {
+            Reply(&'static str),
+            Proposal(&'static str),
+            Fail,
+            MaxTurns,
+            Malformed,
+            /// Fails, and makes `dir` read-only first, so the failure cannot be saved.
+            FailAndFreeze(std::path::PathBuf),
+        }
+
+        fn result_line(output: &str) -> String {
+            let escaped = output.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{escaped}\"}}'")
+        }
+
+        fn step_shell(step: &Step) -> String {
+            match step {
+                Step::Reply(text) => result_line(&format!(r#"{{"type":"reply","text":"{text}"}}"#)),
+                Step::Proposal(json) => result_line(json),
+                Step::Fail => "printf '%s\\n' 'provider unavailable' >&2; exit 2".into(),
+                Step::MaxTurns => "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"errors\":[\"Reached maximum number of turns (4)\"]}'; exit 1".into(),
+                Step::Malformed => result_line("not json"),
+                Step::FailAndFreeze(dir) => format!("chmod -R a-w '{}'; printf '%s\\n' 'provider unavailable' >&2; exit 2", dir.display()),
+            }
+        }
+
+        /// A fake `claude` that logs each run, keeps each run's prompt as
+        /// `<log>.prompt.<run>`, and answers run N with the Nth step. Runs past
+        /// the last step repeat it.
+        fn provider_body(log: &std::path::Path, steps: &[Step]) -> String {
+            let log = log.display();
+            let mut body = format!("echo run >> '{log}'\nn=$(wc -l < '{log}')\ncat > '{log}.prompt.'$n\ncase $n in\n");
+            for (index, step) in steps.iter().enumerate() {
+                body.push_str(&format!("{}) {} ;;\n", index + 1, step_shell(step)));
+            }
+            let last = steps.last().expect("a provider needs at least one step");
+            body.push_str(&format!("*) {} ;;\nesac\n", step_shell(last)));
+            body
+        }
+
+        struct Fx {
+            _tmp: tempfile::TempDir,
+            _fake: crate::test_helpers::FakeProgram,
+            app: tauri::App<tauri::test::MockRuntime>,
+            log: std::path::PathBuf,
+            project_id: Uuid,
+        }
+
+        async fn fixture(tmp: tempfile::TempDir, steps: &[Step]) -> Fx {
+            let log = tmp.path().join("provider-runs.log");
+            let fake = crate::test_helpers::FakeProgram::install("claude", &provider_body(&log, steps)).await;
+            let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+                tmp.path().join("config"),
+                tmp.path().join("data"),
+                tmp.path().join("cache"),
+                tmp.path().join("runtime"),
+            ));
+            let (state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
+            crate::test_helpers::attach_test_executor(&state);
+            let project_id = Uuid::new_v4();
+            state.project.projects.write().await.insert(
+                project_id,
+                crate::domain::Project {
+                    id: project_id,
+                    name: "p".into(),
+                    repository_id: None,
+                    scope: Default::default(),
+                    state_location: crate::config::paths::StateLocation::External,
+                    base: None,
+                    agent_type: crate::domain::project::AgentType::ClaudeCode,
+                    agent_config: crate::domain::project::AgentConfig {
+                        agent_type: crate::domain::project::AgentType::ClaudeCode,
+                        command: "claude".into(),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                        model: None,
+                        api_key: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                },
+            );
+            let app = tauri::test::mock_app();
+            app.manage(state);
+            Fx { _tmp: tmp, _fake: fake, app, log, project_id }
+        }
+
+        impl Fx {
+            fn state(&self) -> &crate::AppState {
+                self.app.state::<crate::AppState>().inner()
+            }
+
+            fn conversation(&self) -> Conversation {
+                self.state().storage.load_primary_conversation(self.project_id).unwrap().unwrap()
+            }
+
+            /// Provider runs so far.
+            fn runs(&self) -> usize {
+                std::fs::read_to_string(&self.log).map(|log| log.lines().count()).unwrap_or(0)
+            }
+
+            /// The prompt sent to provider run `run` (1-based).
+            fn prompt(&self, run: usize) -> String {
+                std::fs::read_to_string(format!("{}.prompt.{run}", self.log.display())).unwrap_or_default()
+            }
+        }
+
+        async fn send(fx: &Fx, text: &str) -> Result<Snapshot, String> {
+            super::super::send_project_message(
+                GuiMutation::untracked(),
+                fx.app.state(),
+                fx.project_id.to_string(),
+                text.into(),
+            )
+            .await
+        }
+
+        async fn retry(fx: &Fx, conversation: &Conversation) -> Result<Snapshot, String> {
+            super::super::retry_project_message(
+                GuiMutation::untracked(),
+                fx.app.state(),
+                fx.project_id.to_string(),
+                conversation.id.to_string(),
+                conversation.revision,
+            )
+            .await
+        }
+
+        async fn reopen(fx: &Fx) -> Conversation {
+            super::super::get_project_conversation(
+                GuiMutation::untracked(),
+                fx.app.state(),
+                fx.project_id.to_string(),
+            )
+            .await
+            .expect("the reopen succeeds")
+            .conversation
+        }
+
+        fn human_count(conversation: &Conversation, text: &str) -> usize {
+            conversation
+                .entries
+                .iter()
+                .filter(|entry| matches!(&entry.kind, EntryKind::HumanMessage { text: saved } if saved.as_str() == text))
+                .count()
+        }
+
+        fn count(conversation: &Conversation, matches: impl Fn(&EntryKind) -> bool) -> usize {
+            conversation.entries.iter().filter(|entry| matches(&entry.kind)).count()
+        }
+
+        fn is_retryable_failure(kind: &EntryKind) -> bool {
+            matches!(kind, EntryKind::RunFailed { role: Role::Coordinator, retryable: true, .. })
+        }
+
+        fn failure_message(conversation: &Conversation) -> String {
+            match &conversation.entries.last().unwrap().kind {
+                EntryKind::RunFailed { message, .. } => message.clone(),
+                _ => panic!("the newest entry is not a failure"),
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_successful_turn_saves_the_message_once_and_its_reply() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Hello")]).await;
+            let conversation = send(&fx, "Hi there").await.expect("the send succeeds").conversation;
+            assert_eq!(human_count(&conversation, "Hi there"), 1);
+            assert!(matches!(
+                &conversation.entries.last().unwrap().kind,
+                EntryKind::CoordinatorReply { text } if text == "Hello"
+            ));
+            assert!(conversation.retryable_human_turn().is_none());
+            assert_eq!(fx.runs(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_provider_failure_is_recorded_at_failure_time_and_is_retryable() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail]).await;
+            let snapshot = send(&fx, "Check the build").await.expect("the failure is recorded, not returned as an error");
+            assert_eq!(human_count(&snapshot.conversation, "Check the build"), 1);
+            let message = failure_message(&snapshot.conversation);
+            assert!(message.contains("did not return a reply") && message.contains("Your message is saved"), "{message}");
+            assert!(is_retryable_failure(&snapshot.conversation.entries.last().unwrap().kind));
+            assert_eq!(snapshot.conversation.retryable_human_turn(), Some((0, "Check the build")));
+            // Durable: the failure is in the saved Conversation, not only the response.
+            assert_eq!(fx.conversation().entries.len(), 2);
+            assert_eq!(fx.runs(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_exhausted_turn_limit_is_recorded_with_its_own_explanation() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::MaxTurns]).await;
+            let conversation = send(&fx, "Summarize the Tasks").await.expect("recorded").conversation;
+            let message = failure_message(&conversation);
+            assert!(message.contains("used up its provider turns"), "{message}");
+            assert!(conversation.retryable_human_turn().is_some());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn malformed_coordinator_output_is_recorded_and_retryable() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Malformed]).await;
+            let conversation = send(&fx, "Status?").await.expect("recorded").conversation;
+            let message = failure_message(&conversation);
+            assert!(message.contains("Invalid Coordinator JSON"), "{message}");
+            assert!(conversation.retryable_human_turn().is_some());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn retry_reuses_the_exact_saved_message_and_is_not_projected_twice() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Done")]).await;
+            send(&fx, "Check the build").await.expect("recorded");
+            let before = fx.conversation();
+            let conversation = retry(&fx, &before).await.expect("the retry succeeds").conversation;
+
+            assert_eq!(human_count(&conversation, "Check the build"), 1, "the Human message is not saved again");
+            assert!(matches!(conversation.entries.last().unwrap().kind, EntryKind::CoordinatorReply { .. }));
+            assert_eq!(fx.runs(), 2);
+            let prompt = fx.prompt(2);
+            assert!(prompt.contains(r#""current_message":"Check the build""#), "the retry asks the saved message");
+            assert_eq!(prompt.matches("Check the build").count(), 1, "the message is projected once");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_repeated_or_stale_retry_runs_nothing_and_saves_nothing() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Done")]).await;
+            send(&fx, "Check the build").await.expect("recorded");
+            let before = fx.conversation();
+            retry(&fx, &before).await.expect("the first retry succeeds");
+
+            let stale = retry(&fx, &before).await;
+            assert!(stale.unwrap_err().contains("Conversation changed"), "the old revision is refused");
+            let after = fx.conversation();
+            let again = retry(&fx, &after).await;
+            assert_eq!(again.unwrap_err(), "No failed Coordinator turn is waiting for a retry");
+
+            let conversation = fx.conversation();
+            assert_eq!(human_count(&conversation, "Check the build"), 1);
+            assert_eq!(count(&conversation, |kind| matches!(kind, EntryKind::CoordinatorReply { .. })), 1);
+            assert_eq!(fx.runs(), 2, "neither refused retry started a provider run");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_retry_with_a_stale_revision_is_refused_before_any_run() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Done")]).await;
+            send(&fx, "Check the build").await.expect("recorded");
+            let mut stale = fx.conversation();
+            stale.revision += 5;
+            let error = retry(&fx, &stale).await.unwrap_err();
+            assert!(error.contains("Conversation changed"), "{error}");
+            assert_eq!(fx.runs(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_retry_while_a_mutation_holds_the_project_lock_is_refused() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Done")]).await;
+            send(&fx, "Check the build").await.expect("recorded");
+            let before = fx.conversation();
+            let lock = fx.state().conversation.project_lock(fx.project_id);
+            let _held = lock.lock().await;
+            let error = retry(&fx, &before).await.unwrap_err();
+            assert!(error.contains("already active"), "{error}");
+            assert_eq!(fx.runs(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_retried_proposal_is_recorded_once() {
+            let proposal = r#"{"type":"create_task","text":"Track it","title":"Track the build"}"#;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Proposal(proposal)]).await;
+            send(&fx, "Track the build").await.expect("recorded");
+            let before = fx.conversation();
+            let conversation = retry(&fx, &before).await.expect("the retry succeeds").conversation;
+            assert_eq!(conversation.project_actions.len(), 1);
+            assert_eq!(count(&conversation, |kind| matches!(kind, EntryKind::ProjectActionProposed { .. })), 1);
+            assert!(conversation.retryable_human_turn().is_none());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failure_that_cannot_be_saved_is_reported_and_recovered_on_reopen() {
+            let tmp = tempfile::tempdir().unwrap();
+            let frozen = tmp.path().to_path_buf();
+            let fx = fixture(tmp, &[Step::FailAndFreeze(frozen.clone()), Step::Reply("Done")]).await;
+
+            let error = send(&fx, "Check the build").await.expect_err("the failure could not be recorded");
+            assert!(error.contains("could not record this failure"), "{error}");
+            assert_eq!(fx.runs(), 1);
+
+            // Storage recovers. The unanswered message is saved, and no failure was written.
+            std::process::Command::new("chmod").arg("-R").arg("u+w").arg(&frozen).status().unwrap();
+            let on_disk = fx.conversation();
+            assert_eq!(human_count(&on_disk, "Check the build"), 1);
+            assert_eq!(on_disk.entries.len(), 1, "the failed save left no failure entry");
+
+            // Reopening the Conversation records the failure that could not be saved before.
+            let reopened = reopen(&fx).await;
+            assert!(is_retryable_failure(&reopened.entries.last().unwrap().kind));
+
+            let recovered = retry(&fx, &reopened).await.expect("the retry succeeds").conversation;
+            assert!(matches!(recovered.entries.last().unwrap().kind, EntryKind::CoordinatorReply { .. }));
+            assert_eq!(human_count(&recovered, "Check the build"), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_message_left_unanswered_by_an_interrupted_run_is_retryable_after_reopen() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Back")]).await;
+            let mut conversation = fx.state().storage.create_primary_conversation(fx.project_id).unwrap();
+            conversation.push(Role::Human, EntryKind::HumanMessage { text: "Where was I?".into() });
+            fx.state().storage.save_conversation(&conversation).unwrap();
+
+            let reopened = reopen(&fx).await;
+            assert_eq!(reopened.retryable_human_turn(), Some((0, "Where was I?")));
+
+            let answered = retry(&fx, &reopened).await.expect("the retry succeeds").conversation;
+            assert_eq!(human_count(&answered, "Where was I?"), 1);
+            assert!(matches!(answered.entries.last().unwrap().kind, EntryKind::CoordinatorReply { .. }));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_new_message_after_a_failure_is_sent_without_retrying_the_old_one() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Second answer")]).await;
+            send(&fx, "First").await.expect("recorded");
+            let conversation = send(&fx, "Second").await.expect("the new send succeeds").conversation;
+            assert_eq!(human_count(&conversation, "First"), 1);
+            assert_eq!(human_count(&conversation, "Second"), 1);
+            assert!(matches!(conversation.entries.last().unwrap().kind, EntryKind::CoordinatorReply { .. }));
+            assert_eq!(fx.runs(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failure_that_was_not_saved_is_recorded_before_the_next_message() {
+            let tmp = tempfile::tempdir().unwrap();
+            let frozen = tmp.path().to_path_buf();
+            let fx = fixture(tmp, &[Step::FailAndFreeze(frozen.clone()), Step::Reply("Second answer")]).await;
+            send(&fx, "First").await.expect_err("the failure could not be recorded");
+            std::process::Command::new("chmod").arg("-R").arg("u+w").arg(&frozen).status().unwrap();
+
+            // Without a reopen, the next send must not bury the unanswered first message.
+            let conversation = send(&fx, "Second").await.expect("the next send succeeds").conversation;
+            let entries = &conversation.entries;
+            assert_eq!(entries.len(), 4, "first message, its recorded failure, second message, reply");
+            assert!(matches!(entries[0].kind, EntryKind::HumanMessage { .. }));
+            assert!(is_retryable_failure(&entries[1].kind), "the first message gets its failure before the next message");
+            assert!(matches!(&entries[2].kind, EntryKind::HumanMessage { text } if text == "Second"));
+            assert!(matches!(&entries[3].kind, EntryKind::CoordinatorReply { text } if text == "Second answer"));
+            assert_eq!(human_count(&conversation, "First"), 1);
+            assert_eq!(fx.runs(), 2);
+        }
+
+        /// Creates the Conversation before a fault is armed, so the fault hits
+        /// the Human message's write and not the creation of the file.
+        fn created_conversation(fx: &Fx) -> Conversation {
+            fx.state().storage.create_primary_conversation(fx.project_id).unwrap()
+        }
+
+        fn fault_on(conversation: &Conversation, stage: slashit_durable_fs::Stage) -> slashit_durable_fs::fault::FaultGuard {
+            slashit_durable_fs::fault::fail_at_file(stage, std::io::ErrorKind::Other, &format!("{}.json", conversation.id))
+        }
+
+        async fn reopen_fails(fx: &Fx) -> bool {
+            super::super::get_project_conversation(
+                GuiMutation::untracked(),
+                fx.app.state(),
+                fx.project_id.to_string(),
+            )
+            .await
+            .is_err()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_message_that_was_not_published_is_neither_saved_nor_sent() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Hello")]).await;
+            let created = created_conversation(&fx);
+            let fault = fault_on(&created, slashit_durable_fs::Stage::Replace);
+            let error = send(&fx, "Hi there").await.expect_err("the save was refused");
+            drop(fault);
+            assert!(error.contains("was not saved"), "{error}");
+            assert_eq!(fx.runs(), 0, "the Coordinator is not asked about a message that was not saved");
+            assert!(fx.conversation().entries.is_empty(), "the file holds what it held before");
+
+            let conversation = send(&fx, "Hi there").await.expect("the send succeeds once storage works").conversation;
+            assert_eq!(human_count(&conversation, "Hi there"), 1);
+            assert_eq!(fx.runs(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_message_published_but_not_confirmed_is_kept_once_and_answered_by_retry() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Answered"), Step::Reply("Next")]).await;
+            let created = created_conversation(&fx);
+            let fault = fault_on(&created, slashit_durable_fs::Stage::SyncDirectory);
+            let error = send(&fx, "Check the build").await.expect_err("the save is not confirmed");
+            drop(fault);
+            assert!(error.contains("was saved") && error.contains("could not confirm"), "{error}");
+            assert_eq!(fx.runs(), 0, "no provider run starts for a message whose save is not confirmed");
+            assert_eq!(human_count(&fx.conversation(), "Check the build"), 1, "the new content is visible");
+
+            // Restart: the reopen records the unanswered message as retryable.
+            let reopened = reopen(&fx).await;
+            assert_eq!(reopened.retryable_human_turn(), Some((0, "Check the build")));
+
+            let answered = retry(&fx, &reopened).await.expect("the retry succeeds").conversation;
+            assert_eq!(human_count(&answered, "Check the build"), 1);
+            assert_eq!(fx.runs(), 1);
+
+            // A later save rewrites the whole Conversation, so the earlier message is saved with it.
+            let next = send(&fx, "Next question").await.expect("the next send succeeds").conversation;
+            assert_eq!(human_count(&next, "Check the build"), 1);
+            assert_eq!(human_count(&next, "Next question"), 1);
+            assert_eq!(fx.runs(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_unconfirmed_message_is_not_sent_again_when_the_reopen_cannot_save_either() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Answered")]).await;
+            created_conversation(&fx);
+            let fault = slashit_durable_fs::fault::fail_every(slashit_durable_fs::Stage::SyncDirectory, std::io::ErrorKind::Other);
+            let error = send(&fx, "Check the build").await.expect_err("the save is not confirmed");
+            assert!(error.contains("could not confirm"), "{error}");
+            assert!(reopen_fails(&fx).await, "the reopen cannot record the unanswered message");
+            assert_eq!(fx.runs(), 0, "nothing is sent again automatically");
+            drop(fault);
+
+            assert_eq!(human_count(&fx.conversation(), "Check the build"), 1);
+            let reopened = reopen(&fx).await;
+            assert_eq!(reopened.retryable_human_turn(), Some((0, "Check the build")));
+            assert_eq!(fx.runs(), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_reply_published_but_not_confirmed_is_shown_after_reload_and_not_asked_again() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Hello"), Step::Reply("Again")]).await;
+            created_conversation(&fx);
+            // The first directory sync is the Human message; the second is the reply.
+            let fault = slashit_durable_fs::fault::fail_in_order(&[(slashit_durable_fs::Stage::SyncDirectory, std::io::ErrorKind::Other, 1)]);
+            let error = send(&fx, "Hi").await.expect_err("the reply is not confirmed");
+            drop(fault);
+            assert!(error.contains("reply") && error.contains("could not confirm"), "{error}");
+            assert_eq!(fx.runs(), 1);
+
+            let reopened = reopen(&fx).await;
+            assert!(matches!(
+                &reopened.entries.last().unwrap().kind,
+                EntryKind::CoordinatorReply { text } if text == "Hello"
+            ));
+            assert!(reopened.retryable_human_turn().is_none());
+            assert_eq!(human_count(&reopened, "Hi"), 1);
+
+            let next = send(&fx, "Again").await.expect("the next send succeeds").conversation;
+            assert_eq!(count(&next, |kind| matches!(kind, EntryKind::CoordinatorReply { text } if text == "Hello")), 1);
+            assert_eq!(fx.runs(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_reply_that_was_not_published_leaves_the_message_unanswered_until_reopen() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Lost"), Step::Reply("Recovered")]).await;
+            created_conversation(&fx);
+            // The first replacement is the Human message; the second is the reply.
+            let fault = slashit_durable_fs::fault::fail_in_order(&[(slashit_durable_fs::Stage::Replace, std::io::ErrorKind::Other, 1)]);
+            let error = send(&fx, "Status?").await.expect_err("the reply could not be saved");
+            drop(fault);
+            assert!(error.contains("could not be saved"), "{error}");
+            assert_eq!(fx.runs(), 1);
+            assert_eq!(fx.conversation().entries.len(), 1, "only the Human message is on disk");
+
+            let reopened = reopen(&fx).await;
+            let retried = retry(&fx, &reopened).await.expect("the retry succeeds").conversation;
+            assert_eq!(human_count(&retried, "Status?"), 1);
+            assert_eq!(fx.runs(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failure_published_but_not_confirmed_is_reported_as_saved_and_retryable() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Done")]).await;
+            created_conversation(&fx);
+            // The first directory sync is the Human message; the second records the failure.
+            let fault = slashit_durable_fs::fault::fail_in_order(&[(slashit_durable_fs::Stage::SyncDirectory, std::io::ErrorKind::Other, 1)]);
+            let error = send(&fx, "Check the build").await.expect_err("the failure is not confirmed");
+            drop(fault);
+            assert!(error.contains("failure") && error.contains("could not confirm"), "{error}");
+            assert!(!error.contains("could not record"), "the failure is in place: {error}");
+            assert_eq!(fx.runs(), 1);
+
+            let reopened = reopen(&fx).await;
+            assert!(is_retryable_failure(&reopened.entries.last().unwrap().kind));
+            let retried = retry(&fx, &reopened).await.expect("the retry succeeds").conversation;
+            assert_eq!(human_count(&retried, "Check the build"), 1);
+            assert_eq!(fx.runs(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_newer_message_ends_an_earlier_retry_and_a_stale_retry_runs_nothing() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Second answer")]).await;
+            send(&fx, "First").await.expect("recorded");
+            let stale = fx.conversation();
+            assert_eq!(stale.retryable_human_turn(), Some((0, "First")));
+
+            let snapshot = send(&fx, "Second").await.expect("the new send succeeds");
+            assert!(!snapshot.turn_retry_available, "the earlier message has no Retry any more");
+            assert!(snapshot.conversation.retryable_human_turn().is_none());
+            let failure = match &snapshot.conversation.entries[1].kind {
+                EntryKind::RunFailed { message, .. } => message.clone(),
+                other => panic!("the first failure is kept: {other:?}"),
+            };
+            assert!(failure.contains("until you send a newer message"), "{failure}");
+
+            let refused = retry(&fx, &stale).await.unwrap_err();
+            assert!(refused.contains("Conversation changed"), "{refused}");
+            assert_eq!(fx.runs(), 2, "the stale retry started no run");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_send_that_races_a_retry_is_refused_and_the_newer_message_is_answered_once() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Answer")]).await;
+            send(&fx, "First").await.expect("recorded");
+            let before = fx.conversation();
+            let (sent, retried) = tokio::join!(send(&fx, "Second"), retry(&fx, &before));
+
+            let conversation = sent.expect("the send succeeds").conversation;
+            assert!(retried.unwrap_err().contains("already active"));
+            assert_eq!(human_count(&conversation, "First"), 1);
+            assert_eq!(human_count(&conversation, "Second"), 1);
+            assert_eq!(fx.runs(), 2, "the refused retry started no run");
+            assert!(matches!(
+                &conversation.entries.last().unwrap().kind,
+                EntryKind::CoordinatorReply { text } if text == "Answer"
+            ));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_retry_that_races_a_send_is_answered_before_the_newer_message() {
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Retried"), Step::Reply("Newer")]).await;
+            send(&fx, "First").await.expect("recorded");
+            let before = fx.conversation();
+            let (retried, sent) = tokio::join!(retry(&fx, &before), send(&fx, "Second"));
+
+            retried.expect("the retry succeeds");
+            let conversation = sent.expect("the send succeeds").conversation;
+            assert_eq!(human_count(&conversation, "First"), 1);
+            assert_eq!(human_count(&conversation, "Second"), 1);
+            assert_eq!(fx.runs(), 3);
+            let replies: Vec<&str> = conversation
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.kind {
+                    EntryKind::CoordinatorReply { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(replies, ["Retried", "Newer"]);
         }
     }
 }

@@ -1134,6 +1134,15 @@ pub fn board_write_published(error: &anyhow::Error) -> bool {
         .is_some_and(slashit_durable_fs::WriteError::is_published)
 }
 
+/// Whether a failed [`Storage::save_conversation`] had already replaced the
+/// Conversation file. The new content is what every reader sees, but it is not
+/// confirmed durable, so a caller must report it as neither unchanged nor saved.
+pub fn conversation_write_published(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<slashit_durable_fs::WriteError>()
+        .is_some_and(slashit_durable_fs::WriteError::is_published)
+}
+
 /// Only the `version` key, read without the strict board types, so a board
 /// whose other keys this build refuses can still say which layout it is.
 #[derive(Deserialize)]

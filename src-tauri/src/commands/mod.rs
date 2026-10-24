@@ -42,7 +42,8 @@ pub use project::*;
 pub use conversation::{
     act_on_project_conversation, get_project_conversation, get_project_conversation_executions,
     open_project_conversation,
-    retry_project_conversation_continuation, send_project_message, stop_project_conversation,
+    retry_project_conversation_continuation, retry_project_message, send_project_message,
+    stop_project_conversation,
 };
 pub use workspace::*;
 pub use task::*;

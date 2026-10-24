@@ -11,7 +11,7 @@ pub enum ActionStatus { Proposed, Approved, Running, Returned, Rejected, Interru
 pub struct TaskAction { pub id: Uuid, pub target_task_id: Uuid, pub target_task_title: String, pub request: String, pub explanation: String, pub approved_request: Option<String>, pub status: ActionStatus, pub worker_result: Option<String>, pub coordinator_replied: bool, pub created_at: String }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum EntryKind { HumanMessage { text: String }, CoordinatorReply { text: String }, ActionProposed { action_id: Uuid }, ActionDecision { action_id: Uuid, approved: bool, request: Option<String> }, WorkerStarted { action_id: Uuid }, WorkerResult { action_id: Uuid, result: String }, RunFailed { role: Role, message: String }, ProjectActionProposed { action_id: Uuid }, ProjectActionDecision { action_id: Uuid, approved: bool }, ProjectActionApplied { action_id: Uuid, task_id: Uuid }, ProjectActionRefused { action_id: Uuid, reason: String }, ActionWithdrawn { action_id: Uuid, revision: u64 } }
+pub enum EntryKind { HumanMessage { text: String }, CoordinatorReply { text: String }, ActionProposed { action_id: Uuid }, ActionDecision { action_id: Uuid, approved: bool, request: Option<String> }, WorkerStarted { action_id: Uuid }, WorkerResult { action_id: Uuid, result: String }, RunFailed { role: Role, message: String, #[serde(default)] retryable: bool }, ProjectActionProposed { action_id: Uuid }, ProjectActionDecision { action_id: Uuid, approved: bool }, ProjectActionApplied { action_id: Uuid, task_id: Uuid }, ProjectActionRefused { action_id: Uuid, reason: String }, ActionWithdrawn { action_id: Uuid, revision: u64 } }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry { pub id: Uuid, pub role: Role, pub kind: EntryKind, pub created_at: String }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +59,9 @@ pub struct Snapshot {
     pub run_status: Option<ConversationRunStatus>,
     #[serde(default)]
     pub continuation_error: Option<String>,
+    /// True when the backend would re-run the Coordinator for the unanswered message.
+    #[serde(default)]
+    pub turn_retry_available: bool,
     /// Absent in snapshots written before execution visibility existed.
     #[serde(default)]
     pub executions: Vec<ConversationExecution>,
@@ -93,5 +96,17 @@ mod tests {
         failed["continuation_error"] = json!("Coordinator unavailable; retry from saved result");
         let failed: Snapshot = serde_json::from_value(failed).expect("continuation failure should decode");
         assert_eq!(failed.continuation_error.as_deref(), Some("Coordinator unavailable; retry from saved result"));
+    }
+
+    #[test]
+    fn run_failure_retryable_flag_defaults_to_false_for_saved_entries() {
+        use super::EntryKind;
+        let legacy: EntryKind = serde_json::from_value(json!({"kind": "run_failed", "role": "coordinator", "message": "older failure"}))
+            .expect("a failure saved before the flag existed should decode");
+        assert!(matches!(legacy, EntryKind::RunFailed { retryable: false, .. }));
+
+        let retryable: EntryKind = serde_json::from_value(json!({"kind": "run_failed", "role": "coordinator", "message": "retry me", "retryable": true}))
+            .expect("a retryable failure should decode");
+        assert!(matches!(retryable, EntryKind::RunFailed { retryable: true, .. }));
     }
 }

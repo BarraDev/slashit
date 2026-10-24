@@ -411,14 +411,33 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let on_send = move || {
         let message = draft.get_untracked().trim().to_string();
         if message.is_empty() || busy.get_untracked() { return; }
+        let revision_before = snapshot.get_untracked().map(|value| value.conversation.revision);
         set_draft.set(String::new()); set_busy.set(true); set_error.set(None);
         let id = send_id.clone();
         let request = send_begin_request.run(());
         let publish = send_publish.clone();
+        let refresh_id = send_id.clone();
+        let refresh_begin_request = send_begin_request.clone();
+        let refresh_publish = send_publish.clone();
         spawn_local(async move {
-            match conversation_service::send_project_message(id, message).await {
+            match conversation_service::send_project_message(id, message.clone()).await {
                 Ok(value) => publish.run((request, value)),
-                Err(error) => set_error.set(Some(error)),
+                Err(error) => {
+                    set_error.set(Some(error));
+                    // A failed send can still have saved the Human message. Reload first, and
+                    // restore the draft only when the Conversation did not change, so the
+                    // same message is never typed and saved twice.
+                    let refresh_request = refresh_begin_request.run(());
+                    let maybe_saved = match conversation_service::get_project_conversation(refresh_id).await {
+                        Ok(value) => {
+                            let changed = revision_before.is_none_or(|before| value.conversation.revision != before);
+                            refresh_publish.run((refresh_request, value));
+                            changed
+                        }
+                        Err(_) => true,
+                    };
+                    if !maybe_saved && draft.get_untracked().is_empty() { set_draft.set(message); }
+                }
             }
             set_busy.set(false);
         });
@@ -501,6 +520,35 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             ).await {
                 Ok(value) => publish.run((request, value)),
                 Err(error) => set_error.set(Some(error)),
+            }
+            set_busy.set(false);
+        });
+    });
+    let turn_project_id = project_id.clone();
+    let turn_begin_request = begin_snapshot_request.clone();
+    let turn_publish = publish_snapshot.clone();
+    let retry_turn = Callback::new(move |()| {
+        if busy.get_untracked() { return; }
+        let Some(current) = snapshot.get_untracked() else { return; };
+        set_busy.set(true);
+        set_error.set(None);
+        let id = turn_project_id.clone();
+        let refresh_id = turn_project_id.clone();
+        let request = turn_begin_request.run(());
+        let publish = turn_publish.clone();
+        let refresh_begin_request = turn_begin_request.clone();
+        let refresh_publish = turn_publish.clone();
+        spawn_local(async move {
+            match conversation_service::retry_project_message(id, current.conversation.id.to_string(), current.conversation.revision).await {
+                Ok(value) => publish.run((request, value)),
+                Err(error) => {
+                    // A refused retry means the Conversation moved on, so reload it.
+                    set_error.set(Some(error));
+                    let refresh_request = refresh_begin_request.run(());
+                    if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await {
+                        refresh_publish.run((refresh_request, value));
+                    }
+                }
             }
             set_busy.set(false);
         });
@@ -626,6 +674,17 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                     </div>
                                 }
                             })
+                    })
+                }}
+                {move || {
+                    snapshot.get().filter(|value| value.turn_retry_available).map(|_| {
+                        let retry = retry_turn.clone();
+                        view! {
+                            <div data-testid="conversation-turn-retry" class="mb-3 flex shrink-0 items-center justify-between gap-3 rounded border border-amber-300/30 bg-amber-400/5 p-3 text-sm text-amber-100">
+                                <p>"Your last message has no reply yet. Retry asks the Coordinator again for that message, and it is not saved twice. Sending a new message ends this Retry: the earlier message stays unanswered, and only the new one is answered."</p>
+                                <button data-testid="conversation-retry-turn" class="shrink-0 rounded border border-amber-200/30 px-3 py-1" disabled=move || busy.get() on:click=move |_| retry.run(())>"Retry"</button>
+                            </div>
+                        }
                     })
                 }}
                 {move || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value)).then(|| view! {
