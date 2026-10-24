@@ -333,6 +333,32 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         }
     }
 
+    // A move from Queue into In Progress is a promotion: it takes an admission
+    // permit before its write, as the scheduler's own promotion does.
+    if old_status == crate::domain::TaskStatus::Queue
+        && new_status == crate::domain::TaskStatus::InProgress
+    {
+        let Some(executor) = ctx.executor.get() else {
+            return IpcResponse::error(crate::commands::queue::NO_EXECUTOR_PROMOTION.to_string());
+        };
+        let record_move = move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>,
+                                promoted_id: Uuid| {
+            if let Some(task) = staged.get_mut(&promoted_id) {
+                task.record_move(&crate::domain::TaskStatus::Queue);
+            }
+        };
+        return match executor
+            .promote_queued(crate::queue::PromotionChoice::Exact(task_uuid), record_move)
+            .await
+        {
+            Ok(crate::queue::PromotionOutcome::Promoted(task)) => task_summary_reply(ctx, &task).await,
+            Ok(refused) => IpcResponse::error(
+                executor.queued_promotion_refusal(Some(task_uuid), &refused).await,
+            ),
+            Err(e) => IpcResponse::error(e),
+        };
+    }
+
     // The same classifier the desktop app uses, through the same
     // stage/persist/publish primitive: this handler used to assign
     // `task.status` directly, which left a task moved e.g. `Failed ->

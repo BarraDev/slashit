@@ -196,6 +196,9 @@ pub struct DrawerActions {
     /// The task is waiting in Backlog with nothing running: put it in the
     /// queue, where the scheduler starts it when there is capacity.
     pub start: bool,
+    /// The task is queued with nothing running for it: promote it now,
+    /// instead of waiting for the queue's own order or for auto-promote.
+    pub run_now: bool,
     /// The task's execution is live, so stopping has something to end.
     pub stop: bool,
     /// The task failed and nothing is running: re-queue it.
@@ -219,6 +222,7 @@ impl DrawerActions {
         let live = run.live;
         Self {
             start: *status == TaskStatus::Backlog && !live && !recovery_required,
+            run_now: *status == TaskStatus::Queue && !live && !recovery_required,
             // Only a running execution. Stopping an AI review would also
             // send the task back to Backlog, which is a decision this surface
             // does not offer yet.
@@ -511,6 +515,35 @@ mod tests {
     }
 
     #[test]
+    fn run_now_is_offered_only_to_a_queued_task_with_nothing_running() {
+        assert!(DrawerActions::for_task(&TaskStatus::Queue, &run(false, Some(true))).run_now);
+        assert!(DrawerActions::for_task(&TaskStatus::Queue, &run(false, None)).run_now);
+        assert!(
+            !DrawerActions::for_task(&TaskStatus::Queue, &run(true, Some(false))).run_now,
+            "a queued task with a live run must not offer another one"
+        );
+        for status in [
+            TaskStatus::Backlog,
+            TaskStatus::InProgress,
+            TaskStatus::AiReview,
+            TaskStatus::HumanReview,
+            TaskStatus::Done,
+            TaskStatus::PrCreated,
+            TaskStatus::Error,
+        ] {
+            assert!(
+                !DrawerActions::for_task(&status, &run(false, None)).run_now,
+                "{status:?}"
+            );
+        }
+        assert!(
+            !DrawerActions::for_task_with_recovery(&TaskStatus::Queue, &run(false, None), true)
+                .run_now,
+            "a task in worker recovery cannot run"
+        );
+    }
+
+    #[test]
     fn stop_is_offered_only_while_an_execution_is_live() {
         assert!(DrawerActions::for_task(&TaskStatus::InProgress, &run(true, Some(false))).stop);
         assert!(!DrawerActions::for_task(&TaskStatus::InProgress, &run(false, Some(true))).stop);
@@ -553,6 +586,7 @@ mod tests {
             actions,
             DrawerActions {
                 start: false,
+                run_now: false,
                 stop: false,
                 retry: false,
                 edit: false,

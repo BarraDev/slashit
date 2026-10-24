@@ -23,7 +23,7 @@ use crate::components::task_review::{AiReviewSection, HumanReviewPanel};
 use crate::components::toast;
 use crate::models::{AgentStatus, LogLevel, Task, TaskPhase, TaskRunSnapshot, TaskStatus};
 use crate::services::task_run_service::{get_task_run, listen_agent_events, stop_task_execution};
-use crate::services::{enqueue_task, get_task_diff, get_task_diff_stat, EnqueueOutcome};
+use crate::services::{enqueue_task, get_task_diff, get_task_diff_stat, promoted_message, run_queued_task, EnqueueOutcome, RunNowOutcome};
 
 /// The most output entries the drawer renders. The backend keeps more; this
 /// is "recent output", not a transcript.
@@ -165,6 +165,10 @@ pub fn TaskDrawer(
     });
 
     let stopping = RwSignal::new(false);
+    // The Run now request for a queued task, from press to answer. Like
+    // Start, a second press while one is in flight is refused: the first
+    // promotion may already have left the queue.
+    let (run_now_pending, set_run_now_pending) = signal(false);
     let retrying = RwSignal::new(false);
     // The failure a retry was asked about, kept visible as the last attempt's
     // result until the next run changes the task.
@@ -222,6 +226,38 @@ pub fn TaskDrawer(
             // The board may have gone while the stop was running.
             refresh_tasks.try_run(());
             stopping.try_set(false);
+            refresh_run();
+        });
+    };
+
+    // Run now promotes a queued task out of the queue, through the same
+    // lifecycle the scheduler's promotion uses; the executor then starts its
+    // run. The queue column is the one this expects: a behind view (the
+    // promotion already happened, or the task was moved) is answered with the
+    // task as it now is, not with a second promotion.
+    let on_run_now = move |_| {
+        if run_now_pending.get_untracked() {
+            return;
+        }
+        set_run_now_pending.set(true);
+        spawn_local(async move {
+            match run_queued_task(task_id.to_string(), TaskStatus::Queue).await {
+                Ok(RunNowOutcome::Promoted(task)) => {
+                    toast::success(promoted_message(&task.title));
+                    apply_task.try_run(task);
+                    refresh_tasks.try_run(());
+                }
+                // Nothing was changed: show the task where it really is.
+                Ok(RunNowOutcome::NotQueued(current)) => {
+                    apply_task.try_run(current);
+                    refresh_tasks.try_run(());
+                }
+                Ok(RunNowOutcome::Missing) => {
+                    toast::error("This task no longer exists".to_string())
+                }
+                Err(e) => toast::error(format!("Could not run the task: {e}")),
+            }
+            set_run_now_pending.try_set(false);
             refresh_run();
         });
     };
@@ -403,6 +439,18 @@ pub fn TaskDrawer(
                         <span data-testid="task-drawer-start-status" role="status" aria-live="polite" class="sr-only">
                             {move || if start.with(StartRequest::is_pending) { "Starting…" } else { "" }}
                         </span>
+                        <Show when=move || actions.get().run_now || run_now_pending.get()>
+                            <button
+                                data-testid="task-drawer-run-now"
+                                class="px-3 py-1.5 rounded-lg text-sm bg-blue-500/15 text-blue-300 hover:bg-blue-500/25 disabled:opacity-50"
+                                title="Promote this queued task now; its run starts without waiting for the queue's order."
+                                disabled=move || run_now_pending.get()
+                                aria-busy=move || if run_now_pending.get() { "true" } else { "false" }
+                                on:click=on_run_now
+                            >
+                                {move || if run_now_pending.get() { "Running…" } else { "Run now" }}
+                            </button>
+                        </Show>
                         <Show when=move || actions.get().stop>
                             <button
                                 data-testid="task-drawer-stop"

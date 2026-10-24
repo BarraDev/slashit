@@ -979,6 +979,7 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Queue);
         assert_eq!(on_disk(&state, project_id, task_id).status, TaskStatus::Queue);
 
+        crate::test_helpers::attach_test_executor(&state);
         let app = tauri::test::mock_app();
         app.manage(state);
         let waiting = crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await;

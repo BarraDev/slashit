@@ -87,3 +87,5 @@
 1	task_dependencies::a_task_created_with_the_depends_on_control_starts_from_its_parents_branch
 3	unreadable_board::a_project_whose_task_board_cannot_be_read_says_so_and_takes_no_task_changes
 2	manual_review::a_manual_task_reaches_human_review_without_any_ai_review
+# Run now from a Queue card and the drawer: one journey with a full-queue refusal and a double click.
+2	run_now::run_now_refuses_a_full_queue_by_keyboard_and_runs_a_queued_task_once_by_double_click
