@@ -2602,27 +2602,31 @@ impl TaskExecutor {
             }
         }
 
-        // Find InProgress tasks that haven't started execution yet.
+        // Find InProgress tasks that haven't started execution yet, and return
+        // any reservation whose task is no longer pending (deleted, moved
+        // again, or otherwise never going to start): dropping the removed
+        // permit is what gives its capacity back.
+        //
+        // Both happen under one `reserved_permits` write lock. `promote_queued`
+        // writes a Task and inserts its reservation under that lock, so a
+        // snapshot taken outside it could miss a Task a command has promoted
+        // in the meantime. The sweep would then drop that Task's fresh
+        // reservation while the Task is still InProgress. Lock order is
+        // reservations, then tasks, as in `promote_queued`.
         let pending: Vec<Uuid> = {
-            let tasks = self.tasks.read().await;
-            tasks
-                .values()
-                .filter(|t| Self::is_pending(t))
-                .map(|t| t.id)
-                .collect()
-        };
-
-        // Any reservation whose task is no longer pending (deleted, moved
-        // again, or otherwise never going to start) is returned here rather
-        // than held forever: dropping the removed permit is what gives its
-        // capacity back.
-        {
+            let mut reserved = self.reserved_permits.write().await;
+            let pending: Vec<Uuid> = {
+                let tasks = self.tasks.read().await;
+                tasks
+                    .values()
+                    .filter(|t| Self::is_pending(t))
+                    .map(|t| t.id)
+                    .collect()
+            };
             let pending_set: std::collections::HashSet<Uuid> = pending.iter().copied().collect();
-            self.reserved_permits
-                .write()
-                .await
-                .retain(|task_id, _| pending_set.contains(task_id));
-        }
+            reserved.retain(|task_id, _| pending_set.contains(task_id));
+            pending
+        };
 
         for task_id in pending {
             // A reservation taken at promotion time is transferred straight
@@ -17059,6 +17063,7 @@ mod tests {
             assert_eq!(free_permits(&executor).await, 0);
         }
 
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_failed_durable_write_returns_the_permit_and_changes_nothing() {
             let (executor, _temps) = test_executor();
@@ -21568,6 +21573,42 @@ VERDICT: APPROVED"
                     .collect()
             }
 
+            /// How many runs have started for this Task. Every start writes
+            /// one execution record, and nothing removes it, so this counts
+            /// starts whether or not a run is still going.
+            #[cfg(unix)]
+            async fn executions_of_task(&self) -> usize {
+                self.executor
+                    .executions
+                    .read()
+                    .await
+                    .values()
+                    .filter(|e| e.task_id == Some(self.task_id))
+                    .count()
+            }
+
+            /// Waits for the Task's run to record that it stopped. The run
+            /// removes its own handle before it records that, so the handle
+            /// map cannot say whether a run has ended. The execution record
+            /// can, and it is only written once the run is over.
+            #[cfg(unix)]
+            async fn wait_for_the_run_to_stop(&self) {
+                for _ in 0..1200 {
+                    let stopped = self
+                        .executor
+                        .executions
+                        .read()
+                        .await
+                        .values()
+                        .any(|e| e.task_id == Some(self.task_id) && e.stopped_at.is_some());
+                    if stopped {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("the run did not stop: {:?}", self.task().await);
+            }
+
             fn events_saying(&self, needle: &str) -> usize {
                 self.agent_events()
                     .iter()
@@ -22215,22 +22256,21 @@ VERDICT: APPROVED"
 
             drop(held);
             w.executor.poll_once_for_test().await;
-            let after_first = w.executor.running_handles.read().await.len();
-            w.executor.poll_once_for_test().await;
-            let after_second = w.executor.running_handles.read().await.len();
-
-            let state = w.task().await;
+            w.wait_for_the_run_to_stop().await;
             assert_eq!(
-                after_first,
+                w.executions_of_task().await,
                 1,
-                "the first pass with a free permit starts the task; error {:?} status {:?} phase {:?} ready {} permits {}",
-                state.error_message,
-                state.status,
-                state.phase,
-                state.is_ready_to_execute(),
-                w.executor.reserved_permits.read().await.len()
+                "the first pass with a free permit starts the task: {:?}",
+                w.task().await
             );
-            assert_eq!(after_second, 1, "a second pass does not start it again");
+
+            w.executor.poll_once_for_test().await;
+
+            assert_eq!(
+                w.executions_of_task().await,
+                1,
+                "a second pass does not start it again"
+            );
             assert!(!w.task().await.is_ready_to_execute(), "the start was recorded");
         }
 
