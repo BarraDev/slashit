@@ -184,9 +184,7 @@ jobs:
         run: cargo test -p slashit-frontend
 
       - name: Install trunk
-        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
-        with:
-          version: latest
+        uses: ./.github/actions/install-trunk
 
       - name: Build frontend
         run: trunk build
@@ -251,9 +249,7 @@ jobs:
           shared-key: acceptance
 
       - name: Install trunk
-        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
-        with:
-          version: latest
+        uses: ./.github/actions/install-trunk
 
       - name: Install the Tauri CLI and tauri-driver
         uses: ./.github/actions/install-tauri-tools
@@ -278,7 +274,7 @@ jobs:
       # provider log, captured while the application was still alive.
       - name: Preserve failure evidence
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: acceptance-failure-artifacts-harness-attempt-${{ github.run_attempt }}
           path: target/acceptance
@@ -322,9 +318,7 @@ jobs:
           shared-key: acceptance
 
       - name: Install trunk
-        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
-        with:
-          version: latest
+        uses: ./.github/actions/install-trunk
 
       - name: Install the Tauri CLI and tauri-driver
         uses: ./.github/actions/install-tauri-tools
@@ -342,7 +336,7 @@ jobs:
       # overwrite each other's evidence.
       - name: Preserve failure evidence
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: acceptance-failure-artifacts-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: target/acceptance
@@ -378,6 +372,13 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # Runs the shared trunk installer on the platforms the release builds on,
+      # so a broken Windows or macOS install fails on a pull request rather than
+      # on the first tag. The installer checks the binary's version before it
+      # reports success.
+      - name: Install trunk
+        uses: ./.github/actions/install-trunk
 
       # `slashit-acceptance` is included on purpose even though its runtime is
       # Linux-only. Its portable half (the WebDriver assertions, the port
