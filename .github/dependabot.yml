@@ -1,6 +1,13 @@
 # Weekly update PRs for the GitHub Actions pins only. Pins stay full-length
 # commit SHAs; Dependabot moves the SHA and its same-line version comment
 # together. Nothing here merges automatically: every update waits for review.
+#
+# Grouping keeps the backlog small without mixing risks:
+# - All github/codeql-action/* components update in one PR, whatever the
+#   update type. codeql.yml pins init and analyze to the same version, so
+#   they must never be split across PRs.
+# - Minor and patch updates for the other actions share one weekly PR.
+# - Major updates are not grouped. Each one gets its own compatibility review.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -8,3 +15,15 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      codeql:
+        patterns:
+          - "github/codeql-action/*"
+      minor-and-patch:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "github/codeql-action/*"
+        update-types:
+          - minor
+          - patch
