@@ -1,0 +1,10 @@
+# Weekly update PRs for the GitHub Actions pins only. Pins stay full-length
+# commit SHAs; Dependabot moves the SHA and its same-line version comment
+# together. Nothing here merges automatically: every update waits for review.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
