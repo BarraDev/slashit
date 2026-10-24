@@ -15,7 +15,7 @@ use crate::components::task_live::{activity_from_event, changes_task_record, Act
 use crate::models::AgentEvent;
 use crate::services::task_run_service::{get_live_runs, listen_agent_events_with_ready};
 use crate::services::is_safe_link_destination;
-use crate::services::{reorder_task, queue_service, run_queued_task, RunNowOutcome, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
+use crate::services::{reorder_task, queue_service, promoted_message, run_queued_task, RunNowOutcome,get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
 
@@ -2076,7 +2076,7 @@ fn KanbanColumn(
                 // For drops into InProgress, check capacity first
                 if !is_same_column && new_status == TaskStatus::InProgress {
                     if let Ok(0) = queue_service::get_queue_capacity().await {
-                        toast::error("No capacity — queue is full. Move to Queue instead.".to_string());
+                        toast::error("No run slot is free, so the task was not moved to In Progress. Move it to Queue instead.".to_string());
                         return;
                     }
                 }
@@ -2782,8 +2782,8 @@ fn KanbanTaskCard(
                                         let task_title = task_title.clone();
                                         spawn_local(async move {
                                             match run_queued_task(task_id, TaskStatus::Queue).await {
-                                                Ok(RunNowOutcome::Started(_)) => {
-                                                    toast::success(format!("'{}' is running now", task_title));
+                                                Ok(RunNowOutcome::Promoted(task)) => {
+                                                    toast::success(promoted_message(&task.title));
                                                 }
                                                 // Nothing was changed; the task is
                                                 // wherever the fresh read puts it.

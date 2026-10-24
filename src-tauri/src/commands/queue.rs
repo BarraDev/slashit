@@ -1,7 +1,7 @@
 use crate::commands::gui_admission::GuiMutation;
 use crate::config::QueueConfig;
 use crate::domain::{Task, TaskStatus};
-use crate::queue::QueueManager;
+use crate::queue::{PromotionChoice, PromotionOutcome, QueueManager};
 use crate::commands::task::Tasks;
 use uuid::Uuid;
 use std::collections::HashMap;
@@ -214,22 +214,20 @@ pub async fn promote_next_task(
     // Promotion asks the executor to start the task, so it waits while new
     // work is paused for disk space; the task stays queued.
     state.start_guard.check().await.map_err(|block| block.to_string())?;
-    let manager = state.queue.manager.read().await;
-    let select = |tasks: &HashMap<Uuid, Task>| {
-        manager.select_promotable(tasks, |task| {
-            crate::queue::start_lease_admits(&state.storage, task)
-        })
-    };
-    let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
-        if let Some(task) = staged.get_mut(&task_id) {
-            QueueManager::apply_promotion(task);
+    let executor = state.executor.get().ok_or_else(|| NO_EXECUTOR_PROMOTION.to_string())?;
+    match executor.promote_queued(PromotionChoice::Next, |_, _| {}).await? {
+        PromotionOutcome::Promoted(task) => Ok(Some(task.id.to_string())),
+        PromotionOutcome::NothingEligible => Ok(None),
+        refused @ PromotionOutcome::NoCapacity => {
+            Err(executor.queued_promotion_refusal(None, &refused).await)
         }
-    };
-    let promoted =
-        crate::lifecycle::commit_selected(&state.task.tasks, &state.storage, select, amend)
-            .await?;
-    Ok(promoted.map(|task| task.id.to_string()))
+    }
 }
+
+/// The answer when no executor is running. Every promotion needs an admission
+/// permit from the executor, so without one nothing is promoted.
+pub(crate) const NO_EXECUTOR_PROMOTION: &str =
+    "The task executor is not running, so nothing was promoted.";
 
 #[tauri::command]
 pub async fn get_queue_capacity(
@@ -272,6 +270,7 @@ pub async fn run_queued_task(
     // space it is refused before anything is read or written, and the block
     // is what the user is shown.
     state.start_guard.check().await.map_err(|block| block.to_string())?;
+    let executor = state.executor.get().ok_or_else(|| NO_EXECUTOR_PROMOTION.to_string())?;
 
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
@@ -290,80 +289,20 @@ pub async fn run_queued_task(
         return Ok(state.task.tasks.read().await.get(&task_id).cloned());
     }
 
-    let manager = state.queue.manager.read().await;
-    let select = |tasks: &HashMap<Uuid, Task>| {
-        manager.select_exact(tasks, task_id, |task| {
-            crate::queue::start_lease_admits(&state.storage, task)
-        })
-    };
-    let amend = |staged: &mut HashMap<Uuid, Task>, promoted_id: Uuid| {
-        if let Some(task) = staged.get_mut(&promoted_id) {
-            QueueManager::apply_promotion(task);
-        }
-    };
-    let promoted =
-        crate::lifecycle::commit_selected(&state.task.tasks, &state.storage, select, amend).await?;
-    drop(manager);
-
-    match promoted {
-        Some(task) => Ok(Some(task)),
-        // Nothing to promote. The task may have been deleted in the race
-        // with the write, or it is still queued and one of the eligibility
-        // rules refused: say which, so the refusal is readable rather than
-        // a generic failure.
-        None => {
-            if !state.task.tasks.read().await.contains_key(&task_id) {
-                return Ok(None);
-            }
+    match executor.promote_queued(PromotionChoice::Exact(task_id), |_, _| {}).await? {
+        PromotionOutcome::Promoted(task) => Ok(Some(*task)),
+        // Nothing was written. The task may have been deleted or moved in the
+        // race before the write, so answer with where it stands; a task still
+        // queued is refused with the reason its promotion was refused.
+        refused => {
             let current = state.task.tasks.read().await.get(&task_id).cloned();
             match current {
-                Some(task) if task.status != TaskStatus::Queue => Ok(Some(task)),
-                Some(task) => {
-                    let manager = state.queue.manager.read().await;
-                    Err(run_queued_task_refusal(&manager, &state.storage, &task).await)
-                }
                 None => Ok(None),
+                Some(task) if task.status != TaskStatus::Queue => Ok(Some(task)),
+                Some(_) => Err(executor.queued_promotion_refusal(Some(task_id), &refused).await),
             }
         }
     }
-}
-
-/// Why one still-queued task was not promoted, as a user-readable reason.
-///
-/// Every rule here is one [`QueueManager::select_exact`] read, so the reason
-/// names what actually refused: capacity, an interrupted cleanup, an
-/// unfinished restack, or the task's provider lease still being held.
-async fn run_queued_task_refusal(
-    manager: &QueueManager,
-    storage: &crate::config::Storage,
-    task: &Task,
-) -> String {
-    if manager.get_in_progress_count().await >= manager.config().parallel_task_limit as usize {
-        return format!(
-            "The queue is at its parallel limit of {} running tasks, so '{}' was not promoted. \
-             Stop or finish a running task first, or raise the limit in the Queue settings.",
-            manager.config().parallel_task_limit, task.title
-        );
-    }
-    if task.cleanup_in_flight {
-        return format!(
-            "'{}' was not promoted: the cleanup of its Task Checkout was interrupted and \
-             needs attention before it can run.",
-            task.title
-        );
-    }
-    if let Some(reason) = task.republish_pending_refusal() {
-        return format!("'{}' was not promoted: {reason}", task.title);
-    }
-    if !crate::queue::start_lease_admits(storage, task) {
-        return format!(
-            "'{}' was not promoted: its Task Checkout's provider lease does not admit a \
-             start while an earlier provider may still be running; try again once it has \
-             ended.",
-            task.title
-        );
-    }
-    format!("'{}' was not promoted; nothing was changed.", task.title)
 }
 
 #[tauri::command]
@@ -987,6 +926,9 @@ mod run_queued_task {
     }
 
     fn app_with(state: crate::AppState) -> tauri::App<tauri::test::MockRuntime> {
+        // A promotion holds an admission permit from the executor, so the
+        // commands need one, as they do in the running application.
+        crate::test_helpers::attach_test_executor(&state);
         let app = tauri::test::mock_app();
         app.manage(state);
         app
@@ -1149,7 +1091,7 @@ mod run_queued_task {
         let mut queued = create_test_task_full("queued work", Uuid::new_v4(), TaskStatus::Queue, 0);
         queued.cleanup_in_flight = true;
 
-        let reason = run_queued_task_refusal(
+        let reason = crate::queue::queued_refusal_reason(
             &manager,
                 &crate::config::Storage::with_paths(crate::config::paths::AppPaths::with_roots(
                     std::path::PathBuf::from("unused-config-dir"),
@@ -1180,7 +1122,7 @@ mod run_queued_task {
             rewritten_tip: None,
         });
 
-        let reason = run_queued_task_refusal(
+        let reason = crate::queue::queued_refusal_reason(
             &manager,
                 &crate::config::Storage::with_paths(crate::config::paths::AppPaths::with_roots(
                     std::path::PathBuf::from("unused-config-dir"),

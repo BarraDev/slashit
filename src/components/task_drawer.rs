@@ -23,7 +23,7 @@ use crate::components::task_review::{AiReviewSection, HumanReviewPanel};
 use crate::components::toast;
 use crate::models::{AgentStatus, LogLevel, Task, TaskPhase, TaskRunSnapshot, TaskStatus};
 use crate::services::task_run_service::{get_task_run, listen_agent_events, stop_task_execution};
-use crate::services::{enqueue_task, get_task_diff, get_task_diff_stat, run_queued_task, EnqueueOutcome, RunNowOutcome};
+use crate::services::{enqueue_task, get_task_diff, get_task_diff_stat, promoted_message, run_queued_task, EnqueueOutcome, RunNowOutcome};
 
 /// The most output entries the drawer renders. The backend keeps more; this
 /// is "recent output", not a transcript.
@@ -242,8 +242,8 @@ pub fn TaskDrawer(
         set_run_now_pending.set(true);
         spawn_local(async move {
             match run_queued_task(task_id.to_string(), TaskStatus::Queue).await {
-                Ok(RunNowOutcome::Started(_)) => {
-                    toast::success("Task moved out of the queue; its run is starting.".to_string());
+                Ok(RunNowOutcome::Promoted(task)) => {
+                    toast::success(promoted_message(&task.title));
                 }
                 // Nothing was changed: show the task where it really is.
                 Ok(RunNowOutcome::NotQueued(current)) => {

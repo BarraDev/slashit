@@ -3,7 +3,7 @@ use leptos::callback::Callback;
 use leptos::task::spawn_local;
 use wasm_bindgen::JsCast;
 use crate::models::{Task, TaskStatus};
-use crate::services::{delete_task, enqueue_task, run_queued_task, reorder_task, create_pr, EnqueueOutcome, RunNowOutcome};
+use crate::services::{delete_task, enqueue_task, promoted_message, run_queued_task, reorder_task, create_pr, EnqueueOutcome, RunNowOutcome};
 use crate::components::kanban::column_title;
 use crate::components::toast;
 use uuid::Uuid;
@@ -117,18 +117,25 @@ pub fn TaskContextMenu(
     // Run now, for the task this menu was opened for, when it is queued. A
     // direct click, not a move-to, so running a queued task does not need
     // drag-and-drop or the nested submenu.
+    // Set while a Run now request is in flight, so a second click on the same
+    // open menu does not send a second request.
+    let run_now_pending = RwSignal::new(false);
     let on_run_now_click = {
         move |_: web_sys::MouseEvent| {
+            if run_now_pending.get_untracked() {
+                return;
+            }
             if let Some(t) = task.get() {
                 let task_clone = t.clone();
+                run_now_pending.set(true);
 
                 spawn_local(async move {
                     // The queue column is the column this menu showed the
                     // task in; a stale view is answered with the task as it
                     // is now, not with a second promotion.
                     match run_queued_task(task_clone.id.to_string(), task_clone.status.clone()).await {
-                        Ok(RunNowOutcome::Started(_)) => {
-                            toast::success(format!("'{}' is running now", task_clone.title));
+                        Ok(RunNowOutcome::Promoted(task)) => {
+                            toast::success(promoted_message(&task.title));
                             on_move.run((task_clone.clone(), TaskStatus::InProgress));
                             apply_task.run(task_clone);
                         }
@@ -144,6 +151,7 @@ pub fn TaskContextMenu(
                         Ok(RunNowOutcome::Missing) => toast::error("This task no longer exists".to_string()),
                         Err(e) => toast::error(format!("Could not run the task: {e}")),
                     }
+                    run_now_pending.set(false);
                     set_show.set(false);
                 });
             }
@@ -256,6 +264,7 @@ pub fn TaskContextMenu(
                             <button
                                 data-testid="task-menu-run-now"
                                 class="w-full px-3 py-2 text-left text-sm text-blue-300 hover:bg-white/10 flex items-center gap-2 transition-colors"
+                                disabled=move || run_now_pending.get()
                                 on:click=on_run_now_click
                             >
                                 <svg class="w-4 h-4 text-blue-400/70" fill="none" viewBox="0 0 24 24" stroke="currentColor">
