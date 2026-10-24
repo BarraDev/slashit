@@ -110,6 +110,49 @@ pub async fn bulk_add_to_queue(task_ids: Vec<String>) -> Result<(), String> {
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
+/// What became of a request to run a queued task now.
+#[derive(Debug, Clone)]
+pub enum RunNowOutcome {
+    /// The task was promoted out of the queue; the scheduler now starts its
+    /// run, exactly as it starts an auto-promoted one.
+    Started(Task),
+    /// The task was no longer in the queue, so nothing was changed: a previous
+    /// click may already have promoted it, or it was moved. This is the task
+    /// as it is now.
+    NotQueued(Task),
+    /// There is no such task.
+    Missing,
+}
+
+/// Run one exact queued task now, from the card, drawer or context menu.
+///
+/// `seen_in` must be the column the caller saw the task in, so a stale view is
+/// refused by the backend instead of promoting a task twice. A refusal the
+/// backend decides -- the queue is at capacity, the queue is paused for disk
+/// space, the task's provider lease is still held -- arrives as an `Err` with
+/// the backend's own reason.
+pub async fn run_queued_task(
+    task_id: String,
+    seen_in: TaskStatus,
+) -> Result<RunNowOutcome, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "taskId": task_id,
+        "expectedStatus": seen_in,
+    }))
+    .map_err(|e| e.to_string())?;
+    let value = try_invoke("run_queued_task", args)
+        .await
+        .map_err(|error| rejection_text(error, "run_queued_task"))?;
+    let answer: Option<Task> = serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())?;
+    // A Some answer whose status is still InProgress means the promotion went
+    // through; anything else is the task as it now stands.
+    Ok(match answer {
+        Some(task) if task.status == TaskStatus::InProgress => RunNowOutcome::Started(task),
+        Some(task) => RunNowOutcome::NotQueued(task),
+        None => RunNowOutcome::Missing,
+    })
+}
+
 pub async fn get_queue_capacity() -> Result<usize, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({})).unwrap();
     let response = invoke("get_queue_capacity", args).await;

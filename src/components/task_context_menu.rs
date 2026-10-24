@@ -3,7 +3,7 @@ use leptos::callback::Callback;
 use leptos::task::spawn_local;
 use wasm_bindgen::JsCast;
 use crate::models::{Task, TaskStatus};
-use crate::services::{delete_task, enqueue_task, reorder_task, create_pr, EnqueueOutcome};
+use crate::services::{delete_task, enqueue_task, run_queued_task, reorder_task, create_pr, EnqueueOutcome, RunNowOutcome};
 use crate::components::kanban::column_title;
 use crate::components::toast;
 use uuid::Uuid;
@@ -114,6 +114,42 @@ pub fn TaskContextMenu(
         }
     };
 
+    // Run now, for the task this menu was opened for, when it is queued. A
+    // direct click, not a move-to, so running a queued task does not need
+    // drag-and-drop or the nested submenu.
+    let on_run_now_click = {
+        move |_: web_sys::MouseEvent| {
+            if let Some(t) = task.get() {
+                let task_clone = t.clone();
+
+                spawn_local(async move {
+                    // The queue column is the column this menu showed the
+                    // task in; a stale view is answered with the task as it
+                    // is now, not with a second promotion.
+                    match run_queued_task(task_clone.id.to_string(), task_clone.status.clone()).await {
+                        Ok(RunNowOutcome::Started(_)) => {
+                            toast::success(format!("'{}' is running now", task_clone.title));
+                            on_move.run((task_clone.clone(), TaskStatus::InProgress));
+                            apply_task.run(task_clone);
+                        }
+                        // Nothing was changed: show the task where it really is.
+                        Ok(RunNowOutcome::NotQueued(current)) => {
+                            toast::info(format!(
+                                "'{}' is not in the queue; it is in {}",
+                                task_clone.title,
+                                column_title(&current.status)
+                            ));
+                            apply_task.run(current);
+                        }
+                        Ok(RunNowOutcome::Missing) => toast::error("This task no longer exists".to_string()),
+                        Err(e) => toast::error(format!("Could not run the task: {e}")),
+                    }
+                    set_show.set(false);
+                });
+            }
+        }
+    };
+
     let create_move_handler = move |status: TaskStatus| {
         let set_show = set_show;
         let on_move = on_move;
@@ -210,6 +246,26 @@ pub fn TaskContextMenu(
                     </svg>
                     "Add to Queue"
                 </button>
+
+                // Run now: only when the task this menu is about is queued.
+                {
+                    let on_run_now_click = on_run_now_click;
+                    move || {
+                        let is_queued = task.get().as_ref().is_some_and(|t| t.status == TaskStatus::Queue);
+                        is_queued.then(|| view! {
+                            <button
+                                data-testid="task-menu-run-now"
+                                class="w-full px-3 py-2 text-left text-sm text-blue-300 hover:bg-white/10 flex items-center gap-2 transition-colors"
+                                on:click=on_run_now_click
+                            >
+                                <svg class="w-4 h-4 text-blue-400/70" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 3l14 9-14 9V3z" />
+                                </svg>
+                                "Run now"
+                            </button>
+                        })
+                    }
+                }
 
                 // Move to submenu
                 <div 

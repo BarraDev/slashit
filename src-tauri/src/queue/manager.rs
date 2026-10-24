@@ -66,25 +66,8 @@ impl QueueManager {
 
         let queued_tasks: Vec<_> = tasks
             .values()
-            .filter(|t| t.status == TaskStatus::Queue)
-            // A task whose cleanup was interrupted cannot be executed -- see
-            // `TaskExecutor::is_pending` -- so promoting it would only park it
-            // in a column that claims it is running while nothing is. Worse,
-            // the promotion below clears `error_message`, which for a
-            // quarantined task is the one place the interrupted cleanup is
-            // explained to the user.
-            .filter(|t| !t.cleanup_in_flight)
-            // Likewise a task with an unfinished restack of its published
-            // branch (see `Task::republish_pending_refusal`): no agent may
-            // start for it, so promoting it would park it InProgress holding
-            // one of the parallel-limit slots while nothing runs.
-            .filter(|t| t.republish_pending_refusal().is_none())
-            // And a task that has checked out with no provider lease on disk:
-            // its start is refused for want of proof that no earlier provider
-            // is still running, so promoting it would park it the same way.
-            .filter(|t| lease_admits(t))
+            .filter(|t| Self::eligible_for_promotion(t, &lease_admits))
             .collect();
-
         if self.config.fifo_ordering {
             queued_tasks
                 .into_iter()
@@ -93,6 +76,61 @@ impl QueueManager {
         } else {
             queued_tasks.first().map(|t| t.id)
         }
+    }
+
+    /// The promotion filters one task must pass. Shared between
+    /// [`Self::select_promotable`]'s ordering pick and
+    /// [`Self::select_exact`], so an explicit "run now" cannot admit a task
+    /// the scheduler's own promotion would have refused.
+    pub(crate) fn eligible_for_promotion(
+        task: &Task,
+        lease_admits: &impl Fn(&Task) -> bool,
+    ) -> bool {
+        task.status == TaskStatus::Queue
+            // A task whose cleanup was interrupted cannot be executed -- see
+            // `TaskExecutor::is_pending` -- so promoting it would only park it
+            // in a column that claims it is running while nothing is. Worse,
+            // the promotion below clears `error_message`, which for a
+            // quarantined task is the one place the interrupted cleanup is
+            // explained to the user.
+            && !task.cleanup_in_flight
+            // Likewise a task with an unfinished restack of its published
+            // branch (see `Task::republish_pending_refusal`): no agent may
+            // start for it, so promoting it would park it InProgress holding
+            // one of the parallel-limit slots while nothing runs.
+            && task.republish_pending_refusal().is_none()
+            // And a task that has checked out with no provider lease on disk:
+            // its start is refused for want of proof that no earlier provider
+            // is still running, so promoting it would park it the same way.
+            && lease_admits(task)
+    }
+
+    /// Whether one exact named queued task may be promoted, asked by the
+    /// "run now" front door, which targets the task a person picked rather
+    /// than the queue's next pick.
+    ///
+    /// Pure, like [`Self::select_promotable`], and run under the same
+    /// write-lock hold `lifecycle::commit_selected` commits with, so the
+    /// capacity count and the task's fields cannot move between the check
+    /// and the promotion write.
+    pub(crate) fn select_exact(
+        &self,
+        tasks: &HashMap<Uuid, Task>,
+        task_id: Uuid,
+        lease_admits: impl Fn(&Task) -> bool,
+    ) -> Option<Uuid> {
+        let in_progress_count = tasks
+            .values()
+            .filter(|t| t.status == TaskStatus::InProgress)
+            .count();
+        if in_progress_count >= self.config.parallel_task_limit as usize {
+            return None;
+        }
+
+        tasks
+            .get(&task_id)
+            .filter(|t| Self::eligible_for_promotion(t, &lease_admits))
+            .map(|_| task_id)
     }
 
     /// The fields a promotion resets, applied by every caller of
