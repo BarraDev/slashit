@@ -1059,12 +1059,17 @@ mod run_queued_task {
         let space = tempfile::TempDir::new().expect("tempdir");
         let space_file = space.path().join("space");
         std::fs::write(&space_file, "1000000000 1\n").unwrap();
-        std::env::set_var(crate::queue::start_guard::DEBUG_DISK_SPACE_FILE, &space_file);
         let (_tmp, mut state) = test_state().await;
+        // The override is process-wide, so hold the shared environment lock
+        // from the set until the variable is removed again. It is taken after
+        // the state is built, so the lock is not held across that await.
+        let env_guard = crate::config::paths::ENV_LOCK.lock().await;
+        std::env::set_var(crate::queue::start_guard::DEBUG_DISK_SPACE_FILE, &space_file);
         state.start_guard = Arc::new(crate::queue::start_guard::StartGuard::for_data_dir(
             _tmp.path().join("data"),
         ));
         std::env::remove_var(crate::queue::start_guard::DEBUG_DISK_SPACE_FILE);
+        drop(env_guard);
         let project_id = Uuid::new_v4();
         let target = seed(&state, project_id, TaskStatus::Queue).await;
 
