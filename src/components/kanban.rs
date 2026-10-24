@@ -15,7 +15,7 @@ use crate::components::task_live::{activity_from_event, changes_task_record, Act
 use crate::models::AgentEvent;
 use crate::services::task_run_service::{get_live_runs, listen_agent_events_with_ready};
 use crate::services::is_safe_link_destination;
-use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
+use crate::services::{reorder_task, queue_service, promoted_message, run_queued_task, RunNowOutcome,get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
 
@@ -2076,7 +2076,7 @@ fn KanbanColumn(
                 // For drops into InProgress, check capacity first
                 if !is_same_column && new_status == TaskStatus::InProgress {
                     if let Ok(0) = queue_service::get_queue_capacity().await {
-                        toast::error("No capacity — queue is full. Move to Queue instead.".to_string());
+                        toast::error("No run slot is free, so the task was not moved to In Progress. Move it to Queue instead.".to_string());
                         return;
                     }
                 }
@@ -2749,6 +2749,68 @@ fn KanbanTaskCard(
                     </svg>
                 </button>
                 <TaskCard task=task.clone() activity=live_activity run=live_run />
+                // "Run now" for queued tasks: promote this exact card out of
+                // the queue without dragging it or opening the card's menu.
+                {
+                    let run_now_pending = RwSignal::new(false);
+                    // Copied out before the closure: `move` would otherwise take
+                    // `task`, and the card's later uses of it would not compile.
+                    let run_now_id = task.id.to_string();
+                    let run_now_title = task.title.clone();
+                    (column_status == TaskStatus::Queue).then(move || {
+                        // One request at a time: a repeated click before the
+                        // first promotion lands would be refused as stale by
+                        // the backend anyway, but not sent here at all is
+                        // cleaner.
+                        let pending = run_now_pending;
+                        let task_id = run_now_id;
+                        let task_title = run_now_title;
+                        view! {
+                            <div class="flex justify-end px-2 pb-1.5 -mt-1">
+                                <button
+                                    data-testid="task-card-run-now"
+                                    disabled=move || pending.get()
+                                    aria-busy=move || if pending.get() { "true" } else { "false" }
+                                    class="px-2 py-0.5 text-[10px] rounded bg-blue-500/10 text-blue-300 hover:bg-blue-500/20 transition-colors disabled:opacity-50"
+                                    on:click=move |e: web_sys::MouseEvent| {
+                                        e.stop_propagation();
+                                        if pending.get_untracked() {
+                                            return;
+                                        }
+                                        pending.set(true);
+                                        let task_id = task_id.clone();
+                                        let task_title = task_title.clone();
+                                        spawn_local(async move {
+                                            match run_queued_task(task_id, TaskStatus::Queue).await {
+                                                Ok(RunNowOutcome::Promoted(task)) => {
+                                                    toast::success(promoted_message(&task.title));
+                                                }
+                                                // Nothing was changed; the task is
+                                                // wherever the fresh read puts it.
+                                                Ok(RunNowOutcome::NotQueued(current)) => {
+                                                    toast::info(format!(
+                                                        "'{}' is not in the queue; it is in {}",
+                                                        task_title,
+                                                        column_title(&current.status)
+                                                    ));
+                                                }
+                                                Ok(RunNowOutcome::Missing) => {
+                                                    toast::error("This task no longer exists".to_string())
+                                                }
+                                                Err(e) => toast::error(format!("Could not run the task: {e}")),
+                                            }
+                                            refresh_tasks.try_run(());
+                                            pending.try_set(false);
+                                        });
+                                    }
+                                    title="Run this queued task now, instead of waiting for the queue's order"
+                                >
+                                    {move || if pending.get() { "Running…" } else { "Run now" }}
+                                </button>
+                            </div>
+                        }
+                    })
+                }
                 // "Diff" button for review/done statuses
                 {
                     let show_diff = matches!(

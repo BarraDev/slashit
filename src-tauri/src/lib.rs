@@ -483,6 +483,7 @@ pub fn run() {
             bulk_add_to_queue,
             get_queue_position,
             promote_next_task,
+            run_queued_task,
             get_queue_capacity,
             get_in_progress_count,
             requeue_task,

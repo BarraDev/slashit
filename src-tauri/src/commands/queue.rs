@@ -1,7 +1,7 @@
 use crate::commands::gui_admission::GuiMutation;
 use crate::config::QueueConfig;
-use crate::domain::Task;
-use crate::queue::QueueManager;
+use crate::domain::{Task, TaskStatus};
+use crate::queue::{PromotionChoice, PromotionOutcome, QueueManager};
 use crate::commands::task::Tasks;
 use uuid::Uuid;
 use std::collections::HashMap;
@@ -214,22 +214,20 @@ pub async fn promote_next_task(
     // Promotion asks the executor to start the task, so it waits while new
     // work is paused for disk space; the task stays queued.
     state.start_guard.check().await.map_err(|block| block.to_string())?;
-    let manager = state.queue.manager.read().await;
-    let select = |tasks: &HashMap<Uuid, Task>| {
-        manager.select_promotable(tasks, |task| {
-            crate::queue::start_lease_admits(&state.storage, task)
-        })
-    };
-    let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
-        if let Some(task) = staged.get_mut(&task_id) {
-            QueueManager::apply_promotion(task);
+    let executor = state.executor.get().ok_or_else(|| NO_EXECUTOR_PROMOTION.to_string())?;
+    match executor.promote_queued(PromotionChoice::Next, |_, _| {}).await? {
+        PromotionOutcome::Promoted(task) => Ok(Some(task.id.to_string())),
+        PromotionOutcome::NothingEligible => Ok(None),
+        refused @ PromotionOutcome::NoCapacity => {
+            Err(executor.queued_promotion_refusal(None, &refused).await)
         }
-    };
-    let promoted =
-        crate::lifecycle::commit_selected(&state.task.tasks, &state.storage, select, amend)
-            .await?;
-    Ok(promoted.map(|task| task.id.to_string()))
+    }
 }
+
+/// The answer when no executor is running. Every promotion needs an admission
+/// permit from the executor, so without one nothing is promoted.
+pub(crate) const NO_EXECUTOR_PROMOTION: &str =
+    "The task executor is not running, so nothing was promoted.";
 
 #[tauri::command]
 pub async fn get_queue_capacity(
@@ -237,6 +235,74 @@ pub async fn get_queue_capacity(
 ) -> Result<usize, String> {
     let manager = state.queue.manager.read().await;
     Ok(manager.get_capacity_available().await)
+}
+
+/// Run one exact queued task now, the "Run now" answer on a queued Task card,
+/// in its drawer and in its context menu.
+///
+/// The task named by `task_id` is promoted Queue → InProgress through the same
+/// durable select-under-the-write-lock, amend and commit the scheduler's
+/// automatic promotion and "promote next task" use
+/// ([`QueueManager::apply_promotion`] and [`crate::lifecycle::commit_selected`]),
+/// so the run that starts afterwards is the executor's own start path, and a
+/// promotion is durable exactly as their promotions are. Auto-promote is not
+/// consulted and not changed: the automatic poll still decides its own
+/// promotions, and turning it off stays off.
+///
+/// `expected_status` is the column the caller saw the task in. When given and
+/// the task is no longer in Queue, nothing is changed and the answer is the
+/// task as it now is, so a caller whose view is behind -- a previous click
+/// already promoted the task, or it was moved -- shows the task where it
+/// really stands instead of promoting a second time. The check runs under the
+/// task's lifecycle lease, so a promotion in flight is finished before this
+/// reads the answer. Repeated clicks are also guarded by the task's own
+/// status: only a task still in Queue can be promoted, so a second request
+/// writes nothing.
+#[tauri::command]
+pub async fn run_queued_task(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+    expected_status: Option<TaskStatus>,
+) -> Result<Option<Task>, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    // A run asks for a new execution; while new work is paused for disk
+    // space it is refused before anything is read or written, and the block
+    // is what the user is shown.
+    state.start_guard.check().await.map_err(|block| block.to_string())?;
+    let executor = state.executor.get().ok_or_else(|| NO_EXECUTOR_PROMOTION.to_string())?;
+
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+
+    // Read under the lease: whatever the caller saw may no longer be true.
+    let Some(task) = state.task.tasks.read().await.get(&task_id).cloned() else {
+        return Ok(None);
+    };
+    // A stale view: nothing was changed, and the task as it now stands is the
+    // answer. This is also the repeated click after a successful one: the
+    // task left Queue, so there is no second promotion to make.
+    if expected_status
+        .as_ref()
+        .is_some_and(|expected| *expected != task.status)
+        || task.status != TaskStatus::Queue
+    {
+        return Ok(state.task.tasks.read().await.get(&task_id).cloned());
+    }
+
+    match executor.promote_queued(PromotionChoice::Exact(task_id), |_, _| {}).await? {
+        PromotionOutcome::Promoted(task) => Ok(Some(*task)),
+        // Nothing was written. The task may have been deleted or moved in the
+        // race before the write, so answer with where it stands; a task still
+        // queued is refused with the reason its promotion was refused.
+        refused => {
+            let current = state.task.tasks.read().await.get(&task_id).cloned();
+            match current {
+                None => Ok(None),
+                Some(task) if task.status != TaskStatus::Queue => Ok(Some(task)),
+                Some(_) => Err(executor.queued_promotion_refusal(Some(task_id), &refused).await),
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -822,6 +888,258 @@ mod queue_settings {
         assert_eq!(config.parallel_task_limit, 1);
         assert!(!config.auto_promote, "repairing the limit must not re-enable promotion");
         assert!(!config.fifo_ordering);
+    }
+}
+
+/// The queue's manual "Run now": the promotion is durable, exact-task and
+/// refused with a reason, through the same lifecycle the scheduler's
+/// promotion uses.
+#[cfg(test)]
+mod run_queued_task {
+    use super::*;
+    use crate::domain::{TaskPhase, TaskStatus};
+    use crate::test_helpers::create_test_task_full;
+    use tauri::Manager;
+
+    async fn test_state() -> (tempfile::TempDir, crate::AppState) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _report) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state should build under a fresh tempdir");
+        (tmp, state)
+    }
+
+    async fn seed(state: &crate::AppState, project_id: Uuid, status: TaskStatus) -> Task {
+        let task = create_test_task_full("queued work", project_id, status, 0);
+        state.task.tasks.write().await.insert(task.id, task.clone());
+        state
+            .storage
+            .save_project_tasks(project_id, std::slice::from_ref(&task))
+            .expect("seed the board");
+        task
+    }
+
+    fn app_with(state: crate::AppState) -> tauri::App<tauri::test::MockRuntime> {
+        // A promotion holds an admission permit from the executor, so the
+        // commands need one, as they do in the running application.
+        crate::test_helpers::attach_test_executor(&state);
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        app
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_click_promotes_the_selected_queued_task_exactly() {
+        let (_tmp, state) = test_state().await;
+        let project_id = Uuid::new_v4();
+        let target = seed(&state, project_id, TaskStatus::Queue).await;
+        let other = seed(&state, project_id, TaskStatus::Queue).await;
+        let app = app_with(state);
+
+        let answer = run_queued_task(
+            GuiMutation::untracked(),
+            app.state(),
+            target.id.to_string(),
+            Some(TaskStatus::Queue),
+        )
+        .await
+        .expect("promote");
+
+        let promoted = answer.expect("the promoted record");
+        assert_eq!(promoted.id, target.id);
+        assert_eq!(promoted.status, TaskStatus::InProgress);
+        // Only the selected task moved: not a listed field is reset except
+        // what the promotion resets, and the queue's next pick is untouched.
+        let live: &crate::AppState = app.state::<crate::AppState>().inner();
+        let tasks = live.task.tasks.read().await;
+        assert_eq!(tasks[&other.id].status, TaskStatus::Queue);
+        assert_eq!(promoted.phase, TaskPhase::Idle);
+        assert_eq!(promoted.phase_progress, 0);
+        assert_eq!(promoted.overall_progress, 0);
+        assert_eq!(promoted.error_message, None);
+        // The promotion was durably written, not only published to memory.
+        let board: Vec<Task> = live
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board file");
+        let on_disk = board.iter().find(|t| t.id == target.id).expect("the task");
+        assert_eq!(on_disk.status, TaskStatus::InProgress);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_click_after_a_successful_one_promotes_nothing_again() {
+        let (_tmp, state) = test_state().await;
+        let project_id = Uuid::new_v4();
+        let target = seed(&state, project_id, TaskStatus::Queue).await;
+        let app = app_with(state);
+
+        run_queued_task(
+            GuiMutation::untracked(),
+            app.state(),
+            target.id.to_string(),
+            Some(TaskStatus::Queue),
+        )
+        .await
+        .expect("the first promotion");
+
+        // The second click arrives with the stale (still queued) view the
+        // first click was made from.
+        let second = run_queued_task(
+            GuiMutation::untracked(),
+            app.state(),
+            target.id.to_string(),
+            Some(TaskStatus::Queue),
+        )
+        .await
+        .expect("the repeated click is answered, not failed");
+
+        assert_eq!(second.expect("the task as it now stands").status, TaskStatus::InProgress);
+        let tasks = app.state::<crate::AppState>().inner().task.tasks.read().await;
+        assert_eq!(tasks[&target.id].status, TaskStatus::InProgress);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_click_on_a_task_that_has_moved_queues_nothing_and_shows_where_it_is() {
+        let (_tmp, state) = test_state().await;
+        let project_id = Uuid::new_v4();
+        let target = seed(&state, project_id, TaskStatus::Backlog).await;
+        let app = app_with(state);
+
+        let answer = run_queued_task(
+            GuiMutation::untracked(),
+            app.state(),
+            target.id.to_string(),
+            Some(TaskStatus::Queue),
+        )
+        .await
+        .expect("answered with the task as it is");
+
+        assert_eq!(answer.expect("task").status, TaskStatus::Backlog);
+        let tasks = app.state::<crate::AppState>().inner().task.tasks.read().await;
+        assert_eq!(tasks[&target.id].status, TaskStatus::Backlog);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_queue_refuses_the_click_and_names_the_parallel_limit() {
+        let (_tmp, state) = test_state().await;
+        let project_id = Uuid::new_v4();
+        let target = seed(&state, project_id, TaskStatus::Queue).await;
+        for _ in 0..3 {
+            seed(&state, project_id, TaskStatus::InProgress).await;
+        }
+        let app = app_with(state);
+        let live: &crate::AppState = app.state::<crate::AppState>().inner();
+        assert_eq!(live.queue.manager.read().await.get_in_progress_count().await, 3);
+
+        let error = run_queued_task(
+            GuiMutation::untracked(),
+            app.state(),
+            target.id.to_string(),
+            Some(TaskStatus::Queue),
+        )
+        .await
+        .expect_err("the queue is full");
+
+        assert!(error.contains("parallel limit of 3"), "{error}");
+        assert_eq!(live.task.tasks.read().await[&target.id].status, TaskStatus::Queue);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_click_while_new_work_is_paused_for_disk_space_names_the_block() {
+        // Debug builds only; the desktop acceptance journeys use the same
+        // override. Test builds replace the application's guard with
+        // `plenty_of_disk()` in `build_state_with_paths`, so this test installs
+        // the debug-override guard itself, after the variable is set.
+        let space = tempfile::TempDir::new().expect("tempdir");
+        let space_file = space.path().join("space");
+        std::fs::write(&space_file, "1000000000 1\n").unwrap();
+        let (_tmp, mut state) = test_state().await;
+        // The override is process-wide, so hold the shared environment lock
+        // from the set until the variable is removed again. It is taken after
+        // the state is built, so the lock is not held across that await.
+        let env_guard = crate::config::paths::ENV_LOCK.lock().await;
+        std::env::set_var(crate::queue::start_guard::DEBUG_DISK_SPACE_FILE, &space_file);
+        state.start_guard = Arc::new(crate::queue::start_guard::StartGuard::for_data_dir(
+            _tmp.path().join("data"),
+        ));
+        std::env::remove_var(crate::queue::start_guard::DEBUG_DISK_SPACE_FILE);
+        drop(env_guard);
+        let project_id = Uuid::new_v4();
+        let target = seed(&state, project_id, TaskStatus::Queue).await;
+
+        let app = app_with(state);
+        let live: &crate::AppState = app.state::<crate::AppState>().inner();
+        let error = run_queued_task(
+            GuiMutation::untracked(),
+            app.state(),
+            target.id.to_string(),
+            Some(TaskStatus::Queue),
+        )
+        .await
+        .expect_err("the paused board refuses the click");
+
+        assert!(error.contains("New work paused") || error.to_lowercase().contains("disk"), "{error}");
+        // Nothing was promoted: the guard runs before anything is read.
+        assert_eq!(live.task.tasks.read().await[&target.id].status, TaskStatus::Queue);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_cleanup_is_named_as_the_refusal() {
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::new()));
+        let manager = QueueManager::with_config(tasks);
+        let mut queued = create_test_task_full("queued work", Uuid::new_v4(), TaskStatus::Queue, 0);
+        queued.cleanup_in_flight = true;
+
+        let reason = crate::queue::queued_refusal_reason(
+            &manager,
+                &crate::config::Storage::with_paths(crate::config::paths::AppPaths::with_roots(
+                    std::path::PathBuf::from("unused-config-dir"),
+                    std::path::PathBuf::from("unused-data-dir"),
+                    std::path::PathBuf::from("unused-cache-dir"),
+                    std::path::PathBuf::from("unused-runtime-dir"),
+                )),
+                &queued,
+            )
+            .await;
+
+        assert!(reason.contains("the cleanup of its Task Checkout was interrupted"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_restack_is_named_as_the_refusal() {
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::new()));
+        let manager = QueueManager::with_config(tasks);
+        let mut queued = create_test_task_full("queued work", Uuid::new_v4(), TaskStatus::Queue, 0);
+        queued.pending_republish = Some(crate::domain::PendingRepublish {
+            parent_branch: "p".to_string(),
+            parent_pr: 1,
+            pr_number: Some(2),
+            default_branch: "main".to_string(),
+            fork_point: "a".repeat(40),
+            previous_tip: "b".repeat(40),
+            onto: "c".repeat(40),
+            rewritten_tip: None,
+        });
+
+        let reason = crate::queue::queued_refusal_reason(
+            &manager,
+                &crate::config::Storage::with_paths(crate::config::paths::AppPaths::with_roots(
+                    std::path::PathBuf::from("unused-config-dir"),
+                    std::path::PathBuf::from("unused-data-dir"),
+                    std::path::PathBuf::from("unused-cache-dir"),
+                    std::path::PathBuf::from("unused-runtime-dir"),
+                )),
+                &queued,
+            )
+            .await;
+
+        assert!(reason.contains("restack"), "{reason}");
     }
 }
 

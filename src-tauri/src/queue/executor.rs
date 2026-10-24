@@ -578,6 +578,63 @@ pub(crate) fn task_provider_lease_path(storage: &crate::config::Storage, task_id
         .join(format!("{task_id}.lock"))
 }
 
+/// Why one still-queued Task was not promoted, as a sentence a person can act
+/// on. Every rule here is one the promotion read, so the reason names what
+/// refused: capacity by count, an interrupted cleanup, an unfinished restack,
+/// or the Task's provider lease still being held.
+pub(crate) async fn queued_refusal_reason(
+    manager: &QueueManager,
+    storage: &crate::config::Storage,
+    task: &Task,
+) -> String {
+    let title = task.title.as_str();
+    let limit = manager.config().parallel_task_limit;
+    if manager.get_in_progress_count().await >= limit as usize {
+        return format!(
+            "The queue is at its parallel limit of {limit} running tasks, so '{title}' was \
+             not promoted. Stop or finish a running task first, or raise the limit in the \
+             Queue settings."
+        );
+    }
+    if task.cleanup_in_flight {
+        return format!(
+            "'{title}' was not promoted: the cleanup of its Task Checkout was interrupted and \
+             needs attention before it can run."
+        );
+    }
+    if let Some(reason) = task.republish_pending_refusal() {
+        return format!("'{title}' was not promoted: {reason}");
+    }
+    if !start_lease_admits(storage, task) {
+        return format!(
+            "'{title}' was not promoted: its Task Checkout's provider lease does not admit a \
+             start while an earlier provider may still be running; try again once it has \
+             ended."
+        );
+    }
+    format!("'{title}' was not promoted; nothing was changed.")
+}
+
+/// Which queued Task a promotion asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromotionChoice {
+    /// The scheduler's own pick: the eligible Task it would start next.
+    Next,
+    /// One Task a person chose.
+    Exact(Uuid),
+}
+
+/// What a [`TaskExecutor::promote_queued`] call did. Only `Promoted` writes.
+pub(crate) enum PromotionOutcome {
+    /// The Task is durably In Progress and holds a reserved admission permit.
+    /// Its run starts on a later executor pass, which can still decline.
+    Promoted(Box<Task>),
+    /// Every admission permit is in use by running work or AI review.
+    NoCapacity,
+    /// No queued Task passed the promotion rules. Nothing was written.
+    NothingEligible,
+}
+
 /// Whether a queued Task may be promoted without taking a parallel slot it
 /// could not use. Where leases exist, a Task with no lease file needs
 /// `never_checked_out`, and one whose lease record already shows a live group or
@@ -2196,6 +2253,97 @@ impl TaskExecutor {
         self.admission.reconcile(limit).await;
     }
 
+    /// Promote one queued Task to In Progress, backed by an admission permit.
+    ///
+    /// This is the one path that moves a Task from Queue to In Progress on
+    /// its own authority. The scheduler's pick, "run now", "promote next" and
+    /// the manual status moves all come through here, so none of them can
+    /// publish a Task as executable without capacity for it.
+    ///
+    /// The order is the invariant. Capacity is reconciled, then one permit is
+    /// taken from [`Self::admission`] before any write. The write selects
+    /// under the tasks write lock, so the persisted count and the eligibility
+    /// rules are read as they are written. On success the permit moves into
+    /// [`Self::reserved_permits`]. That hand-off happens under the
+    /// reservations lock, which is held across the write, so a poll pass
+    /// never sees the promoted Task without its reservation. A refusal, or a
+    /// failed write, drops the permit and returns its capacity.
+    ///
+    /// `amend_extra` runs inside the same write, after the promotion, for
+    /// fields the caller also changes (a drop position, for example).
+    ///
+    /// `Promoted` does not promise a start. The run begins on a later pass,
+    /// and that pass can still decline for disk space or a provider lease.
+    pub(crate) async fn promote_queued(
+        &self,
+        choice: PromotionChoice,
+        amend_extra: impl FnOnce(&mut HashMap<Uuid, Task>, Uuid),
+    ) -> Result<PromotionOutcome, String> {
+        self.reconcile_admission().await;
+        let Some(permit) = self.admission.try_acquire() else {
+            return Ok(PromotionOutcome::NoCapacity);
+        };
+
+        let mut reserved = self.reserved_permits.write().await;
+        let manager = self.queue_manager.read().await;
+        let select = |tasks: &HashMap<Uuid, Task>| match choice {
+            PromotionChoice::Next => manager
+                .select_promotable(tasks, |task| start_lease_admits(&self.storage, task)),
+            PromotionChoice::Exact(task_id) => manager
+                .select_exact(tasks, task_id, |task| start_lease_admits(&self.storage, task)),
+        };
+        let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
+            if let Some(task) = staged.get_mut(&task_id) {
+                QueueManager::apply_promotion(task);
+            }
+            amend_extra(staged, task_id);
+        };
+        let promoted =
+            crate::lifecycle::commit_selected(&self.tasks, &self.storage, select, amend).await;
+        drop(manager);
+
+        match promoted? {
+            Some(task) => {
+                reserved.insert(task.id, permit);
+                Ok(PromotionOutcome::Promoted(Box::new(task)))
+            }
+            None => Ok(PromotionOutcome::NothingEligible),
+        }
+    }
+
+    /// Why [`Self::promote_queued`] promoted nothing, in words a person can
+    /// act on. `task_id` names the Task an exact request was for. Read after a
+    /// refusal; nothing is written here.
+    pub(crate) async fn queued_promotion_refusal(
+        &self,
+        task_id: Option<Uuid>,
+        outcome: &PromotionOutcome,
+    ) -> String {
+        let manager = self.queue_manager.read().await;
+        let limit = manager.config().parallel_task_limit;
+        let task = match task_id {
+            Some(id) => self.tasks.read().await.get(&id).cloned(),
+            None => None,
+        };
+        if matches!(outcome, PromotionOutcome::NoCapacity) {
+            let subject = task
+                .as_ref()
+                .map_or("the queued Task".to_string(), |t| format!("'{}'", t.title));
+            return format!(
+                "All {limit} run slots are in use by running work or AI review, so {subject} was \
+                 not promoted. Try again when one finishes, or raise the parallel limit in the \
+                 Queue settings."
+            );
+        }
+        let Some(task) = task else {
+            return match task_id {
+                Some(id) => format!("Task {id} no longer exists, so nothing was promoted."),
+                None => "No queued Task was promoted; nothing was changed.".to_string(),
+            };
+        };
+        queued_refusal_reason(&manager, &self.storage, &task).await
+    }
+
     /// Whether the poller should start this task on this pass.
     ///
     /// Delegates to [`Task::is_ready_to_execute`] rather than keeping its own
@@ -2431,51 +2579,22 @@ impl TaskExecutor {
             && self.start_guard.check().await.is_ok();
         if auto_promote {
             loop {
-                let Some(permit) = self.admission.try_acquire() else {
-                    break; // no capacity left to reserve; try again next pass
-                };
-
-                let manager = self.queue_manager.read().await;
-                let select = |tasks: &HashMap<Uuid, Task>| {
-                    manager.select_promotable(tasks, |task| start_lease_admits(&self.storage, task))
-                };
-                let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
-                    if let Some(task) = staged.get_mut(&task_id) {
-                        QueueManager::apply_promotion(task);
-                    }
-                };
-                let promoted =
-                    crate::lifecycle::commit_selected(&self.tasks, &self.storage, select, amend)
-                        .await;
-                drop(manager);
-
-                match promoted {
-                    Ok(Some(task)) => {
-                        // Transferred, not dropped: the reservation now
-                        // belongs to this task until its execution starts
-                        // and takes it over (`spawn_task_execution`) or the
-                        // task is pruned from `pending` below without ever
-                        // starting.
-                        self.reserved_permits.write().await.insert(task.id, permit);
+                // Each promotion reserves its own permit inside
+                // `promote_queued`. Any refusal, including a failed write,
+                // returns the capacity it took and stops this pass: a
+                // durably broken write is not retried every poll tick.
+                match self.promote_queued(PromotionChoice::Next, |_, _| {}).await {
+                    Ok(PromotionOutcome::Promoted(task)) => {
                         self.events.agent_event(AgentEvent::Log {
                             task_id: task.id.to_string(),
                             level: LogLevel::Info,
-                            message: "Auto-promoted from queue".to_string(),
+                            message: "Moved from Queue to In Progress; the run starts when the executor can take it".to_string(),
                         });
                     }
-                    // Nothing eligible: the reservation is rescinded simply
-                    // by letting `permit` drop here, cleanly returning the
-                    // capacity nothing used.
-                    Ok(None) => break,
+                    Ok(PromotionOutcome::NoCapacity | PromotionOutcome::NothingEligible) => {
+                        break;
+                    }
                     Err(e) => {
-                        // Nothing was promoted: `commit_selected` never
-                        // publishes to the shared map unless the disk write
-                        // it depends on already succeeded, so `permit`
-                        // dropping here is the same clean rescission as the
-                        // `Ok(None)` arm. Stopping here rather than retrying
-                        // immediately avoids spinning against a durably
-                        // broken write on every poll tick; the next tick
-                        // tries again from the same truthful state.
                         eprintln!("[executor] auto-promotion did not persist: {e}");
                         break;
                     }
@@ -2483,27 +2602,31 @@ impl TaskExecutor {
             }
         }
 
-        // Find InProgress tasks that haven't started execution yet.
+        // Find InProgress tasks that haven't started execution yet, and return
+        // any reservation whose task is no longer pending (deleted, moved
+        // again, or otherwise never going to start): dropping the removed
+        // permit is what gives its capacity back.
+        //
+        // Both happen under one `reserved_permits` write lock. `promote_queued`
+        // writes a Task and inserts its reservation under that lock, so a
+        // snapshot taken outside it could miss a Task a command has promoted
+        // in the meantime. The sweep would then drop that Task's fresh
+        // reservation while the Task is still InProgress. Lock order is
+        // reservations, then tasks, as in `promote_queued`.
         let pending: Vec<Uuid> = {
-            let tasks = self.tasks.read().await;
-            tasks
-                .values()
-                .filter(|t| Self::is_pending(t))
-                .map(|t| t.id)
-                .collect()
-        };
-
-        // Any reservation whose task is no longer pending (deleted, moved
-        // again, or otherwise never going to start) is returned here rather
-        // than held forever: dropping the removed permit is what gives its
-        // capacity back.
-        {
+            let mut reserved = self.reserved_permits.write().await;
+            let pending: Vec<Uuid> = {
+                let tasks = self.tasks.read().await;
+                tasks
+                    .values()
+                    .filter(|t| Self::is_pending(t))
+                    .map(|t| t.id)
+                    .collect()
+            };
             let pending_set: std::collections::HashSet<Uuid> = pending.iter().copied().collect();
-            self.reserved_permits
-                .write()
-                .await
-                .retain(|task_id, _| pending_set.contains(task_id));
-        }
+            reserved.retain(|task_id, _| pending_set.contains(task_id));
+            pending
+        };
 
         for task_id in pending {
             // A reservation taken at promotion time is transferred straight
@@ -16786,6 +16909,288 @@ mod tests {
     // PATH mutations under default parallel `cargo test`; see
     // `test_helpers::PATH_LOCK`'s doc comment for the corrective-pass
     // evidence that this actually raced.
+    /// Queue -> In Progress promotion and the admission it takes. The
+    /// invariant under test: a Task is durably In Progress only while the
+    /// permit that backs its run is held, and every refusal or failed write
+    /// returns that permit.
+    mod queued_promotion {
+        use super::*;
+        use crate::queue::{PromotionChoice, PromotionOutcome};
+
+        async fn limit_of(executor: &TaskExecutor, limit: u32) {
+            executor
+                .queue_manager
+                .write()
+                .await
+                .set_config(crate::config::queue::QueueConfig {
+                    parallel_task_limit: limit,
+                    ..Default::default()
+                })
+                .await;
+            executor.reconcile_admission().await;
+        }
+
+        async fn seed(executor: &TaskExecutor, status: TaskStatus, title: &str) -> Uuid {
+            let task = create_test_task_full(title, Uuid::new_v4(), status, 0);
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+            task_id
+        }
+
+        async fn status_of(executor: &TaskExecutor, task_id: Uuid) -> TaskStatus {
+            executor.tasks.read().await[&task_id].status.clone()
+        }
+
+        /// Capacity nothing holds right now, read by taking it.
+        async fn free_permits(executor: &TaskExecutor) -> usize {
+            let mut held = Vec::new();
+            while let Some(permit) = executor.admission.try_acquire() {
+                held.push(permit);
+            }
+            held.len()
+        }
+
+        #[tokio::test]
+        async fn a_promotion_holds_a_permit_for_the_task_it_promotes() {
+            let (executor, _temps) = test_executor();
+            limit_of(&executor, 2).await;
+            let task_id = seed(&executor, TaskStatus::Queue, "promoted").await;
+
+            let outcome = executor
+                .promote_queued(PromotionChoice::Exact(task_id), |_, _| {})
+                .await
+                .expect("the promotion is written");
+
+            assert!(matches!(outcome, PromotionOutcome::Promoted(ref t) if t.id == task_id));
+            assert_eq!(status_of(&executor, task_id).await, TaskStatus::InProgress);
+            assert!(executor.reserved_permits.read().await.contains_key(&task_id));
+            assert_eq!(free_permits(&executor).await, 1, "one of two slots is backing the run");
+        }
+
+        #[tokio::test]
+        async fn every_admission_permit_already_reserved_refuses_and_writes_nothing() {
+            let (executor, _temps) = test_executor();
+            limit_of(&executor, 1).await;
+            let _held = executor.admission.try_acquire().expect("setup: one slot");
+            let queued = seed(&executor, TaskStatus::Queue, "waiting").await;
+
+            for choice in [PromotionChoice::Next, PromotionChoice::Exact(queued)] {
+                let outcome = executor.promote_queued(choice, |_, _| {}).await.unwrap();
+                assert!(matches!(outcome, PromotionOutcome::NoCapacity), "{choice:?}");
+            }
+
+            assert_eq!(status_of(&executor, queued).await, TaskStatus::Queue);
+            assert!(executor.reserved_permits.read().await.is_empty());
+            let reason = executor
+                .queued_promotion_refusal(Some(queued), &PromotionOutcome::NoCapacity)
+                .await;
+            assert!(reason.contains("run slots are in use"), "{reason}");
+        }
+
+        #[tokio::test]
+        async fn a_full_parallel_limit_refuses_and_returns_the_permit() {
+            let (executor, _temps) = test_executor();
+            limit_of(&executor, 2).await;
+            seed(&executor, TaskStatus::InProgress, "running a").await;
+            seed(&executor, TaskStatus::InProgress, "running b").await;
+            let queued = seed(&executor, TaskStatus::Queue, "waiting").await;
+
+            let outcome = executor
+                .promote_queued(PromotionChoice::Exact(queued), |_, _| {})
+                .await
+                .unwrap();
+
+            assert!(matches!(outcome, PromotionOutcome::NothingEligible));
+            assert_eq!(status_of(&executor, queued).await, TaskStatus::Queue);
+            assert_eq!(free_permits(&executor).await, 2, "the refused promotion gave its permit back");
+            let reason = executor
+                .queued_promotion_refusal(Some(queued), &outcome)
+                .await;
+            assert!(reason.contains("parallel limit of 2"), "{reason}");
+        }
+
+        #[tokio::test]
+        async fn two_concurrent_manual_starts_promote_at_most_the_limit() {
+            let (executor, _temps) = test_executor();
+            limit_of(&executor, 1).await;
+            let first = seed(&executor, TaskStatus::Queue, "first").await;
+            let second = seed(&executor, TaskStatus::Queue, "second").await;
+
+            let (a, b) = tokio::join!(
+                executor.promote_queued(PromotionChoice::Exact(first), |_, _| {}),
+                executor.promote_queued(PromotionChoice::Exact(second), |_, _| {}),
+            );
+            let promoted = [a.unwrap(), b.unwrap()]
+                .into_iter()
+                .filter(|o| matches!(o, PromotionOutcome::Promoted(_)))
+                .count();
+
+            assert_eq!(promoted, 1, "a limit of one admits one manual start");
+            let in_progress = [first, second]
+                .iter()
+                .filter(|id| executor.tasks.try_read().unwrap()[id].status == TaskStatus::InProgress)
+                .count();
+            assert_eq!(in_progress, 1);
+        }
+
+        #[tokio::test]
+        async fn a_manual_start_and_the_scheduler_racing_never_exceed_the_limit() {
+            let (executor, _temps) = test_executor();
+            limit_of(&executor, 2).await;
+            let a = seed(&executor, TaskStatus::Queue, "a").await;
+            let b = seed(&executor, TaskStatus::Queue, "b").await;
+            let c = seed(&executor, TaskStatus::Queue, "c").await;
+
+            let (x, y, z) = tokio::join!(
+                executor.promote_queued(PromotionChoice::Next, |_, _| {}),
+                executor.promote_queued(PromotionChoice::Next, |_, _| {}),
+                executor.promote_queued(PromotionChoice::Exact(c), |_, _| {}),
+            );
+            let promoted = [x.unwrap(), y.unwrap(), z.unwrap()]
+                .into_iter()
+                .filter(|o| matches!(o, PromotionOutcome::Promoted(_)))
+                .count();
+
+            assert_eq!(promoted, 2, "exactly the limit is promoted");
+            let tasks = executor.tasks.read().await;
+            let in_progress = [a, b, c]
+                .iter()
+                .filter(|id| tasks[id].status == TaskStatus::InProgress)
+                .count();
+            assert_eq!(in_progress, 2);
+            drop(tasks);
+            assert_eq!(executor.reserved_permits.read().await.len(), 2);
+            assert_eq!(free_permits(&executor).await, 0);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_failed_durable_write_returns_the_permit_and_changes_nothing() {
+            let (executor, _temps) = test_executor();
+            limit_of(&executor, 1).await;
+            let task_id = seed(&executor, TaskStatus::Queue, "unsaved").await;
+            // Both roots the board can be written under: neither accepts a
+            // new file, so the write fails through the ordinary path.
+            let Some(_config) =
+                crate::test_helpers::UnwritableDir::new(executor.storage.paths().config_dir())
+            else {
+                eprintln!("skipped: this user can write read-only directories");
+                return;
+            };
+            let Some(_data) =
+                crate::test_helpers::UnwritableDir::new(executor.storage.paths().data_dir())
+            else {
+                eprintln!("skipped: this user can write read-only directories");
+                return;
+            };
+
+            let result = executor
+                .promote_queued(PromotionChoice::Exact(task_id), |_, _| {})
+                .await;
+
+            assert!(result.is_err(), "a failed write is reported");
+            assert_eq!(status_of(&executor, task_id).await, TaskStatus::Queue);
+            assert!(executor.reserved_permits.read().await.is_empty());
+            assert_eq!(free_permits(&executor).await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_cancelled_promotion_returns_the_permit_it_had_taken() {
+            let (executor, _temps) = test_executor();
+            limit_of(&executor, 1).await;
+            let task_id = seed(&executor, TaskStatus::Queue, "cancelled").await;
+            // Hold the reservations lock so the promotion parks after it has
+            // taken its permit, then cancel it there.
+            let blocker = executor.reserved_permits.write().await;
+            let promoting = {
+                let executor = executor.clone();
+                tokio::spawn(async move {
+                    executor
+                        .promote_queued(PromotionChoice::Exact(task_id), |_, _| {})
+                        .await
+                })
+            };
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            promoting.abort();
+            let _ = promoting.await;
+            drop(blocker);
+
+            assert_eq!(status_of(&executor, task_id).await, TaskStatus::Queue);
+            assert_eq!(free_permits(&executor).await, 1, "the cancelled promotion released its permit");
+        }
+
+        #[tokio::test]
+        async fn a_reserved_task_that_leaves_the_queue_gives_its_permit_back_on_the_next_pass() {
+            let (executor, _temps) = test_executor();
+            limit_of(&executor, 1).await;
+            let task_id = seed(&executor, TaskStatus::Queue, "moved away").await;
+            executor
+                .promote_queued(PromotionChoice::Exact(task_id), |_, _| {})
+                .await
+                .unwrap();
+            executor.tasks.write().await.get_mut(&task_id).unwrap().status = TaskStatus::Backlog;
+
+            executor.check_and_execute().await;
+
+            assert!(executor.reserved_permits.read().await.is_empty());
+            assert_eq!(free_permits(&executor).await, 1);
+        }
+
+        #[tokio::test]
+        async fn a_promoted_task_with_no_execution_after_restart_draws_its_own_permit() {
+            let (executor, _temps) = test_executor();
+            limit_of(&executor, 1).await;
+            // In Progress and idle on disk, with no reservation: what a restart
+            // leaves. Idle is what makes it pending for the next pass.
+            let mut task = create_test_task_full("after restart", Uuid::new_v4(), TaskStatus::InProgress, 0);
+            task.phase = TaskPhase::Idle;
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+
+            executor.check_and_execute().await;
+
+            assert!(
+                executor.reserved_permits.read().await.is_empty(),
+                "a restart holds no reservation to hand over"
+            );
+            let tasks = executor.tasks.read().await;
+            let task = &tasks[&task_id];
+            assert!(
+                executor.is_task_running(task_id).await || task.error_message.is_some(),
+                "the task is started or says why it was not, never left silent"
+            );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_provider_lease_that_forbids_a_start_leaves_the_task_queued() {
+            let (executor, _temps) = test_executor();
+            limit_of(&executor, 1).await;
+            let task_id = seed(&executor, TaskStatus::Queue, "leased").await;
+            // A spawn mark that a provider may still be behind: the record is
+            // not a process group id, so absence cannot be shown.
+            let lease = task_provider_lease_path(&executor.storage, task_id);
+            std::fs::create_dir_all(lease.parent().unwrap()).unwrap();
+            std::fs::write(&lease, "spawning\n").unwrap();
+
+            let outcome = executor
+                .promote_queued(PromotionChoice::Exact(task_id), |_, _| {})
+                .await
+                .unwrap();
+
+            assert!(matches!(outcome, PromotionOutcome::NothingEligible));
+            assert_eq!(status_of(&executor, task_id).await, TaskStatus::Queue);
+            assert_eq!(free_permits(&executor).await, 1);
+            let reason = executor
+                .queued_promotion_refusal(Some(task_id), &outcome)
+                .await;
+            assert!(reason.contains("provider lease"), "{reason}");
+        }
+
+    }
+
     #[cfg(target_os = "linux")]
     mod review_lifecycle {
         use super::*;
@@ -21168,6 +21573,42 @@ VERDICT: APPROVED"
                     .collect()
             }
 
+            /// How many runs have started for this Task. Every start writes
+            /// one execution record, and nothing removes it, so this counts
+            /// starts whether or not a run is still going.
+            #[cfg(unix)]
+            async fn executions_of_task(&self) -> usize {
+                self.executor
+                    .executions
+                    .read()
+                    .await
+                    .values()
+                    .filter(|e| e.task_id == Some(self.task_id))
+                    .count()
+            }
+
+            /// Waits for the Task's run to record that it stopped. The run
+            /// removes its own handle before it records that, so the handle
+            /// map cannot say whether a run has ended. The execution record
+            /// can, and it is only written once the run is over.
+            #[cfg(unix)]
+            async fn wait_for_the_run_to_stop(&self) {
+                for _ in 0..1200 {
+                    let stopped = self
+                        .executor
+                        .executions
+                        .read()
+                        .await
+                        .values()
+                        .any(|e| e.task_id == Some(self.task_id) && e.stopped_at.is_some());
+                    if stopped {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("the run did not stop: {:?}", self.task().await);
+            }
+
             fn events_saying(&self, needle: &str) -> usize {
                 self.agent_events()
                     .iter()
@@ -21303,7 +21744,7 @@ VERDICT: APPROVED"
             w.executor.check_and_execute().await;
 
             assert_eq!(
-                w.events_saying("Auto-promoted from queue"),
+                w.events_saying("Moved from Queue to In Progress; the run starts when the executor can take it"),
                 1,
                 "{:?}",
                 w.agent_events()
@@ -21561,7 +22002,7 @@ VERDICT: APPROVED"
 
             assert_eq!(w.task().await.status, TaskStatus::Queue);
             assert_eq!(w.records().await, before, "nothing written");
-            assert_eq!(w.events_saying("Auto-promoted from queue"), 0);
+            assert_eq!(w.events_saying("Moved from Queue to In Progress; the run starts when the executor can take it"), 0);
         }
 
         /// A queued, checked-out Task whose lease record shows a provider group
@@ -21589,7 +22030,7 @@ VERDICT: APPROVED"
 
             assert_eq!(w.task().await.status, TaskStatus::Queue);
             assert_eq!(w.records().await, before, "nothing written");
-            assert_eq!(w.events_saying("Auto-promoted from queue"), 0);
+            assert_eq!(w.events_saying("Moved from Queue to In Progress; the run starts when the executor can take it"), 0);
             assert_eq!(std::fs::read(&lease_path).unwrap(), format!("{live_group}\n").into_bytes());
         }
 
@@ -21606,7 +22047,7 @@ VERDICT: APPROVED"
             w.executor.check_and_execute().await;
 
             assert_eq!(w.task().await.status, TaskStatus::Queue);
-            assert_eq!(w.events_saying("Auto-promoted from queue"), 0);
+            assert_eq!(w.events_saying("Moved from Queue to In Progress; the run starts when the executor can take it"), 0);
             assert_eq!(std::fs::read(&lease_path).unwrap(), b"spawning\n");
         }
 
@@ -21628,7 +22069,7 @@ VERDICT: APPROVED"
 
             w.executor.check_and_execute().await;
 
-            assert_eq!(w.events_saying("Auto-promoted from queue"), 1);
+            assert_eq!(w.events_saying("Moved from Queue to In Progress; the run starts when the executor can take it"), 1);
         }
 
         /// Windows has no provider lease. An ordinary retry of a Task that has a
@@ -21695,7 +22136,7 @@ VERDICT: APPROVED"
 
             w.executor.check_and_execute().await;
 
-            assert_eq!(w.events_saying("Auto-promoted from queue"), 1);
+            assert_eq!(w.events_saying("Moved from Queue to In Progress; the run starts when the executor can take it"), 1);
         }
 
         /// Disk space running out while a direct start is underway: the check
@@ -21786,6 +22227,51 @@ VERDICT: APPROVED"
             assert!(w.executor.running_handles.read().await.is_empty());
             drop(held);
             assert_eq!(w.free_permits().await, LIMIT);
+        }
+
+        /// A direct start deferred for capacity is picked up by a later pass
+        /// once a permit frees, and two passes start it exactly once.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_direct_start_deferred_for_capacity_resumes_once_a_permit_frees() {
+            let w = world(NORMAL, TaskStatus::Queue, true).await;
+            w.executor
+                .projects
+                .write()
+                .await
+                .get_mut(&w.project_id)
+                .unwrap()
+                .base = Some(crate::domain::ProjectBase::PreferredLocalBranch {
+                branch: "main".to_string(),
+            });
+            w.executor.reconcile_admission().await;
+            let held: Vec<_> = std::iter::from_fn(|| w.executor.admission.try_acquire()).collect();
+            assert_eq!(held.len(), LIMIT);
+            let deferred = w.executor.execute_task(w.task_id).await;
+            assert!(
+                deferred.as_ref().is_err_and(|m| m.contains("waiting to run")),
+                "{deferred:?}"
+            );
+            assert_eq!(worktree_count(&w.repo), 1, "no checkout before a permit frees");
+
+            drop(held);
+            w.executor.poll_once_for_test().await;
+            w.wait_for_the_run_to_stop().await;
+            assert_eq!(
+                w.executions_of_task().await,
+                1,
+                "the first pass with a free permit starts the task: {:?}",
+                w.task().await
+            );
+
+            w.executor.poll_once_for_test().await;
+
+            assert_eq!(
+                w.executions_of_task().await,
+                1,
+                "a second pass does not start it again"
+            );
+            assert!(!w.task().await.is_ready_to_execute(), "the start was recorded");
         }
 
         /// A direct start of a task an agent is already working on is refused

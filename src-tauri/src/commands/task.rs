@@ -5,6 +5,7 @@ use crate::domain::{
 };
 use crate::domain::task::{CodingProvider, ExternalRef};
 use crate::lifecycle::{classify_status_transition, StatusTransitionEffect};
+use crate::queue::{PromotionChoice, PromotionOutcome};
 use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -271,6 +272,27 @@ pub(crate) async fn set_task_status(
         if let Some(refusal) = recorded {
             return Err(refusal);
         }
+    }
+
+    // Queue -> In Progress is a promotion: it takes an admission permit before
+    // its write, as the scheduler's own promotion does.
+    if old_status == TaskStatus::Queue && status == TaskStatus::InProgress {
+        let executor = state
+            .executor
+            .get()
+            .ok_or_else(|| crate::commands::queue::NO_EXECUTOR_PROMOTION.to_string())?;
+        let record_move = move |staged: &mut HashMap<Uuid, Task>, promoted_id: Uuid| {
+            if let Some(task) = staged.get_mut(&promoted_id) {
+                task.record_move(&TaskStatus::Queue);
+            }
+        };
+        return match executor
+            .promote_queued(PromotionChoice::Exact(task_id), record_move)
+            .await?
+        {
+            PromotionOutcome::Promoted(task) => Ok(Some(*task)),
+            refused => Err(executor.queued_promotion_refusal(Some(task_id), &refused).await),
+        };
     }
 
     let effect = classify_status_transition(&old_status, &status);
@@ -872,6 +894,29 @@ pub async fn reorder_task(
         if let Some(refusal) = recorded {
             return Err(refusal);
         }
+    }
+
+    // Queue -> In Progress is a promotion, so it takes an admission permit
+    // before its write, the same as the scheduler's own promotion. Dropping
+    // the card in In Progress is refused when no run slot is free.
+    if old_status == TaskStatus::Queue && target_status == TaskStatus::InProgress {
+        let executor = state
+            .executor
+            .get()
+            .ok_or_else(|| crate::commands::queue::NO_EXECUTOR_PROMOTION.to_string())?;
+        let place = move |staged: &mut HashMap<Uuid, Task>, promoted_id: Uuid| {
+            if let Some(task) = staged.get_mut(&promoted_id) {
+                task.record_move(&TaskStatus::Queue);
+            }
+            renumber_column(staged, project_id, promoted_id, &TaskStatus::InProgress, new_position);
+        };
+        return match executor
+            .promote_queued(PromotionChoice::Exact(task_id), place)
+            .await?
+        {
+            PromotionOutcome::Promoted(task) => Ok(Some(*task)),
+            refused => Err(executor.queued_promotion_refusal(Some(task_id), &refused).await),
+        };
     }
 
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
@@ -2582,6 +2627,7 @@ mod disk_pressure {
         let disk = FakeDisk::with_available(10 * GIB);
         let (_tmp, state) = state_on(&disk).await;
         let (task_id, project_id) = seed(&state, TaskStatus::Queue).await;
+        crate::test_helpers::attach_test_executor(&state);
         let app = tauri::test::mock_app();
         app.manage(state);
         let state: &crate::AppState = app.state::<crate::AppState>().inner();
