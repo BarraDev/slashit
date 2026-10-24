@@ -136,8 +136,10 @@ pub fn TaskContextMenu(
                     match run_queued_task(task_clone.id.to_string(), task_clone.status.clone()).await {
                         Ok(RunNowOutcome::Promoted(task)) => {
                             toast::success(promoted_message(&task.title));
-                            on_move.run((task_clone.clone(), TaskStatus::InProgress));
-                            apply_task.run(task_clone);
+                            // The backend's record is the promotion: it is
+                            // already In Progress, so no second move is sent,
+                            // and the pre-click record is not applied over it.
+                            apply_task.run(task);
                         }
                         // Nothing was changed: show the task where it really is.
                         Ok(RunNowOutcome::NotQueued(current)) => {

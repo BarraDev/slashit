@@ -244,6 +244,8 @@ pub fn TaskDrawer(
             match run_queued_task(task_id.to_string(), TaskStatus::Queue).await {
                 Ok(RunNowOutcome::Promoted(task)) => {
                     toast::success(promoted_message(&task.title));
+                    apply_task.try_run(task);
+                    refresh_tasks.try_run(());
                 }
                 // Nothing was changed: show the task where it really is.
                 Ok(RunNowOutcome::NotQueued(current)) => {
