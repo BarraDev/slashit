@@ -1,0 +1,94 @@
+name: Install trunk
+description: >
+  The pinned trunk-rs/trunk release for this runner, taken from the upstream
+  release binaries and checked against pinned SHA-256 digests before anything
+  is extracted. Shared by CI and the release workflow so both build the
+  frontend with the same trunk. Replaces jetli/trunk-action, which runs on
+  Node 20 and has no Node 24 release.
+
+runs:
+  using: composite
+  steps:
+    - name: Install trunk (pinned upstream release, SHA-256 verified)
+      shell: bash
+      env:
+        # Bumping the version means replacing every digest in the same change.
+        # Take each digest from the `digest` field of the matching asset in the
+        # `v<version>` release on github.com/trunk-rs/trunk, and check that the
+        # asset's own `.sha256` file agrees. The digests are fixed here, not
+        # fetched at run time, or the check would only prove that the download
+        # matches whatever the download said.
+        TRUNK_VERSION: 0.22.0
+        TRUNK_SHA256_LINUX_X64: f78c1989240c56592d8cfc4df5cc27399a3ff66a3f9cc819e16f1e3d809ce7c2
+        TRUNK_SHA256_LINUX_ARM64: a05b519ad8ba8b3935772586c2f08f93dd8f9ce06c74c03e89d3c2d03cb628b1
+        TRUNK_SHA256_MACOS_X64: 6e6d2d5180fd7eaaf3fb4d2918ba1a6d57365d480c2372444cdeede97d56a519
+        TRUNK_SHA256_MACOS_ARM64: 9a120ec52021e235c30650d700979c99b572cef68ada8aa3f44735b8b29fa411
+        TRUNK_SHA256_WINDOWS_X64: 4a9c5f1967e5563b277802186a836fd6f95fb455a8d4a0c1ed15cc8437187690
+        TRUNK_SHA256_WINDOWS_ARM64: 68222eb1cee3ac1b6221574808fe7c77b7a3030a6a4ad61912d316b96d02af5b
+      run: |
+        set -euo pipefail
+
+        case "${RUNNER_OS}/${RUNNER_ARCH}" in
+          Linux/X64)      asset=trunk-x86_64-unknown-linux-gnu.tar.gz;  digest=${TRUNK_SHA256_LINUX_X64} ;;
+          Linux/ARM64)    asset=trunk-aarch64-unknown-linux-gnu.tar.gz; digest=${TRUNK_SHA256_LINUX_ARM64} ;;
+          macOS/X64)      asset=trunk-x86_64-apple-darwin.tar.gz;       digest=${TRUNK_SHA256_MACOS_X64} ;;
+          macOS/ARM64)    asset=trunk-aarch64-apple-darwin.tar.gz;      digest=${TRUNK_SHA256_MACOS_ARM64} ;;
+          Windows/X64)    asset=trunk-x86_64-pc-windows-msvc.zip;       digest=${TRUNK_SHA256_WINDOWS_X64} ;;
+          Windows/ARM64)  asset=trunk-aarch64-pc-windows-msvc.zip;      digest=${TRUNK_SHA256_WINDOWS_ARM64} ;;
+          *)
+            echo "install-trunk: no pinned trunk ${TRUNK_VERSION} asset for ${RUNNER_OS}/${RUNNER_ARCH}" >&2
+            exit 1
+            ;;
+        esac
+
+        binary=trunk
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          binary=trunk.exe
+        fi
+
+        work=$(mktemp -d)
+        trap 'rm -rf "${work}"' EXIT
+
+        url="https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/${asset}"
+        curl --fail --silent --show-error --location --retry 3 \
+          --proto '=https' --proto-redir '=https' --tlsv1.2 --output "${work}/${asset}" "${url}"
+
+        # Nothing is extracted or installed unless the digest matches.
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual=$(sha256sum "${work}/${asset}" | cut -d' ' -f1)
+        else
+          actual=$(shasum -a 256 "${work}/${asset}" | cut -d' ' -f1)
+        fi
+        if [ "${actual}" != "${digest}" ]; then
+          echo "install-trunk: ${asset} has SHA-256 ${actual}, expected ${digest}" >&2
+          exit 1
+        fi
+
+        mkdir "${work}/extracted"
+        case "${asset}" in
+          *.zip)
+            # PowerShell, not `tar`: the `tar` that Git for Windows puts first
+            # on PATH is GNU tar, which cannot read zip archives.
+            archive=$(cygpath -w "${work}/${asset}")
+            destination=$(cygpath -w "${work}/extracted")
+            powershell.exe -NoProfile -NonInteractive -Command \
+              "Expand-Archive -LiteralPath '${archive}' -DestinationPath '${destination}' -Force"
+            ;;
+          *)
+            tar -xzf "${work}/${asset}" -C "${work}/extracted"
+            ;;
+        esac
+
+        bin_dir="${HOME}/.cargo/bin"
+        mkdir -p "${bin_dir}"
+        install -m 0755 "${work}/extracted/${binary}" "${bin_dir}/${binary}"
+
+        # Checked by running it, so a binary that is the wrong release, or does
+        # not run on this runner, fails here rather than in the build.
+        actual_version=$("${bin_dir}/${binary}" --version)
+        if [ "${actual_version}" != "trunk ${TRUNK_VERSION}" ]; then
+          echo "install-trunk: expected 'trunk ${TRUNK_VERSION}', got '${actual_version}'" >&2
+          exit 1
+        fi
+        echo "${bin_dir}" >> "${GITHUB_PATH}"
+        echo "installed ${actual_version}"
