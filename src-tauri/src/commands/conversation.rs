@@ -2164,6 +2164,8 @@ mod tests {
         }
     }
 
+    // The fake provider is a shell script, and `FakeProgram` exists only on unix.
+    #[cfg(unix)]
     mod ordinary_turn {
         use super::*;
         use crate::commands::conversation::Snapshot;

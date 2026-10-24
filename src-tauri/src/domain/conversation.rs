@@ -719,6 +719,7 @@ fn is_proposal_decision(kind: &EntryKind) -> bool {
         EntryKind::ActionDecision { .. }
             | EntryKind::ProjectActionDecision { .. }
             | EntryKind::ProjectActionApplied { .. }
+            | EntryKind::ProjectActionRefused { .. }
             | EntryKind::ActionWithdrawn { .. }
     )
 }
@@ -1204,6 +1205,19 @@ mod tests {
             retryable_failure(),
             decision,
             applied,
+        ]);
+        assert_eq!(conversation.retryable_human_turn(), Some((0, "first")));
+    }
+
+    #[test]
+    fn a_refused_approval_of_an_earlier_proposal_does_not_stop_a_failed_message_from_being_retried() {
+        let decision = EntryKind::ProjectActionDecision { action_id: Uuid::new_v4(), approved: true };
+        let refused = EntryKind::ProjectActionRefused { action_id: Uuid::new_v4(), reason: "The Task no longer exists".into() };
+        let conversation = conversation_with(vec![
+            human("first"),
+            retryable_failure(),
+            decision,
+            refused,
         ]);
         assert_eq!(conversation.retryable_human_turn(), Some((0, "first")));
     }
