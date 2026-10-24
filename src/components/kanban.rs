@@ -2753,14 +2753,18 @@ fn KanbanTaskCard(
                 // the queue without dragging it or opening the card's menu.
                 {
                     let run_now_pending = RwSignal::new(false);
+                    // Copied out before the closure: `move` would otherwise take
+                    // `task`, and the card's later uses of it would not compile.
+                    let run_now_id = task.id.to_string();
+                    let run_now_title = task.title.clone();
                     (column_status == TaskStatus::Queue).then(move || {
                         // One request at a time: a repeated click before the
                         // first promotion lands would be refused as stale by
                         // the backend anyway, but not sent here at all is
                         // cleaner.
                         let pending = run_now_pending;
-                        let task_id = task.id.to_string();
-                        let task_title = task.title.clone();
+                        let task_id = run_now_id;
+                        let task_title = run_now_title;
                         view! {
                             <div class="flex justify-end px-2 pb-1.5 -mt-1">
                                 <button

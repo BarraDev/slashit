@@ -243,7 +243,7 @@ pub fn TaskDrawer(
         spawn_local(async move {
             match run_queued_task(task_id.to_string(), TaskStatus::Queue).await {
                 Ok(RunNowOutcome::Started(_)) => {
-                    toast::success("Task moved out of the queue; its run is starting.");
+                    toast::success("Task moved out of the queue; its run is starting.".to_string());
                 }
                 // Nothing was changed: show the task where it really is.
                 Ok(RunNowOutcome::NotQueued(current)) => {

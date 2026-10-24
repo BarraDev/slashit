@@ -981,12 +981,12 @@ mod run_queued_task {
         state.task.tasks.write().await.insert(task.id, task.clone());
         state
             .storage
-            .save_project_tasks(project_id, &[task.clone()])
+            .save_project_tasks(project_id, std::slice::from_ref(&task))
             .expect("seed the board");
         task
     }
 
-    fn app_with(state: crate::AppState) -> tauri::App {
+    fn app_with(state: crate::AppState) -> tauri::App<tauri::test::MockRuntime> {
         let app = tauri::test::mock_app();
         app.manage(state);
         app
@@ -1111,16 +1111,20 @@ mod run_queued_task {
     #[tokio::test(start_paused = true)]
     async fn a_click_while_new_work_is_paused_for_disk_space_names_the_block() {
         // Debug builds only; the desktop acceptance journeys use the same
-        // override. Applied before the state is built, which is when the
-        // guard decides where its space reading comes from.
+        // override. Test builds replace the application's guard with
+        // `plenty_of_disk()` in `build_state_with_paths`, so this test installs
+        // the debug-override guard itself, after the variable is set.
         let space = tempfile::TempDir::new().expect("tempdir");
         let space_file = space.path().join("space");
         std::fs::write(&space_file, "1000000000 1\n").unwrap();
         std::env::set_var(crate::queue::start_guard::DEBUG_DISK_SPACE_FILE, &space_file);
-        let (_tmp, state) = test_state().await;
+        let (_tmp, mut state) = test_state().await;
+        state.start_guard = Arc::new(crate::queue::start_guard::StartGuard::for_data_dir(
+            _tmp.path().join("data"),
+        ));
+        std::env::remove_var(crate::queue::start_guard::DEBUG_DISK_SPACE_FILE);
         let project_id = Uuid::new_v4();
         let target = seed(&state, project_id, TaskStatus::Queue).await;
-        std::env::remove_var(crate::queue::start_guard::DEBUG_DISK_SPACE_FILE);
 
         let app = app_with(state);
         let live: &crate::AppState = app.state::<crate::AppState>().inner();
@@ -1157,7 +1161,7 @@ mod run_queued_task {
             )
             .await;
 
-        assert!(reason.contains("cleanup was interrupted"), "{reason}");
+        assert!(reason.contains("the cleanup of its Task Checkout was interrupted"), "{reason}");
     }
 
     #[tokio::test]
