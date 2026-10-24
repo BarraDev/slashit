@@ -409,6 +409,76 @@ async fn project_conversation_shows_the_run_an_approval_started() {
     context.finish(outcome);
 }
 
+/// A Coordinator run whose answer breaks the strict JSON contract is recorded
+/// as a failed turn at once. The message stays saved and visible, the failure
+/// survives a restart, and one explicit Retry answers that same message without
+/// saving it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_coordinator_turn_survives_restart_and_is_retried_once() {
+    const MESSAGE: &str = "Summarize the Project.";
+    const RETRY: &str = "[data-testid=\"conversation-retry-turn\"]";
+    const RETRY_PANEL: &str = "[data-testid=\"conversation-turn-retry\"]";
+    let context = TestContext::new("project_conversation_failed_turn_retry").expect("harness setup");
+    let root = context.state().path().to_path_buf();
+    let agent = FakeAgent::install(&root).expect("install fake Claude");
+    context.set_child_env("PATH", agent.path_value().to_os_string());
+    context.set_child_env(
+        fake_agent::MARKER_DIR_VAR,
+        agent.marker_dir().as_os_str().to_os_string(),
+    );
+    // The first Coordinator run answers with text that is not the JSON contract.
+    // The fixture answers every later run with a valid reply.
+    let scripted = agent.marker_dir().join(".coordinator-output");
+    std::fs::create_dir_all(&scripted).expect("create the scripted output directory");
+    std::fs::write(scripted.join("1"), "this is not the JSON contract").expect("script the malformed run");
+
+    let outcome = async {
+        let session = context.start_session("failed-turn").await?;
+        let project_id = created_id(ui::invoke(session.driver(), "create_project", json!({
+            "name":"Failed Turn Conversation", "repositoryId":Value::Null, "agentType":"claude_code"
+        })).await?, "create_project")?;
+        open_conversations(session.driver(), &project_id).await?;
+
+        submit_message(session.driver(), MESSAGE).await?;
+        await_text(session.driver(), "[data-testid=\"conversation-run-failed\"]", "Invalid Coordinator JSON").await?;
+        await_text(session.driver(), RETRY_PANEL, "Your last message has no reply yet").await?;
+        let failed = text_of(session.driver(), "[data-testid=\"conversation-history\"]").await?.unwrap_or_default();
+        if failed.matches(MESSAGE).count() != 1 { bail!("the failed message is not shown exactly once: {failed}"); }
+        let failed_snapshot = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+        if failed_snapshot["coordinator_live"] != false { bail!("a failed run was reported live: {failed_snapshot}"); }
+        context.close_session(session, "failed-turn", &Ok(())).await?;
+
+        // The failure was saved when it happened, so a restarted application shows it and offers Retry.
+        let restarted = context.start_session("failed-turn-restart").await?;
+        open_conversations(restarted.driver(), &project_id).await?;
+        await_text(restarted.driver(), RETRY_PANEL, "Your last message has no reply yet").await?;
+        ui::visible(restarted.driver(), RETRY).await?.click().await?;
+        await_text(restarted.driver(), "[data-testid=\"conversation-message\"]", "Fake Coordinator reply.").await?;
+
+        let answered = await_conversation_idle(restarted.driver(), &project_id, 3).await?;
+        let kinds = answered["conversation"]["entries"].as_array().context("Conversation entries missing")?
+            .iter()
+            .map(|entry| entry["kind"]["kind"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        if kinds != ["human_message", "run_failed", "coordinator_reply"] { bail!("the retry changed the saved turn order: {kinds:?}"); }
+        let saved_messages = answered["conversation"]["entries"].as_array().context("Conversation entries missing")?
+            .iter()
+            .filter(|entry| entry["kind"]["kind"] == "human_message" && entry["kind"]["text"] == MESSAGE)
+            .count();
+        if saved_messages != 1 { bail!("the message was saved {saved_messages} times"); }
+        if text_of(restarted.driver(), RETRY).await?.is_some() { bail!("Retry is still offered after the turn was answered"); }
+
+        let invocations = agent.invocations()?;
+        let runs = invocations.iter().filter(|invocation| invocation.prompt.is_some()).collect::<Vec<_>>();
+        if runs.len() != 2 { bail!("expected exactly one failed run and one retry, observed {}", runs.len()); }
+        let retried = runs[1].prompt.as_deref().unwrap_or_default();
+        if !retried.contains(r#""current_message":"Summarize the Project.""#) { bail!("the retry did not ask the saved message: {retried}"); }
+        context.close_session(restarted, "failed-turn-restart", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    context.finish(outcome);
+}
+
 /// Open the Conversations page from the Project navigation.
 ///
 /// The last page is restored on reload, so a restarted session may already be

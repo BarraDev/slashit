@@ -435,6 +435,7 @@ pub fn run() {
             get_project_conversation_executions,
             open_project_conversation,
             send_project_message,
+            retry_project_message,
             retry_project_conversation_continuation,
             act_on_project_conversation,
             stop_project_conversation,
