@@ -681,7 +681,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         let retry = retry_turn.clone();
                         view! {
                             <div data-testid="conversation-turn-retry" class="mb-3 flex shrink-0 items-center justify-between gap-3 rounded border border-amber-300/30 bg-amber-400/5 p-3 text-sm text-amber-100">
-                                <p>"Your last message has no reply yet. Retry asks the Coordinator again for that message, and it is not saved twice."</p>
+                                <p>"Your last message has no reply yet. Retry asks the Coordinator again for that message, and it is not saved twice. Sending a new message ends this Retry: the earlier message stays unanswered, and only the new one is answered."</p>
                                 <button data-testid="conversation-retry-turn" class="shrink-0 rounded border border-amber-200/30 px-3 py-1" disabled=move || busy.get() on:click=move |_| retry.run(())>"Retry"</button>
                             </div>
                         }
