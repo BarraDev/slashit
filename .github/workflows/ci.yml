@@ -90,7 +90,7 @@ jobs:
         uses: ./.github/actions/linux-build-deps
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Clippy (backend + CLI)
         run: cargo clippy -p slashit-ui -p slashit -p slashit-ipc -p slashit-durable-fs -p slashit-attention -p slashit-activity -p slashit-review-content -- -D warnings
@@ -141,7 +141,7 @@ jobs:
         uses: ./.github/actions/linux-build-deps
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # `commands::pr::tests` exercises real `jj` behavior (not a mock), so
       # the runner needs an actual `jj` binary on PATH before this step.
@@ -171,7 +171,7 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Its unit tests run on the host target, not wasm32:
       # `#[wasm_bindgen_test]` compiles to a plain `#[test]` off wasm32, and
@@ -244,7 +244,7 @@ jobs:
           webdriver: 'true'
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: acceptance
 
@@ -313,7 +313,7 @@ jobs:
       # On a fully cold run they may all miss before the first job saves; later
       # runs can restore the cache for their matching environment.
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: acceptance
 
@@ -371,7 +371,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Runs the shared trunk installer on the platforms the release builds on,
       # so a broken Windows or macOS install fails on a pull request rather than
@@ -430,7 +430,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: IPC crate tests (named-pipe transport)
         run: cargo test -p slashit-ipc
@@ -460,7 +460,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Durable write crate tests
         run: cargo test -p slashit-durable-fs -- --nocapture
