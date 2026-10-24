@@ -69,6 +69,23 @@ pub enum CodingProvider {
     OpenCode,
 }
 
+/// How a Task's finished coding run is reviewed. Mirrors the backend's
+/// `ReviewMode`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewMode {
+    #[default]
+    Automatic,
+    Manual,
+}
+
+impl ReviewMode {
+    /// True for the default mode, which is omitted from stored records.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: Uuid,
@@ -80,6 +97,10 @@ pub struct Task {
     /// Which coding Worker runs the Task. Absent on older records: Claude.
     #[serde(default)]
     pub provider: CodingProvider,
+    /// How the Task's coding runs are reviewed. Absent on older records:
+    /// Automatic.
+    #[serde(default)]
+    pub review_mode: ReviewMode,
     /// Evidence only: the model the provider last reported for a run. It never
     /// changes `model`, the configured policy.
     #[serde(default)]
@@ -238,6 +259,14 @@ pub struct WorkerHandoff {
     pub branch: Option<String>,
     #[serde(default)]
     pub start_head: Option<String>,
+    /// Mirrors the backend field: the review mode this run started with.
+    /// Absent on older records and for Automatic runs.
+    #[serde(default, skip_serializing_if = "ReviewMode::is_default")]
+    pub review_mode: ReviewMode,
+    /// Mirrors the backend field: the run's record was rebuilt without its
+    /// evidence, so `review_mode` is not what the run started under.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub review_mode_unproven: bool,
     pub stage: WorkerHandoffStage,
     /// Mirrors the backend field: the human decision that resolved this
     /// run's recovery. Kept so a task round-trips through the frontend whole.
@@ -1135,6 +1164,54 @@ mod tests {
     }
 
     /// A task exactly as the backend sends it over IPC.
+    /// A Manual run's handoff carries `review_mode`, and the frontend model
+    /// must read it back: the model denies unknown fields.
+    #[test]
+    fn a_manual_run_handoff_round_trips_through_the_frontend_model() {
+        let handoff = WorkerHandoff {
+            task_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            review_mode: ReviewMode::Manual,
+            review_mode_unproven: false,
+            stage: WorkerHandoffStage::Started {},
+            acceptance: None,
+        };
+        let value = serde_json::to_value(&handoff).unwrap();
+        assert_eq!(value["review_mode"], "manual");
+        let loaded: WorkerHandoff = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.review_mode, ReviewMode::Manual);
+    }
+
+    /// A run whose record was rebuilt after it was lost carries the unproven
+    /// flag, and the frontend model must read it, or the Task cannot load.
+    #[test]
+    fn an_unproven_run_handoff_round_trips_through_the_frontend_model() {
+        let handoff = WorkerHandoff {
+            task_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            review_mode: ReviewMode::Manual,
+            review_mode_unproven: true,
+            stage: WorkerHandoffStage::RecoveryRequired {
+                reason: "run record lost".to_string(),
+                observed_commit: None,
+            },
+            acceptance: None,
+        };
+        let value = serde_json::to_value(&handoff).unwrap();
+        assert_eq!(value["review_mode_unproven"], true);
+        let loaded: WorkerHandoff = serde_json::from_value(value).unwrap();
+        assert!(loaded.review_mode_unproven);
+        assert_eq!(loaded, handoff);
+    }
+
     fn task_json(status: &str, review: serde_json::Value, pr_url: Option<&str>) -> Task {
         serde_json::from_value(serde_json::json!({
             "id": "11111111-1111-1111-1111-111111111111",

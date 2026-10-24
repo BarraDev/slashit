@@ -626,6 +626,10 @@ pub struct UpdateTaskParams {
     /// The coding Worker for the Task. Applied only when given, so an edit
     /// that does not name it leaves the Task's provider as it was.
     pub provider: Option<CodingProvider>,
+    /// How the Task's coding runs are reviewed. Applied only when given. A
+    /// change affects only runs that have not started, because each run keeps
+    /// the mode it started with.
+    pub review_mode: Option<crate::domain::task::ReviewMode>,
     pub planning_mode: Option<bool>,
 }
 
@@ -664,6 +668,9 @@ pub async fn update_task(
             }
             if let Some(provider) = params.provider {
                 task.provider = provider;
+            }
+            if let Some(review_mode) = params.review_mode {
+                task.review_mode = review_mode;
             }
             if let Some(p) = params.planning_mode {
                 task.planning_mode = p;
@@ -2065,6 +2072,7 @@ mod lifecycle_ownership {
             task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
             if with_recovery {
                 task.worker_handoff = Some(crate::domain::WorkerHandoff {
+                    review_mode: Default::default(),
                     task_id: task.id,
                     project_id,
                     repository_id: None,
@@ -2076,6 +2084,7 @@ mod lifecycle_ownership {
                         observed_commit: None,
                     },
                     acceptance: None,
+                    review_mode_unproven: false,
                 });
             }
             // A fixed, old timestamp: any rewrite of the record moves it.
@@ -2703,6 +2712,7 @@ mod queue_entry_from_a_status_move {
         let project_id = Uuid::new_v4();
         let mut task = create_test_task_full("running", project_id, TaskStatus::InProgress, 0);
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id,
             repository_id: None,
@@ -2711,6 +2721,7 @@ mod queue_entry_from_a_status_move {
             start_head: None,
             stage: WorkerHandoffStage::Started {},
             acceptance: None,
+            review_mode_unproven: false,
         });
         let (project_id, task_id) = seed(&state, task).await;
         let executor = crate::test_helpers::attach_test_executor(&state);
@@ -3041,6 +3052,7 @@ mod task_dependency_contract {
                 security_severity: None,
                 model: None,
                 provider: None,
+                review_mode: None,
                 planning_mode: None,
             },
         )

@@ -1334,6 +1334,7 @@ mod tests {
             task.worktree_path = Some(checkout.to_str().unwrap().to_string());
             task.branch_name = Some("task-branch".into());
             task.worker_handoff = Some(WorkerHandoff {
+                review_mode: Default::default(),
                 task_id: task.id,
                 project_id,
                 repository_id: None,
@@ -1345,6 +1346,7 @@ mod tests {
                     reason: "interrupted".into(),
                     observed_commit: None,
                 },
+                review_mode_unproven: false,
             });
             let task_id = task.id;
             state.task.tasks.write().await.insert(task_id, task.clone());

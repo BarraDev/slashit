@@ -1320,6 +1320,7 @@ mod lifecycle_ownership {
         // Task is In Progress.
         let mut task = create_test_task_full("running", project_id, TaskStatus::InProgress, 0);
         task.worker_handoff = Some(crate::domain::WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id,
             repository_id: None,
@@ -1328,6 +1329,7 @@ mod lifecycle_ownership {
             start_head: None,
             stage: crate::domain::WorkerHandoffStage::Started {},
             acceptance: None,
+            review_mode_unproven: false,
         });
         let task_id = seed_task(&ctx, task).await;
         let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
@@ -1382,6 +1384,7 @@ mod lifecycle_ownership {
             task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
             if with_recovery {
                 task.worker_handoff = Some(crate::domain::WorkerHandoff {
+                    review_mode: Default::default(),
                     task_id: task.id,
                     project_id,
                     repository_id: None,
@@ -1393,6 +1396,7 @@ mod lifecycle_ownership {
                         observed_commit: None,
                     },
                     acceptance: None,
+                    review_mode_unproven: false,
                 });
             }
             // A fixed, old timestamp: any rewrite of the record moves it.

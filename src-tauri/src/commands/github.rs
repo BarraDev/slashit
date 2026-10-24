@@ -211,6 +211,7 @@ pub async fn create_task_from_issue(
 
     let now = chrono::Utc::now();
     let task = Task {
+        review_mode: Default::default(),
         id: Uuid::new_v4(),
         project_id,
         title: issue.title,
@@ -329,6 +330,7 @@ pub async fn import_github_issues(
         let priority = map_labels_to_priority(&issue.labels);
 
         let task = Task {
+            review_mode: Default::default(),
             id: Uuid::new_v4(),
             project_id,
             title: issue.title,

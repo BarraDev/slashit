@@ -733,6 +733,26 @@ mod tests {
         crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend).await.unwrap();
     }
 
+    /// Runs the executor's poller until the Task reaches `wanted` or fails.
+    /// The poller is what starts a queued Task and sends a finished run to
+    /// review, so nothing here sets the status by hand. A Task that is still
+    /// running is left alone between passes.
+    #[cfg(unix)]
+    async fn poll_until(state: &crate::AppState, task_id: Uuid, wanted: TaskStatus) -> Task {
+        let executor = state.executor.get().expect("an executor is attached").clone();
+        for _ in 0..400 {
+            let task = state.task.tasks.read().await[&task_id].clone();
+            if task.status == wanted || task.status == TaskStatus::Error {
+                return task;
+            }
+            if task.status != TaskStatus::InProgress {
+                executor.poll_once_for_test().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the Task did not reach {wanted:?}");
+    }
+
     /// Two review cycles, then an approval whose pull request fails twice:
     /// the timeline read from the task file shows each decision once, in
     /// order, and the failed deliveries as failures, never as approvals.
@@ -811,6 +831,101 @@ mod tests {
         // The next run's prompt carries it.
         let prompt = crate::queue::prompt::build_task_prompt(&persisted, None);
         assert!(prompt.contains("Also count lines."));
+    }
+
+    /// A Manual run sent back with changes is run again by the executor. Both
+    /// runs are real Worker runs that the poller starts and routes; neither
+    /// is a shortcut. Each one reaches Human Review with no reviewer. The
+    /// second run gets its own record, numbered 2 and in Manual mode, and the
+    /// run-1 record is not reused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn changes_requested_on_a_manual_run_are_run_again_as_a_second_manual_run() {
+        use crate::domain::task::{ActivityKind, ReviewMode};
+        use std::path::Path;
+
+        let (tmp, state) = test_state().await;
+        let (_repo, project_id, _base) = repo_and_project(&state, &tmp).await;
+        let mut task = create_test_task_full("count words", project_id, TaskStatus::Queue, 0);
+        task.description = Some(DESCRIPTION.to_string());
+        task.review_mode = ReviewMode::Manual;
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        crate::test_helpers::attach_test_executor(&state);
+
+        // The fake Worker writes a number that changes on every run, so the
+        // second run makes a real commit. Any reviewer would be a second
+        // `claude` launch, and the launch count below would show it.
+        let counter = tmp.path().join("worker-runs");
+        let agent = crate::test_helpers::FakeProgram::install(
+            "claude",
+            &format!(
+                "cat >/dev/null; n=$(cat {counter:?} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {counter:?}; \
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}}'; \
+                 printf 'run %s\\n' $n > agent_work.txt; \
+                 printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'"
+            ),
+        )
+        .await;
+
+        // Run 1: the poller starts the Task, and the poller sends the finished
+        // Manual run to Human Review.
+        let first = poll_until(&state, task_id, TaskStatus::HumanReview).await;
+        assert_eq!(first.status, TaskStatus::HumanReview, "{:?}", first.error_message);
+        assert!(first.qa_signoff.is_none(), "no AI verdict is invented");
+        let first_handoff = first.worker_handoff.clone().expect("run 1 has its record");
+        assert_eq!(first_handoff.run, Some(1));
+        assert_eq!(first_handoff.review_mode, ReviewMode::Manual);
+        assert!(!first_handoff.review_mode_unproven);
+        assert_eq!(agent.launches("claude"), 1, "one coding run and no reviewer");
+
+        // A person asks for changes. The Task goes back to Queue with its
+        // feedback, and its checkout and branch are kept.
+        let queued = request_changes(&state, task_id, "Also count lines.")
+            .await
+            .expect("changes requested");
+        assert_eq!(queued.status, TaskStatus::Queue);
+
+        // Run 2: the poller starts it again through the same executor path.
+        let second = poll_until(&state, task_id, TaskStatus::HumanReview).await;
+        assert_eq!(second.status, TaskStatus::HumanReview, "{:?}", second.error_message);
+        assert!(second.qa_signoff.is_none(), "no AI verdict is invented");
+        let handoff = second.worker_handoff.clone().expect("run 2 has its own record");
+        assert_eq!(handoff.run, Some(2), "the record is numbered as the second run");
+        assert_eq!(handoff.review_mode, ReviewMode::Manual, "Manual is fixed at run 2's start");
+        assert!(!handoff.review_mode_unproven, "the record is proven, not rebuilt");
+        assert_ne!(
+            handoff.start_head, first_handoff.start_head,
+            "a new record, started from the commit run 1 made"
+        );
+        assert_eq!(agent.launches("claude"), 2, "two coding runs, and still no reviewer");
+        assert!(second.activity.iter().any(|e| matches!(e.kind, ActivityKind::RunStarted { run: 2, .. })));
+        assert!(
+            !second.activity.iter().any(|e| matches!(e.kind, ActivityKind::AiReviewStarted { .. })),
+            "no AI review ran on either run"
+        );
+        let skipped: Vec<u32> = second
+            .activity
+            .iter()
+            .filter_map(|e| match e.kind {
+                ActivityKind::AiReviewSkipped { review, .. } => Some(review),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skipped, [1, 2], "each Manual run records its skipped AI review once");
+        let checkout = second.worktree_path.clone().expect("the checkout is kept");
+        assert_eq!(git(Path::new(&checkout), &["show", "HEAD:agent_work.txt"]), "run 2");
+
+        // The records survive a reload from the board on disk.
+        let persisted = on_disk(&state, project_id, task_id);
+        assert_eq!(persisted.status, TaskStatus::HumanReview);
+        assert_eq!(persisted.review_mode, ReviewMode::Manual);
+        let persisted_handoff = persisted.worker_handoff.expect("run 2's record is durable");
+        assert_eq!(persisted_handoff.run, Some(2));
+        assert_eq!(persisted_handoff.review_mode, ReviewMode::Manual);
+        assert_eq!(persisted_handoff.start_head, handoff.start_head);
+        assert_eq!(persisted.human_review.entries.len(), 1, "one change request was recorded");
     }
 
     /// Changes cannot be requested while an earlier cleanup of the Task's
@@ -1026,11 +1141,17 @@ mod tests {
         worktree: std::path::PathBuf,
     }
 
-    async fn local_project() -> Local {
-        let (tmp, state) = test_state().await;
+    /// A repository on `main` with one commit and no remote, and a project
+    /// that uses it with a local branch as its base.
+    async fn repo_and_project(
+        state: &crate::AppState,
+        tmp: &tempfile::TempDir,
+    ) -> (std::path::PathBuf, Uuid, crate::domain::project::ProjectBase) {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
+        // Repository-local identity: the executor's commits read it, and the
+        // test environment has no global configuration.
         git(&repo, &["config", "user.email", "test@example.com"]);
         git(&repo, &["config", "user.name", "Test"]);
         std::fs::write(repo.join("README.md"), "base\n").unwrap();
@@ -1072,6 +1193,12 @@ mod tests {
                 updated_at: chrono::Utc::now(),
             },
         );
+        (repo, project_id, base)
+    }
+
+    async fn local_project() -> Local {
+        let (tmp, state) = test_state().await;
+        let (repo, project_id, base) = repo_and_project(&state, &tmp).await;
 
         let branch = "task-local-done".to_string();
         let (info, _) = state

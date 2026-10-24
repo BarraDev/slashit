@@ -164,6 +164,7 @@ pub async fn import_jira_issues(
         let complexity = map_story_points_to_complexity(issue.story_points);
 
         let task = Task {
+            review_mode: Default::default(),
             id: Uuid::new_v4(),
             project_id,
             title: format!("[{}] {}", issue.key, issue.summary),

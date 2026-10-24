@@ -120,14 +120,23 @@ pub fn build_task_prompt(task: &Task, project_path: Option<&str>) -> String {
 pub fn task_input_digest(task: &Task) -> String {
     use sha2::{Digest, Sha256};
     let prompt = build_task_prompt(task, None);
-    match provider_identity(task) {
-        // The default provider keeps the digest it always had, so an approval
-        // recorded for a Claude Task still matches.
-        None => hex::encode(Sha256::digest(prompt.as_bytes())),
-        Some(provider) => {
+    match (provider_identity(task), review_identity(task)) {
+        // The default provider and mode keep the digest they always had, so an
+        // approval recorded for a default Task still matches.
+        (None, None) => hex::encode(Sha256::digest(prompt.as_bytes())),
+        (Some(provider), None) => {
             let mut hasher = Sha256::new();
             hasher.update(b"slashit.task-input.v2\0");
             for field in [prompt.as_bytes(), provider.as_bytes()] {
+                hasher.update((field.len() as u64).to_be_bytes());
+                hasher.update(field);
+            }
+            hex::encode(hasher.finalize())
+        }
+        (provider, Some(review)) => {
+            let mut hasher = Sha256::new();
+            hasher.update(b"slashit.task-input.v3\0");
+            for field in [prompt.as_bytes(), provider_name(provider), review.as_bytes()] {
                 hasher.update((field.len() as u64).to_be_bytes());
                 hasher.update(field);
             }
@@ -147,6 +156,23 @@ fn provider_identity(task: &Task) -> Option<&'static str> {
     }
 }
 
+/// The review mode an approval is bound to, when it is Manual. Whether a run is
+/// followed by an AI review is part of what a person approved, so a change
+/// between the two modes after approval refuses the start. Automatic is absent
+/// from the digest, which keeps every existing approval valid.
+fn review_identity(task: &Task) -> Option<&'static str> {
+    match task.review_mode {
+        crate::domain::task::ReviewMode::Automatic => None,
+        crate::domain::task::ReviewMode::Manual => Some("manual"),
+    }
+}
+
+/// The Worker name written into a digest that also covers the review mode. The
+/// default Worker is spelled out so that the field keeps a fixed position.
+fn provider_name(provider: Option<&'static str>) -> &'static [u8] {
+    provider.unwrap_or("claude").as_bytes()
+}
+
 /// The fingerprint of the input an approval names. With no additional request
 /// it is exactly [`task_input_digest`], so existing queue approvals keep their
 /// meaning. With a request it covers the exact rendered run instructions (the
@@ -163,11 +189,16 @@ pub fn approved_input_digest(task: &Task, approved_request: Option<&str>) -> Str
     };
     let rendered = build_run_prompt(task, None, Some(request));
     let mut fields: Vec<&[u8]> = vec![rendered.as_bytes(), task.model.as_bytes(), request.as_bytes()];
-    let domain: &[u8] = match provider_identity(task) {
-        None => b"slashit.execute-request.v1\0",
-        Some(provider) => {
+    let domain: &[u8] = match (provider_identity(task), review_identity(task)) {
+        (None, None) => b"slashit.execute-request.v1\0",
+        (Some(provider), None) => {
             fields.push(provider.as_bytes());
             b"slashit.execute-request.v2\0"
+        }
+        (provider, Some(review)) => {
+            fields.push(provider_name(provider));
+            fields.push(review.as_bytes());
+            b"slashit.execute-request.v3\0"
         }
     };
     let mut hasher = Sha256::new();
@@ -523,6 +554,31 @@ mod tests {
             hex::encode(Sha256::digest(build_task_prompt(&task, None).as_bytes())),
         );
         assert_eq!(approved_input_digest(&task, Some("extra")), claude_digest_v1(&task, "extra"));
+    }
+
+    #[test]
+    fn a_change_of_review_mode_after_approval_changes_the_digest_both_ways() {
+        use crate::domain::task::ReviewMode;
+        let automatic = crate::test_helpers::create_test_task("Review digests");
+        assert_eq!(automatic.review_mode, ReviewMode::Automatic);
+        let mut manual = automatic.clone();
+        manual.review_mode = ReviewMode::Manual;
+
+        // Automatic keeps every digest it had, so existing approvals still match.
+        assert_ne!(task_input_digest(&automatic), task_input_digest(&manual));
+        assert_ne!(
+            approved_input_digest(&automatic, Some("extra")),
+            approved_input_digest(&manual, Some("extra")),
+        );
+        // Switching back to Automatic restores the Automatic digest, so an
+        // approval given under Automatic matches again.
+        let mut back = manual.clone();
+        back.review_mode = ReviewMode::Automatic;
+        assert_eq!(task_input_digest(&back), task_input_digest(&automatic));
+        assert_eq!(
+            approved_input_digest(&back, Some("extra")),
+            claude_digest_v1(&automatic, "extra"),
+        );
     }
 
     /// A Task approved while it ran under Claude, then switched to OpenCode.

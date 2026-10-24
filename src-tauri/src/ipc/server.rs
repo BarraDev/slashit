@@ -1483,6 +1483,7 @@ pub(crate) mod tests {
         task.worktree_path = Some(checkout.to_string_lossy().to_string());
         task.branch_name = Some("task-branch".into());
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id,
             repository_id: None,
@@ -1494,6 +1495,7 @@ pub(crate) mod tests {
                 reason: "evidence that must survive".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         let task_id = task.id;
         rig.ctx.storage.save_project_tasks(project_id, std::slice::from_ref(&task)).unwrap();

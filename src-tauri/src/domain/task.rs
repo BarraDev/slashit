@@ -137,6 +137,12 @@ pub struct Task {
     /// runs with Claude. Only a person's explicit choice changes it.
     #[serde(default, skip_serializing_if = "CodingProvider::is_default")]
     pub provider: CodingProvider,
+    /// How this Task's coding runs are reviewed. A stored Task with no
+    /// `review_mode` is Automatic. Each run keeps the mode it started with on
+    /// its [`WorkerHandoff`], so a later change here never redirects a run
+    /// that already started.
+    #[serde(default, skip_serializing_if = "ReviewMode::is_default")]
+    pub review_mode: ReviewMode,
     /// The model the provider most recently reported for one of this Task's
     /// runs. It is evidence of what ran, never configuration: approvals,
     /// proposals and launches read `model` only. `None` until a run reports a
@@ -415,6 +421,18 @@ pub struct WorkerHandoff {
     #[serde(default)]
     pub start_head: Option<String>,
     pub stage: WorkerHandoffStage,
+    /// The review mode this run started with. Set once at the run's start
+    /// boundary and never changed, so the run's review follows the mode it was
+    /// started under. A handoff written before this field existed is Automatic.
+    #[serde(default, skip_serializing_if = "ReviewMode::is_default")]
+    pub review_mode: ReviewMode,
+    /// Set when this record was rebuilt for a run whose own record was lost, so
+    /// `review_mode` is not evidence of the mode the run started under. Such a
+    /// run is held in Manual review, and no automatic reviewer starts for it,
+    /// until a person decides. A record written before this field existed is
+    /// proven, so the field defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub review_mode_unproven: bool,
     /// The one human decision that resolved this run's recovery, if any. It
     /// lives and dies with the handoff of the run it resolved: the next run
     /// replaces the whole record, and a stale run is refused by its run
@@ -884,6 +902,7 @@ impl Task {
     pub fn new_backlog(existing: &HashMap<Uuid, Task>, new: NewTask) -> Task {
         let now = chrono::Utc::now();
         Task {
+            review_mode: Default::default(),
             id: new.id,
             project_id: new.project_id,
             title: new.title,
@@ -1682,6 +1701,26 @@ pub enum CodingProvider {
     OpenCode,
 }
 
+/// How a Task's finished coding run is reviewed. Automatic is the default and
+/// the behavior every existing Task has: the run is followed by an AI review.
+/// Manual sends the run straight to Human Review and records that no AI
+/// review was run, so no reviewer or review-fix agent starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewMode {
+    #[default]
+    Automatic,
+    Manual,
+}
+
+impl ReviewMode {
+    /// True for the default mode, which is omitted from stored Tasks and
+    /// stored run records.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 impl CodingProvider {
     /// True for the default provider, which is omitted from stored Tasks.
     pub fn is_default(&self) -> bool {
@@ -2326,6 +2365,7 @@ mod tests {
 
         let mut with_handoff = startable_task();
         with_handoff.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: with_handoff.id,
             project_id: with_handoff.project_id,
             repository_id: None,
@@ -2334,6 +2374,7 @@ mod tests {
             start_head: None,
             stage: WorkerHandoffStage::Started {},
             acceptance: None,
+            review_mode_unproven: false,
         });
         assert!(!with_handoff.never_checked_out());
     }
@@ -2476,6 +2517,7 @@ mod tests {
     fn recovered_task_with_decision(run: u32) -> (Task, NewAttemptDecision) {
         let mut task = startable_task();
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id: task.project_id,
             repository_id: None,
@@ -2487,6 +2529,7 @@ mod tests {
                 reason: "interrupted".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         let decision = NewAttemptDecision {
             decision_id: Uuid::new_v4(),
@@ -2548,6 +2591,7 @@ mod tests {
     fn a_recovery_required_task_is_not_ready_and_needs_the_user() {
         let mut task = startable_task();
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id: task.project_id,
             repository_id: None,
@@ -2559,6 +2603,7 @@ mod tests {
                 reason: "exact commit unknown".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         assert!(!task.is_ready_to_execute());
         assert_eq!(task.needs_you(false), Some(AttentionReason::Recovery));
@@ -2587,6 +2632,7 @@ mod tests {
         let mut task = startable_task();
         let completed_at = chrono::Utc::now();
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id: task.project_id,
             repository_id: None,
@@ -2597,6 +2643,7 @@ mod tests {
             stage: WorkerHandoffStage::ResolvedToAiReview {
                 commit: "b".repeat(40),
             },
+            review_mode_unproven: false,
         });
         task.record_activity_at(completed_at, ActivityKind::RunCompleted { run: 1 });
         task.human_review.record_arrival();
@@ -2616,6 +2663,7 @@ mod tests {
         let mut task = startable_task();
         let prior_decision_at = chrono::Utc::now();
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id: task.project_id,
             repository_id: None,
@@ -2626,6 +2674,7 @@ mod tests {
             stage: WorkerHandoffStage::ResolvedToAiReview {
                 commit: "b".repeat(40),
             },
+            review_mode_unproven: false,
         });
         task.human_review.record_arrival();
         task.human_review.push(
@@ -2744,6 +2793,48 @@ mod tests {
             "[origin]\nkind = \"default_base\"\nbranch = \"main\"\n"
         );
         assert_eq!(toml::from_str::<Holder>(&toml_text).unwrap(), resolved);
+    }
+
+    /// A Task or run record written before review modes existed loads as
+    /// Automatic, and Automatic is not written back, so an unchanged Task keeps
+    /// its stored form.
+    #[test]
+    fn a_record_written_before_review_modes_is_automatic_and_the_default_is_not_stored() {
+        use crate::domain::task::{ReviewMode, WorkerHandoff, WorkerHandoffStage};
+        let task = crate::test_helpers::create_test_task_full(
+            "legacy",
+            Uuid::new_v4(),
+            TaskStatus::Backlog,
+            0,
+        );
+        let stored = serde_json::to_value(&task).unwrap();
+        assert!(stored.get("review_mode").is_none(), "the default is not written");
+        let loaded: Task = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.review_mode, ReviewMode::Automatic);
+
+        let mut manual = task.clone();
+        manual.review_mode = ReviewMode::Manual;
+        let stored = serde_json::to_value(&manual).unwrap();
+        assert_eq!(stored["review_mode"], "manual");
+        let loaded: Task = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.review_mode, ReviewMode::Manual);
+
+        let handoff = WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            acceptance: None,
+            stage: WorkerHandoffStage::Started {},
+            review_mode: ReviewMode::Automatic,
+            review_mode_unproven: false,
+        };
+        let stored = serde_json::to_value(&handoff).unwrap();
+        assert!(stored.get("review_mode").is_none(), "a run's default is not written");
+        let loaded: WorkerHandoff = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.review_mode, ReviewMode::Automatic);
     }
 
     /// A board written before decisions were recorded, with no `human_review`

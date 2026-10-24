@@ -17256,6 +17256,7 @@ mod recovery_admission_tests {
             0,
         );
         task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
             task_id: task.id,
             project_id,
             repository_id: None,
@@ -17267,6 +17268,7 @@ mod recovery_admission_tests {
                 reason: "interrupted".into(),
                 observed_commit: None,
             },
+            review_mode_unproven: false,
         });
         let id = task.id;
         state.task.tasks.write().await.insert(id, task.clone());
