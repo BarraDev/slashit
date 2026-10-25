@@ -54,6 +54,10 @@ use tokio::sync::Mutex;
 /// cannot be read cannot be trusted to be on.
 pub const AUTO_UPDATE_FLAG: &str = "auto_update";
 
+/// The environment variable that overrides [`AUTO_UPDATE_FLAG`] at startup.
+/// Derived from the flag id by `config::features`; a test keeps them in step.
+const AUTO_UPDATE_ENV: &str = "SLASHIT_FEATURE_AUTO_UPDATE";
+
 /// The event name every [`UpdaterProgress`] is emitted under.
 pub const PROGRESS_EVENT: &str = "updater://progress";
 
@@ -452,13 +456,19 @@ fn probe_install(app: &AppHandle) -> InstallProbe {
 /// An unrecognised id reads as off. A build that does not carry the flag has
 /// not shipped the feature, and guessing "on" would run an update path the
 /// build was never meant to expose.
-fn feature_refusal(flag: Option<bool>) -> Option<String> {
+///
+/// The text names the two switches that exist. There is no Settings control
+/// for feature flags; the value is read once at startup, from `features.toml`
+/// or from the environment variable, which wins over the file.
+fn feature_refusal(flag: Option<bool>, flags_file: &std::path::Path) -> Option<String> {
     match flag {
         Some(true) => None,
         Some(false) => Some(err(
             UpdaterErrorKind::Disabled,
             &format!(
-                "Automatic updates are turned off. Enable the '{AUTO_UPDATE_FLAG}' feature flag in Settings to check for updates."
+                "Automatic updates are turned off. Set {AUTO_UPDATE_FLAG} = true in {}, \
+                 or start SlashIt with {AUTO_UPDATE_ENV}=1. Restart SlashIt to apply the change.",
+                flags_file.display()
             ),
         )),
         None => Some(err(UpdaterErrorKind::Disabled, &unknown_flag_reason())),
@@ -668,7 +678,7 @@ pub async fn updater_check(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<UpdateCheckResult, String> {
     let flag = state.features.read().await.get(AUTO_UPDATE_FLAG);
-    if let Some(refusal) = feature_refusal(flag) {
+    if let Some(refusal) = feature_refusal(flag, &state.paths.feature_flags_file()) {
         return Err(refusal);
     }
 
@@ -714,7 +724,7 @@ pub async fn updater_download_and_install(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<(), String> {
     let flag = state.features.read().await.get(AUTO_UPDATE_FLAG);
-    if let Some(refusal) = feature_refusal(flag) {
+    if let Some(refusal) = feature_refusal(flag, &state.paths.feature_flags_file()) {
         return Err(refusal);
     }
 
@@ -1209,16 +1219,43 @@ mod tests {
 
     #[test]
     fn the_flag_gates_the_commands_and_an_unknown_id_reads_as_off() {
-        assert_eq!(feature_refusal(Some(true)), None);
+        let file = std::path::Path::new("/cfg/slashit-app/features.toml");
+        assert_eq!(feature_refusal(Some(true), file), None);
 
-        let off = feature_refusal(Some(false)).expect("an off flag must refuse");
+        let off = feature_refusal(Some(false), file).expect("an off flag must refuse");
         assert!(off.starts_with("disabled: "), "{off}");
         assert!(off.contains(AUTO_UPDATE_FLAG), "{off}");
 
-        let unknown = feature_refusal(None).expect("an unknown flag must refuse");
+        let unknown = feature_refusal(None, file).expect("an unknown flag must refuse");
         assert!(unknown.starts_with("disabled: "), "{unknown}");
         assert!(unknown.contains("does not recognise"), "{unknown}");
         assert_ne!(off, unknown, "the two must be distinguishable");
+    }
+
+    #[test]
+    fn the_off_refusal_names_the_file_and_the_switches_that_exist() {
+        let file = std::path::Path::new("/cfg/slashit-app/features.toml");
+        let off = feature_refusal(Some(false), file).expect("an off flag must refuse");
+
+        assert!(off.contains("/cfg/slashit-app/features.toml"), "{off}");
+        assert!(off.contains("auto_update = true"), "{off}");
+        assert!(off.contains("SLASHIT_FEATURE_AUTO_UPDATE=1"), "{off}");
+        assert!(off.contains("Restart SlashIt"), "{off}");
+        // There is no Settings control for flags; the text must not send the
+        // user looking for one.
+        assert!(!off.contains("Settings"), "{off}");
+    }
+
+    #[test]
+    fn the_env_override_name_is_the_one_the_registry_derives() {
+        assert_eq!(
+            AUTO_UPDATE_ENV,
+            format!(
+                "{}{}",
+                crate::config::features::ENV_PREFIX,
+                AUTO_UPDATE_FLAG.to_ascii_uppercase()
+            )
+        );
     }
 
     // --- Status assembly ----------------------------------------------------
