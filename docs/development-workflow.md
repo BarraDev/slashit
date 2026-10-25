@@ -407,13 +407,19 @@ which makes those commits immutable. Both are expected.
 
 ### Retire remote branches
 
+Deleting a remote branch requires the repository owner's explicit approval for
+that deletion, every time (section 13). This procedure does not grant it, and an
+approval given for other references does not carry over.
+
 Deleting a remote branch changes local JJ state at the next `jj git fetch`.
 JJ drops the remote-tracking bookmark and any local bookmark that tracked it,
 and it abandons commits that nothing else reaches. A squash merge does not make
 the pre-squash commits disposable: once the branch is gone, they exist only in
-the local store. Run JJ through the pinned binary (`mise exec -- jj`), and add
-`--ignore-working-copy` to every inspection. Follow this order for each deleted
-or to-be-deleted branch:
+the local store. Run JJ through the pinned binary (`mise exec -- jj`). In the
+canonical root, inspect with `--ignore-working-copy` as section 5 describes. That
+flag reads the last snapshot, so it can miss files edited in a developer
+workspace since its last JJ command; step 3 covers workspaces. Follow this order
+for each deleted or to-be-deleted branch:
 
 1. Record a baseline and keep it with the report: the visible history
    (`jj log -r '::visible_heads()' --no-graph -T 'commit_id ++ "\n"'`), the
@@ -429,6 +435,12 @@ or to-be-deleted branch:
    and `jj log -r '(<head>:: ~ <head>) ~ ::main'` for unpublished descendants. A
    non-empty result protects the head. Do not forget or delete a protected head;
    record it in the report and wait for the repository owner's decision.
+   A workspace's `@` is only as current as its last snapshot. For each workspace
+   the query involves, its owner must confirm that the working copy is current:
+   the owner runs `jj status` there and records the output. Do not run an
+   ordinary JJ command in a workspace you do not own, because it snapshots that
+   workspace. A head is protected if an unconfirmed workspace shows any relation
+   to it.
 4. Preserve the heads before anything is forgotten. Fetch them by SHA into a
    disposable bare repository (`git fetch <canonical .git> <sha>...`; verified
    with the pinned Git), name each with `git update-ref refs/archive/<name> <sha>`,
