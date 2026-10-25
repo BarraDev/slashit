@@ -1,4 +1,4 @@
-use crate::components::{provide_updater_context, AppLayout, QuitDialog, UpdateBanner};
+use crate::components::{provide_updater_context, setup_keyboard_shortcuts, AppLayout, QuitDialog, UpdateBanner};
 use crate::pages::*;
 use crate::services::get_project;
 use leptos::prelude::*;
@@ -125,6 +125,10 @@ pub fn App() -> impl IntoView {
             set_current_page.set(page);
         }
     });
+
+    // The Ctrl/Cmd page shortcuts shown in the sidebar. The listener lives for
+    // the whole session, so it is installed once, with this component.
+    setup_keyboard_shortcuts(set_current_page, None, None, None);
 
     view! {
         <QuitDialog />
