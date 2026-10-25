@@ -5121,7 +5121,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slashit"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5132,7 +5132,7 @@ dependencies = [
 
 [[package]]
 name = "slashit-acceptance"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5147,7 +5147,7 @@ dependencies = [
 
 [[package]]
 name = "slashit-activity"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "serde",
@@ -5157,7 +5157,7 @@ dependencies = [
 
 [[package]]
 name = "slashit-attention"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5165,14 +5165,14 @@ dependencies = [
 
 [[package]]
 name = "slashit-durable-fs"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "slashit-frontend"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
@@ -5198,7 +5198,7 @@ dependencies = [
 
 [[package]]
 name = "slashit-ipc"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "libc",
@@ -5216,7 +5216,7 @@ dependencies = [
 
 [[package]]
 name = "slashit-review-content"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "sha2",
@@ -5224,7 +5224,7 @@ dependencies = [
 
 [[package]]
 name = "slashit-ui"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",

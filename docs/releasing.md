@@ -21,8 +21,8 @@ installer accepts, and what "signed" does and does not mean here.
 
 ## 1. Bump the version
 
-Five files carry the version, and the preflight job fails the release if any of
-them disagree. There is no single source: Cargo needs it per manifest, and
+Eleven files carry the version, and the preflight job fails the release if any
+of them disagree. There is no single source: Cargo needs it per manifest, and
 Tauri reads its own.
 
 | File | Field | What it controls |
@@ -32,10 +32,12 @@ Tauri reads its own.
 | `Cargo.toml` (root) | `[package] version` | The Leptos/WASM frontend (`slashit-frontend`) |
 | `crates/slashit-cli/Cargo.toml` | `[package] version` | `slashit --version` |
 | `crates/slashit-ipc/Cargo.toml` | `[package] version` | The shared IPC crate |
+| `crates/slashit-acceptance`, `slashit-activity`, `slashit-attention`, `slashit-durable-fs`, `slashit-review-content` (each `Cargo.toml`) | `[package] version` | Workspace members, not shipped on their own |
+| `package.json` | `version` | The private Playwright end-to-end harness (`slashit-e2e`). Never published, but preflight checks it so the workspace has one version |
 
 `tauri.conf.json` is authoritative because Tauri only falls back to
 `src-tauri/Cargo.toml` when the key is absent, and here it is present. The
-preflight job checks the four manifests against it, so a build whose installer
+preflight job checks every file above against it, so a build whose installer
 and whose `slashit --version` disagree cannot get out.
 
 Then refresh the lockfile, which records workspace member versions:
@@ -43,10 +45,6 @@ Then refresh the lockfile, which records workspace member versions:
 ```bash
 cargo check --workspace
 ```
-
-`package.json` also says `0.1.0`, but it is the private Playwright end-to-end
-harness (`slashit-e2e`), is never published, and is not checked by preflight.
-Leave it alone unless you have a reason.
 
 ## 2. Choose a version the Windows installer accepts
 
@@ -122,11 +120,48 @@ and tag again. Never move a tag that has already produced a published release.
 
 `.github/workflows/release.yml`, triggered by the `v*` tag push:
 
-1. **`preflight`** (Ubuntu, seconds, no build) — the tag matches
-   `tauri.conf.json`; all four manifests match it; the version is packageable
-   as an MSI; `CHANGELOG.md` has a `## [<version>]` section and its
-   `[<version>]: https://` link. Everything else
-   waits on this job.
+1. **`preflight`** (Ubuntu, seconds, no build) — runs
+   `scripts/release-preflight.sh "$TAG"`, which checks that the tag matches
+   `tauri.conf.json`; that every version manifest matches it; that the version is
+   packageable as an MSI; that `CHANGELOG.md` has a `## [<version>]` section and
+   its `[<version>]: https://` link; and that `.github/release-channels.txt`
+   declares the version's channel. It writes the channel as the job output that
+   sets the release's `prerelease` flag. Everything else waits on this job.
+
+### Release channels
+
+`.github/release-channels.txt` names the channel of every version the workflow
+may publish, one line each: `<version> prerelease` or `<version> stable`. The
+channel is read from that file and from nothing else. The tag's shape does not
+decide it, so `v0.0.1` has no hyphen and is still a prerelease only because the
+file says so.
+
+The preflight job fails closed:
+
+- a version with no line, or with two, is refused;
+- a channel other than `prerelease` or `stable` is refused;
+- a version with a prerelease suffix (`0.1.0-1`) must be a prerelease, so a
+  numeric suffix cannot publish as a stable release.
+
+A prerelease is published with `prerelease: true`. GitHub never marks it
+`latest`, so `releases/latest/download/latest.json` does not point at it, and
+the updater never offers it. Installed prereleases are offered the next stable
+release. Declare a stable version in the same commit that prepares its CHANGELOG
+section, and check the file's line before you tag.
+
+`scripts/test-release-preflight.sh` runs the script against the repository and
+against fixture trees, so a change to the checks can be tested locally:
+
+```bash
+scripts/test-release-preflight.sh
+```
+
+To check a tag without pushing it, run the script with the tag and read the
+channel it prints:
+
+```bash
+scripts/release-preflight.sh v0.0.1
+```
 2. **`release`** (four runners in parallel) — builds the frontend with Trunk
    and the app with `tauri-action`, then creates or updates a **draft** release
    and uploads each platform's installers plus `latest.json`, the updater
@@ -201,7 +236,9 @@ that is the human's job:
   then correct the CHANGELOG if they differ.
 
 Then publish the release on GitHub. The prerelease flag is already set from the
-tag, so there is nothing to adjust — press Publish.
+channel the preflight job read, so there is nothing to adjust. Check that the
+release page says "Pre-release" for a version declared `prerelease`, and does
+not for a `stable` one, then press Publish.
 
 ## 6. Validate auto-update
 
@@ -262,6 +299,9 @@ from a compromised download.
 
 ## 8. Before the first release
 
-`0.1.0` has never been published. Until it is, the README's Releases link goes
-to an empty page and the updater endpoint resolves to nothing — both expected,
-neither a bug.
+Nothing has been published. The first tag planned is `v0.0.1`, a prerelease
+declared in `.github/release-channels.txt`, which testers install by hand.
+`0.1.0` is the first stable release and follows it. Until a stable release is
+published, the README's Releases link goes to an empty page or to the
+prerelease page, and the updater endpoint resolves to nothing. Both are expected,
+neither is a bug.

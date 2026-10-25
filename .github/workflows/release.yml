@@ -22,70 +22,20 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      channel: ${{ steps.version.outputs.channel }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Validate the release version
+      - name: Validate the release version and choose its channel
         id: version
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-
-          fail() { echo "::error::$*"; exit 1; }
-
-          version="$(jq -er '.version' src-tauri/tauri.conf.json)"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tauri.conf.json version: $version"
-          echo "pushed tag:              $TAG"
-
-          # 1. The tag names the release; tauri.conf.json defines what gets
-          #    built. If they disagree the release is mislabelled, so refuse
-          #    rather than pick a winner.
-          if [ "$TAG" != "v$version" ]; then
-            fail "Tag $TAG does not match the app version $version in src-tauri/tauri.conf.json (expected tag v$version). Bump every version listed in docs/releasing.md, then retag."
-          fi
-
-          # 2. Every workspace manifest ships in the same release; a stale one
-          #    means `slashit --version` disagrees with the installer.
-          for manifest in Cargo.toml src-tauri/Cargo.toml crates/slashit-ipc/Cargo.toml crates/slashit-cli/Cargo.toml; do
-            crate_version="$(grep -m1 '^version = ' "$manifest" | cut -d'"' -f2)"
-            if [ "$crate_version" != "$version" ]; then
-              fail "$manifest is at $crate_version but the release version is $version. See docs/releasing.md."
-            fi
-          done
-
-          # 3. WiX, which builds the MSI, accepts a narrower grammar than
-          #    semver: numeric major.minor.patch, an optional prerelease that
-          #    must be numeric-only, and no build metadata. tauri-bundler maps
-          #    0.1.0-1 to the WiX version 0.1.0.1 and hard-errors on
-          #    0.1.0-rc.1. bundle.targets is "all" and MSI is attempted before
-          #    NSIS, so a rejected version costs the whole Windows job.
-          if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9]+))?$ ]]; then
-            fail "Version $version cannot be packaged as an MSI. Use major.minor.patch with an optional numeric prerelease (0.1.0-1), not a named one (0.1.0-rc.1), and no build metadata. See docs/releasing.md."
-          fi
-          [ "${BASH_REMATCH[1]}" -le 255 ]   || fail "MSI: major version must be <= 255 (got ${BASH_REMATCH[1]})."
-          [ "${BASH_REMATCH[2]}" -le 255 ]   || fail "MSI: minor version must be <= 255 (got ${BASH_REMATCH[2]})."
-          [ "${BASH_REMATCH[3]}" -le 65535 ] || fail "MSI: patch version must be <= 65535 (got ${BASH_REMATCH[3]})."
-          if [ -n "${BASH_REMATCH[5]}" ]; then
-            [ "${BASH_REMATCH[5]}" -le 65535 ] || fail "MSI: prerelease number must be <= 65535 (got ${BASH_REMATCH[5]})."
-          fi
-
-          # 4. The release text leads with the curated CHANGELOG.md section for
-          #    this version. Without it, the release would point readers at an
-          #    [Unreleased] section that says nothing has shipped yet.
-          if ! grep -Fq -- "## [$version]" CHANGELOG.md; then
-            fail "CHANGELOG.md has no '## [$version]' section. Move the [Unreleased] entries under the new version, then retag. See docs/releasing.md."
-          fi
-
-          # 5. The version's reference link at the foot of CHANGELOG.md names
-          #    its tag or its comparison with the previous tag. Tags never move,
-          #    so the link stays valid after publication.
-          if ! grep -Fq -- "[$version]: https://" CHANGELOG.md; then
-            fail "CHANGELOG.md has no '[$version]: https://' link definition at its foot. Add it, pointing at the tag or at the comparison with the previous tag. See docs/releasing.md."
-          fi
-
-          echo "Version $version is releasable."
+          # The checks and the channel rule live in the script, so they can be
+          # run locally: scripts/test-release-preflight.sh. The channel comes
+          # from .github/release-channels.txt, never from the tag's shape.
+          scripts/release-preflight.sh "$TAG"
 
   release:
     needs: preflight
@@ -169,10 +119,11 @@ jobs:
           # Publish. Note that a draft is invisible to the updater endpoint --
           # see the summary printed by the next job.
           releaseDraft: true
-          # A tag containing a hyphen is a prerelease by semver (v0.1.0-1).
-          # Hard-coding false would publish a release candidate as the latest
+          # The channel the preflight job read from .github/release-channels.txt.
+          # A prerelease is never marked latest, so it cannot become the release
+          # the updater's latest.json points at. Anything but "prerelease" is a
           # stable release.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ needs.preflight.outputs.channel == 'prerelease' }}
           args: ${{ matrix.args }}
           uploadUpdaterJson: true
 
@@ -190,7 +141,7 @@ jobs:
       - name: Explain what still has to happen by hand
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
-          IS_PRERELEASE: ${{ contains(github.ref_name, '-') }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.channel == 'prerelease' }}
         run: |
           set -euo pipefail
           {

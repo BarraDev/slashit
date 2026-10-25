@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.1.0]
 
-The first public release of SlashIt.
+The first stable release of SlashIt. It follows the 0.0.1 prerelease and offers the same features.
 
 **Installing.** Download the installer for your platform from the GitHub
 release page: the `.deb`, `.rpm` or `.AppImage` on Linux, the `.dmg` on macOS
@@ -88,5 +88,21 @@ from the release page.
   `docs/`. A contribution guide, a code of conduct and a security policy are at
   the repository root.
 
+## [0.0.1]
+
+A prerelease for testers. It has the features listed under 0.1.0. It is
+installed by hand. GitHub does not mark a prerelease as the latest release, so
+the auto-updater never offers it. An installed 0.0.1 is offered the next stable
+release.
+
+Known gaps in this prerelease:
+
+- The Windows (MSI, NSIS) and macOS (DMG) installers, and the RPM package, have
+  not been installed and upgraded on their own platforms.
+- The builds are not code-signed, so Windows SmartScreen and macOS Gatekeeper
+  warn on first launch.
+- The updater's signature check runs only in hosted CI.
+
 [0.1.0]: https://github.com/BarraDev/slashit/releases/tag/v0.1.0
-[Unreleased]: https://github.com/BarraDev/slashit/compare/v0.1.0...HEAD
+[0.0.1]: https://github.com/BarraDev/slashit/releases/tag/v0.0.1
+[Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.1...HEAD
