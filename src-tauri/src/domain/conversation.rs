@@ -849,6 +849,10 @@ impl Conversation {
         self.coordinator_projection_before(current_message, project_name, project_root, tasks, None)
     }
 
+    /// `tasks` is the Project's whole Task index in the order it should be
+    /// listed. The projection keeps the first `TASK_INDEX_LIMIT` and states the
+    /// total, so the Coordinator knows when the index is partial and can page
+    /// with `list_tasks`.
     pub fn coordinator_projection_before(
         &self,
         current_message: &str,
@@ -883,6 +887,8 @@ impl Conversation {
             "history_semantics": HISTORY_SEMANTICS,
             "recent_history": recent,
             "tasks": tasks.iter().take(TASK_INDEX_LIMIT).collect::<Vec<_>>(),
+            "tasks_total": tasks.len(),
+            "tasks_truncated": tasks.len() > TASK_INDEX_LIMIT,
         })
     }
 }
@@ -1011,6 +1017,25 @@ mod tests {
         assert_eq!(decision["decision"], "rejected");
         assert_eq!(decision["scope"], "this_proposal_only");
         assert_eq!(projection["current_message"], "Add it again");
+    }
+
+    #[test]
+    fn task_index_states_when_the_projection_leaves_tasks_out() {
+        let conversation = Conversation::new(Uuid::new_v4());
+        let tasks: Vec<serde_json::Value> = (0..TASK_INDEX_LIMIT + 5)
+            .map(|position| serde_json::json!({ "position": position }))
+            .collect();
+
+        let partial = conversation.coordinator_projection("hi", "Project", None, &tasks);
+        assert_eq!(partial["tasks"].as_array().unwrap().len(), TASK_INDEX_LIMIT);
+        assert_eq!(partial["tasks"][0]["position"], 0);
+        assert_eq!(partial["tasks_total"], TASK_INDEX_LIMIT + 5);
+        assert_eq!(partial["tasks_truncated"], true);
+
+        let complete = conversation.coordinator_projection("hi", "Project", None, &tasks[..3]);
+        assert_eq!(complete["tasks"].as_array().unwrap().len(), 3);
+        assert_eq!(complete["tasks_total"], 3);
+        assert_eq!(complete["tasks_truncated"], false);
     }
 
     #[test]
