@@ -132,7 +132,12 @@ and tag again. Never move a tag that has already produced a published release.
    and uploads each platform's installers plus `latest.json`, the updater
    manifest. The Linux runner first runs `cargo build -p slashit --release`,
    because the `.deb` and `.rpm` packages copy that CLI binary to
-   `/usr/bin/slashit`. The macOS and Windows installers do not include the CLI.
+   `/usr/bin/slashit`. The Linux packages (`.deb`, `.rpm`, `.AppImage`) also carry
+   `slashitd`, built from the `slashit-ui` package and bundled without a
+   `tauri.conf.json` entry, so a change to the bin layout can drop it silently;
+   section 5 says what to check. The macOS
+   and Windows installers do not include the CLI, and whether they include
+   `slashitd` is checked on the artifacts, not assumed.
 3. **`next-steps`** — writes the remaining manual steps into the run summary,
    including whether this particular version will be reachable by the updater.
 
@@ -187,6 +192,13 @@ that is the human's job:
 - Linux: install the `.deb` or `.rpm`, or run the `.AppImage`.
 - macOS: mount the `.dmg`, drag, launch. Gatekeeper will warn — see below.
 - Windows: run the `.msi` and the NSIS `.exe`. SmartScreen will warn.
+- Payload, for every artifact: the `.deb` and `.rpm` contain `usr/bin/slashit`,
+  `usr/bin/slashitd` and `usr/bin/slashit-ui`, and no package contains
+  `acp_fixture_agent`. List the `.deb` and `.rpm` with `bsdtar -tf`. Extract the
+  `.AppImage` with `--appimage-extract` into an empty directory and list
+  `squashfs-root/usr/bin`, which should hold `slashitd` and `slashit-ui` but not
+  `slashit`. Check the macOS and Windows artifacts for `slashitd` the same way,
+  then correct the CHANGELOG if they differ.
 
 Then publish the release on GitHub. The prerelease flag is already set from the
 tag, so there is nothing to adjust — press Publish.

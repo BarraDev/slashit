@@ -95,7 +95,7 @@ There are none yet. The first tagged release will publish these to [GitHub Relea
 | macOS | `.dmg` |
 | Windows | `.msi`, `.exe` |
 
-The `.deb` and `.rpm` packages also install the `slashit` CLI at `/usr/bin/slashit`. The AppImage, macOS and Windows installers do not include it; build it with `cargo build -p slashit --release` (see [Build from Source](#build-from-source)).
+The Linux packages (`.deb`, `.rpm` and `.AppImage`) include the `slashitd` daemon. The `.deb` and `.rpm` packages also install the `slashit` CLI at `/usr/bin/slashit`. The AppImage, macOS and Windows installers do not include the CLI; build it with `cargo build -p slashit --release` (see [Build from Source](#build-from-source)). On macOS and Windows, build `slashitd` from source as well.
 
 Installers are not code-signed yet, so the first launch will show a SmartScreen or Gatekeeper warning. [`docs/releasing.md`](docs/releasing.md) explains exactly what is and is not signed.
 

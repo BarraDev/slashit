@@ -62,8 +62,9 @@ from the release page.
   apply the approved fixes in one pass. Replies can be posted back on the pull
   request.
 - **Headless daemon.** The `slashitd` binary runs the control channel and the
-  task queue without a window or webview. The installers do not include it; build
-  it from source with `cargo build -p slashit-ui --bin slashitd --release`.
+  task queue without a window or webview. The Linux packages (`.deb`, `.rpm` and
+  `.AppImage`) include it. Elsewhere, build it from source with
+  `cargo build -p slashit-ui --bin slashitd --release`.
 - **Control channel and CLI.** The `slashit` command-line client controls the
   running app from a terminal or a script. The `.deb` and `.rpm` packages install
   it at `/usr/bin/slashit`; the AppImage, macOS and Windows installers do not, so
