@@ -405,6 +405,74 @@ The merged checkpoints stay in the store as visible commits. While the remote
 branch exists, `bookmark forget` leaves it as an untracked remote bookmark,
 which makes those commits immutable. Both are expected.
 
+### Retire remote branches
+
+Deleting a remote branch requires the repository owner's explicit approval for
+that deletion, every time (section 13). This procedure does not grant it, and an
+approval given for other references does not carry over.
+
+Deleting a remote branch changes local JJ state at the next `jj git fetch`.
+JJ drops the remote-tracking bookmark and any local bookmark that tracked it,
+and it abandons commits that nothing else reaches. A squash merge does not make
+the pre-squash commits disposable: once the branch is gone, they exist only in
+the local store. Run JJ through the pinned binary (`mise exec -- jj`). In the
+canonical root, inspect with `--ignore-working-copy` as section 5 describes. That
+flag reads the last snapshot, so it can miss files edited in a developer
+workspace since its last JJ command; step 3 covers workspaces. Follow this order
+for each deleted or to-be-deleted branch:
+
+1. Record a baseline and keep it with the report: the visible history
+   (`mise exec -- jj --ignore-working-copy log -r '::visible_heads()' --no-graph -T 'commit_id ++ "\n"'`),
+   the workspace list (`mise exec -- jj --ignore-working-copy workspace list`),
+   the bookmark list (`mise exec -- jj --ignore-working-copy bookmark list -a`),
+   and `mise exec -- jj --ignore-working-copy log -r 'conflicts() | divergent()'`.
+2. Inventory the name and record each head commit ID:
+   `mise exec -- jj --ignore-working-copy bookmark list -a exact:<name> -T 'name ++ " " ++ if(remote, remote, "-") ++ " " ++ if(conflict, "CONFLICT", "ok") ++ " " ++ if(normal_target, normal_target.commit_id(), "none") ++ "\n"'`.
+   Once the name is forgotten, the commit ID is the only way to refer to the
+   head. If any row reads `CONFLICT`, stop before step 4 and report it: a
+   conflicted bookmark has no single head to preserve. Note any divergent change.
+3. Check each head against every workspace and against unpublished work. List
+   the workspaces with `mise exec -- jj --ignore-working-copy workspace list`,
+   then run `mise exec -- jj --ignore-working-copy log -r '((<head>:: | ::<head>) & ::<slug>@) ~ ::main'`
+   for each `<slug>`, and `mise exec -- jj --ignore-working-copy log -r '(<head>:: ~ <head>) ~ ::main'`
+   for unpublished descendants. A
+   non-empty result protects the head. Do not forget or delete a protected head;
+   record it in the report and wait for the repository owner's decision.
+   A workspace's `@` is only as current as its last snapshot. For each workspace
+   the query involves, its owner must confirm that the working copy is current:
+   the owner runs `mise exec -- jj status` there and records the output. Do not run an
+   ordinary JJ command in a workspace you do not own, because it snapshots that
+   workspace. A head is protected if an unconfirmed workspace shows any relation
+   to it.
+4. Preserve the heads before anything is forgotten. Fetch them by SHA into a
+   disposable bare repository (`git fetch <canonical .git> <sha>...`; verified
+   with the pinned Git), name each with `git update-ref refs/archive/<name> <sha>`,
+   and run `git -C <scratch-repo> bundle create <file> --all`, where the scratch
+   repository is outside the canonical repository and holds only the archive
+   refs. Run `git bundle verify`, restore the bundle into a second disposable repository,
+   and compare each restored SHA and tree with the original. Stop if any check
+   fails.
+5. Forget the exact names: `mise exec -- jj bookmark forget --include-remotes exact:<name> ...`.
+   Confirm first that the step 2 listing matches only the intended rows. Do not
+   use `bookmark delete`, which schedules a remote deletion on the next push; do
+   not use `abandon`; do not use glob patterns.
+6. Delete the remote branch after step 5 and before any fetch. Do not fetch while
+   a forgotten branch is still live on the remote: the fetch imports it back as
+   an untracked `origin` bookmark. If that happened, repeat step 5 before
+   deleting.
+7. Fetch, then compare with the baseline from step 1: the visible history, the
+   workspace list, the bookmarks you keep, and the conflicts and divergent
+   changes. Any commit that leaves the visible history, or any new conflict, is
+   a stop.
+
+Keep other writers out of the store. Run `mise exec -- jj --ignore-working-copy op log --limit 3` before each step,
+and stop if an operation you did not start appears. Rehearse a non-trivial
+sequence in a disposable colocated repository with a local bare remote
+(section 9), including a deleted branch whose commit only it reaches. A rehearsal
+proves the mechanism, not your repository's state, so still run steps 1 to 7 on
+the real one. Do not restore an earlier operation with `jj op restore` until you
+have shown that nothing done since would be overwritten.
+
 ## 6. Colocated Git/JJ safety
 
 The canonical root is colocated: `.jj` and `.git` describe the same
