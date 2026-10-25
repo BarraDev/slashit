@@ -31,3 +31,20 @@ pub use worktrees::*;
 pub use workspaces::*;
 pub use github_issues::*;
 pub use github_prs::*;
+
+/// Pages whose feature is not built yet. They stay compiled and routable, but
+/// the sidebar and the keyboard shortcuts do not offer them.
+pub const UNFINISHED_PAGES: [&str; 4] = ["worktrees", "ideation", "changelog", "mcp"];
+
+/// Set to show the unfinished pages again. Keep it false until they work.
+pub const SHOW_UNFINISHED_PAGES: bool = false;
+
+/// Whether the navigation offers `page` to the person.
+pub fn page_offered(page: &str) -> bool {
+    SHOW_UNFINISHED_PAGES || !UNFINISHED_PAGES.contains(&page)
+}
+
+/// Roadmap controls for features that are not built yet: the Edit button has
+/// no handler, and Convert to task calls a command the backend does not
+/// register. Keep false until both work.
+pub const SHOW_UNFINISHED_FEATURES: bool = false;

@@ -450,8 +450,9 @@ async fn answer_human_message(
         .filter(|task| task.project_id == project_id)
         .collect();
     project_tasks.sort_by_key(|task| task.id);
+    // The whole Project index goes to the projection, which keeps the first
+    // page and reports the total, so a partial index is never mistaken for all Tasks.
     let task_index: Vec<_> = project_tasks.into_iter()
-        .take(crate::domain::conversation::TASK_INDEX_LIMIT)
         .map(|task| serde_json::json!({"id":task.id,"title":task.title,"status":task.status,"priority":task.priority,"category":task.category}))
         .collect();
     drop(tasks);

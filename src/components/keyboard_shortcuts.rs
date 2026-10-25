@@ -3,6 +3,7 @@ use leptos::web_sys;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use leptos::callback::Callback;
+use crate::pages::page_offered;
 
 pub fn setup_keyboard_shortcuts(
     set_current_page: WriteSignal<String>,
@@ -69,7 +70,7 @@ pub fn setup_keyboard_shortcuts(
                     event.prevent_default();
                     set_current_page.set("context".to_string());
                 }
-                "5" => {
+                "5" if page_offered("ideation") => {
                     event.prevent_default();
                     set_current_page.set("ideation".to_string());
                 }

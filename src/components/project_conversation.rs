@@ -1,6 +1,8 @@
 use crate::components::attention::AttentionChip;
+use crate::components::task_activity::{compact_time, local_offset_at, OffsetAt};
 use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationExecution, ConversationExecutionResult, ConversationExecutionState, ConversationFieldChange, ConversationHumanAction, ConversationProjectAction, ConversationProjectActionOutcome, ConversationProjectActionStatus, ConversationRole, ConversationSnapshot, ConversationTaskMutation};
 use crate::services::conversation_service;
+use chrono::{DateTime, Utc};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::collections::HashMap;
@@ -17,6 +19,23 @@ const UNCONFIRMED_STABLE_REFRESHES: u32 = 100;
 
 fn should_poll_snapshot(busy: bool, coordinator_live: bool, worker_live: bool) -> bool {
     busy || coordinator_live || worker_live
+}
+
+/// How far above the end of the history the reader may be and still follow new
+/// entries. The same slack the task drawer's output uses.
+const FOLLOW_LATEST_SLACK_PX: i32 = 24;
+
+/// Whether the history is scrolled to its newest entry, close enough to keep
+/// following it as new entries arrive.
+fn is_at_latest(scroll_top: i32, scroll_height: i32, client_height: i32) -> bool {
+    scroll_top + client_height >= scroll_height - FOLLOW_LATEST_SLACK_PX
+}
+
+/// When an entry was saved, in the form the Task timeline uses. Nothing is shown
+/// for a timestamp that does not parse, rather than a wrong one.
+fn entry_time(created_at: &str, now: DateTime<Utc>, offset_at: OffsetAt<'_>) -> Option<String> {
+    let at = DateTime::parse_from_rfc3339(created_at).ok()?.with_timezone(&Utc);
+    Some(compact_time(at, offset_at, now))
 }
 
 fn has_unmediated_worker_result(snapshot: &ConversationSnapshot) -> bool {
@@ -336,6 +355,28 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         }
     });
 
+    // The history follows its newest entry until the Human scrolls up to read
+    // earlier ones. "Jump to latest" and sending a message bring it back.
+    let history_ref = NodeRef::<leptos::html::Div>::new();
+    let (following_latest, set_following_latest) = signal(true);
+    let scroll_to_latest = move || {
+        if let Some(el) = history_ref.try_get_untracked().flatten() {
+            el.set_scroll_top(el.scroll_height());
+        }
+    };
+    // The entries render from the same snapshot, so the scroll waits one tick for the new height.
+    Effect::new(move |_| {
+        snapshot.track();
+        if following_latest.get_untracked() {
+            gloo_timers::callback::Timeout::new(0, scroll_to_latest).forget();
+        }
+    });
+    let on_history_scroll = move |_| {
+        if let Some(el) = history_ref.try_get_untracked().flatten() {
+            set_following_latest.set(is_at_latest(el.scroll_top(), el.scroll_height(), el.client_height()));
+        }
+    };
+
 
     let initial_id = project_id.clone();
     let initial_begin_request = begin_snapshot_request.clone();
@@ -413,6 +454,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         if message.is_empty() || busy.get_untracked() { return; }
         let revision_before = snapshot.get_untracked().map(|value| value.conversation.revision);
         set_draft.set(String::new()); set_busy.set(true); set_error.set(None);
+        set_following_latest.set(true);
         let id = send_id.clone();
         let request = send_begin_request.run(());
         let publish = send_publish.clone();
@@ -561,12 +603,17 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         <button data-testid="conversation-stop" class="rounded-md border border-red-400/40 px-3 py-1 text-sm text-red-200" on:click=move |_| { let id = stop_id.get_value(); spawn_local(async move { if let Err(error) = conversation_service::stop_project_conversation(id).await { set_error.set(Some(error)); } }); }>"Stop run"</button>
                     </Show>
                 </header>
-                <div class="mb-3 min-h-0 flex-1 space-y-2 overflow-y-auto" data-testid="conversation-history">
+                <div class="mb-3 min-h-0 flex-1 space-y-2 overflow-y-auto" data-testid="conversation-history" node_ref=history_ref on:scroll=on_history_scroll>
+                    {move || snapshot.get().is_some_and(|value| value.conversation.entries.is_empty()).then(|| view! {
+                        <p data-testid="conversation-empty" class="text-sm text-white/50">"No messages yet. Ask the Coordinator about this Project or its Tasks. It can propose changes, and you approve each one before SlashIt applies it."</p>
+                    })}
                     {move || snapshot.get().map(|value| {
                         let actions = value.conversation.actions;
                         let project_actions = value.conversation.project_actions;
                         let executions = executions.get();
+                        let now = Utc::now();
                         value.conversation.entries.into_iter().flat_map(|entry| {
+                            let when = entry_time(&entry.created_at, now, &local_offset_at);
                             let applied = match &entry.kind { ConversationEntryKind::ProjectActionApplied { action_id, .. } => Some(*action_id), _ => None };
                             let (testid, text) = match entry.kind {
                                 ConversationEntryKind::HumanMessage { text } | ConversationEntryKind::CoordinatorReply { text } => ("conversation-message", Some(text)),
@@ -579,7 +626,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                 ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", project_action_event_text(kind, &project_actions)),
                             };
                             let role = match entry.role { ConversationRole::Human => "You", ConversationRole::Coordinator => "Coordinator", ConversationRole::Worker => "Worker" };
-                            let event = text.map(|text| view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 text-xs font-medium text-white/50">{role}</div><div class="whitespace-pre-wrap text-sm text-white/90">{text}</div></article> }.into_any());
+                            let event = text.map(|text| view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 flex items-baseline justify-between gap-2 text-xs font-medium text-white/50"><span>{role}</span><span data-testid="conversation-entry-time" class="font-normal text-white/40">{when}</span></div><div class="whitespace-pre-wrap text-sm text-white/90">{text}</div></article> }.into_any());
                             // The run an approval started appears beside the event that applied it, so the history keeps it after the proposal card is gone.
                             let card = applied.and_then(|action_id| executions.iter().find(|execution| execution.action_id == action_id).cloned()).map(|execution| {
                                 let approval = approval_text(project_actions.iter().find(|action| action.id == execution.action_id));
@@ -589,6 +636,13 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         }).collect_view()
                     })}
                 </div>
+                {move || {
+                    (!following_latest.get() && snapshot.get().is_some_and(|value| !value.conversation.entries.is_empty())).then(|| view! {
+                        <div class="mb-2 flex shrink-0 justify-center">
+                            <button data-testid="conversation-jump-latest" class="rounded-full border border-white/20 bg-zinc-900 px-3 py-1 text-xs text-white/80" on:click=move |_| { set_following_latest.set(true); scroll_to_latest(); }>"Jump to latest"</button>
+                        </div>
+                    })
+                }}
                 <div class="mb-3 max-h-[40%] shrink-0 space-y-2 overflow-y-auto">
                     <For
                         each=move || snapshot.get().map(|value| value.conversation.actions.into_iter().filter(|action| retired_delegation_controls(action.status).is_some()).collect::<Vec<_>>()).unwrap_or_default()
@@ -709,6 +763,22 @@ mod tests {
         assert!(should_poll_snapshot(false, false, true));
         assert!(should_poll_snapshot(true, false, false));
         assert!(!should_poll_snapshot(false, false, false));
+    }
+
+    #[test]
+    fn the_history_keeps_following_the_newest_entry_only_near_its_end() {
+        assert!(is_at_latest(0, 500, 500));
+        assert!(is_at_latest(100, 500, 380));
+        assert!(!is_at_latest(0, 500, 400));
+    }
+
+    #[test]
+    fn an_entry_time_is_shown_in_the_timeline_form_or_not_at_all() {
+        let utc = |_: DateTime<Utc>| chrono::FixedOffset::east_opt(0).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-10-25T12:00:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(entry_time("2026-10-25T08:30:00.123456789Z", now, &utc).as_deref(), Some("08:30"));
+        assert_eq!(entry_time("2026-10-24T09:05:00Z", now, &utc).as_deref(), Some("Oct 24 09:05"));
+        assert_eq!(entry_time("", now, &utc), None);
     }
 
     #[test]

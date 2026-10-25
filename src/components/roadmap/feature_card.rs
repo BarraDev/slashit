@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use uuid::Uuid;
+use crate::pages::SHOW_UNFINISHED_FEATURES;
 
 #[component]
 pub fn FeatureCard(
@@ -41,15 +42,17 @@ pub fn FeatureCard(
             <div class="flex items-start justify-between gap-3 mb-3">
                 <h3 class="font-semibold text-white/90 flex-1">{title}</h3>
                 <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button
-                        on:click=move |_| on_edit.run(feature_id)
-                        class="p-1.5 rounded-lg hover:bg-white/10 text-white/40 hover:text-white/60 transition-colors"
-                        title="Edit feature"
-                    >
-                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                        </svg>
-                    </button>
+                    {SHOW_UNFINISHED_FEATURES.then(|| view! {
+                        <button
+                            on:click=move |_| on_edit.run(feature_id)
+                            class="p-1.5 rounded-lg hover:bg-white/10 text-white/40 hover:text-white/60 transition-colors"
+                            title="Edit feature"
+                        >
+                            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                            </svg>
+                        </button>
+                    })}
                     <button
                         on:click=move |_| on_delete.run(feature_id)
                         class="p-1.5 rounded-lg hover:bg-red-500/10 text-white/40 hover:text-red-300 transition-colors"
@@ -120,6 +123,7 @@ pub fn FeatureCard(
             </Show>
 
             <div class="flex items-center justify-between pt-3 border-t border-white/5">
+                {SHOW_UNFINISHED_FEATURES.then(|| view! {
                 <button
                     disabled=move || converting.get() || has_linked_tasks
                     on:click=move |_| {
@@ -152,6 +156,7 @@ pub fn FeatureCard(
                     }}
                     <span>{move || if converting.get() { "Converting..." } else { "Convert to Task" } }</span>
                 </button>
+                })}
 
                 <div class="flex items-center gap-1.5 text-xs text-white/40">
                     {move || if has_linked_tasks {

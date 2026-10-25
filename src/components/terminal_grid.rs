@@ -32,6 +32,12 @@ pub fn TerminalGrid(
     // Get the selected project from context (fallback to prop)
     let selected_project = use_context::<ReadSignal<String>>();
     let (current_project_id, set_current_project_id) = signal(project_id);
+    // The Project that Invoke All reaches. Empty selects every terminal, the
+    // same set the grid shows when no Project is selected.
+    let invoke_scope = move || {
+        let pid = current_project_id.get_untracked();
+        (!pid.is_empty()).then_some(pid)
+    };
 
     // All terminals (across all projects)
     let (all_terminals, set_all_terminals) = signal(Vec::<TerminalSession>::new());
@@ -288,7 +294,7 @@ pub fn TerminalGrid(
                                         on:click=move |_| {
                                             set_show_invoke_dropdown.set(false);
                                             spawn_local(async move {
-                                                match pty_service::invoke_all_terminals("codebuff").await {
+                                                match pty_service::invoke_all_terminals("codebuff", invoke_scope()).await {
                                                     Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked codebuff on {} terminals", count),
                                                     Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke codebuff: {}", e),
                                                 }
@@ -303,7 +309,7 @@ pub fn TerminalGrid(
                                         on:click=move |_| {
                                             set_show_invoke_dropdown.set(false);
                                             spawn_local(async move {
-                                                match pty_service::invoke_all_terminals("claude").await {
+                                                match pty_service::invoke_all_terminals("claude", invoke_scope()).await {
                                                     Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked claude on {} terminals", count),
                                                     Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke claude: {}", e),
                                                 }
@@ -332,7 +338,7 @@ pub fn TerminalGrid(
                                                         if !cmd.is_empty() {
                                                             set_show_invoke_dropdown.set(false);
                                                             spawn_local(async move {
-                                                                match pty_service::invoke_all_terminals(&cmd).await {
+                                                                match pty_service::invoke_all_terminals(&cmd, invoke_scope()).await {
                                                                     Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked '{}' on {} terminals", cmd, count),
                                                                     Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke '{}': {}", cmd, e),
                                                                 }
@@ -349,7 +355,7 @@ pub fn TerminalGrid(
                                                     if !cmd.is_empty() {
                                                         set_show_invoke_dropdown.set(false);
                                                         spawn_local(async move {
-                                                            match pty_service::invoke_all_terminals(&cmd).await {
+                                                            match pty_service::invoke_all_terminals(&cmd, invoke_scope()).await {
                                                                 Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked '{}' on {} terminals", cmd, count),
                                                                 Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke '{}': {}", cmd, e),
                                                             }
@@ -471,7 +477,8 @@ pub fn TerminalGrid(
                                             let height = height_class.to_string();
                                             let session_id = if terminal.id.is_empty() { None } else { Some(terminal.id.clone()) };
                                             let term_working_dir = terminal.working_directory.clone();
-                                            
+                                            let term_project_id = terminal.project_id.clone();
+
                                             let on_session_created = {
                                                 let term_id_for_close = term_id.clone();
                                                 Callback::new(move |new_session_id: Option<String>| {
@@ -504,6 +511,7 @@ pub fn TerminalGrid(
                                                         name=term_name_for_view
                                                         session_id=session_id
                                                         working_directory=term_working_dir
+                                                        project_id=term_project_id
                                                         on_session_created=on_session_created
                                                         on_close=on_close
                                                     />

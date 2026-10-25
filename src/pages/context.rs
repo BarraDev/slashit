@@ -98,12 +98,12 @@ pub fn Context(
         <div class="space-y-6">
             <div class="flex items-center justify-between">
                 <div>
-                    <h1 class="text-2xl font-bold text-white/90">"Context Management"</h1>
+                    <h1 class="text-2xl font-bold text-white/90">"Context Files"</h1>
                     <p class="text-sm text-white/40 mt-1">
                         {move || if let Some(p) = project_path.get() {
-                            format!("Project files: {}", p)
+                            format!("Read-only view of the project root: {}. Instruction and context files such as AGENTS.md and CLAUDE.md are listed here.", p)
                         } else {
-                            "Select a project to view context files".to_string()
+                            "Select a project to view its context files".to_string()
                         }}
                     </p>
                 </div>
@@ -166,8 +166,11 @@ pub fn Context(
                                             let path_click = file.path.clone();
                                             view! {
                                                 <button
+                                                    // Folders cannot be previewed, so their rows do not look clickable.
+                                                    disabled=is_dir
                                                     class=move || format!(
-                                                        "w-full px-6 py-3 text-left hover:bg-white/5 transition-colors flex items-center gap-3 {}",
+                                                        "w-full px-6 py-3 text-left flex items-center gap-3 {} {}",
+                                                        if is_dir { "cursor-default" } else { "hover:bg-white/5 transition-colors" },
                                                         if is_selected() { "bg-white/5 border-l-2 border-yellow-400" } else { "" }
                                                     )
                                                     on:click=move |_| {

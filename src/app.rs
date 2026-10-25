@@ -1,4 +1,4 @@
-use crate::components::{provide_updater_context, AppLayout, QuitDialog, UpdateBanner};
+use crate::components::{provide_updater_context, setup_keyboard_shortcuts, AppLayout, QuitDialog, UpdateBanner};
 use crate::pages::*;
 use crate::services::get_project;
 use leptos::prelude::*;
@@ -9,7 +9,11 @@ fn get_persisted_page() -> String {
     if let Some(window) = web_sys::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             if let Ok(Some(page)) = storage.get_item("slashit_current_page") {
-                return page;
+                // A page the navigation no longer offers would open with no
+                // sidebar entry to return by, so fall back to the default.
+                if page_offered(&page) {
+                    return page;
+                }
             }
         }
     }
@@ -121,6 +125,10 @@ pub fn App() -> impl IntoView {
             set_current_page.set(page);
         }
     });
+
+    // The Ctrl/Cmd page shortcuts shown in the sidebar. The listener lives for
+    // the whole session, so it is installed once, with this component.
+    setup_keyboard_shortcuts(set_current_page, None, None, None);
 
     view! {
         <QuitDialog />
