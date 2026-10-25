@@ -63,6 +63,20 @@ pub(crate) fn within_root(root: &Path, path: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// The metadata a listing shows for one directory entry. `DirEntry::metadata`
+/// does not follow links, so a link is described by itself by default. A link
+/// whose target lies inside the Project is described by that target, which is
+/// what the read commands open. A link that points outside keeps its own
+/// metadata, so the target's type and size never reach the listing.
+fn listed_metadata(root: &Path, entry: &fs::DirEntry) -> std::io::Result<fs::Metadata> {
+    if entry.file_type()?.is_symlink() && within_root(root, &entry.path().to_string_lossy()).is_ok() {
+        if let Ok(target) = fs::metadata(entry.path()) {
+            return Ok(target);
+        }
+    }
+    entry.metadata()
+}
+
 #[tauri::command]
 pub async fn list_files(
     state: tauri::State<'_, crate::AppState>,
@@ -80,7 +94,7 @@ pub async fn list_files(
 
         for entry in entries {
             let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-            let metadata = entry.metadata().map_err(|e| format!("Failed to read metadata: {}", e))?;
+            let metadata = listed_metadata(&root, &entry).map_err(|e| format!("Failed to read metadata: {}", e))?;
 
             let modified = metadata
                 .modified()
@@ -432,5 +446,36 @@ mod containment_tests {
         std::os::unix::fs::symlink(alpha.join("docs/notes.md"), &link).unwrap();
         let resolved = within_root(&alpha, &link.to_string_lossy()).unwrap();
         assert_eq!(resolved, alpha.join("docs/notes.md").canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    fn listed(root: &Path, name: &str) -> fs::Metadata {
+        let entry = fs::read_dir(root)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.file_name() == name)
+            .unwrap();
+        listed_metadata(root, &entry).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_directory_inside_the_project_is_listed_as_that_directory() {
+        let (_temp, alpha, _beta) = fixture();
+        std::os::unix::fs::symlink(alpha.join("docs"), alpha.join("docs-alias")).unwrap();
+        assert!(listed(&alpha, "docs-alias").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_pointing_outside_the_project_does_not_list_its_target() {
+        let (temp, alpha, _beta) = fixture();
+        std::os::unix::fs::symlink(temp.path(), alpha.join("up")).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("outside.txt"), alpha.join("escape.txt")).unwrap();
+        for name in ["up", "escape.txt"] {
+            let metadata = listed(&alpha, name);
+            assert!(!metadata.is_dir(), "{name} listed as a directory of another Project");
+            assert!(!metadata.is_file(), "{name} listed with a target's size");
+        }
     }
 }
