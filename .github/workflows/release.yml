@@ -130,6 +130,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
+      # The Linux packages ship the `slashit` CLI at /usr/bin/slashit, copied
+      # from target/release by bundle.linux.{deb,rpm}.files. Build it first so
+      # the bundler finds it. macOS and Windows installers do not include it.
+      - name: Build the slashit CLI for the Linux packages
+        if: matrix.platform == 'ubuntu-22.04'
+        run: cargo build -p slashit --release
+
       - name: Build and release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:

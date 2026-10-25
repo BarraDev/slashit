@@ -130,7 +130,9 @@ and tag again. Never move a tag that has already produced a published release.
 2. **`release`** (four runners in parallel) — builds the frontend with Trunk
    and the app with `tauri-action`, then creates or updates a **draft** release
    and uploads each platform's installers plus `latest.json`, the updater
-   manifest.
+   manifest. The Linux runner first runs `cargo build -p slashit --release`,
+   because the `.deb` and `.rpm` packages copy that CLI binary to
+   `/usr/bin/slashit`. The macOS and Windows installers do not include the CLI.
 3. **`next-steps`** — writes the remaining manual steps into the run summary,
    including whether this particular version will be reachable by the updater.
 

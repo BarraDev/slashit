@@ -15,15 +15,16 @@ default-run = "slashit-ui"
 name = "slashit_ui_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-# The fake ACP agent that the ACP v1 tests spawn. A binary rather than an
-# example so that every `cargo test` builds it to the same path. It is a
-# test fixture, not a product binary, and `test`/`doc` are off so no harness
-# runs it.
+# The fake ACP agent that the ACP v1 tests spawn. It is a test fixture, not a
+# product binary: `required-features` keeps it out of every build that does not
+# enable `acp-fixture`, and the dev-dependency on this package below enables it
+# for `cargo test` only. `test`/`doc` are off so no harness runs it.
 [[bin]]
 name = "acp_fixture_agent"
 path = "tests/fixtures/acp_fixture_agent.rs"
 test = false
 doc = false
+required-features = ["acp-fixture"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -98,8 +99,15 @@ rustix = { version = "1", features = ["fs"] }
 # server is the only Rust-only path -- and it has not yet been exercised on
 # real Apple hardware.
 acceptance-webdriver = ["dep:tauri-plugin-wdio-webdriver"]
+# Builds the ACP fake agent binary (`acp_fixture_agent`). Enabled only by the
+# dev-dependency on this package; see the `[[bin]]` entry above.
+acp-fixture = []
 
 [dev-dependencies]
+# TEST-ONLY. Builds this package with `acp-fixture`, so `cargo test` builds
+# `target/<profile>/acp_fixture_agent`. A plain `cargo build` does not enable
+# dev-dependency features (resolver 2), so the binary is not built for it.
+slashit-ui = { path = ".", features = ["acp-fixture"] }
 # TEST-ONLY. Deterministic fault injection for the durable write protocol.
 slashit-durable-fs = { path = "../crates/slashit-durable-fs", features = ["fault-injection"] }
 # TEST-ONLY. `test-util` is what makes `tokio::time::pause` available, so a

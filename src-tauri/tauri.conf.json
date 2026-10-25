@@ -34,6 +34,20 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/bin/slashit": "../target/release/slashit",
+          "/usr/share/doc/slash-it/copyright": "../LICENSE"
+        }
+      },
+      "rpm": {
+        "files": {
+          "/usr/bin/slashit": "../target/release/slashit",
+          "/usr/share/licenses/slash-it/LICENSE": "../LICENSE"
+        }
+      }
+    }
   }
 }
