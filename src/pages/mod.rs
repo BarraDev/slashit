@@ -32,9 +32,11 @@ pub use workspaces::*;
 pub use github_issues::*;
 pub use github_prs::*;
 
-/// Pages whose feature is not built yet. They stay compiled and routable, but
-/// the sidebar and the keyboard shortcuts do not offer them.
-pub const UNFINISHED_PAGES: [&str; 4] = ["worktrees", "ideation", "changelog", "mcp"];
+/// Pages a person cannot yet use. Roadmap has no control to create a feature
+/// (the backend command exists, the UI does not call it), so it has nothing
+/// useful to show. These pages stay compiled and routable, but the sidebar and
+/// the keyboard shortcuts do not offer them.
+pub const UNFINISHED_PAGES: [&str; 5] = ["roadmap", "worktrees", "ideation", "changelog", "mcp"];
 
 /// Set to show the unfinished pages again. Keep it false until they work.
 pub const SHOW_UNFINISHED_PAGES: bool = false;
