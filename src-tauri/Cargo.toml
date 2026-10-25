@@ -60,6 +60,7 @@ slashit-durable-fs = { path = "../crates/slashit-durable-fs" }
 sha2 = "0.10"
 hex = "0.4"
 tauri-plugin-updater = "2"
+reqwest = { version = "0.13", default-features = false }
 # Argument parsing for the `slashitd` binary.
 clap = { version = "4", features = ["derive"] }
 # Embedded W3C WebDriver server, for acceptance builds only. Optional, so a
@@ -108,6 +109,9 @@ slashit-durable-fs = { path = "../crates/slashit-durable-fs", features = ["fault
 # paused-clock machinery.
 tokio = { version = "1", features = ["full", "test-util"] }
 mockall = "0.13"
+# TEST-ONLY. Installs the rustls provider the updater plugin installs before its
+# own requests, so the endpoint probe can run without a preceding plugin check.
+rustls = "0.23"
 # TEST-ONLY. `tauri::test::mock_app` is the only public way to obtain a real
 # `tauri::State<AppState>`: `State` is a newtype over a private reference with
 # no constructor, so a test that wants to drive a `#[tauri::command]` body

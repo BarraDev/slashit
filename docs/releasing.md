@@ -201,8 +201,10 @@ https://github.com/BarraDev/slashit/releases/latest/download/latest.json
 being explicit about, because both look like bugs otherwise:
 
 - While the release is a draft, the endpoint resolves to the previous stable
-  release or, before the first one, to nothing at all. Auto-update starts
-  working when you press Publish, not when the build finishes.
+  release or, before the first one, to a 404. Auto-update starts working when
+  you press Publish, not when the build finishes. Until a stable release is
+  published, `updater_check` reads that 404 as "no update", so no install shows
+  an error. This is the state the first pre-release runs in.
 - A published prerelease is still invisible to the updater. That is the
   intended behaviour — existing installs must not be auto-upgraded onto a
   release candidate — but it means a prerelease has no update channel. Testers

@@ -553,6 +553,108 @@ pub async fn updater_status(
     ))
 }
 
+/// How long the probe waits for one endpoint before reporting it unreachable.
+const ABSENCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run the plugin's check, with one correction the plugin cannot make itself.
+///
+/// The endpoint is `releases/latest`, which GitHub answers with 404 until a
+/// non-draft, non-prerelease release exists. The plugin reports every
+/// non-success response from every endpoint as
+/// [`tauri_plugin_updater::Error::ReleaseNotFound`], a 5xx included, so that
+/// error alone cannot say which state the server is in. Each endpoint is asked
+/// again, and only "every endpoint answered 404" counts as no stable release.
+/// Anything else keeps its error class and is shown as a failure.
+async fn check_for_update(app: &AppHandle) -> Result<Option<Update>, String> {
+    let updater = app.updater().map_err(|e| from_plugin(&e))?;
+    match updater.check().await {
+        Ok(found) => Ok(found),
+        Err(tauri_plugin_updater::Error::ReleaseNotFound) => {
+            let endpoints = endpoints_from_config(app.config().plugins.0.get("updater"))?;
+            absence_verdict(&probe_endpoints(&endpoints).await)?;
+            Ok(None)
+        }
+        Err(error) => Err(from_plugin(&error)),
+    }
+}
+
+/// The endpoints the plugin is configured with, from `plugins.updater` in
+/// `tauri.conf.json`.
+fn endpoints_from_config(section: Option<&serde_json::Value>) -> Result<Vec<reqwest::Url>, String> {
+    let entries = section
+        .and_then(|section| section.get("endpoints"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let urls = entries
+        .iter()
+        .map(|entry| {
+            let text = entry
+                .as_str()
+                .ok_or_else(|| err(UpdaterErrorKind::NotConfigured, "an update endpoint is not a string"))?;
+            reqwest::Url::parse(text).map_err(|error| {
+                err(UpdaterErrorKind::NotConfigured, &format!("the update endpoint {text:?} is not a URL: {error}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if urls.is_empty() {
+        return Err(err(UpdaterErrorKind::NotConfigured, "no update endpoint is configured"));
+    }
+    Ok(urls)
+}
+
+/// The HTTP status each endpoint answers with, or why no answer came.
+///
+/// The client needs a rustls crypto provider, which the plugin installs inside
+/// its own `check()` before it builds a client. [`check_for_update`] calls this
+/// only after that check, so the provider is already in place.
+async fn probe_endpoints(endpoints: &[reqwest::Url]) -> Vec<Result<u16, String>> {
+    let client = match reqwest::Client::builder().timeout(ABSENCE_PROBE_TIMEOUT).build() {
+        Ok(client) => client,
+        Err(error) => return vec![Err(error.to_string())],
+    };
+    let mut answers = Vec::with_capacity(endpoints.len());
+    for url in endpoints {
+        answers.push(match client.get(url.clone()).send().await {
+            Ok(response) => Ok(response.status().as_u16()),
+            Err(error) => Err(error.to_string()),
+        });
+    }
+    answers
+}
+
+/// Decide from the probe's answers whether the endpoints hold no stable
+/// release. Only a 404 from every endpoint says so; `Ok(())` is that verdict.
+fn absence_verdict(answers: &[Result<u16, String>]) -> Result<(), String> {
+    if answers.is_empty() {
+        return Err(err(UpdaterErrorKind::NotConfigured, "no update endpoint is configured"));
+    }
+    for answer in answers {
+        match answer {
+            Ok(404) => {}
+            Ok(status @ 200..=299) => {
+                return Err(err(
+                    UpdaterErrorKind::Metadata,
+                    &format!("the update endpoint answered HTTP {status}, but the updater found no release in it"),
+                ));
+            }
+            Ok(status) => {
+                return Err(err(
+                    UpdaterErrorKind::Network,
+                    &format!("the update endpoint answered HTTP {status}, so the check did not complete"),
+                ));
+            }
+            Err(error) => {
+                return Err(err(
+                    UpdaterErrorKind::Network,
+                    &format!("the update endpoint could not be reached: {error}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Ask the release endpoint whether something newer exists.
 ///
 /// Runs even on an install that cannot apply an update: reading the manifest
@@ -571,8 +673,7 @@ pub async fn updater_check(
     }
 
     let current_version = app.package_info().version.to_string();
-    let updater = app.updater().map_err(|e| from_plugin(&e))?;
-    let found = updater.check().await.map_err(|e| from_plugin(&e))?;
+    let found = check_for_update(&app).await?;
 
     // Recorded only on success. A timestamp that says "checked a minute ago"
     // after a failed check would read as "you are up to date".
@@ -752,6 +853,68 @@ pub fn updater_restart(app: AppHandle, restart: tauri::State<'_, crate::RestartR
 mod tests {
     use super::*;
     use tauri_plugin_updater::Error as PluginError;
+
+    #[test]
+    fn only_a_404_from_every_endpoint_means_no_stable_release() {
+        assert_eq!(absence_verdict(&[Ok(404)]), Ok(()));
+        assert_eq!(absence_verdict(&[Ok(404), Ok(404)]), Ok(()));
+
+        let server = absence_verdict(&[Ok(503)]).unwrap_err();
+        assert!(server.starts_with("network: ") && server.contains("503"), "{server}");
+        let limited = absence_verdict(&[Ok(404), Ok(429)]).unwrap_err();
+        assert!(limited.starts_with("network: "), "{limited}");
+        let unreachable = absence_verdict(&[Err("dns failure".into())]).unwrap_err();
+        assert!(unreachable.starts_with("network: "), "{unreachable}");
+        let contradicted = absence_verdict(&[Ok(200)]).unwrap_err();
+        assert!(contradicted.starts_with("metadata: "), "{contradicted}");
+        assert!(absence_verdict(&[]).unwrap_err().starts_with("not-configured: "));
+    }
+
+    #[test]
+    fn endpoints_come_from_the_configured_updater_section() {
+        let section = serde_json::json!({ "endpoints": ["https://example.test/latest.json"] });
+        assert_eq!(endpoints_from_config(Some(&section)).unwrap().len(), 1);
+
+        let missing = endpoints_from_config(None).unwrap_err();
+        assert!(missing.starts_with("not-configured: "), "{missing}");
+        let bad = serde_json::json!({ "endpoints": ["not a url"] });
+        assert!(endpoints_from_config(Some(&bad)).unwrap_err().starts_with("not-configured: "));
+    }
+
+    /// A local endpoint that answers every connection with `status_line`.
+    fn serve(status_line: &'static str) -> (reqwest::Url, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = reqwest::Url::parse(&format!("http://{}/latest.json", listener.local_addr().unwrap())).unwrap();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let mut stream = stream.unwrap();
+                let mut request = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                let response = format!("{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn the_probe_tells_a_missing_release_from_a_failing_server() {
+        // The plugin's check installs this provider before any request; the
+        // probe is never run without it in the app.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (missing, first) = serve("HTTP/1.1 404 Not Found");
+        let answers = probe_endpoints(std::slice::from_ref(&missing)).await;
+        assert_eq!(answers, vec![Ok(404)]);
+        assert_eq!(absence_verdict(&answers), Ok(()));
+        first.join().unwrap();
+
+        let (failing, second) = serve("HTTP/1.1 503 Service Unavailable");
+        let answers = probe_endpoints(std::slice::from_ref(&failing)).await;
+        assert_eq!(answers, vec![Ok(503)]);
+        let shown = absence_verdict(&answers).unwrap_err();
+        assert!(shown.starts_with("network: ") && shown.contains("503"), "{shown}");
+        second.join().unwrap();
+    }
 
     #[test]
     fn a_second_install_is_refused_while_the_first_holds_the_guard() {
