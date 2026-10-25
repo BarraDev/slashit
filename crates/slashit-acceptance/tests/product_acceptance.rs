@@ -52,6 +52,8 @@ mod disk_pressure;
 mod checkout_recovery;
 #[path = "product_acceptance/conversations.rs"]
 mod conversations;
+#[path = "product_acceptance/conversation_history.rs"]
+mod conversation_history;
 #[path = "product_acceptance/developer_tools.rs"]
 mod developer_tools;
 #[path = "product_acceptance/human_review.rs"]
