@@ -102,7 +102,9 @@ Known gaps in this prerelease:
 - The builds are not code-signed, so Windows SmartScreen and macOS Gatekeeper
   warn on first launch.
 - The updater's signature check runs only in hosted CI.
+- A background job whose shell has already exited keeps running when its
+  terminal closes or SlashIt quits. The quit dialog says so.
 
-[0.1.0]: https://github.com/BarraDev/slashit/releases/tag/v0.1.0
+[0.1.0]: https://github.com/BarraDev/slashit/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/BarraDev/slashit/releases/tag/v0.0.1
 [Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.1...HEAD

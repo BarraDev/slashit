@@ -71,7 +71,7 @@ pub fn QuitDialog() -> impl IntoView {
                             </Show>
                         </div>
                         <p class="text-white/40 text-xs mb-6">
-                            "Quitting will terminate all running processes."
+                            "Quitting ends each terminal and the shell in it. A background job that its shell left running after the shell exited keeps running."
                         </p>
                     </div>
                     <div class="flex items-center justify-end gap-3 p-6 border-t border-white/5">
