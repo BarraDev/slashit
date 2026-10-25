@@ -498,4 +498,95 @@ mod quit_tests {
         }
         assert!(survivors.is_empty(), "ending the sessions at shutdown left {survivors:?} running");
     }
+
+    /// Starts a real interactive bash, which runs a background job and then
+    /// exits on its own. Returns the shell's pid, the job's pid and the session.
+    /// The shell has exited by the time this returns, and the job still runs.
+    fn exited_shell_with_background_job(
+        name: &str,
+    ) -> (i32, i32, crate::pty::manager::PtySession, Box<dyn std::io::Read + Send>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        std::env::set_var("SHELL", "/bin/bash");
+        let (mut session, reader) = spawn_pty_session(
+            name.to_string(),
+            80,
+            24,
+            Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .expect("spawn the session");
+
+        session
+            .write(format!("sleep 300 & echo $$ $! > {}; exit\n", pids.display()).as_bytes())
+            .expect("write the command");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (shell, child) = loop {
+            let parsed = std::fs::read_to_string(&pids).ok().and_then(|text| {
+                let mut parts = text.split_whitespace().map(|p| p.parse::<i32>());
+                match (parts.next(), parts.next()) {
+                    (Some(Ok(shell)), Some(Ok(child))) => Some((shell, child)),
+                    _ => None,
+                }
+            });
+            if let Some(pair) = parsed {
+                break pair;
+            }
+            assert!(Instant::now() < deadline, "the shell did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        while is_live(shell) {
+            assert!(Instant::now() < deadline, "the shell did not exit");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(is_live(child), "the background job should outlive its shell before the terminal is closed");
+        (shell, child, session, reader, dir)
+    }
+
+    /// Open defect: the shell exits by itself while its background job runs.
+    /// Closing the terminal afterwards should end that job too. Job control
+    /// puts the job in its own process group, and the session signals only the
+    /// shell's group, so the job survives. Run it alone with
+    /// `cargo test -p slashit-ui --lib closing_a_terminal_whose_shell -- --ignored`.
+    #[test]
+    #[ignore = "open defect: a background job outlives its exited shell; spawns an interactive bash"]
+    fn closing_a_terminal_whose_shell_exited_ends_its_background_job() {
+        let _shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_shell_pid, child, session, reader, _dir) = exited_shell_with_background_job("closed-after-exit");
+
+        drop(session);
+        drop(reader);
+        std::thread::sleep(Duration::from_secs(2));
+
+        let alive = is_live(child);
+        if alive {
+            // Safety: the pid was started by this test and is only killed here.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+        }
+        assert!(!alive, "closing the terminal left its background job {child} running");
+    }
+
+    /// Open defect, at application quit: the same job survives `end_sessions`,
+    /// because the shell that has already exited is no longer signalled.
+    #[test]
+    #[ignore = "open defect: a background job outlives its exited shell; spawns an interactive bash"]
+    fn quitting_ends_the_background_job_of_a_shell_that_already_exited() {
+        let _shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_shell_pid, child, session, reader, _dir) = exited_shell_with_background_job("quit-after-exit");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(crate::pty::manager::end_sessions(vec![session]));
+        drop(reader);
+
+        let alive = is_live(child);
+        if alive {
+            // Safety: the pid was started by this test and is only killed here.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+        }
+        assert!(!alive, "quitting left the background job {child} of an exited shell running");
+    }
 }
