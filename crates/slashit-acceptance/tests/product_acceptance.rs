@@ -72,6 +72,10 @@ mod needs_you;
 mod orphans;
 #[path = "product_acceptance/pr_status.rs"]
 mod pr_status;
+#[path = "product_acceptance/project_rail.rs"]
+mod project_rail;
+#[path = "product_acceptance/terminal_lifecycle.rs"]
+mod terminal_lifecycle;
 #[path = "product_acceptance/queue_settings.rs"]
 mod queue_settings;
 #[path = "product_acceptance/run_now.rs"]

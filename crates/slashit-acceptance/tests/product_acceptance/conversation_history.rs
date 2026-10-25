@@ -389,9 +389,11 @@ async fn an_unanswered_turn_is_recorded_once_and_ordinary_reads_do_not_write() {
 /// Selects a Project in the rail the way `open_conversations` does: the rail
 /// expands under the pointer, and navigation waits until it has.
 ///
-/// Then the pointer leaves the rail. In the running WebView the rail can stay
-/// expanded after that, because the item under the pointer was re-rendered by
-/// the selection; the journey records it and enters and leaves the rail once more.
+/// Then the pointer leaves the rail. Under WebDriver's synthesized pointer, the
+/// rail can stay expanded after a selection: the single move off the item
+/// produces no mousemove, so the leave is never delivered. A real pointer does
+/// not do this (see the project_rail journey, which moves within the item). The
+/// journey records it and enters and leaves the rail once more.
 async fn select_project(driver: &WebDriver, project_id: &str) -> Result<()> {
     let selector = format!("[data-testid=\"rail-project-{project_id}\"]");
     ui::visible(driver, &selector).await?
