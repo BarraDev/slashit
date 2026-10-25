@@ -2,9 +2,24 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::callback::Callback;
 use super::terminal::RealTerminal;
+use super::toast;
 use crate::services::{pty_service, get_project_path};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+
+/// Sends `command` to the terminals of `scope` (every terminal when `None`) and
+/// reports how many received it, or why none did, in a toast.
+fn run_invoke_all(command: &str, scope: Option<String>) {
+    let command = command.to_string();
+    spawn_local(async move {
+        match pty_service::invoke_all_terminals(&command, scope).await {
+            Ok(0) => toast::info(format!("No open terminals received '{}'", command)),
+            Ok(1) => toast::success(format!("Sent '{}' to 1 terminal", command)),
+            Ok(count) => toast::success(format!("Sent '{}' to {} terminals", command, count)),
+            Err(e) => toast::error(format!("Invoke All failed for '{}': {}", command, e)),
+        }
+    });
+}
 
 /// Helper to get value from input event
 fn event_target_value(ev: &web_sys::Event) -> String {
@@ -293,12 +308,7 @@ pub fn TerminalGrid(
                                     <button
                                         on:click=move |_| {
                                             set_show_invoke_dropdown.set(false);
-                                            spawn_local(async move {
-                                                match pty_service::invoke_all_terminals("codebuff", invoke_scope()).await {
-                                                    Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked codebuff on {} terminals", count),
-                                                    Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke codebuff: {}", e),
-                                                }
-                                            });
+                                            run_invoke_all("codebuff", invoke_scope());
                                         }
                                         class="w-full text-left px-3 py-2 rounded hover:bg-white/10 text-white/90 text-sm flex items-center gap-2"
                                     >
@@ -308,12 +318,7 @@ pub fn TerminalGrid(
                                     <button
                                         on:click=move |_| {
                                             set_show_invoke_dropdown.set(false);
-                                            spawn_local(async move {
-                                                match pty_service::invoke_all_terminals("claude", invoke_scope()).await {
-                                                    Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked claude on {} terminals", count),
-                                                    Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke claude: {}", e),
-                                                }
-                                            });
+                                            run_invoke_all("claude", invoke_scope());
                                         }
                                         class="w-full text-left px-3 py-2 rounded hover:bg-white/10 text-white/90 text-sm flex items-center gap-2"
                                     >
@@ -337,12 +342,7 @@ pub fn TerminalGrid(
                                                         let cmd = custom_command.get();
                                                         if !cmd.is_empty() {
                                                             set_show_invoke_dropdown.set(false);
-                                                            spawn_local(async move {
-                                                                match pty_service::invoke_all_terminals(&cmd, invoke_scope()).await {
-                                                                    Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked '{}' on {} terminals", cmd, count),
-                                                                    Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke '{}': {}", cmd, e),
-                                                                }
-                                                            });
+                                                            run_invoke_all(&cmd, invoke_scope());
                                                             set_custom_command.set(String::new());
                                                         }
                                                     }
@@ -354,12 +354,7 @@ pub fn TerminalGrid(
                                                     let cmd = custom_command.get();
                                                     if !cmd.is_empty() {
                                                         set_show_invoke_dropdown.set(false);
-                                                        spawn_local(async move {
-                                                            match pty_service::invoke_all_terminals(&cmd, invoke_scope()).await {
-                                                                Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked '{}' on {} terminals", cmd, count),
-                                                                Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke '{}': {}", cmd, e),
-                                                            }
-                                                        });
+                                                        run_invoke_all(&cmd, invoke_scope());
                                                         set_custom_command.set(String::new());
                                                     }
                                                 }
