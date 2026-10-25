@@ -6,176 +6,82 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-Nothing has been released yet. The sections below describe what the first
-release will contain.
+## [0.1.0]
+
+The first stable release of SlashIt.
+
+**Installing.** Download the installer for your platform from the GitHub
+release page: the `.deb`, `.rpm` or `.AppImage` on Linux, the `.dmg` on macOS
+(Apple Silicon and Intel), and the `.msi` or NSIS `.exe` on Windows. The
+installers are not code-signed by Microsoft or Apple, so Windows SmartScreen and
+macOS Gatekeeper warn on the first launch. On Windows, choose "More info", then
+"Run anyway". On macOS, open the app from its context menu.
+
+**Updating.** The in-app updater checks GitHub Releases for newer versions,
+verifies each update against SlashIt's signing key, and installs it when you
+ask. It is on by default. To turn it off, set `auto_update = false` in
+`features.toml`. An installation from a `.deb` or `.rpm` package is not replaced
+by the in-app updater; the app says so, and you can install the newer package
+from the release page.
 
 ### Added
 
-- **Headless daemon mode.** A `slashitd` binary runs the IPC server and the
-  queue executor with no window and no webview, so agents and terminals can
-  outlive the desktop app entirely. It is not a second implementation: the
-  daemon and the GUI build the same state, serve the same command set and
-  resolve the same feature flags, differing only in where events go and in
-  whether there is a window to raise.
-- **The control channel works on every platform.** A Unix domain socket on
-  Linux and macOS, a named pipe on Windows, and — off by default — a loopback
-  TCP listener for cases neither covers. The first two are access-controlled
-  by the operating system, so reaching them already proves you are the owning
-  user; TCP proves nothing, so it exists only alongside a bearer token held in
-  a 0600 file and compared in constant time. See
-  [`docs/architecture/ipc-security.md`](docs/architecture/ipc-security.md).
-- **In-app updates.** The app checks for a new release, shows what is
-  available, and installs it on request. Updates are verified against a
-  signing key before they are applied; the installers themselves are not yet
-  OS code-signed, which is stated plainly in
-  [`docs/releasing.md`](docs/releasing.md).
-- **Project storage location.** Each project chooses whether its board lives
-  outside the project (the default, leaving your repository untouched) or
-  inside it at `.slashit/` so it can be committed and shared. Changing the
-  setting previews the move — file counts, sizes and any conflicts — and does
-  nothing until confirmed. See
-  [`docs/architecture/state-locations.md`](docs/architecture/state-locations.md).
-- **Runtime feature flags** in `features.toml`, so unfinished work can ship
-  off by default. A flag resolves through a command-line override, then
-  `SLASHIT_FEATURE_<NAME>`, then the file, then its default, and `slashit
-  features` reports the value *and* which layer decided it — "the flag is on"
-  is not an actionable answer when someone is asking why.
-- Architecture documentation for state locations, the IPC security model, the
-  headless daemon and the release procedure.
-- Meta-workspace model: a workspace folder that coordinates several projects.
-- A project whose workspace is missing from the registry, for example after a
-  corrupt `workspaces.toml` was quarantined, is listed under "Unresolved
-  membership" on the Workspaces page with the missing workspace's id. Detach
-  makes it standalone again; the missing workspace is not recreated, and
-  startup never rewrites the membership on its own.
-- PR comment review workflow with per-item approve, fix and skip.
-- **Projects without a remote run tasks.** A repository with commits and no
-  remote runs tasks end to end, AI Review and Human Review included; the pull
-  request it cannot have is explained where it would be offered. Each project
-  records a local base branch where new tasks start when `origin` names no
-  default branch: captured when the project is registered, only when that is
-  unambiguous (Git's `HEAD` on a branch that agrees with `origin`, or the
-  bookmark Jujutsu's `trunk()` names), otherwise chosen in the new
-  Settings > Repository tab. Checking out another branch does not move it.
-- **Complete approved changes locally.** In a project that cannot take a pull
-  request, approved changes in Human Review offer Complete locally. After it
-  says what it does, the task becomes Done and its Task Checkout is removed; its
-  branch is kept, never merged or pushed, and the task records that it was
-  completed locally. A checkout Git will not remove keeps the task in Human
-  Review, and asking again once it is dealt with finishes the job. A project
-  that can open a pull request is still delivered with Create PR.
-- **Explicit repository setup.** Settings > Repository shows whether a project
-  can run tasks and why not, and offers Detect default branch (`git remote
-  set-head origin --auto`, which reads `origin` and writes only
-  `refs/remotes/origin/HEAD`) and Initialize with Git or Jujutsu. Create
-  Project offers the same initialization, saying first what it will record.
-  Initializing never picks a branch name, records the folder's current files
-  (ignore rules applied) as the first commit, needs a configured commit
-  identity, colocates Jujutsu with Git, and refuses rather than record less
-  than it showed: a nested repository, a file above Jujutsu's own
-  `snapshot.max-new-file-size`, or a folder that changed since it was shown. A
-  Jujutsu initialization that fails after `jj git init` is undone, removing
-  only the `.jj` and `.git` it created, so the folder is as it was and can be
-  initialized again; a Git initialization whose first commit fails is
-  completed by initializing again. A folder is never initialized on its own,
-  and starting a task in one without version control is refused with what to
-  do. A Jujutsu repository that is not colocated with Git is recognised and
-  refused, pointing to `jj git colocation enable`.
-- Community health files for the public contribution flow.
+- **Product Workspaces.** A Product Workspace groups several related Projects.
+  A Project belongs to at most one, and you attach or detach Projects on the
+  Workspaces page. When a member Project's task runs and the Workspace folder
+  exists, the coding agent starts in that folder, so instruction files kept
+  there are shared by every member Project. Each task's diff, review, commit and
+  pull request still cover only its own Task Checkout. There are no combined
+  views across Projects yet. A Project whose Workspace is no longer registered
+  is listed under "Unresolved membership"; detaching it makes it standalone.
+- **Task Checkouts.** Each task works in its own Task Checkout: a Git worktree
+  on its own branch, kept in SlashIt's data directory rather than in your
+  repository. SlashIt creates and removes these worktrees with Git itself, so no
+  additional tool is needed. Parallel tasks never edit the same files, and each
+  checkout has its own terminals.
+- **Projects without a remote.** A repository with commits but no remote runs
+  tasks from start to finish, including AI Review and Human Review. Steps that
+  need a remote, such as pushing and opening a pull request, are offered only
+  where a supported remote exists.
+- **Local completion.** In a project that cannot open pull requests, an approved
+  task can be completed locally. Its Task Checkout is removed, the task is marked
+  Done, and its branch is kept, unmerged and unpushed. Integrate locally moves a
+  local branch to the exact commit you approved, after a confirmation that lists
+  what will change, and it never pushes. Projects that can open pull requests
+  keep them as the default way to finish a task.
+- **Repository setup.** Settings > Repository shows whether a project can run
+  tasks and, if it cannot, why. It can detect the default branch of `origin`, and
+  it can initialize a folder that has no version control, with Git or with
+  Jujutsu. Initializing never chooses a branch name for you, and it refuses if
+  the folder changed after it was shown to you. A Jujutsu repository must be
+  colocated with Git; one that is not is refused, with the command that fixes it.
+- **Pull request review.** The PR review assistant lists every reviewer comment
+  on a pull request with the agent's recommendation. For each comment, choose
+  Fix, Skip or Question, edit the reasoning and the proposed change, and then
+  apply the approved fixes in one pass. Replies can be posted back on the pull
+  request.
+- **Headless daemon.** The `slashitd` binary runs the control channel and the
+  task queue without a window or webview.
+- **Control channel and CLI.** The `slashit` command-line client controls the
+  running app from a terminal or a script. The channel uses a Unix domain socket
+  on Linux and macOS and a named pipe on Windows, both protected by the operating
+  system. A loopback TCP listener is available too, but it is off by default and
+  requires a bearer token.
+- **Window and tray.** Closing the main window hides it, and the app keeps
+  running. A click on the system tray icon shows the window again.
+- **Project storage.** Each project keeps its board outside the repository by
+  default, or inside it at `.slashit/` so it can be committed and shared. The
+  board can also be detected automatically. Settings > Storage previews a move,
+  with file counts, sizes and any conflicts, and changes nothing until you
+  confirm.
+- **Feature flags.** Unfinished features can ship turned off. Flags are stored in
+  `features.toml` in SlashIt's configuration directory, and the
+  `SLASHIT_FEATURE_<NAME>` environment variable overrides them. `slashit
+  features` shows each flag's value and which setting decided it.
+- **Documentation and project files.** Design notes on storage locations, the
+  IPC security model, the headless daemon and the release procedure are in
+  `docs/`. A contribution guide, a code of conduct and a security policy are at
+  the repository root.
 
-### Changed
-
-- **Worktrees are created outside your repository**, under
-  `<data_dir>/worktrees/<project-key>/<branch>` instead of as siblings named
-  `<repo>.<branch>`. Existing worktrees are adopted, not recreated.
-- **Task Checkouts no longer depend on Worktrunk.** SlashIt creates, reattaches,
-  stacks and removes every task worktree with `git` itself, whether or not
-  `wt` is installed. Earlier builds delegated to `wt` when it was on `PATH`,
-  always with its hooks turned off, so no Worktrunk hook ever ran for a task.
-  Worktrees `wt` already created at its own template paths are adopted where
-  they are, for reattaching, starting and cleanup alike.
-- **An ordinary task branch starts at `origin`'s default branch**, at the
-  exact commit `refs/remotes/origin/<default>` names, instead of at whatever
-  the primary checkout had checked out (a feature branch, or unpushed work in
-  a Jujutsu-colocated repository). The default branch comes from
-  `refs/remotes/origin/HEAD`, or from Jujutsu's `trunk()` alias when that is
-  exactly `<branch>@origin`, and nothing is fetched to find it. Without
-  either, the branch starts at the project's local base branch (see Added); a
-  remote is not required. The new branch tracks nothing until SlashIt pushes
-  it, and its pull request is opened against that default branch explicitly.
-  Tasks created earlier keep the origin they recorded and open their pull
-  requests as before.
-- **Task branches are named from the whole task id**, `task-<id>`, instead of
-  its first eight hex digits, which two tasks could share, and with them one
-  checkout. A task keeps the branch it already records, whatever its form. A
-  task is refused, with the other task named, while another task in the same
-  repository records its branch, whatever path the checkout is at. A task that
-  records no branch is also refused while a branch of its old eight-digit name
-  (`task-<8 hex>`) exists and no task records it: it may hold an earlier start
-  whose record was never saved, or another task's work. To hand it to the
-  task, rename it with `git branch -m task-<8 hex> task-<id>` and, if no
-  worktree has it checked out, add one with
-  `git worktree add <directory> task-<id>`; otherwise delete or rename it.
-- **`[worktree] placement = "auto"` now means `"managed"`.** Both spellings
-  still load, and new configurations are written with `"managed"`. Downgrade
-  caveat: an earlier build reading a configuration that says `"auto"` delegates
-  to `wt` again wherever it is installed. Change the setting to `"managed"`
-  before going back if that matters. An earlier build that rewrites a
-  project's `tasks.toml` also drops the default branch recorded for each task,
-  so those tasks' pull requests lose their explicit `--base` and go to
-  GitHub's default branch again.
-- `config.toml` is written atomically and with owner-only permissions. It
-  carries `AgentConfig::api_key`, and was previously world-readable.
-- Task files move from one global directory into each project's own state
-  directory. The old location is still read, so no task disappears on upgrade;
-  the move happens on the next save.
-- The frontend crate is now `slashit-frontend`, and the Playwright harness
-  `slashit-e2e`. Nothing user-visible changes. Of the workspace's names —
-  `slashit-ui` for the desktop app, `slashit` for the CLI, `slashit-ipc` for
-  the shared protocol — only `slashit-app-ui` failed to say which piece it
-  was. It could not simply become `slashit-ui`, because the Tauri crate
-  already is: two packages with one name in a workspace is a Cargo error and
-  would make `cargo -p slashit-ui` ambiguous. Application data still lives
-  under `slashit-app`, which is frozen.
-
-### Fixed
-
-- **A release candidate would have shipped without a Windows installer.** WiX
-  accepts only numeric version components, so `0.1.0-rc.1` made the MSI
-  bundler bail — but not until the whole release build had already compiled on
-  the Windows runner, and only there, leaving a release that looked nearly
-  complete with nothing for Windows users. The release workflow now rejects an
-  unpackageable version in seconds, before any platform build starts, and
-  [`docs/releasing.md`](docs/releasing.md) documents the numeric form
-  (`0.1.0-1`) that does work.
-- **A release could be named after a version other than its tag.** The release
-  name was substituted from `tauri.conf.json` rather than from the git ref, so
-  pushing `v0.1.0-rc.1` against an app version of `0.1.0` silently produced a
-  release called `v0.1.0`. The tag and the app version are now checked against
-  each other, and the release takes its name from the ref.
-- **A task branch could resolve to your main checkout.** Worktree lookup
-  matched the branch name as a substring of the whole `git worktree list`
-  block, including the line holding the repository path, so a branch whose
-  name appeared in that path returned the primary working copy — and an agent
-  would then have run there. Matching is now on the exact branch record.
-- **Startup no longer strands relocated worktrees.** A recorded worktree path
-  that did not resolve had its reference cleared, abandoning the branch and any
-  uncommitted work in it. The worktree is now adopted at its current location
-  first.
-- **Starting a second instance no longer steals the first one's IPC socket.**
-  The existing socket was removed unconditionally before binding; a liveness
-  check now refuses startup instead.
-- The IPC socket no longer falls back to a predictable path in the
-  world-writable temp directory, and its parent directory is created with
-  owner-only permissions before binding.
-- IPC requests are capped at 1 MiB. A client that never sent a newline
-  previously made the server buffer without bound.
-- Registering a workspace no longer creates an empty `.slashit/` directory
-  inside it. Existing empty ones can be cleaned up from settings.
-- The Windows release build compiles again; the Unix-socket IPC module is now
-  correctly gated.
-- The bundler emits updater artifacts, without which the configured updater
-  had nothing to serve.
-- The browser tab no longer says "Tauri + Leptos App".
-
-[Unreleased]: https://github.com/BarraDev/slashit/commits/main
+[0.1.0]: https://github.com/BarraDev/slashit/releases/tag/v0.1.0
+[Unreleased]: https://github.com/BarraDev/slashit/compare/v0.1.0...HEAD
