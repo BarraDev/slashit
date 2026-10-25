@@ -184,7 +184,7 @@ back.
 Nothing in CI verifies that an installer installs or that the app launches, so
 that is the human's job:
 
-- Linux: install the `.deb` or run the `.AppImage`.
+- Linux: install the `.deb` or `.rpm`, or run the `.AppImage`.
 - macOS: mount the `.dmg`, drag, launch. Gatekeeper will warn — see below.
 - Windows: run the `.msi` and the NSIS `.exe`. SmartScreen will warn.
 
@@ -205,8 +205,8 @@ being explicit about, because both look like bugs otherwise:
 - While the release is a draft, the endpoint resolves to the previous stable
   release or, before the first one, to a 404. Auto-update starts working when
   you press Publish, not when the build finishes. Until a stable release is
-  published, `updater_check` reads that 404 as "no update", so no install shows
-  an error. This is the state the first pre-release runs in.
+  published, `updater_check` reads a 404 from every endpoint as "no update", so no
+  install shows an error. Any other failure is still reported as an error. This is the state the first pre-release runs in.
 - A published prerelease is still invisible to the updater. That is the
   intended behaviour — existing installs must not be auto-upgraded onto a
   release candidate — but it means a prerelease has no update channel. Testers
@@ -227,7 +227,7 @@ release, launch it, and let it offer the update.
 
 Two different things get called signing, and only one of them happens here.
 
-**The updater is signed.** `TAURI_SIGNING_PRIVATE_KEY` and its password sign
+**The updater is signed.** `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` sign
 `latest.json` and the update artifacts. The public key is embedded in the app
 (`plugins.updater.pubkey`), so a running SlashIt verifies any update it
 downloads and refuses one that was tampered with in transit or on the release

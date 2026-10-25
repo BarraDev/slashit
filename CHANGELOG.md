@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.1.0]
 
-The first stable release of SlashIt.
+The first public release of SlashIt.
 
 **Installing.** Download the installer for your platform from the GitHub
 release page: the `.deb`, `.rpm` or `.AppImage` on Linux, the `.dmg` on macOS
@@ -20,7 +20,8 @@ macOS Gatekeeper warn on the first launch. On Windows, choose "More info", then
 **Updating.** The in-app updater checks GitHub Releases for newer versions,
 verifies each update against SlashIt's signing key, and installs it when you
 ask. It is on by default. To turn it off, set `auto_update = false` in
-`features.toml`. An installation from a `.deb` or `.rpm` package is not replaced
+`features.toml` in SlashIt's configuration directory, then restart SlashIt. The
+`SLASHIT_FEATURE_AUTO_UPDATE` environment variable overrides the file. An installation from a `.deb` or `.rpm` package is not replaced
 by the in-app updater; the app says so, and you can install the newer package
 from the release page.
 
@@ -61,9 +62,12 @@ from the release page.
   apply the approved fixes in one pass. Replies can be posted back on the pull
   request.
 - **Headless daemon.** The `slashitd` binary runs the control channel and the
-  task queue without a window or webview.
+  task queue without a window or webview. The installers do not include it; build
+  it from source with `cargo build -p slashit-ui --bin slashitd --release`.
 - **Control channel and CLI.** The `slashit` command-line client controls the
-  running app from a terminal or a script. The channel uses a Unix domain socket
+  running app from a terminal or a script. The `.deb` and `.rpm` packages install
+  it at `/usr/bin/slashit`; the AppImage, macOS and Windows installers do not, so
+  build it with `cargo build -p slashit --release` there. The channel uses a Unix domain socket
   on Linux and macOS and a named pipe on Windows, both protected by the operating
   system. A loopback TCP listener is available too, but it is off by default and
   requires a bearer token.

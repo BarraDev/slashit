@@ -46,7 +46,7 @@ It's built for people who've already outgrown a single terminal tab and a stack 
 
 **Stay in flow**
 - Works with whatever version-control setup you already have — plain Git is fine, and [Jujutsu](https://github.com/jj-vcs/jj) (`jj`) gets first-class treatment for stacked changes if you use it.
-- A `slashit` CLI controls the running app from any terminal — handy for shell scripts and for other agents to talk to.
+- A `slashit` CLI controls the running app from any terminal — handy for shell scripts and for other agents to talk to. The `.deb` and `.rpm` packages include it; elsewhere, build it from source.
 - System tray keeps agents and terminals alive when the window closes, and a headless `slashitd` keeps them running with no window at all — see [`docs/architecture/daemon.md`](docs/architecture/daemon.md).
 - Updates are downloaded from GitHub Releases and verified against a signing key before they are applied. The installers themselves are not yet code-signed by Windows or Apple, so the first launch of a fresh install shows an OS warning — see [`docs/releasing.md`](docs/releasing.md).
 
@@ -95,7 +95,7 @@ There are none yet. The first tagged release will publish these to [GitHub Relea
 | macOS | `.dmg` |
 | Windows | `.msi`, `.exe` |
 
-The `.deb` and `.rpm` packages also install the `slashit` CLI at `/usr/bin/slashit`. The macOS and Windows installers do not include it; build it with `cargo build -p slashit --release` (see [Build from Source](#build-from-source)).
+The `.deb` and `.rpm` packages also install the `slashit` CLI at `/usr/bin/slashit`. The AppImage, macOS and Windows installers do not include it; build it with `cargo build -p slashit --release` (see [Build from Source](#build-from-source)).
 
 Installers are not code-signed yet, so the first launch will show a SmartScreen or Gatekeeper warning. [`docs/releasing.md`](docs/releasing.md) explains exactly what is and is not signed.
 
