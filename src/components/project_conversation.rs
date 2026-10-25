@@ -181,6 +181,10 @@ fn project_action_controls(status: ConversationProjectActionStatus) -> ProjectAc
     }
 }
 
+/// Shown for a history event whose record is absent from the snapshot. Dropping
+/// the event would leave a gap nobody can explain.
+const MISSING_RECORD_TEXT: &str = "The record for this event is not in this Conversation, so its details cannot be shown.";
+
 fn project_action_event_text(kind: &ConversationEntryKind, actions: &[ConversationProjectAction]) -> Option<String> {
     let find = |id: &Uuid| actions.iter().find(|action| action.id == *id);
     match kind {
@@ -345,13 +349,20 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         request
     });
     let publish_snapshot = Callback::new(move |(request, value): (u64, ConversationSnapshot)| {
-        let current = snapshot.get_untracked();
+        // A response can arrive after a Project switch has disposed this view.
+        // The accessors below report that nothing is left, instead of panicking.
+        let Some(applied) = applied_snapshot_request.try_get_untracked() else { return; };
+        let current = snapshot.try_get_untracked().flatten();
         let current_version = current.as_ref().map(|current| (current.conversation.id, current.conversation.revision));
         let incoming_version = (value.conversation.id, value.conversation.revision);
-        if should_publish_snapshot(current_version, incoming_version, request, applied_snapshot_request.get_untracked()) {
-            set_executions.set(value.executions.clone());
-            set_snapshot.set(Some(value));
-            set_applied_snapshot_request.set(request);
+        if should_publish_snapshot(current_version, incoming_version, request, applied) {
+            // The liveness poll returns the whole history every 800 ms. Setting
+            // the signal re-renders every entry, so an unchanged poll must not set it.
+            if current.as_ref() != Some(&value) {
+                let _ = set_executions.try_set(value.executions.clone());
+                let _ = set_snapshot.try_set(Some(value));
+            }
+            let _ = set_applied_snapshot_request.try_set(request);
         }
     });
 
@@ -396,7 +407,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             };
             match loaded {
                 Ok(value) => publish.run((request, value)),
-                Err(error) => set_error.set(Some(error)),
+                Err(error) => { let _ = set_error.try_set(Some(error)); }
             }
         });
     });
@@ -561,7 +572,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                 id, current.conversation.id.to_string(), current.conversation.revision, action_id,
             ).await {
                 Ok(value) => publish.run((request, value)),
-                Err(error) => set_error.set(Some(error)),
+                Err(error) => { let _ = set_error.try_set(Some(error)); }
             }
             set_busy.set(false);
         });
@@ -617,13 +628,13 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                             let applied = match &entry.kind { ConversationEntryKind::ProjectActionApplied { action_id, .. } => Some(*action_id), _ => None };
                             let (testid, text) = match entry.kind {
                                 ConversationEntryKind::HumanMessage { text } | ConversationEntryKind::CoordinatorReply { text } => ("conversation-message", Some(text)),
-                                ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {} (Task {}): {}", action.target_task_title, action.target_task_id, action.request))),
+                                ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {} (Task {}): {}", action.target_task_title, action.target_task_id, action.request)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
                                 ConversationEntryKind::ActionDecision { approved, request, .. } => ("conversation-action-event", Some(if approved { format!("You approved the Worker request: {}", request.unwrap_or_default()) } else { "You rejected the proposed Task work.".to_string() })),
-                                ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title))),
+                                ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
                                 ConversationEntryKind::WorkerResult { result, .. } => ("conversation-worker-result", Some(result)),
                                 ConversationEntryKind::ActionWithdrawn { .. } => ("conversation-action-event", Some("You withdrew an earlier approval of a retired direct delegation. Nothing was started.".to_string())),
                                 ConversationEntryKind::RunFailed { message, .. } => ("conversation-run-failed", Some(message)),
-                                ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", project_action_event_text(kind, &project_actions)),
+                                ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", Some(project_action_event_text(kind, &project_actions).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
                             };
                             let role = match entry.role { ConversationRole::Human => "You", ConversationRole::Coordinator => "Coordinator", ConversationRole::Worker => "Worker" };
                             let event = text.map(|text| view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 flex items-baseline justify-between gap-2 text-xs font-medium text-white/50"><span>{role}</span><span data-testid="conversation-entry-time" class="font-normal text-white/40">{when}</span></div><div class="whitespace-pre-wrap text-sm text-white/90">{text}</div></article> }.into_any());
@@ -678,7 +689,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         }
                     />
                 </div>
-                <div class="mb-3 max-h-[40%] shrink-0 space-y-2 overflow-y-auto" data-testid="project-actions">
+                <div class="mb-3 shrink-0 space-y-2" data-testid="project-actions">
                     <For
                         each=move || snapshot.get().map(|value| pending_project_actions(&value)).unwrap_or_default()
                         key=|action| (action.id, action.status)

@@ -141,7 +141,7 @@ pub fn App() -> impl IntoView {
             selected_project=selected_project
             set_selected_project=set_selected_project
         >
-            <div class="content">
+            <div class=move || if current_page.get() == "conversations" { "content h-full min-h-0" } else { "content" }>
                 {
                     let current_page = current_page;
                     let selected_project = selected_project;
