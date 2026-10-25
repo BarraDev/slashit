@@ -174,6 +174,11 @@ kept:
 | Inside the project | `<repo>/.slashit/<project-id>/` | You want the board committed and shared with your team |
 | Detect automatically | `.slashit/` if it already exists and has content, otherwise outside | Upgrading, or moving between machines |
 
+The inside-the-project board is ordinary files in your repository. Its
+`tasks.toml` records Task titles, descriptions, review decisions and activity,
+and SlashIt does not ignore `.slashit/` for you. Add it to `.gitignore` if the
+board should stay local, or commit it knowingly.
+
 Switching between them previews the move first — how many files, how large, and
 any conflicts — and nothing is moved until you confirm. Your API keys, terminal
 scrollback and logs are never part of that choice; they always stay outside the
