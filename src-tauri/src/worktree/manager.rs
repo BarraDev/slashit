@@ -532,9 +532,48 @@ pub fn carries_locked_registration_notice(message: &str) -> bool {
 /// Whether two checkout paths name the same directory. Each is canonicalized
 /// when it exists, so a symlink or `..`-relative alias compares equal; one that
 /// cannot be canonicalized is compared as it is.
-fn same_path(a: &str, b: &str) -> bool {
+///
+/// Git records a worktree by its resolved path, while SlashIt keeps the path it
+/// was given, which may run through a symlink. Compare the two with this, never
+/// with `==`.
+pub(crate) fn same_path(a: &str, b: &str) -> bool {
     let canonical = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
     canonical(a) == canonical(b)
+}
+
+#[cfg(all(test, unix))]
+mod same_path_tests {
+    use super::same_path;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn a_symlinked_alias_names_the_directory_it_points_at_and_nothing_else() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join("real");
+        let other = root.path().join("other");
+        std::fs::create_dir_all(real.join("checkout")).unwrap();
+        std::fs::create_dir_all(other.join("checkout")).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let through_alias = alias.join("checkout");
+        let through_alias = through_alias.to_str().unwrap();
+        let resolved = real.join("checkout");
+        let resolved = resolved.to_str().unwrap();
+        assert!(same_path(through_alias, resolved), "the alias reaches the same directory");
+
+        // Retargeting the alias moves the name to another directory, so it no
+        // longer matches the one it used to name.
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&other, &alias).unwrap();
+        assert!(!same_path(through_alias, resolved), "a retargeted alias is another checkout");
+
+        // A path that does not exist names nothing that exists, so it matches
+        // only itself as written.
+        let missing = root.path().join("missing").join("checkout");
+        let missing = missing.to_str().unwrap();
+        assert!(!same_path(missing, resolved));
+        assert!(same_path(missing, missing));
+    }
 }
 
 impl WorktreeManager {

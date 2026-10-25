@@ -4670,7 +4670,7 @@ impl TaskExecutor {
                 if let Some(evidence) = approved.as_ref().and_then(|binding| binding.checkout.as_ref()) {
                     let same_checkout = t.worktree_path.as_deref() == Some(evidence.checkout_path.as_str())
                         && t.branch_name.as_deref() == Some(evidence.branch.as_str())
-                        && acquired.info.path == evidence.checkout_path
+                        && crate::worktree::same_path(&acquired.info.path, &evidence.checkout_path)
                         && start_head == evidence.head;
                     if !same_checkout {
                         t.fail_stale_approval();
@@ -5125,7 +5125,14 @@ impl TaskExecutor {
                     .to_string(),
             );
         }
-        if recorded_path.as_deref() != Some(decision.checkout_path.as_str()) {
+        // The Task records the path the checkout was given before a run starts,
+        // and Git's resolved path after one (`record_run_start` writes what the
+        // attach reported). Both name the inspected checkout, so compare them as
+        // directories, not as strings.
+        let same_checkout = recorded_path.as_deref().is_some_and(|recorded| {
+            crate::worktree::same_path(recorded, &decision.checkout_path)
+        });
+        if !same_checkout {
             return Err(
                 "The Task Checkout is no longer the one you inspected. Nothing was started; \
                  inspect the Task again."
@@ -5470,8 +5477,10 @@ impl TaskExecutor {
         if let Some(decision) = authorized.as_ref() {
             // Attaching must have reused the inspected checkout, never created one.
             // Read again now, after the attach, and undo only what this call created.
+            // Git reports the attached path resolved, and the decision keeps the
+            // path it was given, which may be a symlink to the same directory.
             let reused = acquired.created_at.is_none()
-                && acquired.info.path == decision.checkout_path
+                && crate::worktree::same_path(&acquired.info.path, &decision.checkout_path)
                 && checkout_before.is_some()
                 && crate::worktree::new_attempt::git_entry_identity(&decision.checkout_path)
                     == checkout_before;
@@ -19424,6 +19433,12 @@ VERDICT: APPROVED"
     #[cfg(unix)]
     mod unrecorded_acquisition {
         use super::*;
+        use crate::domain::task::without_home_dir;
+
+        // `Task::record_activity_at` stores a run's failure reason with the
+        // home directory written as `~`. An expectation that names a path under
+        // TMPDIR therefore holds the same masked form, which is the same text
+        // when TMPDIR is not beneath HOME.
 
         /// How a start acquires the task's worktree.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20158,7 +20173,7 @@ VERDICT: APPROVED"
                 assert_eq!(run_starts(&task), 0, "no RunStarted");
                 assert!(task.activity.iter().any(|e| matches!(
                     &e.kind,
-                    ActivityKind::RunFailed { run: None, reason } if *reason == cleanup
+                    ActivityKind::RunFailed { run: None, reason } if *reason == without_home_dir(&cleanup)
                 )));
             }
         }
@@ -20276,7 +20291,7 @@ VERDICT: APPROVED"
                 assert_eq!(run_starts(&task), 0, "no RunStarted");
                 assert!(task.activity.iter().any(|e| matches!(
                     &e.kind,
-                    ActivityKind::RunFailed { run: None, reason } if reason.contains(&worktree)
+                    ActivityKind::RunFailed { run: None, reason } if reason.contains(&without_home_dir(&worktree))
                 )));
             }
         }
@@ -21377,6 +21392,158 @@ VERDICT: APPROVED"
 
             assert!(refused.contains("could not be recorded"), "{refused}");
             assert!(!refused.contains("waiting to run"), "{refused}");
+        }
+
+        /// A new attempt on a checkout that the Project reaches through a
+        /// symlink. Git reports the attached checkout by its resolved path; the
+        /// decision and the Task keep the path the app was given.
+        #[cfg(unix)]
+        mod new_attempt_identity {
+            use super::*;
+
+            /// Symlinks `links/alias` to the directory `worktree` sits in, and
+            /// returns the checkout's path through that symlink.
+            fn through_symlink(links: &std::path::Path, worktree: &str) -> String {
+                let worktree = std::path::Path::new(worktree);
+                let parent = worktree.parent().expect("a checkout has a parent directory");
+                let alias = links.join("alias");
+                std::os::unix::fs::symlink(parent, &alias).expect("symlink the checkout's directory");
+                alias
+                    .join(worktree.file_name().expect("a checkout has a name"))
+                    .to_string_lossy()
+                    .into_owned()
+            }
+
+            /// Makes the World's Task a recovered run that the person has
+            /// authorized to start a new attempt on `checkout`, as an inspection
+            /// of that checkout records it. Returns the decision's id.
+            async fn authorize_new_attempt(w: &World, checkout: &str, branch: &str) -> Uuid {
+                let fingerprint = crate::worktree::checkout_fingerprint::fingerprint(std::path::Path::new(checkout))
+                    .await
+                    .expect("fingerprint the checkout");
+                let decision = NewAttemptDecision {
+                    decision_id: Uuid::new_v4(),
+                    for_run: 1,
+                    recovery_reason: "interrupted".into(),
+                    branch: branch.to_string(),
+                    checkout_path: checkout.to_string(),
+                    observed_commit: None,
+                    expected_head: fingerprint.head.clone(),
+                    dirty_fingerprint: fingerprint.digest.clone(),
+                    dirty_paths: fingerprint.dirty_paths.clone(),
+                    authorized_at: chrono::Utc::now(),
+                };
+                let id = w.task_id;
+                // No provider was spawned for the interrupted run: its lease is
+                // free and records nothing, which is what proves absence.
+                let lease = w.executor.provider_lease_path(id);
+                std::fs::create_dir_all(lease.parent().unwrap()).unwrap();
+                std::fs::write(&lease, b"").unwrap();
+                let recorded = decision.clone();
+                let checkout = checkout.to_string();
+                let branch = branch.to_string();
+                let head = fingerprint.head.clone();
+                crate::lifecycle::commit_task(&w.executor.tasks, &w.executor.storage, id, &move |staged: &mut HashMap<Uuid, Task>| {
+                    let task = staged.get_mut(&id).unwrap();
+                    task.status = TaskStatus::Error;
+                    task.worktree_path = Some(checkout.clone());
+                    task.branch_name = Some(branch.clone());
+                    task.record_activity(ActivityKind::RunStarted { run: 1, addressing_feedback: false });
+                    task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                        review_mode: Default::default(),
+                        task_id: id,
+                        project_id: task.project_id,
+                        repository_id: None,
+                        run: Some(1),
+                        branch: Some(branch.clone()),
+                        start_head: Some(head.clone()),
+                        acceptance: None,
+                        stage: crate::domain::task::WorkerHandoffStage::RecoveryRequired {
+                            reason: "interrupted".into(),
+                            observed_commit: None,
+                        },
+                        review_mode_unproven: false,
+                    });
+                    task.new_attempt = Some(recorded.clone());
+                    task.new_attempt_confirmed = true;
+                })
+                .await
+                .expect("record the authorized recovery");
+                decision.decision_id
+            }
+
+            /// A World whose checkout is attached, and whose path through a
+            /// symlink is what the person authorizes. Returns the World, the
+            /// checkout as Git reports it, its branch, and the alias.
+            async fn attached_through_symlink() -> (World, String, String, String, std::path::PathBuf) {
+                let w = world(Class::Created).await;
+                let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+                let acquired = acquired.expect("checkout");
+                let worktree = acquired.info.path.clone();
+                let branch = acquired.info.branch.clone();
+                let links = w.temps[0].path().join("links");
+                std::fs::create_dir_all(&links).unwrap();
+                let alias = through_symlink(&links, &worktree);
+                assert_ne!(alias, worktree, "the checkout is reached through another path");
+                assert_eq!(
+                    std::fs::canonicalize(&alias).unwrap(),
+                    std::fs::canonicalize(&worktree).unwrap(),
+                    "the alias and Git's path name one directory"
+                );
+                (w, worktree, branch, alias, links)
+            }
+
+            /// The new attempt starts on the checkout the person inspected, even
+            /// though the attach reports it by its resolved path.
+            #[tokio::test]
+            async fn a_new_attempt_starts_on_a_checkout_reached_through_a_symlink() {
+                let (w, worktree, branch, alias, _links) = attached_through_symlink().await;
+                let agent = fake_agent().await;
+                let decision_id = authorize_new_attempt(&w, &alias, &branch).await;
+
+                assert_eq!(w.executor.start_new_attempt(w.task_id, decision_id).await, Ok(()));
+                assert!(agent_invoked(&agent).await, "the agent runs");
+                let task = w.in_memory().await;
+                assert_eq!(run_starts(&task), 2, "the new attempt is recorded after the interrupted run");
+                assert!(task.new_attempt.is_none(), "the authorization is consumed by its start");
+                let started_in = task.worktree_path.clone().expect("the run names its checkout");
+                assert_eq!(
+                    std::fs::canonicalize(&started_in).unwrap(),
+                    std::fs::canonicalize(&worktree).unwrap(),
+                    "the run is in the checkout that was inspected"
+                );
+                w.end_run().await;
+            }
+
+            /// Retargeting the alias after the person inspected the checkout
+            /// refuses the new attempt. Nothing is recorded or launched, the
+            /// authorization is kept, and the checkout is left as it was.
+            #[tokio::test]
+            async fn a_new_attempt_is_refused_when_the_alias_is_retargeted() {
+                let (w, worktree, branch, alias, links) = attached_through_symlink().await;
+                let agent = fake_agent().await;
+                let decision_id = authorize_new_attempt(&w, &alias, &branch).await;
+
+                let elsewhere = w.temps[0].path().join("elsewhere");
+                std::fs::create_dir_all(&elsewhere).unwrap();
+                std::fs::remove_file(links.join("alias")).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, links.join("alias")).unwrap();
+
+                // Refused by the checkout the alias now names, before anything is
+                // attached: the lease check passes, as it does in the test above.
+                let message = w
+                    .executor
+                    .start_new_attempt(w.task_id, decision_id)
+                    .await
+                    .expect_err("a retargeted alias is refused");
+                assert!(!message.contains("provider"), "refused by the checkout, not the lease: {message}");
+                assert_eq!(agent.invocations(), "", "no provider launch");
+                let task = w.in_memory().await;
+                assert_eq!(run_starts(&task), 1, "only the interrupted run is recorded");
+                assert!(task.new_attempt.is_some(), "the authorization is kept");
+                assert!(std::path::Path::new(&worktree).is_dir(), "the inspected checkout is left in place");
+                git_in(&w.repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+            }
         }
     }
 

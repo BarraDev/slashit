@@ -26,4 +26,5 @@ pub use manager::{
     CheckoutState, WorktreeInfo, WorktreeManager, WorktreeRecovery,
 };
 pub use orphans::{owners_in_repository, OrphanScan, Owners};
+pub(crate) use manager::same_path;
 pub use ownership::{refuse_shared_task_branch, tasks_sharing_a_recorded_branch};
