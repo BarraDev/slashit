@@ -9,7 +9,11 @@ fn get_persisted_page() -> String {
     if let Some(window) = web_sys::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             if let Ok(Some(page)) = storage.get_item("slashit_current_page") {
-                return page;
+                // A page the navigation no longer offers would open with no
+                // sidebar entry to return by, so fall back to the default.
+                if page_offered(&page) {
+                    return page;
+                }
             }
         }
     }
