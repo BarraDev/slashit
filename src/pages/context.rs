@@ -40,11 +40,12 @@ pub fn Context(
             }
             set_loading.set(true);
             spawn_local(async move {
-                if let Ok(Some(path)) = get_project_path(pid).await {
+                if let Ok(Some(path)) = get_project_path(pid.clone()).await {
                     set_project_path.set(Some(path.clone()));
 
                     // List files in project root
                     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                        "projectId": pid,
                         "path": path,
                     })).unwrap();
                     let result = invoke("list_files", args).await;
@@ -69,11 +70,15 @@ pub fn Context(
         });
     }
 
+    // Read through a StoredValue so the click handler captures only Copy values.
+    let project_store = StoredValue::new(project_id.clone());
     let on_file_click = move |path: String| {
         let path_clone = path.clone();
+        let pid = project_store.get_value();
         set_selected_file.set(Some(path.clone()));
         spawn_local(async move {
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "projectId": pid,
                 "path": path_clone,
             })).unwrap();
             let result = invoke("read_file", args).await;

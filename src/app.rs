@@ -152,7 +152,6 @@ pub fn App() -> impl IntoView {
                         "roadmap" => view! { <Roadmap project_id=selected_project.get() /> }.into_any(),
                         "ideation" => view! { <Ideation project_id=selected_project.get() /> }.into_any(),
                         "context" => view! { <Context project_id=selected_project.get() /> }.into_any(),
-                        "spec" => view! { <Spec project_id=selected_project.get() /> }.into_any(),
                         "settings" => view! { <Settings project_id=selected_project.get() /> }.into_any(),
                         "insights" => view! { <Insights project_id=selected_project.get() /> }.into_any(),
                         "changelog" => view! { <Changelog project_id=selected_project.get() /> }.into_any(),

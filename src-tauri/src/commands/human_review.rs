@@ -205,8 +205,15 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
         rewritten: false,
         reason: None,
     };
-    if task.branch_name.is_none() || !task.human_review.is_approved() {
+    if task.branch_name.is_none() {
         return Ok(none(ApprovalCoverage::NotApplicable));
+    }
+    if !task.human_review.is_approved() {
+        // Not approved yet: name the commit an approval would record now, so
+        // the person can see it before deciding. An unreadable branch shows no
+        // commit and never fails the panel.
+        let branch_tip = crate::commands::pr::task_branch_tip(state, task_id).await.ok().flatten();
+        return Ok(ApprovalStatus { branch_tip, ..none(ApprovalCoverage::NotApplicable) });
     }
     let branch_tip = crate::commands::pr::task_branch_tip(state, task_id).await?;
     let refusal = match task.human_review.binds(true, branch_tip.as_deref()) {
@@ -1679,6 +1686,15 @@ mod tests {
         assert_eq!(approval_status(&local.state, local.task_id).await.unwrap().coverage, ApprovalCoverage::Current);
         let done = local.complete().await.expect("the renewed approval completes it");
         assert_eq!(done.status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn an_undecided_task_names_the_commit_an_approval_would_record() {
+        let local = local_project().await;
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::NotApplicable);
+        assert!(status.approved_tip.is_none());
+        assert_eq!(status.branch_tip.as_deref(), Some(local.tip().as_str()));
     }
 
     #[tokio::test]

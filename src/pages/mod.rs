@@ -3,7 +3,6 @@
 pub mod conversations;
 pub mod dashboard;
 pub mod agent;
-pub mod spec;
 pub mod context;
 pub mod settings;
 pub mod roadmap;
@@ -19,7 +18,6 @@ pub mod github_prs;
 pub use conversations::*;
 pub use dashboard::*;
 pub use agent::*;
-pub use spec::*;
 pub use context::*;
 pub use settings::*;
 pub use roadmap::*;

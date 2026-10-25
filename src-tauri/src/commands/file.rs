@@ -1,10 +1,9 @@
-use crate::commands::gui_admission::GuiMutation;
-use crate::domain::file::{FileItem, FileInfo};
+use crate::domain::file::FileItem;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 use chrono::{DateTime, Utc};
 use tauri_plugin_dialog::DialogExt;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct FileState;
@@ -21,13 +20,57 @@ impl Default for FileState {
     }
 }
 
-#[tauri::command]
-pub async fn list_files(path: String) -> Result<Vec<FileItem>, String> {
-    let path = PathBuf::from(&path);
+/// The folder a Project's file commands may read: its repository path, resolved
+/// from the backend's own records, never from what the caller sends.
+async fn project_root_for(
+    state: &tauri::State<'_, crate::AppState>,
+    project_id: &str,
+) -> Result<PathBuf, String> {
+    let id = Uuid::parse_str(project_id).map_err(|e| e.to_string())?;
+    let projects = state.project.projects.read().await;
+    let project = projects.get(&id).ok_or("Project not found")?;
+    let repositories = state.repository.repositories.read().await;
+    let local_path = project
+        .repository_path(&repositories)
+        .ok_or("This Project has no folder to read from.")?;
+    resolve_root(&local_path)
+}
 
-    if !path.exists() {
-        return Err(format!("Path does not exist: {}", path.display()));
+/// Canonical form of a Project's root, so containment can be a prefix check.
+pub(crate) fn resolve_root(local_path: &str) -> Result<PathBuf, String> {
+    Path::new(local_path)
+        .canonicalize()
+        .map_err(|e| format!("The Project folder is not available: {e}"))
+}
+
+/// Resolves `path` and requires it to lie inside `root`.
+///
+/// The path must be absolute, and it is canonicalized before the check, so a
+/// symlink inside the Project that points elsewhere is refused. The check is
+/// made once, before the read: a link swapped in after it is not covered.
+pub(crate) fn within_root(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let requested = Path::new(path);
+    if !requested.is_absolute() {
+        return Err("A file path must be absolute.".to_string());
     }
+    let resolved = requested
+        .canonicalize()
+        .map_err(|e| format!("Path does not exist or cannot be read: {} ({e})", requested.display()))?;
+    if resolved.starts_with(root) {
+        Ok(resolved)
+    } else {
+        Err(format!("{} is outside this Project's folder.", requested.display()))
+    }
+}
+
+#[tauri::command]
+pub async fn list_files(
+    state: tauri::State<'_, crate::AppState>,
+    project_id: String,
+    path: String,
+) -> Result<Vec<FileItem>, String> {
+    let root = project_root_for(&state, &project_id).await?;
+    let path = within_root(&root, &path)?;
 
     let mut items = Vec::new();
 
@@ -66,50 +109,15 @@ pub async fn list_files(path: String) -> Result<Vec<FileItem>, String> {
 }
 
 #[tauri::command]
-pub async fn read_file(path: String) -> Result<String, String> {
+pub async fn read_file(
+    state: tauri::State<'_, crate::AppState>,
+    project_id: String,
+    path: String,
+) -> Result<String, String> {
+    let root = project_root_for(&state, &project_id).await?;
+    let path = within_root(&root, &path)?;
     fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read file: {}", e))
-}
-
-#[tauri::command]
-pub async fn write_file(_gui: GuiMutation, path: String, content: String) -> Result<(), String> {
-    fs::write(&path, content)
-        .map_err(|e| format!("Failed to write file: {}", e))
-}
-
-#[tauri::command]
-pub async fn search_files(query: String, path: String) -> Result<Vec<FileItem>, String> {
-    let base_path = PathBuf::from(&path);
-
-    if !base_path.exists() {
-        return Err(format!("Path does not exist: {}", base_path.display()));
-    }
-
-    let mut results = Vec::new();
-    let query_lower = query.to_lowercase();
-
-    for entry in WalkDir::new(&base_path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let file_name = entry.file_name().to_string_lossy();
-        if file_name.to_lowercase().contains(&query_lower) {
-            let metadata = entry.metadata().ok();
-            let modified = metadata.as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| DateTime::<Utc>::from_timestamp(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64, 0));
-
-            results.push(FileItem {
-                name: file_name.to_string(),
-                path: entry.path().to_string_lossy().to_string(),
-                is_dir: metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false),
-                size: metadata.and_then(|m| if m.is_file() { Some(m.len()) } else { None }),
-                modified,
-            });
-        }
-    }
-
-    Ok(results)
 }
 
 #[tauri::command]
@@ -330,31 +338,99 @@ mod git_location_tests {
     }
 }
 
-#[tauri::command]
-pub async fn get_file_info(path: String) -> Result<FileInfo, String> {
-    let path_obj = Path::new(&path);
 
-    let metadata = fs::metadata(path_obj)
-        .map_err(|e| format!("Failed to get file metadata: {}", e))?;
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+    use tempfile::TempDir;
 
-    let created = metadata.created()
-        .ok()
-        .and_then(|t| DateTime::<Utc>::from_timestamp(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64, 0))
-        .unwrap_or_else(Utc::now);
+    /// Two Projects side by side, each with one file, and a file outside both.
+    fn fixture() -> (TempDir, PathBuf, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let alpha = temp.path().join("alpha");
+        let beta = temp.path().join("beta");
+        fs::create_dir_all(alpha.join("docs")).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+        fs::write(alpha.join("docs/notes.md"), "alpha").unwrap();
+        fs::write(beta.join("beta.md"), "beta").unwrap();
+        fs::write(temp.path().join("outside.txt"), "outside").unwrap();
+        let alpha = resolve_root(&alpha.to_string_lossy()).unwrap();
+        let beta = resolve_root(&beta.to_string_lossy()).unwrap();
+        (temp, alpha, beta)
+    }
 
-    let modified = metadata.modified()
-        .ok()
-        .and_then(|t| DateTime::<Utc>::from_timestamp(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64, 0))
-        .unwrap_or_else(Utc::now);
+    #[test]
+    fn a_file_and_the_root_itself_inside_the_project_are_allowed() {
+        let (_temp, alpha, _beta) = fixture();
+        let notes = alpha.join("docs/notes.md");
+        assert_eq!(within_root(&alpha, &notes.to_string_lossy()).unwrap(), notes.canonicalize().unwrap());
+        assert_eq!(within_root(&alpha, &alpha.to_string_lossy()).unwrap(), alpha);
+    }
 
-    let readonly = metadata.permissions().readonly();
-    let permissions = if readonly { "r--" } else { "rw-" };
+    #[test]
+    fn a_file_of_another_project_is_refused() {
+        let (_temp, alpha, beta) = fixture();
+        let beta_file = beta.join("beta.md");
+        let err = within_root(&alpha, &beta_file.to_string_lossy()).unwrap_err();
+        assert!(err.contains("outside this Project"), "{err}");
+    }
 
-    Ok(FileInfo {
-        path: path.clone(),
-        size: metadata.len(),
-        created,
-        modified,
-        permissions: permissions.to_string(),
-    })
+    #[test]
+    fn an_absolute_path_outside_every_project_is_refused() {
+        let (temp, alpha, _beta) = fixture();
+        let outside = temp.path().join("outside.txt");
+        assert!(within_root(&alpha, &outside.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn traversal_out_of_the_project_is_refused() {
+        let (temp, alpha, _beta) = fixture();
+        let escaped = alpha.join("..").join("outside.txt");
+        let err = within_root(&alpha, &escaped.to_string_lossy()).unwrap_err();
+        assert!(err.contains("outside this Project"), "{err}");
+        assert!(temp.path().join("outside.txt").exists());
+    }
+
+    #[test]
+    fn a_relative_path_is_refused_rather_than_resolved_against_the_process_directory() {
+        let (_temp, alpha, _beta) = fixture();
+        let err = within_root(&alpha, "docs/notes.md").unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_path_is_reported_as_unreadable() {
+        let (_temp, alpha, _beta) = fixture();
+        let missing = alpha.join("nope.md");
+        assert!(within_root(&alpha, &missing.to_string_lossy()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_project_that_points_outside_is_refused() {
+        let (temp, alpha, _beta) = fixture();
+        let link = alpha.join("escape.txt");
+        std::os::unix::fs::symlink(temp.path().join("outside.txt"), &link).unwrap();
+        let err = within_root(&alpha, &link.to_string_lossy()).unwrap_err();
+        assert!(err.contains("outside this Project"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_directory_pointing_outside_cannot_expose_its_contents() {
+        let (temp, alpha, _beta) = fixture();
+        let link = alpha.join("linked");
+        std::os::unix::fs::symlink(temp.path(), &link).unwrap();
+        assert!(within_root(&alpha, &link.join("outside.txt").to_string_lossy()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_project_that_points_inside_is_allowed() {
+        let (_temp, alpha, _beta) = fixture();
+        let link = alpha.join("alias.md");
+        std::os::unix::fs::symlink(alpha.join("docs/notes.md"), &link).unwrap();
+        let resolved = within_root(&alpha, &link.to_string_lossy()).unwrap();
+        assert_eq!(resolved, alpha.join("docs/notes.md").canonicalize().unwrap());
+    }
 }

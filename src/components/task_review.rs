@@ -534,6 +534,19 @@ pub fn HumanReviewPanel(
                         ". If the branch moves after you approve, the approval no longer applies and you approve again."
                     </p>
                 })}
+                // The exact commit, read from Git now, when it can be read.
+                {move || coverage.get()
+                    .filter(|c| matches!(c.coverage, ApprovalCoverage::NotApplicable))
+                    .and_then(|c| c.branch_tip)
+                    .map(|tip| view! {
+                        <p data-testid="human-review-approval-commit" class="text-xs text-white/50 break-all">
+                            "Current commit: "
+                            <code class="font-mono text-white/70">{tip}</code>
+                        </p>
+                    })}
+                <p data-testid="human-review-test-evidence" class="text-xs text-white/50">
+                    "No test run is recorded for this Task. The AI review is the only recorded check."
+                </p>
                 <div class="flex flex-wrap gap-2">
                     {move || {
                         let available = availability.get();

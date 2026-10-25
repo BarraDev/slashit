@@ -615,41 +615,6 @@ async fn a_burst_of_kill_requests_starts_one_leader_wait() {
     assert_eq!(owned.leader_waits.load(Ordering::SeqCst), 1);
 }
 
-/// Reproduces the suspected defect in the legacy client (`acp/client.rs`).
-///
-/// Its stdout reader locks the child for the whole life of the process, and
-/// `initialize` must lock the same child to write its request, so the request
-/// is never sent and `initialize` waits. The legacy reader also performs
-/// blocking reads on a runtime worker, which is stuck for good. Dropping that
-/// runtime would join the stuck worker, so the runtime is forgotten after the
-/// check. Ignored by default: it leaves one blocked thread and one child
-/// process, both of which end when the test binary exits.
-#[test]
-#[ignore = "reproduces the legacy stdout-lock defect; run with --ignored"]
-fn legacy_client_initialize_is_blocked_by_the_child_lock() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let fixture = fixture_path().to_string_lossy().into_owned();
-    let blocked = runtime.block_on(async move {
-        let client = crate::acp::AcpClient::start(&fixture, &["ok"], &[], &std::env::temp_dir())
-            .expect("start the legacy client against the fixture");
-        let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            client.initialize("SlashIt".to_string(), "0.1.0".to_string()),
-        )
-        .await;
-        result.is_err()
-    });
-    std::mem::forget(runtime);
-    assert!(
-        blocked,
-        "the legacy initialize returned instead of blocking"
-    );
-}
-
 /// Whether a process still runs. `kill` with signal 0 finds a pid that exists,
 /// and a zombie also exists, so on Linux `/proc` excludes a zombie. A process
 /// that another process has reaped no longer exists, whatever the platform.

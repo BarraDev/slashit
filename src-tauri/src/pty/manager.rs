@@ -23,6 +23,41 @@ pub struct PtySession {
     _child: Box<dyn Child + Send + Sync>,
 }
 
+/// Ends a terminal's process group: SIGHUP first, then SIGKILL once the group
+/// has had a moment to exit. Closing the master only hangs up the shell, so a
+/// shell that ignores SIGHUP, or a job it started, would otherwise outlive it.
+#[cfg(unix)]
+fn end_process_group(pgid: i32) {
+    // Safety: the group is the one this process's own terminal shell leads
+    // (portable-pty starts the shell in a new session).
+    unsafe { libc::killpg(pgid, libc::SIGHUP) };
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // A group id is not reused while any process still carries it, so a
+        // group that is still there is still this terminal's.
+        // Safety: as above; signal 0 only probes.
+        if unsafe { libc::kill(-pgid, 0) } == 0 {
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    });
+}
+
+impl Drop for PtySession {
+    /// Ending the session ends its shell and the jobs it started. A shell that
+    /// has already exited is not signalled: once reaped, its pid may name a
+    /// different process group.
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            if matches!(self._child.try_wait(), Ok(None)) {
+                if let Some(pid) = self._child.process_id() {
+                    end_process_group(pid as i32);
+                }
+            }
+        }
+    }
+}
+
 impl PtySession {
     /// Write data to the PTY
     pub fn write(&mut self, data: &[u8]) -> std::io::Result<()> {

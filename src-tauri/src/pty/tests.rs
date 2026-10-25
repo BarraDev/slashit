@@ -354,3 +354,84 @@ mod project_scope_tests {
         assert!(project_takes_input(None, None));
     }
 }
+
+#[cfg(all(test, unix))]
+mod quit_tests {
+    use crate::pty::manager::spawn_pty_session;
+    use std::time::{Duration, Instant};
+
+    /// Whether `pid` is a live process. A zombie is not live: it has ended and
+    /// only waits to be reaped.
+    fn is_live(pid: i32) -> bool {
+        // Safety: signal 0 sends nothing; it only asks whether the pid exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !matches!(
+                stat.rsplit(')').next().and_then(|rest| rest.trim_start().chars().next()),
+                Some('Z' | 'X')
+            ),
+            Err(_) => false,
+        }
+    }
+
+    /// Reproduces T5: ending a terminal session leaves a shell that ignores
+    /// SIGHUP, and the background job it started, running. The shell and its
+    /// child are the processes a person would expect to end with the window.
+    ///
+    /// `SHELL` is read when the session spawns, so this test changes it for
+    /// its own process. Run it alone:
+    /// `cargo test -p slashit-ui --lib dropping_a_session -- --ignored --exact`
+    #[test]
+    #[ignore = "spawns a shell and changes SHELL for this process; run alone with --ignored --exact"]
+    fn dropping_a_session_ends_a_shell_that_ignores_hangup_and_its_children() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hup-ignoring-shell.sh");
+        let pids = dir.path().join("pids");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n", pids.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("SHELL", &script);
+
+        let (session, reader) = spawn_pty_session(
+            "quit-test".to_string(),
+            80,
+            24,
+            Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .expect("spawn the session");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (shell, child) = loop {
+            let parsed = std::fs::read_to_string(&pids).ok().and_then(|text| {
+                let mut parts = text.split_whitespace().map(|p| p.parse::<i32>());
+                match (parts.next(), parts.next()) {
+                    (Some(Ok(shell)), Some(Ok(child))) => Some((shell, child)),
+                    _ => None,
+                }
+            });
+            if let Some(pair) = parsed {
+                break pair;
+            }
+            assert!(Instant::now() < deadline, "the shell did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        drop(session);
+        drop(reader);
+        std::thread::sleep(Duration::from_secs(2));
+
+        let survivors: Vec<i32> = [shell, child].into_iter().filter(|pid| is_live(*pid)).collect();
+        for pid in &survivors {
+            // Safety: the pids were started by this test and are only killed here.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        assert!(survivors.is_empty(), "dropping the session left {survivors:?} running");
+    }
+}

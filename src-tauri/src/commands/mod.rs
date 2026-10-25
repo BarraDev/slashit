@@ -64,7 +64,7 @@ pub use task_boards::list_task_board_diagnostics;
 pub use worktree::*;
 pub use pr::*;
 pub use roadmap::*;
-pub use file::{list_files, read_file, write_file, search_files, get_file_info, pick_folder, check_is_git_repo};
+pub use file::{list_files, read_file, pick_folder, check_is_git_repo};
 pub use github::*;
 pub use changelog::*;
 pub use mcp::*;

@@ -318,7 +318,6 @@ pub fn run() {
                     finish_grace: std::time::Duration::ZERO,
                 };
                 let executor_cell = state.executor.clone();
-                let agent_clients = state.agent.running_clients.clone();
                 tauri::async_runtime::spawn(async move {
                     let server = tauri::async_runtime::spawn(async move {
                         bound.attach(ipc_ctx).serve_until(supervision).await
@@ -339,12 +338,11 @@ pub fn run() {
                     if let Err(error) = &result {
                         eprintln!("SlashIt: the instance failed closed and is exiting: {error}");
                     }
-                    // Legacy ACP agents belong to the app state, not the
-                    // executor; the fence is closed, so none can be added.
-                    let clients: Vec<_> = agent_clients.write().await.drain().collect();
-                    for (_, client) in clients {
-                        let _ = client.kill().await;
-                    }
+                    // Terminals end with the application. Dropping a session ends
+                    // its shell's process group, which closing the master alone
+                    // does not do.
+                    let terminals: Vec<_> = app_handle.state::<AppState>().pty.sessions.lock().await.drain().collect();
+                    drop(terminals);
                     *ownership_slot.lock().unwrap() = Some(ownership);
                     shutdown_complete.store(true, std::sync::atomic::Ordering::Release);
                     // An update restart waits for the same drain as a quit.
@@ -466,10 +464,6 @@ pub fn run() {
             update_task,
             delete_task,
             reorder_task,
-            start_agent,
-            stop_agent,
-            get_agent_status,
-            get_agent_logs,
             list_available_models,
             check_claude_cli,
             create_session,
@@ -545,9 +539,6 @@ pub fn run() {
             unlink_task_from_feature,
             list_files,
             read_file,
-            write_file,
-            search_files,
-            get_file_info,
             get_issues,
             get_issue,
             create_task_from_issue,

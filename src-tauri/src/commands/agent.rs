@@ -1,20 +1,17 @@
-use crate::commands::gui_admission::GuiMutation;
-use crate::domain::{AgentExecution, AgentStatus, AgentLogEntry, LogLevel};
-use crate::acp::AcpClient;
+use crate::domain::{AgentExecution, AgentStatus, AgentLogEntry};
 use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::io::{BufRead, BufReader};
 
 type AgentExecutions = Arc<RwLock<HashMap<Uuid, AgentExecution>>>;
-type RunningClients = Arc<RwLock<HashMap<Uuid, Arc<AcpClient>>>>;
 type AgentLogs = Arc<RwLock<HashMap<Uuid, Vec<AgentLogEntry>>>>;
 
+/// The execution and log records the executor owns. The executor and the IPC
+/// server share these maps; nothing else writes to them.
 #[derive(Clone)]
 pub struct AgentState {
     pub executions: AgentExecutions,
-    pub running_clients: RunningClients,
     pub logs: AgentLogs,
 }
 
@@ -22,7 +19,6 @@ impl AgentState {
     pub fn new() -> Self {
         Self {
             executions: Arc::new(RwLock::new(HashMap::new())),
-            running_clients: Arc::new(RwLock::new(HashMap::new())),
             logs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -34,14 +30,15 @@ impl Default for AgentState {
     }
 }
 
-/// Count provider processes owned by the executor and by the legacy ACP
-/// command path without counting an executor coding record twice.
+/// Count provider processes SlashIt is running, without counting an executor
+/// coding record twice.
 ///
 /// The executor returns execution ids for the records it inserted itself and
 /// separate task ids for provider flows that have no `AgentExecution` record
-/// (AI review/fix, PR helpers, and a pre-record coding start). Any remaining
-/// active records belong to the independent ACP path and are counted as-is.
-/// A shared helper keeps tray, quit, and IPC status on the same safety rule.
+/// (AI review/fix, PR helpers, and a pre-record coding start). An active record
+/// the executor does not own is still counted as-is: it is a provider process
+/// nothing else would wait for at quit. A shared helper keeps tray, quit, and
+/// IPC status on the same safety rule.
 pub(crate) async fn active_agent_count(
     executions: &AgentExecutions,
     executor: Option<&crate::queue::TaskExecutor>,
@@ -50,7 +47,7 @@ pub(crate) async fn active_agent_count(
         Some(executor) => executor.active_agent_owners().await,
         None => (std::collections::HashSet::new(), std::collections::HashSet::new()),
     };
-    let legacy_count = executions
+    let unowned_count = executions
         .read()
         .await
         .values()
@@ -65,171 +62,8 @@ pub(crate) async fn active_agent_count(
     // registered, even during the short window before its record exists.
     // Those records are excluded above, so this counts each owned provider
     // exactly once while still covering that pre-record window.
-    executor_execution_ids.len() + executor_task_ids.len() + legacy_count
+    executor_execution_ids.len() + executor_task_ids.len() + unowned_count
         + executor.map_or(0, crate::queue::TaskExecutor::counted_project_run_count)
-}
-
-#[tauri::command]
-pub async fn start_agent(
-    _gui: GuiMutation,
-    state: tauri::State<'_, crate::AppState>,
-    worktree_id: String,
-    task_id: Option<String>,
-) -> Result<AgentExecution, String> {
-    let worktree_id = Uuid::parse_str(&worktree_id).map_err(|e| e.to_string())?;
-    let task_id = task_id.and_then(|t| Uuid::parse_str(&t).ok());
-    // A new agent run, like a queued one, waits while new work is paused for
-    // disk space. Checked before anything is recorded.
-    state.start_guard.check().await.map_err(|block| block.to_string())?;
-    // The agent runs in the task's own checkout or it does not run. Passing no
-    // directory at all -- which is what this did -- left it in whatever
-    // directory SlashIt was launched from, so the agent read and wrote
-    // somewhere nobody chose. The queue answers this same question the same
-    // way for its own runs; see the worktree acquisition in
-    // `crate::queue::executor`.
-    let working_dir = {
-        let task_id = task_id.ok_or(
-            "An agent needs a task to work on, so it has a checkout of its own to work in.",
-        )?;
-        let tasks = state.task.tasks.read().await;
-        let task = tasks.get(&task_id).ok_or("Task not found")?;
-        // This path starts Claude only. An OpenCode Task must not run here
-        // under the wrong Worker; it runs through the queue.
-        if task.provider == crate::domain::task::CodingProvider::OpenCode {
-            return Err(
-                "This Task's Coding Worker is OpenCode, and this command starts only Claude. Start the Task through its queue instead.".into(),
-            );
-        }
-        task.worktree_path.clone().ok_or(
-            "This task has no worktree of its own, so there is nowhere to run an agent. \
-             Attach a worktree to the task first.",
-        )?
-    };
-
-    // Held until the client is registered where shutdown will find and kill
-    // it: closing the fence waits for this, and refuses what comes after.
-    let _admission = match state.executor.get() {
-        Some(executor) => Some(executor.admit_external_start()?),
-        None => None,
-    };
-
-    let id = Uuid::new_v4();
-    let execution = AgentExecution {
-        id,
-        worktree_id: Some(worktree_id),
-        task_id,
-        agent_type: "claude-code".to_string(),
-        status: AgentStatus::Starting,
-        started_at: chrono::Utc::now(),
-        stopped_at: None,
-    };
-    state.agent.executions.write().await.insert(id, execution.clone());
-    state.agent.logs.write().await.insert(id, Vec::new());
-
-    let client = AcpClient::start(
-        "claude",
-        &["--stdio"],
-        &[],
-        std::path::Path::new(&working_dir),
-    )
-    .map_err(|e| format!("Failed to start agent: {}", e));
-
-    let client = match client {
-        Ok(client) => Arc::new(client),
-        Err(error) => {
-            let mut executions = state.agent.executions.write().await;
-            if let Some(execution) = executions.get_mut(&id) {
-                execution.status = AgentStatus::Failed(error.clone());
-                execution.stopped_at = Some(chrono::Utc::now());
-            }
-            return Err(error);
-        }
-    };
-
-    if let Err(error) = client
-        .initialize("SlashIt".to_string(), env!("CARGO_PKG_VERSION").to_string())
-        .await
-    {
-        let error = format!("Failed to initialize agent: {}", error);
-        let _ = client.kill().await;
-        let mut executions = state.agent.executions.write().await;
-        if let Some(execution) = executions.get_mut(&id) {
-            execution.status = AgentStatus::Failed(error.clone());
-            execution.stopped_at = Some(chrono::Utc::now());
-        }
-        return Err(error);
-    }
-
-    start_log_collection(client.clone(), id, state.agent.logs.clone());
-
-    state.agent.running_clients.write().await.insert(id, client.clone());
-    state.agent.executions.write().await.insert(id, AgentExecution {
-        status: AgentStatus::Running,
-        ..execution.clone()
-    });
-
-    Ok(AgentExecution { status: AgentStatus::Running, ..execution })
-}
-
-fn start_log_collection(client: Arc<AcpClient>, execution_id: Uuid, logs: AgentLogs) {
-    tokio::spawn(async move {
-        let child = client.child.clone();
-        let mut child_guard = child.lock().await;
-        if let Some(stderr) = child_guard.stderr.as_mut() {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                let log_entry = AgentLogEntry {
-                    timestamp: chrono::Utc::now(),
-                    level: LogLevel::Info,
-                    message: line.clone(),
-                };
-                logs.write().await.entry(execution_id).or_default().push(log_entry);
-            }
-        }
-    });
-}
-
-#[tauri::command]
-pub async fn stop_agent(
-    _gui: GuiMutation,
-    state: tauri::State<'_, crate::AppState>,
-    execution_id: String,
-) -> Result<bool, String> {
-    let execution_id = Uuid::parse_str(&execution_id).map_err(|e| e.to_string())?;
-
-    if let Some(client) = state.agent.running_clients.write().await.remove(&execution_id) {
-        client.kill().await.map_err(|e| e.to_string())?;
-
-        let mut executions = state.agent.executions.write().await;
-        if let Some(execution) = executions.get_mut(&execution_id) {
-            execution.status = AgentStatus::Stopped;
-            execution.stopped_at = Some(chrono::Utc::now());
-        }
-
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-#[tauri::command]
-pub async fn get_agent_status(
-    state: tauri::State<'_, crate::AppState>,
-    execution_id: String,
-) -> Result<Option<AgentExecution>, String> {
-    let execution_id = Uuid::parse_str(&execution_id).map_err(|e| e.to_string())?;
-    let executions = state.agent.executions.read().await;
-    Ok(executions.get(&execution_id).cloned())
-}
-
-#[tauri::command]
-pub async fn get_agent_logs(
-    state: tauri::State<'_, crate::AppState>,
-    execution_id: String,
-) -> Result<Vec<AgentLogEntry>, String> {
-    let execution_id = Uuid::parse_str(&execution_id).map_err(|e| e.to_string())?;
-    let logs = state.agent.logs.read().await;
-    Ok(logs.get(&execution_id).cloned().unwrap_or_default())
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]

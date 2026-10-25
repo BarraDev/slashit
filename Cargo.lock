@@ -5262,7 +5262,6 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "uuid",
- "walkdir",
  "which",
 ]
 

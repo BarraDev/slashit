@@ -219,13 +219,12 @@ persisted: after a restart there is no Run until SlashIt starts one. Project Con
 same executor by Conversation UUID, share its admission capacity, and expose a
 stop signal without manufacturing a Task identity. `AgentSlotStatus`
 and the workflow `AgentSlot`s are static templates that no execution updates,
-and the Tauri commands in `commands/agent.rs` that drive `AcpClient` are an
-older, parallel path that the board does not use. `AgentPanel` has no rendered
-call site in the current product, so ACP executions are not task-card or board
-Working state; they remain a separate adapter debt rather than being merged
-into `TaskExecutor` here. The tray, quit guard and IPC status helper still
-include their active execution records in the union with executor ownership,
-so the safety surfaces do not assume the executor is the only provider owner.
+The former `start_agent` command, which started a Claude process outside the
+queue for an `AgentPanel` that nothing rendered, has been removed. Every
+provider run now starts through `TaskExecutor`. The tray, quit guard and IPC
+status helper still count any active execution record the executor does not
+own, so the safety surfaces do not assume the executor is the only provider
+owner.
 Neither is a second source of truth for a TaskExecutor run, and ACP startup
 failures are terminalized rather than left as active records. `WaitingForInput`
 stays out of `AgentStatus` until a provider or protocol signal exists that can
