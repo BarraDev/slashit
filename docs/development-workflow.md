@@ -422,30 +422,34 @@ workspace since its last JJ command; step 3 covers workspaces. Follow this order
 for each deleted or to-be-deleted branch:
 
 1. Record a baseline and keep it with the report: the visible history
-   (`jj log -r '::visible_heads()' --no-graph -T 'commit_id ++ "\n"'`), the
-   workspace list (`jj workspace list`), the bookmark list (`jj bookmark list -a`),
-   and `jj log -r 'conflicts() | divergent()'`.
+   (`mise exec -- jj --ignore-working-copy log -r '::visible_heads()' --no-graph -T 'commit_id ++ "\n"'`),
+   the workspace list (`mise exec -- jj --ignore-working-copy workspace list`),
+   the bookmark list (`mise exec -- jj --ignore-working-copy bookmark list -a`),
+   and `mise exec -- jj --ignore-working-copy log -r 'conflicts() | divergent()'`.
 2. Inventory the name and record each head commit ID:
-   `jj bookmark list -a exact:<name> -T 'name ++ " " ++ if(remote, remote, "-") ++ " " ++ normal_target.commit_id() ++ "\n"'`.
+   `mise exec -- jj --ignore-working-copy bookmark list -a exact:<name> -T 'name ++ " " ++ if(remote, remote, "-") ++ " " ++ if(conflict, "CONFLICT", "ok") ++ " " ++ if(normal_target, normal_target.commit_id(), "none") ++ "\n"'`.
    Once the name is forgotten, the commit ID is the only way to refer to the
-   head. Note any conflicted bookmark or divergent change.
+   head. If any row reads `CONFLICT`, stop before step 4 and report it: a
+   conflicted bookmark has no single head to preserve. Note any divergent change.
 3. Check each head against every workspace and against unpublished work. List
-   the workspaces with `jj workspace list`, then run
-   `jj log -r '((<head>:: | ::<head>) & ::<slug>@) ~ ::main'` for each `<slug>`,
-   and `jj log -r '(<head>:: ~ <head>) ~ ::main'` for unpublished descendants. A
+   the workspaces with `mise exec -- jj --ignore-working-copy workspace list`,
+   then run `mise exec -- jj --ignore-working-copy log -r '((<head>:: | ::<head>) & ::<slug>@) ~ ::main'`
+   for each `<slug>`, and `mise exec -- jj --ignore-working-copy log -r '(<head>:: ~ <head>) ~ ::main'`
+   for unpublished descendants. A
    non-empty result protects the head. Do not forget or delete a protected head;
    record it in the report and wait for the repository owner's decision.
    A workspace's `@` is only as current as its last snapshot. For each workspace
    the query involves, its owner must confirm that the working copy is current:
-   the owner runs `jj status` there and records the output. Do not run an
+   the owner runs `mise exec -- jj status` there and records the output. Do not run an
    ordinary JJ command in a workspace you do not own, because it snapshots that
    workspace. A head is protected if an unconfirmed workspace shows any relation
    to it.
 4. Preserve the heads before anything is forgotten. Fetch them by SHA into a
    disposable bare repository (`git fetch <canonical .git> <sha>...`; verified
    with the pinned Git), name each with `git update-ref refs/archive/<name> <sha>`,
-   and run `git bundle create <file> --all` outside the repository. Run
-   `git bundle verify`, restore the bundle into a second disposable repository,
+   and run `git -C <scratch-repo> bundle create <file> --all`, where the scratch
+   repository is outside the canonical repository and holds only the archive
+   refs. Run `git bundle verify`, restore the bundle into a second disposable repository,
    and compare each restored SHA and tree with the original. Stop if any check
    fails.
 5. Forget the exact names: `mise exec -- jj bookmark forget --include-remotes exact:<name> ...`.
@@ -461,7 +465,7 @@ for each deleted or to-be-deleted branch:
    changes. Any commit that leaves the visible history, or any new conflict, is
    a stop.
 
-Keep other writers out of the store. Run `jj op log --limit 3` before each step,
+Keep other writers out of the store. Run `mise exec -- jj --ignore-working-copy op log --limit 3` before each step,
 and stop if an operation you did not start appears. Rehearse a non-trivial
 sequence in a disposable colocated repository with a local bare remote
 (section 9), including a deleted branch whose commit only it reaches. A rehearsal
