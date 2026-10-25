@@ -335,3 +335,22 @@ mod pty_resize_tests {
         assert!(resize_result.is_ok());
     }
 }
+
+#[cfg(test)]
+mod project_scope_tests {
+    use super::super::commands::project_takes_input;
+
+    #[test]
+    fn test_project_takes_input_only_its_own_sessions() {
+        assert!(project_takes_input(Some("project-a"), Some("project-a")));
+        assert!(!project_takes_input(Some("project-b"), Some("project-a")));
+        // A session opened outside any Project is not reachable from one.
+        assert!(!project_takes_input(None, Some("project-a")));
+    }
+
+    #[test]
+    fn test_project_takes_input_without_a_project_takes_every_session() {
+        assert!(project_takes_input(Some("project-a"), None));
+        assert!(project_takes_input(None, None));
+    }
+}

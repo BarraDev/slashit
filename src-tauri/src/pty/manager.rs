@@ -13,6 +13,9 @@ pub struct PtySession {
     pub name: String,
     pub cols: u16,
     pub rows: u16,
+    /// The Project the terminal was opened in. Set by the spawn command, and
+    /// the only thing that scopes a session to a Project.
+    pub project_id: Option<String>,
     writer: Box<dyn Write + Send>,
     // Keep the master PTY alive for resizing and proper operation
     master: Box<dyn MasterPty + Send>,
@@ -217,6 +220,7 @@ pub fn spawn_pty_session(
         name: name.clone(),
         cols,
         rows,
+        project_id: None,
         writer,
         master: pair.master,
         _child: child,

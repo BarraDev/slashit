@@ -54,11 +54,12 @@ pub async fn spawn_pty(
     println!("[PTY Backend] spawn_pty: name={}, size={}x{}, wd={:?}", name, cols, rows, working_directory);
 
     // Spawn the PTY session
-    let (session, mut reader) = spawn_pty_session(name.clone(), cols, rows, working_directory.clone())
+    let (mut session, mut reader) = spawn_pty_session(name.clone(), cols, rows, working_directory.clone())
         .map_err(|e| {
             eprintln!("[PTY Backend] Failed to spawn PTY: {}", e);
             e
         })?;
+    session.project_id = project_id.clone();
 
     let session_id = session.id;
     
@@ -302,7 +303,7 @@ pub async fn list_pty_sessions(
             cols: session.cols,
             rows: session.rows,
             is_new: false,
-            project_id: None, // TODO: store project_id in session
+            project_id: session.project_id.clone(),
         })
         .collect();
 
@@ -324,19 +325,32 @@ pub async fn get_pty_scrollback(
         .ok_or_else(|| "Scrollback not found".to_string())
 }
 
-/// Write data to all active PTY sessions
+/// Whether a session whose Project is `session_project` takes input meant for
+/// `project_id`. `None` takes every session, which is what the grid shows when
+/// no Project is selected.
+pub(crate) fn project_takes_input(session_project: Option<&str>, project_id: Option<&str>) -> bool {
+    match project_id {
+        None => true,
+        Some(pid) => session_project == Some(pid),
+    }
+}
+
+/// Write data to the PTY sessions of one Project, or to every session when no
+/// Project is given. Returns how many sessions took the data.
 #[tauri::command]
 pub async fn write_to_all_ptys(
     _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     data: Vec<u8>,
+    project_id: Option<String>,
 ) -> Result<u32, String> {
-
-    
     let mut sessions = state.pty.sessions.lock().await;
     let mut success_count = 0u32;
-    
+
     for session in sessions.values_mut() {
+        if !project_takes_input(session.project_id.as_deref(), project_id.as_deref()) {
+            continue;
+        }
         match session.write(&data) {
             Ok(_) => {
                 success_count += 1;

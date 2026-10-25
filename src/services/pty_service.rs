@@ -104,10 +104,12 @@ pub async fn attach_pty_session(session_id: String) -> Result<PtyInfo, String> {
     serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
 }
 
-/// Write data to all active PTY sessions
-pub async fn write_to_all_ptys(data: Vec<u8>) -> Result<u32, String> {
+/// Write data to the PTY sessions of `project_id`, or to every session when no
+/// Project is given.
+pub async fn write_to_all_ptys(data: Vec<u8>, project_id: Option<String>) -> Result<u32, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "data": data,
+        "projectId": project_id,
     })).map_err(|e| e.to_string())?;
 
     let result = invoke("write_to_all_ptys", args).await;
@@ -118,11 +120,11 @@ pub async fn write_to_all_ptys(data: Vec<u8>) -> Result<u32, String> {
     }
 }
 
-/// Invoke a command on all terminals (writes command + Enter)
-pub async fn invoke_all_terminals(command: &str) -> Result<u32, String> {
+/// Invoke a command on the terminals of `project_id` (writes command + Enter)
+pub async fn invoke_all_terminals(command: &str, project_id: Option<String>) -> Result<u32, String> {
     let mut data = command.as_bytes().to_vec();
     data.push(b'\r');
-    write_to_all_ptys(data).await
+    write_to_all_ptys(data, project_id).await
 }
 
 /// Get scrollback buffer for a session
