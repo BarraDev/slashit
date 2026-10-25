@@ -5,8 +5,12 @@ use wasm_bindgen::JsCast;
 use leptos::callback::Callback;
 use crate::pages::page_offered;
 
+/// Installs the global Ctrl/Cmd shortcuts. Page shortcuts go through `navigate`
+/// so they take the same path as a sidebar click, including persisting the page.
+/// A shortcut calls `prevent_default` only when it has a handler to run, so the
+/// webview keeps its own behavior (such as reload on Ctrl+R) when nothing is bound.
 pub fn setup_keyboard_shortcuts(
-    set_current_page: WriteSignal<String>,
+    navigate: Callback<String>,
     on_new_task: Option<Callback<()>>,
     on_refresh: Option<Callback<()>>,
     on_close_modals: Option<Callback<()>>,
@@ -49,50 +53,50 @@ pub fn setup_keyboard_shortcuts(
         if cmd_or_ctrl {
             match key.as_str() {
                 "k" => {
-                    event.prevent_default();
                     if let Some(ref cb) = on_new_task {
+                        event.prevent_default();
                         cb.run(());
                     }
                 }
                 "1" => {
                     event.prevent_default();
-                    set_current_page.set("dashboard".to_string());
+                    navigate.run("dashboard".to_string());
                 }
                 "2" => {
                     event.prevent_default();
-                    set_current_page.set("agent".to_string());
+                    navigate.run("agent".to_string());
                 }
-                "3" => {
+                "3" if page_offered("roadmap") => {
                     event.prevent_default();
-                    set_current_page.set("roadmap".to_string());
+                    navigate.run("roadmap".to_string());
                 }
                 "4" => {
                     event.prevent_default();
-                    set_current_page.set("context".to_string());
+                    navigate.run("context".to_string());
                 }
                 "5" if page_offered("ideation") => {
                     event.prevent_default();
-                    set_current_page.set("ideation".to_string());
+                    navigate.run("ideation".to_string());
                 }
                 "n" => {
                     event.prevent_default();
-                    set_current_page.set("insights".to_string());
+                    navigate.run("insights".to_string());
                 }
                 "r" => {
-                    event.prevent_default();
                     if let Some(ref cb) = on_refresh {
+                        event.prevent_default();
                         cb.run(());
                     }
                 }
                 "," => {
                     event.prevent_default();
-                    set_current_page.set("settings".to_string());
+                    navigate.run("settings".to_string());
                 }
                 _ => {}
             }
         } else if key.as_str() == "Escape" {
-            event.prevent_default();
             if let Some(ref cb) = on_close_modals {
+                event.prevent_default();
                 cb.run(());
             }
         }
