@@ -102,11 +102,12 @@ not a channel to iterate in on Windows. Ship the real patch version instead.
 ## 3. Tag and push
 
 The tag must be exactly `v` followed by the version in `tauri.conf.json`. The
-preflight job compares them and fails otherwise.
+preflight job compares them and fails otherwise. The example below tags the
+planned `0.0.1` prerelease; substitute the version your `tauri.conf.json` names.
 
 ```bash
-git tag -a v0.1.0 -m 'SlashIt v0.1.0'
-git push origin v0.1.0
+git tag -a v0.0.1 -m 'SlashIt v0.0.1'
+git push origin v0.0.1
 ```
 
 This project's normal workflow is Jujutsu, but `jj` treats git tags as
@@ -127,6 +128,26 @@ and tag again. Never move a tag that has already produced a published release.
    its `[<version>]: https://` link; and that `.github/release-channels.txt`
    declares the version's channel. It writes the channel as the job output that
    sets the release's `prerelease` flag. Everything else waits on this job.
+2. **`release`** (four runners in parallel) — builds the frontend with Trunk
+   and the app with `tauri-action`, then creates or updates a **draft** release
+   and uploads each platform's installers plus `latest.json`, the updater
+   manifest. The Linux runner first runs `cargo build -p slashit --release`,
+   because the `.deb` and `.rpm` packages copy that CLI binary to
+   `/usr/bin/slashit`. The Linux packages (`.deb`, `.rpm`, `.AppImage`) also carry
+   `slashitd`, built from the `slashit-ui` package and bundled without a
+   `tauri.conf.json` entry, so a change to the bin layout can drop it silently;
+   section 5 says what to check. The macOS
+   and Windows installers do not include the CLI, and whether they include
+   `slashitd` is checked on the artifacts, not assumed.
+3. **`next-steps`** — writes the remaining manual steps into the run summary,
+   including whether this particular version will be reachable by the updater.
+
+The release body links the `CHANGELOG.md` at the tag, which is the curated
+account of the release. It does not list pull requests: GitHub's generated
+notes would list every merged pull request in the repository (over 150 for the
+first release), which describes the project's history rather than this version.
+Commits pushed straight to `main` have no pull request and appear only in
+`CHANGELOG.md`.
 
 ### Release channels
 
@@ -162,26 +183,6 @@ channel it prints:
 ```bash
 scripts/release-preflight.sh v0.0.1
 ```
-2. **`release`** (four runners in parallel) — builds the frontend with Trunk
-   and the app with `tauri-action`, then creates or updates a **draft** release
-   and uploads each platform's installers plus `latest.json`, the updater
-   manifest. The Linux runner first runs `cargo build -p slashit --release`,
-   because the `.deb` and `.rpm` packages copy that CLI binary to
-   `/usr/bin/slashit`. The Linux packages (`.deb`, `.rpm`, `.AppImage`) also carry
-   `slashitd`, built from the `slashit-ui` package and bundled without a
-   `tauri.conf.json` entry, so a change to the bin layout can drop it silently;
-   section 5 says what to check. The macOS
-   and Windows installers do not include the CLI, and whether they include
-   `slashitd` is checked on the artifacts, not assumed.
-3. **`next-steps`** — writes the remaining manual steps into the run summary,
-   including whether this particular version will be reachable by the updater.
-
-The release body links the `CHANGELOG.md` at the tag, which is the curated
-account of the release. It does not list pull requests: GitHub's generated
-notes would list every merged pull request in the repository (over 150 for the
-first release), which describes the project's history rather than this version.
-Commits pushed straight to `main` have no pull request and appear only in
-`CHANGELOG.md`.
 
 ### Version links in CHANGELOG.md
 
@@ -189,18 +190,19 @@ Each version has a reference link at the foot of `CHANGELOG.md`, in Keep a
 Changelog form. Write it when you cut the release, in the same commit that moves
 `[Unreleased]` under the version:
 
-- The first release links to its tag:
+- The first release, the `0.0.1` prerelease, links to its tag:
 
   ```
-  [0.1.0]: https://github.com/BarraDev/slashit/releases/tag/v0.1.0
+  [0.0.1]: https://github.com/BarraDev/slashit/releases/tag/v0.0.1
+  [Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.1...HEAD
+  ```
+
+- Each later release links to the comparison with the tag before it. The
+  first stable release, `0.1.0`, follows the `0.0.1` prerelease:
+
+  ```
+  [0.1.0]: https://github.com/BarraDev/slashit/compare/v0.0.1...v0.1.0
   [Unreleased]: https://github.com/BarraDev/slashit/compare/v0.1.0...HEAD
-  ```
-
-- Each later release links to the comparison with the tag before it:
-
-  ```
-  [0.1.1]: https://github.com/BarraDev/slashit/compare/v0.1.0...v0.1.1
-  [Unreleased]: https://github.com/BarraDev/slashit/compare/v0.1.1...HEAD
   ```
 
 Use the release tags as the boundaries, not `main` or dates. The comparison is
