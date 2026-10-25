@@ -138,7 +138,7 @@ pub fn StorageSettings(project_id: String) -> impl IntoView {
             <div>
                 <h2 class="text-lg font-semibold text-white/90 mb-1">"Project storage"</h2>
                 <p class="text-sm text-white/50 mb-4">
-                    "Choose where SlashIt keeps this project's board. Your API keys, terminal history and logs are always stored outside the project and are never affected by this setting."
+                    "Choose where SlashIt keeps this project's board. Your API keys, terminal history and logs are never written into the project, and this setting does not change where they are kept."
                 </p>
             </div>
 

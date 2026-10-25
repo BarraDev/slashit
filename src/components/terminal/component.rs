@@ -1006,6 +1006,7 @@ pub fn RealTerminal(
                     </span>
                 </div>
                 <button
+                    data-testid="terminal-close"
                     on:click=move |ev| on_close_click_header(ev)
                     class="text-white/40 hover:text-white/60 transition-colors p-1 hover:bg-white/10 rounded"
                 >

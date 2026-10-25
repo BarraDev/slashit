@@ -128,7 +128,7 @@ pub fn App() -> impl IntoView {
 
     // The Ctrl/Cmd page shortcuts shown in the sidebar. The listener lives for
     // the whole session, so it is installed once, with this component.
-    setup_keyboard_shortcuts(on_navigate, None, None, None);
+    setup_keyboard_shortcuts(on_navigate);
 
     view! {
         <QuitDialog />

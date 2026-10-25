@@ -360,6 +360,10 @@ mod quit_tests {
     use crate::pty::manager::spawn_pty_session;
     use std::time::{Duration, Instant};
 
+    /// `SHELL` is process-wide, and the two tests that set it must not interleave:
+    /// one test's script directory is removed while the other spawns.
+    static SHELL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Whether `pid` is a live process. A zombie is not live: it has ended and
     /// only waits to be reaped.
     fn is_live(pid: i32) -> bool {
@@ -387,6 +391,7 @@ mod quit_tests {
     #[ignore = "spawns a shell and changes SHELL for this process; run alone with --ignored --exact"]
     fn dropping_a_session_ends_a_shell_that_ignores_hangup_and_its_children() {
         use std::os::unix::fs::PermissionsExt;
+        let _shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("hup-ignoring-shell.sh");
@@ -433,5 +438,64 @@ mod quit_tests {
             unsafe { libc::kill(*pid, libc::SIGKILL) };
         }
         assert!(survivors.is_empty(), "dropping the session left {survivors:?} running");
+    }
+
+    /// The application exits as soon as shutdown returns, so the shutdown path
+    /// must have ended the shell's group by then. Unlike the drop above, this
+    /// checks with no grace period.
+    #[test]
+    #[ignore = "spawns a shell and changes SHELL for this process; run alone with --ignored --exact"]
+    fn ending_the_sessions_at_shutdown_has_ended_a_shell_that_ignores_hangup_when_it_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        let _shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hup-ignoring-shell.sh");
+        let pids = dir.path().join("pids");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n", pids.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("SHELL", &script);
+
+        let (session, reader) = spawn_pty_session(
+            "shutdown-test".to_string(),
+            80,
+            24,
+            Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .expect("spawn the session");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (shell, child) = loop {
+            let parsed = std::fs::read_to_string(&pids).ok().and_then(|text| {
+                let mut parts = text.split_whitespace().map(|p| p.parse::<i32>());
+                match (parts.next(), parts.next()) {
+                    (Some(Ok(shell)), Some(Ok(child))) => Some((shell, child)),
+                    _ => None,
+                }
+            });
+            if let Some(pair) = parsed {
+                break pair;
+            }
+            assert!(Instant::now() < deadline, "the shell did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(crate::pty::manager::end_sessions(vec![session]));
+        drop(reader);
+
+        let survivors: Vec<i32> = [shell, child].into_iter().filter(|pid| is_live(*pid)).collect();
+        for pid in &survivors {
+            // Safety: the pids were started by this test and are only killed here.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        assert!(survivors.is_empty(), "ending the sessions at shutdown left {survivors:?} running");
     }
 }

@@ -1581,7 +1581,7 @@ fn PrReviewModal(
                             </label>
                             <label
                                 class="flex items-center gap-1.5 cursor-pointer"
-                                title="Run the agent read-only: describe what it would change without editing, pushing, or replying"
+                                title="Dry run: the agent only reads the code (Read, Glob, Grep) and reports what it would change. It makes no edits, pushes, or replies."
                             >
                                 <input
                                     type="checkbox"

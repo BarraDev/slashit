@@ -5,16 +5,11 @@ use wasm_bindgen::JsCast;
 use leptos::callback::Callback;
 use crate::pages::page_offered;
 
-/// Installs the global Ctrl/Cmd shortcuts. Page shortcuts go through `navigate`
+/// Installs the global Ctrl/Cmd page shortcuts. They go through `navigate`
 /// so they take the same path as a sidebar click, including persisting the page.
-/// A shortcut calls `prevent_default` only when it has a handler to run, so the
-/// webview keeps its own behavior (such as reload on Ctrl+R) when nothing is bound.
-pub fn setup_keyboard_shortcuts(
-    navigate: Callback<String>,
-    on_new_task: Option<Callback<()>>,
-    on_refresh: Option<Callback<()>>,
-    on_close_modals: Option<Callback<()>>,
-) {
+/// A key that is not bound here is left to the webview, so Ctrl+R keeps the
+/// webview's own behavior.
+pub fn setup_keyboard_shortcuts(navigate: Callback<String>) {
     let window = web_sys::window().expect("no global window exists");
     let document = window.document().expect("no document exists");
 
@@ -52,12 +47,6 @@ pub fn setup_keyboard_shortcuts(
 
         if cmd_or_ctrl {
             match key.as_str() {
-                "k" => {
-                    if let Some(ref cb) = on_new_task {
-                        event.prevent_default();
-                        cb.run(());
-                    }
-                }
                 "1" => {
                     event.prevent_default();
                     navigate.run("dashboard".to_string());
@@ -82,22 +71,11 @@ pub fn setup_keyboard_shortcuts(
                     event.prevent_default();
                     navigate.run("insights".to_string());
                 }
-                "r" => {
-                    if let Some(ref cb) = on_refresh {
-                        event.prevent_default();
-                        cb.run(());
-                    }
-                }
                 "," => {
                     event.prevent_default();
                     navigate.run("settings".to_string());
                 }
                 _ => {}
-            }
-        } else if key.as_str() == "Escape" {
-            if let Some(ref cb) = on_close_modals {
-                event.prevent_default();
-                cb.run(());
             }
         }
     }) as Box<dyn Fn(_)>);

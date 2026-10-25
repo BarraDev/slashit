@@ -338,11 +338,11 @@ pub fn run() {
                     if let Err(error) = &result {
                         eprintln!("SlashIt: the instance failed closed and is exiting: {error}");
                     }
-                    // Terminals end with the application. Dropping a session ends
-                    // its shell's process group, which closing the master alone
-                    // does not do.
-                    let terminals: Vec<_> = app_handle.state::<AppState>().pty.sessions.lock().await.drain().collect();
-                    drop(terminals);
+                    // Terminals end with the application, and the shutdown waits
+                    // for their process groups to be gone: the process exits
+                    // right after this, before a detached SIGKILL could run.
+                    let terminals: Vec<_> = app_handle.state::<AppState>().pty.sessions.lock().await.drain().map(|(_, session)| session).collect();
+                    pty::manager::end_sessions(terminals).await;
                     *ownership_slot.lock().unwrap() = Some(ownership);
                     shutdown_complete.store(true, std::sync::atomic::Ordering::Release);
                     // An update restart waits for the same drain as a quit.

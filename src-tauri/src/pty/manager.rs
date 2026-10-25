@@ -42,6 +42,64 @@ fn end_process_group(pgid: i32) {
     });
 }
 
+/// Whether any process still belongs to the group.
+#[cfg(unix)]
+fn group_is_running(pgid: i32) -> bool {
+    // Safety: signal 0 only probes.
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// Reaps exited shells and waits until none of `groups` is running, or until
+/// `limit` has passed. Reaping matters: an exited shell stays a zombie, which
+/// keeps its group non-empty until it is collected.
+#[cfg(unix)]
+async fn wait_for_groups(sessions: &mut [PtySession], groups: &[i32], limit: std::time::Duration, poll: std::time::Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        for session in sessions.iter_mut() {
+            let _ = session._child.try_wait();
+        }
+        if !groups.iter().any(|&pgid| group_is_running(pgid)) || std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Ends every terminal at application shutdown, and returns once no shell
+/// group is left or the SIGKILL fallback has been sent.
+///
+/// The application exits as soon as this returns, so the fallback cannot wait
+/// on a detached thread the way dropping a session does: a shell that ignores
+/// SIGHUP would then outlive a quit whose dialog said it would end it.
+#[cfg(unix)]
+pub async fn end_sessions(mut sessions: Vec<PtySession>) {
+    use std::time::Duration;
+    const POLL: Duration = Duration::from_millis(25);
+    const HANGUP_GRACE: Duration = Duration::from_millis(500);
+    const KILL_GRACE: Duration = Duration::from_secs(1);
+
+    let groups: Vec<i32> = sessions.iter_mut().filter_map(PtySession::live_group).collect();
+    for &pgid in &groups {
+        // Safety: each group is one this process's own terminal shell leads.
+        unsafe { libc::killpg(pgid, libc::SIGHUP) };
+    }
+    wait_for_groups(&mut sessions, &groups, HANGUP_GRACE, POLL).await;
+    for &pgid in &groups {
+        if group_is_running(pgid) {
+            // Safety: as above.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
+    wait_for_groups(&mut sessions, &groups, KILL_GRACE, POLL).await;
+}
+
+/// Windows has no process groups to signal; dropping the sessions closes them.
+#[cfg(not(unix))]
+pub async fn end_sessions(sessions: Vec<PtySession>) {
+    drop(sessions);
+}
+
 impl Drop for PtySession {
     /// Ending the session ends its shell and the jobs it started. A shell that
     /// has already exited is not signalled: once reaped, its pid may name a
@@ -59,6 +117,16 @@ impl Drop for PtySession {
 }
 
 impl PtySession {
+    /// The process group of this session's shell, while the shell is running.
+    #[cfg(unix)]
+    fn live_group(&mut self) -> Option<i32> {
+        if matches!(self._child.try_wait(), Ok(None)) {
+            self._child.process_id().map(|pid| pid as i32)
+        } else {
+            None
+        }
+    }
+
     /// Write data to the PTY
     pub fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
         self.writer.write_all(data)?;
