@@ -525,6 +525,15 @@ pub fn HumanReviewPanel(
             // Undecided: the decision itself.
             <Show when=move || in_review.get() && decision.get().is_none()>
                 <p class="text-xs text-white/50">"Decide on these changes. The diff is in the Changes tab."</p>
+                // An approval covers the branch commit that is current when the
+                // person approves. Naming the branch shows what that will be.
+                {move || task.with(|t| t.as_ref().and_then(|t| t.branch_name.clone())).map(|branch| view! {
+                    <p data-testid="human-review-approval-branch" class="text-xs text-white/50 break-all">
+                        "Approval covers the current commit of branch "
+                        <code class="font-mono text-white/70">{branch}</code>
+                        ". If the branch moves after you approve, the approval no longer applies and you approve again."
+                    </p>
+                })}
                 <div class="flex flex-wrap gap-2">
                     {move || {
                         let available = availability.get();
