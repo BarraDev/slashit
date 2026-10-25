@@ -192,7 +192,7 @@ command -v dbus-run-session >/dev/null ||
   fail "dbus-run-session is not installed (package dbus on Arch, dbus-bin or dbus on Debian/Ubuntu).
 Hidden mode needs it to keep the application off your real session bus."
 
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/slashit-acceptance-display.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/acc-display.XXXXXX")
 # The path goes unescaped into a D-Bus address and its XML configuration, and
 # a Unix socket path is limited to 108 bytes.
 if [[ ! $scratch =~ ^[A-Za-z0-9/._-]+$ ]] || ((${#scratch} > 80)); then

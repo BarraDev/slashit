@@ -117,7 +117,8 @@ impl TestContext {
         // Deliberately under the system temp directory rather than inside
         // `target/`: the application binds a Unix socket under
         // `XDG_RUNTIME_DIR`, and socket paths are limited to about 108 bytes.
-        let state = StateRoot::create(&std::env::temp_dir(), "slashit-acc")?;
+        let state = StateRoot::create(&std::env::temp_dir(), "acc")?;
+        state.check_socket_path()?;
 
         Ok(Self {
             name: name.to_string(),

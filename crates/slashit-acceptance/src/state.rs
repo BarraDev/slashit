@@ -46,6 +46,10 @@ pub struct StateRoot {
 /// directory rather than unlucky.
 const CLAIM_ATTEMPTS: usize = 32;
 
+/// The longest a Unix socket path may be, excluding the terminating NUL:
+/// `sun_path` holds 108 bytes.
+const SOCKET_PATH_LIMIT: usize = 107;
+
 /// Distinguishes roots created inside one process, where the clock can repeat
 /// but this cannot.
 static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -98,10 +102,40 @@ pub(crate) fn claim_unique(parent: &Path, label: &str) -> Result<PathBuf> {
     )
 }
 
+/// Like [`claim_unique`], with a name short enough to leave room for the
+/// control socket under it. The process id and an in-process counter are
+/// enough: [`claim`] still decides ownership, and a stale directory with the
+/// same name only moves the counter on.
+fn claim_short(parent: &Path, label: &str) -> Result<PathBuf> {
+    for _ in 0..CLAIM_ATTEMPTS {
+        let candidate = parent.join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        if claim(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "could not claim an unused directory for {label} under {} after {CLAIM_ATTEMPTS} attempts",
+        parent.display()
+    )
+}
+
 impl StateRoot {
     /// Create a fresh root under `parent`, owning it exclusively.
+    ///
+    /// `parent` is resolved first. Git records a worktree by its resolved
+    /// path, so a root reached through a symlink would have the application
+    /// and Git naming the same checkout differently.
     pub fn create(parent: &Path, label: &str) -> Result<Self> {
-        let path = claim_unique(parent, label)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+        let parent = parent
+            .canonicalize()
+            .with_context(|| format!("could not resolve {}", parent.display()))?;
+        let path = claim_short(&parent, label)?;
 
         // Only now that the root is ours: anything below it is private by
         // construction, so plain `create_dir_all` is correct here.
@@ -139,6 +173,21 @@ impl StateRoot {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Fails when the application's control socket would not fit in a Unix
+    /// socket path. `bind` refuses a longer one, and the application reports
+    /// that as another instance owning the channel, so say what is wrong here.
+    pub fn check_socket_path(&self) -> Result<()> {
+        let socket = self.runtime_dir().join(APP_DIR).join("slashit.sock");
+        let length = socket.as_os_str().len();
+        if length > SOCKET_PATH_LIMIT {
+            bail!(
+                "the control socket path {} is {length} bytes, and a Unix socket path holds at most {SOCKET_PATH_LIMIT}; set TMPDIR to a shorter path",
+                socket.display()
+            );
+        }
+        Ok(())
     }
 
     pub fn config_home(&self) -> PathBuf {
