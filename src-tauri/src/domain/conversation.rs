@@ -683,10 +683,12 @@ pub enum CoordinatorOutput {
     InspectTask {
         target_task_id: Uuid,
     },
-    /// Read-only: a bounded, filtered page of this Project's Tasks.
+    /// Read-only: a bounded, filtered page of this Project's Tasks, after
+    /// skipping `offset` matching Tasks in the order every Coordinator read uses.
     ListTasks {
         status: Option<TaskStatus>,
         limit: Option<u8>,
+        offset: Option<u32>,
     },
     /// Read-only: the most recent milestones of one Task's activity.
     InspectTaskActivity {
@@ -849,10 +851,11 @@ impl Conversation {
         self.coordinator_projection_before(current_message, project_name, project_root, tasks, None)
     }
 
-    /// `tasks` is the Project's whole Task index in the order it should be
-    /// listed. The projection keeps the first `TASK_INDEX_LIMIT` and states the
-    /// total, so the Coordinator knows when the index is partial and can page
-    /// with `list_tasks`.
+    /// `tasks` is the Project's whole Task index, in the order `list_tasks`
+    /// pages through it. The projection keeps the first `TASK_INDEX_LIMIT`
+    /// entries and reports `tasks_total` and `tasks_truncated`, so the
+    /// Coordinator knows the index is partial and can read the rest with
+    /// `list_tasks` and an offset.
     pub fn coordinator_projection_before(
         &self,
         current_message: &str,
