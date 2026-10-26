@@ -376,8 +376,10 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         }
     };
     // The entries render from the same snapshot, so the scroll waits one tick for the new height.
+    // An execution refresh can change a card in the history without a new snapshot, so it counts too.
     Effect::new(move |_| {
         snapshot.track();
+        executions.track();
         if following_latest.get_untracked() {
             gloo_timers::callback::Timeout::new(0, scroll_to_latest).forget();
         }
@@ -689,7 +691,8 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         }
                     />
                 </div>
-                <div class="mb-3 shrink-0 space-y-2" data-testid="project-actions">
+                // Bounded, so many pending proposals scroll here instead of taking the history's height.
+                <div class="mb-3 max-h-64 shrink-0 space-y-2 overflow-y-auto" data-testid="project-actions">
                     <For
                         each=move || snapshot.get().map(|value| pending_project_actions(&value)).unwrap_or_default()
                         key=|action| (action.id, action.status)
