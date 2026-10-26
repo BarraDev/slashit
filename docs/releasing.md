@@ -72,23 +72,14 @@ Left alone, a bad version is expensive and badly timed. It is not a
 configuration error caught at startup — it happens at bundling time, after the
 entire release build has compiled on the Windows runner, and only there. Linux
 and macOS succeed, so the release is created and looks nearly complete while
-Windows users have nothing. So the `preflight` job refuses the version up front,
-in seconds, before any platform build starts.
+Windows users have nothing. So the `preflight` job encodes the bundler's rule and
+refuses the version up front, in seconds, with a message naming the allowed
+form, before any platform build starts.
 
 Versions only increase. Each line of `.github/release-channels.txt` must name a
 later version than the line above it, and a release must be the latest declared
 version. The updater compares these numbers, so a version published after a
 later one would move the update channel backwards.
-
-Left alone, this failure is expensive and badly timed. It is not a
-configuration error caught at startup — it happens at bundling time, after the
-entire release build has compiled on the Windows runner, and only there. Linux
-and macOS succeed, so the release is created and looks nearly complete while
-Windows users have nothing.
-
-So the workflow refuses the version up front. The `preflight` job encodes
-exactly the bundler's rule and fails in seconds with a message naming the
-allowed form, before any platform build starts.
 
 Build metadata (`0.1.0+1`) is refused as well. Semver excludes build metadata
 from version precedence, so `0.1.0+1` and `0.1.0+2` are *equal* versions: the
