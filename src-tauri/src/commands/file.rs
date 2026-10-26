@@ -27,12 +27,18 @@ async fn project_root_for(
     project_id: &str,
 ) -> Result<PathBuf, String> {
     let id = Uuid::parse_str(project_id).map_err(|e| e.to_string())?;
-    let projects = state.project.projects.read().await;
-    let project = projects.get(&id).ok_or("Project not found")?;
-    let repositories = state.repository.repositories.read().await;
-    let local_path = project
-        .repository_path(&repositories)
-        .ok_or("This Project has no folder to read from.")?;
+    // The locks are held only to copy the path out. Canonicalizing touches the
+    // filesystem, which can block on a slow mount, and writers must not wait
+    // behind it.
+    let local_path = {
+        let projects = state.project.projects.read().await;
+        let project = projects.get(&id).ok_or("Project not found")?;
+        let repositories = state.repository.repositories.read().await;
+        project
+            .repository_path(&repositories)
+            .ok_or("This Project has no folder to read from.")?
+            .to_string()
+    };
     resolve_root(&local_path)
 }
 
