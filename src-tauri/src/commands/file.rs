@@ -55,6 +55,11 @@ pub(crate) fn resolve_root(local_path: &str) -> Result<PathBuf, String> {
 /// The path must be absolute, and it is canonicalized before the check, so a
 /// symlink inside the Project that points elsewhere is refused. The check is
 /// made once, before the read: a link swapped in after it is not covered.
+///
+/// The contract is to refuse paths the webview asks for. It is not a sandbox
+/// against a process running as the same user with write access to the Project:
+/// that process can already read every file the app can, so a swap made while
+/// this check runs gives it nothing new.
 pub(crate) fn within_root(root: &Path, path: &str) -> Result<PathBuf, String> {
     let requested = Path::new(path);
     if !requested.is_absolute() {
