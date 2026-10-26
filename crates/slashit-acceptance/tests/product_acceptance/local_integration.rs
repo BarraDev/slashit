@@ -250,6 +250,8 @@ async fn integrate_into_checked_out_main(driver: &WebDriver, repository: &GitFix
     assert_main_checked_out_and_clean(repository)?;
 
     approve_and_complete_locally(driver, repository, &executed, false).await?;
+    // The completion toast sits over the drawer's tab bar, so it must be gone before the tab is pressed.
+    dismiss_toasts(driver).await?;
     click(driver, "[data-testid=\"task-drawer-tab-changes\"]", "Changes after local completion").await?;
     await_text(
         driver,
