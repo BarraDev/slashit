@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! How much disk SlashIt uses. Read-only: see [`crate::storage_accounting`].
 
 use crate::commands::gui_admission::GuiMutation;

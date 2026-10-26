@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! How much disk SlashIt uses, and how much of it it could prove is safe to
 //! give back.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Test-only Git fixture shared by the desktop journeys and ordinary helper tests.
 
 use super::git_support::git_command;

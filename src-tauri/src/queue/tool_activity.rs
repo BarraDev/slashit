@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The tool calls a coding run's timeline keeps, and what each one says.
 //!
 //! A tool call reaches the timeline as its tool's name and one short detail:

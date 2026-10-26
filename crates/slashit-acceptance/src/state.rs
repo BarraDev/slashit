@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Temporary state roots, so a run can never see or damage real SlashIt data.
 //!
 //! `AppPaths` resolves every location through `directories::ProjectDirs`,

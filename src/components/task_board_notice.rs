@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The warning for a Task board that could not be loaded.
 //!
 //! A board that cannot be read is never shown as an empty Project. The notice

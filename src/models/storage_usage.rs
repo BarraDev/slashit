@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Mirrors `src-tauri/src/domain/storage_usage.rs`. What each total means is
 //! documented there.
 

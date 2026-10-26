@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Integrating a task's approved work into a local branch: the preview the
 //! drawer shows, the confirmation, and finishing or dropping an integration
 //! that was started and not finished.

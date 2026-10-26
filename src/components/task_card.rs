@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use leptos::prelude::*;
 use crate::components::attention::{AttentionChip, DeliveringChip};
 use crate::components::task_live::{project_run, RunBadge};

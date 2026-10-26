@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
 use crate::domain::file::{FileItem, FileInfo};
 use std::fs;

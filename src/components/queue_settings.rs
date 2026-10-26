@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Queue settings in the Settings page: what the Queue is running under, and
 //! the way to change it.
 //!

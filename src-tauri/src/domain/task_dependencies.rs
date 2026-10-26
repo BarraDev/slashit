@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The rules for the Task dependencies a person configures.
 //!
 //! A new configuration names at most one Task. The executor stacks a Task's

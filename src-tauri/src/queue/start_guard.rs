@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Whether SlashIt may begin a new task execution, as far as disk space goes.
 //!
 //! A task execution creates or reattaches a Task Checkout and then runs an

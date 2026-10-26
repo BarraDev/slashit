@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The shutdown boundary for desktop commands.
 //!
 //! Closing the process-wide admission gate (see `TaskExecutor::close_admission`)

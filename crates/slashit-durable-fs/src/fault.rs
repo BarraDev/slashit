@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Deterministic fault injection and call tracing.
 //!
 //! State is per thread, so tests run in parallel without disturbing each

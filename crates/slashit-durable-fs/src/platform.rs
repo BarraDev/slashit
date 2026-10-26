@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The few operations whose implementation differs by platform.
 
 use crate::{DirectorySync, Permissions};

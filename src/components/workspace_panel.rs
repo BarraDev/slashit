@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::components::custom_select::{CustomSelect, SelectOption};
 use crate::components::toast;
 use crate::models::{Project, ProjectScope, Workspace};

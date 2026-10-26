@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::models::github::{GithubIssue, PullRequest};
 use crate::models::Task;
 use wasm_bindgen::prelude::*;

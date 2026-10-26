@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Filesystem and process-record assertions used by acceptance tests.
 
 use anyhow::{bail, Result};

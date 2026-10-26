@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The control channel, server side.
 //!
 //! `slashit_ipc` owns the wire: the command set, the framing, the transports,

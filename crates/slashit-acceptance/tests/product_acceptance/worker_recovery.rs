@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! S1 Worker handoff recovery through the real desktop application.
 //!
 //! The committed case seeds the exact Task-owned crash record after a real

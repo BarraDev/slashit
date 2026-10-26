@@ -5,8 +5,7 @@
 name = "slashit-frontend"
 version = "0.1.0"
 edition = "2021"
-authors = ["Barradev Digital Services <admin@barradev.com>"]
-license = "Apache-2.0"
+license = "MPL-2.0"
 description = "SlashIt frontend - Leptos/WASM UI for the AI agent workspace manager"
 repository = "https://github.com/BarraDev/slashit"
 [dependencies]

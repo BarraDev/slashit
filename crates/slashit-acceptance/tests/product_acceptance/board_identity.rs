@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A task's card keeps its DOM node while its task changes.
 //!
 //! A click is a press and a release. WebKit sends no click if the element the

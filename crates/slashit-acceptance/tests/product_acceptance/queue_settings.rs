@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The Queue settings are operated in Settings > Queue and survive a restart.
 //!
 //! A Human turns automatic promotion off in the form, queues a Task, and the

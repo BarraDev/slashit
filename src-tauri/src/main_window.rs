@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The main window and the boundary that keeps it on the application's own origin.
 //!
 //! Tauri creates windows declared in `tauri.conf.json` before `setup()` runs,

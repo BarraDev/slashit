@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use super::*;
 use crate::fault::{fail_at, trace};
 use tempfile::TempDir;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The Task board refuses what its types do not declare, at every depth.
 //!
 //! The persistent Rust types are the schema: nothing lists accepted names a

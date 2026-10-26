@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Settings > Storage lists the checkouts and task branches no task owns,
 //! and reclaims each only on an explicit, confirmed request.
 //!

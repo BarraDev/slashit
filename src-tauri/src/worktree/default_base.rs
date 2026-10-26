@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The base an ordinary task branch starts from.
 //!
 //! A task needs a safe, explicit version-control base; a remote is optional.

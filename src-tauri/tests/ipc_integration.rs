@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! End-to-end tests for the control channel, with no GUI anywhere.
 //!
 //! Every test binds a real listener inside a tempdir and talks to it over a

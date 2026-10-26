@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Settings > Storage shows how much disk SlashIt uses, and only shows it.
 //!
 //! The journey measures, gives SlashIt's own log directory a file of known

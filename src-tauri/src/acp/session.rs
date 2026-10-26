@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use super::client::AcpClient;
 use anyhow::Result;
 

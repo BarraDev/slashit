@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Transport-neutral event emission.
 //!
 //! The queue executor, the PTY layer and the PR review flow all need to tell

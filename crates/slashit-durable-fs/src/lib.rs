@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Durable, atomic replacement of one file.
 //!
 //! [`write_atomic`] is the single protocol SlashIt uses to persist a Task

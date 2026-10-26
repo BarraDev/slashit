@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The Human Review decision in the task drawer: the AI review summary, the
 //! review history, and the actions a person takes on the changes (approve,
 //! with or without a pull request, complete them locally where no pull

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A Project whose Task board cannot be read says so on its board, and takes no
 //! Task changes until the file is repaired and SlashIt restarts.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Orphaned Task Checkouts and task branches of one Project: a read-only
 //! scan, and reclaims that each run only because a person asked for that one
 //! item. See `worktree::orphans` for what is an orphan and what a reclaim

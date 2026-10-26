@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The Linux WebDriver provider and one live application session.
 //!
 //! The chain is `thirtyfour -> tauri-driver -> WebKitWebDriver -> SlashIt`.

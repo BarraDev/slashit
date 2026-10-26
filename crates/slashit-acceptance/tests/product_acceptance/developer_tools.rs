@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A review tool the developer installed never reaches the application.
 //!
 //! The product runs CodeRabbit during AI Review when `coderabbit` is on its

@@ -2,8 +2,7 @@
 name = "slashit-review-content"
 version = "0.1.0"
 edition = "2021"
-authors = ["Barradev Digital Services <admin@barradev.com>"]
-license = "Apache-2.0"
+license = "MPL-2.0"
 description = "Which version of a PR review comment a fix was made from: the one rule the backend and the frontend share"
 repository = "https://github.com/BarraDev/slashit"
 

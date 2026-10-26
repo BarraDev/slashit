@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What to keep when an acceptance journey fails.
 //!
 //! A failed desktop test is expensive to reproduce, so the run captures the

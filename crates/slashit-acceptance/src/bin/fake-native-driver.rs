@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A stand-in for `WebKitWebDriver`, used only by the readiness regression in
 //! `tests/acceptance.rs`.
 //!

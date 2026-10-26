@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Human-gated Task operations proposed from a Project Conversation.
 //!
 //! The Coordinator never mutates SlashIt from its own output. A provider

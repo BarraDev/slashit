@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Windows named pipe transport.
 //!
 //! The security properties match the Unix socket rather than TCP:

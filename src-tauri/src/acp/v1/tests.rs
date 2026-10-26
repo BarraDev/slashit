@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Tests for the ACP v1 layer. Connection tests run against the fake agent
 //! `tests/fixtures/acp_fixture_agent.rs`, a package binary that `cargo test`
 //! builds. No test calls a model.

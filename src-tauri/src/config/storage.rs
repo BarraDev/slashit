@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::config::paths::{AppPaths, ProjectKey};
 use crate::domain::task::ExternalRef;
 use crate::domain::{AgentConfig, Conversation, Project, Repository, Task};

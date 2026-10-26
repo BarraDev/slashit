@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Mirrors of the backend's orphan scan (`worktree::orphans`).
 
 use serde::Deserialize;

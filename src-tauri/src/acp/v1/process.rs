@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Owned child process: spawn, supervise, write, read, and reap.
 //!
 //! Ownership is split so that no lock is held while a task waits for I/O.

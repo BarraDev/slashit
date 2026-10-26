@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Self-test for scripts/check-agent-docs.sh.
 #
 # Copies the repository's files into a throwaway Git repository, breaks one

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What a task's *lifecycle* is allowed to say while its terminal cleanup is
 //! still able to destroy the checkout that lifecycle points at.
 //!

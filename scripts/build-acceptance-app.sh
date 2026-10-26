@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Build the application the desktop acceptance journeys run against.
 #
 # This is the only supported way to build it, locally and in CI, so the two

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Typed ACP v1 values: negotiated capabilities, streamed session updates,
 //! stop reasons, and permission options.
 //!

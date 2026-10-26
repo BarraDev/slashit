@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Human-guided recovery of an interrupted coding Worker.
 //!
 //! A Worker whose outcome SlashIt could not attribute (see

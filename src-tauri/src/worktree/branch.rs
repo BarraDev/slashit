@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 /// Refuses a task branch name that is not safe to hand to `git`, `jj` or `gh`.
 ///
 /// `Task.branch_name` is read back from `tasks.toml`, and for a board stored in

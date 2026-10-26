@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use crate::services::get_project_path;

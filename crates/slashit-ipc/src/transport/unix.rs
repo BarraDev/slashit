@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Unix domain socket transport. Linux and macOS.
 //!
 //! The **directory** is the access control. Permissions on the socket file

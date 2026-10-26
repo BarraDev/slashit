@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The client half of the round trip: connect, send one request, read one
 //! response.
 //!

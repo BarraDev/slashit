@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Free text as a timeline entry may keep it.
 //!
 //! Every piece of text an entry stores -- a tool call's detail, a failure's

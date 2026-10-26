@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Starting a new coding attempt after an interrupted Worker, from the task
 //! drawer. The new attempt builds on the Task Checkout as it is now. It is
 //! separate from accepting the Worker's commit, which the recovery panel above

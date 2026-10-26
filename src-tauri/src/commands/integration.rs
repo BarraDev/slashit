@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Integrating a Task's approved work into a local branch.
 //!
 //! This is a delivery action, distinct from completing a Task locally: that

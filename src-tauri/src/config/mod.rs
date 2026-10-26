@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Configuration and storage module
 //!
 //! This module handles persistent storage of application configuration,

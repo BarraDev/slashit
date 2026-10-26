@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use super::coding_run::CodingRunEvent;
 use super::provider_lease::ProviderLease;
 use std::sync::atomic::{AtomicBool, Ordering};

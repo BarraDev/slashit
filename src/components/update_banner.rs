@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Update UX: the shared updater state, the floating notice, and the restart
 //! confirmation.
 //!

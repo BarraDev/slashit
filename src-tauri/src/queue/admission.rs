@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! One backend-owned capacity gate shared by ordinary task execution and AI
 //! review/fix work.
 //!

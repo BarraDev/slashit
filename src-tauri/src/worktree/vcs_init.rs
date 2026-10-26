@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Putting a project folder under version control, on explicit request only.
 //!
 //! A Task Checkout is a Git worktree on a branch created at a commit, so a

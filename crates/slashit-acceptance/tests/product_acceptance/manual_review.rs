@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Manual review mode: a Task whose person chose Manual is not reviewed by an
 //! AI.
 //!

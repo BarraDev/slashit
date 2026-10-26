@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Moving a project's shareable state between external and in-project storage.
 //!
 //! Changing [`StateLocation`] must move data, not just repoint a setting —

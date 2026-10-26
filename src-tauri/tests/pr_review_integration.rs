@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Integration tests for `address_pr_review_inner` — the apply pipeline
 //! exercised end-to-end against mock `claude` and `gh` binaries on PATH.
 //!

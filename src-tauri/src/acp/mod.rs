@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 pub mod protocol;
 pub mod client;
 

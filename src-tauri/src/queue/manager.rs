@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::config::QueueConfig;
 use crate::domain::{Task, TaskPhase, TaskStatus};
 use std::collections::HashMap;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Bearer tokens for transports the operating system does not access-control.
 //!
 //! A Unix socket in a 0700 directory and a named pipe with a restrictive

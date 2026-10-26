@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A person's decision to start a new coding attempt after an interrupted
 //! Worker, building on the Task Checkout as it stands.
 //!

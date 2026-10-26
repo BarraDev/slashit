@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use super::protocol::*;
 use anyhow::Result;
 use std::io::{BufRead, BufReader};

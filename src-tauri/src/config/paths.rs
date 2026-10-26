@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Single authoritative source for every persistent, runtime and worktree path.
 //!
 //! No other module may build a state path by hand. The reason is concrete: an

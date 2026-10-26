@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What kind of process is running, and the few operations that differ
 //! between a windowed app and a headless daemon.
 //!

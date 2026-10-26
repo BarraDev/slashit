@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Which tasks need the user, across every project.
 //!
 //! A read, and only of attention: the board of the project being looked at

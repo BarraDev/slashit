@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What SlashIt's directories hold, and whose it is.
 //!
 //! Only SlashIt's own roots are looked at: the data, configuration, cache and

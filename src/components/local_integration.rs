@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Integrating a task's approved work into a local branch, from the task
 //! drawer: after the task was completed locally ("Integrate locally"), or
 //! from Human Review as one action that also completes it ("Complete and

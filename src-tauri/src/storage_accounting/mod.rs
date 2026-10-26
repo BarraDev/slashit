@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Read-only accounting of the disk SlashIt uses.
 //!
 //! - [`walk`] measures one directory tree without following links out of it.

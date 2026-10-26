@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::agents::roles::AgentSlot;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

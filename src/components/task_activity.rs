@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The task drawer's Activity section: what happened to the task, oldest
 //! first.
 //!

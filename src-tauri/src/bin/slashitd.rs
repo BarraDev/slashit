@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `slashitd` — SlashIt without a window.
 //!
 //! Runs the queue executor and the IPC server so agents keep working, and the

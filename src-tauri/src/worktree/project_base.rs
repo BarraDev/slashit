@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Establishing a project's local base branch (`domain::ProjectBase`).
 //!
 //! A project's base is captured once, when the project is registered or its

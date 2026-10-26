@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What version control a project's folder has, as far as a Task Checkout is
 //! concerned.
 //!

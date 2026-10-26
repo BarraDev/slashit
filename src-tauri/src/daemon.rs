@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Headless execution: the IPC server and the queue executor, with no window.
 //!
 //! The daemon is not a second implementation of SlashIt. It calls the same

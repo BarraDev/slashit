@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Workspace registry — OS-level index of all SlashIt meta-workspaces.
 //!
 //! Stored as TOML at the path [`AppPaths::workspaces_file`] resolves to. Each

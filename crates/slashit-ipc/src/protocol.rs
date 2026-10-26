@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Wire protocol: the command set, the envelope that carries it, and the
 //! response shape.
 //!
