@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Queue mutations must stage, persist, then publish -- the same contract
 //! Unit 4A already gave the ordinary task-mutation front doors.
 //!

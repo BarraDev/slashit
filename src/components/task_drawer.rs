@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The task drawer: a side panel that answers what a Task is doing, what
 //! happened if it failed, and what can be done about it now.
 //!

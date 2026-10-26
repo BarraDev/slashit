@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Regenerate the README screenshots from synthetic data. Local use only: CI
 # never runs this, and the images are not compared pixel by pixel.
 #

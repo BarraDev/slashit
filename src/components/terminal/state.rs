@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 /// ANSI color representation
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[derive(Default)]

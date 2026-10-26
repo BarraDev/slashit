@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::models::github::GithubIssue;
 use crate::services::github_service;
 use leptos::prelude::*;

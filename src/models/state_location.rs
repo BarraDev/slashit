@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Mirrors `src-tauri/src/config/paths.rs` and `src-tauri/src/config/migration.rs`.
 //!
 //! The serde attributes here must stay identical to the backend's. Both enums

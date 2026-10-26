@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What a Task's agent is doing: the live `agent-event` stream, the run
 //! snapshot behind it, and stopping a run. Re-queuing a task is
 //! [`crate::services::queue_service::enqueue_task`].

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::agents::coding_run::{CodingRunEvent, CodingRunner};
 use crate::agents::opencode_run::OpenCodeRunConfig;
 use crate::agents::runner::{ClaudeRunConfig, ToolAccess};

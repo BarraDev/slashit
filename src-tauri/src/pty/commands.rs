@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
 use super::manager::{spawn_pty_session, resize_pty_session};
 use super::store::SessionMetadata;

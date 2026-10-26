@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Whether origin's default branch is known locally, and the one explicit
 //! action that asks origin for it.
 //!

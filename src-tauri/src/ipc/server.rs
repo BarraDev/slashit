@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Bind, accept, authenticate, authorize, dispatch.
 //!
 //! Everything about *how* bytes arrive lives in [`slashit_ipc::transport`].

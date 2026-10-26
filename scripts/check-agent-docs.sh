@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Validate the structure of the agent documentation (AGENTS.md and CLAUDE.md).
 #
 # This runs locally and in CI. It is deterministic, edits no file, and uses

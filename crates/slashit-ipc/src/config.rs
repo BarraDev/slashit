@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Which listeners the instance opens, and where clients look.
 //!
 //! Stored as `ipc.toml` beside the other configuration. Kept out of

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Task diffs. The legacy JJ IPC commands that lived here were removed: JJ
 //! workspaces have no ownership model in SlashIt, so the status read and the
 //! mutating commands were disabled. Task diffs read the Git worktree only.

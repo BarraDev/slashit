@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Reading a recovered Task Checkout for a new coding attempt.
 //!
 //! Authorizing a new attempt and launching it both read the same facts here,

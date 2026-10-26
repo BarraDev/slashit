@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Whether a project can run tasks, and whether it can deliver them to a
 //! remote, as two separate answers.
 //!

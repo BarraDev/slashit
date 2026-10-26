@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Restacking a stacked task whose branch is already published, after its
 //! parent landed on the default branch.
 //!

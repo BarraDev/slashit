@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Frontend access to the storage accounting commands.
 //!
 //! Uses the fallible `raw_invoke` binding, like `state_service`, so a failed

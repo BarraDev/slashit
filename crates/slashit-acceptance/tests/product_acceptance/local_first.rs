@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Local-first projects: a remote is optional, version control is not.
 //!
 //! A repository with commits and no remote runs a task end to end -- its

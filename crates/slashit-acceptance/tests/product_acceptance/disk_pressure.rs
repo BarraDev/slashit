@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! When disk space is critically low, a started task waits in the queue, the
 //! board says why, and the task runs by itself once space returns.
 //!

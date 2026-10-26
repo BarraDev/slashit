@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The one place a published stacked task is moved onto the branch its parent
 //! landed on: a notice in the task drawer's pull request section, with the
 //! action that fixes what it says, and a confirmation that spells out the

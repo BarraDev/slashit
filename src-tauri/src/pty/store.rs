@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::config::paths::AppPaths;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

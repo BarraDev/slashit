@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Self-update: what this install can do, what the release channel offers, and
 //! who decides when the process dies.
 //!

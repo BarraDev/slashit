@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Which version of a review comment a fix was made from.
 //!
 //! GitHub keeps a comment's id when its text is edited, so the id says

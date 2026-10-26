@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 /// Convert a keyboard event to bytes to send to the PTY
 pub fn key_to_escape_sequence(key: &str, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<u8>> {
     // Handle Ctrl+key combinations

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Transport: the bytes, and what the operating system can prove about who
 //! sent them.
 //!

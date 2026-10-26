@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Leftover Task Checkouts and task branches of one project: what no task
 //! owns any more, and an explicit way to reclaim each.
 //!

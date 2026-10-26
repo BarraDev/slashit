@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A project's repository setup: whether it can run tasks, and the explicit
 //! actions that make it able to.
 //!

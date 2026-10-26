@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A stand-in for the `claude` executable, so a journey can exercise the real
 //! agent lifecycle without a model, a network or a credential.
 //!

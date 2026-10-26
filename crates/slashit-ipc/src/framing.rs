@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Message framing: one newline-delimited JSON value per message, bounded.
 //!
 //! Framing is separated from both the protocol and the transport so the size

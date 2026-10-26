@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What happened to a task, in the order it happened.
 //!
 //! A task's timeline is assembled from two kinds of source, and never from

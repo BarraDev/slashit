@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Mirrors of the backend's local integration types
 //! (`commands::integration`, `domain::integration`), and the words the
 //! drawer uses for them.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Recovering an interrupted coding Worker from the task drawer: what is
 //! confirmed, what is uncertain, and one explicit decision that accepts the
 //! exact commit the person inspected.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! PTY module tests
 //! Run with: cargo test -p slashit-ui
 

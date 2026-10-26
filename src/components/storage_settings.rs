@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Storage settings: choose where a project's board is kept, and move it.
 //!
 //! Moving state is destructive-adjacent, so the flow is always preview then

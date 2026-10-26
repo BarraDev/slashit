@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 import { test, expect, Page } from '@playwright/test';
 
 // Helper to wait for WASM app to load

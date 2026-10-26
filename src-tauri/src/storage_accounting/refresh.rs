@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! At most one measurement at a time, however many ask.
 //!
 //! Walking SlashIt's directories can take a while, so nothing measures on a

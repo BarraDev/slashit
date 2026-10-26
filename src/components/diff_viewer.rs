@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use leptos::prelude::*;
 
 const DIFF_DEFAULT_COLLAPSED_KEY: &str = "slashit_diff_default_collapsed";

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The provider-neutral boundary between `TaskExecutor` and a coding agent run.
 //!
 //! The executor starts a run, subscribes to its events, waits for it, reads

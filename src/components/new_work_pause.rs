@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Why queued work is not starting, when the reason is disk space.
 //!
 //! The backend decides; this only shows it. A fresh reading is asked for

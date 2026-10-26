@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::models::{QueueConfig, Task, TaskStatus};
 use wasm_bindgen::prelude::*;
 

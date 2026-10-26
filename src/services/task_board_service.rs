@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Frontend access to the unreadable Task board report.
 //!
 //! Uses the fallible `raw_invoke` binding, as the orphans service does, so a

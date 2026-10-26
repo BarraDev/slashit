@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, Child};
 use std::collections::HashMap;
 use std::io::{Read, Write};

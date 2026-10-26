@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Assertions and bridges against a running SlashIt window.
 //!
 //! Everything here goes through the same surfaces a user or the frontend

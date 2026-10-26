@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `slashit` — the command line front end for a running SlashIt instance.
 //!
 //! Every subcommand is one request and one response over the control channel.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Rust-only desktop acceptance harness for SlashIt.
 //!
 //! The journeys in `tests/acceptance.rs` drive the real desktop application:

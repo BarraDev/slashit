@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Human Review as a decision point: approving (with and without a pull
 //! request), requesting changes, and closing a task without merging it.
 //!

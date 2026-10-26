@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Disk usage: how much space SlashIt uses, and how full the disk is.
 //!
 //! There is deliberately no action here that deletes, cleans or prunes

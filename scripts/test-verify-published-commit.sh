@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Self-test for scripts/verify-published-commit.sh.
 #
 # Puts a fake `gh` first on PATH that answers from environment variables, so

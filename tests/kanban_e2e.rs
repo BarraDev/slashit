@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! E2E tests for Kanban board functionality
 //!
 //! These tests verify the core Kanban interactions including:

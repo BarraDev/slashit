@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 import { test, expect, Page } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 

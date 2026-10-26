@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What GitHub last said about the pull requests linked to tasks.
 //!
 //! One owner asks: [`PrStatuses::refresh`] is the only code that runs

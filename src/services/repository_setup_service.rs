@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Frontend access to a project's repository setup commands.
 //!
 //! Uses the fallible `raw_invoke` binding: an initialization or a detection

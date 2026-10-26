@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Removing the WebAssembly `name` section from the acceptance build, and
 //! proving that nothing else changed.
 //!

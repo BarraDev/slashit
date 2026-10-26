@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 #![allow(unused_imports)]
 
 pub mod app_layout;

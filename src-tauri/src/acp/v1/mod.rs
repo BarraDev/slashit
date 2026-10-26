@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! ACP v1 over stdio: the spec-conformant transport and protocol layer.
 //!
 //! The OpenCode Worker runs through this module (see `agents::opencode_run`).

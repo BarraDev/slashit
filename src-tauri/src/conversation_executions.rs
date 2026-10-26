@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Which Task run each Project Conversation action started, and what that run
 //! has become. This is the read-only projection behind the execution cards.
 //!

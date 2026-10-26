@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Ordinary (non-terminal) task mutations must stage, persist, then publish.
 //!
 //! Terminal transitions already went through `crate::lifecycle::terminalize`,

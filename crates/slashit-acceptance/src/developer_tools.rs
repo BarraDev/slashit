@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Keeps review tools a developer installed out of the application's reach.
 //!
 //! The product decides whether CodeRabbit is available the only way it can:

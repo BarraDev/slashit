@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Replaying a task's own commits onto a new base, in the task's Git worktree.
 //!
 //! This is the Git half of restacking a stacked task whose parent has landed

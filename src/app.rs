@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::components::{provide_updater_context, AppLayout, QuitDialog, UpdateBanner};
 use crate::pages::*;
 use crate::services::get_project;

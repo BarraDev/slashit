@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

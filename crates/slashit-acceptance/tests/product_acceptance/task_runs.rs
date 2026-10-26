@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What the stacked-task and checkout-recovery journeys share: several tasks
 //! in one project, each carried to Human Review by the real executor, and
 //! reading git for what the product left behind.

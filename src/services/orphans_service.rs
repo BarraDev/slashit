@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Frontend access to the orphan scan and reclaim commands.
 //!
 //! Uses the fallible `raw_invoke` binding: a refused reclaim must say why.

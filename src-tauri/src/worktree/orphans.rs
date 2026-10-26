@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Task Checkouts and task branches that no Task owns, found by a read-only
 //! scan and reclaimed only one at a time, on explicit request.
 //!

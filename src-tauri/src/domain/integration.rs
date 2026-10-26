@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The durable record of integrating a Task's approved work into a local
 //! branch.
 //!

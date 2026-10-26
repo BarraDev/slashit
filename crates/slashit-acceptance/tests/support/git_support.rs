@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Deterministic Git command helpers for acceptance fixtures.
 
 use anyhow::{bail, Context, Result};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The ACP v1 client connection.
 //!
 //! A `Connection` is a cheap handle. Its reader task owns stdout and routes

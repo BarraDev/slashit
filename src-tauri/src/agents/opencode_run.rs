@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The OpenCode Worker: one `opencode acp` process per run, driven over ACP v1.
 //!
 //! [`super::coding_run::CodingRunner`] exposes this run through the same

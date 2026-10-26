@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Task boards this run could not load: a read-only report for the warning
 //! the frontend shows. Changes nothing, and never reads a board again; see
 //! `Storage::task_board_diagnostics`.

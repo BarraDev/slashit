@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};

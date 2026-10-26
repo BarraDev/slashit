@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use leptos::prelude::*;
 use leptos::web_sys;
 use wasm_bindgen::closure::Closure;

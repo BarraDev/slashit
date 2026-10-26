@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Pull request status: what GitHub says about a task's pull request, on its
 //! card and in its drawer.
 //!

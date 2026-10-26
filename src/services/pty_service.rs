@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;

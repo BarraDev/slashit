@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A fake ACP agent for fixture tests. It never calls a model.
 //!
 //! Usage: `acp_fixture_agent <scenario>`. Scenarios:

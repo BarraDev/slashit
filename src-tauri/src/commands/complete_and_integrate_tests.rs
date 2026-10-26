@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Complete and Integrate from Human Review: the integration and the
 //! completion are two durable facts, and every state between them has to be
 //! truthful, recoverable and repeatable without repeating anything.

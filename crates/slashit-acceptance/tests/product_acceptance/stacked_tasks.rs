@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A task stacked on another, through the parent's merge to the child's own
 //! pull request.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The journeys that prove the harness itself.
 //!
 //! They are deliberately few. Their job is not product coverage — it is to

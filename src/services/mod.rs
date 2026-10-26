@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 
 pub mod repository_service;
 pub mod project_service;

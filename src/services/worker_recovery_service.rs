@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Inspecting an interrupted Worker's preserved evidence and accepting one
 //! exact commit as its result.
 

@@ -2,8 +2,7 @@
 name = "slashit-activity"
 version = "0.1.0"
 edition = "2021"
-authors = ["Barradev Digital Services <admin@barradev.com>"]
-license = "Apache-2.0"
+license = "MPL-2.0"
 description = "What happened to a SlashIt task: the milestones the backend records and the timeline the app shows"
 repository = "https://github.com/BarraDev/slashit"
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! One function per command.
 //!
 //! The handlers know nothing about transports, credentials or windows. Access

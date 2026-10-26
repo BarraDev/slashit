@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Test helper utilities
 //! Common test fixtures and utilities for backend testing
 
