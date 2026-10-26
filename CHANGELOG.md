@@ -6,24 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-## [0.1.0]
+## [0.0.1]
 
-The first stable release of SlashIt. It follows the 0.0.1 prerelease and offers the same features.
+A prerelease for testers. It is installed by hand. GitHub does not mark a
+prerelease as the latest release, so the in-app updater does not offer it. The
+features listed below are the full feature set of this prerelease.
 
 **Installing.** Download the installer for your platform from the GitHub
 release page: the `.deb`, `.rpm` or `.AppImage` on Linux, the `.dmg` on macOS
 (Apple Silicon and Intel), and the `.msi` or NSIS `.exe` on Windows. The
 installers are not code-signed by Microsoft or Apple, so Windows SmartScreen and
-macOS Gatekeeper warn on the first launch. On Windows, choose "More info", then
-"Run anyway". On macOS, open the app from its context menu.
+macOS Gatekeeper are expected to warn on the first launch. On Windows, choose
+"More info", then "Run anyway". On macOS, open the app from its context menu.
+Neither warning has been seen on a real machine for this build.
 
-**Updating.** The in-app updater checks GitHub Releases for newer versions,
-verifies each update against SlashIt's signing key, and installs it when you
-ask. It is on by default. To turn it off, set `auto_update = false` in
-`features.toml` in SlashIt's configuration directory, then restart SlashIt. The
-`SLASHIT_FEATURE_AUTO_UPDATE` environment variable overrides the file. An installation from a `.deb` or `.rpm` package is not replaced
-by the in-app updater; the app says so, and you can install the newer package
-from the release page.
+**Updating.** The in-app updater is on by default. It checks GitHub Releases for
+newer versions, verifies each update against SlashIt's signing key, and installs
+it when you ask. For this prerelease the update path has not been run end to
+end (see the known gaps). An installed 0.0.1 is designed to be offered the next
+stable release once one is published. To turn the updater off, set
+`auto_update = false` in `features.toml` in SlashIt's configuration directory,
+then restart SlashIt. The `SLASHIT_FEATURE_AUTO_UPDATE` environment variable
+overrides the file. An installation from a `.deb` or `.rpm` package is not
+replaced by the in-app updater; the app says so, and you can install the newer
+package from the release page.
 
 ### Added
 
@@ -63,15 +69,16 @@ from the release page.
   request.
 - **Headless daemon.** The `slashitd` binary runs the control channel and the
   task queue without a window or webview. The Linux packages (`.deb`, `.rpm` and
-  `.AppImage`) include it. Elsewhere, build it from source with
+  `.AppImage`) are meant to include it; the package contents are listed under the
+  known gaps. Elsewhere, build it from source with
   `cargo build -p slashit-ui --bin slashitd --release`.
 - **Control channel and CLI.** The `slashit` command-line client controls the
-  running app from a terminal or a script. The `.deb` and `.rpm` packages install
-  it at `/usr/bin/slashit`; the AppImage, macOS and Windows installers do not, so
-  build it with `cargo build -p slashit --release` there. The channel uses a Unix domain socket
-  on Linux and macOS and a named pipe on Windows, both protected by the operating
-  system. A loopback TCP listener is available too, but it is off by default and
-  requires a bearer token.
+  running app from a terminal or a script. The `.deb` and `.rpm` packages are
+  meant to install it at `/usr/bin/slashit`; the AppImage, macOS and Windows
+  installers are not, so build it with `cargo build -p slashit --release` there.
+  The channel uses a Unix domain socket on Linux and macOS and a named pipe on
+  Windows, both protected by the operating system. A loopback TCP listener is
+  available too, but it is off by default and requires a bearer token.
 - **Window and tray.** Closing the main window hides it, and the app keeps
   running. A click on the system tray icon shows the window again.
 - **Project storage.** Each project keeps its board outside the repository by
@@ -88,23 +95,26 @@ from the release page.
   `docs/`. A contribution guide, a code of conduct and a security policy are at
   the repository root.
 
-## [0.0.1]
-
-A prerelease for testers. It has the features listed under 0.1.0. It is
-installed by hand. GitHub does not mark a prerelease as the latest release, so
-the auto-updater never offers it. An installed 0.0.1 is offered the next stable
-release.
-
 Known gaps in this prerelease:
 
-- The Windows (MSI, NSIS) and macOS (DMG) installers, and the RPM package, have
-  not been installed and upgraded on their own platforms.
-- The builds are not code-signed, so Windows SmartScreen and macOS Gatekeeper
-  warn on first launch.
-- The updater's signature check runs only in hosted CI.
+- No installer has been installed or launched on its target platform yet. That
+  covers the `.deb`, `.rpm` and `.AppImage` on Linux, the `.msi` and NSIS `.exe`
+  on Windows, and the `.dmg` on macOS. Upgrading over an earlier install has not
+  been tested either.
+- The contents of each package have not been checked on the built artifacts.
+  Whether the `.deb`, `.rpm` and `.AppImage` include `slashitd`, and whether the
+  `.deb` and `.rpm` include the `slashit` client, is not yet confirmed. The
+  macOS and Windows installers have not been checked for `slashitd`.
+- The installers are not code-signed, so Windows SmartScreen and macOS Gatekeeper
+  warn on first launch. The warnings have not been observed on real machines.
+- The update path has not been run. Updates are signed with a key held in the
+  release workflow's secrets, and no signed 0.0.1 artifact exists yet, so the
+  signature check, the download and the install have not been exercised. The
+  live updater can be tested only against a published stable release.
 - A background job whose shell has already exited keeps running when its
-  terminal closes or SlashIt quits. The quit dialog says so.
+  terminal closes or SlashIt quits. The quit and restart dialogs say so.
+- The product acceptance checks use fake agent providers. A real provider has
+  not been run against this build.
 
-[0.1.0]: https://github.com/BarraDev/slashit/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/BarraDev/slashit/releases/tag/v0.0.1
 [Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.1...HEAD
