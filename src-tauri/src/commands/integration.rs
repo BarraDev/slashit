@@ -234,9 +234,9 @@ pub async fn discard_local_integration(
 }
 
 /// The tip of `task`'s branch now, for an approval to record. `None` when
-/// the task has no branch or it cannot be read: the approval is then
-/// recorded without a commit and has to be reconfirmed before integrating,
-/// which is the safe direction.
+/// the task has no branch or it cannot be read. An approval of a task with a
+/// branch is refused when this is `None`, so nothing is recorded without the
+/// commit the person was shown.
 pub(crate) async fn tip_to_approve(state: &crate::AppState, task: &Task) -> Option<String> {
     // The resolver the review display uses, so the commit shown and the commit
     // approved are read the same way, including in a jj workspace.

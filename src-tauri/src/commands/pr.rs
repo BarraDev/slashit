@@ -8954,11 +8954,19 @@ mod tests {
             async fn a_failed_pull_request_keeps_the_approval_and_a_retry_does_not_approve_again() {
                 let _guard = PATH_LOCK.lock().await;
                 let repo = RepoFixture::new();
-                point_origin_at_github(&repo);
                 let _mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+                // origin reads as GitHub, but the push goes nowhere, so the first
+                // pull request cannot be published.
+                git(&repo.checkout, &["remote", "set-url", "origin", "https://github.com/testorg/testrepo.git"]);
+                git(
+                    &repo.checkout,
+                    &["remote", "set-url", "--push", "origin", repo.remote.with_file_name("missing.git").to_str().unwrap()],
+                );
 
                 let (state, _tmp) = build_test_state().await;
-                // Recorded but not in the repository yet, so the push fails.
+                // The branch has a commit a person can see and approve, so the
+                // approval records it.
+                let sha = create_branch(&repo, "task-late");
                 let task_id = seed_task(
                     &state,
                     repo.checkout.to_str().unwrap(),
@@ -8983,9 +8991,11 @@ mod tests {
                 let again = approve_shown(&state, task_id, false).await.expect("already approved");
                 assert_eq!(again.task.human_review.entries.len(), 1);
 
-                let sha = create_branch(&repo, "task-late");
-                // The approval was made before there was a commit to approve,
-                // so a person confirms the commit that exists now.
+                // An approval recorded before the commit was required has no
+                // commit on record. A retry must ask for that confirmation and
+                // must not approve again.
+                state.task.tasks.write().await.get_mut(&task_id).unwrap().human_review.entries[0].approved_tip = None;
+                point_origin_at_github(&repo);
                 let unconfirmed = retry_delivery(&state, task_id).await.expect("a retry is allowed");
                 assert!(
                     matches!(&unconfirmed.pr, Some(PrDelivery::Failed { reason }) if reason.contains("did not record which commit")),
