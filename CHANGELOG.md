@@ -6,13 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Added
-
-- Update channels. Settings > Application updates offers Stable (the default)
-  and Prerelease. Stable offers stable releases only; Prerelease also offers
-  prereleases. The installed build's channel is shown separately from the
-  channel you select.
-
 ## [0.0.1]
 
 A prerelease for testers. Install it by hand the first time. After that, the
@@ -94,6 +87,10 @@ package from the release page.
   board can also be detected automatically. Settings > Storage previews a move,
   with file counts, sizes and any conflicts, and changes nothing until you
   confirm.
+- **Update channels.** Settings > Application updates offers Stable (the default)
+  and Prerelease. Stable offers stable releases only; Prerelease also offers
+  prereleases. The installed build's channel is shown separately from the
+  channel you select.
 - **Feature flags.** Unfinished features can ship turned off. Flags are stored in
   `features.toml` in SlashIt's configuration directory, and the
   `SLASHIT_FEATURE_<NAME>` environment variable overrides them. `slashit
@@ -115,10 +112,11 @@ Known gaps in this prerelease:
   macOS and Windows installers have not been checked for `slashitd`.
 - The installers are not code-signed, so Windows SmartScreen and macOS Gatekeeper
   warn on first launch. The warnings have not been observed on real machines.
-- The update path has not been run. Updates are signed with a key held in the
-  release workflow's secrets, and no signed 0.0.1 artifact exists yet, so the
-  signature check, the download and the install have not been exercised. The
-  live updater can be tested only against a published stable release.
+- The update path has not been run against a published release. Updates are
+  signed with a key held in the release workflow's secrets, and no signed 0.0.1
+  artifact exists yet, so the signature check, the download and the install have
+  not been exercised. The Stable channel has nothing to offer until a stable
+  release newer than 0.0.1 is published, so it cannot be tested live before then.
 - A background job whose shell has already exited keeps running when its
   terminal closes or SlashIt quits. The quit and restart dialogs say so.
 - The product acceptance checks use fake agent providers. A real provider has
