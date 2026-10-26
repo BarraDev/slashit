@@ -899,9 +899,7 @@ pub async fn updater_set_channel(
         // The file already says the new channel. Memory must follow the file,
         // or the next check would run on a channel the file no longer holds.
         Err(ConfigWriteError::PublishedNotDurable(error)) => {
-            *selected = channel;
-            state.updater.checks.supersede();
-            *pending = None;
+            adopt_channel(&mut selected, &mut pending, &state.updater.checks, channel);
             return Err(err(
                 UpdaterErrorKind::Internal,
                 &format!("the update channel is now {}, but the change may not survive a crash: {error:#}", channel.as_str()),
@@ -915,10 +913,37 @@ pub async fn updater_set_channel(
         }
     }
 
-    *selected = channel;
-    state.updater.checks.supersede();
-    *pending = None;
+    adopt_channel(&mut selected, &mut pending, &state.updater.checks, channel);
     Ok(())
+}
+
+/// Makes a channel the file now holds the effective one in memory. Every check
+/// in flight and every update found under the old channel is invalidated. Used
+/// for both the durable and the published-but-not-durable outcomes, because in
+/// the second the file already says the new channel.
+fn adopt_channel<T>(
+    selected: &mut ReleaseChannel,
+    pending: &mut Option<T>,
+    checks: &CheckSequence,
+    channel: ReleaseChannel,
+) {
+    *selected = channel;
+    checks.supersede();
+    *pending = None;
+}
+
+/// Refuses an install whose offered release is not the one the person accepted.
+/// The install applies the version it finds, so a channel change or a newer
+/// check between display and click must not swap in a different release.
+fn accepted_version_refusal(offered: &str, accepted: &str) -> Option<String> {
+    (offered != accepted).then(|| {
+        err(
+            UpdaterErrorKind::Superseded,
+            &format!(
+                "SlashIt would install {offered}, not the {accepted} you accepted. Check for updates again."
+            ),
+        )
+    })
 }
 
 /// Download the pending update and put it in place. Does not restart.
@@ -932,6 +957,7 @@ pub async fn updater_download_and_install(
     _gui: GuiMutation,
     app: AppHandle,
     state: tauri::State<'_, crate::AppState>,
+    accepted_version: String,
 ) -> Result<(), String> {
     let flag = state.features.read().await.get(AUTO_UPDATE_FLAG);
     if let Some(refusal) = feature_refusal(flag, &state.paths.feature_flags_file()) {
@@ -991,6 +1017,11 @@ pub async fn updater_download_and_install(
             }
         }
     };
+    // Checked before a byte is downloaded. The release on screen is the one the
+    // person accepted; a different release is refused, never installed instead.
+    if let Some(refusal) = accepted_version_refusal(&pending.update.version, &accepted_version) {
+        return Err(refusal);
+    }
     let update = pending.update.clone();
 
     let events = state.events();
@@ -1121,6 +1152,44 @@ mod tests {
         let fresh = checks.begin();
         assert!(checks.is_current(fresh));
         assert_eq!(fresh.generation(), before + 1);
+    }
+
+    #[test]
+    fn a_channel_saved_but_not_durable_takes_effect_and_drops_the_old_answer() {
+        // The file already says the new channel, so memory must follow it and
+        // the update found under the old channel must not survive.
+        let checks = CheckSequence::default();
+        let mut selected = ReleaseChannel::Stable;
+        let mut pending = Some("found under stable");
+        let ticket = checks.begin();
+
+        adopt_channel(&mut selected, &mut pending, &checks, ReleaseChannel::Prerelease);
+
+        assert_eq!(selected, ReleaseChannel::Prerelease);
+        assert!(pending.is_none(), "an update found under the old channel must be dropped");
+        assert!(!checks.is_current(ticket), "a check started under the old channel must not store");
+    }
+
+    #[test]
+    fn a_successful_channel_change_also_drops_the_old_answer() {
+        let checks = CheckSequence::default();
+        let mut selected = ReleaseChannel::Prerelease;
+        let mut pending = Some("found under prerelease");
+        let ticket = checks.begin();
+
+        adopt_channel(&mut selected, &mut pending, &checks, ReleaseChannel::Stable);
+
+        assert_eq!(selected, ReleaseChannel::Stable);
+        assert!(pending.is_none());
+        assert!(!checks.is_current(ticket));
+    }
+
+    #[test]
+    fn an_install_of_a_different_release_than_accepted_is_refused() {
+        assert!(accepted_version_refusal("0.0.2", "0.0.2").is_none());
+        let refusal = accepted_version_refusal("0.0.3", "0.0.2").expect("a mismatch must be refused");
+        assert!(refusal.starts_with("superseded: "), "{refusal}");
+        assert!(refusal.contains("0.0.3") && refusal.contains("0.0.2"), "{refusal}");
     }
 
     #[test]

@@ -327,10 +327,13 @@ pub async fn updater_set_channel(channel: &str) -> Result<(), String> {
 /// Downloads and stages the update. Since the backend stopped calling
 /// `app.restart()` itself, `Ok(())` means "installed, not yet running" — the
 /// caller must ask the user before restarting.
-pub async fn updater_download_and_install() -> Result<(), String> {
-    invoke("updater_download_and_install", empty_args())
-        .await
-        .map(|_| ())
+///
+/// `accepted_version` is the version on screen. The backend installs exactly
+/// that version or refuses, so no other release can be applied in its place.
+pub async fn updater_download_and_install(accepted_version: &str) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "acceptedVersion": accepted_version }))
+        .map_err(|e| e.to_string())?;
+    invoke("updater_download_and_install", args).await.map(|_| ())
 }
 
 /// Replaces the running process. On success this never resolves, so an `Ok`

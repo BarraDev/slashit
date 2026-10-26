@@ -411,9 +411,11 @@ fn UpdatesTab() -> impl IntoView {
                                 })}
                             </div>
                             {move || {
-                                // No check button on a build that cannot act on
-                                // the answer.
-                                if ctx.blocked_reason().is_some() {
+                                // No check button where the backend would refuse the
+                                // check (feature flag off). A build that cannot
+                                // install may still check; the reason shown below
+                                // replaces only the install action.
+                                if !ctx.can_check() {
                                     return ().into_any();
                                 }
                                 let busy = ctx.activity.get().busy();
