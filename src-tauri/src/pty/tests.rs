@@ -355,14 +355,25 @@ mod project_scope_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+/// Linux only: liveness is read from `/proc`, which other Unix systems do not
+/// have. Elsewhere every pid would read as gone, and the survivor checks would
+/// pass without checking anything.
+#[cfg(all(test, target_os = "linux"))]
 mod quit_tests {
     use crate::pty::manager::spawn_pty_session;
     use std::time::{Duration, Instant};
 
-    /// `SHELL` is process-wide, and the two tests that set it must not interleave:
+    /// `SHELL` is process-wide, and the tests that set it must not interleave:
     /// one test's script directory is removed while the other spawns.
     static SHELL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes the environment lock every test that mutates the environment
+    /// shares, then this module's `SHELL` lock. Every test here sets `SHELL`.
+    fn lock_shell() -> (tokio::sync::MutexGuard<'static, ()>, std::sync::MutexGuard<'static, ()>) {
+        let env = crate::config::paths::ENV_LOCK.blocking_lock();
+        let shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        (env, shell)
+    }
 
     /// Whether `pid` is a live process. A zombie is not live: it has ended and
     /// only waits to be reaped.
@@ -391,7 +402,7 @@ mod quit_tests {
     #[ignore = "spawns a shell and changes SHELL for this process; run alone with --ignored --exact"]
     fn dropping_a_session_ends_a_shell_that_ignores_hangup_and_its_children() {
         use std::os::unix::fs::PermissionsExt;
-        let _shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _locks = lock_shell();
 
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("hup-ignoring-shell.sh");
@@ -447,7 +458,7 @@ mod quit_tests {
     #[ignore = "spawns a shell and changes SHELL for this process; run alone with --ignored --exact"]
     fn ending_the_sessions_at_shutdown_has_ended_a_shell_that_ignores_hangup_when_it_returns() {
         use std::os::unix::fs::PermissionsExt;
-        let _shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _locks = lock_shell();
 
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("hup-ignoring-shell.sh");
@@ -552,7 +563,7 @@ mod quit_tests {
     #[test]
     #[ignore = "open defect: a background job outlives its exited shell; spawns an interactive bash"]
     fn closing_a_terminal_whose_shell_exited_ends_its_background_job() {
-        let _shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _locks = lock_shell();
         let (_shell_pid, child, session, reader, _dir) = exited_shell_with_background_job("closed-after-exit");
 
         drop(session);
@@ -572,7 +583,7 @@ mod quit_tests {
     #[test]
     #[ignore = "open defect: a background job outlives its exited shell; spawns an interactive bash"]
     fn quitting_ends_the_background_job_of_a_shell_that_already_exited() {
-        let _shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _locks = lock_shell();
         let (_shell_pid, child, session, reader, _dir) = exited_shell_with_background_job("quit-after-exit");
 
         let runtime = tokio::runtime::Builder::new_current_thread()
