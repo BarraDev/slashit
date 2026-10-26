@@ -237,9 +237,10 @@ pub async fn discard_local_integration(
 /// recorded without a commit and has to be reconfirmed before integrating,
 /// which is the safe direction.
 pub(crate) async fn tip_to_approve(state: &crate::AppState, task: &Task) -> Option<String> {
-    let branch = task.branch_name.as_deref()?;
-    let repo = repo_path_of(state, task.project_id).await.ok()?;
-    git::branch_tip(Path::new(&repo), branch).await.ok().flatten()
+    // The resolver the review display uses, so the commit shown and the commit
+    // approved are read the same way, including in a jj workspace.
+    task.branch_name.as_deref()?;
+    crate::commands::pr::task_branch_tip(state, task.id).await.ok().flatten()
 }
 
 pub(crate) async fn repo_path_of(state: &crate::AppState, project_id: Uuid) -> Result<String, String> {
