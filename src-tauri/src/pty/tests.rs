@@ -601,3 +601,85 @@ mod quit_tests {
         assert!(!alive, "quitting left the background job {child} of an exited shell running");
     }
 }
+
+/// Publishing a terminal is gated on its record: a terminal whose record cannot
+/// be written is not published, and leaves neither a session nor a scrollback.
+/// These spawn a real shell, so they are ignored by default like the others.
+#[cfg(all(test, unix))]
+mod registration_tests {
+    use crate::pty::manager::{spawn_pty_session, PtyState};
+    use crate::pty::store::{ScrollbackManager, SessionMetadata, SessionStore};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn metadata(id: uuid::Uuid, project_id: Option<&str>) -> SessionMetadata {
+        SessionMetadata {
+            id,
+            name: "Test Terminal".into(),
+            cols: 80,
+            rows: 24,
+            working_directory: None,
+            project_id: project_id.map(str::to_owned),
+            created_at: chrono::Utc::now(),
+            last_attached_at: chrono::Utc::now(),
+            is_alive: true,
+        }
+    }
+
+    fn state_with_store(store: SessionStore) -> PtyState {
+        PtyState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            scrollback: ScrollbackManager::new(),
+            store: Arc::new(store),
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell"]
+    fn a_terminal_whose_record_cannot_be_written_is_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        // The store path is a directory, so the record cannot be written.
+        let state = state_with_store(SessionStore::at_path(dir.path().to_path_buf()));
+        let (session, _reader) = spawn_pty_session("Test Terminal".into(), 80, 24, None).expect("spawn");
+        let id = session.id;
+
+        let result = runtime().block_on(async {
+            let result = state.register_session(session, metadata(id, Some("project-a"))).await;
+            assert!(state.sessions.lock().await.get(&id).is_none(), "an unrecorded session was published");
+            assert!(state.scrollback.get(id).await.is_none(), "an unrecorded terminal kept a scrollback");
+            result
+        });
+        let error = result.expect_err("a terminal without a record must not start");
+        assert!(error.contains("Could not record the terminal session"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell"]
+    fn a_recorded_terminal_is_published_with_its_scrollback_and_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.toml");
+        let state = state_with_store(SessionStore::at_path(path.clone()));
+        let (session, _reader) = spawn_pty_session("Test Terminal".into(), 80, 24, None).expect("spawn");
+        let id = session.id;
+
+        runtime().block_on(async {
+            state
+                .register_session(session, metadata(id, Some("project-a")))
+                .await
+                .expect("a recorded terminal starts");
+            assert!(state.sessions.lock().await.contains_key(&id));
+            assert!(state.scrollback.get(id).await.is_some());
+        });
+        let recorded = SessionStore::at_path(path).load_sessions().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].project_id.as_deref(), Some("project-a"));
+    }
+}

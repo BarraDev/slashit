@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::store::{ScrollbackManager, SessionStore};
+use super::store::{ScrollbackManager, SessionMetadata, SessionStore};
 
 /// Information about a PTY session
 pub struct PtySession {
@@ -164,6 +164,20 @@ impl PtyState {
             scrollback: ScrollbackManager::new(),
             store: Arc::new(store),
         }
+    }
+
+    /// Publish a spawned terminal, and only after its record is written. If the
+    /// record cannot be written, nothing is published: the scrollback is
+    /// removed, and the session is dropped, which ends its shell.
+    pub async fn register_session(&self, session: PtySession, metadata: SessionMetadata) -> Result<(), String> {
+        let session_id = session.id;
+        self.scrollback.create(session_id).await;
+        if let Err(e) = self.store.upsert_session(metadata) {
+            self.scrollback.remove(session_id).await;
+            return Err(format!("Could not record the terminal session: {e}"));
+        }
+        self.sessions.lock().await.insert(session_id, session);
+        Ok(())
     }
 }
 

@@ -72,29 +72,22 @@ pub async fn spawn_pty(
         project_id: project_id.clone(),
     };
     
-    // Create scrollback buffer for this session
-    state.pty.scrollback.create(session_id).await;
-    
-    // Save session metadata
     let metadata = SessionMetadata {
         id: session_id,
         name: session.name.clone(),
         cols: session.cols,
         rows: session.rows,
         working_directory,
+        project_id: project_id.clone(),
         created_at: Utc::now(),
         last_attached_at: Utc::now(),
         is_alive: true,
     };
-    if let Err(e) = state.pty.store.upsert_session(metadata) {
-        eprintln!("[PTY Backend] Failed to save session metadata: {}", e);
-    }
-
-    // Store the session
-    {
-        let mut sessions = state.pty.sessions.lock().await;
-        sessions.insert(session_id, session);
-    }
+    // Publish the session only once its record is written. On failure the
+    // session is dropped here, which ends its shell, and no scrollback remains.
+    state.pty.register_session(session, metadata).await.inspect_err(|e| {
+        eprintln!("[PTY Backend] {}", e);
+    })?;
 
     // Spawn a background thread to read PTY output and emit events
     let app_handle = app.clone();
