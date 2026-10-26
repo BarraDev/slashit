@@ -88,6 +88,12 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: cargo build -p slashit --release
 
+      # Pins the Tauri CLI to the version the updater signing probe runs
+      # (.github/workflows/updater-signing-probe.yml). Update both together.
+      # tauri-action would otherwise install @tauri-apps/cli@v2, which floats.
+      - name: Install the Tauri CLI
+        run: npm install --global @tauri-apps/cli@2.12.4
+
       - name: Build and release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
@@ -104,6 +110,9 @@ jobs:
           # name a release something other than the tag that triggered it. The
           # preflight job has already proven the two agree, so this is the same
           # string by construction -- it just cannot drift again.
+          # Runs the pinned `tauri` installed above. Without this input
+          # tauri-action ignores the pin and installs @tauri-apps/cli@v2 itself.
+          tauriScript: tauri
           tagName: ${{ github.ref_name }}
           releaseName: 'SlashIt ${{ github.ref_name }}'
           # The curated summary is the CHANGELOG.md at this tag. Its link

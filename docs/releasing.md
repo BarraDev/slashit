@@ -314,10 +314,10 @@ with the production secrets and verifies it against the configured public key.
 It runs only from `main`, publishes nothing, and reports PASS or FAIL. Until it
 has passed, the production key is **not verified**.
 
-The release workflow installs the Tauri CLI as `@tauri-apps/cli@v2`, which
-floats to the newest 2.x release. The probe pins the version the floating tag
-resolved to when it was written. Pin the release workflow to the same version
-before the first release.
+The release workflow installs the Tauri CLI with `npm install --global
+@tauri-apps/cli@2.12.4` and passes `tauriScript: tauri` to `tauri-action`, so
+the action runs that binary rather than installing `@tauri-apps/cli@v2`, which
+floats. The probe installs the same version. Change both places together.
 
 This is a cost decision, not an oversight — both require a paid certificate or
 membership. It has to be said plainly in the release notes and the README,

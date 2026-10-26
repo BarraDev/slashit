@@ -11,28 +11,46 @@ permissions: {}
 
 jobs:
   probe:
-    # The production signing secrets are read only by code on the default branch,
-    # which a maintainer has reviewed and merged. A run dispatched from any other
-    # ref stops here, before any step that could read a secret.
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
+      # The production signing secrets are read only by the signing step, and
+      # only for a run from the default branch. A run from any other ref fails
+      # here, before any step that could read a secret. It fails rather than
+      # skips, so a refused run cannot read as a green probe.
+      - name: Refuse any ref other than main
+        env:
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$GIT_REF" != "refs/heads/main" ]; then
+            echo "FAIL the probe runs only from refs/heads/main; this run is from $GIT_REF" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # The release workflow installs the Tauri CLI with `npm install -g
-      # @tauri-apps/cli@v2`, which floats. This pins the version that floating
-      # tag resolved to when this probe was written, so the probe signs with the
-      # same CLI a release would use at that time. Update both together.
+      # The release workflow installs the Tauri CLI with `tauri-action`'s
+      # `tauriScript: tauri`, after `npm install --global @tauri-apps/cli@2.12.4`
+      # in release.yml. This is the same version. Update both together.
       - name: Install the Tauri CLI
         run: |
           set -euo pipefail
           npm install --global @tauri-apps/cli@2.12.4
           tauri --version
+
+      # Builds the verifier before any secret is present. The script's own build
+      # then finds it current and runs no build script in the secret-bearing step.
+      - name: Build the signature verifier
+        run: |
+          set -euo pipefail
+          cargo build --quiet --release --locked \
+            --manifest-path tools/updater-signing-probe/Cargo.toml \
+            --target-dir target/updater-signing-probe
 
       - name: Write the configured public key to a scratch file
         run: |
@@ -44,6 +62,7 @@ jobs:
       # script never prints them, and the signatures it writes stay in
       # RUNNER_TEMP, which is not uploaded.
       - name: Sign the probe payload and verify it against the configured key
+        if: github.ref == 'refs/heads/main'
         env:
           SIGNING_CLI: tauri
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

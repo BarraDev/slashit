@@ -101,14 +101,23 @@ case "${status:-0}" in
   *) echo "INPUT ERROR: the verifier could not check the signature" >&2; exit 2 ;;
 esac
 
+# expect_rejected <label> <verifier status>: 1 is the only status that proves
+# the rejection. 0 means the verifier accepted what it must reject (a FAIL). Any
+# other status is an input error, not evidence about the key.
+expect_rejected() {
+  case "$2" in
+    1) echo "ok   $1" ;;
+    0) echo "FAIL $1 was accepted" >&2; exit 1 ;;
+    *) echo "INPUT ERROR: the verifier could not check: $1 (status $2)" >&2; exit 2 ;;
+  esac
+}
+
 status=0
 verify "$payload.sig" "$work/probe-tampered.txt" || status=$?
-[ "$status" -eq 1 ] || { echo "FAIL a signature over a changed payload was not rejected (verifier status $status)" >&2; exit 1; }
-echo "ok   a changed payload is rejected"
+expect_rejected "a signature over a changed payload is rejected" "$status"
 
 status=0
 verify "$other.sig" "$payload" || status=$?
-[ "$status" -eq 1 ] || { echo "FAIL a signature over a different payload was not rejected (verifier status $status)" >&2; exit 1; }
-echo "ok   a signature over another payload is rejected"
+expect_rejected "a signature over another payload is rejected" "$status"
 
 echo "PASS the signing key matches the configured public key, and tampering is rejected."
