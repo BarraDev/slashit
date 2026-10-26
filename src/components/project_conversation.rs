@@ -385,6 +385,13 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             gloo_timers::callback::Timeout::new(0, scroll_to_latest).forget();
         }
     });
+    // Following is turned on by a send and by "Jump to latest". A send can fail
+    // without changing the snapshot, so turning it on must scroll by itself.
+    // The scroll waits one tick, as the effect above does, for the new layout.
+    let follow_latest = move || {
+        set_following_latest.set(true);
+        gloo_timers::callback::Timeout::new(0, scroll_to_latest).forget();
+    };
     let on_history_scroll = move |_| {
         if let Some(el) = history_ref.try_get_untracked().flatten() {
             set_following_latest.set(is_at_latest(el.scroll_top(), el.scroll_height(), el.client_height()));
@@ -468,7 +475,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         if message.is_empty() || busy.get_untracked() { return; }
         let revision_before = snapshot.get_untracked().map(|value| value.conversation.revision);
         set_draft.set(String::new()); set_busy.set(true); set_error.set(None);
-        set_following_latest.set(true);
+        follow_latest();
         let id = send_id.clone();
         let request = send_begin_request.run(());
         let publish = send_publish;
@@ -653,7 +660,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                 {move || {
                     (!following_latest.get() && snapshot.get().is_some_and(|value| !value.conversation.entries.is_empty())).then(|| view! {
                         <div class="mb-2 flex shrink-0 justify-center">
-                            <button data-testid="conversation-jump-latest" class="rounded-full border border-white/20 bg-zinc-900 px-3 py-1 text-xs text-white/80" on:click=move |_| { set_following_latest.set(true); scroll_to_latest(); }>"Jump to latest"</button>
+                            <button data-testid="conversation-jump-latest" class="rounded-full border border-white/20 bg-zinc-900 px-3 py-1 text-xs text-white/80" on:click=move |_| follow_latest()>"Jump to latest"</button>
                         </div>
                     })
                 }}
