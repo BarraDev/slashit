@@ -218,14 +218,14 @@ from live-run and agent-count projections. Nothing about a live Run is
 persisted: after a restart there is no Run until SlashIt starts one. Project Conversation runs are separately registered in the
 same executor by Conversation UUID, share its admission capacity, and expose a
 stop signal without manufacturing a Task identity. `AgentSlotStatus`
-and the workflow `AgentSlot`s are static templates that no execution updates,
+and the workflow `AgentSlot`s are static templates that no execution updates.
 The former `start_agent` command, which started a Claude process outside the
 queue for an `AgentPanel` that nothing rendered, has been removed. Every
 provider run now starts through `TaskExecutor`. The tray, quit guard and IPC
 status helper still count any active execution record the executor does not
 own, so the safety surfaces do not assume the executor is the only provider
 owner.
-Neither is a second source of truth for a TaskExecutor run, and ACP startup
+Neither `AgentSlotStatus` nor the workflow `AgentSlot`s is a second source of truth for a TaskExecutor run, and ACP startup
 failures are terminalized rather than left as active records. `WaitingForInput`
 stays out of `AgentStatus` until a provider or protocol signal exists that can
 set it.
@@ -233,15 +233,20 @@ set it.
 ## ACP
 
 ACP is a provider or protocol adapter boundary. It must not become SlashIt's
-domain model. Current support (`src-tauri/src/acp`) is rudimentary: four
-requests (initialize, create, send_prompt, stop), two notifications (log and
-a free-text status), no cancellation of a running prompt, no session
-loading, no recovery, and notifications that nothing consumes
-(`subscribe_notifications` has no caller outside the module; the app logs
-only the child's stderr). The `session.rs` and `stream.rs` files are not even
-compiled, because `acp/mod.rs` declares only `protocol` and `client`. Making
-it a dependable adapter needs lifecycle, notification, cancellation, session and
-recovery work. That is deliberately not tracked as one large issue now.
+domain model. The client is `src-tauri/src/acp/v1`, the ACP v1 stdio transport
+the OpenCode Worker runs through (`agents::opencode_run`). It sends
+`initialize`, `session/new`, `session/set_config_option` and `session/prompt`,
+and `session/cancel` when a turn times out or a run is stopped. It answers
+permission requests from the options the agent offered, and answers
+`cancelled` when none match or no decision arrives in time. Its session
+updates reach the Worker through an event stream.
+
+Two gaps remain. The initialize result records whether the agent advertises
+`loadSession` and `sessionCapabilities.resume`, but SlashIt sends neither
+`session/load` nor `session/resume`, so a session is not reloaded or resumed
+after a restart. And a turn that ends without `end_turn` is a failure rather than
+a recovered run. Closing these needs session load and resume work and recovery
+tests. That is deliberately not tracked as one large issue now.
 
 ## Future scope
 
