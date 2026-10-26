@@ -59,8 +59,14 @@ run_case() {
 }
 
 echo "== the repository as it is"
-run_case "v0.0.1 is a prerelease channel" yes prerelease v0.0.1 "$root"
-run_case "v0.1.0 is refused while the repository is at 0.0.1" no - v0.1.0 "$root"
+# The repository's own version and channel are read, not assumed, so a legitimate
+# version bump keeps these cases true. The refusal uses a different version.
+repo_version=$(jq -er '.version' "$root/src-tauri/tauri.conf.json")
+repo_channel=$(awk -v v="$repo_version" '$0 !~ /^[[:space:]]*(#|$)/ && $1 == v { print $2 }' "$root/.github/release-channels.txt")
+other_version=0.0.0
+[ "$repo_version" = 0.0.0 ] && other_version=0.0.1
+run_case "v$repo_version is releasable on the channel the repository declares" yes "$repo_channel" "v$repo_version" "$root"
+run_case "v$other_version is refused for the repository's version $repo_version" no - "v$other_version" "$root"
 
 echo "== fixture trees"
 good=$work/good
