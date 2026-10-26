@@ -1273,6 +1273,7 @@ mod tests {
         let mut task = create_test_task_full("finish locally", project_id, TaskStatus::HumanReview, 0);
         task.branch_name = Some(branch.clone());
         task.worktree_path = Some(info.path.clone());
+        task.base_commit = Some(git(&repo, &["rev-parse", "main"]));
         task.overall_progress = 90;
         task.human_review.record_arrival();
         let task_id = task.id;
@@ -1359,6 +1360,31 @@ mod tests {
         assert_eq!(reloaded.phase, crate::domain::task::TaskPhase::Complete);
         assert_eq!(reloaded.status, TaskStatus::Done);
         assert!(reloaded.worktree_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_local_task_still_shows_the_approved_changes() {
+        let local = local_project().await;
+        local.approve().await;
+        let before = crate::commands::jj::fetch_task_diff(&local.state, local.task_id)
+            .await
+            .expect("diff while checkout exists");
+        assert!(before.patch.contains("work.txt"), "{}", before.patch);
+
+        local.complete().await.expect("completed locally");
+        assert!(!local.worktree.exists(), "the original diff source is gone");
+        let after = crate::commands::jj::fetch_task_diff(&local.state, local.task_id)
+            .await
+            .expect("diff from the approved commit");
+        assert_eq!(after, before);
+
+        // A later branch move must not silently change what the person saw
+        // and approved. The approved commit remains available by its SHA.
+        git(&local.repo, &["branch", "-f", &local.branch, "main"]);
+        let after_branch_move = crate::commands::jj::fetch_task_diff(&local.state, local.task_id)
+            .await
+            .expect("diff still bound to the approved commit");
+        assert_eq!(after_branch_move, before);
     }
 
     #[tokio::test]
