@@ -13,7 +13,8 @@ This repository records its own licensing versioning.
   revision immediately preceding the revision that introduces this file; it
   is the parent of the commit that first carries this page. The verified
   boundary commit is fba5c81d2d269b11b1c2440d2e68803b8021e7a6
-  (2026-10-26 11:11 +00:00), parent of 352a4ec818499bca0bf4e4709e07d046e23f0c35,
+  (2026-10-26 00:26 +00:00), parent of
+  352a4ec818499bca0bf4e4709e07d046e23f0c35 (merged 2026-10-26 11:11 +00:00),
   the squash-merge commit that first carries this page and is the first
   default-branch revision licensed under MPL-2.0.
 
