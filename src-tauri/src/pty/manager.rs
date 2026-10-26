@@ -158,8 +158,11 @@ impl PtyState {
     pub fn new() -> Self {
         let store = SessionStore::new().expect("Failed to create session store");
         // Mark all sessions as dead on startup (they'll be revived when spawned)
-        let _ = store.mark_all_dead();
-        
+        // A file that cannot be read is left as it is, so its records survive for a later repair.
+        if let Err(e) = store.mark_all_dead() {
+            eprintln!("[PTY Backend] Could not mark earlier terminal sessions as ended: {e}");
+        }
+
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             scrollback: ScrollbackManager::new(),

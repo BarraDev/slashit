@@ -179,8 +179,14 @@ impl SessionStore {
         let contents = toml::to_string_pretty(&file)
             .context("Failed to serialize sessions")?;
 
-        fs::write(&self.store_path, contents)
-            .context("Failed to write sessions file")?;
+        // Replaced durably and atomically: a failure before the replacement
+        // leaves the previous file whole, so it still loads.
+        slashit_durable_fs::write_atomic(
+            &self.store_path,
+            contents.as_bytes(),
+            slashit_durable_fs::Permissions::Preserve,
+        )
+        .context("Failed to write sessions file")?;
 
         Ok(())
     }
@@ -219,9 +225,12 @@ impl SessionStore {
 
     /// Read, change and rewrite the file as one step. The lock matters: two
     /// writers that load before either saves would otherwise drop one record.
+    ///
+    /// An unreadable file is an error, not an empty list. Writing the change
+    /// over it would discard every record it still holds.
     fn update(&self, change: impl FnOnce(&mut Vec<SessionMetadata>)) -> Result<()> {
         let _guard = self.write_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut sessions = self.load_sessions().unwrap_or_default();
+        let mut sessions = self.load_sessions()?;
         change(&mut sessions);
         self.save_sessions(&sessions)
     }
@@ -308,5 +317,70 @@ mod tests {
         // The store path is a directory, so the write must fail.
         let store = SessionStore::at_path(dir.path().to_path_buf());
         assert!(store.upsert_session(record(Some("project-a"))).is_err());
+    }
+
+    const MALFORMED: &str = "[[sessions]\nid = \"not closed";
+
+    /// A file that does not parse is not an empty list. Every change must fail
+    /// and leave the bytes as they were, so the records it holds survive.
+    #[test]
+    fn a_malformed_sessions_file_is_refused_and_left_as_it_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("terminal-sessions.toml");
+        fs::write(&path, MALFORMED).expect("write");
+        let store = SessionStore::at_path(path.clone());
+
+        assert!(store.load_sessions().is_err());
+        assert!(store.upsert_session(record(Some("project-a"))).is_err());
+        assert!(store.mark_all_dead().is_err(), "startup must not erase an unreadable file");
+        assert!(store.mark_alive(Uuid::new_v4()).is_err());
+        assert!(store.remove_session(Uuid::new_v4()).is_err());
+
+        assert_eq!(fs::read_to_string(&path).expect("read"), MALFORMED);
+    }
+
+    /// A failure before the replacement must leave the previous state whole,
+    /// and a restart must read exactly that state.
+    #[test]
+    fn a_failed_write_before_publication_keeps_the_last_valid_state() {
+        use slashit_durable_fs::{fault, Stage};
+
+        for stage in [Stage::CreateTemp, Stage::WriteTemp, Stage::SyncTemp, Stage::Replace] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("terminal-sessions.toml");
+            let store = SessionStore::at_path(path.clone());
+            let kept = record(Some("project-a"));
+            store.upsert_session(kept.clone()).expect("first write");
+
+            let armed = fault::fail_at(stage, std::io::ErrorKind::Other);
+            assert!(
+                store.upsert_session(record(Some("project-b"))).is_err(),
+                "a write that fails at {stage:?} must be reported"
+            );
+            drop(armed);
+
+            let restarted = SessionStore::at_path(path).load_sessions().expect("the file still loads");
+            assert_eq!(restarted.len(), 1, "stage {stage:?} changed the saved records");
+            assert_eq!(restarted[0].id, kept.id, "stage {stage:?} replaced the saved record");
+        }
+    }
+
+    /// Once the replacement has happened, readers see the new content. The
+    /// error still reaches the caller, and the file stays whole and parseable.
+    #[test]
+    fn a_failure_after_publication_is_reported_and_leaves_a_whole_file() {
+        use slashit_durable_fs::{fault, Stage};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("terminal-sessions.toml");
+        let store = SessionStore::at_path(path.clone());
+        store.upsert_session(record(Some("project-a"))).expect("first write");
+
+        let armed = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        assert!(store.upsert_session(record(Some("project-b"))).is_err());
+        drop(armed);
+
+        let restarted = SessionStore::at_path(path).load_sessions().expect("the file still loads");
+        assert_eq!(restarted.len(), 2, "the published record is whole and readable");
     }
 }
