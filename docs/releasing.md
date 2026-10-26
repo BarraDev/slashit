@@ -48,23 +48,37 @@ cargo check --workspace
 
 ## 2. Choose a version the Windows installer accepts
 
-**Named prereleases such as `0.1.0-rc.1` cannot be packaged as an MSI.** Use a
-numeric prerelease instead: `0.1.0-1`, `0.1.0-2`.
+Every published version is plain `MAJOR.MINOR.PATCH`: three numbers, no
+prerelease or build suffix, and no fourth component. `0.0.1`, `0.0.2` and
+`0.1.0` are versions; `0.1.0-1`, `0.1.0-rc.1` and `0.1.0+1` are not, and the
+preflight job refuses them on every platform.
 
-`bundle.targets` is `"all"`, so a Windows release builds both an MSI and an
-NSIS installer, and MSI is attempted first. WiX, which builds the MSI, requires
-a numeric `major.minor.patch.build` version, so `tauri-bundler` converts the
-app version to that shape and refuses anything it cannot convert:
+The reason is the Windows installer. `bundle.targets` is `"all"`, so a Windows
+release builds both an MSI and an NSIS installer, and MSI is attempted first.
+WiX requires a numeric `major.minor.patch.build` version, so `tauri-bundler`
+converts the app version to that shape and refuses anything it cannot convert.
+A plain version converts to `major.minor.patch.0`, which orders the same way:
 
 | App version | WiX version | Result |
 |---|---|---|
-| `0.1.0` | `0.1.0` | builds |
-| `0.1.0-1` | `0.1.0.1` | builds |
-| `0.1.0-rc.1` | — | **error**, no Windows artifact |
-| `0.1.0-alpha` | — | **error**, no Windows artifact |
+| `0.0.1` | `0.0.1.0` | builds |
+| `0.1.0` | `0.1.0.0` | builds |
+| `0.1.0-1` | — | **refused by the preflight**: a suffix is not a published version |
+| `0.1.0-rc.1` | — | **refused by the preflight**, and an error in the bundler |
 
-The ranges are bounded too: major and minor at most 255, patch and the
-prerelease number at most 65535.
+The ranges are bounded too: major and minor at most 255, patch at most 65535.
+
+Left alone, a bad version is expensive and badly timed. It is not a
+configuration error caught at startup — it happens at bundling time, after the
+entire release build has compiled on the Windows runner, and only there. Linux
+and macOS succeed, so the release is created and looks nearly complete while
+Windows users have nothing. So the `preflight` job refuses the version up front,
+in seconds, before any platform build starts.
+
+Versions only increase. Each line of `.github/release-channels.txt` must name a
+later version than the line above it, and a release must be the latest declared
+version. The updater compares these numbers, so a version published after a
+later one would move the update channel backwards.
 
 Left alone, this failure is expensive and badly timed. It is not a
 configuration error caught at startup — it happens at bundling time, after the
@@ -76,11 +90,10 @@ So the workflow refuses the version up front. The `preflight` job encodes
 exactly the bundler's rule and fails in seconds with a message naming the
 allowed form, before any platform build starts.
 
-Build metadata (`0.1.0+1`) is the one place the guard is deliberately stricter
-than the bundler, which would convert it the same way a numeric prerelease is
-converted. Semver excludes build metadata from version precedence, so `0.1.0+1`
-and `0.1.0+2` are *equal* versions: the updater would never offer one as an
-upgrade over the other while the two installers claimed to differ.
+Build metadata (`0.1.0+1`) is refused as well. Semver excludes build metadata
+from version precedence, so `0.1.0+1` and `0.1.0+2` are *equal* versions: the
+updater would never offer one as an upgrade over the other while the two
+installers claimed to differ.
 
 ### Why not the `wix.version` escape hatch
 
@@ -90,14 +103,6 @@ a second hard-coded version to keep in step with the other five, and when it
 falls out of step nothing complains — the MSI simply advertises a version that
 is not the app's. A guard that refuses a version the toolchain cannot package
 is honest; an override that makes the installer lie about its version is not.
-
-### One caveat on numeric prereleases
-
-Windows Installer compares only the first three fields of `ProductVersion`.
-`0.1.0-1` and `0.1.0-2` become `0.1.0.1` and `0.1.0.2`, which it considers the
-same version, so installing the second over the first is not treated as an
-upgrade. Numeric prereleases are fine for handing a build to testers; they are
-not a channel to iterate in on Windows. Ship the real patch version instead.
 
 ## 3. Tag and push
 
@@ -161,13 +166,19 @@ The preflight job fails closed:
 
 - a version with no line, or with two, is refused;
 - a channel other than `prerelease` or `stable` is refused;
-- a version with a prerelease suffix (`0.1.0-1`) must be a prerelease, so a
-  numeric suffix cannot publish as a stable release.
+- a line that is not a plain version, or that is not later than the line above
+  it, is refused, and so is a release that is not the latest declared version;
+- the preflight output `prerelease` is the GitHub `prerelease` flag, so the
+  flag cannot disagree with the declaration.
 
-A prerelease is published with `prerelease: true`. GitHub never marks it
-`latest`, so `releases/latest/download/latest.json` does not point at it, and
-the updater never offers it. Installed prereleases are offered the next stable
-release. Declare a stable version in the same commit that prepares its CHANGELOG
+The version does not decide the channel: `0.0.1` is a prerelease because its
+line says so, and a later `0.0.3 stable` line is a stable release with no hyphen.
+
+The application reads the same file at build time (`src-tauri/build.rs`) and
+records the channel the build was published on, so an installed build reports
+`0.0.1 · Prerelease` whatever update channel the person has selected.
+
+Declare a stable version in the same commit that prepares its CHANGELOG
 section, and check the file's line before you tag.
 
 `scripts/test-release-preflight.sh` runs the script against the repository and
@@ -244,35 +255,44 @@ not for a `stable` one, then press Publish.
 
 ## 6. Validate auto-update
 
-The updater endpoint configured in `tauri.conf.json` is:
+The application does not read `releases/latest`. GitHub's `latest` excludes
+prereleases and ranks by creation time, so it can neither offer a prerelease nor
+pick the highest version. Instead the updater:
 
-```
-https://github.com/BarraDev/slashit/releases/latest/download/latest.json
-```
+1. lists the repository's releases through the public REST API (at most three
+   pages, bounded timeouts, no credentials, a five-minute cache);
+2. drops drafts, and for the stable channel drops prereleases;
+3. drops any release without a `latest.json` asset, reporting it when it is
+   newer than the running build;
+4. chooses the highest semantic version newer than the running build;
+5. reads that release's own `latest.json` and refuses it unless its `version`
+   matches the release tag;
+6. hands the manifest to the Tauri updater, which verifies the signature of the
+   payload before anything is installed.
 
-**GitHub's `latest` excludes drafts and prereleases.** Two consequences worth
-being explicit about, because both look like bugs otherwise:
+A release that is not offered is not an error. A listing that cannot be read is
+an error, and it is never reported as "up to date".
 
-- While the release is a draft, the endpoint resolves to the previous stable
-  release or, before the first one, to a 404. Auto-update starts working when
-  you press Publish, not when the build finishes. Until a stable release is
-  published, `updater_check` reads a 404 from every endpoint as "no update", so no
-  install shows an error. Any other failure is still reported as an error. This is the state the first pre-release runs in.
-- A published prerelease is still invisible to the updater. That is the
-  intended behaviour — existing installs must not be auto-upgraded onto a
-  release candidate — but it means a prerelease has no update channel. Testers
-  install and update it by hand.
+A published prerelease is offered to people who chose the Prerelease channel and
+to nobody else. A stable release is offered to both channels. Nothing older than
+the running build is ever offered.
 
-After publishing a stable release, check that the manifest is reachable and
-points at the version you just shipped:
+After publishing a stable release, check the release listing and the manifest it
+names:
 
 ```bash
-curl -sSL https://github.com/BarraDev/slashit/releases/latest/download/latest.json
+curl -sSL https://api.github.com/repos/BarraDev/slashit/releases?per_page=5
+curl -sSL https://github.com/BarraDev/slashit/releases/download/v<version>/latest.json
 ```
 
-It should contain the new `version`, and a `platforms` entry per target with a
-`url` and a `signature`. Then confirm end to end: install the *previous*
-release, launch it, and let it offer the update.
+The manifest should contain the release's `version`, and a `platforms` entry per
+target with a `url` and a `signature`. Then confirm end to end: install the
+*previous* release, launch it, and let it offer the update on the channel it
+has selected.
+
+The configured `plugins.updater.endpoints` value in `tauri.conf.json` is the
+plugin's own default. The application's checks always pass the release manifest
+they selected, so that default is not consulted by SlashIt.
 
 ## 7. Signing, stated accurately
 
@@ -294,6 +314,20 @@ certificate and no Apple Developer ID signature or notarization. In practice:
 - macOS Gatekeeper refuses the first launch; the user has to open it from the
   context menu, or clear the quarantine attribute.
 
+**Checking that the secret matches the public key.** The build warns but does not
+fail when the signing secret and `plugins.updater.pubkey` disagree, so a release
+can be built and then refuse its own updates. `scripts/test-updater-signing.sh`
+tests the probe with disposable keys. The manual **Updater signing probe**
+workflow (`.github/workflows/updater-signing-probe.yml`) signs a fixed payload
+with the production secrets and verifies it against the configured public key.
+It runs only from `main`, publishes nothing, and reports PASS or FAIL. Until it
+has passed, the production key is **not verified**.
+
+The release workflow installs the Tauri CLI as `@tauri-apps/cli@v2`, which
+floats to the newest 2.x release. The probe pins the version the floating tag
+resolved to when it was written. Pin the release workflow to the same version
+before the first release.
+
 This is a cost decision, not an oversight — both require a paid certificate or
 membership. It has to be said plainly in the release notes and the README,
 because a security warning that nobody warned users about is indistinguishable
@@ -302,8 +336,8 @@ from a compromised download.
 ## 8. Before the first release
 
 Nothing has been published. The first tag planned is `v0.0.1`, a prerelease
-declared in `.github/release-channels.txt`, which testers install by hand.
-`0.1.0` is the first stable release and follows it. Until a stable release is
-published, the README's Releases link goes to an empty page or to the
-prerelease page, and the updater endpoint resolves to nothing. Both are expected,
-neither is a bug.
+declared in `.github/release-channels.txt`. Testers who choose the Prerelease
+channel in Settings receive it and later prereleases; people on the Stable
+channel receive nothing until a stable release is published. Until then the
+README's Releases link goes to the prerelease page, and a Stable check reports
+that no newer Stable release is available. That is expected, and not an error.

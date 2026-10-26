@@ -23,6 +23,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       channel: ${{ steps.version.outputs.channel }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -119,11 +120,9 @@ jobs:
           # Publish. Note that a draft is invisible to the updater endpoint --
           # see the summary printed by the next job.
           releaseDraft: true
-          # The channel the preflight job read from .github/release-channels.txt.
-          # A prerelease is never marked latest, so it cannot become the release
-          # the updater's latest.json points at. Anything but "prerelease" is a
-          # stable release.
-          prerelease: ${{ needs.preflight.outputs.channel == 'prerelease' }}
+          # The flag the preflight job derived from the channel it read from
+          # .github/release-channels.txt. A prerelease is never marked latest.
+          prerelease: ${{ needs.preflight.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }}
           uploadUpdaterJson: true
 
@@ -141,7 +140,7 @@ jobs:
       - name: Explain what still has to happen by hand
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
-          IS_PRERELEASE: ${{ needs.preflight.outputs.channel == 'prerelease' }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
         run: |
           set -euo pipefail
           {

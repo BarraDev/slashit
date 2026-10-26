@@ -6,11 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Update channels. Settings > Application updates offers Stable (the default)
+  and Prerelease. Stable offers stable releases only; Prerelease also offers
+  prereleases. The installed build's channel is shown separately from the
+  channel you select.
+
 ## [0.0.1]
 
-A prerelease for testers. It is installed by hand. GitHub does not mark a
-prerelease as the latest release, so the in-app updater does not offer it. The
-features listed below are the full feature set of this prerelease.
+A prerelease for testers. Install it by hand the first time. After that, the
+in-app updater offers later prereleases to people who choose the Prerelease
+update channel, and never to people on the Stable channel. The features listed
+below are the full feature set of this prerelease.
 
 **Installing.** Download the installer for your platform from the GitHub
 release page: the `.deb`, `.rpm` or `.AppImage` on Linux, the `.dmg` on macOS

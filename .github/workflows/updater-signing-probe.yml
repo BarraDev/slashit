@@ -1,0 +1,53 @@
+name: Updater signing probe
+
+# Manual only. It signs a fixed test payload with the production updater key and
+# checks the result against the public key in src-tauri/tauri.conf.json. It
+# publishes nothing: no tag, no release, no artifact, and no output that holds
+# key material. Its verdict is the job's exit status, PASS or FAIL.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    # The production signing secrets are read only by code on the default branch,
+    # which a maintainer has reviewed and merged. A run dispatched from any other
+    # ref stops here, before any step that could read a secret.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The release workflow installs the Tauri CLI with `npm install -g
+      # @tauri-apps/cli@v2`, which floats. This pins the version that floating
+      # tag resolved to when this probe was written, so the probe signs with the
+      # same CLI a release would use at that time. Update both together.
+      - name: Install the Tauri CLI
+        run: |
+          set -euo pipefail
+          npm install --global @tauri-apps/cli@2.12.4
+          tauri --version
+
+      - name: Write the configured public key to a scratch file
+        run: |
+          set -euo pipefail
+          jq -er '.plugins.updater.pubkey' src-tauri/tauri.conf.json > "$RUNNER_TEMP/updater-pubkey.txt"
+
+      # The Tauri CLI reads the key from TAURI_SIGNING_PRIVATE_KEY and the password
+      # from TAURI_SIGNING_PRIVATE_KEY_PASSWORD. Only this step receives them. The
+      # script never prints them, and the signatures it writes stay in
+      # RUNNER_TEMP, which is not uploaded.
+      - name: Sign the probe payload and verify it against the configured key
+        env:
+          SIGNING_CLI: tauri
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          scripts/updater-signing-probe.sh "$RUNNER_TEMP/updater-pubkey.txt" "$RUNNER_TEMP/updater-signing-probe"

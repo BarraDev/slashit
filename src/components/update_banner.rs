@@ -17,7 +17,8 @@ use crate::services::tray_service::get_active_process_count;
 use crate::services::updater_service::{
     clear_skipped_version, format_bytes, get_skipped_version, set_skipped_version,
     subscribe_updater_progress, updater_check, updater_download_and_install, updater_restart,
-    updater_status, UpdateInfo, UpdaterFailure, UpdaterProgress, UpdaterStage, UpdaterStatus,
+    updater_set_channel, updater_status, UpdateInfo, UpdaterErrorKind, UpdaterFailure,
+    UpdaterProgress, UpdaterStage, UpdaterStatus,
 };
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
@@ -83,6 +84,8 @@ pub struct UpdaterContext {
     /// install", never as "can".
     pub status: RwSignal<Option<UpdaterStatus>>,
     pub available: RwSignal<Option<UpdateInfo>>,
+    /// Notices from the last check that found the selected channel's answer.
+    pub notices: RwSignal<Vec<String>>,
     pub last_check: RwSignal<Option<String>>,
     /// Separates "no update found" from "never looked".
     pub checked_once: RwSignal<bool>,
@@ -172,6 +175,7 @@ pub fn provide_updater_context() -> UpdaterContext {
     let ctx = UpdaterContext {
         status: RwSignal::new(None),
         available: RwSignal::new(None),
+        notices: RwSignal::new(Vec::new()),
         last_check: RwSignal::new(None),
         checked_once: RwSignal::new(false),
         activity: RwSignal::new(UpdaterActivity::Idle),
@@ -271,6 +275,13 @@ async fn run_check(ctx: UpdaterContext) {
 
     match updater_check().await {
         Ok(result) => {
+            // An answer for a channel that is no longer selected describes a
+            // different set of releases. Drop it rather than show it.
+            let selected = ctx.status.get_untracked().map(|s| s.update_channel);
+            if selected.as_deref() != Some(result.channel.as_str()) {
+                ctx.activity.set(UpdaterActivity::Idle);
+                return;
+            }
             ctx.last_check.set(Some(result.checked_at));
             // Keep the displayed version honest even if `updater_status` was
             // read before some other part of the app changed it.
@@ -280,14 +291,65 @@ async fn run_check(ctx: UpdaterContext) {
                 }
             });
             ctx.available.set(result.update);
+            ctx.notices.set(result.notices);
             ctx.checked_once.set(true);
             ctx.activity.set(UpdaterActivity::Idle);
         }
         Err(e) => {
             ctx.activity.set(UpdaterActivity::Idle);
-            ctx.record_failure(UpdaterFailure::new(UpdaterStage::Check, e));
+            let failure = UpdaterFailure::new(UpdaterStage::Check, e);
+            // Superseded means the channel changed under this check. The check
+            // that replaces it reports the answer, so this one is not a failure.
+            if failure.kind == UpdaterErrorKind::Superseded {
+                return;
+            }
+            ctx.record_failure(failure);
         }
     }
+}
+
+/// Switch the update channel, then check the newly selected one.
+///
+/// Refused while the updater is busy, so the selection cannot change under a
+/// check or an install. The backend invalidates anything found under the old
+/// channel; here the answer on screen is cleared to match, and the installed
+/// version is left alone.
+pub fn set_update_channel(ctx: UpdaterContext, channel: &'static str) {
+    if ctx.activity.get_untracked().busy() {
+        return;
+    }
+    if ctx.status.get_untracked().map(|s| s.update_channel).as_deref() == Some(channel) {
+        return;
+    }
+    ctx.failure.set(None);
+    ctx.activity.set(UpdaterActivity::Checking);
+    spawn_local(async move {
+        match updater_set_channel(channel).await {
+            Ok(()) => {
+                ctx.status.update(|s| {
+                    if let Some(status) = s {
+                        status.update_channel = channel.to_string();
+                    }
+                });
+                ctx.available.set(None);
+                ctx.notices.set(Vec::new());
+                ctx.checked_once.set(false);
+                ctx.dismissed_version.set(None);
+                ctx.activity.set(UpdaterActivity::Idle);
+                run_check(ctx).await;
+            }
+            Err(e) => {
+                ctx.activity.set(UpdaterActivity::Idle);
+                // The backend can change the channel and still report an error
+                // (saved but not confirmed durable). Re-read the status so the
+                // screen follows what the backend now holds.
+                if let Ok(status) = updater_status().await {
+                    ctx.status.set(Some(status));
+                }
+                ctx.record_failure(UpdaterFailure::new(UpdaterStage::Channel, e));
+            }
+        }
+    });
 }
 
 /// A check the user asked for. Unlike the background poll it un-skips whatever
@@ -659,7 +721,13 @@ fn failure_card(ctx: UpdaterContext) -> AnyView {
         return ().into_any();
     };
 
-    let retry = failure.kind.retryable().then_some(failure.stage);
+    // A failed channel change is retried from Settings, where the person picks
+    // the channel again; a check button here would not repeat that change.
+    let retry = failure
+        .kind
+        .retryable()
+        .then_some(failure.stage)
+        .filter(|stage| *stage != UpdaterStage::Channel);
     let headline = failure.kind.headline();
     let hint = failure.kind.hint();
     let detail = format!("{}: {}", failure.stage.label(), failure.detail);
@@ -684,17 +752,18 @@ fn failure_card(ctx: UpdaterContext) -> AnyView {
                     "Dismiss"
                 </button>
                 {retry.map(|stage| {
+                    // `Channel` is filtered out above and never reaches here.
                     let label = match stage {
                         UpdaterStage::Restart => "Restart now",
                         UpdaterStage::Install => "Try again",
-                        UpdaterStage::Status | UpdaterStage::Check => "Check again",
+                        UpdaterStage::Status | UpdaterStage::Check | UpdaterStage::Channel => "Check again",
                     };
                     view! {
                         <button
                             on:click=move |_| match stage {
                                 UpdaterStage::Restart => request_restart(ctx),
                                 UpdaterStage::Install => start_install(ctx),
-                                UpdaterStage::Status | UpdaterStage::Check => check_now(ctx),
+                                UpdaterStage::Status | UpdaterStage::Check | UpdaterStage::Channel => check_now(ctx),
                             }
                             class="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-semibold text-white/85"
                         >

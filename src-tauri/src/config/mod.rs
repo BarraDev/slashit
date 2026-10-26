@@ -9,6 +9,7 @@ pub mod migration;
 pub mod paths;
 pub mod queue;
 pub mod storage;
+pub mod updates;
 pub mod workspace_registry;
 
 #[cfg(test)]
