@@ -93,6 +93,10 @@ pub enum PrDelivery {
 /// Approve the changes of a task in Human Review, and optionally open a pull
 /// request for them.
 ///
+/// `tip` is the branch commit the person was shown when they decided. The
+/// approval records that commit, and only that commit: if the branch has moved
+/// since, nothing is recorded and the person is asked to review it again.
+///
 /// `Err` means the approval was not recorded. Once it is recorded, a pull
 /// request that cannot be opened is reported in [`ApprovalOutcome::pr`], not
 /// as an error, because the approval happened.
@@ -102,9 +106,10 @@ pub async fn approve_task(
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     create_pr: bool,
+    tip: Option<String>,
 ) -> Result<ApprovalOutcome, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    approve(&state, task_id, create_pr).await
+    approve(&state, task_id, create_pr, tip.as_deref()).await
 }
 
 /// Open the pull request for a task whose changes are already approved,
@@ -328,10 +333,34 @@ pub(crate) async fn approve_again(
     Ok(task)
 }
 
+/// The refusal for an approval whose shown commit no longer is the branch tip.
+const MOVED_BEFORE_APPROVAL: &str =
+    "The branch moved after it was shown to you, so nothing was approved. Review it again.";
+
+/// Whether the commit an approval would record is the one the person was
+/// shown. A task without a branch has no commit to show. A task whose branch
+/// has no readable commit on either side is approved as before, with nothing
+/// recorded for it.
+fn shown_tip_is_current(has_branch: bool, shown: Option<&str>, current: Option<&str>) -> Result<(), String> {
+    if !has_branch {
+        return Ok(());
+    }
+    match (shown, current) {
+        (None, None) => Ok(()),
+        (Some(shown), Some(current)) if shown == current => Ok(()),
+        (None, Some(_)) => Err(
+            "The commit to approve was not shown to you, so nothing was approved. Review it again."
+                .to_string(),
+        ),
+        _ => Err(MOVED_BEFORE_APPROVAL.to_string()),
+    }
+}
+
 pub(crate) async fn approve(
     state: &crate::AppState,
     task_id: Uuid,
     create_pr: bool,
+    shown_tip: Option<&str>,
 ) -> Result<ApprovalOutcome, String> {
     // The delivery marker is taken before the approval is recorded, not
     // inside `deliver`: approving runs outside the task's lifecycle lease
@@ -341,12 +370,25 @@ pub(crate) async fn approve(
     // the Project out from under a delivery that is about to own the Task.
     // Counted marks nest, so `deliver` keeps starting its own.
     let _in_flight = state.task.deliveries.start(task_id);
-    let task = record_approval(state, task_id).await?;
+    let task = record_approval(state, task_id, shown_tip).await?;
     if !create_pr {
         return Ok(ApprovalOutcome { task, pr: None });
     }
     let pr = deliver(state, task_id).await;
     Ok(ApprovalOutcome { task: current(state, task_id).await.unwrap_or(task), pr: Some(pr) })
+}
+
+/// Approve as a person would who was shown the branch's current commit. For
+/// tests that are not about what was shown.
+#[cfg(test)]
+pub(crate) async fn approve_shown(
+    state: &crate::AppState,
+    task_id: Uuid,
+    create_pr: bool,
+) -> Result<ApprovalOutcome, String> {
+    let task = current(state, task_id).await.ok_or("Task not found")?;
+    let shown = crate::commands::integration::tip_to_approve(state, &task).await;
+    approve(state, task_id, create_pr, shown.as_deref()).await
 }
 
 pub(crate) async fn retry_delivery(
@@ -483,7 +525,11 @@ pub(crate) async fn complete_leased(
     .await
 }
 
-async fn record_approval(state: &crate::AppState, task_id: Uuid) -> Result<Task, String> {
+async fn record_approval(
+    state: &crate::AppState,
+    task_id: Uuid,
+    shown_tip: Option<&str>,
+) -> Result<Task, String> {
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
     let task = current(state, task_id).await.ok_or("Task not found")?;
@@ -504,8 +550,11 @@ async fn record_approval(state: &crate::AppState, task_id: Uuid) -> Result<Task,
     let now = chrono::Utc::now();
     // The exact commit being approved, read while the lease is held so that
     // what is recorded is what the person decided on. Integrating later
-    // merges this commit and nothing newer.
+    // merges this commit and nothing newer. The person's decision is only
+    // valid for the commit they were shown, so a branch that moved since the
+    // display is refused here, before anything is written.
     let tip = crate::commands::integration::tip_to_approve(state, &task).await;
+    shown_tip_is_current(task.branch_name.is_some(), shown_tip, tip.as_deref())?;
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(t) = staged.get_mut(&task_id) {
             if t.status == TaskStatus::HumanReview && t.human_review.current_decision().is_none() {
@@ -772,8 +821,8 @@ mod tests {
         arrive_again(&state, task_id).await;
         request_changes(&state, task_id, "And bytes.").await.expect("second request");
         arrive_again(&state, task_id).await;
-        approve(&state, task_id, false).await.expect("approved");
-        approve(&state, task_id, false).await.expect("approving again changes nothing");
+        approve_shown(&state, task_id, false).await.expect("approved");
+        approve_shown(&state, task_id, false).await.expect("approving again changes nothing");
         record_pr_failure(&state, task_id, "gh: HTTP 422".to_string()).await;
         record_pr_failure(&state, task_id, "gh: HTTP 422".to_string()).await;
 
@@ -1021,7 +1070,7 @@ mod tests {
     async fn approved_changes_cannot_also_be_sent_back_and_vice_versa() {
         let (_tmp, state) = test_state().await;
         let (_project_id, approved) = seed_in_review(&state).await;
-        approve(&state, approved, false).await.expect("approved");
+        approve_shown(&state, approved, false).await.expect("approved");
         let refused = request_changes(&state, approved, "change it").await.expect_err("approved");
         assert!(refused.contains("already approved"), "{refused}");
         let task = current(&state, approved).await.unwrap();
@@ -1030,7 +1079,7 @@ mod tests {
 
         let (_project_id, sent_back) = seed_in_review(&state).await;
         request_changes(&state, sent_back, "change it").await.expect("recorded");
-        let refused = approve(&state, sent_back, false).await.expect_err("queued now");
+        let refused = approve_shown(&state, sent_back, false).await.expect_err("queued now");
         assert!(refused.contains("Human Review"), "{refused}");
     }
 
@@ -1043,8 +1092,8 @@ mod tests {
         let (_tmp, state) = test_state().await;
         let (_p, moved) = seed_in_review(&state).await;
         let (_p, queued) = seed_in_review(&state).await;
-        approve(&state, moved, false).await.expect("approved");
-        approve(&state, queued, false).await.expect("approved");
+        approve_shown(&state, moved, false).await.expect("approved");
+        approve_shown(&state, queued, false).await.expect("approved");
         let app = tauri::test::mock_app();
         app.manage(state);
 
@@ -1080,7 +1129,7 @@ mod tests {
         request_changes(&state, task_id, "fix it").await.expect("recorded");
         // Put back in Human Review without a run, as a manual move would.
         state.task.tasks.write().await.get_mut(&task_id).unwrap().status = TaskStatus::HumanReview;
-        let refused = approve(&state, task_id, false).await.expect_err("changes were requested");
+        let refused = approve_shown(&state, task_id, false).await.expect_err("changes were requested");
         assert!(refused.contains("already requested"), "{refused}");
     }
 
@@ -1237,7 +1286,7 @@ mod tests {
             on_disk(&self.state, self.project_id, self.task_id)
         }
         async fn approve(&self) {
-            approve(&self.state, self.task_id, false).await.expect("approved");
+            approve_shown(&self.state, self.task_id, false).await.expect("approved");
         }
         async fn complete(&self) -> Result<Task, String> {
             complete_locally(&self.state, self.task_id, false).await
@@ -1587,7 +1636,7 @@ mod tests {
     async fn a_task_without_a_branch_is_approved_without_a_commit() {
         let (_tmp, state) = test_state().await;
         let (project_id, task_id) = seed_in_review(&state).await;
-        approve(&state, task_id, false).await.expect("approved");
+        approve_shown(&state, task_id, false).await.expect("approved");
         let task = on_disk(&state, project_id, task_id);
         assert!(task.human_review.is_approved());
         assert_eq!(task.human_review.approved_tip(), None);
@@ -1686,6 +1735,40 @@ mod tests {
         assert_eq!(approval_status(&local.state, local.task_id).await.unwrap().coverage, ApprovalCoverage::Current);
         let done = local.complete().await.expect("the renewed approval completes it");
         assert_eq!(done.status, TaskStatus::Done);
+    }
+
+    /// The race the drawer can lose: the person is shown one commit, the
+    /// branch moves to another, and then they press Approve. The approval
+    /// must not record the commit they never saw, and the next approval must
+    /// record the one they are shown after a fresh inspection.
+    #[tokio::test]
+    async fn an_approval_is_refused_when_the_branch_moved_after_it_was_shown() {
+        let local = local_project().await;
+        let shown = local.tip();
+        let moved = local.advance();
+        assert_ne!(shown, moved);
+
+        let refused = approve(&local.state, local.task_id, false, Some(&shown))
+            .await
+            .expect_err("the branch moved after it was shown");
+        assert!(refused.contains("moved after it was shown"), "{refused}");
+        local.untouched().await;
+        assert_eq!(local.tip(), moved, "the branch is left where it is");
+        let task = local.on_disk();
+        assert!(!task.human_review.is_approved(), "nothing was approved");
+        assert!(task.human_review.entries.is_empty(), "no decision was recorded");
+
+        // The approval that carries no commit at all is refused the same way.
+        let unshown = approve(&local.state, local.task_id, false, None)
+            .await
+            .expect_err("no commit was shown");
+        assert!(unshown.contains("was not shown"), "{unshown}");
+        assert!(!local.on_disk().human_review.is_approved());
+
+        // A fresh inspection shows the moved commit, and approving it records it.
+        assert_eq!(approval_status(&local.state, local.task_id).await.unwrap().branch_tip.as_deref(), Some(moved.as_str()));
+        approve(&local.state, local.task_id, false, Some(&moved)).await.expect("approved as shown");
+        assert_eq!(local.on_disk().human_review.approved_tip(), Some(moved.as_str()));
     }
 
     #[tokio::test]

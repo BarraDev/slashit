@@ -226,17 +226,20 @@ pub fn HumanReviewPanel(
     // as approved.
     let coverage = RwSignal::new(None::<ApprovalStatus>);
     let asked = StoredValue::new(0u32);
-    Effect::new(move |_| {
-        task.track();
+    // Asks what the branch is now. Only the latest question's answer is kept.
+    let ask_coverage = move || {
         let ask = asked.try_update_value(|n| { *n += 1; *n }).unwrap_or(0);
         spawn_local(async move {
-            // Only the latest question's answer is kept.
             if let Ok(status) = get_approval_status(task_id.to_string()).await {
                 if asked.try_get_value() == Some(ask) {
                     coverage.try_set(Some(status));
                 }
             }
         });
+    };
+    Effect::new(move |_| {
+        task.track();
+        ask_coverage();
     });
     let approve_current_branch = move |tip: String| {
         if busy.get_untracked() {
@@ -290,8 +293,10 @@ pub fn HumanReviewPanel(
                 d.begin(task_id);
             }
         }
+        // The commit on screen. The approval covers that commit and no other.
+        let shown = coverage.get_untracked().filter(|c| matches!(c.coverage, ApprovalCoverage::NotApplicable)).and_then(|c| c.branch_tip);
         spawn_local(async move {
-            let attempted = match approve_task(task_id.to_string(), create_pr).await {
+            let attempted = match approve_task(task_id.to_string(), create_pr, shown).await {
                 Ok(outcome) => {
                     let attempted = tried_a_pull_request(outcome.pr.as_ref());
                     apply_outcome(outcome.task, outcome.pr);
@@ -299,6 +304,8 @@ pub fn HumanReviewPanel(
                 }
                 Err(e) => {
                     error.try_set(Some(e));
+                    // A refusal usually means the branch moved: show what it is now.
+                    ask_coverage();
                     false
                 }
             };
@@ -544,8 +551,17 @@ pub fn HumanReviewPanel(
                             <code class="font-mono text-white/70">{tip}</code>
                         </p>
                     })}
+                // A Manual run has no AI review on record, so only a recorded
+                // review is named as a check.
                 <p data-testid="human-review-test-evidence" class="text-xs text-white/50">
-                    "No test run is recorded for this Task. The AI review is the only recorded check."
+                    {move || {
+                        let ai_review = task.with(|t| t.as_ref().is_some_and(|t| t.qa_signoff.is_some()));
+                        if ai_review {
+                            "No test run is recorded for this Task. The AI review is the only recorded check."
+                        } else {
+                            "No test run and no AI review is recorded for this Task. You are the only check on these changes."
+                        }
+                    }}
                 </p>
                 <div class="flex flex-wrap gap-2">
                     {move || {
