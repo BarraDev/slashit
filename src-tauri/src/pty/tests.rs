@@ -367,12 +367,33 @@ mod quit_tests {
     /// one test's script directory is removed while the other spawns.
     static SHELL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Takes the environment lock every test that mutates the environment
-    /// shares, then this module's `SHELL` lock. Every test here sets `SHELL`.
-    fn lock_shell() -> (tokio::sync::MutexGuard<'static, ()>, std::sync::MutexGuard<'static, ()>) {
+    /// Holds the environment lock every test that mutates the environment
+    /// shares, then this module's `SHELL` lock. When the test ends, `SHELL` is
+    /// put back first, so a later test in this process never inherits the
+    /// script directory this test removes.
+    struct ShellGuard {
+        prior: Option<std::ffi::OsString>,
+        _env: tokio::sync::MutexGuard<'static, ()>,
+        _shell: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ShellGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => std::env::set_var("SHELL", value),
+                None => std::env::remove_var("SHELL"),
+            }
+        }
+    }
+
+    fn lock_shell() -> ShellGuard {
         let env = crate::config::paths::ENV_LOCK.blocking_lock();
         let shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        (env, shell)
+        ShellGuard {
+            prior: std::env::var_os("SHELL"),
+            _env: env,
+            _shell: shell,
+        }
     }
 
     /// Whether `pid` is a live process. A zombie is not live: it has ended and
@@ -645,6 +666,8 @@ mod registration_tests {
     #[test]
     #[ignore = "spawns a real shell"]
     fn a_terminal_whose_record_cannot_be_written_is_not_published() {
+        // Spawning reads SHELL, which the shutdown tests set under this lock.
+        let _env = crate::config::paths::ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         // The store path is a directory, so the record cannot be written.
         let state = state_with_store(SessionStore::at_path(dir.path().to_path_buf()));
@@ -664,6 +687,8 @@ mod registration_tests {
     #[test]
     #[ignore = "spawns a real shell"]
     fn a_recorded_terminal_is_published_with_its_scrollback_and_project() {
+        // Spawning reads SHELL, which the shutdown tests set under this lock.
+        let _env = crate::config::paths::ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.toml");
         let state = state_with_store(SessionStore::at_path(path.clone()));
