@@ -793,8 +793,7 @@ owner policy, applied by whoever merges.
 - Compile check (windows-latest)
 - Compile check (macos-latest)
 - Durable write tests (ubuntu-22.04, macos-latest, windows-latest)
-- Desktop acceptance / harness
-- Desktop acceptance / product shard 1, 2 and 3
+- Desktop acceptance / product shard 1, 2 and 3 (shard 2 also runs the harness suite)
 
 **Advisory; may finish after the merge.**
 

@@ -8,14 +8,14 @@
 # all fail that check. scripts/run-desktop-acceptance.sh --shard <N> reads this file to pick
 # which journeys a shard runs, both in CI and locally.
 #
-# The harness suite (tests/acceptance.rs) is not sharded; it always runs whole, in its own CI
-# job ("Desktop acceptance / harness"), and does not belong in this file.
+# The harness suite (tests/acceptance.rs) is not sharded; CI runs it whole in product shard 2,
+# using that shard's already built application, and it does not belong in this file.
 #
-# The nine non-desktop helper/predicate tests now run as ordinary acceptance-crate unit tests;
-# this manifest covers only the 47 journeys that launch the product application. Their current
-# grouping had nearly balanced execution in hosted run 37723618840: 223.7s / 210.2s / 174.0s.
-# The grouping is retained after removing the helper rows. Rebalance after collecting timings for
-# the current assignment; the coverage check proves completeness and non-overlap, not balance.
+# The nine non-desktop helper/predicate tests run as ordinary acceptance-crate unit tests.
+# This manifest covers the product journeys that launch the desktop application.
+# Shards are assigned using hosted journey timings. Recheck the balance when
+# the suite changes; the coverage check proves completeness and non-overlap,
+# not balance.
 
 1	a_cleanup_git_abandons_partway_keeps_everything_and_only_an_explicit_retry_finishes_it
 1	a_task_moved_into_progress_runs_its_agent_and_reaches_human_review
@@ -24,7 +24,6 @@
 1	human_review::a_failed_pull_request_keeps_the_approval_and_retrying_needs_no_second_approval
 1	human_review::closing_a_reviewed_task_without_merging_is_confirmed_first_and_keeps_its_work
 1	pr_status::a_pull_requests_ci_status_shows_on_its_card_and_in_its_drawer
-1	stopping_a_running_task_ends_its_agent_and_does_not_restart_it
 1	worker_recovery::a_committed_handoff_recovers_on_restart_without_a_second_coding_worker
 1	worker_recovery::a_recovered_worker_starts_a_new_attempt_only_after_a_person_confirms
 1	worker_recovery::an_interrupted_worker_is_visible_and_cannot_be_restarted_or_moved
@@ -32,13 +31,12 @@
 1	the_task_drawer_shows_a_running_task_live_and_stops_it
 
 2	a_done_cleanup_that_fails_keeps_everything_and_only_an_explicit_retry_finishes_it
-2	a_failed_agent_run_is_recorded_and_retrying_the_task_reaches_human_review
 2	finishing_a_task_removes_its_worktree_without_destroying_its_work
 2	human_review::approving_a_task_opens_its_pull_request_and_the_decision_survives_a_restart
 2	human_review::approving_without_a_github_remote_records_the_decision_and_merges_nothing
 2	human_review::requested_changes_reach_the_next_run_and_the_review_history_survives_a_restart
 2	local_first::projects_without_version_control_are_set_up_explicitly
-2	needs_you::the_rail_shows_every_project_and_the_header_only_the_current_one
+1	needs_you::the_rail_shows_every_project_and_the_header_only_the_current_one
 2	storage::storage_settings_measure_disk_usage_and_offer_nothing_destructive
 2	board_identity::a_task_card_keeps_its_dom_node_through_updates_to_its_task_and_its_column
 2	board_identity::a_drag_in_progress_survives_an_update_to_the_dragged_task_and_still_ends_cleanly
@@ -54,8 +52,8 @@
 3	a_project_whose_workspace_is_lost_is_shown_unresolved_and_can_be_detached
 3	developer_tools::a_developer_installed_coderabbit_is_never_run
 3	human_review::approved_changes_are_completed_locally_without_merging_and_the_branch_survives_a_restart
-3	disk_pressure::a_critically_full_disk_pauses_new_work_until_space_returns
-3	local_first::a_repository_without_a_remote_runs_a_task_through_review
+2	disk_pressure::a_critically_full_disk_pauses_new_work_until_space_returns
+1	local_first::a_repository_without_a_remote_runs_a_task_through_review
 3	needs_you::a_pull_request_that_was_not_created_needs_you_until_a_retry_opens_it
 3	needs_you::only_an_undecided_review_needs_you
 3	needs_you::the_header_counts_what_needs_you_and_takes_you_to_it
@@ -63,14 +61,10 @@
 3	the_task_drawer_starts_a_backlog_task_through_the_queue
 1	orphans::leftover_checkouts_and_branches_are_listed_and_reclaimed_only_on_explicit_confirmation
 
-# Added after the timings above, measured locally (not on a hosted runner) at about 45s and
-# 35s: each went to a different shard, the checkout-recovery journey to shard 1 and the stacked
-# journey to shard 3, rather than rebalancing the existing assignment.
 1	checkout_recovery::restarting_keeps_an_intact_checkout_adopts_a_moved_one_and_clears_a_gone_one
 3	stacked_tasks::a_task_stacked_on_a_parent_is_restacked_onto_the_default_branch_once_the_parent_lands
 
-# Queue settings journey: one launch to edit and queue, one restart. Placed in shard 3, the
-# shortest in the hosted timings recorded above.
+# Queue settings journey: one launch to edit and queue, one restart.
 3	queue_settings::queue_settings_are_edited_in_settings_and_keep_a_queued_task_waiting_across_a_restart
 
 # Local integration journeys (checked-out target and dependent task; GitHub remote and local base

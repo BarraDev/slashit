@@ -223,354 +223,14 @@ async fn journey(context: &TestContext) -> Result<()> {
     Ok(())
 }
 
-/// Prove that a failed agent run is recorded as one, and that retrying the
-/// task through the product's own status transition really runs the agent
-/// again and carries the task to the state a successful run reaches.
-///
-/// The failure is a well-formed result that reports failure, with a zero exit
-/// status — the agent ran and said it could not do the work. That is the
-/// failure the product distinguishes in `ClaudeRunner::wait`, and it exercises
-/// the whole path: the real stream parser reads `is_error`, the runner turns it
-/// into an error, and the executor settles the task on it. It is deliberately
-/// not a crashing agent, which would prove the same product transition through
-/// less of the product.
-///
-/// Retry is `update_task_status` to `queue`, which is exactly what the board
-/// sends when a card is dragged out of the Error column back into Queue, and
-/// the queue promotes it from there on its own. Nothing in the executor is
-/// called directly at any point.
-///
-/// The journey also holds the product to preserving the work it is retrying:
-/// the failed attempt's worktree and branch have to survive the failure, the
-/// reset, and the second run — which reattaches to them rather than starting
-/// from an empty directory. Re-queuing a task asks it to continue; discarding
-/// what it produced is a different operation and no part of this path.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_failed_agent_run_is_recorded_and_retrying_the_task_reaches_human_review() {
-    let context = TestContext::new("queue_agent_retry").expect("harness setup");
-    let outcome = retry_journey(&context).await;
-    context.finish(outcome);
-}
-
-async fn retry_journey(context: &TestContext) -> Result<()> {
-    let root = context.state().path().to_path_buf();
-
-    let agent = FakeAgent::install(&root)?;
-    context.set_child_env("PATH", agent.path_value());
-    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
-    // The first agent run fails and every one after it succeeds. The fixture
-    // is told how many runs to fail and nothing else: it never learns that a
-    // retry is what produced the second run, or that there is a task at all.
-    context.set_child_env(fake_agent::FAILING_RUNS_VAR, "1");
-
-    start_on_the_legacy_auto_placement(&context.state().config_file())?;
-    let repository = GitFixture::create(&root.join("fixture-repo"))?;
-
-    let session = context.start_session("retry").await?;
-    let outcome = fail_then_retry(session.driver(), &agent, &repository).await;
-    context.close_session(session, "retry", &outcome).await?;
-    let recovered = outcome?;
-
-    assert_persisted(&root, &recovered, "human_review")?;
-
-    // The directory the task points at is the one the retried agent ran in,
-    // and it is still there once everything has settled. A task reporting a
-    // worktree that no longer exists would be coherent in memory and wrong on
-    // disk — which is precisely what re-queuing used to produce.
-    if !recovered.worktree_path.is_dir() {
-        bail!(
-            "after the retry the task reports worktree {} but nothing is there",
-            recovered.worktree_path.display()
-        );
-    }
-
-    let runs = agent_runs(&agent)?;
-    if runs.len() != 2 {
-        bail!(
-            "the agent ran {} times over the whole journey, expected exactly two: one failure \
-             and one retry",
-            runs.len()
-        );
-    }
-
-    Ok(())
-}
-
-/// Prove what stopping a task does while its agent is still running.
-///
-/// Four claims, and the journey is only worth anything if it crosses the whole
-/// distance between them. The agent the user was looking at has to be gone —
-/// the actual process, named before the stop and looked for afterwards.
-/// Nothing may start the task again on its own, because a stop that quietly
-/// becomes a restart is not a stop. The task has to settle somewhere a person
-/// has to act on before it runs again, which is `backlog`, and it has to
-/// settle there on disk as well as in the board, or the next launch will
-/// disagree with what the user was just told. And nothing may be destroyed:
-/// the worktree, the branch and the work already in them all survive, because
-/// stopping is not discarding and the product has no operation that discards.
-///
-/// A stoppable run needs an agent that is still there to stop, which is what
-/// the fixture's blocking mode is for: it announces the process it is and then
-/// waits. Nothing else about the journey is arranged — the queue notices the
-/// task on its own tick, and the stop goes through the same command the
-/// frontend would invoke.
-#[tokio::test(flavor = "multi_thread")]
-async fn stopping_a_running_task_ends_its_agent_and_does_not_restart_it() {
-    let context = TestContext::new("queue_task_cancellation").expect("harness setup");
-    let outcome = cancellation_journey(&context).await;
-    context.finish(outcome);
-}
-
-async fn cancellation_journey(context: &TestContext) -> Result<()> {
-    let root = context.state().path().to_path_buf();
-
-    let agent = FakeAgent::install(&root)?;
-    // Agent runs stay open until something ends them, so there is a real
-    // process to stop when the journey asks the product to stop one.
-    let release = agent.block_agent_runs()?;
-    context.set_child_env("PATH", agent.path_value());
-    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
-    context.set_child_env(fake_agent::BLOCK_DIR_VAR, &release);
-
-    start_on_the_legacy_auto_placement(&context.state().config_file())?;
-    let repository = GitFixture::create(&root.join("fixture-repo"))?;
-
-    let session = context.start_session("cancellation").await?;
-    let outcome = stop_a_running_task(session.driver(), &agent, &repository, &root).await;
-
-    // A run the product ended is already gone, so there is normally nothing
-    // here to release. Anything still alive is a failure, and it is left
-    // exactly as it is: the session's own shutdown ends it along with the
-    // application, since it owns the process group and returns only once that
-    // group is gone. Releasing the runs here instead would let them finish and
-    // carry the task onward, overwriting the on-disk state a preserved failure
-    // exists to show.
-    context
-        .close_session(session, "cancellation", &outcome)
-        .await?;
-    outcome
-}
-
 /// What the journey saw in the interval after the stop was requested.
 struct AfterStop {
-    /// Whether the process the product was asked to stop is still running.
+    /// Whether the stopped process is still alive after the observation window.
     agent_alive: bool,
     /// Agent runs that started after the stop.
     runs: usize,
     /// The processes those runs announced.
     pids: Vec<u32>,
-}
-
-/// Start one real execution, stop it through the product's own command, and
-/// report every way the result departs from what the product says it does.
-///
-/// The violations are collected rather than raised one at a time. Stopping
-/// touches the process, the queue, the task and the disk at once, and a report
-/// that stopped at whichever of those broke first would describe a fraction of
-/// what happened and hide the rest until the next run.
-async fn stop_a_running_task(
-    driver: &WebDriver,
-    agent: &FakeAgent,
-    repository: &GitFixture,
-    root: &Path,
-) -> Result<()> {
-    ui::assert_frontend_is_real(driver).await?;
-
-    let Prerequisites {
-        project_id,
-        task_id,
-        title,
-    } = create_prerequisites(
-        driver,
-        repository,
-        "Cancellation journey",
-        "Exercises stopping a task while its agent is still running.",
-    )
-    .await?;
-
-    let already_ran = agent_runs(agent)?.len();
-    if already_ran != 0 {
-        bail!("the agent ran {already_ran} times before the task was ever started");
-    }
-
-    // --- A real execution, still running -----------------------------------
-    ui::invoke(
-        driver,
-        "update_task_status",
-        json!({ "taskId": task_id, "status": "in_progress" }),
-    )
-    .await?;
-
-    let agent_pid = await_one_blocked_agent(agent).await?;
-
-    // The process that announced itself belongs to the task run, not to the
-    // product asking what version is installed.
-    let runs = agent_runs(agent)?;
-    if runs.len() != 1 {
-        bail!(
-            "{} agent runs started before the stop, expected exactly one",
-            runs.len()
-        );
-    }
-    let invocation = &runs[0];
-    if invocation.flag("--output-format") != Some(OsStr::new("stream-json")) {
-        bail!(
-            "the agent was not invoked with the streaming protocol the runner parses: {:?}",
-            invocation.args
-        );
-    }
-    let prompt = invocation
-        .prompt
-        .as_deref()
-        .context("the agent was invoked without reading a prompt from stdin")?;
-    if prompt.is_empty() {
-        bail!("the agent was invoked with an empty prompt");
-    }
-    // The prompt travels on stdin only, where other local processes cannot
-    // read it and no argument size limit applies.
-    if let Some(leaked) = invocation.args.iter().find(|arg| arg.to_string_lossy().contains(prompt)) {
-        bail!("the prompt was also passed as an argument: {leaked:?}");
-    }
-
-    // And it ran where the product's own executions run.
-    let worktree_path = invocation.working_dir.clone();
-    let resolved_worktree = resolve(&worktree_path);
-    if !resolved_worktree.starts_with(resolve(repository.state_root())) {
-        bail!(
-            "the agent ran in {}, which is outside this run's state root {} — isolation is \
-             leaking",
-            worktree_path.display(),
-            repository.state_root().display()
-        );
-    }
-    if resolved_worktree == resolve(&repository.path_buf()) {
-        bail!("the agent ran in the repository itself instead of a task worktree");
-    }
-
-    if !agent.is_running(agent_pid) {
-        bail!(
-            "the agent process {agent_pid} was already gone before the stop was requested, so \
-             this journey would prove nothing about stopping it"
-        );
-    }
-
-    // --- The one action under test -----------------------------------------
-    //
-    // The command the frontend invokes, not the executor method behind it.
-    ui::invoke(driver, "stop_task_execution", json!({ "taskId": task_id })).await?;
-
-    // The phase the moment the stop returned, read through the product's own
-    // command. Reported rather than asserted: it is what tells a reader whether
-    // a later phase was left by the stop or written by something that ran after
-    // it, and the queue is free to have acted before this line.
-    let phase_at_stop =
-        ui::invoke(driver, "get_execution_status", json!({ "taskId": task_id })).await?;
-
-    let after = observe_after_stop(agent, agent_pid).await?;
-
-    // --- What the product now says about the task --------------------------
-    let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
-    let task = find_task(&listed, &task_id)
-        .context("the product no longer lists the task it was asked to stop")?;
-    let status = status_of(&task).unwrap_or("unreadable").to_string();
-    let phase = task
-        .get("phase")
-        .and_then(Value::as_str)
-        .unwrap_or("unreadable")
-        .to_string();
-    let progress = task.get("phase_progress").and_then(Value::as_i64);
-    let branch = task
-        .get("branch_name")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    let mut broken: Vec<String> = Vec::new();
-
-    if after.agent_alive {
-        broken.push(format!(
-            "the agent process {agent_pid} is still running {}s after the product reported the \
-             stop as done — the user was told the run was over while it carried on working in \
-             the task's worktree",
-            RESTART_WINDOW.as_secs()
-        ));
-    }
-    if after.runs > 0 {
-        broken.push(format!(
-            "{} further agent run(s) started within {}s of the stop with no user action in \
-             between, as process(es) {:?} — nothing asked for this work again",
-            after.runs,
-            RESTART_WINDOW.as_secs(),
-            after.pids
-        ));
-    }
-    if status != "backlog" {
-        broken.push(format!(
-            "the task settled at status {status:?}; a stopped task belongs in `backlog`, the \
-             one place the queue will not start it from without someone asking"
-        ));
-    }
-    if phase != "idle" {
-        broken.push(format!(
-            "the task settled at phase {phase:?}; the run it names is not happening any more"
-        ));
-    }
-    if progress != Some(0) {
-        broken.push(format!(
-            "the task reports {progress:?} phase progress for a run that was stopped"
-        ));
-    }
-
-    // Nothing may be destroyed. Stopping is not discarding, and the product has
-    // no operation that discards.
-    if !worktree_path.is_dir() {
-        broken.push(format!(
-            "the worktree {} the agent was working in no longer exists",
-            worktree_path.display()
-        ));
-    }
-    match &branch {
-        Some(name) if !repository.has_branch(name)? => broken.push(format!(
-            "the task still records branch {name} but the branch no longer exists"
-        )),
-        Some(_) => {}
-        None => broken.push(
-            "the task records no branch, so the work the stopped run had produced can no longer \
-             be found"
-                .to_string(),
-        ),
-    }
-
-    // The state the product reports has to be the state on disk, proven the
-    // same structural way every other journey proves it.
-    let executed = ExecutedTask {
-        id: task_id.clone(),
-        project_id: project_id.to_string(),
-        title: title.clone(),
-        worktree_path: worktree_path.clone(),
-    };
-    if let Err(error) = assert_persisted(root, &executed, &status) {
-        broken.push(format!(
-            "the state the product reports is not the state on disk: {error:#}"
-        ));
-    }
-
-    // And a user has to be able to see where the task ended up.
-    if let Err(error) = show_on_board(driver, &project_id, BACKLOG_COLUMN, &title).await {
-        broken.push(format!(
-            "the board does not show the stopped task: {error:#}"
-        ));
-    }
-
-    if !broken.is_empty() {
-        bail!(
-            "stopping a running task did not do what the product says it does:\n  - {}\n\nthe \
-             product reported phase {phase_at_stop} the moment the stop returned, and the agent \
-             it was asked to stop was process {agent_pid}",
-            broken.join("\n  - ")
-        );
-    }
-
-    Ok(())
 }
 
 /// Wait until exactly one agent run has started and announced its process.
@@ -737,6 +397,9 @@ async fn observe_and_stop_in_the_drawer(
     assert_not_offered(driver, DRAWER_RETRY, "Retry, for a task that never failed").await?;
 
     // --- Task A runs while task B's drawer is open ---------------------------
+    if !agent_runs(agent)?.is_empty() {
+        bail!("the agent ran before the task was started");
+    }
     ui::invoke(
         driver,
         "update_task_status",
@@ -744,6 +407,22 @@ async fn observe_and_stop_in_the_drawer(
     )
     .await?;
     let agent_pid = await_one_blocked_agent(agent).await?;
+    let runs = agent_runs(agent)?;
+    if runs.len() != 1 {
+        bail!("the stop journey started {} agent runs before Stop, expected one", runs.len());
+    }
+    let invocation = &runs[0];
+    if invocation.flag("--output-format") != Some(OsStr::new("stream-json")) {
+        bail!("the agent did not use the stream-json protocol");
+    }
+    let prompt = invocation.prompt.as_deref().context("the agent received no stdin prompt")?;
+    if prompt.is_empty() || invocation.args.iter().any(|arg| arg.to_string_lossy().contains(prompt)) {
+        bail!("the agent's prompt was empty or leaked into its arguments");
+    }
+    let worktree = resolve(&invocation.working_dir);
+    if !worktree.starts_with(resolve(repository.state_root())) || worktree == resolve(&repository.path_buf()) {
+        bail!("the agent ran outside its task worktree: {}", worktree.display());
+    }
 
     // The board received the running task's events: its card shows what the
     // agent is doing. This is what makes the next check about isolation rather
@@ -824,19 +503,46 @@ async fn observe_and_stop_in_the_drawer(
     await_drawer_status(driver, "backlog").await?;
     await_absent_from_drawer(driver, DRAWER_STOP, "Stop, once the agent is gone").await?;
     await_output_containing(driver, "Stopped").await?;
-    if settled.get("phase").and_then(Value::as_str) != Some("idle") {
-        bail!("the stopped task reports phase {:?}, expected idle", settled.get("phase"));
+    if settled.get("phase").and_then(Value::as_str) != Some("idle")
+        || settled.get("phase_progress").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("the stopped task did not reset its phase and progress: {settled}");
     }
+    if !worktree.is_dir() {
+        bail!("stopping deleted the agent's worktree at {}", worktree.display());
+    }
+    let recorded_worktree = settled.get("worktree_path").and_then(Value::as_str)
+        .map(|path| resolve(Path::new(path)));
+    if recorded_worktree.as_ref() != Some(&worktree) {
+        bail!("the stopped task records worktree {recorded_worktree:?}, but its agent ran in {}", worktree.display());
+    }
+    let branch = settled.get("branch_name").and_then(Value::as_str)
+        .context("the stopped task lost its branch name")?;
+    if !repository.has_branch(branch)? {
+        bail!("stopping deleted the task's branch {branch}");
+    }
+    let stopped = ExecutedTask {
+        id: task_id.clone(),
+        project_id: project_id.clone(),
+        title: title.clone(),
+        worktree_path: worktree,
+    };
+    assert_persisted(repository.state_root(), &stopped, "backlog")?;
 
     // Nothing starts it again on its own.
     let after = observe_after_stop(agent, agent_pid).await?;
+    if after.agent_alive {
+        bail!("the stopped agent {agent_pid} is still alive after the observation window");
+    }
     if after.runs > 0 {
         bail!("{} agent run(s) started after the stop with no user action: {:?}", after.runs, after.pids);
     }
+    assert_persisted(repository.state_root(), &stopped, "backlog")?;
     await_drawer_status(driver, "backlog").await?;
 
     close_drawer(driver).await?;
     await_listener_count(driver, 1).await.context("after closing the running task's drawer")?;
+    show_on_board(driver, &project_id, BACKLOG_COLUMN, &title).await?;
     Ok(())
 }
 
@@ -868,6 +574,9 @@ async fn drawer_retry_journey(context: &TestContext) -> Result<()> {
     let recovered = outcome?;
 
     assert_persisted(&root, &recovered, "human_review")?;
+    if agent_runs(&agent)?.len() != 2 {
+        bail!("the drawer retry did not produce exactly one failed and one successful agent run");
+    }
     Ok(())
 }
 
@@ -905,8 +614,21 @@ async fn fail_and_retry_in_the_drawer(
         .context("the failed run carried no usable --session-id")?
         .to_os_string();
     let failed_worktree = resolve(&first_run[0].working_dir);
+    if !failed_worktree.starts_with(resolve(repository.state_root())) || !failed_worktree.is_dir() {
+        bail!("the failed attempt did not preserve its worktree under the test state root: {}", failed_worktree.display());
+    }
 
     let failed = await_status(driver, &project_id, &task_id, &["error", "human_review"]).await?;
+    if status_of(&failed) != Some("error") || failed.get("phase").and_then(Value::as_str) != Some("failed") {
+        bail!("the failed agent did not leave the task in Error with a failed phase: {failed}");
+    }
+    let failed_task = ExecutedTask {
+        id: task_id.clone(),
+        project_id: project_id.clone(),
+        title: title.clone(),
+        worktree_path: failed_worktree.clone(),
+    };
+    assert_persisted(repository.state_root(), &failed_task, "error")?;
     let recorded = failed
         .get("error_message")
         .and_then(Value::as_str)
@@ -923,6 +645,13 @@ async fn fail_and_retry_in_the_drawer(
         .and_then(Value::as_str)
         .context("a task that ran should record its branch")?
         .to_string();
+    if !repository.has_branch(&failed_branch)? {
+        bail!("the failed attempt's branch {failed_branch} is gone");
+    }
+    let recorded_worktree = failed.get("worktree_path").and_then(Value::as_str).map(|path| resolve(Path::new(path)));
+    if recorded_worktree.as_ref() != Some(&failed_worktree) {
+        bail!("the failed task records worktree {recorded_worktree:?}, but its agent ran in {}", failed_worktree.display());
+    }
 
     // --- The failure, in full --------------------------------------------------
     assert_card_in_column(driver, ERROR_COLUMN, &title).await?;
@@ -973,6 +702,9 @@ async fn fail_and_retry_in_the_drawer(
 
     // The queue starts it again on its own, in the same worktree.
     let runs = await_agent_runs(agent, 2).await?;
+    if runs.len() != 2 {
+        bail!("the retry started {} agent runs, expected exactly two", runs.len());
+    }
     let second_run = retry_among(&runs, &failed_session)?;
     let retried_worktree = resolve(&second_run.working_dir);
     if retried_worktree != failed_worktree {
@@ -981,6 +713,9 @@ async fn fail_and_retry_in_the_drawer(
             retried_worktree.display(),
             failed_worktree.display()
         );
+    }
+    if !repository.has_branch(&failed_branch)? || !retried_worktree.is_dir() {
+        bail!("the retry lost its branch or worktree");
     }
 
     // --- Through to Human Review, still in the open drawer -------------------
@@ -2183,297 +1918,6 @@ async fn show_on_board(
 ) -> Result<()> {
     open_board(driver, project_id).await?;
     assert_card_in_column(driver, column, title).await
-}
-
-async fn fail_then_retry(
-    driver: &WebDriver,
-    agent: &FakeAgent,
-    repository: &GitFixture,
-) -> Result<ExecutedTask> {
-    ui::assert_frontend_is_real(driver).await?;
-
-    let Prerequisites {
-        project_id,
-        task_id,
-        title,
-    } = create_prerequisites(
-        driver,
-        repository,
-        "Retry journey",
-        "Fails once, then succeeds when the task is retried.",
-    )
-    .await?;
-
-    let already_ran = agent_runs(agent)?.len();
-    if already_ran != 0 {
-        bail!("the agent ran {already_ran} times before the task was ever started");
-    }
-
-    // --- Stage A: the first execution really fails -------------------------
-    ui::invoke(
-        driver,
-        "update_task_status",
-        json!({ "taskId": task_id, "status": "in_progress" }),
-    )
-    .await?;
-
-    let first_run = await_agent_runs(agent, 1).await?;
-    // The executor gives every execution a fresh session id, so this is what
-    // tells the two runs apart later. Records come back in start order, but
-    // identity is what the selection below relies on, not position.
-    // An empty value is as unusable here as a missing one: it identifies no
-    // execution, and taking it would make every later comparison against it
-    // meaningless while still looking like a session.
-    let failed_session = first_run[0]
-        .flag("--session-id")
-        .filter(|session| !session.is_empty())
-        .context("the failed run carried no usable --session-id to tell the retry apart from")?
-        .to_os_string();
-    let failed_worktree = resolve(&first_run[0].working_dir);
-    if !failed_worktree.starts_with(resolve(repository.state_root())) {
-        bail!(
-            "the first agent run happened in {}, which is outside this run's state root {}",
-            failed_worktree.display(),
-            repository.state_root().display()
-        );
-    }
-
-    let failed = await_status(driver, &project_id, &task_id, &["error", "human_review"]).await?;
-    if status_of(&failed) != Some("error") {
-        bail!(
-            "the agent reported a failure but the task settled at {:?} instead of error",
-            status_of(&failed)
-        );
-    }
-
-    // The failure the product recorded is the one this executable reported.
-    // Anything else would mean the task failed for a reason the journey did
-    // not arrange, and the retry below would be recovering from the wrong
-    // thing.
-    let reported = failed.get("error_message").and_then(Value::as_str);
-    let expected = fake_agent::recorded_failure();
-    if reported != Some(expected.as_str()) {
-        bail!(
-            "the task carries error message {reported:?}, but the agent's failure should be \
-             recorded as {expected:?} — the failure under test is not the one that happened"
-        );
-    }
-    let phase = failed.get("phase").and_then(Value::as_str);
-    if phase != Some("failed") {
-        bail!("a failed execution should leave the task in the failed phase, found {phase:?}");
-    }
-
-    // The failure reached the disk before anything retried it, so a user who
-    // closed the application here would find it as they left it.
-    let failure_on_disk = ExecutedTask {
-        id: task_id.clone(),
-        project_id: project_id.clone(),
-        title: title.clone(),
-        worktree_path: failed_worktree.clone(),
-    };
-    assert_persisted(repository.state_root(), &failure_on_disk, "error")?;
-
-    // And a user would see it, in the column the board keeps for failures.
-    open_board(driver, &project_id).await?;
-    assert_card_in_column(driver, ERROR_COLUMN, &title).await?;
-
-    // The work the failed attempt produced is still there, and the task still
-    // knows where it is. This is what the retry below has to continue from.
-    let failed_branch = failed
-        .get("branch_name")
-        .and_then(Value::as_str)
-        .context("a task that ran should record the branch its execution used")?
-        .to_string();
-    let recorded_after_failure = failed
-        .get("worktree_path")
-        .and_then(Value::as_str)
-        .map(|path| resolve(Path::new(path)));
-    if recorded_after_failure.as_ref() != Some(&failed_worktree) {
-        bail!(
-            "after the failure the task records worktree {recorded_after_failure:?}, but the \
-             agent ran in {}",
-            failed_worktree.display()
-        );
-    }
-    if !failed_worktree.is_dir() {
-        bail!(
-            "the failed attempt's worktree {} is gone; a failure must not discard the work",
-            failed_worktree.display()
-        );
-    }
-    if !repository.has_branch(&failed_branch)? {
-        bail!("the failed attempt's branch {failed_branch} is gone after the failure");
-    }
-
-    // --- Stage B: retry is a real product operation ------------------------
-    //
-    // The same command the board sends for any other status change, moving the
-    // card from Error back to Queue. The reset that makes a retry possible is
-    // the product's, in `classify_status_transition`: leaving Error clears the
-    // phase, the progress and the error message, and deliberately keeps the
-    // worktree and branch, so the queue's promotion finds a task ready to run
-    // again where it left off.
-    let retried = ui::invoke(
-        driver,
-        "update_task_status",
-        json!({ "taskId": task_id, "status": "queue" }),
-    )
-    .await?;
-
-    let queued_status = status_of(&retried);
-    if queued_status != Some("queue") {
-        bail!("retrying should put the task in the queue, found {queued_status:?}");
-    }
-
-    // Asserted on what the command returned rather than by polling: this reset
-    // is synchronous inside the command, so reading it back later could not
-    // tell the reset apart from the second execution having already started.
-    let cleared = retried.get("error_message").cloned();
-    if !matches!(cleared, None | Some(Value::Null)) {
-        bail!("retrying the task left the previous failure's message behind: {cleared:?}");
-    }
-    let reset_phase = retried.get("phase").and_then(Value::as_str);
-    if reset_phase != Some("idle") {
-        bail!(
-            "retrying the task should return it to the idle phase the poller looks for, found \
-             {reset_phase:?}"
-        );
-    }
-    let reset_progress = retried.get("overall_progress").and_then(Value::as_u64);
-    if reset_progress != Some(0) {
-        bail!("retrying the task should reset its progress, found {reset_progress:?}");
-    }
-
-    // Resetting execution state is not the same operation as throwing the work
-    // away. The command returns the task still pointing at the worktree and
-    // branch of the attempt that failed, because that is what the next run
-    // continues from.
-    let kept_worktree = retried
-        .get("worktree_path")
-        .and_then(Value::as_str)
-        .map(|path| resolve(Path::new(path)));
-    if kept_worktree.as_ref() != Some(&failed_worktree) {
-        bail!(
-            "retrying dropped the task's worktree: it now records {kept_worktree:?} instead of {}",
-            failed_worktree.display()
-        );
-    }
-    let kept_branch = retried.get("branch_name").and_then(Value::as_str);
-    if kept_branch != Some(failed_branch.as_str()) {
-        bail!("retrying dropped the task's branch: {kept_branch:?} instead of {failed_branch:?}");
-    }
-
-    // --- Stage C: the second attempt succeeds ------------------------------
-    //
-    // Nothing moves the task on from Queue here. The queue's own promotion
-    // does, on its next pass, which is the rest of the decided retry path.
-    let runs = await_agent_runs(agent, 2).await?;
-    if runs.len() != 2 {
-        bail!(
-            "the retry started {} agent runs, expected exactly one more",
-            runs.len() - 1
-        );
-    }
-    let second_run = retry_among(&runs, &failed_session)?;
-    if second_run.flag("--output-format") != Some(OsStr::new("stream-json")) {
-        bail!(
-            "the retried run did not use the streaming protocol the runner parses: {:?}",
-            second_run.args
-        );
-    }
-    let retried_worktree = resolve(&second_run.working_dir);
-    if !retried_worktree.starts_with(resolve(repository.state_root())) {
-        bail!(
-            "the retried agent run happened in {}, which is outside this run's state root {}",
-            retried_worktree.display(),
-            repository.state_root().display()
-        );
-    }
-    if retried_worktree == resolve(&repository.path_buf()) {
-        bail!("the retried agent ran in the repository itself instead of a task worktree");
-    }
-    // The retry continued the failed attempt's work rather than starting over
-    // somewhere else: same worktree, reattached by the executor.
-    if retried_worktree != failed_worktree {
-        bail!(
-            "the retried agent ran in {} but the failed attempt's worktree is {} — the retry did \
-             not continue the existing work",
-            retried_worktree.display(),
-            failed_worktree.display()
-        );
-    }
-
-    let settled = await_status(driver, &project_id, &task_id, &["human_review", "error"]).await?;
-    if status_of(&settled) == Some("error") {
-        bail!(
-            "the retried run failed instead of completing: {}",
-            settled
-                .get("error_message")
-                .and_then(Value::as_str)
-                .unwrap_or("no error message recorded")
-        );
-    }
-
-    // The same settled state the success journey derives, reached the second
-    // time round.
-    let configured_model = settled.get("model").and_then(Value::as_str);
-    if configured_model != Some("default") {
-        bail!(
-            "the run changed the task's configured model to {configured_model:?}; a reported \
-             model is evidence and must leave the configuration at provider default"
-        );
-    }
-    let observed_model = settled.get("last_observed_model").and_then(Value::as_str);
-    if observed_model != Some(REPORTED_MODEL) {
-        bail!(
-            "the task does not record the model the agent reported: expected {REPORTED_MODEL:?}, \
-             found {observed_model:?} — the runner did not parse the retried run's output"
-        );
-    }
-    let overall = settled.get("overall_progress").and_then(Value::as_u64);
-    if overall != Some(90) {
-        bail!("a settled task should report 90 percent overall, found {overall:?}");
-    }
-    let settled_phase = settled.get("phase").and_then(Value::as_str);
-    if settled_phase != Some("complete") {
-        bail!("a settled task should be in the complete phase, found {settled_phase:?}");
-    }
-    let cleared = settled.get("error_message").cloned();
-    if !matches!(cleared, None | Some(Value::Null)) {
-        bail!("a task that recovered still reports the failure it recovered from: {cleared:?}");
-    }
-
-    // The product records the worktree the retried agent actually ran in.
-    let recorded_worktree = settled.get("worktree_path").and_then(Value::as_str);
-    if recorded_worktree.map(|path| resolve(Path::new(path))) != Some(retried_worktree.clone()) {
-        bail!(
-            "the task records worktree {recorded_worktree:?} but the retried agent ran in {} — \
-             the execution the journey observed is not the one the task remembers",
-            retried_worktree.display()
-        );
-    }
-
-    let settled_branch = settled.get("branch_name").and_then(Value::as_str);
-    if settled_branch != Some(failed_branch.as_str()) {
-        bail!("the recovered task records branch {settled_branch:?}, expected {failed_branch:?}");
-    }
-    if !repository.has_branch(&failed_branch)? {
-        bail!(
-            "the task still records branch {failed_branch} but the branch no longer exists — the \
-             retry destroyed the work it produced"
-        );
-    }
-
-    // And the board moved it out of Error into the reviewable column.
-    open_board(driver, &project_id).await?;
-    assert_card_in_column(driver, HUMAN_REVIEW_COLUMN, &title).await?;
-
-    Ok(ExecutedTask {
-        id: task_id,
-        project_id,
-        title,
-        worktree_path: retried_worktree,
-    })
 }
 
 /// What the journey learned about the task it drove.
