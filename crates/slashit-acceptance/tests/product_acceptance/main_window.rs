@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The main window stays on the application's own origin.
 //!
 //! A page in the main window must not be able to take the window somewhere

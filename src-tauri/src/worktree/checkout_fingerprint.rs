@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Content-aware fingerprint of a Task Checkout's uncommitted work.
 //!
 //! A human-authorized new attempt builds on the work already in the checkout,

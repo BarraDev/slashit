@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What happens to a terminal's shell when the window is hidden, when the
 //! terminal is closed, and when the application quits. Each terminal's shell
 //! ignores SIGHUP and starts a background job, so only a process-group end

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::domain::{AgentExecution, AgentStatus, AgentLogEntry};
 use uuid::Uuid;
 use std::collections::HashMap;

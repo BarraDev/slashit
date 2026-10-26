@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use slashit_ipc::{
     AppStatus, FeatureFlagInfo, InstanceInfo, ProjectSummary, QueueStatusInfo, TaskSummary,
     TerminalSummary,

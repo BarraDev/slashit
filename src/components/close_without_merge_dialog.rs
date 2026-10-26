@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The confirmation every ordinary move from Human Review to Done goes
 //! through: a drop on the Done column and the card menu's Move to, Done.
 //!

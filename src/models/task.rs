@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use serde::{Deserialize, Serialize};
 pub use slashit_attention::AttentionReason;
 use uuid::Uuid;

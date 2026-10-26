@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Rust-only acceptance support checks. These need neither a TestContext nor
 //! a running Tauri application, so `cargo test -p slashit-acceptance` runs
 //! them with the ordinary harness tests.

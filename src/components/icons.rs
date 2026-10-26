@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use leptos::prelude::*;
 
 // Icon components below use #[prop(into)] class which Leptos macros consume in view!{}.

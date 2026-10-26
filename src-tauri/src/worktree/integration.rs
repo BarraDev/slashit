@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The Git side of integrating a Task's approved commit into a local branch.
 //!
 //! Everything here is Git plumbing that never touches a working tree, an

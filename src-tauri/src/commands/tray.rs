@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 #[tauri::command]
 pub async fn force_quit(app: tauri::AppHandle) {
     app.exit(0);

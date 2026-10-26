@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use super::checked_task_branch;
 use super::default_base::{resolve_default_base, ResolvedBase};
 use crate::config::paths::{AppPaths, ProjectKey};

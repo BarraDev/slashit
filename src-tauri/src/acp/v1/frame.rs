@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! JSON-RPC 2.0 framing for ACP over stdio.
 //!
 //! The ACP transport page (verified 2026-10-21, https://agentclientprotocol.com/protocol/transports)

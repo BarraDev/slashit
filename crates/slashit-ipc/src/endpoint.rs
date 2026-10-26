@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Where the control channel lives, per platform.
 //!
 //! This module is the single source of truth for the runtime directory and

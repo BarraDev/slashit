@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Mirrors of the backend's repository readiness types
 //! (`worktree::readiness`, `worktree::vcs_init`).
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Turning this program's global flags into connection options.
 //!
 //! The connection itself — every transport, the retry policy, and the "SlashIt

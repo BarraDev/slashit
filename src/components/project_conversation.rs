@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::components::attention::AttentionChip;
 use crate::components::task_activity::{compact_time, local_offset_at, OffsetAt};
 use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationExecution, ConversationExecutionResult, ConversationExecutionState, ConversationFieldChange, ConversationHumanAction, ConversationProjectAction, ConversationProjectActionOutcome, ConversationProjectActionStatus, ConversationRole, ConversationSnapshot, ConversationTaskMutation};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Whether a task branch can be given to a task at all, when another task
 //! could claim the same name.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use serde::{Deserialize, Serialize};
 
 /// Bounds for [`QueueConfig::parallel_task_limit`]. The settings form enforces

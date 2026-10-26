@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! "Needs you": which tasks cannot make progress without the user.
 //!
 //! Whether a task needs the user is `Task::needs_you`, which is the shared

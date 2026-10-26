@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Building the application state, once, for whichever front end wants it.
 //!
 //! This used to live inline in `lib.rs::run()`, interleaved with

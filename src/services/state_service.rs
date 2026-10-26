@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Frontend access to the state-location commands.
 //!
 //! Uses the fallible `raw_invoke` binding rather than the `-> JsValue` one most

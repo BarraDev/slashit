@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Proof that no coding provider from an earlier run is still working in a
 //! Task Checkout.
 //!

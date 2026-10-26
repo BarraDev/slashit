@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Per-task lifecycle authority and the one operation that terminalizes a task.
 //!
 //! A task owns at most one worktree and at most one agent execution. Every

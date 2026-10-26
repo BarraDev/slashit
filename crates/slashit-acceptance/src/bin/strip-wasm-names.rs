@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Strip the `name` section from the frontend module in a Trunk output
 //! directory, in place, and prove nothing else changed.
 //!

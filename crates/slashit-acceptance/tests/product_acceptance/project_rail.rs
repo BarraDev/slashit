@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The Project Rail after a selection. The rail expands while the pointer is
 //! over it and collapses once the pointer leaves, including after a switch
 //! from one selected Project to another.

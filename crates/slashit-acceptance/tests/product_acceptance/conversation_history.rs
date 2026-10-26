@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Desktop journeys for a Project Conversation with a long saved history: how it
 //! renders, when entries were saved, whether it follows the newest entry, what a
 //! Project switch shows, which reads write, and which keyboard shortcuts the

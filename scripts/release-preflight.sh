@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Checks a release tag before the release workflow builds anything, and decides
 # the release channel. Runs in the workflow's preflight job and locally.
 #

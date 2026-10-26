@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::domain::Task;
 
 /// The lines that open and close each piece of Human Review feedback in a

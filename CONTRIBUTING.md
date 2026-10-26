@@ -94,6 +94,21 @@ toolchain, described in [docs/development-workflow.md](docs/development-workflow
 That workflow is not required for outside contributions: the fork-and-branch
 Git process above is all you need.
 
-## License
+## License and contributions
 
-By contributing, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE), the same license as the project.
+SlashIt is licensed under the [Mozilla Public License 2.0](LICENSE). The
+history of the change from Apache-2.0 is in [LICENSE-HISTORY.md](LICENSE-HISTORY.md).
+
+### Contribution policy
+
+Until the SlashIt contributor license agreement (CLA) process is published,
+effective and operational, external human contributions are not merged. You
+may open a pull request at any time and it may be reviewed, but it will not
+be merged until the CLA process is active and the required agreements are in
+effect.
+
+Issues, discussions and ordinary comments are not contributions and do not
+require a CLA.
+
+This is a temporary measure. The CLA process will be announced when it is
+ready.

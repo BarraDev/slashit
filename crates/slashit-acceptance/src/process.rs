@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Process ownership: everything the harness starts must die with it.
 //!
 //! `tauri-driver` spawns `WebKitWebDriver`, which in turn spawns the

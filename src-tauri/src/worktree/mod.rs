@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 mod branch;
 pub mod checkout_fingerprint;
 mod commit;

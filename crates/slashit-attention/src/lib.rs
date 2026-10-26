@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Which tasks cannot make progress without the user right now.
 //!
 //! Attention is derived, never stored: it follows from a task's status, its

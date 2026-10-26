@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What starting the application again does to the Task Checkouts of tasks
 //! that were already running, when the checkouts met three different fates
 //! while it was stopped.

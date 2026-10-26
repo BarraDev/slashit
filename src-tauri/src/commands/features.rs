@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Commands for reading and toggling runtime feature flags.
 
 use crate::commands::gui_admission::GuiMutation;

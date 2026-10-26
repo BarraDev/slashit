@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 pub mod roadmap_board;
 pub mod feature_card;
 pub mod audience_badge;

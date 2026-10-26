@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Terminal component tests
 //!
 //! Tests for the terminal component including:

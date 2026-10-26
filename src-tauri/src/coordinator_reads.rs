@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Read-only capabilities the Project Coordinator can invoke by name.
 //!
 //! The Coordinator never receives the whole Project. It asks for one Task

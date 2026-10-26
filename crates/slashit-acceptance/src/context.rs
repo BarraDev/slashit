@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What one acceptance test owns: where the application is, which private
 //! state root it runs against, and where its evidence goes.
 //!

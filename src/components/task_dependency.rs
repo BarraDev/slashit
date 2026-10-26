@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The "Depends on" choice in the Create and Edit forms, and the dependency list
 //! in the task drawer.
 //!

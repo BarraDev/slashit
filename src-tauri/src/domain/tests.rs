@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Domain model tests
 //! Run with: cargo test -p slashit-ui
 

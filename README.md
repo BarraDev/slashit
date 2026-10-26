@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/BarraDev/slashit/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/BarraDev/slashit/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="LICENSE"><img alt="License: MPL-2.0" src="https://img.shields.io/badge/license-MPL--2.0-blue.svg"></a>
   <a href="https://github.com/BarraDev/slashit/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/BarraDev/slashit?include_prereleases"></a>
   <a href="https://github.com/BarraDev/slashit/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/BarraDev/slashit"></a>
 </p>
@@ -220,6 +220,4 @@ Security vulnerabilities should be reported privately; see [SECURITY.md](SECURIT
 
 ## License
 
-Copyright 2025 Barradev Digital Services
-
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+SlashIt is licensed under the [Mozilla Public License 2.0](LICENSE). The history of the change from Apache-2.0 is in [LICENSE-HISTORY.md](LICENSE-HISTORY.md).

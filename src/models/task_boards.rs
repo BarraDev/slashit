@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Mirror of the backend's unreadable Task board report
 //! (`commands::task_boards`). The rules that decide where a report is shown
 //! live here, so a Project board and the application-level notice cannot both

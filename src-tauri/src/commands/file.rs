@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::domain::file::FileItem;
 use std::fs;
 use std::path::{Path, PathBuf};

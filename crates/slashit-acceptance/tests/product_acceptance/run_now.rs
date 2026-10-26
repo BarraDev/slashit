@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Run now is operated from the card's menu, with the keyboard and with a
 //! double click.
 //!

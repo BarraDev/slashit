@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Prove crates/slashit-acceptance/shard-manifest.txt exactly covers the
 # product acceptance journeys: every test in exactly one shard, no stale
 # entries. Needs only a compile of the test binary -- no display, no built

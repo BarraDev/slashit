@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Tasks need a safe, explicit version-control base; a remote is optional.
 //!
 //! Each test here builds a real repository (Git, colocated Jujutsu, or

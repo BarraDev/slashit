@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Needs you: which tasks cannot make progress without the user.
 //!
 //! Nothing about attention is stored, so every journey reads it where a

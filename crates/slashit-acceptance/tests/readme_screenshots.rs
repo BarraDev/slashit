@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Regenerates the README's screenshots from synthetic data.
 //!
 //! This is documentation tooling, not a product journey. It lives in its own

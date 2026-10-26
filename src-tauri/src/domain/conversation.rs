@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Durable, Project-owned conversation state. Provider processes and their
 //! output streams are deliberately not part of this model.
 

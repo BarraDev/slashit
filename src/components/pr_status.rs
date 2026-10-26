@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A pull request's status on the board: the one signal its card shows, and
 //! the section the task drawer shows.
 //!

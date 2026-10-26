@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Tests scripts/release-preflight.sh against the repository as it is and against
 # small fixture trees. Each case names what it proves, and a failure prints the
 # script's own message.

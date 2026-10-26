@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Port allocation, and the preflight that makes a stale provider loud.
 //!
 //! Fixed ports are the reason a leftover WebDriver can silently hijack a run:

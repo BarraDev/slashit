@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Measure how much disk a directory tree occupies, without following
 //! anything out of it.
 //!

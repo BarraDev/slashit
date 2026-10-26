@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The SlashIt control channel, shared by the desktop app, the daemon and the
 //! CLI.
 //!

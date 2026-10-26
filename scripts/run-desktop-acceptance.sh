@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Run the desktop acceptance journeys against the application built by
 # scripts/build-acceptance-app.sh.
 #

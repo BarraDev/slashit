@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! TCP transport. Off by default, loopback only, always authenticated.
 //!
 //! TCP exists because a containerised or remote daemon will eventually need

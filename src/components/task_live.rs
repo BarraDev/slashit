@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The decisions behind the task drawer and the card activity line, kept free
 //! of the DOM so they can be tested natively.
 

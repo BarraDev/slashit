@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Recording the edits in a Task Checkout as a Git commit on its task branch.
 //!
 //! A Task Checkout is always a Git worktree, so Git alone decides whether

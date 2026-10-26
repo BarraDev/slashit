@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::models::github::PullRequest;
 use crate::services::github_service;
 use super::github_issues::format_relative_time;

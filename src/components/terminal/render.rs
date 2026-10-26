@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use super::state::{CellAttributes, Color};
 
 /// Convert a Color to a CSS color string

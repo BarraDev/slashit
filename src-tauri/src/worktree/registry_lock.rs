@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! One `git` at a time on a repository's worktree registrations.
 //!
 //! `git worktree add` registers a checkout by making

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Verify that a branch on GitHub publishes the commit you meant to publish,
 # and that this commit really changes files.
 #

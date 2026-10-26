@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use wasm_bindgen::prelude::*;
 use serde::{Deserialize, Serialize};
 use leptos::web_sys;

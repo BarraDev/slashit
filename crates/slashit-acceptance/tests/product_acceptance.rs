@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The first journey that tests SlashIt itself rather than the harness.
 //!
 //! One task goes all the way through the real machinery: the real window, the

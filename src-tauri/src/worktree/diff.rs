@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! One canonical task diff.
 //!
 //! A task needs exactly one answer to "what changed in this task", used by

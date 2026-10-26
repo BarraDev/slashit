@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A stand-in for the `gh` executable, so a journey can open a pull request
 //! without GitHub, a network or a credential.
 //!

@@ -3,8 +3,7 @@ name = "slashit-acceptance"
 version = "0.0.1"
 edition = "2021"
 description = "Rust-only desktop acceptance harness driving the real SlashIt application"
-authors = ["Barradev Digital Services <admin@barradev.com>"]
-license = "Apache-2.0"
+license = "MPL-2.0"
 repository = "https://github.com/BarraDev/slashit"
 publish = false
 

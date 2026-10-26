@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::components::toast;
 use crate::components::workspace_panel::WorkspacePanel;
 use crate::models::{project::Project, workspace::Workspace};

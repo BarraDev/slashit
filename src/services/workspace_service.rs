@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 use crate::models::workspace::Workspace;
 use serde::Serialize;
 use wasm_bindgen::JsValue;

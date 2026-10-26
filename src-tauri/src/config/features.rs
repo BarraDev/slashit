@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Runtime feature flags.
 //!
 //! Flags exist so work that is not finished can ship dark rather than sitting

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Commands for inspecting and changing where a project's state is stored.
 //!
 //! The user-facing contract is narrow on purpose: a project's *shareable*

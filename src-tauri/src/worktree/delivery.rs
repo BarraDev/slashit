@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What a Task Checkout can prove about its work reaching the remote.
 //!
 //! Two questions, both answered from Git alone:

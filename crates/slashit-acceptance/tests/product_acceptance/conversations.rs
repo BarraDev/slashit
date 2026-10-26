@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Desktop journeys for Project-owned conversation, including the zero-Task
 //! path, the refusal of retired direct delegation, and approved Task execution.
 

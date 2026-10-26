@@ -2,8 +2,7 @@
 name = "slashit-durable-fs"
 version = "0.0.1"
 edition = "2021"
-authors = ["Barradev Digital Services <admin@barradev.com>"]
-license = "Apache-2.0"
+license = "MPL-2.0"
 description = "Per-file durable atomic replacement shared by SlashIt's Task, configuration and Conversation storage"
 repository = "https://github.com/BarraDev/slashit"
 

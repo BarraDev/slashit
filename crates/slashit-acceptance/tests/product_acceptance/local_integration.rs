@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Integrating locally completed work into a local branch, from the drawer.
 //!
 //! Every action is a click on the drawer or on Settings > Repository, the way

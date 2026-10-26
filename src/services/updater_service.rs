@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Frontend IPC for the Tauri auto-updater commands.
 //!
 //! Uses the fallible `raw_invoke` binding rather than the `-> JsValue` one that
