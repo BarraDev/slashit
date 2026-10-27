@@ -874,6 +874,7 @@ mod tests {
     /// either build, the same as the listing client.
     #[tokio::test]
     async fn the_plugin_client_refuses_plain_http_before_connecting() {
+        install_tls_provider();
         let (plain, _server) = serve(vec![response("200 OK", "", "")]);
         let client = plugin_client_policy(&Endpoints::published())(
             reqwest::Client::builder().timeout(Duration::from_secs(5)),
@@ -1082,6 +1083,7 @@ mod tests {
     #[cfg(feature = "updater-test-endpoints")]
     #[tokio::test]
     async fn the_plugin_client_refuses_a_redirect_to_a_public_host() {
+        install_tls_provider();
         let (first, first_server) = serve(vec![response(
             "302 Found",
             "Location: https://example.com/BarraDev/slashit/releases/download/v0.0.2/latest.json\r\n",

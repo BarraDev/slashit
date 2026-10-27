@@ -399,8 +399,8 @@ jobs:
   # connecting, an HTTPS redirect to plain HTTP is refused, and an HTTPS redirect
   # to another host is followed. The TLS tests trust a certificate generated per
   # run, so the platform's certificate verifier is not consulted. Only the
-  # `update_feed` tests run here, not the whole library, on the two platforms the
-  # release builds on. The Linux test job runs the rest of the backend.
+  # `update_feed` tests run here, not the whole library, on the two non-Linux
+  # release platforms. The Linux test job runs the rest of the backend.
   updater-transport:
     name: Updater transport tests (${{ matrix.platform }})
     runs-on: ${{ matrix.platform }}
