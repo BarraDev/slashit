@@ -267,11 +267,23 @@ pub fn client(endpoints: &Endpoints) -> Result<reqwest::Client, FeedError> {
         .map_err(|error| FeedError::Unreachable(error.to_string()))
 }
 
-#[cfg(not(feature = "updater-test-endpoints"))]
-fn transport(builder: reqwest::ClientBuilder, _endpoints: &Endpoints) -> reqwest::ClientBuilder {
+/// The redirect limit for every client this module configures. reqwest enforces
+/// `limited(n)` as `previous.len() > n`.
+const MAX_REDIRECTS: usize = 5;
+
+/// The production transport: HTTPS only, at most [`MAX_REDIRECTS`] redirects.
+/// `https_only` also refuses a redirect whose target is plain HTTP. It limits
+/// the scheme and not the host, so a redirect to another HTTPS host, such as
+/// GitHub's release-asset CDN, is still followed.
+fn https_only_transport(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     builder
         .https_only(true)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+}
+
+#[cfg(not(feature = "updater-test-endpoints"))]
+fn transport(builder: reqwest::ClientBuilder, _endpoints: &Endpoints) -> reqwest::ClientBuilder {
+    https_only_transport(builder)
 }
 
 /// A build with the test seam uses the production transport unless both test
@@ -282,9 +294,7 @@ fn transport(builder: reqwest::ClientBuilder, _endpoints: &Endpoints) -> reqwest
 #[cfg(feature = "updater-test-endpoints")]
 fn transport(builder: reqwest::ClientBuilder, endpoints: &Endpoints) -> reqwest::ClientBuilder {
     if *endpoints == Endpoints::published() {
-        return builder
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::limited(5));
+        return https_only_transport(builder);
     }
     builder.no_proxy().redirect(reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() > MAX_REDIRECTS {
@@ -297,15 +307,9 @@ fn transport(builder: reqwest::ClientBuilder, endpoints: &Endpoints) -> reqwest:
     }))
 }
 
-/// The redirect limit, equal to the production client's `limited(5)`. reqwest
-/// enforces it as `previous.len() > max`. Production keeps its own literal.
-#[cfg(feature = "updater-test-endpoints")]
-const MAX_REDIRECTS: usize = 5;
-
-/// The client policy for the updater plugin's own requests (the manifest and
-/// the payload). It is installed only in a test build, and with no override
-/// configured it selects the same HTTPS-only transport as the listing client.
-#[cfg(feature = "updater-test-endpoints")]
+/// The client policy for the updater plugin's own requests: the manifest, and
+/// the payload download, which the plugin makes with the same client. With no
+/// test override it is the production transport, the same as the listing client.
 pub fn plugin_client_policy(
     endpoints: &Endpoints,
 ) -> impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync + 'static {
@@ -313,26 +317,35 @@ pub fn plugin_client_policy(
     move |builder| transport(builder, &endpoints)
 }
 
-/// With a configured override, the payload the manifest names must come from
-/// the configured download server: the same scheme, host and port as
-/// `download_base`, which is loopback. The plugin takes that URL from the
-/// manifest and requests it with its own client, and the redirect policy does
-/// not check the initial request. A build with no override keeps the published
-/// location.
-#[cfg(feature = "updater-test-endpoints")]
+/// The plugin takes the payload URL from the manifest and requests it without
+/// checking its location, and the redirect policy does not see the first
+/// request. So the location is checked here, before any download. Production
+/// payloads must be HTTPS, on any host: real manifests name GitHub's API asset
+/// URLs, which redirect to a CDN host.
 pub fn check_payload_location(endpoints: &Endpoints, payload: &str) -> Result<(), String> {
-    if *endpoints == Endpoints::published() {
-        return Ok(());
-    }
-    let refused = || format!("the test build refuses a payload at {payload}, which is not on the configured test server");
-    let (Ok(url), Ok(base)) = (reqwest::Url::parse(payload), reqwest::Url::parse(&endpoints.download_base)) else {
-        return Err(refused());
-    };
-    if url.origin() == base.origin() && test_endpoints::is_loopback(&url) {
+    let allowed = reqwest::Url::parse(payload).is_ok_and(|url| payload_allowed(endpoints, &url));
+    if allowed {
         Ok(())
     } else {
-        Err(refused())
+        Err(format!("the update refuses a payload at {payload}, which is not an allowed download location"))
     }
+}
+
+#[cfg(not(feature = "updater-test-endpoints"))]
+fn payload_allowed(_endpoints: &Endpoints, url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+}
+
+/// With a configured override, the payload must come from the configured
+/// download server: the same scheme, host and port as `download_base`, which is
+/// loopback. A build with no override keeps the production rule.
+#[cfg(feature = "updater-test-endpoints")]
+fn payload_allowed(endpoints: &Endpoints, url: &reqwest::Url) -> bool {
+    if *endpoints == Endpoints::published() {
+        return url.scheme() == "https";
+    }
+    reqwest::Url::parse(&endpoints.download_base)
+        .is_ok_and(|base| url.origin() == base.origin() && test_endpoints::is_loopback(url))
 }
 
 /// Test-only endpoint overrides. Compiled only with `updater-test-endpoints`.
@@ -854,6 +867,156 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, FeedError::Unreachable(_)), "{error:?}");
+    }
+
+    /// The plugin's client makes the manifest request and the payload download.
+    /// With no override it refuses a plain HTTP request before connecting, in
+    /// either build, the same as the listing client.
+    #[tokio::test]
+    async fn the_plugin_client_refuses_plain_http_before_connecting() {
+        let (plain, _server) = serve(vec![response("200 OK", "", "")]);
+        let client = plugin_client_policy(&Endpoints::published())(
+            reqwest::Client::builder().timeout(Duration::from_secs(5)),
+        )
+        .build()
+        .unwrap();
+        assert!(client.get(plain.as_str()).send().await.is_err(), "a plain HTTP request must not be sent");
+    }
+
+    // --- Against a local TLS server ---------------------------------------
+    //
+    // A redirect from HTTPS to HTTP is refused only when the origin is HTTPS,
+    // so these tests need a TLS origin. Its certificate is generated per run and
+    // trusted through the client builder. No key is committed.
+
+    /// A TLS server configuration for `localhost` and `127.0.0.1`, and the
+    /// certificate a client must trust to reach it.
+    fn tls_identity() -> (std::sync::Arc<rustls::ServerConfig>, reqwest::Certificate) {
+        install_tls_provider();
+        let generated = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .unwrap();
+        let certificate = generated.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key.into())
+            .unwrap();
+        let trusted = reqwest::Certificate::from_der(certificate.as_ref()).unwrap();
+        (std::sync::Arc::new(config), trusted)
+    }
+
+    /// A TLS server that answers one connection per response, in order. It
+    /// returns the port it listens on.
+    fn serve_tls(
+        config: std::sync::Arc<rustls::ServerConfig>,
+        responses: Vec<String>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for reply in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let connection = rustls::ServerConnection::new(config.clone()).unwrap();
+                let mut tls = rustls::StreamOwned::new(connection, stream);
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    match tls.read(&mut byte) {
+                        Ok(1) => request.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let _ = tls.write_all(reply.as_bytes());
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+        });
+        (port, handle)
+    }
+
+    /// A client that trusts only the test certificate, on every OS. A timeout
+    /// turns a regression that lets a request hang into a failure.
+    fn tls_plugin_client(trusted: reqwest::Certificate) -> reqwest::Client {
+        plugin_client_policy(&Endpoints::published())(
+            reqwest::Client::builder()
+                .tls_certs_only([trusted])
+                .timeout(Duration::from_secs(5)),
+        )
+        .build()
+        .unwrap()
+    }
+
+    /// An HTTPS origin that redirects to plain HTTP is refused, and the plain
+    /// HTTP server receives no connection.
+    #[tokio::test]
+    async fn the_plugin_client_refuses_an_https_redirect_to_plain_http() {
+        let (config, trusted) = tls_identity();
+        let plain = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        plain.set_nonblocking(true).unwrap();
+        let plain_url = format!("http://{}/payload", plain.local_addr().unwrap());
+        let (port, origin) = serve_tls(
+            config,
+            vec![response("302 Found", &format!("Location: {plain_url}\r\n"), "")],
+        );
+        let error = tls_plugin_client(trusted)
+            .get(format!("https://127.0.0.1:{port}/manifest"))
+            .send()
+            .await
+            .unwrap_err();
+        origin.join().unwrap();
+        assert!(error.is_redirect(), "{error:?}");
+        assert!(plain.accept().is_err(), "the plain HTTP server must receive no connection");
+    }
+
+    /// A redirect from HTTPS to another HTTPS host is followed. A manifest's
+    /// asset URL reaches GitHub's CDN this way.
+    #[tokio::test]
+    async fn the_plugin_client_follows_an_https_redirect_to_another_https_host() {
+        let (config, trusted) = tls_identity();
+        let (target, target_server) =
+            serve_tls(config.clone(), vec![response("200 OK", "", "payload")]);
+        let (origin, origin_server) = serve_tls(
+            config,
+            vec![response("302 Found", &format!("Location: https://localhost:{target}/payload\r\n"), "")],
+        );
+        let body = tls_plugin_client(trusted)
+            .get(format!("https://127.0.0.1:{origin}/manifest"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        origin_server.join().unwrap();
+        target_server.join().unwrap();
+        assert_eq!(body, "payload");
+    }
+
+    /// In production a payload must be HTTPS, on any host. Other schemes and a
+    /// value that is not a URL are refused before any download.
+    #[test]
+    fn a_production_payload_must_be_https() {
+        let published = Endpoints::published();
+        for payload in [
+            "https://api.github.com/repos/BarraDev/slashit/releases/assets/1",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1",
+        ] {
+            assert!(check_payload_location(&published, payload).is_ok(), "{payload} must be accepted");
+        }
+        for payload in [
+            "http://api.github.com/repos/BarraDev/slashit/releases/assets/1",
+            "http://127.0.0.1:8080/payload",
+            "ftp://example.com/payload",
+            "file:///tmp/payload",
+            "not a url",
+            "",
+        ] {
+            assert!(check_payload_location(&published, payload).is_err(), "{payload} must be refused");
+        }
     }
 
     /// The endpoints of a test build whose listing is `listing`. The download

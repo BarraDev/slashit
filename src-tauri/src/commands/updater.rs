@@ -789,10 +789,9 @@ async fn find_update(
         .endpoints(vec![endpoint])
         .map_err(|e| from_plugin(&e))?
         .timeout(MANIFEST_TIMEOUT);
-    // A test build applies its redirect rule to the plugin's client, and it
-    // checks the payload location the manifest names, which the plugin does not
-    // check itself.
-    #[cfg(feature = "updater-test-endpoints")]
+    // The plugin's client makes the manifest request and the payload download.
+    // It is HTTPS only, with a bounded redirect chain, so an HTTP redirect is
+    // refused on both. The plugin applies no transport policy of its own.
     let updater = updater.configure_client(update_feed::plugin_client_policy(&endpoints));
     let updater = updater.build().map_err(|e| from_plugin(&e))?;
     let update = match updater.check().await.map_err(|e| from_plugin(&e))? {
@@ -810,7 +809,8 @@ async fn find_update(
             ))
         }
     };
-    #[cfg(feature = "updater-test-endpoints")]
+    // The plugin does not check the payload location the manifest names. This
+    // runs before any download, so a refused location is never requested.
     update_feed::check_payload_location(&endpoints, update.download_url.as_str())
         .map_err(|detail| err(UpdaterErrorKind::Metadata, &detail))?;
     update_feed::check_manifest_version(&chosen, &update.version)
