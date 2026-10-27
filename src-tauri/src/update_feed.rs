@@ -60,7 +60,25 @@ pub struct Feed {
 pub struct Chosen {
     pub tag: String,
     pub version: PlainVersion,
-    pub manifest_url: String,
+}
+
+/// Where this build reads releases and manifests from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoints {
+    /// The releases listing, with no query string.
+    pub listing: String,
+    /// The directory that holds each release's assets: `{download_base}/{tag}/latest.json`.
+    pub download_base: String,
+}
+
+impl Endpoints {
+    /// GitHub: the only endpoints a production build uses.
+    pub fn published() -> Self {
+        Self {
+            listing: RELEASES_API.to_string(),
+            download_base: format!("https://github.com/{REPOSITORY}/releases/download"),
+        }
+    }
 }
 
 /// The outcome of selection: at most one release to offer, plus anything the
@@ -81,9 +99,24 @@ pub enum FeedError {
     Malformed(String),
 }
 
-/// The updater manifest for a release tag, at the URL the release publishes.
-pub fn manifest_url(tag: &str) -> String {
-    format!("https://github.com/{REPOSITORY}/releases/download/{tag}/{MANIFEST_ASSET}")
+/// The updater manifest for a release tag under `download_base`, which is
+/// [`Endpoints::download_base`].
+pub fn manifest_url(download_base: &str, tag: &str) -> String {
+    format!("{download_base}/{tag}/{MANIFEST_ASSET}")
+}
+
+/// The endpoints this build reads. A production build always returns
+/// [`Endpoints::published`]. A build with `updater-test-endpoints` takes its two
+/// locations from the environment, and only loopback addresses are accepted.
+pub fn endpoints() -> Result<Endpoints, String> {
+    #[cfg(feature = "updater-test-endpoints")]
+    {
+        test_endpoints::from_environment()
+    }
+    #[cfg(not(feature = "updater-test-endpoints"))]
+    {
+        Ok(Endpoints::published())
+    }
 }
 
 /// The tag every release must carry: `v` followed by its plain version.
@@ -148,7 +181,6 @@ pub fn select(feed: &Feed, channel: ReleaseChannel, current: PlainVersion) -> Se
         chosen: best.map(|(version, candidate)| Chosen {
             tag: candidate.tag.clone(),
             version,
-            manifest_url: manifest_url(&candidate.tag),
         }),
         notices,
     }
@@ -222,18 +254,251 @@ fn install_tls_provider() {
     });
 }
 
-/// An HTTP client for the releases API: HTTPS only, bounded time, no
-/// credentials, and a user agent that names the version asking.
-pub fn client() -> Result<reqwest::Client, FeedError> {
+/// An HTTP client for the releases listing `endpoints` names: bounded time, no
+/// credentials, and a user agent that names the version asking. It is HTTPS
+/// only, except in a test build with a configured loopback override.
+pub fn client(endpoints: &Endpoints) -> Result<reqwest::Client, FeedError> {
     install_tls_provider();
-    reqwest::Client::builder()
-        .https_only(true)
+    transport(reqwest::Client::builder(), endpoints)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(5))
         .user_agent(format!("slashit-updater/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| FeedError::Unreachable(error.to_string()))
+}
+
+#[cfg(not(feature = "updater-test-endpoints"))]
+fn transport(builder: reqwest::ClientBuilder, _endpoints: &Endpoints) -> reqwest::ClientBuilder {
+    builder
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(5))
+}
+
+/// A build with the test seam uses the production transport unless both test
+/// locations are configured. With an override, the listing client may reach a
+/// loopback address over plain HTTP, bypasses system proxies, and follows only
+/// redirects that stay on loopback (see [`check_payload_location`] for the
+/// payload).
+#[cfg(feature = "updater-test-endpoints")]
+fn transport(builder: reqwest::ClientBuilder, endpoints: &Endpoints) -> reqwest::ClientBuilder {
+    if *endpoints == Endpoints::published() {
+        return builder
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::limited(5));
+    }
+    builder.no_proxy().redirect(reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if test_endpoints::redirect_allowed(attempt.previous(), attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("the test build refuses a redirect it was not configured to follow")
+        }
+    }))
+}
+
+/// The redirect limit, equal to the production client's `limited(5)`. reqwest
+/// enforces it as `previous.len() > max`. Production keeps its own literal.
+#[cfg(feature = "updater-test-endpoints")]
+const MAX_REDIRECTS: usize = 5;
+
+/// The client policy for the updater plugin's own requests (the manifest and
+/// the payload). It is installed only in a test build, and with no override
+/// configured it selects the same HTTPS-only transport as the listing client.
+#[cfg(feature = "updater-test-endpoints")]
+pub fn plugin_client_policy(
+    endpoints: &Endpoints,
+) -> impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync + 'static {
+    let endpoints = endpoints.clone();
+    move |builder| transport(builder, &endpoints)
+}
+
+/// With a configured override, the payload the manifest names must come from
+/// the configured download server: the same scheme, host and port as
+/// `download_base`, which is loopback. The plugin takes that URL from the
+/// manifest and requests it with its own client, and the redirect policy does
+/// not check the initial request. A build with no override keeps the published
+/// location.
+#[cfg(feature = "updater-test-endpoints")]
+pub fn check_payload_location(endpoints: &Endpoints, payload: &str) -> Result<(), String> {
+    if *endpoints == Endpoints::published() {
+        return Ok(());
+    }
+    let refused = || format!("the test build refuses a payload at {payload}, which is not on the configured test server");
+    let (Ok(url), Ok(base)) = (reqwest::Url::parse(payload), reqwest::Url::parse(&endpoints.download_base)) else {
+        return Err(refused());
+    };
+    if url.origin() == base.origin() && test_endpoints::is_loopback(&url) {
+        Ok(())
+    } else {
+        Err(refused())
+    }
+}
+
+/// Test-only endpoint overrides. Compiled only with `updater-test-endpoints`.
+#[cfg(feature = "updater-test-endpoints")]
+mod test_endpoints {
+    use super::Endpoints;
+    use std::net::IpAddr;
+
+    /// The releases listing, for example `http://127.0.0.1:8080/repos/x/y/releases`.
+    pub const LISTING_VAR: &str = "SLASHIT_UPDATER_TEST_RELEASES_API";
+    /// The directory of release downloads, for example `http://127.0.0.1:8080/download`.
+    pub const DOWNLOAD_VAR: &str = "SLASHIT_UPDATER_TEST_DOWNLOAD_BASE";
+
+    pub fn from_environment() -> Result<Endpoints, String> {
+        resolve(read_var(LISTING_VAR)?.as_deref(), read_var(DOWNLOAD_VAR)?.as_deref())
+    }
+
+    /// A variable that is set but is not Unicode is an error, never an absent
+    /// variable: treating it as absent would fall back to GitHub silently.
+    fn read_var(name: &str) -> Result<Option<String>, String> {
+        match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid Unicode")),
+        }
+    }
+
+    /// Both variables are needed together, so a build never reads a listing from
+    /// the test server and downloads from GitHub.
+    pub fn resolve(listing: Option<&str>, download: Option<&str>) -> Result<Endpoints, String> {
+        match (listing, download) {
+            (None, None) => Ok(Endpoints::published()),
+            (Some(listing), Some(download)) => Ok(Endpoints {
+                listing: loopback_url(LISTING_VAR, listing)?,
+                download_base: loopback_url(DOWNLOAD_VAR, download)?,
+            }),
+            _ => Err(format!("{LISTING_VAR} and {DOWNLOAD_VAR} must be set together")),
+        }
+    }
+
+    fn loopback_url(name: &str, value: &str) -> Result<String, String> {
+        let url = reqwest::Url::parse(value).map_err(|error| format!("{name} is not a URL: {error}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!("{name} must use http or https"));
+        }
+        let plain = url.username().is_empty() && url.password().is_none();
+        if !is_loopback(&url) || !plain || url.query().is_some() || url.fragment().is_some() {
+            return Err(format!(
+                "{name} must be a loopback IP address with no user, query or fragment, such as http://127.0.0.1:8080/"
+            ));
+        }
+        Ok(value.trim_end_matches('/').to_string())
+    }
+
+    /// True for an IP literal in the loopback range. Host names are refused,
+    /// because resolving one could reach anywhere.
+    pub fn is_loopback(url: &reqwest::Url) -> bool {
+        url.host_str()
+            .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+            .and_then(|host| host.parse::<IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback())
+    }
+
+    /// Whether an override client may follow a redirect to `target`, given the
+    /// URLs already requested in `previous`. The target must be a loopback
+    /// address. A plain HTTP target is allowed only when every earlier request
+    /// was plain HTTP too, so the chain never falls back from HTTPS.
+    pub fn redirect_allowed(previous: &[reqwest::Url], target: &reqwest::Url) -> bool {
+        match target.scheme() {
+            "https" => is_loopback(target),
+            "http" => is_loopback(target) && previous.iter().all(|url| url.scheme() == "http"),
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn url(text: &str) -> reqwest::Url {
+            reqwest::Url::parse(text).unwrap()
+        }
+
+        #[test]
+        fn a_redirect_stays_on_loopback_and_never_falls_back_from_https() {
+            let plain = url("http://127.0.0.1:8080/repos");
+            let secure = url("https://127.0.0.1:8443/repos");
+            // Plain HTTP to plain HTTP, and HTTP upgraded to HTTPS, are allowed.
+            assert!(redirect_allowed(std::slice::from_ref(&plain), &url("http://127.0.0.2:9/x")));
+            assert!(redirect_allowed(std::slice::from_ref(&plain), &secure));
+            // HTTPS to HTTPS on loopback is allowed.
+            assert!(redirect_allowed(std::slice::from_ref(&secure), &url("https://127.0.0.2:9/x")));
+            // A downgrade from HTTPS to HTTP is refused, even on loopback.
+            assert!(!redirect_allowed(std::slice::from_ref(&secure), &plain));
+            assert!(!redirect_allowed(&[plain.clone(), secure.clone()], &url("http://[::1]:9/x")));
+        }
+
+        #[test]
+        fn a_redirect_to_a_host_name_or_a_public_address_is_refused() {
+            let origin = [url("http://127.0.0.1:8080/repos")];
+            for target in [
+                "http://example.com/repos",
+                "https://api.github.com/repos/BarraDev/slashit/releases",
+                "http://localhost:8080/",
+                "http://10.0.0.1/",
+                "https://github.com/BarraDev/slashit/releases/download/v0.0.1/latest.json",
+            ] {
+                assert!(!redirect_allowed(&origin, &url(target)), "{target} must be refused");
+            }
+        }
+
+        #[test]
+        fn a_redirect_to_another_scheme_is_refused() {
+            let origin = [url("http://127.0.0.1:8080/repos")];
+            assert!(!redirect_allowed(&origin, &url("ftp://127.0.0.1/x")));
+        }
+
+        #[test]
+        fn loopback_ip_literals_are_accepted() {
+            for value in ["http://127.0.0.1:8080/repos", "https://127.0.0.2/x", "http://[::1]:9/download/"] {
+                assert!(loopback_url(LISTING_VAR, value).is_ok(), "{value} must be accepted");
+            }
+        }
+
+        #[test]
+        fn anything_that_could_reach_another_host_is_refused() {
+            for value in [
+                "http://example.com/repos",
+                "https://api.github.com/repos/BarraDev/slashit/releases",
+                "http://localhost:8080/",
+                "http://127.0.0.1.nip.io/",
+                "http://10.0.0.1/",
+                "http://0.0.0.0/",
+                "ftp://127.0.0.1/",
+                "http://user@127.0.0.1/",
+                "http://127.0.0.1/x?per_page=1",
+            ] {
+                assert!(loopback_url(LISTING_VAR, value).is_err(), "{value} must be refused");
+            }
+        }
+
+        #[test]
+        fn both_variables_are_required_together_and_neither_alone_is_an_override() {
+            assert_eq!(resolve(None, None), Ok(Endpoints::published()));
+            assert!(resolve(Some("http://127.0.0.1:1/"), None).is_err());
+            assert!(resolve(None, Some("http://127.0.0.1:1/")).is_err());
+        }
+
+        #[test]
+        fn a_plain_http_download_location_must_also_be_loopback() {
+            let listing = Some("http://127.0.0.1:8080/repos/BarraDev/slashit/releases");
+            assert!(resolve(listing, Some("http://example.com/download")).is_err());
+            assert!(resolve(listing, Some("http://127.0.0.1:8080/download")).is_ok());
+        }
+
+        #[test]
+        fn a_complete_override_replaces_both_locations_without_trailing_slashes() {
+            let endpoints = resolve(
+                Some("http://127.0.0.1:8080/repos/BarraDev/slashit/releases"),
+                Some("http://127.0.0.1:8080/download/"),
+            )
+            .unwrap();
+            assert_eq!(endpoints.listing, "http://127.0.0.1:8080/repos/BarraDev/slashit/releases");
+            assert_eq!(endpoints.download_base, "http://127.0.0.1:8080/download");
+        }
+    }
 }
 
 /// List the releases at `listing`, newest first, over at most [`MAX_PAGES`]
@@ -417,9 +682,25 @@ mod tests {
     #[test]
     fn the_manifest_url_is_the_release_asset_for_its_tag() {
         assert_eq!(
-            manifest_url("v0.0.1"),
+            manifest_url(&Endpoints::published().download_base, "v0.0.1"),
             "https://github.com/BarraDev/slashit/releases/download/v0.0.1/latest.json"
         );
+    }
+
+    #[test]
+    fn the_production_endpoints_are_the_published_github_locations() {
+        let published = Endpoints::published();
+        assert_eq!(published.listing, "https://api.github.com/repos/BarraDev/slashit/releases");
+        assert_eq!(published.download_base, "https://github.com/BarraDev/slashit/releases/download");
+    }
+
+    /// A production build has no seam to read, so this holds whatever the
+    /// environment says. This test does not set the variables itself; the
+    /// verification run executes it with both variables set to loopback values.
+    #[cfg(not(feature = "updater-test-endpoints"))]
+    #[test]
+    fn endpoints_ignore_the_test_variables_in_a_production_build() {
+        assert_eq!(endpoints(), Ok(Endpoints::published()));
     }
 
     #[test]
@@ -427,7 +708,6 @@ mod tests {
         let chosen = Chosen {
             tag: "v0.0.2".to_string(),
             version: version("0.0.2"),
-            manifest_url: manifest_url("v0.0.2"),
         };
         assert!(check_manifest_version(&chosen, "0.0.2").is_ok());
         let refused = check_manifest_version(&chosen, "0.0.9").unwrap_err();
@@ -561,6 +841,118 @@ mod tests {
         let error = fetch_feed(&plain_client(), &listing).await.unwrap_err();
         server.join().unwrap();
         assert!(matches!(error, FeedError::Malformed(_)), "{error:?}");
+    }
+
+    /// The published client never sends a plaintext request, in either build.
+    /// This holds with the test seam compiled in but no override configured.
+    /// If plaintext were sent, the queued 200 response would be read and the
+    /// fetch would succeed, so the assertion would fail.
+    #[tokio::test]
+    async fn the_published_client_refuses_plain_http_before_connecting() {
+        let (listing, _server) = serve(vec![response("200 OK", "", &full_page(0, 1))]);
+        let error = fetch_feed(&client(&Endpoints::published()).unwrap(), &listing)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FeedError::Unreachable(_)), "{error:?}");
+    }
+
+    /// The endpoints of a test build whose listing is `listing`. The download
+    /// base is a fixed loopback address on another port, which these tests do
+    /// not contact.
+    #[cfg(feature = "updater-test-endpoints")]
+    fn override_for(listing: &str) -> Endpoints {
+        Endpoints {
+            listing: listing.to_string(),
+            download_base: "http://127.0.0.1:9/download".to_string(),
+        }
+    }
+
+    /// A test build with a configured override reads a loopback listing over
+    /// plain HTTP.
+    #[cfg(feature = "updater-test-endpoints")]
+    #[tokio::test]
+    async fn the_test_client_reads_a_loopback_listing_over_plain_http() {
+        let (listing, server) = serve(vec![response("200 OK", "", &full_page(0, 2))]);
+        let feed = fetch_feed(&client(&override_for(&listing)).unwrap(), &listing).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(feed.candidates.len(), 2);
+    }
+
+    /// A test build with a configured override follows a redirect to another
+    /// loopback listing.
+    #[cfg(feature = "updater-test-endpoints")]
+    #[tokio::test]
+    async fn the_test_client_follows_a_redirect_to_a_loopback_address() {
+        let (second, second_server) = serve(vec![response("200 OK", "", &full_page(0, 2))]);
+        let (first, first_server) =
+            serve(vec![response("302 Found", &format!("Location: {second}\r\n"), "")]);
+        let feed = fetch_feed(&client(&override_for(&first)).unwrap(), &first).await.unwrap();
+        first_server.join().unwrap();
+        second_server.join().unwrap();
+        assert_eq!(feed.candidates.len(), 2);
+    }
+
+    /// A test build with a configured override refuses a redirect to a public
+    /// host before connecting to it.
+    #[cfg(feature = "updater-test-endpoints")]
+    #[tokio::test]
+    async fn the_test_client_refuses_a_redirect_to_a_public_host() {
+        let (first, first_server) = serve(vec![response(
+            "302 Found",
+            "Location: http://example.com/repos/BarraDev/slashit/releases\r\n",
+            "",
+        )]);
+        // Assert on the redirect refusal itself. A followed redirect would fail
+        // later with a DNS or connection error, which is not a proof of refusal.
+        let error = client(&override_for(&first))
+            .unwrap()
+            .get(&first)
+            .send()
+            .await
+            .unwrap_err();
+        first_server.join().unwrap();
+        assert!(error.is_redirect(), "{error:?}");
+    }
+
+    /// The plugin's own client follows the same rule: a manifest or payload
+    /// redirect from a configured loopback override to a public host is refused.
+    #[cfg(feature = "updater-test-endpoints")]
+    #[tokio::test]
+    async fn the_plugin_client_refuses_a_redirect_to_a_public_host() {
+        let (first, first_server) = serve(vec![response(
+            "302 Found",
+            "Location: https://example.com/BarraDev/slashit/releases/download/v0.0.2/latest.json\r\n",
+            "",
+        )]);
+        let builder = plugin_client_policy(&override_for(&first))(reqwest::Client::builder());
+        let error = builder.build().unwrap().get(&first).send().await.unwrap_err();
+        first_server.join().unwrap();
+        assert!(error.is_redirect(), "{error:?}");
+    }
+
+    /// With an override, the manifest's payload must be loopback, whichever
+    /// scheme it uses. A build with no override keeps the published location.
+    #[cfg(feature = "updater-test-endpoints")]
+    #[test]
+    fn a_payload_must_come_from_the_configured_test_server_only_under_an_override() {
+        let overridden = Endpoints {
+            listing: "http://127.0.0.1:8080/repos/BarraDev/slashit/releases".to_string(),
+            download_base: "http://127.0.0.1:8080/download".to_string(),
+        };
+        assert!(check_payload_location(&overridden, "http://127.0.0.1:8080/download/v0.0.2/payload").is_ok());
+        for payload in [
+            // The same host on another port, and an https origin on the same port, are other origins.
+            "http://127.0.0.1:9999/download/v0.0.2/payload",
+            "https://127.0.0.1:8080/download/v0.0.2/payload",
+            "http://example.com/download/v0.0.2/payload",
+            "https://github.com/BarraDev/slashit/releases/download/v0.0.2/payload",
+            "http://localhost:8080/payload",
+            "not a url",
+        ] {
+            assert!(check_payload_location(&overridden, payload).is_err(), "{payload} must be refused");
+        }
+        let published = Endpoints::published();
+        assert!(check_payload_location(&published, "https://github.com/BarraDev/slashit/releases/download/v0.0.2/payload").is_ok());
     }
 
     #[tokio::test]
