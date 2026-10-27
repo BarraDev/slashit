@@ -268,6 +268,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: acceptance
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install trunk
         uses: ./.github/actions/install-trunk
@@ -333,10 +334,16 @@ jobs:
       # rust-cache still separates different Rust environments and lockfiles.
       # On a fully cold run they may all miss before the first job saves; later
       # runs can restore the cache for their matching environment.
+      # Only pushes to main save this cache; pull requests restore it but do not
+      # write. A PR that changes the lockfile or toolchain therefore rebuilds
+      # the changed dependencies on every push instead of only the first, and
+      # its own entry is never created, which keeps PR runs from consuming
+      # repository cache quota. Delete the `save-if` lines to restore PR writes.
       - name: Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: acceptance
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install trunk
         uses: ./.github/actions/install-trunk
