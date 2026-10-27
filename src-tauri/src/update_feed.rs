@@ -254,11 +254,12 @@ fn install_tls_provider() {
     });
 }
 
-/// An HTTP client for the releases API: HTTPS only, bounded time, no
-/// credentials, and a user agent that names the version asking.
-pub fn client() -> Result<reqwest::Client, FeedError> {
+/// An HTTP client for the releases listing `endpoints` names: bounded time, no
+/// credentials, and a user agent that names the version asking. It is HTTPS
+/// only, except in a test build with a configured loopback override.
+pub fn client(endpoints: &Endpoints) -> Result<reqwest::Client, FeedError> {
     install_tls_provider();
-    transport(reqwest::Client::builder())
+    transport(reqwest::Client::builder(), endpoints)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .user_agent(format!("slashit-updater/{}", env!("CARGO_PKG_VERSION")))
@@ -267,26 +268,71 @@ pub fn client() -> Result<reqwest::Client, FeedError> {
 }
 
 #[cfg(not(feature = "updater-test-endpoints"))]
-fn transport(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+fn transport(builder: reqwest::ClientBuilder, _endpoints: &Endpoints) -> reqwest::ClientBuilder {
     builder
         .https_only(true)
         .redirect(reqwest::redirect::Policy::limited(5))
 }
 
-/// A test build may reach a loopback listing over plain HTTP, reaches it
-/// directly rather than through a system proxy, and follows redirects only to
-/// loopback addresses.
+/// A build with the test seam uses the production transport unless both test
+/// locations are configured. With an override, the listing client may reach a
+/// loopback address over plain HTTP, bypasses system proxies, and follows only
+/// redirects that stay on loopback (see [`check_payload_location`] for the
+/// payload).
 #[cfg(feature = "updater-test-endpoints")]
-fn transport(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+fn transport(builder: reqwest::ClientBuilder, endpoints: &Endpoints) -> reqwest::ClientBuilder {
+    if *endpoints == Endpoints::published() {
+        return builder
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::limited(5));
+    }
     builder.no_proxy().redirect(reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= 5 {
-            attempt.stop()
-        } else if test_endpoints::is_loopback(attempt.url()) {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if test_endpoints::redirect_allowed(attempt.previous(), attempt.url()) {
             attempt.follow()
         } else {
-            attempt.error("the test build refuses a redirect to a non-loopback address")
+            attempt.error("the test build refuses a redirect it was not configured to follow")
         }
     }))
+}
+
+/// The redirect limit, equal to the production client's `limited(5)`. reqwest
+/// enforces it as `previous.len() > max`. Production keeps its own literal.
+#[cfg(feature = "updater-test-endpoints")]
+const MAX_REDIRECTS: usize = 5;
+
+/// The client policy for the updater plugin's own requests (the manifest and
+/// the payload). It is installed only in a test build, and with no override
+/// configured it selects the same HTTPS-only transport as the listing client.
+#[cfg(feature = "updater-test-endpoints")]
+pub fn plugin_client_policy(
+    endpoints: &Endpoints,
+) -> impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync + 'static {
+    let endpoints = endpoints.clone();
+    move |builder| transport(builder, &endpoints)
+}
+
+/// With a configured override, the payload the manifest names must come from
+/// the configured download server: the same scheme, host and port as
+/// `download_base`, which is loopback. The plugin takes that URL from the
+/// manifest and requests it with its own client, and the redirect policy does
+/// not check the initial request. A build with no override keeps the published
+/// location.
+#[cfg(feature = "updater-test-endpoints")]
+pub fn check_payload_location(endpoints: &Endpoints, payload: &str) -> Result<(), String> {
+    if *endpoints == Endpoints::published() {
+        return Ok(());
+    }
+    let refused = || format!("the test build refuses a payload at {payload}, which is not on the configured test server");
+    let (Ok(url), Ok(base)) = (reqwest::Url::parse(payload), reqwest::Url::parse(&endpoints.download_base)) else {
+        return Err(refused());
+    };
+    if url.origin() == base.origin() && test_endpoints::is_loopback(&url) {
+        Ok(())
+    } else {
+        Err(refused())
+    }
 }
 
 /// Test-only endpoint overrides. Compiled only with `updater-test-endpoints`.
@@ -350,9 +396,59 @@ mod test_endpoints {
             .is_some_and(|ip| ip.is_loopback())
     }
 
+    /// Whether an override client may follow a redirect to `target`, given the
+    /// URLs already requested in `previous`. The target must be a loopback
+    /// address. A plain HTTP target is allowed only when every earlier request
+    /// was plain HTTP too, so the chain never falls back from HTTPS.
+    pub fn redirect_allowed(previous: &[reqwest::Url], target: &reqwest::Url) -> bool {
+        match target.scheme() {
+            "https" => is_loopback(target),
+            "http" => is_loopback(target) && previous.iter().all(|url| url.scheme() == "http"),
+            _ => false,
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn url(text: &str) -> reqwest::Url {
+            reqwest::Url::parse(text).unwrap()
+        }
+
+        #[test]
+        fn a_redirect_stays_on_loopback_and_never_falls_back_from_https() {
+            let plain = url("http://127.0.0.1:8080/repos");
+            let secure = url("https://127.0.0.1:8443/repos");
+            // Plain HTTP to plain HTTP, and HTTP upgraded to HTTPS, are allowed.
+            assert!(redirect_allowed(std::slice::from_ref(&plain), &url("http://127.0.0.2:9/x")));
+            assert!(redirect_allowed(std::slice::from_ref(&plain), &secure));
+            // HTTPS to HTTPS on loopback is allowed.
+            assert!(redirect_allowed(std::slice::from_ref(&secure), &url("https://127.0.0.2:9/x")));
+            // A downgrade from HTTPS to HTTP is refused, even on loopback.
+            assert!(!redirect_allowed(std::slice::from_ref(&secure), &plain));
+            assert!(!redirect_allowed(&[plain.clone(), secure.clone()], &url("http://[::1]:9/x")));
+        }
+
+        #[test]
+        fn a_redirect_to_a_host_name_or_a_public_address_is_refused() {
+            let origin = [url("http://127.0.0.1:8080/repos")];
+            for target in [
+                "http://example.com/repos",
+                "https://api.github.com/repos/BarraDev/slashit/releases",
+                "http://localhost:8080/",
+                "http://10.0.0.1/",
+                "https://github.com/BarraDev/slashit/releases/download/v0.0.1/latest.json",
+            ] {
+                assert!(!redirect_allowed(&origin, &url(target)), "{target} must be refused");
+            }
+        }
+
+        #[test]
+        fn a_redirect_to_another_scheme_is_refused() {
+            let origin = [url("http://127.0.0.1:8080/repos")];
+            assert!(!redirect_allowed(&origin, &url("ftp://127.0.0.1/x")));
+        }
 
         #[test]
         fn loopback_ip_literals_are_accepted() {
@@ -383,6 +479,13 @@ mod test_endpoints {
             assert_eq!(resolve(None, None), Ok(Endpoints::published()));
             assert!(resolve(Some("http://127.0.0.1:1/"), None).is_err());
             assert!(resolve(None, Some("http://127.0.0.1:1/")).is_err());
+        }
+
+        #[test]
+        fn a_plain_http_download_location_must_also_be_loopback() {
+            let listing = Some("http://127.0.0.1:8080/repos/BarraDev/slashit/releases");
+            assert!(resolve(listing, Some("http://example.com/download")).is_err());
+            assert!(resolve(listing, Some("http://127.0.0.1:8080/download")).is_ok());
         }
 
         #[test]
@@ -740,40 +843,57 @@ mod tests {
         assert!(matches!(error, FeedError::Malformed(_)), "{error:?}");
     }
 
-    /// The production client never sends a plaintext request. The server is left
-    /// unanswered on purpose, so the test does not wait for a connection.
-    #[cfg(not(feature = "updater-test-endpoints"))]
+    /// The published client never sends a plaintext request, in either build.
+    /// This holds with the test seam compiled in but no override configured.
+    /// If plaintext were sent, the queued 200 response would be read and the
+    /// fetch would succeed, so the assertion would fail.
     #[tokio::test]
-    async fn the_production_client_refuses_plain_http_before_connecting() {
+    async fn the_published_client_refuses_plain_http_before_connecting() {
         let (listing, _server) = serve(vec![response("200 OK", "", &full_page(0, 1))]);
-        let error = fetch_feed(&client().unwrap(), &listing).await.unwrap_err();
+        let error = fetch_feed(&client(&Endpoints::published()).unwrap(), &listing)
+            .await
+            .unwrap_err();
         assert!(matches!(error, FeedError::Unreachable(_)), "{error:?}");
     }
 
-    /// A test build reads a loopback listing over plain HTTP.
+    /// The endpoints of a test build whose listing is `listing`. The download
+    /// base is a fixed loopback address on another port, which these tests do
+    /// not contact.
+    #[cfg(feature = "updater-test-endpoints")]
+    fn override_for(listing: &str) -> Endpoints {
+        Endpoints {
+            listing: listing.to_string(),
+            download_base: "http://127.0.0.1:9/download".to_string(),
+        }
+    }
+
+    /// A test build with a configured override reads a loopback listing over
+    /// plain HTTP.
     #[cfg(feature = "updater-test-endpoints")]
     #[tokio::test]
     async fn the_test_client_reads_a_loopback_listing_over_plain_http() {
         let (listing, server) = serve(vec![response("200 OK", "", &full_page(0, 2))]);
-        let feed = fetch_feed(&client().unwrap(), &listing).await.unwrap();
+        let feed = fetch_feed(&client(&override_for(&listing)).unwrap(), &listing).await.unwrap();
         server.join().unwrap();
         assert_eq!(feed.candidates.len(), 2);
     }
 
-    /// A test build follows a redirect to another loopback listing.
+    /// A test build with a configured override follows a redirect to another
+    /// loopback listing.
     #[cfg(feature = "updater-test-endpoints")]
     #[tokio::test]
     async fn the_test_client_follows_a_redirect_to_a_loopback_address() {
         let (second, second_server) = serve(vec![response("200 OK", "", &full_page(0, 2))]);
         let (first, first_server) =
             serve(vec![response("302 Found", &format!("Location: {second}\r\n"), "")]);
-        let feed = fetch_feed(&client().unwrap(), &first).await.unwrap();
+        let feed = fetch_feed(&client(&override_for(&first)).unwrap(), &first).await.unwrap();
         first_server.join().unwrap();
         second_server.join().unwrap();
         assert_eq!(feed.candidates.len(), 2);
     }
 
-    /// A test build refuses a redirect to a public host before connecting to it.
+    /// A test build with a configured override refuses a redirect to a public
+    /// host before connecting to it.
     #[cfg(feature = "updater-test-endpoints")]
     #[tokio::test]
     async fn the_test_client_refuses_a_redirect_to_a_public_host() {
@@ -782,9 +902,57 @@ mod tests {
             "Location: http://example.com/repos/BarraDev/slashit/releases\r\n",
             "",
         )]);
-        let error = fetch_feed(&client().unwrap(), &first).await.unwrap_err();
+        // Assert on the redirect refusal itself. A followed redirect would fail
+        // later with a DNS or connection error, which is not a proof of refusal.
+        let error = client(&override_for(&first))
+            .unwrap()
+            .get(&first)
+            .send()
+            .await
+            .unwrap_err();
         first_server.join().unwrap();
-        assert!(matches!(error, FeedError::Unreachable(_)), "{error:?}");
+        assert!(error.is_redirect(), "{error:?}");
+    }
+
+    /// The plugin's own client follows the same rule: a manifest or payload
+    /// redirect from a configured loopback override to a public host is refused.
+    #[cfg(feature = "updater-test-endpoints")]
+    #[tokio::test]
+    async fn the_plugin_client_refuses_a_redirect_to_a_public_host() {
+        let (first, first_server) = serve(vec![response(
+            "302 Found",
+            "Location: https://example.com/BarraDev/slashit/releases/download/v0.0.2/latest.json\r\n",
+            "",
+        )]);
+        let builder = plugin_client_policy(&override_for(&first))(reqwest::Client::builder());
+        let error = builder.build().unwrap().get(&first).send().await.unwrap_err();
+        first_server.join().unwrap();
+        assert!(error.is_redirect(), "{error:?}");
+    }
+
+    /// With an override, the manifest's payload must be loopback, whichever
+    /// scheme it uses. A build with no override keeps the published location.
+    #[cfg(feature = "updater-test-endpoints")]
+    #[test]
+    fn a_payload_must_come_from_the_configured_test_server_only_under_an_override() {
+        let overridden = Endpoints {
+            listing: "http://127.0.0.1:8080/repos/BarraDev/slashit/releases".to_string(),
+            download_base: "http://127.0.0.1:8080/download".to_string(),
+        };
+        assert!(check_payload_location(&overridden, "http://127.0.0.1:8080/download/v0.0.2/payload").is_ok());
+        for payload in [
+            // The same host on another port, and an https origin on the same port, are other origins.
+            "http://127.0.0.1:9999/download/v0.0.2/payload",
+            "https://127.0.0.1:8080/download/v0.0.2/payload",
+            "http://example.com/download/v0.0.2/payload",
+            "https://github.com/BarraDev/slashit/releases/download/v0.0.2/payload",
+            "http://localhost:8080/payload",
+            "not a url",
+        ] {
+            assert!(check_payload_location(&overridden, payload).is_err(), "{payload} must be refused");
+        }
+        let published = Endpoints::published();
+        assert!(check_payload_location(&published, "https://github.com/BarraDev/slashit/releases/download/v0.0.2/payload").is_ok());
     }
 
     #[tokio::test]

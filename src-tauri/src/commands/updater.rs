@@ -774,7 +774,7 @@ async fn find_update(
     })?;
     let endpoints = update_feed::endpoints()
         .map_err(|detail| err(UpdaterErrorKind::NotConfigured, &detail))?;
-    let feed = cached_feed(state, &endpoints.listing).await?;
+    let feed = cached_feed(state, &endpoints).await?;
     let Selection { chosen, notices } = update_feed::select(&feed, channel, current);
     let Some(chosen) = chosen else {
         return Ok(Found { update: None, notices });
@@ -788,9 +788,13 @@ async fn find_update(
         .updater_builder()
         .endpoints(vec![endpoint])
         .map_err(|e| from_plugin(&e))?
-        .timeout(MANIFEST_TIMEOUT)
-        .build()
-        .map_err(|e| from_plugin(&e))?;
+        .timeout(MANIFEST_TIMEOUT);
+    // A test build applies its redirect rule to the plugin's client, and it
+    // checks the payload location the manifest names, which the plugin does not
+    // check itself.
+    #[cfg(feature = "updater-test-endpoints")]
+    let updater = updater.configure_client(update_feed::plugin_client_policy(&endpoints));
+    let updater = updater.build().map_err(|e| from_plugin(&e))?;
     let update = match updater.check().await.map_err(|e| from_plugin(&e))? {
         Some(update) => update,
         // The release is newer than this build by its tag, so a manifest the
@@ -806,6 +810,9 @@ async fn find_update(
             ))
         }
     };
+    #[cfg(feature = "updater-test-endpoints")]
+    update_feed::check_payload_location(&endpoints, update.download_url.as_str())
+        .map_err(|detail| err(UpdaterErrorKind::Metadata, &detail))?;
     update_feed::check_manifest_version(&chosen, &update.version)
         .map_err(|detail| err(UpdaterErrorKind::Metadata, &detail))?;
     Ok(Found {
@@ -821,18 +828,21 @@ const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 ///
 /// Held across the request on purpose: concurrent checks wait for one listing
 /// rather than each spending a request of the unauthenticated quota.
-async fn cached_feed(state: &tauri::State<'_, crate::AppState>, listing: &str) -> Result<Feed, String> {
+async fn cached_feed(
+    state: &tauri::State<'_, crate::AppState>,
+    endpoints: &update_feed::Endpoints,
+) -> Result<Feed, String> {
     let mut cache = state.updater.feed_cache.lock().await;
     if let Some((fetched, cached_listing, feed)) = cache.as_ref() {
-        if cached_listing == listing && fetched.elapsed() < update_feed::CACHE_TTL {
+        if *cached_listing == endpoints.listing && fetched.elapsed() < update_feed::CACHE_TTL {
             return Ok(feed.clone());
         }
     }
-    let client = update_feed::client().map_err(|error| feed_error(&error))?;
-    let feed = update_feed::fetch_feed(&client, listing)
+    let client = update_feed::client(endpoints).map_err(|error| feed_error(&error))?;
+    let feed = update_feed::fetch_feed(&client, &endpoints.listing)
         .await
         .map_err(|error| feed_error(&error))?;
-    *cache = Some((Instant::now(), listing.to_string(), feed.clone()));
+    *cache = Some((Instant::now(), endpoints.listing.clone(), feed.clone()));
     Ok(feed)
 }
 
