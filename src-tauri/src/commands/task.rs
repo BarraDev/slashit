@@ -1238,6 +1238,36 @@ mod tests {
     }
 
     #[test]
+    fn reordering_a_failed_task_into_queue_resets_execution_state_but_keeps_its_work() {
+        // The drawer's Retry and a card dragged out of Error both reach the
+        // backend as `reorder_task`, not `update_task_status`. They must reset
+        // the same execution state and keep the same work.
+        let project_id = Uuid::new_v4();
+        let task = failed_task_with_worktree(project_id);
+        let task_id = task.id;
+        let mut tasks = create_test_tasks_map(vec![task]);
+
+        let reordered = reorder_task_logic(&mut tasks, task_id, Some(TaskStatus::Queue), 0)
+            .expect("the task exists");
+
+        assert_eq!(reordered.status, TaskStatus::Queue);
+        assert_eq!(reordered.phase, TaskPhase::Idle, "phase must reset so the poller picks it up");
+        assert_eq!(reordered.phase_progress, 0);
+        assert_eq!(reordered.overall_progress, 0);
+        assert_eq!(reordered.error_message, None, "the previous failure must not linger");
+        assert_eq!(
+            reordered.worktree_path.as_deref(),
+            Some("/tmp/wt/task-abcd1234"),
+            "the retry continues in the existing worktree"
+        );
+        assert_eq!(
+            reordered.branch_name.as_deref(),
+            Some("task-abcd1234"),
+            "the retry reattaches to the existing branch"
+        );
+    }
+
+    #[test]
     fn retrying_straight_into_progress_preserves_the_worktree_too() {
         // Error -> InProgress skips the Queue column but means the same thing.
         // A caller taking the shortcut must not get a different, destructive

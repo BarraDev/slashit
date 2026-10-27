@@ -27,8 +27,9 @@ test binary unchanged. Journeys always run one at a time.
 
 **CI shards.** Hosted CI splits the product journeys across three runners
 (`Desktop acceptance / product shard 1..3`) so they run concurrently instead
-of one 11-12 minute job; a separate `Desktop acceptance / harness` job runs
-`tests/acceptance.rs` once and is not sharded. `--shard <N>` reads
+of one 11-12 minute job. Shard 2 also runs `tests/acceptance.rs` once, using
+its already built application. A harness failure does not skip the product
+journeys in that shard. `--shard <N>` reads
 [`shard-manifest.txt`](shard-manifest.txt) and runs exactly the journeys CI's
 shard `N` runs, so a shard failure reproduces locally without retyping test
 names. `scripts/check-acceptance-shards.sh` (run in the "Lint and
@@ -36,6 +37,13 @@ structural checks" job) proves the manifest assigns every journey `cargo test --
 reports to exactly one shard; editing the manifest to rebalance shards or add
 a newly-written journey to one is normal, but leaving a journey unassigned or
 in two shards fails that check.
+
+**Consolidating coverage.** Before removing a journey, assign each of its
+unique assertions to a surviving desktop journey or a direct test. Keep real
+window, process, disk, restart and negative-observation claims at the layer
+that can prove them. Rebalance with hosted journey timings, then compare both
+the slowest shard and total runner time; the manifest check proves assignment,
+not the value of the coverage.
 
 The build step is not optional: a plain `cargo build` produces a binary that
 loads http://localhost:1420 and shows a connection-error page. The script runs
