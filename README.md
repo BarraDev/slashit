@@ -214,7 +214,7 @@ cargo tauri icon logo.svg
 
 ## Contributing
 
-Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+Contributions are welcome. Bugs, feature requests and open work are tracked in the [issue tracker](https://github.com/BarraDev/slashit/issues). Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request; it explains how to link pull requests to issues.
 
 Security vulnerabilities should be reported privately; see [SECURITY.md](SECURITY.md).
 

@@ -16,6 +16,22 @@ Before opening an issue, please:
 
 For **security vulnerabilities**, do not open a public issue. See [SECURITY.md](SECURITY.md).
 
+## Issues and Pull Requests
+
+Issues are the public entry point for bugs, feature requests and open work. For a
+change that affects behavior, open or find the issue first so the scope can be
+agreed before code is written. Documentation and maintenance changes do not need
+their own issue.
+
+When a pull request relates to an issue, reference it in the pull request
+description, and target `main`:
+
+- Use `Closes #123` or `Fixes #123` only when the pull request fully resolves the
+  issue. GitHub closes the issue when the pull request merges, so check the
+  issue's acceptance criteria first.
+- Use `Refs #123` for partial, exploratory or stacked work, so the issue stays open
+  until its criteria are met.
+
 ## Development Setup
 
 ### Prerequisites
