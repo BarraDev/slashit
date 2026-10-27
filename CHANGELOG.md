@@ -8,9 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.0.1]
 
-A prerelease for testers. It is installed by hand. GitHub does not mark a
-prerelease as the latest release, so the in-app updater does not offer it. The
-features listed below are the full feature set of this prerelease.
+A prerelease for testers. Install it by hand the first time. After that, the
+in-app updater offers later prereleases to people who choose the Prerelease
+update channel, and never to people on the Stable channel. The features listed
+below are the full feature set of this prerelease.
 
 **Installing.** Download the installer for your platform from the GitHub
 release page: the `.deb`, `.rpm` or `.AppImage` on Linux, the `.dmg` on macOS
@@ -86,6 +87,10 @@ package from the release page.
   board can also be detected automatically. Settings > Storage previews a move,
   with file counts, sizes and any conflicts, and changes nothing until you
   confirm.
+- **Update channels.** Settings > Application updates offers Stable (the default)
+  and Prerelease. Stable offers stable releases only; Prerelease also offers
+  prereleases. The installed build's channel is shown separately from the
+  channel you select.
 - **Feature flags.** Unfinished features can ship turned off. Flags are stored in
   `features.toml` in SlashIt's configuration directory, and the
   `SLASHIT_FEATURE_<NAME>` environment variable overrides them. `slashit
@@ -101,16 +106,19 @@ Known gaps in this prerelease:
   covers the `.deb`, `.rpm` and `.AppImage` on Linux, the `.msi` and NSIS `.exe`
   on Windows, and the `.dmg` on macOS. Upgrading over an earlier install has not
   been tested either.
-- The contents of each package have not been checked on the built artifacts.
-  Whether the `.deb`, `.rpm` and `.AppImage` include `slashitd`, and whether the
-  `.deb` and `.rpm` include the `slashit` client, is not yet confirmed. The
-  macOS and Windows installers have not been checked for `slashitd`.
+- The Linux packages were checked only as built locally, with a disposable
+  signing key and not the release key. The `.deb` and `.rpm` contain `slashit`,
+  `slashit-ui` and `slashitd`. The `.AppImage` contains `slashitd` and
+  `slashit-ui`, and not the `slashit` client. No package contains the test
+  fixture binary. The macOS and Windows installers have not been checked for
+  `slashitd`, and the packages from the release workflow have not been checked.
 - The installers are not code-signed, so Windows SmartScreen and macOS Gatekeeper
   warn on first launch. The warnings have not been observed on real machines.
-- The update path has not been run. Updates are signed with a key held in the
-  release workflow's secrets, and no signed 0.0.1 artifact exists yet, so the
-  signature check, the download and the install have not been exercised. The
-  live updater can be tested only against a published stable release.
+- The update path has not been run against a published release. Updates are
+  signed with a key held in the release workflow's secrets, and no signed 0.0.1
+  artifact exists yet, so the signature check, the download and the install have
+  not been exercised. The Stable channel has nothing to offer until a stable
+  release newer than 0.0.1 is published, so it cannot be tested live before then.
 - A background job whose shell has already exited keeps running when its
   terminal closes or SlashIt quits. The quit and restart dialogs say so.
 - The product acceptance checks use fake agent providers. A real provider has

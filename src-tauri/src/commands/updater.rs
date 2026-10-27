@@ -39,10 +39,15 @@
 //! than an `AppHandle`, so the flow is not tied to a webview existing.
 
 use crate::commands::gui_admission::GuiMutation;
+use crate::config::updates::UpdatePreferences;
+use crate::config::ConfigWriteError;
 use crate::events::EventSinkExt;
+use crate::release_channel::{PlainVersion, ReleaseChannel};
+use crate::update_feed::{self, Feed, FeedError, Selection};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::utils::config::BundleType;
 use tauri::AppHandle;
 use tauri_plugin_updater::{Update, UpdaterExt};
@@ -70,10 +75,21 @@ pub const PROGRESS_EVENT: &str = "updater://progress";
 /// release endpoint when the user accepts an update they were just shown, and
 /// `last_check` is returned by [`updater_status`] so the timestamp survives a
 /// webview reload rather than being recomputed as "never".
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct UpdaterState {
-    /// The update the last successful check found, if it found one.
-    pending: Arc<Mutex<Option<Update>>>,
+    /// The update the last successful check found, if it found one. Carries the
+    /// channel and generation it was found under, so an install can refuse it
+    /// once the person has switched channels.
+    pending: Arc<Mutex<Option<PendingUpdate>>>,
+    /// The update channel the person selected. Read at the start of every
+    /// check; changed only by [`updater_set_channel`].
+    channel: Arc<Mutex<ReleaseChannel>>,
+    /// Which checks are current, and which channel generation is in force. See
+    /// [`CheckSequence`].
+    checks: Arc<CheckSequence>,
+    /// The releases listing from the last successful fetch, reused for
+    /// [`update_feed::CACHE_TTL`].
+    feed_cache: Arc<Mutex<Option<(Instant, Feed)>>>,
     /// When the last *successful* check completed.
     last_check: Arc<Mutex<Option<DateTime<Utc>>>>,
     /// Held for the whole download-and-install span via [`InstallGuard`], so
@@ -118,9 +134,87 @@ pub fn install_timing(os: &str) -> InstallTiming {
 }
 
 impl UpdaterState {
-    pub fn new() -> Self {
-        Self::default()
+    /// State for a process whose persisted update channel is `channel`.
+    pub fn new(channel: ReleaseChannel) -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(None)),
+            channel: Arc::new(Mutex::new(channel)),
+            checks: Arc::new(CheckSequence::default()),
+            feed_cache: Arc::new(Mutex::new(None)),
+            last_check: Arc::new(Mutex::new(None)),
+            installing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            staged: Arc::new(Mutex::new(None)),
+        }
     }
+}
+
+/// An update the last check found, with what it was found under.
+struct PendingUpdate {
+    update: Update,
+    channel: ReleaseChannel,
+    /// The channel generation at the check. Stale once the channel changes.
+    generation: u64,
+}
+
+/// Decides which asynchronous check results may still write updater state.
+///
+/// A check takes a [`CheckTicket`] when it starts. Its result is stored only if
+/// no later check has started since (the newest request wins, so a slow
+/// background poll cannot overwrite a manual check), and only if the channel has
+/// not changed since (a late answer from the previous channel is dropped). Both
+/// the store and the channel change are made while holding the pending-update
+/// lock, so the two orderings cannot interleave.
+#[derive(Default)]
+pub struct CheckSequence {
+    /// Bumped on every channel change.
+    generation: std::sync::atomic::AtomicU64,
+    /// The number of checks started.
+    started: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckTicket {
+    generation: u64,
+    sequence: u64,
+}
+
+impl CheckTicket {
+    /// The channel generation the check started under.
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+impl CheckSequence {
+    pub fn begin(&self) -> CheckTicket {
+        use std::sync::atomic::Ordering::SeqCst;
+        CheckTicket {
+            generation: self.generation.load(SeqCst),
+            sequence: self.started.fetch_add(1, SeqCst) + 1,
+        }
+    }
+
+    pub fn is_current(&self, ticket: CheckTicket) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.generation.load(SeqCst) == ticket.generation && self.started.load(SeqCst) == ticket.sequence
+    }
+
+    /// The channel generation now in force.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Invalidate every check in flight and every update found before now.
+    pub fn supersede(&self) {
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The channel this build was published on, from `.github/release-channels.txt`
+/// at build time (`build.rs`). Never the person's selection.
+pub fn installed_channel() -> ReleaseChannel {
+    ReleaseChannel::parse(env!("SLASHIT_RELEASE_CHANNEL"))
+        .expect("build.rs sets SLASHIT_RELEASE_CHANNEL to a known channel")
 }
 
 /// Releases [`UpdaterState::installing`] on every exit path, including the
@@ -165,14 +259,23 @@ pub struct UpdateInfo {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateCheckResult {
     pub current_version: String,
+    /// The update channel the check ran on: `stable` or `prerelease`.
+    pub channel: String,
     pub update: Option<UpdateInfo>,
     pub checked_at: String,
+    /// Things the person should know that did not stop the check, such as a
+    /// newer release that cannot be installed. Shown verbatim.
+    pub notices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdaterStatus {
     pub current_version: String,
+    /// The channel this build was published on: `stable` or `prerelease`.
+    pub installed_channel: String,
+    /// The channel the person chose for future updates.
+    pub update_channel: String,
     /// Whether this install can actually replace itself.
     pub supported: bool,
     /// Why not, in a sentence the UI can show verbatim.
@@ -227,6 +330,9 @@ pub enum UpdaterErrorKind {
     NoUpdate,
     /// The payload arrived and verified, but could not be put in place.
     Install,
+    /// The answer belongs to a check or an update that the channel has since
+    /// replaced. Not a failure: the newer answer is the one to show.
+    Superseded,
     /// Anything the plugin can return that does not fit above.
     Internal,
 }
@@ -244,6 +350,7 @@ impl UpdaterErrorKind {
             Self::Signature => "signature",
             Self::NoUpdate => "no-update",
             Self::Install => "install",
+            Self::Superseded => "superseded",
             Self::Internal => "internal",
         }
     }
@@ -494,6 +601,8 @@ fn build_status(
     probe: &InstallProbe,
     flag: Option<bool>,
     last_check: Option<DateTime<Utc>>,
+    installed: ReleaseChannel,
+    selected: ReleaseChannel,
 ) -> UpdaterStatus {
     let install_reason = unsupported_reason(probe);
     let supported = install_reason.is_none();
@@ -509,6 +618,8 @@ fn build_status(
 
     UpdaterStatus {
         current_version,
+        installed_channel: installed.as_str().to_string(),
+        update_channel: selected.as_str().to_string(),
         supported,
         unsupported_reason,
         enabled: flag.unwrap_or(false),
@@ -553,6 +664,7 @@ pub async fn updater_status(
 ) -> Result<UpdaterStatus, String> {
     let flag = state.features.read().await.get(AUTO_UPDATE_FLAG);
     let last_check = *state.updater.last_check.lock().await;
+    let selected = *state.updater.channel.lock().await;
 
     Ok(build_status(
         // The same source the plugin compares against, so status and check can
@@ -561,109 +673,9 @@ pub async fn updater_status(
         &probe_install(&app),
         flag,
         last_check,
+        installed_channel(),
+        selected,
     ))
-}
-
-/// How long the probe waits for one endpoint before reporting it unreachable.
-const ABSENCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Run the plugin's check, with one correction the plugin cannot make itself.
-///
-/// The endpoint is `releases/latest`, which GitHub answers with 404 until a
-/// non-draft, non-prerelease release exists. The plugin reports every
-/// non-success response from every endpoint as
-/// [`tauri_plugin_updater::Error::ReleaseNotFound`], a 5xx included, so that
-/// error alone cannot say which state the server is in. Each endpoint is asked
-/// again, and only "every endpoint answered 404" counts as no stable release.
-/// Anything else keeps its error class and is shown as a failure.
-async fn check_for_update(app: &AppHandle) -> Result<Option<Update>, String> {
-    let updater = app.updater().map_err(|e| from_plugin(&e))?;
-    match updater.check().await {
-        Ok(found) => Ok(found),
-        Err(tauri_plugin_updater::Error::ReleaseNotFound) => {
-            let endpoints = endpoints_from_config(app.config().plugins.0.get("updater"))?;
-            absence_verdict(&probe_endpoints(&endpoints).await)?;
-            Ok(None)
-        }
-        Err(error) => Err(from_plugin(&error)),
-    }
-}
-
-/// The endpoints the plugin is configured with, from `plugins.updater` in
-/// `tauri.conf.json`.
-fn endpoints_from_config(section: Option<&serde_json::Value>) -> Result<Vec<reqwest::Url>, String> {
-    let entries = section
-        .and_then(|section| section.get("endpoints"))
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let urls = entries
-        .iter()
-        .map(|entry| {
-            let text = entry
-                .as_str()
-                .ok_or_else(|| err(UpdaterErrorKind::NotConfigured, "an update endpoint is not a string"))?;
-            reqwest::Url::parse(text).map_err(|error| {
-                err(UpdaterErrorKind::NotConfigured, &format!("the update endpoint {text:?} is not a URL: {error}"))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if urls.is_empty() {
-        return Err(err(UpdaterErrorKind::NotConfigured, "no update endpoint is configured"));
-    }
-    Ok(urls)
-}
-
-/// The HTTP status each endpoint answers with, or why no answer came.
-///
-/// The client needs a rustls crypto provider, which the plugin installs inside
-/// its own `check()` before it builds a client. [`check_for_update`] calls this
-/// only after that check, so the provider is already in place.
-async fn probe_endpoints(endpoints: &[reqwest::Url]) -> Vec<Result<u16, String>> {
-    let client = match reqwest::Client::builder().timeout(ABSENCE_PROBE_TIMEOUT).build() {
-        Ok(client) => client,
-        Err(error) => return vec![Err(error.to_string())],
-    };
-    let mut answers = Vec::with_capacity(endpoints.len());
-    for url in endpoints {
-        answers.push(match client.get(url.clone()).send().await {
-            Ok(response) => Ok(response.status().as_u16()),
-            Err(error) => Err(error.to_string()),
-        });
-    }
-    answers
-}
-
-/// Decide from the probe's answers whether the endpoints hold no stable
-/// release. Only a 404 from every endpoint says so; `Ok(())` is that verdict.
-fn absence_verdict(answers: &[Result<u16, String>]) -> Result<(), String> {
-    if answers.is_empty() {
-        return Err(err(UpdaterErrorKind::NotConfigured, "no update endpoint is configured"));
-    }
-    for answer in answers {
-        match answer {
-            Ok(404) => {}
-            Ok(status @ 200..=299) => {
-                return Err(err(
-                    UpdaterErrorKind::Metadata,
-                    &format!("the update endpoint answered HTTP {status}, but the updater found no release in it"),
-                ));
-            }
-            Ok(status) => {
-                return Err(err(
-                    UpdaterErrorKind::Network,
-                    &format!("the update endpoint answered HTTP {status}, so the check did not complete"),
-                ));
-            }
-            Err(error) => {
-                return Err(err(
-                    UpdaterErrorKind::Network,
-                    &format!("the update endpoint could not be reached: {error}"),
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Ask the release endpoint whether something newer exists.
@@ -684,31 +696,253 @@ pub async fn updater_check(
     }
 
     let current_version = app.package_info().version.to_string();
-    let found = check_for_update(&app).await?;
+    let channel = *state.updater.channel.lock().await;
+    let ticket = state.updater.checks.begin();
+    let found = find_update(&app, &state, channel, &current_version).await?;
 
-    // Recorded only on success. A timestamp that says "checked a minute ago"
-    // after a failed check would read as "you are up to date".
+    // The answer is stored only if no later check started and the channel did
+    // not change while this one was in flight. The pending lock makes the test
+    // and the store one step, so a channel change cannot slip between them.
     let checked_at = Utc::now();
-    *state.updater.last_check.lock().await = Some(checked_at);
-
-    let info = match found {
-        Some(update) => {
-            let info = update_to_info(&update, &current_version);
-            *state.updater.pending.lock().await = Some(update);
-            Some(info)
+    let info = {
+        let mut pending = state.updater.pending.lock().await;
+        if !state.updater.checks.is_current(ticket) {
+            return Err(superseded_check());
         }
-        None => {
-            // Clear it: a stale pending update would let the install command
-            // apply a version the user was never shown.
-            *state.updater.pending.lock().await = None;
-            None
+        // Recorded only on success. A timestamp that says "checked a minute
+        // ago" after a failed check would read as "you are up to date".
+        *state.updater.last_check.lock().await = Some(checked_at);
+        match found.update {
+            Some(update) => {
+                let info = update_to_info(&update, &current_version);
+                *pending = Some(PendingUpdate {
+                    update,
+                    channel,
+                    generation: ticket.generation(),
+                });
+                Some(info)
+            }
+            None => {
+                // Clear it: a stale pending update would let the install command
+                // apply a version the user was never shown.
+                *pending = None;
+                None
+            }
         }
     };
 
     Ok(UpdateCheckResult {
         current_version,
+        channel: channel.as_str().to_string(),
         update: info,
         checked_at: checked_at.to_rfc3339(),
+        notices: found.notices,
+    })
+}
+
+/// What one discovery run found.
+struct Found {
+    update: Option<Update>,
+    notices: Vec<String>,
+}
+
+fn superseded_check() -> String {
+    err(
+        UpdaterErrorKind::Superseded,
+        "The update channel changed while SlashIt was checking. Check for updates again.",
+    )
+}
+
+/// Find the update the selected channel offers, if any.
+///
+/// The releases listing picks the release by version and channel. The plugin
+/// then reads that release's own manifest, verifies nothing yet (signatures are
+/// checked when the payload is downloaded), and reports whether the manifest is
+/// newer than the running build. The manifest must name the release's version.
+async fn find_update(
+    app: &AppHandle,
+    state: &tauri::State<'_, crate::AppState>,
+    channel: ReleaseChannel,
+    current_version: &str,
+) -> Result<Found, String> {
+    let current = PlainVersion::parse(current_version).ok_or_else(|| {
+        err(
+            UpdaterErrorKind::Internal,
+            &format!("the running version {current_version} is not a plain MAJOR.MINOR.PATCH"),
+        )
+    })?;
+    let feed = cached_feed(state).await?;
+    let Selection { chosen, notices } = update_feed::select(&feed, channel, current);
+    let Some(chosen) = chosen else {
+        return Ok(Found { update: None, notices });
+    };
+
+    let endpoint = tauri::Url::parse(&chosen.manifest_url).map_err(|error| {
+        err(UpdaterErrorKind::NotConfigured, &format!("the release manifest URL is invalid: {error}"))
+    })?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|e| from_plugin(&e))?
+        .timeout(MANIFEST_TIMEOUT)
+        .build()
+        .map_err(|e| from_plugin(&e))?;
+    let update = match updater.check().await.map_err(|e| from_plugin(&e))? {
+        Some(update) => update,
+        // The release is newer than this build by its tag, so a manifest the
+        // plugin will not offer contradicts the release. That is a broken
+        // release, not an up-to-date build, and it must not read as one.
+        None => {
+            return Err(err(
+                UpdaterErrorKind::Metadata,
+                &format!(
+                    "the release {} publishes a manifest that does not offer a version newer than {current_version}",
+                    chosen.tag
+                ),
+            ))
+        }
+    };
+    update_feed::check_manifest_version(&chosen, &update.version)
+        .map_err(|detail| err(UpdaterErrorKind::Metadata, &detail))?;
+    Ok(Found {
+        update: Some(update),
+        notices,
+    })
+}
+
+/// How long one manifest request may take before it is reported unreachable.
+const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The releases listing, from the cache when it is fresh enough.
+///
+/// Held across the request on purpose: concurrent checks wait for one listing
+/// rather than each spending a request of the unauthenticated quota.
+async fn cached_feed(state: &tauri::State<'_, crate::AppState>) -> Result<Feed, String> {
+    let mut cache = state.updater.feed_cache.lock().await;
+    if let Some((fetched, feed)) = cache.as_ref() {
+        if fetched.elapsed() < update_feed::CACHE_TTL {
+            return Ok(feed.clone());
+        }
+    }
+    let client = update_feed::client().map_err(|error| feed_error(&error))?;
+    let feed = update_feed::fetch_feed(&client, update_feed::RELEASES_API)
+        .await
+        .map_err(|error| feed_error(&error))?;
+    *cache = Some((Instant::now(), feed.clone()));
+    Ok(feed)
+}
+
+/// Turn a listing failure into its class. None of these means "up to date".
+fn feed_error(error: &FeedError) -> String {
+    match error {
+        FeedError::Unreachable(detail) => err(
+            UpdaterErrorKind::Network,
+            &format!("the release list could not be reached: {detail}"),
+        ),
+        FeedError::RateLimited => err(
+            UpdaterErrorKind::Network,
+            "GitHub is limiting requests for the release list. Try again later.",
+        ),
+        FeedError::Status(404) => err(
+            UpdaterErrorKind::Metadata,
+            "GitHub has no release list for this repository (HTTP 404).",
+        ),
+        FeedError::Status(status) => err(
+            UpdaterErrorKind::Network,
+            &format!("GitHub answered HTTP {status} for the release list, so the check did not complete."),
+        ),
+        FeedError::Malformed(detail) => err(
+            UpdaterErrorKind::Metadata,
+            &format!("the release list could not be read: {detail}"),
+        ),
+    }
+}
+
+/// Change the channel future checks use. Persisted before it takes effect.
+///
+/// Refused while an update is being installed or is staged for the restart,
+/// since either one was found under the channel being replaced. On success every
+/// pending update and every check in flight is invalidated, so nothing found
+/// under the old channel can be installed or displayed afterwards. The installed
+/// version is not touched; the caller re-checks the new channel.
+#[tauri::command]
+pub async fn updater_set_channel(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    channel: String,
+) -> Result<(), String> {
+    let channel = ReleaseChannel::parse(&channel).ok_or_else(|| {
+        err(UpdaterErrorKind::NotConfigured, &format!("{channel:?} is not an update channel"))
+    })?;
+
+    let mut pending = state.updater.pending.lock().await;
+    if state.updater.installing.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(err(
+            UpdaterErrorKind::Install,
+            "An update is being installed. Change the channel after it finishes.",
+        ));
+    }
+    if state.updater.staged.lock().await.is_some() {
+        return Err(err(
+            UpdaterErrorKind::Install,
+            "An update is ready to install. Restart SlashIt before changing the channel.",
+        ));
+    }
+    let mut selected = state.updater.channel.lock().await;
+    if *selected == channel {
+        return Ok(());
+    }
+
+    let saved = UpdatePreferences { channel }.save(&state.paths);
+    match saved {
+        Ok(()) => {}
+        // The file already says the new channel. Memory must follow the file,
+        // or the next check would run on a channel the file no longer holds.
+        Err(ConfigWriteError::PublishedNotDurable(error)) => {
+            adopt_channel(&mut selected, &mut pending, &state.updater.checks, channel);
+            return Err(err(
+                UpdaterErrorKind::Internal,
+                &format!("the update channel is now {}, but the change may not survive a crash: {error:#}", channel.as_str()),
+            ));
+        }
+        Err(error) => {
+            return Err(err(
+                UpdaterErrorKind::Internal,
+                &format!("the update channel could not be saved, so it is unchanged: {error:#}"),
+            ));
+        }
+    }
+
+    adopt_channel(&mut selected, &mut pending, &state.updater.checks, channel);
+    Ok(())
+}
+
+/// Makes a channel the file now holds the effective one in memory. Every check
+/// in flight and every update found under the old channel is invalidated. Used
+/// for both the durable and the published-but-not-durable outcomes, because in
+/// the second the file already says the new channel.
+fn adopt_channel<T>(
+    selected: &mut ReleaseChannel,
+    pending: &mut Option<T>,
+    checks: &CheckSequence,
+    channel: ReleaseChannel,
+) {
+    *selected = channel;
+    checks.supersede();
+    *pending = None;
+}
+
+/// Refuses an install whose offered release is not the one the person accepted.
+/// The install applies the version it finds, so a channel change or a newer
+/// check between display and click must not swap in a different release.
+fn accepted_version_refusal(offered: &str, accepted: &str) -> Option<String> {
+    (offered != accepted).then(|| {
+        err(
+            UpdaterErrorKind::Superseded,
+            &format!(
+                "SlashIt would install {offered}, not the {accepted} you accepted. Check for updates again."
+            ),
+        )
     })
 }
 
@@ -723,6 +957,7 @@ pub async fn updater_download_and_install(
     _gui: GuiMutation,
     app: AppHandle,
     state: tauri::State<'_, crate::AppState>,
+    accepted_version: String,
 ) -> Result<(), String> {
     let flag = state.features.read().await.get(AUTO_UPDATE_FLAG);
     if let Some(refusal) = feature_refusal(flag, &state.paths.feature_flags_file()) {
@@ -744,23 +979,50 @@ pub async fn updater_download_and_install(
         return Err(refusal);
     }
 
-    let cached = state.updater.pending.lock().await.take();
-    let update = match cached {
-        Some(update) => update,
+    // The channel and the pending update are read under the pending lock, which
+    // a channel change holds while it checks for an install in progress and
+    // writes the new channel. So the channel read here is the one this install
+    // runs under, whichever of the two started first.
+    let (channel, cached, generation) = {
+        let mut pending = state.updater.pending.lock().await;
+        let channel = *state.updater.channel.lock().await;
+        (channel, pending.take(), state.updater.checks.generation())
+    };
+    let pending = match cached {
+        Some(pending) => {
+            // An update found under a channel the person has since left is not
+            // the one the current channel offers. Refuse it, do not install it.
+            if pending.channel != channel || pending.generation != generation {
+                return Err(superseded_check());
+            }
+            pending
+        }
         None => {
-            let updater = app.updater().map_err(|e| from_plugin(&e))?;
-            updater
-                .check()
-                .await
-                .map_err(|e| from_plugin(&e))?
-                .ok_or_else(|| {
-                    err(
-                        UpdaterErrorKind::NoUpdate,
-                        "SlashIt is already on the latest published version.",
-                    )
-                })?
+            let version = app.package_info().version.to_string();
+            let found = find_update(&app, &state, channel, &version).await?;
+            let update = found.update.ok_or_else(|| {
+                // Say why, when the listing had a reason: a newer release that
+                // has no manifest is otherwise indistinguishable from none.
+                let mut message = "SlashIt is already on the latest published version.".to_string();
+                for notice in &found.notices {
+                    message.push(' ');
+                    message.push_str(notice);
+                }
+                err(UpdaterErrorKind::NoUpdate, &message)
+            })?;
+            PendingUpdate {
+                update,
+                channel,
+                generation,
+            }
         }
     };
+    // Checked before a byte is downloaded. The release on screen is the one the
+    // person accepted; a different release is refused, never installed instead.
+    if let Some(refusal) = accepted_version_refusal(&pending.update.version, &accepted_version) {
+        return Err(refusal);
+    }
+    let update = pending.update.clone();
 
     let events = state.events();
     events.emit(
@@ -814,8 +1076,12 @@ pub async fn updater_download_and_install(
         Err(e) => {
             // Put it back. The update is still the one the last check found,
             // and a dropped connection should not force the user to check
-            // again before retrying.
-            *state.updater.pending.lock().await = Some(update);
+            // again before retrying. A check that ran during the install may
+            // already have stored an answer; that newer answer wins.
+            let mut slot = state.updater.pending.lock().await;
+            if slot.is_none() {
+                *slot = Some(pending);
+            }
             Err(from_plugin(&e))
         }
     }
@@ -866,65 +1132,110 @@ mod tests {
     use tauri_plugin_updater::Error as PluginError;
 
     #[test]
-    fn only_a_404_from_every_endpoint_means_no_stable_release() {
-        assert_eq!(absence_verdict(&[Ok(404)]), Ok(()));
-        assert_eq!(absence_verdict(&[Ok(404), Ok(404)]), Ok(()));
-
-        let server = absence_verdict(&[Ok(503)]).unwrap_err();
-        assert!(server.starts_with("network: ") && server.contains("503"), "{server}");
-        let limited = absence_verdict(&[Ok(404), Ok(429)]).unwrap_err();
-        assert!(limited.starts_with("network: "), "{limited}");
-        let unreachable = absence_verdict(&[Err("dns failure".into())]).unwrap_err();
-        assert!(unreachable.starts_with("network: "), "{unreachable}");
-        let contradicted = absence_verdict(&[Ok(200)]).unwrap_err();
-        assert!(contradicted.starts_with("metadata: "), "{contradicted}");
-        assert!(absence_verdict(&[]).unwrap_err().starts_with("not-configured: "));
+    fn only_the_newest_check_may_store_its_answer() {
+        let checks = CheckSequence::default();
+        let background = checks.begin();
+        assert!(checks.is_current(background));
+        let manual = checks.begin();
+        assert!(!checks.is_current(background), "a later check makes the earlier answer stale");
+        assert!(checks.is_current(manual));
     }
 
     #[test]
-    fn endpoints_come_from_the_configured_updater_section() {
-        let section = serde_json::json!({ "endpoints": ["https://example.test/latest.json"] });
-        assert_eq!(endpoints_from_config(Some(&section)).unwrap().len(), 1);
-
-        let missing = endpoints_from_config(None).unwrap_err();
-        assert!(missing.starts_with("not-configured: "), "{missing}");
-        let bad = serde_json::json!({ "endpoints": ["not a url"] });
-        assert!(endpoints_from_config(Some(&bad)).unwrap_err().starts_with("not-configured: "));
+    fn a_channel_change_makes_every_check_in_flight_stale() {
+        let checks = CheckSequence::default();
+        let ticket = checks.begin();
+        let before = ticket.generation();
+        checks.supersede();
+        assert!(!checks.is_current(ticket), "a late answer from the old channel must not be stored");
+        assert_eq!(checks.generation(), before + 1);
+        let fresh = checks.begin();
+        assert!(checks.is_current(fresh));
+        assert_eq!(fresh.generation(), before + 1);
     }
 
-    /// A local endpoint that answers every connection with `status_line`.
-    fn serve(status_line: &'static str) -> (reqwest::Url, std::thread::JoinHandle<()>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = reqwest::Url::parse(&format!("http://{}/latest.json", listener.local_addr().unwrap())).unwrap();
-        let handle = std::thread::spawn(move || {
-            for stream in listener.incoming().take(1) {
-                let mut stream = stream.unwrap();
-                let mut request = [0u8; 4096];
-                let _ = std::io::Read::read(&mut stream, &mut request);
-                let response = format!("{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
-            }
-        });
-        (url, handle)
+    #[test]
+    fn a_channel_saved_but_not_durable_takes_effect_and_drops_the_old_answer() {
+        // The file already says the new channel, so memory must follow it and
+        // the update found under the old channel must not survive.
+        let checks = CheckSequence::default();
+        let mut selected = ReleaseChannel::Stable;
+        let mut pending = Some("found under stable");
+        let ticket = checks.begin();
+
+        adopt_channel(&mut selected, &mut pending, &checks, ReleaseChannel::Prerelease);
+
+        assert_eq!(selected, ReleaseChannel::Prerelease);
+        assert!(pending.is_none(), "an update found under the old channel must be dropped");
+        assert!(!checks.is_current(ticket), "a check started under the old channel must not store");
     }
 
-    #[tokio::test]
-    async fn the_probe_tells_a_missing_release_from_a_failing_server() {
-        // The plugin's check installs this provider before any request; the
-        // probe is never run without it in the app.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let (missing, first) = serve("HTTP/1.1 404 Not Found");
-        let answers = probe_endpoints(std::slice::from_ref(&missing)).await;
-        assert_eq!(answers, vec![Ok(404)]);
-        assert_eq!(absence_verdict(&answers), Ok(()));
-        first.join().unwrap();
+    #[test]
+    fn a_successful_channel_change_also_drops_the_old_answer() {
+        let checks = CheckSequence::default();
+        let mut selected = ReleaseChannel::Prerelease;
+        let mut pending = Some("found under prerelease");
+        let ticket = checks.begin();
 
-        let (failing, second) = serve("HTTP/1.1 503 Service Unavailable");
-        let answers = probe_endpoints(std::slice::from_ref(&failing)).await;
-        assert_eq!(answers, vec![Ok(503)]);
-        let shown = absence_verdict(&answers).unwrap_err();
-        assert!(shown.starts_with("network: ") && shown.contains("503"), "{shown}");
-        second.join().unwrap();
+        adopt_channel(&mut selected, &mut pending, &checks, ReleaseChannel::Stable);
+
+        assert_eq!(selected, ReleaseChannel::Stable);
+        assert!(pending.is_none());
+        assert!(!checks.is_current(ticket));
+    }
+
+    #[test]
+    fn an_install_of_a_different_release_than_accepted_is_refused() {
+        assert!(accepted_version_refusal("0.0.2", "0.0.2").is_none());
+        let refusal = accepted_version_refusal("0.0.3", "0.0.2").expect("a mismatch must be refused");
+        assert!(refusal.starts_with("superseded: "), "{refusal}");
+        assert!(refusal.contains("0.0.3") && refusal.contains("0.0.2"), "{refusal}");
+    }
+
+    #[test]
+    fn a_listing_failure_is_never_reported_as_up_to_date() {
+        let classes = [
+            feed_error(&FeedError::Unreachable("dns".into())),
+            feed_error(&FeedError::RateLimited),
+            feed_error(&FeedError::Status(503)),
+            feed_error(&FeedError::Status(403)),
+            feed_error(&FeedError::Malformed("not json".into())),
+            feed_error(&FeedError::Status(404)),
+        ];
+        for message in &classes {
+            assert!(!message.starts_with("no-update"), "{message}");
+        }
+        assert!(classes[0].starts_with("network: "));
+        assert!(classes[1].starts_with("network: ") && classes[1].contains("limiting"));
+        assert!(classes[2].starts_with("network: ") && classes[2].contains("503"));
+        assert!(classes[4].starts_with("metadata: "));
+        assert!(classes[5].starts_with("metadata: "));
+    }
+
+    #[test]
+    fn the_build_reports_the_channel_its_version_is_declared_on() {
+        let text = include_str!("../../../.github/release-channels.txt");
+        let declarations = crate::release_channel::parse_declarations(text).unwrap();
+        let version = PlainVersion::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        assert_eq!(
+            crate::release_channel::channel_for(&declarations, version),
+            Some(installed_channel())
+        );
+    }
+
+    #[test]
+    fn the_status_reports_the_installed_build_apart_from_the_selection() {
+        let value = serde_json::to_value(build_status(
+            "0.0.1".to_string(),
+            &probe("linux", InstallKind::AppImage),
+            Some(true),
+            None,
+            ReleaseChannel::Prerelease,
+            ReleaseChannel::Stable,
+        ))
+        .unwrap();
+        assert_eq!(value["installedChannel"], "prerelease");
+        assert_eq!(value["updateChannel"], "stable");
     }
 
     #[test]
@@ -1268,6 +1579,8 @@ mod tests {
             &probe("linux", InstallKind::AppImage),
             Some(true),
             None,
+            ReleaseChannel::Stable,
+            ReleaseChannel::Stable,
         );
         assert_eq!(status.current_version, "1.2.3");
         assert!(status.supported);
@@ -1285,6 +1598,8 @@ mod tests {
             &probe("linux", InstallKind::AppImage),
             Some(false),
             None,
+            ReleaseChannel::Stable,
+            ReleaseChannel::Stable,
         );
         assert!(off.supported);
         assert!(!off.enabled);
@@ -1296,6 +1611,8 @@ mod tests {
             &probe("linux", InstallKind::Deb),
             Some(true),
             None,
+            ReleaseChannel::Stable,
+            ReleaseChannel::Stable,
         );
         assert!(!deb.supported);
         assert!(deb.enabled);
@@ -1309,6 +1626,8 @@ mod tests {
             &probe("linux", InstallKind::AppImage),
             None,
             None,
+            ReleaseChannel::Stable,
+            ReleaseChannel::Stable,
         );
         assert!(status.supported, "the install itself is fine");
         assert!(!status.enabled);
@@ -1329,6 +1648,8 @@ mod tests {
             &probe("linux", InstallKind::Deb),
             None,
             None,
+            ReleaseChannel::Stable,
+            ReleaseChannel::Stable,
         );
         let reason = status.unsupported_reason.unwrap();
         assert!(reason.contains("dpkg"), "{reason}");
@@ -1350,6 +1671,8 @@ mod tests {
             &probe("linux", InstallKind::AppImage),
             Some(true),
             Some(when),
+            ReleaseChannel::Stable,
+            ReleaseChannel::Stable,
         );
         assert_eq!(
             status.last_check.as_deref(),
@@ -1394,6 +1717,8 @@ mod tests {
             &probe("linux", InstallKind::Deb),
             Some(true),
             None,
+            ReleaseChannel::Stable,
+            ReleaseChannel::Stable,
         ))
         .unwrap();
         assert_eq!(value["currentVersion"], "1.2.3");

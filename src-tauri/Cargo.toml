@@ -59,7 +59,13 @@ slashit-durable-fs = { path = "../crates/slashit-durable-fs" }
 sha2 = "0.10"
 hex = "0.4"
 tauri-plugin-updater = "2"
-reqwest = { version = "0.13", default-features = false }
+# The releases API client (`update_feed`). No TLS provider is compiled in by
+# default; the provider is the one the updater plugin uses, installed in
+# `update_feed::client`.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# The TLS provider the updater plugin also uses (`ring`), installed once by
+# `update_feed::client` before the first request.
+rustls = { version = "0.23", features = ["ring"] }
 # Argument parsing for the `slashitd` binary.
 clap = { version = "4", features = ["derive"] }
 # Embedded W3C WebDriver server, for acceptance builds only. Optional, so a
@@ -115,9 +121,6 @@ slashit-durable-fs = { path = "../crates/slashit-durable-fs", features = ["fault
 # paused-clock machinery.
 tokio = { version = "1", features = ["full", "test-util"] }
 mockall = "0.13"
-# TEST-ONLY. Installs the rustls provider the updater plugin installs before its
-# own requests, so the endpoint probe can run without a preceding plugin check.
-rustls = "0.23"
 # TEST-ONLY. `tauri::test::mock_app` is the only public way to obtain a real
 # `tauri::State<AppState>`: `State` is a newtype over a private reference with
 # no constructor, so a test that wants to drive a `#[tauri::command]` body

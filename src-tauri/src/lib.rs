@@ -12,6 +12,10 @@ mod pty;
 mod worktree;
 mod main_window;
 mod storage_accounting;
+// Public because `build.rs` compiles this module too; the declaration parser is
+// used by the build script and by tests, not by the application's runtime.
+pub mod release_channel;
+mod update_feed;
 /// What GitHub last said about the pull requests linked to tasks.
 pub mod pr_status;
 /// Building `AppState` once, for whichever front end wants it.
@@ -417,6 +421,7 @@ pub fn run() {
             describe_feature_flags,
             updater_status,
             updater_check,
+            updater_set_channel,
             updater_download_and_install,
             updater_restart,
             create_repository,

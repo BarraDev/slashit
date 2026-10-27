@@ -23,6 +23,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       channel: ${{ steps.version.outputs.channel }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -87,6 +88,29 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: cargo build -p slashit --release
 
+      # Pins the Tauri CLI to the version the updater signing probe runs
+      # (.github/workflows/updater-signing-probe.yml). Update both together.
+      # tauri-action would otherwise install @tauri-apps/cli@v2, which floats.
+      - name: Install the Tauri CLI
+        run: npm install --global @tauri-apps/cli@2.12.4
+
+      # The release description is this version's CHANGELOG.md section plus the
+      # installation and signing notices, built for the version the preflight
+      # job validated, so it cannot take another version's section. The text is
+      # multi-line, so it goes out through a delimiter that cannot occur in it.
+      - name: Write the release description for this version
+        id: notes
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/release-notes.sh "$VERSION" > "$RUNNER_TEMP/release-notes.md"
+          {
+            echo "body<<SLASHIT_RELEASE_NOTES_END"
+            cat "$RUNNER_TEMP/release-notes.md"
+            echo "SLASHIT_RELEASE_NOTES_END"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
@@ -103,27 +127,22 @@ jobs:
           # name a release something other than the tag that triggered it. The
           # preflight job has already proven the two agree, so this is the same
           # string by construction -- it just cannot drift again.
+          # Runs the pinned `tauri` installed above. Without this input
+          # tauri-action ignores the pin and installs @tauri-apps/cli@v2 itself.
+          tauriScript: tauri
           tagName: ${{ github.ref_name }}
           releaseName: 'SlashIt ${{ github.ref_name }}'
-          # The curated summary is the CHANGELOG.md at this tag. Its link
-          # reference for this version points at the comparison with the
-          # previous release, so the body needs no version-specific link of
-          # its own and no list of merged pull requests.
-          releaseBody: |
-            Curated summary: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md
-
-            Installers are not yet OS code-signed: Windows SmartScreen and
-            macOS Gatekeeper will warn on first run.
+          # The CHANGELOG.md section for this version, then the installation
+          # and signing notices. See scripts/release-notes.sh.
+          releaseBody: ${{ steps.notes.outputs.body }}
           # Drafts are deliberate. Nothing in this workflow verifies that the
           # artifacts install and launch, so a human checks them and presses
           # Publish. Note that a draft is invisible to the updater endpoint --
           # see the summary printed by the next job.
           releaseDraft: true
-          # The channel the preflight job read from .github/release-channels.txt.
-          # A prerelease is never marked latest, so it cannot become the release
-          # the updater's latest.json points at. Anything but "prerelease" is a
-          # stable release.
-          prerelease: ${{ needs.preflight.outputs.channel == 'prerelease' }}
+          # The flag the preflight job derived from the channel it read from
+          # .github/release-channels.txt. A prerelease is never marked latest.
+          prerelease: ${{ needs.preflight.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }}
           uploadUpdaterJson: true
 
@@ -141,7 +160,7 @@ jobs:
       - name: Explain what still has to happen by hand
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
-          IS_PRERELEASE: ${{ needs.preflight.outputs.channel == 'prerelease' }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
         run: |
           set -euo pipefail
           {
@@ -155,17 +174,18 @@ jobs:
             echo
             echo "### Auto-update"
             echo
-            echo "The updater endpoint is \`releases/latest/download/latest.json\`."
-            echo "GitHub's \`latest\` excludes drafts **and** prereleases, so:"
+            echo "The app does not read \`releases/latest\`. It lists the releases and"
+            echo "offers the highest version its update channel allows. Drafts are never"
+            echo "offered; a published release is offered once it has a \`latest.json\`."
             echo
             if [ "$IS_PRERELEASE" = "true" ]; then
-              echo "- \`$VERSION\` is a prerelease. Publishing it will **not** make it"
-              echo "  reachable by the updater, by design: existing installs must not be"
-              echo "  auto-upgraded onto a release candidate."
+              echo "- \`$VERSION\` is a prerelease. Once published, it is offered to installs"
+              echo "  on the Prerelease update channel. Installs on the Stable channel are not"
+              echo "  offered it."
             else
-              echo "- \`$VERSION\` is a stable release. Auto-update starts working the"
-              echo "  moment the draft is published, and not before."
+              echo "- \`$VERSION\` is a stable release. Once published, it is offered to installs"
+              echo "  on both the Stable and the Prerelease update channels."
             fi
             echo
-            echo "See docs/releasing.md."
+            echo "See docs/releasing.md, section 6."
           } >> "$GITHUB_STEP_SUMMARY"

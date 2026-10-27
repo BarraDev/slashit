@@ -326,6 +326,11 @@ impl AppPaths {
         self.config_dir.join("features.toml")
     }
 
+    /// The update channel the person chose (`config::updates`).
+    pub fn update_preferences_file(&self) -> PathBuf {
+        self.config_dir.join("updates.toml")
+    }
+
     /// IPC listener configuration: which transports are enabled and, for TCP,
     /// where to bind. Separate from `config.toml` so the CLI can read it
     /// without loading the whole desktop configuration model.

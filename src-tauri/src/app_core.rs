@@ -146,6 +146,7 @@ pub async fn build_state_with_paths(
     // The `gh` on `PATH`, in tests too: command tests stand in their own
     // there, as they do for every other `gh` call.
     let pr_statuses = Arc::new(crate::pr_status::PrStatuses::github());
+    let update_channel = crate::config::updates::UpdatePreferences::load(&paths).channel;
     let app_state = AppState {
         repository: repository_state,
         project: project_state,
@@ -162,7 +163,7 @@ pub async fn build_state_with_paths(
         mcp: commands::mcp::McpState::new(),
         memory: commands::memory::MemoryState::new(),
         appearance: commands::appearance::AppearanceState::new(),
-        updater: commands::updater::UpdaterState::new(),
+        updater: commands::updater::UpdaterState::new(update_channel),
         pty: PtyState::new(),
         storage,
         // Installed by the caller: a webview sink in the GUI, a logging sink

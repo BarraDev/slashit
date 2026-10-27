@@ -3,10 +3,11 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use wasm_bindgen::JsCast;
 use crate::components::update_banner::{
-    abandon_stalled, check_now, request_restart, start_install, UpdaterActivity, UpdaterContext,
+    abandon_stalled, check_now, request_restart, set_update_channel, start_install,
+    UpdaterActivity, UpdaterContext,
 };
 use crate::services::appearance_service::*;
-use crate::services::updater_service::format_bytes;
+use crate::services::updater_service::{format_bytes, CHANNEL_PRERELEASE, CHANNEL_STABLE};
 
 /// Helper to get checked state from checkbox event
 fn event_target_checked(ev: &leptos::ev::Event) -> bool {
@@ -368,6 +369,15 @@ pub fn Settings(
 /// Reads the same `UpdaterContext` the floating notice does, so the two can
 /// never contradict each other and a message here cannot survive the check that
 /// disproved it: `run_check` clears the failure before every attempt.
+/// The label a channel spelling is shown under.
+fn channel_label(channel: &str) -> &'static str {
+    match channel {
+        CHANNEL_PRERELEASE => "Prerelease",
+        CHANNEL_STABLE => "Stable",
+        _ => "Unknown",
+    }
+}
+
 #[component]
 fn UpdatesTab() -> impl IntoView {
     let Some(ctx) = use_context::<UpdaterContext>() else {
@@ -401,9 +411,11 @@ fn UpdatesTab() -> impl IntoView {
                                 })}
                             </div>
                             {move || {
-                                // No check button on a build that cannot act on
-                                // the answer.
-                                if ctx.blocked_reason().is_some() {
+                                // No check button where the backend would refuse the
+                                // check (feature flag off). A build that cannot
+                                // install may still check; the reason shown below
+                                // replaces only the install action.
+                                if !ctx.can_check() {
                                     return ().into_any();
                                 }
                                 let busy = ctx.activity.get().busy();
@@ -420,6 +432,60 @@ fn UpdatesTab() -> impl IntoView {
                             }}
                         </div>
                     </div>
+
+                    // The installed build's own channel, and the channel the person
+                    // selected for future updates. They are different facts: a
+                    // Stable selection does not relabel a Prerelease build.
+                    {move || {
+                        let status = ctx.status.get();
+                        let installed = status
+                            .as_ref()
+                            .map(|s| channel_label(&s.installed_channel))
+                            .unwrap_or("Unknown");
+                        let version = status
+                            .as_ref()
+                            .map(|s| s.current_version.clone())
+                            .unwrap_or_else(|| "Unknown".to_string());
+                        let selected = status.as_ref().map(|s| s.update_channel.clone()).unwrap_or_default();
+                        let is_prerelease = selected == CHANNEL_PRERELEASE;
+                        let busy = ctx.activity.get().busy();
+                        view! {
+                            <div class="p-4 rounded-xl bg-white/5 border border-white/10 space-y-4">
+                                <div>
+                                    <p class="text-xs uppercase tracking-wide text-white/40">"Installed build"</p>
+                                    <p class="font-medium text-white/90 mt-1">{format!("{version} · {installed}")}</p>
+                                </div>
+                                <fieldset class="space-y-2" disabled=busy>
+                                    <legend class="text-xs uppercase tracking-wide text-white/40 mb-2">"Update channel"</legend>
+                                    <label class="flex items-center gap-2 text-sm text-white/80">
+                                        <input
+                                            type="radio"
+                                            name="update-channel"
+                                            value=CHANNEL_STABLE
+                                            prop:checked=!is_prerelease
+                                            on:change=move |_| set_update_channel(ctx, CHANNEL_STABLE)
+                                        />
+                                        "Stable (default)"
+                                    </label>
+                                    <label class="flex items-center gap-2 text-sm text-white/80">
+                                        <input
+                                            type="radio"
+                                            name="update-channel"
+                                            value=CHANNEL_PRERELEASE
+                                            prop:checked=is_prerelease
+                                            on:change=move |_| set_update_channel(ctx, CHANNEL_PRERELEASE)
+                                        />
+                                        "Prerelease"
+                                    </label>
+                                </fieldset>
+                                {is_prerelease.then(|| view! {
+                                    <p class="text-xs text-amber-300">
+                                        "Prerelease builds are early and may contain regressions. Stable releases are still offered when they are newer."
+                                    </p>
+                                })}
+                            </div>
+                        }
+                    }}
 
                     // Unsupported or disabled: the reason replaces every action.
                     {move || ctx.blocked_reason().map(|reason| view! {
@@ -447,11 +513,33 @@ fn UpdatesTab() -> impl IntoView {
 
                     // A completed check that found nothing is a result worth
                     // stating; silence would read as "never checked".
-                    {move || ctx.up_to_date().then(|| view! {
-                        <div class="p-4 rounded-xl bg-white/5 border border-white/10">
-                            <p class="text-sm text-white/70">"SlashIt is up to date."</p>
-                        </div>
+                    {move || ctx.up_to_date().then(|| {
+                        let channel = ctx
+                            .status
+                            .get()
+                            .map(|s| channel_label(&s.update_channel))
+                            .unwrap_or("selected");
+                        view! {
+                            <div class="p-4 rounded-xl bg-white/5 border border-white/10">
+                                <p class="text-sm text-white/70">
+                                    {format!("No newer {channel} release is available. SlashIt is up to date.")}
+                                </p>
+                            </div>
+                        }
                     })}
+
+                    // Things the check noticed without failing, such as a newer
+                    // release that has no installer manifest yet.
+                    {move || {
+                        let notices = ctx.notices.get();
+                        (!notices.is_empty()).then(|| view! {
+                            <div class="p-4 rounded-xl bg-white/5 border border-white/10">
+                                <ul class="space-y-1 text-sm text-white/60 list-disc pl-5">
+                                    {notices.into_iter().map(|notice| view! { <li>{notice}</li> }).collect_view()}
+                                </ul>
+                            </div>
+                        })
+                    }}
 
                     {move || {
                         match ctx.activity.get() {

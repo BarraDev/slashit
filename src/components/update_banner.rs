@@ -17,7 +17,8 @@ use crate::services::tray_service::get_active_process_count;
 use crate::services::updater_service::{
     clear_skipped_version, format_bytes, get_skipped_version, set_skipped_version,
     subscribe_updater_progress, updater_check, updater_download_and_install, updater_restart,
-    updater_status, UpdateInfo, UpdaterFailure, UpdaterProgress, UpdaterStage, UpdaterStatus,
+    updater_set_channel, updater_status, UpdateInfo, UpdaterErrorKind, UpdaterFailure,
+    UpdaterProgress, UpdaterStage, UpdaterStatus,
 };
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
@@ -83,6 +84,8 @@ pub struct UpdaterContext {
     /// install", never as "can".
     pub status: RwSignal<Option<UpdaterStatus>>,
     pub available: RwSignal<Option<UpdateInfo>>,
+    /// Notices from the last check that found the selected channel's answer.
+    pub notices: RwSignal<Vec<String>>,
     pub last_check: RwSignal<Option<String>>,
     /// Separates "no update found" from "never looked".
     pub checked_once: RwSignal<bool>,
@@ -129,6 +132,11 @@ impl UpdaterContext {
         }
     }
 
+    /// Whether the backend will answer a check. See [`check_permitted`].
+    pub fn can_check(&self) -> bool {
+        self.status.with(|s| check_permitted(s.as_ref()))
+    }
+
     /// True only once a check has actually completed and reported nothing newer.
     pub fn up_to_date(&self) -> bool {
         self.checked_once.get()
@@ -166,12 +174,39 @@ impl UpdaterContext {
     }
 }
 
+/// Whether a check may be requested at all. This mirrors the feature refusal in
+/// `updater_check`, so a build whose flag is off is never asked, and its
+/// "disabled" answer is never shown as a failure. A build that cannot install
+/// still checks: the answer it gets is true, and the install affordance is
+/// withheld separately by [`UpdaterContext::blocked_reason`].
+pub fn check_permitted(status: Option<&UpdaterStatus>) -> bool {
+    status.is_some_and(|s| s.enabled)
+}
+
+/// Whether an offer found under `offer_channel` still belongs to the channel the
+/// backend reports as effective. An unknown effective channel never matches: an
+/// offer whose channel cannot be confirmed must not stay actionable.
+pub fn offer_matches_channel(offer_channel: Option<&str>, effective_channel: Option<&str>) -> bool {
+    matches!((offer_channel, effective_channel), (Some(offered), Some(effective)) if offered == effective)
+}
+
+/// Forgets the offer and everything found with it. Used whenever the channel an
+/// offer belongs to may no longer be the effective one. The installed version
+/// is left alone.
+fn clear_offer(ctx: UpdaterContext) {
+    ctx.available.set(None);
+    ctx.notices.set(Vec::new());
+    ctx.checked_once.set(false);
+    ctx.dismissed_version.set(None);
+}
+
 /// Creates the shared updater signals, wires the progress subscription, and
 /// starts the background poll. Call once from `App`.
 pub fn provide_updater_context() -> UpdaterContext {
     let ctx = UpdaterContext {
         status: RwSignal::new(None),
         available: RwSignal::new(None),
+        notices: RwSignal::new(Vec::new()),
         last_check: RwSignal::new(None),
         checked_once: RwSignal::new(false),
         activity: RwSignal::new(UpdaterActivity::Idle),
@@ -271,6 +306,13 @@ async fn run_check(ctx: UpdaterContext) {
 
     match updater_check().await {
         Ok(result) => {
+            // An answer for a channel that is no longer selected describes a
+            // different set of releases. Drop it rather than show it.
+            let selected = ctx.status.get_untracked().map(|s| s.update_channel);
+            if selected.as_deref() != Some(result.channel.as_str()) {
+                ctx.activity.set(UpdaterActivity::Idle);
+                return;
+            }
             ctx.last_check.set(Some(result.checked_at));
             // Keep the displayed version honest even if `updater_status` was
             // read before some other part of the app changed it.
@@ -280,21 +322,84 @@ async fn run_check(ctx: UpdaterContext) {
                 }
             });
             ctx.available.set(result.update);
+            ctx.notices.set(result.notices);
             ctx.checked_once.set(true);
             ctx.activity.set(UpdaterActivity::Idle);
         }
         Err(e) => {
             ctx.activity.set(UpdaterActivity::Idle);
-            ctx.record_failure(UpdaterFailure::new(UpdaterStage::Check, e));
+            let failure = UpdaterFailure::new(UpdaterStage::Check, e);
+            // Superseded means the channel changed under this check. The check
+            // that replaces it reports the answer, so this one is not a failure.
+            if failure.kind == UpdaterErrorKind::Superseded {
+                return;
+            }
+            ctx.record_failure(failure);
         }
     }
+}
+
+/// Switch the update channel, then check the newly selected one.
+///
+/// Refused while the updater is busy, so the selection cannot change under a
+/// check or an install. The backend invalidates anything found under the old
+/// channel; here the answer on screen is cleared to match, and the installed
+/// version is left alone.
+///
+/// The backend can switch channels and still report an error: the choice is
+/// saved but not confirmed durable, and it takes effect in memory anyway. After
+/// any failure the effective channel is read back, and the offer on screen is
+/// kept only if it is still the one for that channel. The backend's answer is
+/// authoritative in every case.
+pub fn set_update_channel(ctx: UpdaterContext, channel: &'static str) {
+    if ctx.activity.get_untracked().busy() {
+        return;
+    }
+    let shown_channel = ctx.status.get_untracked().map(|s| s.update_channel);
+    if shown_channel.as_deref() == Some(channel) {
+        return;
+    }
+    ctx.failure.set(None);
+    ctx.activity.set(UpdaterActivity::Checking);
+    spawn_local(async move {
+        match updater_set_channel(channel).await {
+            Ok(()) => {
+                ctx.status.update(|s| {
+                    if let Some(status) = s {
+                        status.update_channel = channel.to_string();
+                    }
+                });
+                clear_offer(ctx);
+                ctx.activity.set(UpdaterActivity::Idle);
+                // Only builds whose checks are permitted ask for the new channel's
+                // answer. A refused check would report "disabled" as a failure.
+                if ctx.can_check() {
+                    run_check(ctx).await;
+                }
+            }
+            Err(e) => {
+                ctx.activity.set(UpdaterActivity::Idle);
+                let effective = updater_status().await.ok();
+                if !offer_matches_channel(
+                    shown_channel.as_deref(),
+                    effective.as_ref().map(|s| s.update_channel.as_str()),
+                ) {
+                    clear_offer(ctx);
+                }
+                if let Some(status) = effective {
+                    ctx.status.set(Some(status));
+                }
+                ctx.record_failure(UpdaterFailure::new(UpdaterStage::Channel, e));
+            }
+        }
+    });
 }
 
 /// A check the user asked for. Unlike the background poll it un-skips whatever
 /// it finds — asking for a check is asking to see the answer — and it is
 /// visible while it runs.
 pub fn check_now(ctx: UpdaterContext) {
-    if ctx.activity.get_untracked().busy() {
+    if ctx.activity.get_untracked().busy() || !ctx.can_check() {
         return;
     }
     ctx.check_user_initiated.set(true);
@@ -323,6 +428,15 @@ pub fn start_install(ctx: UpdaterContext) {
         ));
         return;
     }
+    // The install is bound to the version on screen. The backend applies exactly
+    // this version or refuses, so without an offer there is nothing to bind to.
+    let Some(accepted_version) = ctx.available.get_untracked().map(|u| u.version) else {
+        ctx.record_failure(UpdaterFailure::new(
+            UpdaterStage::Check,
+            "no-update: There is no offered update to install. Check for updates first.".to_string(),
+        ));
+        return;
+    };
 
     ctx.failure.set(None);
     ctx.stalled.set(false);
@@ -337,7 +451,7 @@ pub fn start_install(ctx: UpdaterContext) {
     watch_for_stall(ctx, generation);
 
     spawn_local(async move {
-        let outcome = updater_download_and_install().await;
+        let outcome = updater_download_and_install(&accepted_version).await;
         // The backend serialises installs, so `abandon_stalled` followed by a
         // retry usually gets an immediate "already installing" error rather
         // than a second real download — but the guard is released the instant
@@ -357,7 +471,16 @@ pub fn start_install(ctx: UpdaterContext) {
             }
             Err(e) => {
                 ctx.activity.set(UpdaterActivity::Idle);
-                ctx.record_failure(UpdaterFailure::new(UpdaterStage::Install, e));
+                let failure = UpdaterFailure::new(UpdaterStage::Install, e);
+                if failure.kind == UpdaterErrorKind::Superseded {
+                    // The backend refused a different release than the one on
+                    // screen, so nothing was installed. The offer is stale: drop
+                    // it and make the next step a fresh check.
+                    clear_offer(ctx);
+                    ctx.record_failure(UpdaterFailure::new(UpdaterStage::Check, failure.detail));
+                } else {
+                    ctx.record_failure(failure);
+                }
             }
         }
     });
@@ -659,7 +782,13 @@ fn failure_card(ctx: UpdaterContext) -> AnyView {
         return ().into_any();
     };
 
-    let retry = failure.kind.retryable().then_some(failure.stage);
+    // A failed channel change is retried from Settings, where the person picks
+    // the channel again; a check button here would not repeat that change.
+    let retry = failure
+        .kind
+        .retryable()
+        .then_some(failure.stage)
+        .filter(|stage| *stage != UpdaterStage::Channel);
     let headline = failure.kind.headline();
     let hint = failure.kind.hint();
     let detail = format!("{}: {}", failure.stage.label(), failure.detail);
@@ -684,17 +813,18 @@ fn failure_card(ctx: UpdaterContext) -> AnyView {
                     "Dismiss"
                 </button>
                 {retry.map(|stage| {
+                    // `Channel` is filtered out above and never reaches here.
                     let label = match stage {
                         UpdaterStage::Restart => "Restart now",
                         UpdaterStage::Install => "Try again",
-                        UpdaterStage::Status | UpdaterStage::Check => "Check again",
+                        UpdaterStage::Status | UpdaterStage::Check | UpdaterStage::Channel => "Check again",
                     };
                     view! {
                         <button
                             on:click=move |_| match stage {
                                 UpdaterStage::Restart => request_restart(ctx),
                                 UpdaterStage::Install => start_install(ctx),
-                                UpdaterStage::Status | UpdaterStage::Check => check_now(ctx),
+                                UpdaterStage::Status | UpdaterStage::Check | UpdaterStage::Channel => check_now(ctx),
                             }
                             class="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-semibold text-white/85"
                         >
@@ -855,4 +985,57 @@ fn RestartConfirm() -> impl IntoView {
         }}
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(enabled: bool, supported: bool) -> UpdaterStatus {
+        UpdaterStatus {
+            current_version: "0.0.1".to_string(),
+            installed_channel: "stable".to_string(),
+            update_channel: "stable".to_string(),
+            supported,
+            unsupported_reason: None,
+            enabled,
+            last_check: None,
+        }
+    }
+
+    #[test]
+    fn a_build_with_the_flag_off_is_never_asked_to_check() {
+        assert!(!check_permitted(None), "an unknown capability must not check");
+        assert!(!check_permitted(Some(&status(false, true))));
+        assert!(!check_permitted(Some(&status(false, false))));
+    }
+
+    #[test]
+    fn a_build_that_cannot_install_still_checks() {
+        // Its answer is true, and the install affordance is withheld separately.
+        assert!(check_permitted(Some(&status(true, false))));
+        assert!(check_permitted(Some(&status(true, true))));
+    }
+
+    #[test]
+    fn an_offer_stays_only_while_the_effective_channel_is_the_one_it_was_found_under() {
+        // Ordinary success: the channel moved, so the old offer is not kept.
+        assert!(!offer_matches_channel(Some("stable"), Some("prerelease")));
+        // Failure before publication: the backend still reports the old channel.
+        assert!(offer_matches_channel(Some("stable"), Some("stable")));
+    }
+
+    #[test]
+    fn a_saved_but_not_durable_channel_change_drops_the_offer() {
+        // The backend switched and reported an error. The effective channel is new.
+        assert!(!offer_matches_channel(Some("stable"), Some("prerelease")));
+    }
+
+    #[test]
+    fn an_offer_whose_effective_channel_cannot_be_read_is_not_kept() {
+        // Stale cached state: the status read failed, so nothing confirms the offer.
+        assert!(!offer_matches_channel(Some("stable"), None));
+        assert!(!offer_matches_channel(None, Some("stable")));
+        assert!(!offer_matches_channel(None, None));
+    }
 }

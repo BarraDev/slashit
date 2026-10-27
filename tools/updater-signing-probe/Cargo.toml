@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MPL-2.0
+[package]
+name = "slashit-updater-signing-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Verifies a Tauri updater signature exactly as tauri-plugin-updater does."
+publish = false
+license = "MPL-2.0"
+
+# A standalone crate: it is not a member of the application's workspace, so the
+# application build never compiles it and it never compiles the application.
+[workspace]
+
+[dependencies]
+# The verifier the pinned tauri-plugin-updater uses (see Cargo.lock of the app).
+minisign-verify = "0.2.5"
+base64 = "0.22"

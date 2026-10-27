@@ -54,10 +54,20 @@ pub struct UpdateInfo {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateCheckResult {
     pub current_version: String,
+    /// The channel the check ran on. An answer for a channel that is no longer
+    /// selected is dropped by the caller.
+    pub channel: String,
     #[serde(default)]
     pub update: Option<UpdateInfo>,
     pub checked_at: String,
+    #[serde(default)]
+    pub notices: Vec<String>,
 }
+
+/// The two update channels the person can choose between, as the backend
+/// spells them.
+pub const CHANNEL_STABLE: &str = "stable";
+pub const CHANNEL_PRERELEASE: &str = "prerelease";
 
 /// Whether this particular build is even capable of updating itself, and
 /// whether configuration allows it. Read before any install affordance is
@@ -66,6 +76,10 @@ pub struct UpdateCheckResult {
 #[serde(rename_all = "camelCase")]
 pub struct UpdaterStatus {
     pub current_version: String,
+    /// The channel this build was published on. Fixed at build time.
+    pub installed_channel: String,
+    /// The channel the person selected for future updates.
+    pub update_channel: String,
     pub supported: bool,
     #[serde(default)]
     pub unsupported_reason: Option<String>,
@@ -104,6 +118,7 @@ pub enum UpdaterStage {
     Check,
     Install,
     Restart,
+    Channel,
 }
 
 impl UpdaterStage {
@@ -113,6 +128,7 @@ impl UpdaterStage {
             UpdaterStage::Check => "Update check",
             UpdaterStage::Install => "Update install",
             UpdaterStage::Restart => "Restart",
+            UpdaterStage::Channel => "Update channel",
         }
     }
 }
@@ -128,6 +144,9 @@ pub enum UpdaterErrorKind {
     Unsupported,
     Disabled,
     Stalled,
+    /// The answer belongs to a channel that was changed while it was in flight.
+    /// Not shown as a failure; the caller drops it.
+    Superseded,
     Unknown,
 }
 
@@ -140,6 +159,7 @@ impl UpdaterErrorKind {
             UpdaterErrorKind::Unsupported => "This build cannot update itself",
             UpdaterErrorKind::Disabled => "Updates are turned off for this build",
             UpdaterErrorKind::Stalled => "The update stopped reporting progress",
+            UpdaterErrorKind::Superseded => "The update changed while it was being checked",
             UpdaterErrorKind::Unknown => "The update did not complete",
         }
     }
@@ -164,6 +184,7 @@ impl UpdaterErrorKind {
             UpdaterErrorKind::Stalled => {
                 "It may still be running in the background. Give it a moment, then check again."
             }
+            UpdaterErrorKind::Superseded => "Check again to see the answer for the selected channel.",
             UpdaterErrorKind::Unknown => {
                 "The running version is unchanged. Try again, or check the release page."
             }
@@ -207,6 +228,7 @@ pub fn classify_error(raw: &str) -> UpdaterErrorKind {
         "not-configured" => return UpdaterErrorKind::Unsupported,
         "disabled" => return UpdaterErrorKind::Disabled,
         "stalled" => return UpdaterErrorKind::Stalled,
+        "superseded" => return UpdaterErrorKind::Superseded,
         // Named explicitly rather than left to the substring fallback, so a
         // reworded backend message cannot silently reclassify them. All three
         // mean "it did not finish", which is what `Unknown` says.
@@ -293,13 +315,25 @@ pub async fn updater_check() -> Result<UpdateCheckResult, String> {
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
+/// Select the channel future checks use. `channel` is `CHANNEL_STABLE` or
+/// `CHANNEL_PRERELEASE`. The backend persists it, invalidates anything found
+/// under the previous channel, and refuses while an update is being installed.
+pub async fn updater_set_channel(channel: &str) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "channel": channel }))
+        .map_err(|e| e.to_string())?;
+    invoke("updater_set_channel", args).await.map(|_| ())
+}
+
 /// Downloads and stages the update. Since the backend stopped calling
 /// `app.restart()` itself, `Ok(())` means "installed, not yet running" — the
 /// caller must ask the user before restarting.
-pub async fn updater_download_and_install() -> Result<(), String> {
-    invoke("updater_download_and_install", empty_args())
-        .await
-        .map(|_| ())
+///
+/// `accepted_version` is the version on screen. The backend installs exactly
+/// that version or refuses, so no other release can be applied in its place.
+pub async fn updater_download_and_install(accepted_version: &str) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "acceptedVersion": accepted_version }))
+        .map_err(|e| e.to_string())?;
+    invoke("updater_download_and_install", args).await.map(|_| ())
 }
 
 /// Replaces the running process. On success this never resolves, so an `Ok`
