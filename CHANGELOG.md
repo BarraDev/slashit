@@ -106,10 +106,12 @@ Known gaps in this prerelease:
   covers the `.deb`, `.rpm` and `.AppImage` on Linux, the `.msi` and NSIS `.exe`
   on Windows, and the `.dmg` on macOS. Upgrading over an earlier install has not
   been tested either.
-- The contents of each package have not been checked on the built artifacts.
-  Whether the `.deb`, `.rpm` and `.AppImage` include `slashitd`, and whether the
-  `.deb` and `.rpm` include the `slashit` client, is not yet confirmed. The
-  macOS and Windows installers have not been checked for `slashitd`.
+- The Linux packages were checked only as built locally, with a disposable
+  signing key and not the release key. The `.deb` and `.rpm` contain `slashit`,
+  `slashit-ui` and `slashitd`. The `.AppImage` contains `slashitd` and
+  `slashit-ui`, and not the `slashit` client. No package contains the test
+  fixture binary. The macOS and Windows installers have not been checked for
+  `slashitd`, and the packages from the release workflow have not been checked.
 - The installers are not code-signed, so Windows SmartScreen and macOS Gatekeeper
   warn on first launch. The warnings have not been observed on real machines.
 - The update path has not been run against a published release. Updates are

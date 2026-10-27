@@ -119,6 +119,12 @@ jobs:
       - name: Release preflight channel and version rules
         run: scripts/test-release-preflight.sh
 
+      # The release description is one version's CHANGELOG section. This runs
+      # against fixture changelogs, so a version can never take another version's
+      # section, and against the repository's own CHANGELOG.md.
+      - name: Release description takes only its own version's section
+        run: scripts/test-release-notes.sh
+
       # The embedded WebDriver server can drive the webview and evaluate
       # arbitrary JavaScript. Asserting it stays out of a default build is
       # cheaper than trusting that nobody adds it to `default` by accident.
