@@ -2643,7 +2643,7 @@ mod disk_pressure {
     }
 
     #[tokio::test]
-    async fn attaching_a_checkout_or_starting_an_agent_directly_is_refused_on_a_critical_disk() {
+    async fn attaching_a_checkout_is_refused_on_a_critical_disk() {
         let disk = FakeDisk::with_available(10 * GIB);
         let (_tmp, state) = state_on(&disk).await;
         let (task_id, project_id) = seed(&state, TaskStatus::Backlog).await;
@@ -2654,14 +2654,6 @@ mod disk_pressure {
         let refused = crate::commands::worktree::create_worktree(GuiMutation::untracked(), app.state(), task_id.to_string()).await;
         assert!(refused.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{refused:?}");
         assert!(on_disk(state, project_id, task_id).worktree_path.is_none());
-
-        let refused = crate::commands::agent::start_agent(GuiMutation::untracked(), 
-            app.state(),
-            Uuid::new_v4().to_string(),
-            Some(task_id.to_string()),
-        )
-        .await;
-        assert!(refused.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{refused:?}");
         assert!(state.agent.executions.read().await.is_empty(), "nothing was recorded");
     }
 

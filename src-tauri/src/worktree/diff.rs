@@ -96,6 +96,26 @@ pub async fn task_diff(working_dir: &str, base_commit: Option<&str>) -> Result<T
     git_task_diff(working_dir, base).await
 }
 
+/// The approved part of a completed local task, after its checkout was
+/// removed. Compare the recorded starting commit with the approved commit,
+/// never with the project's current checkout or a branch that may have moved.
+pub async fn committed_task_diff(
+    repo: &str,
+    base: &str,
+    approved: &str,
+) -> Result<TaskDiff, TaskDiffError> {
+    for oid in [base, approved] {
+        if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(TaskDiffError::Failed(
+                "the recorded diff commit is not a full Git object ID".into(),
+            ));
+        }
+    }
+    let patch = run_git(repo, &["diff", base, approved, "--"]).await?;
+    let stat = run_git(repo, &["diff", "--stat", base, approved, "--"]).await?;
+    Ok(TaskDiff { patch, stat })
+}
+
 async fn jj_task_diff(working_dir: &str) -> Option<TaskDiff> {
     // jj's own repo discovery walks up parent directories exactly like
     // git's does, so without this check a task worktree nested (however

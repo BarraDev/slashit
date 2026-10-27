@@ -99,8 +99,6 @@ pub fn Settings(
         true
     });
 
-    let (git_colocation, set_git_colocation) = signal(true);
-
     let (diff_collapsed, set_diff_collapsed) = signal({
         web_sys::window()
             .and_then(|w| w.local_storage().ok().flatten())
@@ -230,20 +228,13 @@ pub fn Settings(
                                                         </code>
                                                     </div>
                                                 </div>
-                                                <div class="flex items-center justify-between p-4 rounded-xl bg-white/5 border border-white/10">
-                                                    <div>
-                                                        <p class="font-medium text-white/90">"Enable Git Colocation"</p>
-                                                        <p class="text-sm text-white/40 mt-1">"Use Git as backend for Jujutsu"</p>
-                                                    </div>
-                                                    <label class="relative inline-flex items-center cursor-pointer">
-                                                        <input
-                                                            type="checkbox"
-                                                            prop:checked=git_colocation
-                                                            on:change=move |ev| set_git_colocation.set(event_target_checked(&ev))
-                                                            class="sr-only peer"
-                                                        />
-                                                        <div class="w-11 h-6 bg-white/10 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-blue-500/50 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
-                                                    </label>
+                                                <div class="p-4 rounded-xl bg-white/5 border border-white/10">
+                                                    <p class="font-medium text-white/90">"Git colocation"</p>
+                                                    <p class="text-sm text-white/50 mt-1">
+                                                        "Task Checkouts are Git worktrees, so a Jujutsu project needs a repository colocated with Git. SlashIt initializes new Jujutsu repositories colocated. For an existing repository that is not colocated, run "
+                                                        <code class="text-xs font-mono">"jj git colocation enable"</code>
+                                                        " in the project folder."
+                                                    </p>
                                                 </div>
                                             </div>
                                         </div>

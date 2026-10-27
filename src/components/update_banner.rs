@@ -831,7 +831,7 @@ fn RestartConfirm() -> impl IntoView {
                                 }.into_any()
                             }}
                             <p class="text-white/40 text-xs mb-6">
-                                "Restarting will terminate all running processes. The update is already installed and will be used on the next launch either way."
+                                "Restarting ends each terminal and the shell in it. A background job that its shell left running after the shell exited keeps running. The update is already installed and will be used on the next launch either way."
                             </p>
                         </div>
                         <div class="flex items-center justify-end gap-3 p-6 border-t border-white/5">

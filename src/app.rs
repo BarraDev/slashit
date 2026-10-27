@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-use crate::components::{provide_updater_context, AppLayout, QuitDialog, UpdateBanner};
+use crate::components::{provide_updater_context, setup_keyboard_shortcuts, AppLayout, QuitDialog, UpdateBanner};
 use crate::pages::*;
 use crate::services::get_project;
 use leptos::prelude::*;
@@ -10,7 +10,12 @@ fn get_persisted_page() -> String {
     if let Some(window) = web_sys::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             if let Ok(Some(page)) = storage.get_item("slashit_current_page") {
-                return page;
+                // A page that was removed, or that the navigation no longer
+                // offers, would open with no sidebar entry to return by, so
+                // fall back to the default.
+                if page_restorable(&page) {
+                    return page;
+                }
             }
         }
     }
@@ -123,6 +128,10 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    // The Ctrl/Cmd page shortcuts shown in the sidebar. The listener lives for
+    // the whole session, so it is installed once, with this component.
+    setup_keyboard_shortcuts(on_navigate);
+
     view! {
         <QuitDialog />
         // Floats over the layout rather than sitting above it: AppLayout's root
@@ -134,7 +143,7 @@ pub fn App() -> impl IntoView {
             selected_project=selected_project
             set_selected_project=set_selected_project
         >
-            <div class="content">
+            <div class=move || if current_page.get() == "conversations" { "content h-full min-h-0" } else { "content" }>
                 {
                     let current_page = current_page;
                     let selected_project = selected_project;
@@ -145,7 +154,6 @@ pub fn App() -> impl IntoView {
                         "roadmap" => view! { <Roadmap project_id=selected_project.get() /> }.into_any(),
                         "ideation" => view! { <Ideation project_id=selected_project.get() /> }.into_any(),
                         "context" => view! { <Context project_id=selected_project.get() /> }.into_any(),
-                        "spec" => view! { <Spec project_id=selected_project.get() /> }.into_any(),
                         "settings" => view! { <Settings project_id=selected_project.get() /> }.into_any(),
                         "insights" => view! { <Insights project_id=selected_project.get() /> }.into_any(),
                         "changelog" => view! { <Changelog project_id=selected_project.get() /> }.into_any(),

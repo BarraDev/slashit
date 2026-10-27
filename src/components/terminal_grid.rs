@@ -3,9 +3,24 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::callback::Callback;
 use super::terminal::RealTerminal;
+use super::toast;
 use crate::services::{pty_service, get_project_path};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+
+/// Sends `command` to the terminals of `scope` (every terminal when `None`) and
+/// reports how many received it, or why none did, in a toast.
+fn run_invoke_all(command: &str, scope: Option<String>) {
+    let command = command.to_string();
+    spawn_local(async move {
+        match pty_service::invoke_all_terminals(&command, scope).await {
+            Ok(0) => toast::info(format!("No open terminals received '{}'", command)),
+            Ok(1) => toast::success(format!("Sent '{}' to 1 terminal", command)),
+            Ok(count) => toast::success(format!("Sent '{}' to {} terminals", command, count)),
+            Err(e) => toast::error(format!("Invoke All failed for '{}': {}", command, e)),
+        }
+    });
+}
 
 /// Helper to get value from input event
 fn event_target_value(ev: &web_sys::Event) -> String {
@@ -33,6 +48,12 @@ pub fn TerminalGrid(
     // Get the selected project from context (fallback to prop)
     let selected_project = use_context::<ReadSignal<String>>();
     let (current_project_id, set_current_project_id) = signal(project_id);
+    // The Project that Invoke All reaches. Empty selects every terminal, the
+    // same set the grid shows when no Project is selected.
+    let invoke_scope = move || {
+        let pid = current_project_id.get_untracked();
+        (!pid.is_empty()).then_some(pid)
+    };
 
     // All terminals (across all projects)
     let (all_terminals, set_all_terminals) = signal(Vec::<TerminalSession>::new());
@@ -288,12 +309,7 @@ pub fn TerminalGrid(
                                     <button
                                         on:click=move |_| {
                                             set_show_invoke_dropdown.set(false);
-                                            spawn_local(async move {
-                                                match pty_service::invoke_all_terminals("codebuff").await {
-                                                    Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked codebuff on {} terminals", count),
-                                                    Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke codebuff: {}", e),
-                                                }
-                                            });
+                                            run_invoke_all("codebuff", invoke_scope());
                                         }
                                         class="w-full text-left px-3 py-2 rounded hover:bg-white/10 text-white/90 text-sm flex items-center gap-2"
                                     >
@@ -303,12 +319,7 @@ pub fn TerminalGrid(
                                     <button
                                         on:click=move |_| {
                                             set_show_invoke_dropdown.set(false);
-                                            spawn_local(async move {
-                                                match pty_service::invoke_all_terminals("claude").await {
-                                                    Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked claude on {} terminals", count),
-                                                    Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke claude: {}", e),
-                                                }
-                                            });
+                                            run_invoke_all("claude", invoke_scope());
                                         }
                                         class="w-full text-left px-3 py-2 rounded hover:bg-white/10 text-white/90 text-sm flex items-center gap-2"
                                     >
@@ -332,12 +343,7 @@ pub fn TerminalGrid(
                                                         let cmd = custom_command.get();
                                                         if !cmd.is_empty() {
                                                             set_show_invoke_dropdown.set(false);
-                                                            spawn_local(async move {
-                                                                match pty_service::invoke_all_terminals(&cmd).await {
-                                                                    Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked '{}' on {} terminals", cmd, count),
-                                                                    Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke '{}': {}", cmd, e),
-                                                                }
-                                                            });
+                                                            run_invoke_all(&cmd, invoke_scope());
                                                             set_custom_command.set(String::new());
                                                         }
                                                     }
@@ -349,12 +355,7 @@ pub fn TerminalGrid(
                                                     let cmd = custom_command.get();
                                                     if !cmd.is_empty() {
                                                         set_show_invoke_dropdown.set(false);
-                                                        spawn_local(async move {
-                                                            match pty_service::invoke_all_terminals(&cmd).await {
-                                                                Ok(count) => leptos::logging::log!("[TerminalGrid] Invoked '{}' on {} terminals", cmd, count),
-                                                                Err(e) => leptos::logging::error!("[TerminalGrid] Failed to invoke '{}': {}", cmd, e),
-                                                            }
-                                                        });
+                                                        run_invoke_all(&cmd, invoke_scope());
                                                         set_custom_command.set(String::new());
                                                     }
                                                 }
@@ -472,7 +473,8 @@ pub fn TerminalGrid(
                                             let height = height_class.to_string();
                                             let session_id = if terminal.id.is_empty() { None } else { Some(terminal.id.clone()) };
                                             let term_working_dir = terminal.working_directory.clone();
-                                            
+                                            let term_project_id = terminal.project_id.clone();
+
                                             let on_session_created = {
                                                 let term_id_for_close = term_id.clone();
                                                 Callback::new(move |new_session_id: Option<String>| {
@@ -505,6 +507,7 @@ pub fn TerminalGrid(
                                                         name=term_name_for_view
                                                         session_id=session_id
                                                         working_directory=term_working_dir
+                                                        project_id=term_project_id
                                                         on_session_created=on_session_created
                                                         on_close=on_close
                                                     />

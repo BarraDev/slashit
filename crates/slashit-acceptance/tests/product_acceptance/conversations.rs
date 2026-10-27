@@ -484,7 +484,7 @@ async fn a_failed_coordinator_turn_survives_restart_and_is_retried_once() {
 ///
 /// The last page is restored on reload, so a restarted session may already be
 /// on this page and must not be expected to land on the board.
-async fn open_conversations(driver: &WebDriver, project_id: &str) -> Result<()> {
+pub(super) async fn open_conversations(driver: &WebDriver, project_id: &str) -> Result<()> {
     driver.refresh().await.context("could not reload the application window")?;
     ui::assert_frontend_is_real(driver).await?;
     ui::visible(driver, &format!("[data-testid=\"rail-project-{project_id}\"]")).await?
@@ -509,7 +509,7 @@ async fn await_board_task_title(driver: &WebDriver, title: &str) -> Result<()> {
 /// centre of every navigation item, so clicking before it has collapsed is
 /// intercepted, or lands on the rail instead. Park the pointer on the page
 /// and wait for the rail to be back at its collapsed width first.
-async fn open_nav(driver: &WebDriver, page: &str, landmark: &str) -> Result<()> {
+pub(super) async fn open_nav(driver: &WebDriver, page: &str, landmark: &str) -> Result<()> {
     release_rail(driver).await?;
     ui::visible(driver, &format!("[data-testid=\"nav-{page}\"]")).await?.click().await
         .with_context(|| format!("could not open the {page} page"))?;
@@ -526,7 +526,7 @@ async fn release_rail(driver: &WebDriver) -> Result<()> {
 }
 
 /// Wait until the Project Rail satisfies a predicate over `rail`.
-async fn await_rail(driver: &WebDriver, predicate: &str) -> Result<()> {
+pub(super) async fn await_rail(driver: &WebDriver, predicate: &str) -> Result<()> {
     let script = format!("const rail = document.querySelector('[data-testid=\"project-rail\"]'); return !!rail && (() => {{ {predicate} }})();");
     let started = Instant::now();
     loop {
@@ -579,7 +579,7 @@ async fn await_conversation_idle(
     }
 }
 
-async fn await_text(driver: &WebDriver, selector: &str, text: &str) -> Result<()> {
+pub(super) async fn await_text(driver: &WebDriver, selector: &str, text: &str) -> Result<()> {
     let started = Instant::now();
     loop {
         let matches = super::page(

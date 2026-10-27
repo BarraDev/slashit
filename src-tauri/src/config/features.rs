@@ -103,12 +103,11 @@ pub static REGISTRY: &[FeatureDef] = &[
         description: "Check for and install application updates from GitHub Releases.",
         area: "updater",
         owner: "core",
-        // Off until the first non-draft, non-prerelease release exists. The
-        // configured endpoint is `releases/latest/download/latest.json`, and
-        // GitHub's "latest" excludes both drafts and prereleases, so with this
-        // on by default every user would see a failing check for a feature
-        // that cannot yet succeed. Turn it on with the first real release.
-        default: false,
+        // On by default. The endpoint is `releases/latest/download/latest.json`,
+        // and GitHub's "latest" excludes drafts and prereleases, so until the
+        // first stable release exists the check gets a 404. `updater_check`
+        // reads that as "no update", so the first pre-release shows no error.
+        default: true,
         read: |flags: &FeatureFlags| flags.auto_update,
         write: |flags: &mut FeatureFlags, value: bool| flags.auto_update = value,
     },
@@ -295,11 +294,8 @@ pub struct FeatureFlags {
     /// A remote `CreateTask` is a remote shell.
     pub remote_access: bool,
 
-    /// Check for and install application updates.
-    ///
-    /// Off until a non-draft, non-prerelease GitHub release exists — see the
-    /// registry entry. The updater plugin, its endpoint and its signing key are
-    /// all configured; only the release is missing.
+    /// Check for and install application updates. On by default; see the
+    /// registry entry for how a missing stable release is handled.
     pub auto_update: bool,
 
     /// Unrecognised keys, kept so a downgrade does not drop them.
@@ -680,15 +676,17 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_all_off() {
+    fn defaults_are_off_except_the_updater() {
         let flags = FeatureFlags::default();
         assert!(!flags.daemon_mode);
         assert!(!flags.remote_access);
+        assert!(flags.auto_update, "auto_update ships on");
         // And the struct default must agree with the registry, since serde
         // fills missing keys from the former and resolution from the latter.
         for def in REGISTRY {
-            assert!(!def.default, "{} must ship off", def.id);
-            assert_eq!(flags.get(def.id), Some(def.default));
+            let expected = def.id == "auto_update";
+            assert_eq!(def.default, expected, "{} default", def.id);
+            assert_eq!(flags.get(def.id), Some(expected));
         }
     }
 
@@ -712,6 +710,41 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let flags = FeatureFlags::load_from(&tmp.path().join("absent.toml"));
         assert_eq!(flags, FeatureFlags::default());
+    }
+
+    #[test]
+    fn a_saved_false_is_kept_even_though_the_default_is_on() {
+        // A file that saved `auto_update = false` cannot be told apart from one
+        // where the user turned it off, so the saved value wins.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("features.toml");
+        std::fs::write(&path, "daemon_mode = true\nauto_update = false\n").unwrap();
+        let flags = FeatureFlags::load_from(&path);
+        assert!(!flags.auto_update, "a saved false must stay false");
+        assert!(flags.daemon_mode, "other saved flags are untouched");
+    }
+
+    #[test]
+    fn a_file_that_never_saved_auto_update_gets_the_new_default() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("features.toml");
+        std::fs::write(&path, "daemon_mode = true\n").unwrap();
+        assert!(FeatureFlags::load_from(&path).auto_update);
+    }
+
+    #[test]
+    fn a_saved_choice_survives_a_restart() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        );
+        let mut flags = FeatureFlags::load(&paths);
+        flags.auto_update = false;
+        flags.save(&paths).unwrap();
+        assert!(!FeatureFlags::load(&paths).auto_update);
     }
 
     #[test]

@@ -53,6 +53,8 @@ mod disk_pressure;
 mod checkout_recovery;
 #[path = "product_acceptance/conversations.rs"]
 mod conversations;
+#[path = "product_acceptance/conversation_history.rs"]
+mod conversation_history;
 #[path = "product_acceptance/developer_tools.rs"]
 mod developer_tools;
 #[path = "product_acceptance/human_review.rs"]
@@ -71,6 +73,10 @@ mod needs_you;
 mod orphans;
 #[path = "product_acceptance/pr_status.rs"]
 mod pr_status;
+#[path = "product_acceptance/project_rail.rs"]
+mod project_rail;
+#[path = "product_acceptance/terminal_lifecycle.rs"]
+mod terminal_lifecycle;
 #[path = "product_acceptance/queue_settings.rs"]
 mod queue_settings;
 #[path = "product_acceptance/run_now.rs"]

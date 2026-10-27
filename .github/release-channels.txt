@@ -1,0 +1,14 @@
+# Release channel for each version the release workflow may publish.
+#
+# Format: <version> <channel>, where channel is `prerelease` or `stable`.
+#
+# scripts/release-preflight.sh reads this file. It refuses a tag whose version
+# has no line here, declares a version twice, names any other channel, or
+# declares a version with a prerelease suffix (0.1.0-1) as stable. A prerelease
+# is published with prerelease: true, so GitHub never marks it latest, and
+# releases/latest/download/latest.json, which the updater reads, never points
+# at it.
+#
+# Add a stable line in the same commit that prepares its CHANGELOG section.
+
+0.0.1 prerelease

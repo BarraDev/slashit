@@ -4,6 +4,7 @@ use leptos::task::spawn_local;
 use leptos::callback::Callback;
 use crate::services::{list_projects, get_project, get_project_path, check_claude_cli};
 use crate::components::toast;
+use crate::pages::{page_offered, SHOW_UNFINISHED_PAGES};
 
 #[component]
 pub fn Sidebar(
@@ -112,7 +113,7 @@ pub fn Sidebar(
                             </div>
                             <div>
                                 <h1 class="font-semibold text-white/90">"SlashIt"</h1>
-                                <p class="text-xs text-white/30">"Workspace"</p>
+                                <p class="text-xs text-white/30">"Task orchestration"</p>
                             </div>
                         </div>
                     }.into_any()
@@ -198,7 +199,7 @@ pub fn Sidebar(
                     current_page=current_page
                     on_navigate=on_navigate
                     label="Kanban".to_string()
-                    shortcut="K".to_string()
+                    shortcut="Ctrl+1".to_string()
                     collapsed=collapsed
                 >
                     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -210,7 +211,7 @@ pub fn Sidebar(
                     current_page=current_page
                     on_navigate=on_navigate
                     label="Agent Terminals".to_string()
-                    shortcut="A".to_string()
+                    shortcut="Ctrl+2".to_string()
                     collapsed=collapsed
                 >
                     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -222,31 +223,33 @@ pub fn Sidebar(
                     current_page=current_page
                     on_navigate=on_navigate
                     label="Insights".to_string()
-                    shortcut="N".to_string()
+                    shortcut="Ctrl+N".to_string()
                     collapsed=collapsed
                 >
                     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
                     </svg>
                 </SidebarNavItem>
-                <SidebarNavItem
-                    page="roadmap".to_string()
-                    current_page=current_page
-                    on_navigate=on_navigate
-                    label="Roadmap".to_string()
-                    shortcut="D".to_string()
-                    collapsed=collapsed
-                >
-                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
-                    </svg>
-                </SidebarNavItem>
+                {page_offered("roadmap").then(|| view! {
+                    <SidebarNavItem
+                        page="roadmap".to_string()
+                        current_page=current_page
+                        on_navigate=on_navigate
+                        label="Roadmap".to_string()
+                        shortcut="Ctrl+3".to_string()
+                        collapsed=collapsed
+                    >
+                        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                        </svg>
+                    </SidebarNavItem>
+                })}
                 <SidebarNavItem
                     page="context".to_string()
                     current_page=current_page
                     on_navigate=on_navigate
                     label="Context".to_string()
-                    shortcut="C".to_string()
+                    shortcut="Ctrl+4".to_string()
                     collapsed=collapsed
                 >
                     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -265,24 +268,26 @@ pub fn Sidebar(
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                     </svg>
                 </SidebarNavItem>
-                <SidebarNavItem
-                    page="worktrees".to_string()
-                    current_page=current_page
-                    on_navigate=on_navigate
-                    label="Worktrees".to_string()
-                    shortcut="W".to_string()
-                    collapsed=collapsed
-                >
-                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                    </svg>
-                </SidebarNavItem>
+                {page_offered("worktrees").then(|| view! {
+                    <SidebarNavItem
+                        page="worktrees".to_string()
+                        current_page=current_page
+                        on_navigate=on_navigate
+                        label="Worktrees".to_string()
+                        shortcut="".to_string()
+                        collapsed=collapsed
+                    >
+                        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                        </svg>
+                    </SidebarNavItem>
+                })}
                 <SidebarNavItem
                     page="github_issues".to_string()
                     current_page=current_page
                     on_navigate=on_navigate
                     label="GitHub Issues".to_string()
-                    shortcut="G".to_string()
+                    shortcut="".to_string()
                     collapsed=collapsed
                 >
                     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -294,7 +299,7 @@ pub fn Sidebar(
                     current_page=current_page
                     on_navigate=on_navigate
                     label="GitHub PRs".to_string()
-                    shortcut="P".to_string()
+                    shortcut="".to_string()
                     collapsed=collapsed
                 >
                     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -306,7 +311,7 @@ pub fn Sidebar(
                     current_page=current_page
                     on_navigate=on_navigate
                     label="Settings".to_string()
-                    shortcut="⌘,".to_string()
+                    shortcut="Ctrl+,".to_string()
                     collapsed=collapsed
                 >
                     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -314,7 +319,8 @@ pub fn Sidebar(
                     </svg>
                 </SidebarNavItem>
 
-                // Labs section separator
+                // Labs section: shown only while it holds pages that are built
+                {SHOW_UNFINISHED_PAGES.then(|| view! {
                 {move || if !collapsed.get() {
                     view! {
                         <div class="mt-4 mb-2 px-3">
@@ -369,6 +375,7 @@ pub fn Sidebar(
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" />
                     </svg>
                 </SidebarNavItem>
+                })}
             </nav>
 
             // Claude CLI status

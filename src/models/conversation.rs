@@ -8,14 +8,14 @@ pub enum Role { Human, Coordinator, Worker }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionStatus { Proposed, Approved, Running, Returned, Rejected, Interrupted, Failed, Withdrawn }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskAction { pub id: Uuid, pub target_task_id: Uuid, pub target_task_title: String, pub request: String, pub explanation: String, pub approved_request: Option<String>, pub status: ActionStatus, pub worker_result: Option<String>, pub coordinator_replied: bool, pub created_at: String }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EntryKind { HumanMessage { text: String }, CoordinatorReply { text: String }, ActionProposed { action_id: Uuid }, ActionDecision { action_id: Uuid, approved: bool, request: Option<String> }, WorkerStarted { action_id: Uuid }, WorkerResult { action_id: Uuid, result: String }, RunFailed { role: Role, message: String, #[serde(default)] retryable: bool }, ProjectActionProposed { action_id: Uuid }, ProjectActionDecision { action_id: Uuid, approved: bool }, ProjectActionApplied { action_id: Uuid, task_id: Uuid }, ProjectActionRefused { action_id: Uuid, reason: String }, ActionWithdrawn { action_id: Uuid, revision: u64 } }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry { pub id: Uuid, pub role: Role, pub kind: EntryKind, pub created_at: String }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Conversation { pub id: Uuid, pub project_id: Uuid, pub revision: u64, pub created_at: String, pub updated_at: String, pub entries: Vec<Entry>, pub actions: Vec<TaskAction>, #[serde(default)] pub project_actions: Vec<ProjectAction> }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,7 +35,7 @@ pub struct ExistingCheckout { pub checkout_path: String, pub branch: String, pub
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ProjectActionOutcome { Applied { task_id: Uuid, title: String }, AlreadyQueued { task_id: Uuid, title: String }, Refused { reason: String } }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectAction { pub id: Uuid, pub explanation: String, pub mutation: TaskMutation, pub status: ProjectActionStatus, #[serde(default)] pub outcome: Option<ProjectActionOutcome>, pub created_at: String }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,7 +52,7 @@ pub struct ConversationBoundedText { pub text: String, pub truncated: bool, pub 
 pub enum ConversationExecutionResult { Available { text: ConversationBoundedText }, Truncated { text: ConversationBoundedText }, Unavailable { reason: ConversationBoundedText }, NotRecorded, NotApplicable }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationExecution { pub action_id: Uuid, pub task_id: Uuid, pub task_title: String, pub state: ConversationExecutionState, pub transitional: bool, pub run: Option<u32>, pub result: ConversationExecutionResult, pub needs_human: bool, pub attention: Option<crate::models::AttentionReason>, pub explanation: ConversationBoundedText }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub conversation: Conversation,
     pub coordinator_live: bool,
@@ -109,5 +109,22 @@ mod tests {
         let retryable: EntryKind = serde_json::from_value(json!({"kind": "run_failed", "role": "coordinator", "message": "retry me", "retryable": true}))
             .expect("a retryable failure should decode");
         assert!(matches!(retryable, EntryKind::RunFailed { retryable: true, .. }));
+    }
+
+    #[test]
+    fn an_unchanged_poll_equals_the_shown_snapshot_and_a_status_change_does_not() {
+        let mut value = snapshot_json();
+        value["conversation"]["actions"] = json!([{
+            "id": Uuid::new_v4(), "target_task_id": Uuid::new_v4(), "target_task_title": "t",
+            "request": "r", "explanation": "e", "approved_request": null, "status": "running",
+            "worker_result": null, "coordinator_replied": false, "created_at": ""
+        }]);
+        let shown: Snapshot = serde_json::from_value(value.clone()).expect("snapshot should decode");
+        let polled: Snapshot = serde_json::from_value(value.clone()).expect("snapshot should decode");
+        assert!(shown == polled, "the same saved state must not look changed");
+
+        value["conversation"]["actions"][0]["status"] = json!("interrupted");
+        let changed: Snapshot = serde_json::from_value(value).expect("snapshot should decode");
+        assert!(shown != changed, "an action status change must reach the view");
     }
 }

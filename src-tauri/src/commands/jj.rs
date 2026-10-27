@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 //! Task diffs. The legacy JJ IPC commands that lived here were removed: JJ
 //! workspaces have no ownership model in SlashIt, so the status read and the
-//! mutating commands were disabled. Task diffs read the Git worktree only.
+//! mutating commands were disabled. Active Task diffs read the Git worktree;
+//! a completed local Task reads its approved commit after checkout removal.
 
 use crate::commands::gui_admission::GuiMutation;
 use uuid::Uuid;
 
-/// A task with no worktree has no diff of its own.
+/// A task with no worktree and no completed local approval has no diff of its own.
 ///
 /// This used to resolve the project's repository and diff that instead, so the
 /// UI showed the user's own uncommitted work under the task's name -- a
@@ -20,36 +21,44 @@ fn no_worktree_diff(task_id: Uuid) -> String {
     )
 }
 
-/// The one canonical task diff, shared by both `get_task_diff` and
-/// `get_task_diff_stat` -- neither IPC command computes its own range; both
-/// read the same [`crate::worktree::task_diff`] result the AI reviewer uses.
-async fn fetch_task_diff(
-    state: &tauri::State<'_, crate::AppState>,
+/// The one task diff answer shared by both IPC commands. While the Task owns a
+/// checkout, use the canonical working-tree diff the AI reviewer sees. After
+/// local completion, show only the commit that was approved.
+pub(crate) async fn fetch_task_diff(
+    state: &crate::AppState,
     task_uuid: Uuid,
 ) -> Result<crate::worktree::TaskDiff, String> {
-    let (worktree_path, base_commit) = {
+    let task = {
         let tasks = state.task.tasks.read().await;
-        match tasks.get(&task_uuid) {
-            Some(t) => (t.worktree_path.clone(), t.base_commit.clone()),
-            None => (None, None),
-        }
+        tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
 
-    let Some(wt_path) = worktree_path else {
+    let result = if let Some(wt_path) = task.worktree_path.as_deref() {
+        crate::worktree::task_diff(wt_path, task.base_commit.as_deref()).await
+    } else if task.completed_locally() {
+        let base = task.base_commit.as_deref().ok_or_else(|| {
+            format!(
+                "Task {task_uuid}'s diff boundary is unknown: it has no recorded starting commit."
+            )
+        })?;
+        let approved = task.human_review.approved_tip().ok_or_else(|| {
+            format!("Task {task_uuid} has no recorded approved commit to compare.")
+        })?;
+        let repo = crate::commands::integration::repo_path_of(state, task.project_id).await?;
+        crate::worktree::committed_task_diff(&repo, base, approved).await
+    } else {
         return Err(no_worktree_diff(task_uuid));
     };
 
-    crate::worktree::task_diff(&wt_path, base_commit.as_deref())
-        .await
-        .map_err(|e| match e {
-            crate::worktree::TaskDiffError::UnknownBoundary => format!(
-                "Task {task_uuid}'s diff boundary is unknown: it has no recorded starting \
-                 commit, so there is nothing reliable to compare its worktree against."
-            ),
-            crate::worktree::TaskDiffError::Failed(msg) => {
-                format!("Failed to compute the diff for task {task_uuid}: {msg}")
-            }
-        })
+    result.map_err(|e| match e {
+        crate::worktree::TaskDiffError::UnknownBoundary => format!(
+            "Task {task_uuid}'s diff boundary is unknown: it has no recorded starting \
+             commit, so there is nothing reliable to compare its worktree against."
+        ),
+        crate::worktree::TaskDiffError::Failed(msg) => {
+            format!("Failed to compute the diff for task {task_uuid}: {msg}")
+        }
+    })
 }
 
 #[tauri::command]

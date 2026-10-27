@@ -336,9 +336,12 @@ pub fn RealTerminal(
     #[prop(into)] name: String,
     session_id: Option<String>,
     working_directory: Option<String>,
+    // The Project the terminal was opened in; recorded on a new PTY session.
+    project_id: Option<String>,
     on_session_created: Callback<Option<String>>,
     on_close: Callback<()>,
 ) -> impl IntoView {
+    let project_id = StoredValue::new(project_id);
     let (current_session_id, set_current_session_id) = signal(session_id.clone());
     let (error, set_error) = signal(None::<String>);
     let (mode, set_mode) = signal(TerminalMode::Connecting);
@@ -592,13 +595,13 @@ pub fn RealTerminal(
                     Err(e) => {
                         leptos::logging::error!("[Terminal] ✗ Failed to attach: {}, spawning new session", e);
                         // Session might have died, spawn new one
-                        spawn_new_session_with_state(SpawnCtx { name, cols: current_cols, rows: current_rows, set_current_session_id, set_mode, set_error, set_view_state, on_session_created, terminal_state_rc: terminal_state_rc.clone(), cols_signal: cols, rows_signal: rows, set_exit_info, on_close, working_directory: wd_for_spawn.clone(), reconnect_trigger }).await;
+                        spawn_new_session_with_state(SpawnCtx { name, cols: current_cols, rows: current_rows, set_current_session_id, set_mode, set_error, set_view_state, on_session_created, terminal_state_rc: terminal_state_rc.clone(), cols_signal: cols, rows_signal: rows, set_exit_info, on_close, working_directory: wd_for_spawn.clone(), project_id: project_id.get_value(), reconnect_trigger }).await;
                     }
                 }
             } else {
                 // Spawn new session
                 leptos::logging::log!("[Terminal] Spawning new PTY session...");
-                spawn_new_session_with_state(SpawnCtx { name, cols: current_cols, rows: current_rows, set_current_session_id, set_mode, set_error, set_view_state, on_session_created, terminal_state_rc: terminal_state_rc.clone(), cols_signal: cols, rows_signal: rows, set_exit_info, on_close, working_directory: wd_for_spawn.clone(), reconnect_trigger }).await;
+                spawn_new_session_with_state(SpawnCtx { name, cols: current_cols, rows: current_rows, set_current_session_id, set_mode, set_error, set_view_state, on_session_created, terminal_state_rc: terminal_state_rc.clone(), cols_signal: cols, rows_signal: rows, set_exit_info, on_close, working_directory: wd_for_spawn.clone(), project_id: project_id.get_value(), reconnect_trigger }).await;
             }
         });
     });
@@ -673,6 +676,7 @@ pub fn RealTerminal(
                     set_exit_info,
                     on_close,
                     working_directory: wd,
+                    project_id: project_id.get_value(),
                     reconnect_trigger,
                 }).await;
                 
@@ -764,6 +768,7 @@ pub fn RealTerminal(
                     set_exit_info,
                     on_close: on_close_for_restart,
                     working_directory: wd_for_restart,
+                    project_id: project_id.get_value(),
                     reconnect_trigger,
                 }).await;
                 
@@ -1002,6 +1007,7 @@ pub fn RealTerminal(
                     </span>
                 </div>
                 <button
+                    data-testid="terminal-close"
                     on:click=move |ev| on_close_click_header(ev)
                     class="text-white/40 hover:text-white/60 transition-colors p-1 hover:bg-white/10 rounded"
                 >
@@ -1294,6 +1300,7 @@ struct SpawnCtx {
     set_exit_info: WriteSignal<ExitInfo>,
     on_close: Callback<()>,
     working_directory: Option<String>,
+    project_id: Option<String>,
     reconnect_trigger: RwSignal<bool>,
 }
 
@@ -1302,7 +1309,7 @@ async fn spawn_new_session_with_state(ctx: SpawnCtx) {
     let SpawnCtx {
         name, cols, rows, set_current_session_id, set_mode, set_error,
         set_view_state, on_session_created, terminal_state_rc, cols_signal,
-        rows_signal, set_exit_info, on_close, working_directory, reconnect_trigger,
+        rows_signal, set_exit_info, on_close, working_directory, project_id, reconnect_trigger,
     } = ctx;
     leptos::logging::log!("[Terminal] === Spawning new PTY session for: {} ({}x{}) working_dir={:?} ===", name, cols, rows, working_directory);
 
@@ -1326,7 +1333,7 @@ async fn spawn_new_session_with_state(ctx: SpawnCtx) {
             Some(cols),
             Some(rows),
             working_directory.clone(),
-            None, // TODO: pass project_id from context
+            project_id.clone(),
         ));
         
         // Create a timeout future (5 seconds per attempt)

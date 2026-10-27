@@ -600,6 +600,77 @@ async fn driver_click(driver: &WebDriver, selector: &str) -> Result<()> {
     Ok(())
 }
 
+/// Diagnostics only: wraps the page's Tauri `invoke` so that the answers to
+/// the two new-attempt commands are kept in `window.__naLog`. The wrapper
+/// returns the same promise the page gets, so nothing it sees changes.
+async fn record_new_attempt_answers(driver: &WebDriver) -> Result<()> {
+    const INSTALL: &str = r#"
+        const core = window.__TAURI__.core;
+        if (!window.__naLog) {
+            window.__naLog = [];
+            const invoke = core.invoke;
+            core.invoke = function (command, args, options) {
+                const pending = invoke.call(this, command, args, options);
+                if (command === "start_new_attempt" || command === "authorize_new_attempt") {
+                    pending.then(
+                        (value) => window.__naLog.push({ command: command, ok: JSON.stringify(value).slice(0, 800) }),
+                        (error) => window.__naLog.push({ command: command, err: String(error) })
+                    );
+                }
+                return pending;
+            };
+        }
+        return true;
+    "#;
+    driver.execute(INSTALL, vec![]).await?;
+    Ok(())
+}
+
+/// What a refused start left behind, for the failure message: the answers the
+/// backend gave the page, the messages the page shows, and the persisted Task.
+async fn new_attempt_diagnostics(driver: &WebDriver, root: &Path, task_id: &str) -> String {
+    const READ: &str = r#"
+        const alerts = Array.from(document.querySelectorAll('[role="alert"]'))
+            .map((element) => element.textContent.trim());
+        const start = document.querySelector('[data-testid="new-attempt-start"]');
+        return {
+            answers: window.__naLog || [],
+            alerts: alerts,
+            confirm_open: !!document.querySelector('[data-testid="new-attempt-confirm"]'),
+            start_disabled: start ? start.disabled : null,
+            busy_text: start ? start.textContent.trim() : null
+        };
+    "#;
+    let page = match driver.execute(READ, vec![]).await {
+        Ok(value) => value.json().to_string(),
+        Err(error) => format!("page could not be read: {error}"),
+    };
+    let task = match read_task_record(root, task_id) {
+        Ok(record) => {
+            let activity: Vec<String> = record
+                .get("activity")
+                .and_then(toml::Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.get("kind")?.get("type")?.as_str())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!(
+                "status = {:?}\nnew_attempt = {:?}\nnew_attempt_confirmed = {:?}\nworker_handoff = {:?}\nactivity = {activity:?}",
+                record.get("status"),
+                record.get("new_attempt"),
+                record.get("new_attempt_confirmed"),
+                record.get("worker_handoff"),
+            )
+        }
+        Err(error) => format!("task record could not be read: {error:#}"),
+    };
+    format!("page: {page}\ntask:\n{task}")
+}
+
 fn read_task_record(root: &Path, task_id: &str) -> Result<toml::value::Table> {
     for file in toml_files(root)? {
         let raw = std::fs::read_to_string(&file)?;
@@ -780,6 +851,7 @@ async fn new_attempt_journey(context: &TestContext) -> Result<()> {
     driver_click(session.driver(), "[data-testid=\"new-attempt-review\"]").await?;
     ui::visible(session.driver(), "[data-testid=\"new-attempt-confirm\"]").await?;
     driver_click(session.driver(), "[data-testid=\"new-attempt-acknowledge\"]").await?;
+    record_new_attempt_answers(session.driver()).await?;
     driver_click(session.driver(), "[data-testid=\"new-attempt-start\"]").await?;
 
     let launched_at = Instant::now();
@@ -788,7 +860,8 @@ async fn new_attempt_journey(context: &TestContext) -> Result<()> {
             break pid;
         }
         if launched_at.elapsed() > EXECUTION_DEADLINE {
-            bail!("the new attempt never launched its provider");
+            let diagnostics = new_attempt_diagnostics(session.driver(), &root, &task_id).await;
+            bail!("the new attempt never launched its provider\n{diagnostics}");
         }
         tokio::time::sleep(POLL).await;
     };

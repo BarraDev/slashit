@@ -116,7 +116,7 @@ pub fn Workspaces() -> impl IntoView {
             <div>
                 <h1 class="text-2xl font-bold text-white/90">"Workspaces"</h1>
                 <p class="text-sm text-white/40 mt-1">
-                    "A workspace coordinates one or more projects. Agents launch from the workspace root and read its instruction files."
+                    "A workspace groups projects, and each project belongs to at most one workspace. When a task of a member project runs, its agent starts from the workspace root, so instruction files there, such as AGENTS.md, apply to every member."
                 </p>
             </div>
 

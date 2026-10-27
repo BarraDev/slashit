@@ -1,6 +1,6 @@
 [package]
 name = "slashit-review-content"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 license = "MPL-2.0"
 description = "Which version of a PR review comment a fix was made from: the one rule the backend and the frontend share"

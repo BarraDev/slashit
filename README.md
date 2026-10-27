@@ -46,7 +46,7 @@ It's built for people who've already outgrown a single terminal tab and a stack 
 
 **Stay in flow**
 - Works with whatever version-control setup you already have — plain Git is fine, and [Jujutsu](https://github.com/jj-vcs/jj) (`jj`) gets first-class treatment for stacked changes if you use it.
-- A `slashit` CLI controls the running app from any terminal — handy for shell scripts and for other agents to talk to.
+- A `slashit` CLI controls the running app from any terminal — handy for shell scripts and for other agents to talk to. The `.deb` and `.rpm` packages include it; elsewhere, build it from source.
 - System tray keeps agents and terminals alive when the window closes, and a headless `slashitd` keeps them running with no window at all — see [`docs/architecture/daemon.md`](docs/architecture/daemon.md).
 - Updates are downloaded from GitHub Releases and verified against a signing key before they are applied. The installers themselves are not yet code-signed by Windows or Apple, so the first launch of a fresh install shows an OS warning — see [`docs/releasing.md`](docs/releasing.md).
 
@@ -91,9 +91,11 @@ There are none yet. The first tagged release will publish these to [GitHub Relea
 
 | Platform | Format |
 |----------|--------|
-| Linux | `.AppImage`, `.deb` |
+| Linux | `.AppImage`, `.deb`, `.rpm` |
 | macOS | `.dmg` |
 | Windows | `.msi`, `.exe` |
+
+The Linux packages (`.deb`, `.rpm` and `.AppImage`) include the `slashitd` daemon. The `.deb` and `.rpm` packages also install the `slashit` CLI at `/usr/bin/slashit`. The AppImage, macOS and Windows installers do not include the CLI; build it with `cargo build -p slashit --release` (see [Build from Source](#build-from-source)). On macOS and Windows, build `slashitd` from source as well.
 
 Installers are not code-signed yet, so the first launch will show a SmartScreen or Gatekeeper warning. [`docs/releasing.md`](docs/releasing.md) explains exactly what is and is not signed.
 
@@ -171,6 +173,11 @@ kept:
 | Outside the project *(default)* | `<data_dir>/projects/<project-key>/<project-id>/` | You want the repository untouched |
 | Inside the project | `<repo>/.slashit/<project-id>/` | You want the board committed and shared with your team |
 | Detect automatically | `.slashit/` if it already exists and has content, otherwise outside | Upgrading, or moving between machines |
+
+The inside-the-project board is ordinary files in your repository. Its
+`tasks.toml` records Task titles, descriptions, review decisions and activity,
+and SlashIt does not ignore `.slashit/` for you. Add it to `.gitignore` if the
+board should stay local, or commit it knowingly.
 
 Switching between them previews the move first — how many files, how large, and
 any conflicts — and nothing is moved until you confirm. Your API keys, terminal

@@ -19,6 +19,10 @@ pub struct SessionMetadata {
     pub cols: u16,
     pub rows: u16,
     pub working_directory: Option<String>,
+    /// The Project the terminal was opened in. Files written before this field
+    /// existed load with `None`.
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_attached_at: chrono::DateTime<chrono::Utc>,
     pub is_alive: bool,
@@ -115,6 +119,7 @@ impl Default for ScrollbackManager {
 /// Persists session metadata to disk
 pub struct SessionStore {
     store_path: PathBuf,
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl SessionStore {
@@ -131,7 +136,16 @@ impl SessionStore {
 
         Ok(Self {
             store_path: paths.terminal_sessions_file(),
+            write_lock: std::sync::Mutex::new(()),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn at_path(store_path: PathBuf) -> Self {
+        Self {
+            store_path,
+            write_lock: std::sync::Mutex::new(()),
+        }
     }
 
     /// Load all session metadata from disk
@@ -165,48 +179,59 @@ impl SessionStore {
         let contents = toml::to_string_pretty(&file)
             .context("Failed to serialize sessions")?;
 
-        fs::write(&self.store_path, contents)
-            .context("Failed to write sessions file")?;
+        // Replaced durably and atomically: a failure before the replacement
+        // leaves the previous file whole, so it still loads.
+        slashit_durable_fs::write_atomic(
+            &self.store_path,
+            contents.as_bytes(),
+            slashit_durable_fs::Permissions::Preserve,
+        )
+        .context("Failed to write sessions file")?;
 
         Ok(())
     }
 
     /// Add or update a session
     pub fn upsert_session(&self, metadata: SessionMetadata) -> Result<()> {
-        let mut sessions = self.load_sessions().unwrap_or_default();
-        
-        if let Some(existing) = sessions.iter_mut().find(|s| s.id == metadata.id) {
-            *existing = metadata;
-        } else {
-            sessions.push(metadata);
-        }
-
-        self.save_sessions(&sessions)
+        self.update(|sessions| match sessions.iter_mut().find(|s| s.id == metadata.id) {
+            Some(existing) => *existing = metadata,
+            None => sessions.push(metadata),
+        })
     }
 
     /// Remove a session by ID
     pub fn remove_session(&self, session_id: Uuid) -> Result<()> {
-        let mut sessions = self.load_sessions().unwrap_or_default();
-        sessions.retain(|s| s.id != session_id);
-        self.save_sessions(&sessions)
+        self.update(|sessions| sessions.retain(|s| s.id != session_id))
     }
 
     /// Mark all sessions as not alive (on startup)
     pub fn mark_all_dead(&self) -> Result<()> {
-        let mut sessions = self.load_sessions().unwrap_or_default();
-        for session in &mut sessions {
-            session.is_alive = false;
-        }
-        self.save_sessions(&sessions)
+        self.update(|sessions| {
+            for session in sessions.iter_mut() {
+                session.is_alive = false;
+            }
+        })
     }
 
     /// Mark a session as alive
     pub fn mark_alive(&self, session_id: Uuid) -> Result<()> {
-        let mut sessions = self.load_sessions().unwrap_or_default();
-        if let Some(session) = sessions.iter_mut().find(|s| s.id == session_id) {
-            session.is_alive = true;
-            session.last_attached_at = chrono::Utc::now();
-        }
+        self.update(|sessions| {
+            if let Some(session) = sessions.iter_mut().find(|s| s.id == session_id) {
+                session.is_alive = true;
+                session.last_attached_at = chrono::Utc::now();
+            }
+        })
+    }
+
+    /// Read, change and rewrite the file as one step. The lock matters: two
+    /// writers that load before either saves would otherwise drop one record.
+    ///
+    /// An unreadable file is an error, not an empty list. Writing the change
+    /// over it would discard every record it still holds.
+    fn update(&self, change: impl FnOnce(&mut Vec<SessionMetadata>)) -> Result<()> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sessions = self.load_sessions()?;
+        change(&mut sessions);
         self.save_sessions(&sessions)
     }
 }
@@ -214,5 +239,148 @@ impl SessionStore {
 impl Default for SessionStore {
     fn default() -> Self {
         Self::new().expect("Failed to create session store")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(project_id: Option<&str>) -> SessionMetadata {
+        SessionMetadata {
+            id: Uuid::new_v4(),
+            name: "Terminal".into(),
+            cols: 80,
+            rows: 24,
+            working_directory: None,
+            project_id: project_id.map(str::to_owned),
+            created_at: chrono::Utc::now(),
+            last_attached_at: chrono::Utc::now(),
+            is_alive: true,
+        }
+    }
+
+    #[test]
+    fn a_record_keeps_its_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::at_path(dir.path().join("terminal-sessions.toml"));
+        store.upsert_session(record(Some("project-a"))).expect("write");
+        let loaded = store.load_sessions().expect("read");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].project_id.as_deref(), Some("project-a"));
+    }
+
+    #[test]
+    fn a_file_written_before_the_project_field_loads_without_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("terminal-sessions.toml");
+        let old = record(None);
+        let contents = format!(
+            "[[sessions]]\nid = \"{}\"\nname = \"Terminal\"\ncols = 80\nrows = 24\ncreated_at = \"{}\"\nlast_attached_at = \"{}\"\nis_alive = true\n",
+            old.id,
+            old.created_at.to_rfc3339(),
+            old.last_attached_at.to_rfc3339(),
+        );
+        fs::write(&path, contents).expect("write");
+        let loaded = SessionStore::at_path(path).load_sessions().expect("read");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].project_id, None);
+    }
+
+    /// Two writers racing on one file must keep both sets of records. Without
+    /// the write lock, a save can overwrite the other writer's load-modify-save.
+    #[test]
+    fn concurrent_writers_keep_every_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = std::sync::Arc::new(SessionStore::at_path(dir.path().join("terminal-sessions.toml")));
+        let writers: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        store.upsert_session(record(None)).expect("write");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("writer");
+        }
+        assert_eq!(store.load_sessions().expect("read").len(), 50);
+    }
+
+    /// A record that cannot be written must be reported, never swallowed: the
+    /// caller decides whether the terminal may still start.
+    #[test]
+    fn a_record_that_cannot_be_written_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The store path is a directory, so the write must fail.
+        let store = SessionStore::at_path(dir.path().to_path_buf());
+        assert!(store.upsert_session(record(Some("project-a"))).is_err());
+    }
+
+    const MALFORMED: &str = "[[sessions]\nid = \"not closed";
+
+    /// A file that does not parse is not an empty list. Every change must fail
+    /// and leave the bytes as they were, so the records it holds survive.
+    #[test]
+    fn a_malformed_sessions_file_is_refused_and_left_as_it_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("terminal-sessions.toml");
+        fs::write(&path, MALFORMED).expect("write");
+        let store = SessionStore::at_path(path.clone());
+
+        assert!(store.load_sessions().is_err());
+        assert!(store.upsert_session(record(Some("project-a"))).is_err());
+        assert!(store.mark_all_dead().is_err(), "startup must not erase an unreadable file");
+        assert!(store.mark_alive(Uuid::new_v4()).is_err());
+        assert!(store.remove_session(Uuid::new_v4()).is_err());
+
+        assert_eq!(fs::read_to_string(&path).expect("read"), MALFORMED);
+    }
+
+    /// A failure before the replacement must leave the previous state whole,
+    /// and a restart must read exactly that state.
+    #[test]
+    fn a_failed_write_before_publication_keeps_the_last_valid_state() {
+        use slashit_durable_fs::{fault, Stage};
+
+        for stage in [Stage::CreateTemp, Stage::WriteTemp, Stage::SyncTemp, Stage::Replace] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("terminal-sessions.toml");
+            let store = SessionStore::at_path(path.clone());
+            let kept = record(Some("project-a"));
+            store.upsert_session(kept.clone()).expect("first write");
+
+            let armed = fault::fail_at(stage, std::io::ErrorKind::Other);
+            assert!(
+                store.upsert_session(record(Some("project-b"))).is_err(),
+                "a write that fails at {stage:?} must be reported"
+            );
+            drop(armed);
+
+            let restarted = SessionStore::at_path(path).load_sessions().expect("the file still loads");
+            assert_eq!(restarted.len(), 1, "stage {stage:?} changed the saved records");
+            assert_eq!(restarted[0].id, kept.id, "stage {stage:?} replaced the saved record");
+        }
+    }
+
+    /// Once the replacement has happened, readers see the new content. The
+    /// error still reaches the caller, and the file stays whole and parseable.
+    #[test]
+    fn a_failure_after_publication_is_reported_and_leaves_a_whole_file() {
+        use slashit_durable_fs::{fault, Stage};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("terminal-sessions.toml");
+        let store = SessionStore::at_path(path.clone());
+        store.upsert_session(record(Some("project-a"))).expect("first write");
+
+        let armed = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        assert!(store.upsert_session(record(Some("project-b"))).is_err());
+        drop(armed);
+
+        let restarted = SessionStore::at_path(path).load_sessions().expect("the file still loads");
+        assert_eq!(restarted.len(), 2, "the published record is whole and readable");
     }
 }

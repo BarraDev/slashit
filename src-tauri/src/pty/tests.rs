@@ -336,3 +336,376 @@ mod pty_resize_tests {
         assert!(resize_result.is_ok());
     }
 }
+
+#[cfg(test)]
+mod project_scope_tests {
+    use super::super::commands::project_takes_input;
+
+    #[test]
+    fn test_project_takes_input_only_its_own_sessions() {
+        assert!(project_takes_input(Some("project-a"), Some("project-a")));
+        assert!(!project_takes_input(Some("project-b"), Some("project-a")));
+        // A session opened outside any Project is not reachable from one.
+        assert!(!project_takes_input(None, Some("project-a")));
+    }
+
+    #[test]
+    fn test_project_takes_input_without_a_project_takes_every_session() {
+        assert!(project_takes_input(Some("project-a"), None));
+        assert!(project_takes_input(None, None));
+    }
+}
+
+/// Linux only: liveness is read from `/proc`, which other Unix systems do not
+/// have. Elsewhere every pid would read as gone, and the survivor checks would
+/// pass without checking anything.
+#[cfg(all(test, target_os = "linux"))]
+mod quit_tests {
+    use crate::pty::manager::spawn_pty_session;
+    use std::time::{Duration, Instant};
+
+    /// `SHELL` is process-wide, and the tests that set it must not interleave:
+    /// one test's script directory is removed while the other spawns.
+    static SHELL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds the environment lock every test that mutates the environment
+    /// shares, then this module's `SHELL` lock. When the test ends, `SHELL` is
+    /// put back first, so a later test in this process never inherits the
+    /// script directory this test removes.
+    struct ShellGuard {
+        prior: Option<std::ffi::OsString>,
+        _env: tokio::sync::MutexGuard<'static, ()>,
+        _shell: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ShellGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => std::env::set_var("SHELL", value),
+                None => std::env::remove_var("SHELL"),
+            }
+        }
+    }
+
+    fn lock_shell() -> ShellGuard {
+        let env = crate::config::paths::ENV_LOCK.blocking_lock();
+        let shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        ShellGuard {
+            prior: std::env::var_os("SHELL"),
+            _env: env,
+            _shell: shell,
+        }
+    }
+
+    /// Whether `pid` is a live process. A zombie is not live: it has ended and
+    /// only waits to be reaped.
+    fn is_live(pid: i32) -> bool {
+        // Safety: signal 0 sends nothing; it only asks whether the pid exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !matches!(
+                stat.rsplit(')').next().and_then(|rest| rest.trim_start().chars().next()),
+                Some('Z' | 'X')
+            ),
+            Err(_) => false,
+        }
+    }
+
+    /// Reproduces T5: ending a terminal session leaves a shell that ignores
+    /// SIGHUP, and the background job it started, running. The shell and its
+    /// child are the processes a person would expect to end with the window.
+    ///
+    /// `SHELL` is read when the session spawns, so this test changes it for
+    /// its own process. Run it alone:
+    /// `cargo test -p slashit-ui --lib dropping_a_session -- --ignored --exact`
+    #[test]
+    #[ignore = "spawns a shell and changes SHELL for this process; run alone with --ignored --exact"]
+    fn dropping_a_session_ends_a_shell_that_ignores_hangup_and_its_children() {
+        use std::os::unix::fs::PermissionsExt;
+        let _locks = lock_shell();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hup-ignoring-shell.sh");
+        let pids = dir.path().join("pids");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n", pids.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("SHELL", &script);
+
+        let (session, reader) = spawn_pty_session(
+            "quit-test".to_string(),
+            80,
+            24,
+            Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .expect("spawn the session");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (shell, child) = loop {
+            let parsed = std::fs::read_to_string(&pids).ok().and_then(|text| {
+                let mut parts = text.split_whitespace().map(|p| p.parse::<i32>());
+                match (parts.next(), parts.next()) {
+                    (Some(Ok(shell)), Some(Ok(child))) => Some((shell, child)),
+                    _ => None,
+                }
+            });
+            if let Some(pair) = parsed {
+                break pair;
+            }
+            assert!(Instant::now() < deadline, "the shell did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        drop(session);
+        drop(reader);
+        std::thread::sleep(Duration::from_secs(2));
+
+        let survivors: Vec<i32> = [shell, child].into_iter().filter(|pid| is_live(*pid)).collect();
+        for pid in &survivors {
+            // Safety: the pids were started by this test and are only killed here.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        assert!(survivors.is_empty(), "dropping the session left {survivors:?} running");
+    }
+
+    /// The application exits as soon as shutdown returns, so the shutdown path
+    /// must have ended the shell's group by then. Unlike the drop above, this
+    /// checks with no grace period.
+    #[test]
+    #[ignore = "spawns a shell and changes SHELL for this process; run alone with --ignored --exact"]
+    fn ending_the_sessions_at_shutdown_has_ended_a_shell_that_ignores_hangup_when_it_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        let _locks = lock_shell();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hup-ignoring-shell.sh");
+        let pids = dir.path().join("pids");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n", pids.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("SHELL", &script);
+
+        let (session, reader) = spawn_pty_session(
+            "shutdown-test".to_string(),
+            80,
+            24,
+            Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .expect("spawn the session");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (shell, child) = loop {
+            let parsed = std::fs::read_to_string(&pids).ok().and_then(|text| {
+                let mut parts = text.split_whitespace().map(|p| p.parse::<i32>());
+                match (parts.next(), parts.next()) {
+                    (Some(Ok(shell)), Some(Ok(child))) => Some((shell, child)),
+                    _ => None,
+                }
+            });
+            if let Some(pair) = parsed {
+                break pair;
+            }
+            assert!(Instant::now() < deadline, "the shell did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(crate::pty::manager::end_sessions(vec![session]));
+        drop(reader);
+
+        let survivors: Vec<i32> = [shell, child].into_iter().filter(|pid| is_live(*pid)).collect();
+        for pid in &survivors {
+            // Safety: the pids were started by this test and are only killed here.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        assert!(survivors.is_empty(), "ending the sessions at shutdown left {survivors:?} running");
+    }
+
+    /// Starts a real interactive bash, which runs a background job and then
+    /// exits on its own. Returns the shell's pid, the job's pid and the session.
+    /// The shell has exited by the time this returns, and the job still runs.
+    fn exited_shell_with_background_job(
+        name: &str,
+    ) -> (i32, i32, crate::pty::manager::PtySession, Box<dyn std::io::Read + Send>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        std::env::set_var("SHELL", "/bin/bash");
+        let (mut session, reader) = spawn_pty_session(
+            name.to_string(),
+            80,
+            24,
+            Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .expect("spawn the session");
+
+        session
+            .write(format!("sleep 300 & echo $$ $! > {}; exit\n", pids.display()).as_bytes())
+            .expect("write the command");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (shell, child) = loop {
+            let parsed = std::fs::read_to_string(&pids).ok().and_then(|text| {
+                let mut parts = text.split_whitespace().map(|p| p.parse::<i32>());
+                match (parts.next(), parts.next()) {
+                    (Some(Ok(shell)), Some(Ok(child))) => Some((shell, child)),
+                    _ => None,
+                }
+            });
+            if let Some(pair) = parsed {
+                break pair;
+            }
+            assert!(Instant::now() < deadline, "the shell did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        while is_live(shell) {
+            assert!(Instant::now() < deadline, "the shell did not exit");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(is_live(child), "the background job should outlive its shell before the terminal is closed");
+        (shell, child, session, reader, dir)
+    }
+
+    /// Open defect: the shell exits by itself while its background job runs.
+    /// Closing the terminal afterwards should end that job too. Job control
+    /// puts the job in its own process group, and the session signals only the
+    /// shell's group, so the job survives. Run it alone with
+    /// `cargo test -p slashit-ui --lib closing_a_terminal_whose_shell -- --ignored`.
+    #[test]
+    #[ignore = "open defect: a background job outlives its exited shell; spawns an interactive bash"]
+    fn closing_a_terminal_whose_shell_exited_ends_its_background_job() {
+        let _locks = lock_shell();
+        let (_shell_pid, child, session, reader, _dir) = exited_shell_with_background_job("closed-after-exit");
+
+        drop(session);
+        drop(reader);
+        std::thread::sleep(Duration::from_secs(2));
+
+        let alive = is_live(child);
+        if alive {
+            // Safety: the pid was started by this test and is only killed here.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+        }
+        assert!(!alive, "closing the terminal left its background job {child} running");
+    }
+
+    /// Open defect, at application quit: the same job survives `end_sessions`,
+    /// because the shell that has already exited is no longer signalled.
+    #[test]
+    #[ignore = "open defect: a background job outlives its exited shell; spawns an interactive bash"]
+    fn quitting_ends_the_background_job_of_a_shell_that_already_exited() {
+        let _locks = lock_shell();
+        let (_shell_pid, child, session, reader, _dir) = exited_shell_with_background_job("quit-after-exit");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(crate::pty::manager::end_sessions(vec![session]));
+        drop(reader);
+
+        let alive = is_live(child);
+        if alive {
+            // Safety: the pid was started by this test and is only killed here.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+        }
+        assert!(!alive, "quitting left the background job {child} of an exited shell running");
+    }
+}
+
+/// Publishing a terminal is gated on its record: a terminal whose record cannot
+/// be written is not published, and leaves neither a session nor a scrollback.
+/// These spawn a real shell, so they are ignored by default like the others.
+#[cfg(all(test, unix))]
+mod registration_tests {
+    use crate::pty::manager::{spawn_pty_session, PtyState};
+    use crate::pty::store::{ScrollbackManager, SessionMetadata, SessionStore};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn metadata(id: uuid::Uuid, project_id: Option<&str>) -> SessionMetadata {
+        SessionMetadata {
+            id,
+            name: "Test Terminal".into(),
+            cols: 80,
+            rows: 24,
+            working_directory: None,
+            project_id: project_id.map(str::to_owned),
+            created_at: chrono::Utc::now(),
+            last_attached_at: chrono::Utc::now(),
+            is_alive: true,
+        }
+    }
+
+    fn state_with_store(store: SessionStore) -> PtyState {
+        PtyState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            scrollback: ScrollbackManager::new(),
+            store: Arc::new(store),
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell"]
+    fn a_terminal_whose_record_cannot_be_written_is_not_published() {
+        // Spawning reads SHELL, which the shutdown tests set under this lock.
+        let _env = crate::config::paths::ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // The store path is a directory, so the record cannot be written.
+        let state = state_with_store(SessionStore::at_path(dir.path().to_path_buf()));
+        let (session, _reader) = spawn_pty_session("Test Terminal".into(), 80, 24, None).expect("spawn");
+        let id = session.id;
+
+        let result = runtime().block_on(async {
+            let result = state.register_session(session, metadata(id, Some("project-a"))).await;
+            assert!(state.sessions.lock().await.get(&id).is_none(), "an unrecorded session was published");
+            assert!(state.scrollback.get(id).await.is_none(), "an unrecorded terminal kept a scrollback");
+            result
+        });
+        let error = result.expect_err("a terminal without a record must not start");
+        assert!(error.contains("Could not record the terminal session"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "spawns a real shell"]
+    fn a_recorded_terminal_is_published_with_its_scrollback_and_project() {
+        // Spawning reads SHELL, which the shutdown tests set under this lock.
+        let _env = crate::config::paths::ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.toml");
+        let state = state_with_store(SessionStore::at_path(path.clone()));
+        let (session, _reader) = spawn_pty_session("Test Terminal".into(), 80, 24, None).expect("spawn");
+        let id = session.id;
+
+        runtime().block_on(async {
+            state
+                .register_session(session, metadata(id, Some("project-a")))
+                .await
+                .expect("a recorded terminal starts");
+            assert!(state.sessions.lock().await.contains_key(&id));
+            assert!(state.scrollback.get(id).await.is_some());
+        });
+        let recorded = SessionStore::at_path(path).load_sessions().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].project_id.as_deref(), Some("project-a"));
+    }
+}

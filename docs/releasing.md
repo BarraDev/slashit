@@ -21,8 +21,8 @@ installer accepts, and what "signed" does and does not mean here.
 
 ## 1. Bump the version
 
-Five files carry the version, and the preflight job fails the release if any of
-them disagree. There is no single source: Cargo needs it per manifest, and
+Eleven files carry the version, and the preflight job fails the release if any
+of them disagree. There is no single source: Cargo needs it per manifest, and
 Tauri reads its own.
 
 | File | Field | What it controls |
@@ -32,10 +32,12 @@ Tauri reads its own.
 | `Cargo.toml` (root) | `[package] version` | The Leptos/WASM frontend (`slashit-frontend`) |
 | `crates/slashit-cli/Cargo.toml` | `[package] version` | `slashit --version` |
 | `crates/slashit-ipc/Cargo.toml` | `[package] version` | The shared IPC crate |
+| `crates/slashit-acceptance`, `slashit-activity`, `slashit-attention`, `slashit-durable-fs`, `slashit-review-content` (each `Cargo.toml`) | `[package] version` | Workspace members, not shipped on their own |
+| `package.json` | `version` | The private Playwright end-to-end harness (`slashit-e2e`). Never published, but preflight checks it so the workspace has one version |
 
 `tauri.conf.json` is authoritative because Tauri only falls back to
 `src-tauri/Cargo.toml` when the key is absent, and here it is present. The
-preflight job checks the four manifests against it, so a build whose installer
+preflight job checks every file above against it, so a build whose installer
 and whose `slashit --version` disagree cannot get out.
 
 Then refresh the lockfile, which records workspace member versions:
@@ -43,10 +45,6 @@ Then refresh the lockfile, which records workspace member versions:
 ```bash
 cargo check --workspace
 ```
-
-`package.json` also says `0.1.0`, but it is the private Playwright end-to-end
-harness (`slashit-e2e`), is never published, and is not checked by preflight.
-Leave it alone unless you have a reason.
 
 ## 2. Choose a version the Windows installer accepts
 
@@ -104,11 +102,12 @@ not a channel to iterate in on Windows. Ship the real patch version instead.
 ## 3. Tag and push
 
 The tag must be exactly `v` followed by the version in `tauri.conf.json`. The
-preflight job compares them and fails otherwise.
+preflight job compares them and fails otherwise. The example below tags the
+planned `0.0.1` prerelease; substitute the version your `tauri.conf.json` names.
 
 ```bash
-git tag -a v0.1.0 -m 'SlashIt v0.1.0'
-git push origin v0.1.0
+git tag -a v0.0.1 -m 'SlashIt v0.0.1'
+git push origin v0.0.1
 ```
 
 This project's normal workflow is Jujutsu, but `jj` treats git tags as
@@ -122,15 +121,24 @@ and tag again. Never move a tag that has already produced a published release.
 
 `.github/workflows/release.yml`, triggered by the `v*` tag push:
 
-1. **`preflight`** (Ubuntu, seconds, no build) — the tag matches
-   `tauri.conf.json`; all four manifests match it; the version is packageable
-   as an MSI; `CHANGELOG.md` has a `## [<version>]` section and its
-   `[<version>]: https://` link. Everything else
-   waits on this job.
+1. **`preflight`** (Ubuntu, seconds, no build) — runs
+   `scripts/release-preflight.sh "$TAG"`, which checks that the tag matches
+   `tauri.conf.json`; that every version manifest matches it; that the version is
+   packageable as an MSI; that `CHANGELOG.md` has a `## [<version>]` section and
+   its `[<version>]: https://` link; and that `.github/release-channels.txt`
+   declares the version's channel. It writes the channel as the job output that
+   sets the release's `prerelease` flag. Everything else waits on this job.
 2. **`release`** (four runners in parallel) — builds the frontend with Trunk
    and the app with `tauri-action`, then creates or updates a **draft** release
    and uploads each platform's installers plus `latest.json`, the updater
-   manifest.
+   manifest. The Linux runner first runs `cargo build -p slashit --release`,
+   because the `.deb` and `.rpm` packages copy that CLI binary to
+   `/usr/bin/slashit`. The Linux packages (`.deb`, `.rpm`, `.AppImage`) also carry
+   `slashitd`, built from the `slashit-ui` package and bundled without a
+   `tauri.conf.json` entry, so a change to the bin layout can drop it silently;
+   section 5 says what to check. The macOS
+   and Windows installers do not include the CLI, and whether they include
+   `slashitd` is checked on the artifacts, not assumed.
 3. **`next-steps`** — writes the remaining manual steps into the run summary,
    including whether this particular version will be reachable by the updater.
 
@@ -141,24 +149,60 @@ first release), which describes the project's history rather than this version.
 Commits pushed straight to `main` have no pull request and appear only in
 `CHANGELOG.md`.
 
+### Release channels
+
+`.github/release-channels.txt` names the channel of every version the workflow
+may publish, one line each: `<version> prerelease` or `<version> stable`. The
+channel is read from that file and from nothing else. The tag's shape does not
+decide it, so `v0.0.1` has no hyphen and is still a prerelease only because the
+file says so.
+
+The preflight job fails closed:
+
+- a version with no line, or with two, is refused;
+- a channel other than `prerelease` or `stable` is refused;
+- a version with a prerelease suffix (`0.1.0-1`) must be a prerelease, so a
+  numeric suffix cannot publish as a stable release.
+
+A prerelease is published with `prerelease: true`. GitHub never marks it
+`latest`, so `releases/latest/download/latest.json` does not point at it, and
+the updater never offers it. Installed prereleases are offered the next stable
+release. Declare a stable version in the same commit that prepares its CHANGELOG
+section, and check the file's line before you tag.
+
+`scripts/test-release-preflight.sh` runs the script against the repository and
+against fixture trees, so a change to the checks can be tested locally:
+
+```bash
+scripts/test-release-preflight.sh
+```
+
+To check a tag without pushing it, run the script with the tag and read the
+channel it prints:
+
+```bash
+scripts/release-preflight.sh v0.0.1
+```
+
 ### Version links in CHANGELOG.md
 
 Each version has a reference link at the foot of `CHANGELOG.md`, in Keep a
 Changelog form. Write it when you cut the release, in the same commit that moves
 `[Unreleased]` under the version:
 
-- The first release links to its tag:
+- The first release, the `0.0.1` prerelease, links to its tag:
 
   ```
-  [0.1.0]: https://github.com/BarraDev/slashit/releases/tag/v0.1.0
+  [0.0.1]: https://github.com/BarraDev/slashit/releases/tag/v0.0.1
+  [Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.1...HEAD
+  ```
+
+- Each later release links to the comparison with the tag before it. The
+  first stable release, `0.1.0`, follows the `0.0.1` prerelease:
+
+  ```
+  [0.1.0]: https://github.com/BarraDev/slashit/compare/v0.0.1...v0.1.0
   [Unreleased]: https://github.com/BarraDev/slashit/compare/v0.1.0...HEAD
-  ```
-
-- Each later release links to the comparison with the tag before it:
-
-  ```
-  [0.1.1]: https://github.com/BarraDev/slashit/compare/v0.1.0...v0.1.1
-  [Unreleased]: https://github.com/BarraDev/slashit/compare/v0.1.1...HEAD
   ```
 
 Use the release tags as the boundaries, not `main` or dates. The comparison is
@@ -182,12 +226,21 @@ back.
 Nothing in CI verifies that an installer installs or that the app launches, so
 that is the human's job:
 
-- Linux: install the `.deb` or run the `.AppImage`.
+- Linux: install the `.deb` or `.rpm`, or run the `.AppImage`.
 - macOS: mount the `.dmg`, drag, launch. Gatekeeper will warn — see below.
 - Windows: run the `.msi` and the NSIS `.exe`. SmartScreen will warn.
+- Payload, for every artifact: the `.deb` and `.rpm` contain `usr/bin/slashit`,
+  `usr/bin/slashitd` and `usr/bin/slashit-ui`, and no package contains
+  `acp_fixture_agent`. List the `.deb` and `.rpm` with `bsdtar -tf`. Extract the
+  `.AppImage` with `--appimage-extract` into an empty directory and list
+  `squashfs-root/usr/bin`, which should hold `slashitd` and `slashit-ui` but not
+  `slashit`. Check the macOS and Windows artifacts for `slashitd` the same way,
+  then correct the CHANGELOG if they differ.
 
 Then publish the release on GitHub. The prerelease flag is already set from the
-tag, so there is nothing to adjust — press Publish.
+channel the preflight job read, so there is nothing to adjust. Check that the
+release page says "Pre-release" for a version declared `prerelease`, and does
+not for a `stable` one, then press Publish.
 
 ## 6. Validate auto-update
 
@@ -201,8 +254,10 @@ https://github.com/BarraDev/slashit/releases/latest/download/latest.json
 being explicit about, because both look like bugs otherwise:
 
 - While the release is a draft, the endpoint resolves to the previous stable
-  release or, before the first one, to nothing at all. Auto-update starts
-  working when you press Publish, not when the build finishes.
+  release or, before the first one, to a 404. Auto-update starts working when
+  you press Publish, not when the build finishes. Until a stable release is
+  published, `updater_check` reads a 404 from every endpoint as "no update", so no
+  install shows an error. Any other failure is still reported as an error. This is the state the first pre-release runs in.
 - A published prerelease is still invisible to the updater. That is the
   intended behaviour — existing installs must not be auto-upgraded onto a
   release candidate — but it means a prerelease has no update channel. Testers
@@ -223,7 +278,7 @@ release, launch it, and let it offer the update.
 
 Two different things get called signing, and only one of them happens here.
 
-**The updater is signed.** `TAURI_SIGNING_PRIVATE_KEY` and its password sign
+**The updater is signed.** `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` sign
 `latest.json` and the update artifacts. The public key is embedded in the app
 (`plugins.updater.pubkey`), so a running SlashIt verifies any update it
 downloads and refuses one that was tampered with in transit or on the release
@@ -246,6 +301,9 @@ from a compromised download.
 
 ## 8. Before the first release
 
-`0.1.0` has never been published. Until it is, the README's Releases link goes
-to an empty page and the updater endpoint resolves to nothing — both expected,
-neither a bug.
+Nothing has been published. The first tag planned is `v0.0.1`, a prerelease
+declared in `.github/release-channels.txt`, which testers install by hand.
+`0.1.0` is the first stable release and follows it. Until a stable release is
+published, the README's Releases link goes to an empty page or to the
+prerelease page, and the updater endpoint resolves to nothing. Both are expected,
+neither is a bug.

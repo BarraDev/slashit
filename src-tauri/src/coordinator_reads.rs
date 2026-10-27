@@ -121,22 +121,40 @@ fn inspect_task(tasks: &HashMap<Uuid, Task>, project_id: Uuid, task_id: Uuid) ->
     })
 }
 
+/// This Project's Tasks in the one order every Coordinator read uses: Backlog
+/// position, then id. Pages and the Task index both follow it, so a page can
+/// never disagree with the index about which Task comes next.
+pub fn project_tasks(tasks: &HashMap<Uuid, Task>, project_id: Uuid) -> Vec<&Task> {
+    let mut found: Vec<&Task> = tasks.values().filter(|task| task.project_id == project_id).collect();
+    found.sort_by_key(|task| (task.position, task.id));
+    found
+}
+
+/// The Task index the Project context carries, in [`project_tasks`] order.
+pub fn task_index(tasks: &HashMap<Uuid, Task>, project_id: Uuid) -> Vec<Value> {
+    project_tasks(tasks, project_id)
+        .into_iter()
+        .map(|task| json!({"id":task.id,"title":task.title,"status":task.status,"priority":task.priority,"category":task.category}))
+        .collect()
+}
+
 fn list_tasks(
     tasks: &HashMap<Uuid, Task>,
     project_id: Uuid,
     status: Option<&TaskStatus>,
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Value {
     let limit = limit.unwrap_or(LIST_DEFAULT_LIMIT).clamp(1, LIST_MAX_LIMIT);
-    let mut matching: Vec<&Task> = tasks
-        .values()
-        .filter(|task| task.project_id == project_id)
+    let offset = offset.unwrap_or(0);
+    let matching: Vec<&Task> = project_tasks(tasks, project_id)
+        .into_iter()
         .filter(|task| status.is_none_or(|status| &task.status == status))
         .collect();
-    matching.sort_by_key(|task| (task.position, task.id));
     let total_matching = matching.len();
     let page: Vec<Value> = matching
-        .into_iter()
+        .iter()
+        .skip(offset)
         .take(limit)
         .map(|task| {
             json!({
@@ -148,11 +166,15 @@ fn list_tasks(
             })
         })
         .collect();
+    let end = offset.saturating_add(page.len());
+    let truncated = end < total_matching;
     json!({
         "outcome": "listed",
         "total_matching": total_matching,
+        "offset": offset,
         "returned": page.len(),
-        "truncated": total_matching > page.len(),
+        "truncated": truncated,
+        "next_offset": truncated.then_some(end),
         "tasks": page,
     })
 }
@@ -334,11 +356,12 @@ pub fn read(
         CoordinatorOutput::InspectTask { target_task_id } => {
             Some(inspect_task(tasks, project_id, *target_task_id))
         }
-        CoordinatorOutput::ListTasks { status, limit } => Some(list_tasks(
+        CoordinatorOutput::ListTasks { status, limit, offset } => Some(list_tasks(
             tasks,
             project_id,
             status.as_ref(),
             limit.map(usize::from),
+            offset.map(|offset| usize::try_from(offset).unwrap_or(usize::MAX)),
         )),
         CoordinatorOutput::InspectTaskActivity { target_task_id, limit } => Some(inspect_task_activity(
             tasks,
@@ -545,7 +568,7 @@ mod tests {
             task(project, "running", TaskStatus::InProgress, 0),
             task(Uuid::new_v4(), "foreign", TaskStatus::Backlog, 0),
         ]);
-        let list = CoordinatorOutput::ListTasks { status: Some(TaskStatus::Backlog), limit: None };
+        let list = CoordinatorOutput::ListTasks { status: Some(TaskStatus::Backlog), limit: None, offset: None };
         let result = read(&list, project, &tasks).unwrap();
         let titles: Vec<_> = result["tasks"]
             .as_array()
@@ -566,21 +589,108 @@ mod tests {
                 .map(|n| task(project, &format!("t{n}"), TaskStatus::Backlog, n))
                 .collect(),
         );
-        let greedy = CoordinatorOutput::ListTasks { status: None, limit: Some(200) };
+        let greedy = CoordinatorOutput::ListTasks { status: None, limit: Some(200), offset: None };
         let result = read(&greedy, project, &tasks).unwrap();
         assert_eq!(result["returned"], LIST_MAX_LIMIT);
         assert_eq!(result["total_matching"], LIST_MAX_LIMIT + 7);
         assert_eq!(result["truncated"], true);
-        let default = CoordinatorOutput::ListTasks { status: None, limit: None };
+        assert_eq!(result["next_offset"], LIST_MAX_LIMIT);
+        let default = CoordinatorOutput::ListTasks { status: None, limit: None, offset: None };
         assert_eq!(read(&default, project, &tasks).unwrap()["returned"], LIST_DEFAULT_LIMIT);
     }
 
     #[test]
     fn empty_project_lists_nothing() {
-        let list = CoordinatorOutput::ListTasks { status: None, limit: None };
+        let list = CoordinatorOutput::ListTasks { status: None, limit: None, offset: None };
         let result = read(&list, Uuid::new_v4(), &HashMap::new()).unwrap();
         assert_eq!(result["returned"], 0);
         assert_eq!(result["truncated"], false);
+        assert!(result["next_offset"].is_null());
+    }
+
+    fn listing(limit: Option<u8>, offset: Option<u32>) -> CoordinatorOutput {
+        CoordinatorOutput::ListTasks { status: None, limit, offset }
+    }
+
+    /// Titles in the order a Coordinator reads them, following `next_offset`
+    /// until it is null. Each page asks for the largest page the read allows.
+    fn every_page_title(project: Uuid, tasks: &HashMap<Uuid, Task>) -> Vec<String> {
+        let mut titles = Vec::new();
+        let mut offset = Some(0);
+        while let Some(at) = offset {
+            let page = read(&listing(Some(LIST_MAX_LIMIT as u8), Some(at)), project, tasks).unwrap();
+            titles.extend(
+                page["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|task| task["title"].as_str().unwrap().to_owned()),
+            );
+            offset = page["next_offset"].as_u64().map(|next| next as u32);
+        }
+        titles
+    }
+
+    #[test]
+    fn pages_past_twenty_reach_every_task_once_in_position_order() {
+        let project = Uuid::new_v4();
+        // Inserted out of position order, so only the sort can put them right.
+        let tasks = store(
+            (0..25)
+                .rev()
+                .map(|n| task(project, &format!("t{n:02}"), TaskStatus::Backlog, n))
+                .collect(),
+        );
+        let expected: Vec<String> = (0..25).map(|n| format!("t{n:02}")).collect();
+        assert_eq!(every_page_title(project, &tasks), expected);
+        let second = read(&listing(Some(20), Some(20)), project, &tasks).unwrap();
+        assert_eq!(second["offset"], 20);
+        assert_eq!(second["returned"], 5);
+        assert_eq!(second["truncated"], false);
+        assert!(second["next_offset"].is_null());
+    }
+
+    #[test]
+    fn pages_past_forty_reach_every_task_once_and_break_position_ties_by_id() {
+        let project = Uuid::new_v4();
+        // Every Task shares one position, so the id alone orders them.
+        let tasks = store((0..45).map(|n| task(project, &format!("t{n:02}"), TaskStatus::Backlog, 0)).collect());
+        let by_id: Vec<String> = {
+            let mut ordered: Vec<&Task> = tasks.values().collect();
+            ordered.sort_by_key(|task| task.id);
+            ordered.iter().map(|task| task.title.clone()).collect()
+        };
+        let paged = every_page_title(project, &tasks);
+        assert_eq!(paged, by_id);
+        assert_eq!(paged.len(), 45);
+    }
+
+    #[test]
+    fn the_task_index_and_the_first_pages_agree_past_forty() {
+        let project = Uuid::new_v4();
+        let tasks = store((0..45).rev().map(|n| task(project, &format!("t{n:02}"), TaskStatus::Backlog, n)).collect());
+        let index: Vec<Value> = task_index(&tasks, project);
+        assert_eq!(index.len(), 45);
+        let listed = every_page_title(project, &tasks);
+        let indexed: Vec<&str> = index.iter().map(|task| task["title"].as_str().unwrap()).collect();
+        assert_eq!(indexed, listed.iter().map(String::as_str).collect::<Vec<_>>());
+        // The projection shows the first 40; the tail is one offset read away.
+        let tail = read(&listing(Some(20), Some(40)), project, &tasks).unwrap();
+        assert_eq!(tail["tasks"][0]["id"], index[40]["id"]);
+        assert_eq!(tail["returned"], 5);
+        assert_eq!(tail["total_matching"], 45);
+    }
+
+    #[test]
+    fn an_offset_past_the_end_is_an_empty_last_page() {
+        let project = Uuid::new_v4();
+        let tasks = store((0..3).map(|n| task(project, &format!("t{n}"), TaskStatus::Backlog, n)).collect());
+        let past = read(&listing(None, Some(3)), project, &tasks).unwrap();
+        assert_eq!(past["returned"], 0);
+        assert_eq!(past["truncated"], false);
+        assert!(past["next_offset"].is_null());
+        let far = read(&listing(None, Some(u32::MAX)), project, &tasks).unwrap();
+        assert_eq!(far["returned"], 0);
     }
 
     fn activity(id: Uuid, limit: Option<u8>) -> CoordinatorOutput {
@@ -896,12 +1006,18 @@ mod tests {
             Conversation::parse_output(r#"{"type":"list_tasks","status":"backlog","limit":5}"#),
             Ok(CoordinatorOutput::ListTasks { limit: Some(5), .. })
         ));
+        assert!(matches!(
+            Conversation::parse_output(r#"{"type":"list_tasks","offset":40}"#),
+            Ok(CoordinatorOutput::ListTasks { offset: Some(40), .. })
+        ));
         for bad in [
             r#"{"type":"inspect_task"}"#,
             r#"{"type":"inspect_task","target_task_id":"nope"}"#,
             r#"{"type":"list_tasks","status":"archived"}"#,
             r#"{"type":"list_tasks","limit":0}"#,
             r#"{"type":"list_tasks","limit":-1}"#,
+            r#"{"type":"list_tasks","offset":-1}"#,
+            r#"{"type":"list_tasks","offset":"40"}"#,
             r#"{"type":"list_tasks","path":"/etc"}"#,
         ] {
             assert!(Conversation::parse_output(bad).is_err(), "{bad}");

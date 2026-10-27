@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::store::{ScrollbackManager, SessionStore};
+use super::store::{ScrollbackManager, SessionMetadata, SessionStore};
 
 /// Information about a PTY session
 pub struct PtySession {
@@ -14,6 +14,9 @@ pub struct PtySession {
     pub name: String,
     pub cols: u16,
     pub rows: u16,
+    /// The Project the terminal was opened in. Set by the spawn command, and
+    /// the only thing that scopes a session to a Project.
+    pub project_id: Option<String>,
     writer: Box<dyn Write + Send>,
     // Keep the master PTY alive for resizing and proper operation
     master: Box<dyn MasterPty + Send>,
@@ -21,7 +24,110 @@ pub struct PtySession {
     _child: Box<dyn Child + Send + Sync>,
 }
 
+/// Ends a terminal's process group: SIGHUP first, then SIGKILL once the group
+/// has had a moment to exit. Closing the master only hangs up the shell, so a
+/// shell that ignores SIGHUP, or a job it started, would otherwise outlive it.
+#[cfg(unix)]
+fn end_process_group(pgid: i32) {
+    // Safety: the group is the one this process's own terminal shell leads
+    // (portable-pty starts the shell in a new session).
+    unsafe { libc::killpg(pgid, libc::SIGHUP) };
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // A group id is not reused while any process still carries it, so a
+        // group that is still there is still this terminal's.
+        // Safety: as above; signal 0 only probes.
+        if unsafe { libc::kill(-pgid, 0) } == 0 {
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    });
+}
+
+/// Whether any process still belongs to the group.
+#[cfg(unix)]
+fn group_is_running(pgid: i32) -> bool {
+    // Safety: signal 0 only probes.
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// Reaps exited shells and waits until none of `groups` is running, or until
+/// `limit` has passed. Reaping matters: an exited shell stays a zombie, which
+/// keeps its group non-empty until it is collected.
+#[cfg(unix)]
+async fn wait_for_groups(sessions: &mut [PtySession], groups: &[i32], limit: std::time::Duration, poll: std::time::Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        for session in sessions.iter_mut() {
+            let _ = session._child.try_wait();
+        }
+        if !groups.iter().any(|&pgid| group_is_running(pgid)) || std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Ends every terminal at application shutdown, and returns once no shell
+/// group is left or the SIGKILL fallback has been sent.
+///
+/// The application exits as soon as this returns, so the fallback cannot wait
+/// on a detached thread the way dropping a session does: a shell that ignores
+/// SIGHUP would then outlive a quit whose dialog said it would end it.
+#[cfg(unix)]
+pub async fn end_sessions(mut sessions: Vec<PtySession>) {
+    use std::time::Duration;
+    const POLL: Duration = Duration::from_millis(25);
+    const HANGUP_GRACE: Duration = Duration::from_millis(500);
+    const KILL_GRACE: Duration = Duration::from_secs(1);
+
+    let groups: Vec<i32> = sessions.iter_mut().filter_map(PtySession::live_group).collect();
+    for &pgid in &groups {
+        // Safety: each group is one this process's own terminal shell leads.
+        unsafe { libc::killpg(pgid, libc::SIGHUP) };
+    }
+    wait_for_groups(&mut sessions, &groups, HANGUP_GRACE, POLL).await;
+    for &pgid in &groups {
+        if group_is_running(pgid) {
+            // Safety: as above.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
+    wait_for_groups(&mut sessions, &groups, KILL_GRACE, POLL).await;
+}
+
+/// Windows has no process groups to signal; dropping the sessions closes them.
+#[cfg(not(unix))]
+pub async fn end_sessions(sessions: Vec<PtySession>) {
+    drop(sessions);
+}
+
+impl Drop for PtySession {
+    /// Ending the session ends its shell and the jobs it started. A shell that
+    /// has already exited is not signalled: once reaped, its pid may name a
+    /// different process group.
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            if matches!(self._child.try_wait(), Ok(None)) {
+                if let Some(pid) = self._child.process_id() {
+                    end_process_group(pid as i32);
+                }
+            }
+        }
+    }
+}
+
 impl PtySession {
+    /// The process group of this session's shell, while the shell is running.
+    #[cfg(unix)]
+    fn live_group(&mut self) -> Option<i32> {
+        if matches!(self._child.try_wait(), Ok(None)) {
+            self._child.process_id().map(|pid| pid as i32)
+        } else {
+            None
+        }
+    }
+
     /// Write data to the PTY
     pub fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
         self.writer.write_all(data)?;
@@ -52,13 +158,30 @@ impl PtyState {
     pub fn new() -> Self {
         let store = SessionStore::new().expect("Failed to create session store");
         // Mark all sessions as dead on startup (they'll be revived when spawned)
-        let _ = store.mark_all_dead();
-        
+        // A file that cannot be read is left as it is, so its records survive for a later repair.
+        if let Err(e) = store.mark_all_dead() {
+            eprintln!("[PTY Backend] Could not mark earlier terminal sessions as ended: {e}");
+        }
+
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             scrollback: ScrollbackManager::new(),
             store: Arc::new(store),
         }
+    }
+
+    /// Publish a spawned terminal, and only after its record is written. If the
+    /// record cannot be written, nothing is published: the scrollback is
+    /// removed, and the session is dropped, which ends its shell.
+    pub async fn register_session(&self, session: PtySession, metadata: SessionMetadata) -> Result<(), String> {
+        let session_id = session.id;
+        self.scrollback.create(session_id).await;
+        if let Err(e) = self.store.upsert_session(metadata) {
+            self.scrollback.remove(session_id).await;
+            return Err(format!("Could not record the terminal session: {e}"));
+        }
+        self.sessions.lock().await.insert(session_id, session);
+        Ok(())
     }
 }
 
@@ -218,6 +341,7 @@ pub fn spawn_pty_session(
         name: name.clone(),
         cols,
         rows,
+        project_id: None,
         writer,
         master: pair.master,
         _child: child,

@@ -13,7 +13,7 @@ pub fn Worktrees(
             <div class="flex items-center justify-between">
                 <div>
                     <h1 class="text-2xl font-bold text-white/90">"Worktrees"</h1>
-                    <p class="text-sm text-white/40 mt-1">"Manage Jujutsu worktrees"</p>
+                    <p class="text-sm text-white/40 mt-1">"A task's checkout is a Git worktree"</p>
                 </div>
             </div>
 

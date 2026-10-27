@@ -193,6 +193,29 @@ fn tried_a_pull_request(answer: Option<&PrDelivery>) -> bool {
     matches!(answer, Some(PrDelivery::Created { .. } | PrDelivery::Failed { .. }))
 }
 
+/// The commit on screen that an approval would record. Only an answer that
+/// says the approval is not recorded yet, and names a readable commit, counts.
+/// Anything else (not loaded, a moved or missing approval, no readable commit)
+/// shows nothing to approve.
+fn displayed_tip(status: Option<&ApprovalStatus>) -> Option<String> {
+    status
+        .filter(|s| matches!(s.coverage, ApprovalCoverage::NotApplicable))
+        .and_then(|s| s.branch_tip.clone())
+}
+
+/// Whether the approve controls may be used. Approval needs the pull request
+/// answer. A task that is not loaded cannot be approved. A task with a branch
+/// also needs the commit on screen, because the backend records only the commit
+/// the person was shown. A task without a branch has no commit to show.
+fn approval_ready(availability_known: bool, task_has_branch: Option<bool>, tip_shown: bool) -> bool {
+    availability_known
+        && match task_has_branch {
+            None => false,
+            Some(false) => true,
+            Some(true) => tip_shown,
+        }
+}
+
 /// The decision section for a task in Human Review, and what became of an
 /// approval once the task has moved on to its pull request.
 #[component]
@@ -227,18 +250,40 @@ pub fn HumanReviewPanel(
     // as approved.
     let coverage = RwSignal::new(None::<ApprovalStatus>);
     let asked = StoredValue::new(0u32);
-    Effect::new(move |_| {
-        task.track();
+    // Asks what the branch is now. Only the latest question's answer is kept.
+    let ask_coverage = move || {
         let ask = asked.try_update_value(|n| { *n += 1; *n }).unwrap_or(0);
         spawn_local(async move {
-            // Only the latest question's answer is kept.
-            if let Ok(status) = get_approval_status(task_id.to_string()).await {
-                if asked.try_get_value() == Some(ask) {
+            let answer = get_approval_status(task_id.to_string()).await;
+            if asked.try_get_value() != Some(ask) {
+                return;
+            }
+            match answer {
+                Ok(status) => {
                     coverage.try_set(Some(status));
+                }
+                // Without a current answer there is no commit to approve, so the
+                // earlier one must not keep the controls enabled.
+                Err(e) => {
+                    coverage.try_set(None);
+                    error.try_set(Some(format!("The branch's current commit could not be read, so it cannot be approved yet: {e}")));
                 }
             }
         });
+    };
+    Effect::new(move |_| {
+        task.track();
+        ask_coverage();
     });
+    // Read at each use, so the controls follow both the availability answer and
+    // the commit answer. Enabling them on availability alone was not enough.
+    let approval_ready_now = move || {
+        approval_ready(
+            availability.with(Option::is_some),
+            task.with(|t| t.as_ref().map(|t| t.branch_name.is_some())),
+            coverage.with(|c| displayed_tip(c.as_ref())).is_some(),
+        )
+    };
     let approve_current_branch = move |tip: String| {
         if busy.get_untracked() {
             return;
@@ -291,8 +336,10 @@ pub fn HumanReviewPanel(
                 d.begin(task_id);
             }
         }
+        // The commit on screen. The approval covers that commit and no other.
+        let shown = displayed_tip(coverage.get_untracked().as_ref());
         spawn_local(async move {
-            let attempted = match approve_task(task_id.to_string(), create_pr).await {
+            let attempted = match approve_task(task_id.to_string(), create_pr, shown).await {
                 Ok(outcome) => {
                     let attempted = tried_a_pull_request(outcome.pr.as_ref());
                     apply_outcome(outcome.task, outcome.pr);
@@ -300,6 +347,8 @@ pub fn HumanReviewPanel(
                 }
                 Err(e) => {
                     error.try_set(Some(e));
+                    // A refusal usually means the branch moved: show what it is now.
+                    ask_coverage();
                     false
                 }
             };
@@ -526,6 +575,37 @@ pub fn HumanReviewPanel(
             // Undecided: the decision itself.
             <Show when=move || in_review.get() && decision.get().is_none()>
                 <p class="text-xs text-white/50">"Decide on these changes. The diff is in the Changes tab."</p>
+                // An approval covers the branch commit that is current when the
+                // person approves. Naming the branch shows what that will be.
+                {move || task.with(|t| t.as_ref().and_then(|t| t.branch_name.clone())).map(|branch| view! {
+                    <p data-testid="human-review-approval-branch" class="text-xs text-white/50 break-all">
+                        "Approval covers the current commit of branch "
+                        <code class="font-mono text-white/70">{branch}</code>
+                        ". If the branch moves after you approve, the approval no longer applies and you approve again."
+                    </p>
+                })}
+                // The exact commit, read from Git now, when it can be read.
+                {move || coverage.get()
+                    .filter(|c| matches!(c.coverage, ApprovalCoverage::NotApplicable))
+                    .and_then(|c| c.branch_tip)
+                    .map(|tip| view! {
+                        <p data-testid="human-review-approval-commit" class="text-xs text-white/50 break-all">
+                            "Current commit: "
+                            <code class="font-mono text-white/70">{tip}</code>
+                        </p>
+                    })}
+                // A Manual run has no AI review on record, so only a recorded
+                // review is named as a check.
+                <p data-testid="human-review-test-evidence" class="text-xs text-white/50">
+                    {move || {
+                        let ai_review = task.with(|t| t.as_ref().is_some_and(|t| t.qa_signoff.is_some()));
+                        if ai_review {
+                            "No test run is recorded for this Task. The AI review is the only recorded check."
+                        } else {
+                            "No test run and no AI review is recorded for this Task. You are the only check on these changes."
+                        }
+                    }}
+                </p>
                 <div class="flex flex-wrap gap-2">
                     {move || {
                         let available = availability.get();
@@ -534,13 +614,12 @@ pub fn HumanReviewPanel(
                             Some(PrAvailability::Available) => ("Approve & Create PR", true),
                             Some(PrAvailability::Unavailable { .. }) => ("Approve", false),
                         };
-                        let ready = available.is_some();
                         view! {
                             <button
                                 data-testid="human-review-approve"
                                 data-creates-pr=create_pr.to_string()
                                 class="px-3 py-1.5 rounded-lg text-sm font-medium bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-50"
-                                disabled=move || busy.get() || !ready
+                                disabled=move || busy.get() || !approval_ready_now()
                                 on:click=move |_| approve(create_pr)
                             >
                                 {move || if busy.get() && !composing.get() { "Working…" } else { label }}
@@ -554,7 +633,7 @@ pub fn HumanReviewPanel(
                         <button
                             data-testid="human-review-approve-local"
                             class="px-3 py-1.5 rounded-lg text-sm font-medium bg-white/5 text-emerald-200/90 hover:bg-white/10 disabled:opacity-50"
-                            disabled=move || busy.get()
+                            disabled=move || busy.get() || !approval_ready_now()
                             on:click=move |_| approve(false)
                         >
                             "Approve for local delivery"
@@ -985,5 +1064,56 @@ mod tests {
             let label = ai_review_label(&status);
             assert!(!label.contains("FixesApplied") && !label.contains("Rejected"), "{label}");
         }
+    }
+
+    fn answer(coverage: ApprovalCoverage, branch_tip: Option<&str>) -> ApprovalStatus {
+        ApprovalStatus {
+            coverage,
+            approved_tip: None,
+            branch_tip: branch_tip.map(str::to_string),
+            rewritten: false,
+            reason: None,
+        }
+    }
+
+    /// Missing evidence: nothing is on screen until the answer names a commit.
+    #[test]
+    fn no_commit_is_shown_before_the_answer_arrives_or_when_none_is_readable() {
+        assert_eq!(displayed_tip(None), None);
+        assert_eq!(displayed_tip(Some(&answer(ApprovalCoverage::NotApplicable, None))), None);
+    }
+
+    /// Current tip: an undecided branch shows the commit an approval would record.
+    #[test]
+    fn the_commit_read_for_an_undecided_branch_is_the_one_shown() {
+        let tip = "a".repeat(40);
+        assert_eq!(displayed_tip(Some(&answer(ApprovalCoverage::NotApplicable, Some(&tip)))), Some(tip));
+    }
+
+    /// Stale tip: an approval that no longer covers the branch shows no commit
+    /// to approve, so a stale answer cannot authorize a different state.
+    #[test]
+    fn a_moved_or_missing_approval_shows_no_commit_to_approve() {
+        let tip = "b".repeat(40);
+        for coverage in [ApprovalCoverage::Current, ApprovalCoverage::Moved, ApprovalCoverage::Unrecorded, ApprovalCoverage::BranchMissing] {
+            assert_eq!(displayed_tip(Some(&answer(coverage, Some(&tip)))), None, "{coverage:?}");
+        }
+    }
+
+    /// The controls need the availability answer, the task, and, for a branch,
+    /// the commit on screen. Availability alone is not evidence.
+    #[test]
+    fn approval_waits_for_the_commit_on_a_branch_and_for_availability() {
+        // Missing evidence: availability known, branch present, commit not loaded.
+        assert!(!approval_ready(true, Some(true), false));
+        // Availability still being asked.
+        assert!(!approval_ready(false, Some(true), true));
+        assert!(!approval_ready(false, Some(false), false));
+        // The task is not loaded.
+        assert!(!approval_ready(true, None, true));
+        // Current tip shown.
+        assert!(approval_ready(true, Some(true), true));
+        // A task without a branch has no commit to show.
+        assert!(approval_ready(true, Some(false), false));
     }
 }

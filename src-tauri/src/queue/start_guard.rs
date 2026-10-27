@@ -32,6 +32,7 @@ pub type SpaceProbe = Arc<dyn Fn() -> io::Result<FilesystemSpace> + Send + Sync>
 /// without depending on the host's disk. The file holds two numbers, total
 /// and available bytes; anything else reads as a failed check. Release
 /// builds ignore the variable.
+#[cfg(debug_assertions)]
 pub const DEBUG_DISK_SPACE_FILE: &str = "SLASHIT_DEBUG_DISK_SPACE_FILE";
 
 /// How long a check waits for the filesystem before treating free space as

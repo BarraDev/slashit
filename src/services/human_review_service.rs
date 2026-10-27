@@ -75,9 +75,11 @@ pub async fn get_pr_availability(task_id: String) -> Result<PrAvailability, Stri
     invoke("get_pr_availability", serde_json::json!({ "taskId": task_id })).await
 }
 
-/// `Err` means the approval was not recorded.
-pub async fn approve_task(task_id: String, create_pr: bool) -> Result<ApprovalOutcome, String> {
-    invoke("approve_task", serde_json::json!({ "taskId": task_id, "createPr": create_pr })).await
+/// `tip` is the branch commit the person was shown. The approval covers only
+/// that commit, and is refused if the branch has moved since. `Err` means the
+/// approval was not recorded.
+pub async fn approve_task(task_id: String, create_pr: bool, tip: Option<String>) -> Result<ApprovalOutcome, String> {
+    invoke("approve_task", serde_json::json!({ "taskId": task_id, "createPr": create_pr, "tip": tip })).await
 }
 
 pub async fn create_approved_task_pr(task_id: String) -> Result<ApprovalOutcome, String> {

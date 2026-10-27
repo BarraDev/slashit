@@ -113,7 +113,11 @@ Per project, in Settings → Storage:
   `<data_dir>/projects/<project-key>/<project-id>/`.
   Your repository is untouched.
 - **Inside the project** — `<repo>/.slashit/<project-id>/`. Opt in when you
-  want the board committed and shared with your team.
+  want the board committed and shared with your team. The board file
+  (`tasks.toml`) holds Task records: titles, descriptions, review decisions,
+  review feedback and activity history. SlashIt does not add a `.gitignore`
+  entry for `.slashit/`, so a `git add -A` or a commit made by an agent will
+  include it. Ignore the directory yourself if the board should stay private.
 - **Detect automatically** — use `.slashit/` if it already exists and has
   content, otherwise stay outside.
 

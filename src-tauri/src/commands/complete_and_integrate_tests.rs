@@ -158,7 +158,7 @@ async fn fixture_with(detach: bool, remote: Option<&str>) -> Fx {
         run(&repo, &["checkout", "-q", "--detach"]);
     }
     let fx = Fx { _tmp: tmp, paths, state, repo, worktree, project_id, task_id, branch, tip };
-    human_review::approve(&fx.state, fx.task_id, false).await.expect("approved");
+    human_review::approve_shown(&fx.state, fx.task_id, false).await.expect("approved");
     assert_eq!(current(&fx).await.human_review.approved_tip(), Some(fx.tip.as_str()), "the approval records the commit");
     fx
 }
@@ -511,7 +511,7 @@ async fn only_an_approved_task_in_human_review_can_be_completed_and_integrated()
     assert!(complete_and_integrate(&fx.state, fx.task_id, confirmed.clone()).await.is_err());
 
     // Completed without integration: the other action integrates it.
-    human_review::approve(&fx.state, fx.task_id, false).await.unwrap();
+    human_review::approve_shown(&fx.state, fx.task_id, false).await.unwrap();
     human_review::complete_locally(&fx.state, fx.task_id, true).await.expect("completed locally");
     let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("already completed");
     assert!(refused.contains("without its approved work being integrated"), "{refused}");

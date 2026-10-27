@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::components::attention::AttentionChip;
+use crate::components::task_activity::{compact_time, local_offset_at, OffsetAt};
 use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationExecution, ConversationExecutionResult, ConversationExecutionState, ConversationFieldChange, ConversationHumanAction, ConversationProjectAction, ConversationProjectActionOutcome, ConversationProjectActionStatus, ConversationRole, ConversationSnapshot, ConversationTaskMutation};
 use crate::services::conversation_service;
+use chrono::{DateTime, Utc};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::collections::HashMap;
@@ -18,6 +20,23 @@ const UNCONFIRMED_STABLE_REFRESHES: u32 = 100;
 
 fn should_poll_snapshot(busy: bool, coordinator_live: bool, worker_live: bool) -> bool {
     busy || coordinator_live || worker_live
+}
+
+/// How far above the end of the history the reader may be and still follow new
+/// entries. The same slack the task drawer's output uses.
+const FOLLOW_LATEST_SLACK_PX: i32 = 24;
+
+/// Whether the history is scrolled to its newest entry, close enough to keep
+/// following it as new entries arrive.
+fn is_at_latest(scroll_top: i32, scroll_height: i32, client_height: i32) -> bool {
+    scroll_top + client_height >= scroll_height - FOLLOW_LATEST_SLACK_PX
+}
+
+/// When an entry was saved, in the form the Task timeline uses. Nothing is shown
+/// for a timestamp that does not parse, rather than a wrong one.
+fn entry_time(created_at: &str, now: DateTime<Utc>, offset_at: OffsetAt<'_>) -> Option<String> {
+    let at = DateTime::parse_from_rfc3339(created_at).ok()?.with_timezone(&Utc);
+    Some(compact_time(at, offset_at, now))
 }
 
 fn has_unmediated_worker_result(snapshot: &ConversationSnapshot) -> bool {
@@ -162,6 +181,10 @@ fn project_action_controls(status: ConversationProjectActionStatus) -> ProjectAc
         ConversationProjectActionStatus::Applied | ConversationProjectActionStatus::Rejected | ConversationProjectActionStatus::Refused => ProjectActionControls { approve_label: None, can_reject: false },
     }
 }
+
+/// Shown for a history event whose record is absent from the snapshot. Dropping
+/// the event would leave a gap nobody can explain.
+const MISSING_RECORD_TEXT: &str = "The record for this event is not in this Conversation, so its details cannot be shown.";
 
 fn project_action_event_text(kind: &ConversationEntryKind, actions: &[ConversationProjectAction]) -> Option<String> {
     let find = |id: &Uuid| actions.iter().find(|action| action.id == *id);
@@ -327,25 +350,63 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         request
     });
     let publish_snapshot = Callback::new(move |(request, value): (u64, ConversationSnapshot)| {
-        let current = snapshot.get_untracked();
+        // A response can arrive after a Project switch has disposed this view.
+        // The accessors below report that nothing is left, instead of panicking.
+        let Some(applied) = applied_snapshot_request.try_get_untracked() else { return; };
+        let current = snapshot.try_get_untracked().flatten();
         let current_version = current.as_ref().map(|current| (current.conversation.id, current.conversation.revision));
         let incoming_version = (value.conversation.id, value.conversation.revision);
-        if should_publish_snapshot(current_version, incoming_version, request, applied_snapshot_request.get_untracked()) {
-            set_executions.set(value.executions.clone());
-            set_snapshot.set(Some(value));
-            set_applied_snapshot_request.set(request);
+        if should_publish_snapshot(current_version, incoming_version, request, applied) {
+            // The liveness poll returns the whole history every 800 ms. Setting
+            // the signal re-renders every entry, so an unchanged poll must not set it.
+            if current.as_ref() != Some(&value) {
+                let _ = set_executions.try_set(value.executions.clone());
+                let _ = set_snapshot.try_set(Some(value));
+            }
+            let _ = set_applied_snapshot_request.try_set(request);
         }
     });
 
+    // The history follows its newest entry until the Human scrolls up to read
+    // earlier ones. "Jump to latest" and sending a message bring it back.
+    let history_ref = NodeRef::<leptos::html::Div>::new();
+    let (following_latest, set_following_latest) = signal(true);
+    let scroll_to_latest = move || {
+        if let Some(el) = history_ref.try_get_untracked().flatten() {
+            el.set_scroll_top(el.scroll_height());
+        }
+    };
+    // The entries render from the same snapshot, so the scroll waits one tick for the new height.
+    // An execution refresh can change a card in the history without a new snapshot, so it counts too.
+    Effect::new(move |_| {
+        snapshot.track();
+        executions.track();
+        if following_latest.get_untracked() {
+            gloo_timers::callback::Timeout::new(0, scroll_to_latest).forget();
+        }
+    });
+    // Following is turned on by a send and by "Jump to latest". A send can fail
+    // without changing the snapshot, so turning it on must scroll by itself.
+    // The scroll waits one tick, as the effect above does, for the new layout.
+    let follow_latest = move || {
+        set_following_latest.set(true);
+        gloo_timers::callback::Timeout::new(0, scroll_to_latest).forget();
+    };
+    let on_history_scroll = move |_| {
+        if let Some(el) = history_ref.try_get_untracked().flatten() {
+            set_following_latest.set(is_at_latest(el.scroll_top(), el.scroll_height(), el.client_height()));
+        }
+    };
+
 
     let initial_id = project_id.clone();
-    let initial_begin_request = begin_snapshot_request.clone();
-    let initial_publish = publish_snapshot.clone();
+    let initial_begin_request = begin_snapshot_request;
+    let initial_publish = publish_snapshot;
     Effect::new(move |_| {
         if initial_id.is_empty() { return; }
         let id = initial_id.clone();
         let request = initial_begin_request.run(());
-        let publish = initial_publish.clone();
+        let publish = initial_publish;
         spawn_local(async move {
             // Opening takes the Project lock, which a live run holds, so a page
             // remounted mid-run reads first and only opens a Conversation that
@@ -356,13 +417,13 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             };
             match loaded {
                 Ok(value) => publish.run((request, value)),
-                Err(error) => set_error.set(Some(error)),
+                Err(error) => { let _ = set_error.try_set(Some(error)); }
             }
         });
     });
     let poll_id = project_id.clone();
-    let poll_begin_request = begin_snapshot_request.clone();
-    let poll_publish = publish_snapshot.clone();
+    let poll_begin_request = begin_snapshot_request;
+    let poll_publish = publish_snapshot;
     let timer = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(800, move || {
         let active = snapshot.get_untracked().is_some_and(|value| {
             should_poll_snapshot(busy.get_untracked(), value.coordinator_live, value.worker_live)
@@ -370,7 +431,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         if !active { return; }
         let id = poll_id.clone();
         let request = poll_begin_request.run(());
-        let publish = poll_publish.clone();
+        let publish = poll_publish;
         spawn_local(async move { if let Ok(value) = conversation_service::get_project_conversation(id).await { publish.run((request, value)); } });
     })));
     on_cleanup(move || { timer.update_value(|value| { value.take(); }); });
@@ -407,19 +468,20 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     on_cleanup(move || { execution_timer.update_value(|value| { value.take(); }); });
 
     let send_id = project_id.clone();
-    let send_begin_request = begin_snapshot_request.clone();
-    let send_publish = publish_snapshot.clone();
+    let send_begin_request = begin_snapshot_request;
+    let send_publish = publish_snapshot;
     let on_send = move || {
         let message = draft.get_untracked().trim().to_string();
         if message.is_empty() || busy.get_untracked() { return; }
         let revision_before = snapshot.get_untracked().map(|value| value.conversation.revision);
         set_draft.set(String::new()); set_busy.set(true); set_error.set(None);
+        follow_latest();
         let id = send_id.clone();
         let request = send_begin_request.run(());
-        let publish = send_publish.clone();
+        let publish = send_publish;
         let refresh_id = send_id.clone();
-        let refresh_begin_request = send_begin_request.clone();
-        let refresh_publish = send_publish.clone();
+        let refresh_begin_request = send_begin_request;
+        let refresh_publish = send_publish;
         spawn_local(async move {
             match conversation_service::send_project_message(id, message.clone()).await {
                 Ok(value) => publish.run((request, value)),
@@ -445,17 +507,17 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     };
     let stop_id = StoredValue::new_local(project_id.clone());
     let approve_project_id = project_id.clone();
-    let approve_begin_request = begin_snapshot_request.clone();
-    let approve_publish = publish_snapshot.clone();
+    let approve_begin_request = begin_snapshot_request;
+    let approve_publish = publish_snapshot;
     let approve_action = Callback::new(move |(action_id, request): (String, Option<String>)| {
         let Some(current) = snapshot.get_untracked() else { return; };
         set_busy.set(true);
         let id = approve_project_id.clone();
         let refresh_id = approve_project_id.clone();
         let request_id = approve_begin_request.run(());
-        let publish = approve_publish.clone();
-        let refresh_begin_request = approve_begin_request.clone();
-        let refresh_publish = approve_publish.clone();
+        let publish = approve_publish;
+        let refresh_begin_request = approve_begin_request;
+        let refresh_publish = approve_publish;
         spawn_local(async move {
             match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Approve { request }).await {
                 Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
@@ -464,17 +526,17 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         });
     });
     let reject_project_id = project_id.clone();
-    let reject_begin_request = begin_snapshot_request.clone();
-    let reject_publish = publish_snapshot.clone();
+    let reject_begin_request = begin_snapshot_request;
+    let reject_publish = publish_snapshot;
     let reject_action = Callback::new(move |action_id: String| {
         let Some(current) = snapshot.get_untracked() else { return; };
         set_busy.set(true);
         let id = reject_project_id.clone();
         let refresh_id = reject_project_id.clone();
         let request_id = reject_begin_request.run(());
-        let publish = reject_publish.clone();
-        let refresh_begin_request = reject_begin_request.clone();
-        let refresh_publish = reject_publish.clone();
+        let publish = reject_publish;
+        let refresh_begin_request = reject_begin_request;
+        let refresh_publish = reject_publish;
         spawn_local(async move {
             match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Reject).await {
                 Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
@@ -483,17 +545,17 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         });
     });
     let withdraw_project_id = project_id.clone();
-    let withdraw_begin_request = begin_snapshot_request.clone();
-    let withdraw_publish = publish_snapshot.clone();
+    let withdraw_begin_request = begin_snapshot_request;
+    let withdraw_publish = publish_snapshot;
     let withdraw_action = Callback::new(move |action_id: String| {
         let Some(current) = snapshot.get_untracked() else { return; };
         set_busy.set(true);
         let id = withdraw_project_id.clone();
         let refresh_id = withdraw_project_id.clone();
         let request_id = withdraw_begin_request.run(());
-        let publish = withdraw_publish.clone();
-        let refresh_begin_request = withdraw_begin_request.clone();
-        let refresh_publish = withdraw_publish.clone();
+        let publish = withdraw_publish;
+        let refresh_begin_request = withdraw_begin_request;
+        let refresh_publish = withdraw_publish;
         spawn_local(async move {
             match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Withdraw).await {
                 Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
@@ -502,8 +564,8 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         });
     });
     let retry_project_id = project_id.clone();
-    let retry_begin_request = begin_snapshot_request.clone();
-    let retry_publish = publish_snapshot.clone();
+    let retry_begin_request = begin_snapshot_request;
+    let retry_publish = publish_snapshot;
     let retry_coordinator = Callback::new(move |()| {
         if busy.get_untracked() { return; }
         let Some(current) = snapshot.get_untracked() else { return; };
@@ -514,20 +576,20 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         set_error.set(None);
         let id = retry_project_id.clone();
         let request = retry_begin_request.run(());
-        let publish = retry_publish.clone();
+        let publish = retry_publish;
         spawn_local(async move {
             match conversation_service::retry_project_conversation_continuation(
                 id, current.conversation.id.to_string(), current.conversation.revision, action_id,
             ).await {
                 Ok(value) => publish.run((request, value)),
-                Err(error) => set_error.set(Some(error)),
+                Err(error) => { let _ = set_error.try_set(Some(error)); }
             }
             set_busy.set(false);
         });
     });
     let turn_project_id = project_id.clone();
-    let turn_begin_request = begin_snapshot_request.clone();
-    let turn_publish = publish_snapshot.clone();
+    let turn_begin_request = begin_snapshot_request;
+    let turn_publish = publish_snapshot;
     let retry_turn = Callback::new(move |()| {
         if busy.get_untracked() { return; }
         let Some(current) = snapshot.get_untracked() else { return; };
@@ -536,9 +598,9 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let id = turn_project_id.clone();
         let refresh_id = turn_project_id.clone();
         let request = turn_begin_request.run(());
-        let publish = turn_publish.clone();
-        let refresh_begin_request = turn_begin_request.clone();
-        let refresh_publish = turn_publish.clone();
+        let publish = turn_publish;
+        let refresh_begin_request = turn_begin_request;
+        let refresh_publish = turn_publish;
         spawn_local(async move {
             match conversation_service::retry_project_message(id, current.conversation.id.to_string(), current.conversation.revision).await {
                 Ok(value) => publish.run((request, value)),
@@ -562,25 +624,30 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         <button data-testid="conversation-stop" class="rounded-md border border-red-400/40 px-3 py-1 text-sm text-red-200" on:click=move |_| { let id = stop_id.get_value(); spawn_local(async move { if let Err(error) = conversation_service::stop_project_conversation(id).await { set_error.set(Some(error)); } }); }>"Stop run"</button>
                     </Show>
                 </header>
-                <div class="mb-3 min-h-0 flex-1 space-y-2 overflow-y-auto" data-testid="conversation-history">
+                <div class="mb-3 min-h-0 flex-1 space-y-2 overflow-y-auto" data-testid="conversation-history" node_ref=history_ref on:scroll=on_history_scroll>
+                    {move || snapshot.get().is_some_and(|value| value.conversation.entries.is_empty()).then(|| view! {
+                        <p data-testid="conversation-empty" class="text-sm text-white/50">"No messages yet. Ask the Coordinator about this Project or its Tasks. It can propose changes, and you approve each one before SlashIt applies it."</p>
+                    })}
                     {move || snapshot.get().map(|value| {
                         let actions = value.conversation.actions;
                         let project_actions = value.conversation.project_actions;
                         let executions = executions.get();
+                        let now = Utc::now();
                         value.conversation.entries.into_iter().flat_map(|entry| {
+                            let when = entry_time(&entry.created_at, now, &local_offset_at);
                             let applied = match &entry.kind { ConversationEntryKind::ProjectActionApplied { action_id, .. } => Some(*action_id), _ => None };
                             let (testid, text) = match entry.kind {
                                 ConversationEntryKind::HumanMessage { text } | ConversationEntryKind::CoordinatorReply { text } => ("conversation-message", Some(text)),
-                                ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {} (Task {}): {}", action.target_task_title, action.target_task_id, action.request))),
+                                ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {} (Task {}): {}", action.target_task_title, action.target_task_id, action.request)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
                                 ConversationEntryKind::ActionDecision { approved, request, .. } => ("conversation-action-event", Some(if approved { format!("You approved the Worker request: {}", request.unwrap_or_default()) } else { "You rejected the proposed Task work.".to_string() })),
-                                ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title))),
+                                ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
                                 ConversationEntryKind::WorkerResult { result, .. } => ("conversation-worker-result", Some(result)),
                                 ConversationEntryKind::ActionWithdrawn { .. } => ("conversation-action-event", Some("You withdrew an earlier approval of a retired direct delegation. Nothing was started.".to_string())),
                                 ConversationEntryKind::RunFailed { message, .. } => ("conversation-run-failed", Some(message)),
-                                ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", project_action_event_text(kind, &project_actions)),
+                                ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", Some(project_action_event_text(kind, &project_actions).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
                             };
                             let role = match entry.role { ConversationRole::Human => "You", ConversationRole::Coordinator => "Coordinator", ConversationRole::Worker => "Worker" };
-                            let event = text.map(|text| view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 text-xs font-medium text-white/50">{role}</div><div class="whitespace-pre-wrap text-sm text-white/90">{text}</div></article> }.into_any());
+                            let event = text.map(|text| view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 flex items-baseline justify-between gap-2 text-xs font-medium text-white/50"><span>{role}</span><span data-testid="conversation-entry-time" class="font-normal text-white/40">{when}</span></div><div class="whitespace-pre-wrap text-sm text-white/90">{text}</div></article> }.into_any());
                             // The run an approval started appears beside the event that applied it, so the history keeps it after the proposal card is gone.
                             let card = applied.and_then(|action_id| executions.iter().find(|execution| execution.action_id == action_id).cloned()).map(|execution| {
                                 let approval = approval_text(project_actions.iter().find(|action| action.id == execution.action_id));
@@ -590,6 +657,13 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         }).collect_view()
                     })}
                 </div>
+                {move || {
+                    (!following_latest.get() && snapshot.get().is_some_and(|value| !value.conversation.entries.is_empty())).then(|| view! {
+                        <div class="mb-2 flex shrink-0 justify-center">
+                            <button data-testid="conversation-jump-latest" class="rounded-full border border-white/20 bg-zinc-900 px-3 py-1 text-xs text-white/80" on:click=move |_| follow_latest()>"Jump to latest"</button>
+                        </div>
+                    })
+                }}
                 <div class="mb-3 max-h-[40%] shrink-0 space-y-2 overflow-y-auto">
                     <For
                         each=move || snapshot.get().map(|value| value.conversation.actions.into_iter().filter(|action| retired_delegation_controls(action.status).is_some()).collect::<Vec<_>>()).unwrap_or_default()
@@ -601,7 +675,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         let recorded_request = Signal::derive(move || snapshot.get().and_then(|value| value.conversation.actions.into_iter().find(|item| item.id == action_uuid)).map(|item| item.approved_request.unwrap_or(item.request)).unwrap_or_else(|| recorded.clone()));
                         let status = Signal::derive(move || snapshot.get().and_then(|value| value.conversation.actions.into_iter().find(|item| item.id == action_uuid)).map(|item| item.status));
                         let controls = Signal::derive(move || status.get().and_then(retired_delegation_controls));
-                        let reject_action = reject_action.clone(); let withdraw_action = withdraw_action.clone();
+                        let reject_action = reject_action; let withdraw_action = withdraw_action;
                         view! {
                             <article data-testid="conversation-action-proposal" class="rounded-lg border border-amber-300/30 bg-amber-400/5 p-3">
                                 <div class="text-xs uppercase tracking-wide text-amber-200">"Retired direct delegation"</div>
@@ -612,11 +686,11 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                 <label class="mt-2 block text-xs text-white/50">"Recorded request"<textarea data-testid="conversation-action-request" class="mt-1 min-h-20 w-full rounded bg-black/30 p-2 text-sm text-white" readonly=true prop:value=move || recorded_request.get()></textarea></label>
                                 <div class="mt-2 flex gap-2">
                                     {move || controls.get().is_some_and(|c| c.can_reject).then(|| {
-                                        let reject_action = reject_action.clone(); let reject_id = reject_id.clone();
+                                        let reject_id = reject_id.clone();
                                         view! { <button data-testid="conversation-action-reject" class="rounded border border-white/20 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| reject_action.run(reject_id.clone())>"Reject"</button> }
                                     })}
                                     {move || controls.get().is_some_and(|c| c.can_withdraw).then(|| {
-                                        let withdraw_action = withdraw_action.clone(); let withdraw_id = withdraw_id.clone();
+                                        let withdraw_id = withdraw_id.clone();
                                         view! { <button data-testid="conversation-action-withdraw" class="rounded border border-amber-200/40 px-3 py-1 text-sm text-amber-100" disabled=move || busy.get() on:click=move |_| withdraw_action.run(withdraw_id.clone())>"Withdraw approval"</button> }
                                     })}
                                 </div>
@@ -625,7 +699,8 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         }
                     />
                 </div>
-                <div class="mb-3 max-h-[40%] shrink-0 space-y-2 overflow-y-auto" data-testid="project-actions">
+                // Bounded, so many pending proposals scroll here instead of taking the history's height.
+                <div class="mb-3 max-h-64 shrink-0 space-y-2 overflow-y-auto" data-testid="project-actions">
                     <For
                         each=move || snapshot.get().map(|value| pending_project_actions(&value)).unwrap_or_default()
                         key=|action| (action.id, action.status)
@@ -633,7 +708,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                             let view = mutation_view(&action.mutation);
                             let controls = project_action_controls(action.status);
                             let approve_id = action.id.to_string(); let reject_id = approve_id.clone();
-                            let approve_action = approve_action.clone(); let reject_action = reject_action.clone();
+                            let approve_action = approve_action; let reject_action = reject_action;
                             let status = format!("{:?}", action.status).to_lowercase();
                             let action_id = action.id;
                             let note = approval_effect_note(&action.mutation);
@@ -667,7 +742,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         value.conversation.actions.iter()
                             .find(|action| action.status == ConversationActionStatus::Returned && !action.coordinator_replied)
                             .map(|_| {
-                                let retry = retry_coordinator.clone();
+                                let retry = retry_coordinator;
                                 view! {
                                     <div data-testid="conversation-continuation-error" class="mb-3 rounded border border-amber-300/30 bg-amber-400/5 p-3 text-sm text-amber-100">
                                         <p>{value.continuation_error.unwrap_or_else(|| "The Worker result is saved and awaits a Coordinator response.".into())}</p>
@@ -679,7 +754,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                 }}
                 {move || {
                     snapshot.get().filter(|value| value.turn_retry_available).map(|_| {
-                        let retry = retry_turn.clone();
+                        let retry = retry_turn;
                         view! {
                             <div data-testid="conversation-turn-retry" class="mb-3 flex shrink-0 items-center justify-between gap-3 rounded border border-amber-300/30 bg-amber-400/5 p-3 text-sm text-amber-100">
                                 <p>"Your last message has no reply yet. Retry asks the Coordinator again for that message, and it is not saved twice. Sending a new message ends this Retry: the earlier message stays unanswered, and only the new one is answered."</p>
@@ -710,6 +785,22 @@ mod tests {
         assert!(should_poll_snapshot(false, false, true));
         assert!(should_poll_snapshot(true, false, false));
         assert!(!should_poll_snapshot(false, false, false));
+    }
+
+    #[test]
+    fn the_history_keeps_following_the_newest_entry_only_near_its_end() {
+        assert!(is_at_latest(0, 500, 500));
+        assert!(is_at_latest(100, 500, 380));
+        assert!(!is_at_latest(0, 500, 400));
+    }
+
+    #[test]
+    fn an_entry_time_is_shown_in_the_timeline_form_or_not_at_all() {
+        let utc = |_: DateTime<Utc>| chrono::FixedOffset::east_opt(0).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-10-25T12:00:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(entry_time("2026-10-25T08:30:00.123456789Z", now, &utc).as_deref(), Some("08:30"));
+        assert_eq!(entry_time("2026-10-24T09:05:00Z", now, &utc).as_deref(), Some("Oct 24 09:05"));
+        assert_eq!(entry_time("", now, &utc), None);
     }
 
     #[test]
