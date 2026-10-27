@@ -337,3 +337,24 @@ channel in Settings receive it and later prereleases; people on the Stable
 channel receive nothing until a stable release is published. Until then the
 README's Releases link goes to the prerelease page, and a Stable check reports
 that no newer Stable release is available. That is expected, and not an error.
+
+## 9. Recovering a partial draft
+
+A tag whose workflow failed on one platform is not re-run and is never moved.
+Re-running a tag's workflow uses the workflow file as it was at the tagged
+commit, so a fix on `main` does not reach it. Its draft is kept and the missing
+platform is added to it:
+
+1. Fix the cause on `main` through an ordinary pull request.
+2. Run **Release Windows recovery** from `main`. It refuses any other ref, and
+   it checks before building that the tag resolves to the source commit it names,
+   that exactly one release carries the tag and it is the draft it names, that
+   the draft is still a Draft and a Prerelease, and that the description it would
+   write matches the draft's body.
+3. Its build step is the only one that receives the signing secrets. It uploads
+   the platform's installers and merges its entries into the existing
+   `latest.json`. The other platforms' assets and entries are kept.
+
+The workflow names the tag, the release ID and the source commit as constants.
+When a different tag or release needs the same recovery, change them together in
+a reviewed pull request, not by dispatch input.
