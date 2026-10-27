@@ -393,6 +393,35 @@ jobs:
       - name: IPC integration suite (assembled server over a named pipe)
         run: cargo test -p slashit-ui --test ipc_integration
 
+  # The update feed's transport policy is compiled on every platform, but the
+  # compile check above never runs it. These tests run the production client
+  # against local HTTP and HTTPS servers: a plain-HTTP request is refused before
+  # connecting, an HTTPS redirect to plain HTTP is refused, and an HTTPS redirect
+  # to another host is followed. The TLS tests trust a certificate generated per
+  # run, so the platform's certificate verifier is not consulted. Only the
+  # `update_feed` tests run here, not the whole library, on the two platforms the
+  # release builds on. The Linux test job runs the rest of the backend.
+  updater-transport:
+    name: Updater transport tests (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Update feed transport tests
+        run: cargo test -p slashit-ui --lib update_feed
+
   # Durable replacement has a different implementation on each platform
   # (fsync, F_FULLFSYNC, a directory flush on Windows), so the crate that
   # owns it runs its tests on all three. The crate is dependency-light on
