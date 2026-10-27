@@ -420,7 +420,65 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Update feed transport tests
+        if: runner.os != 'Windows'
         run: cargo test -p slashit-ui --lib update_feed
+
+      # tauri-build embeds the Common Controls v6 manifest only into binaries
+      # (embed-resource links it with rustc-link-arg-bins), so the library test
+      # harness starts with comctl32 v5. rfd imports TaskDialogIndirect, which v5
+      # lacks, and the harness exits with STATUS_ENTRYPOINT_NOT_FOUND before any
+      # test runs. This embeds the same manifest into the test executable only.
+      - name: Build update feed test executable (Windows)
+        if: runner.os == 'Windows'
+        id: build
+        shell: pwsh
+        run: |
+          $messages = cargo test -p slashit-ui --lib --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw "cargo test --no-run failed with $LASTEXITCODE" }
+          $exe = $messages |
+            ForEach-Object { $_ | ConvertFrom-Json -ErrorAction SilentlyContinue } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'slashit_ui_lib' -and $_.executable } |
+            ForEach-Object { $_.executable } |
+            Select-Object -Last 1
+          if (-not $exe) { throw "the library test executable was not reported by cargo" }
+
+          $manifest = Join-Path $env:RUNNER_TEMP 'update-feed-test.manifest'
+          $xml = @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+            <dependency>
+              <dependentAssembly>
+                <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+              </dependentAssembly>
+            </dependency>
+          </assembly>
+          '@
+          [IO.File]::WriteAllText($manifest, $xml)
+
+          $mt = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mt.exe |
+            Where-Object { $_.FullName -match '\\x64\\mt\.exe$' } |
+            Sort-Object FullName |
+            Select-Object -Last 1
+          if (-not $mt) { throw "mt.exe was not found in the Windows SDK" }
+
+          & $mt.FullName -nologo -manifest $manifest "-outputresource:$exe;#1"
+          if ($LASTEXITCODE -ne 0) { throw "mt.exe could not embed the manifest" }
+          & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:$(Join-Path $env:RUNNER_TEMP 'embedded.manifest')"
+          if ($LASTEXITCODE -ne 0) { throw "the embedded manifest could not be read back" }
+
+          "exe=$exe" >> $env:GITHUB_OUTPUT
+
+      - name: Run update feed transport tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: src-tauri
+        env:
+          TEST_EXE: ${{ steps.build.outputs.exe }}
+        run: |
+          $output = & $env:TEST_EXE update_feed 2>&1
+          $output | ForEach-Object { $_ }
+          if ($LASTEXITCODE -ne 0) { throw "the update_feed tests exited with $LASTEXITCODE" }
+          if (-not ($output -match 'test result: ok\. [1-9][0-9]* passed')) { throw "no update_feed test passed" }
 
   # Durable replacement has a different implementation on each platform
   # (fsync, F_FULLFSYNC, a directory flush on Windows), so the crate that
