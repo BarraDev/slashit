@@ -125,6 +125,12 @@ jobs:
       - name: Release description takes only its own version's section
         run: scripts/test-release-notes.sh
 
+      # A Windows runner runs a step in PowerShell unless the step names
+      # `shell:`. A step with POSIX syntax and no `shell:` fails only there, after
+      # the rest of its job has run, so every workflow is checked here.
+      - name: Windows run steps name their shell when they use POSIX syntax
+        run: scripts/test-check-workflow-shells.sh
+
       # The embedded WebDriver server can drive the webview and evaluate
       # arbitrary JavaScript. Asserting it stays out of a default build is
       # cheaper than trusting that nobody adds it to `default` by accident.

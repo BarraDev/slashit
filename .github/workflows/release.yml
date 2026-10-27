@@ -98,8 +98,11 @@ jobs:
       # installation and signing notices, built for the version the preflight
       # job validated, so it cannot take another version's section. The text is
       # multi-line, so it goes out through a delimiter that cannot occur in it.
+      # `shell: bash` is required: the Windows runner's default shell is
+      # PowerShell, which cannot run this script's `set -euo pipefail`.
       - name: Write the release description for this version
         id: notes
+        shell: bash
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
