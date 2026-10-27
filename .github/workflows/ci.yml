@@ -332,7 +332,8 @@ jobs:
       # the same Rust environment fingerprint can reuse one another's cache.
       # rust-cache still separates different Rust environments and lockfiles.
       # On a fully cold run they may all miss before the first job saves; later
-      # runs can restore the cache for their matching environment.
+      # runs can restore the cache for their matching environment. Pull requests
+      # can restore from main, but their saves stay scoped to the PR merge ref.
       - name: Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
