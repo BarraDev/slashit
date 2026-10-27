@@ -2,6 +2,12 @@
 
 - 
 
+## Related issue
+
+<!-- `Closes #N` or `Fixes #N` only if this PR fully resolves the issue. `Refs #N` for partial or stacked work. Delete this section if no issue applies. -->
+
+- 
+
 ## Testing
 
 - [ ] `cargo fmt --check`
