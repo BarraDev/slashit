@@ -137,4 +137,9 @@ mockall = "0.13"
 # a dev-dependency feature, it is not unified into `cargo build`/`cargo tauri
 # build`, so no shipped binary carries the mock runtime.
 tauri = { version = "2", features = ["test"] }
+# TEST-ONLY. Generates a self-signed certificate at test time for the loopback
+# TLS server behind the updater's HTTPS redirect test. No key is committed. It
+# uses `ring`, the provider the app already installs, so no second crypto
+# backend is added to the test build.
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 
