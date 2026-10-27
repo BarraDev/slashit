@@ -103,10 +103,10 @@ pub static REGISTRY: &[FeatureDef] = &[
         description: "Check for and install application updates from GitHub Releases.",
         area: "updater",
         owner: "core",
-        // On by default. The endpoint is `releases/latest/download/latest.json`,
-        // and GitHub's "latest" excludes drafts and prereleases, so until the
-        // first stable release exists the check gets a 404. `updater_check`
-        // reads that as "no update", so the first pre-release shows no error.
+        // On by default. The updater reads the GitHub releases listing and
+        // offers the highest release its channel allows (see update_feed.rs),
+        // so a published prerelease reaches the Prerelease channel, and this
+        // flag never depends on GitHub's "latest" release.
         default: true,
         read: |flags: &FeatureFlags| flags.auto_update,
         write: |flags: &mut FeatureFlags, value: bool| flags.auto_update = value,
