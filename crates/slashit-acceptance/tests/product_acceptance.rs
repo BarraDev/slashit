@@ -580,6 +580,40 @@ async fn drawer_retry_journey(context: &TestContext) -> Result<()> {
     Ok(())
 }
 
+/// A run's working directory must be a task checkout under this run's state
+/// root. The repository fixture lives inside that state root too, so the root
+/// alone cannot tell a task checkout from the repository itself.
+fn assert_isolated_checkout(invocation: &fake_agent::Invocation, repository: &GitFixture, what: &str) -> Result<()> {
+    let resolved = resolve(&invocation.working_dir);
+    if !resolved.starts_with(resolve(repository.state_root())) {
+        bail!(
+            "{what} ran in {}, which is outside this run's state root {}",
+            invocation.working_dir.display(),
+            repository.state_root().display()
+        );
+    }
+    if resolved.starts_with(resolve(&repository.path_buf())) {
+        bail!("{what} ran in {}, inside the repository, not in a task checkout", invocation.working_dir.display());
+    }
+    Ok(())
+}
+
+/// The invocation a retry must share with a first run: the streaming protocol
+/// the runner parses, and a prompt delivered on stdin rather than in arguments.
+fn assert_invocation_protocol(invocation: &fake_agent::Invocation, what: &str) -> Result<()> {
+    if invocation.flag("--output-format") != Some(OsStr::new("stream-json")) {
+        bail!("{what} did not use the streaming protocol the runner parses: {:?}", invocation.args);
+    }
+    let prompt = invocation.prompt.as_deref().with_context(|| format!("{what} read no prompt from stdin"))?;
+    if prompt.is_empty() {
+        bail!("{what} was invoked with an empty prompt");
+    }
+    if let Some(leaked) = invocation.args.iter().find(|arg| arg.to_string_lossy().contains(prompt)) {
+        bail!("{what} also received its prompt as an argument: {leaked:?}");
+    }
+    Ok(())
+}
+
 async fn fail_and_retry_in_the_drawer(
     driver: &WebDriver,
     agent: &FakeAgent,
@@ -613,9 +647,11 @@ async fn fail_and_retry_in_the_drawer(
         .filter(|session| !session.is_empty())
         .context("the failed run carried no usable --session-id")?
         .to_os_string();
+    assert_isolated_checkout(&first_run[0], repository, "the failed attempt")?;
+    assert_invocation_protocol(&first_run[0], "the failed attempt")?;
     let failed_worktree = resolve(&first_run[0].working_dir);
-    if !failed_worktree.starts_with(resolve(repository.state_root())) || !failed_worktree.is_dir() {
-        bail!("the failed attempt did not preserve its worktree under the test state root: {}", failed_worktree.display());
+    if !failed_worktree.is_dir() {
+        bail!("the failed attempt's worktree {} is not there", failed_worktree.display());
     }
 
     let failed = await_status(driver, &project_id, &task_id, &["error", "human_review"]).await?;
@@ -706,6 +742,8 @@ async fn fail_and_retry_in_the_drawer(
         bail!("the retry started {} agent runs, expected exactly two", runs.len());
     }
     let second_run = retry_among(&runs, &failed_session)?;
+    assert_isolated_checkout(second_run, repository, "the retried attempt")?;
+    assert_invocation_protocol(second_run, "the retried attempt")?;
     let retried_worktree = resolve(&second_run.working_dir);
     if retried_worktree != failed_worktree {
         bail!(
@@ -724,6 +762,50 @@ async fn fail_and_retry_in_the_drawer(
         bail!(
             "the retried run did not reach human review: {:?}",
             settled.get("error_message")
+        );
+    }
+    // The settled state the product writes when a run reaches review: the
+    // phase is complete at 90 percent overall, the failure the attempt recorded
+    // is gone, the run's model is the one the agent reported, and the task still
+    // points at the branch and worktree the retried run used.
+    if settled.get("phase").and_then(Value::as_str) != Some("complete") {
+        bail!("the retried run settled in phase {:?}, expected complete", settled.get("phase"));
+    }
+    if settled.get("overall_progress").and_then(Value::as_u64) != Some(90) {
+        bail!(
+            "the retried run settled at overall progress {:?}, expected 90",
+            settled.get("overall_progress")
+        );
+    }
+    if !matches!(settled.get("error_message"), None | Some(Value::Null)) {
+        bail!(
+            "the retried run still records the failure it replaced: {:?}",
+            settled.get("error_message")
+        );
+    }
+    if settled.get("model").and_then(Value::as_str) != Some("default") {
+        bail!("the retry changed the configured model to {:?}", settled.get("model"));
+    }
+    if settled.get("last_observed_model").and_then(Value::as_str) != Some(REPORTED_MODEL) {
+        bail!(
+            "the retried run records observed model {:?}, expected {REPORTED_MODEL:?}",
+            settled.get("last_observed_model")
+        );
+    }
+    if settled.get("branch_name").and_then(Value::as_str) != Some(failed_branch.as_str()) {
+        bail!(
+            "the retried run settled on branch {:?}, expected the failed attempt's {failed_branch:?}",
+            settled.get("branch_name")
+        );
+    }
+    let settled_worktree = settled
+        .get("worktree_path")
+        .and_then(Value::as_str)
+        .map(|path| resolve(Path::new(path)));
+    if settled_worktree.as_ref() != Some(&retried_worktree) {
+        bail!(
+            "the retried run settled on worktree {settled_worktree:?}, but ran in {}",
+            retried_worktree.display()
         );
     }
     await_drawer_status(driver, "humanreview").await?;
