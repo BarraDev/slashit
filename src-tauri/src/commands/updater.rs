@@ -87,9 +87,10 @@ pub struct UpdaterState {
     /// Which checks are current, and which channel generation is in force. See
     /// [`CheckSequence`].
     checks: Arc<CheckSequence>,
-    /// The releases listing from the last successful fetch, reused for
-    /// [`update_feed::CACHE_TTL`].
-    feed_cache: Arc<Mutex<Option<(Instant, Feed)>>>,
+    /// The releases listing from the last successful fetch, and the listing it
+    /// was fetched from. Reused for [`update_feed::CACHE_TTL`], only for the same
+    /// listing.
+    feed_cache: Arc<Mutex<Option<(Instant, String, Feed)>>>,
     /// When the last *successful* check completed.
     last_check: Arc<Mutex<Option<DateTime<Utc>>>>,
     /// Held for the whole download-and-install span via [`InstallGuard`], so
@@ -771,13 +772,16 @@ async fn find_update(
             &format!("the running version {current_version} is not a plain MAJOR.MINOR.PATCH"),
         )
     })?;
-    let feed = cached_feed(state).await?;
+    let endpoints = update_feed::endpoints()
+        .map_err(|detail| err(UpdaterErrorKind::NotConfigured, &detail))?;
+    let feed = cached_feed(state, &endpoints.listing).await?;
     let Selection { chosen, notices } = update_feed::select(&feed, channel, current);
     let Some(chosen) = chosen else {
         return Ok(Found { update: None, notices });
     };
 
-    let endpoint = tauri::Url::parse(&chosen.manifest_url).map_err(|error| {
+    let manifest = update_feed::manifest_url(&endpoints.download_base, &chosen.tag);
+    let endpoint = tauri::Url::parse(&manifest).map_err(|error| {
         err(UpdaterErrorKind::NotConfigured, &format!("the release manifest URL is invalid: {error}"))
     })?;
     let updater = app
@@ -817,18 +821,18 @@ const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 ///
 /// Held across the request on purpose: concurrent checks wait for one listing
 /// rather than each spending a request of the unauthenticated quota.
-async fn cached_feed(state: &tauri::State<'_, crate::AppState>) -> Result<Feed, String> {
+async fn cached_feed(state: &tauri::State<'_, crate::AppState>, listing: &str) -> Result<Feed, String> {
     let mut cache = state.updater.feed_cache.lock().await;
-    if let Some((fetched, feed)) = cache.as_ref() {
-        if fetched.elapsed() < update_feed::CACHE_TTL {
+    if let Some((fetched, cached_listing, feed)) = cache.as_ref() {
+        if cached_listing == listing && fetched.elapsed() < update_feed::CACHE_TTL {
             return Ok(feed.clone());
         }
     }
     let client = update_feed::client().map_err(|error| feed_error(&error))?;
-    let feed = update_feed::fetch_feed(&client, update_feed::RELEASES_API)
+    let feed = update_feed::fetch_feed(&client, listing)
         .await
         .map_err(|error| feed_error(&error))?;
-    *cache = Some((Instant::now(), feed.clone()));
+    *cache = Some((Instant::now(), listing.to_string(), feed.clone()));
     Ok(feed)
 }
 

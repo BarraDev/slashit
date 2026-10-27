@@ -60,7 +60,25 @@ pub struct Feed {
 pub struct Chosen {
     pub tag: String,
     pub version: PlainVersion,
-    pub manifest_url: String,
+}
+
+/// Where this build reads releases and manifests from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoints {
+    /// The releases listing, with no query string.
+    pub listing: String,
+    /// The directory that holds each release's assets: `{download_base}/{tag}/latest.json`.
+    pub download_base: String,
+}
+
+impl Endpoints {
+    /// GitHub: the only endpoints a production build uses.
+    pub fn published() -> Self {
+        Self {
+            listing: RELEASES_API.to_string(),
+            download_base: format!("https://github.com/{REPOSITORY}/releases/download"),
+        }
+    }
 }
 
 /// The outcome of selection: at most one release to offer, plus anything the
@@ -81,9 +99,24 @@ pub enum FeedError {
     Malformed(String),
 }
 
-/// The updater manifest for a release tag, at the URL the release publishes.
-pub fn manifest_url(tag: &str) -> String {
-    format!("https://github.com/{REPOSITORY}/releases/download/{tag}/{MANIFEST_ASSET}")
+/// The updater manifest for a release tag under `download_base`, which is
+/// [`Endpoints::download_base`].
+pub fn manifest_url(download_base: &str, tag: &str) -> String {
+    format!("{download_base}/{tag}/{MANIFEST_ASSET}")
+}
+
+/// The endpoints this build reads. A production build always returns
+/// [`Endpoints::published`]. A build with `updater-test-endpoints` takes its two
+/// locations from the environment, and only loopback addresses are accepted.
+pub fn endpoints() -> Result<Endpoints, String> {
+    #[cfg(feature = "updater-test-endpoints")]
+    {
+        test_endpoints::from_environment()
+    }
+    #[cfg(not(feature = "updater-test-endpoints"))]
+    {
+        Ok(Endpoints::published())
+    }
 }
 
 /// The tag every release must carry: `v` followed by its plain version.
@@ -148,7 +181,6 @@ pub fn select(feed: &Feed, channel: ReleaseChannel, current: PlainVersion) -> Se
         chosen: best.map(|(version, candidate)| Chosen {
             tag: candidate.tag.clone(),
             version,
-            manifest_url: manifest_url(&candidate.tag),
         }),
         notices,
     }
@@ -226,14 +258,144 @@ fn install_tls_provider() {
 /// credentials, and a user agent that names the version asking.
 pub fn client() -> Result<reqwest::Client, FeedError> {
     install_tls_provider();
-    reqwest::Client::builder()
-        .https_only(true)
+    transport(reqwest::Client::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(5))
         .user_agent(format!("slashit-updater/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| FeedError::Unreachable(error.to_string()))
+}
+
+#[cfg(not(feature = "updater-test-endpoints"))]
+fn transport(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(5))
+}
+
+/// A test build may reach a loopback listing over plain HTTP, reaches it
+/// directly rather than through a system proxy, and follows redirects only to
+/// loopback addresses.
+#[cfg(feature = "updater-test-endpoints")]
+fn transport(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.no_proxy().redirect(reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            attempt.stop()
+        } else if test_endpoints::is_loopback(attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("the test build refuses a redirect to a non-loopback address")
+        }
+    }))
+}
+
+/// Test-only endpoint overrides. Compiled only with `updater-test-endpoints`.
+#[cfg(feature = "updater-test-endpoints")]
+mod test_endpoints {
+    use super::Endpoints;
+    use std::net::IpAddr;
+
+    /// The releases listing, for example `http://127.0.0.1:8080/repos/x/y/releases`.
+    pub const LISTING_VAR: &str = "SLASHIT_UPDATER_TEST_RELEASES_API";
+    /// The directory of release downloads, for example `http://127.0.0.1:8080/download`.
+    pub const DOWNLOAD_VAR: &str = "SLASHIT_UPDATER_TEST_DOWNLOAD_BASE";
+
+    pub fn from_environment() -> Result<Endpoints, String> {
+        resolve(read_var(LISTING_VAR)?.as_deref(), read_var(DOWNLOAD_VAR)?.as_deref())
+    }
+
+    /// A variable that is set but is not Unicode is an error, never an absent
+    /// variable: treating it as absent would fall back to GitHub silently.
+    fn read_var(name: &str) -> Result<Option<String>, String> {
+        match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid Unicode")),
+        }
+    }
+
+    /// Both variables are needed together, so a build never reads a listing from
+    /// the test server and downloads from GitHub.
+    pub fn resolve(listing: Option<&str>, download: Option<&str>) -> Result<Endpoints, String> {
+        match (listing, download) {
+            (None, None) => Ok(Endpoints::published()),
+            (Some(listing), Some(download)) => Ok(Endpoints {
+                listing: loopback_url(LISTING_VAR, listing)?,
+                download_base: loopback_url(DOWNLOAD_VAR, download)?,
+            }),
+            _ => Err(format!("{LISTING_VAR} and {DOWNLOAD_VAR} must be set together")),
+        }
+    }
+
+    fn loopback_url(name: &str, value: &str) -> Result<String, String> {
+        let url = reqwest::Url::parse(value).map_err(|error| format!("{name} is not a URL: {error}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!("{name} must use http or https"));
+        }
+        let plain = url.username().is_empty() && url.password().is_none();
+        if !is_loopback(&url) || !plain || url.query().is_some() || url.fragment().is_some() {
+            return Err(format!(
+                "{name} must be a loopback IP address with no user, query or fragment, such as http://127.0.0.1:8080/"
+            ));
+        }
+        Ok(value.trim_end_matches('/').to_string())
+    }
+
+    /// True for an IP literal in the loopback range. Host names are refused,
+    /// because resolving one could reach anywhere.
+    pub fn is_loopback(url: &reqwest::Url) -> bool {
+        url.host_str()
+            .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+            .and_then(|host| host.parse::<IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn loopback_ip_literals_are_accepted() {
+            for value in ["http://127.0.0.1:8080/repos", "https://127.0.0.2/x", "http://[::1]:9/download/"] {
+                assert!(loopback_url(LISTING_VAR, value).is_ok(), "{value} must be accepted");
+            }
+        }
+
+        #[test]
+        fn anything_that_could_reach_another_host_is_refused() {
+            for value in [
+                "http://example.com/repos",
+                "https://api.github.com/repos/BarraDev/slashit/releases",
+                "http://localhost:8080/",
+                "http://127.0.0.1.nip.io/",
+                "http://10.0.0.1/",
+                "http://0.0.0.0/",
+                "ftp://127.0.0.1/",
+                "http://user@127.0.0.1/",
+                "http://127.0.0.1/x?per_page=1",
+            ] {
+                assert!(loopback_url(LISTING_VAR, value).is_err(), "{value} must be refused");
+            }
+        }
+
+        #[test]
+        fn both_variables_are_required_together_and_neither_alone_is_an_override() {
+            assert_eq!(resolve(None, None), Ok(Endpoints::published()));
+            assert!(resolve(Some("http://127.0.0.1:1/"), None).is_err());
+            assert!(resolve(None, Some("http://127.0.0.1:1/")).is_err());
+        }
+
+        #[test]
+        fn a_complete_override_replaces_both_locations_without_trailing_slashes() {
+            let endpoints = resolve(
+                Some("http://127.0.0.1:8080/repos/BarraDev/slashit/releases"),
+                Some("http://127.0.0.1:8080/download/"),
+            )
+            .unwrap();
+            assert_eq!(endpoints.listing, "http://127.0.0.1:8080/repos/BarraDev/slashit/releases");
+            assert_eq!(endpoints.download_base, "http://127.0.0.1:8080/download");
+        }
+    }
 }
 
 /// List the releases at `listing`, newest first, over at most [`MAX_PAGES`]
@@ -417,9 +579,25 @@ mod tests {
     #[test]
     fn the_manifest_url_is_the_release_asset_for_its_tag() {
         assert_eq!(
-            manifest_url("v0.0.1"),
+            manifest_url(&Endpoints::published().download_base, "v0.0.1"),
             "https://github.com/BarraDev/slashit/releases/download/v0.0.1/latest.json"
         );
+    }
+
+    #[test]
+    fn the_production_endpoints_are_the_published_github_locations() {
+        let published = Endpoints::published();
+        assert_eq!(published.listing, "https://api.github.com/repos/BarraDev/slashit/releases");
+        assert_eq!(published.download_base, "https://github.com/BarraDev/slashit/releases/download");
+    }
+
+    /// A production build has no seam to read, so this holds whatever the
+    /// environment says. This test does not set the variables itself; the
+    /// verification run executes it with both variables set to loopback values.
+    #[cfg(not(feature = "updater-test-endpoints"))]
+    #[test]
+    fn endpoints_ignore_the_test_variables_in_a_production_build() {
+        assert_eq!(endpoints(), Ok(Endpoints::published()));
     }
 
     #[test]
@@ -427,7 +605,6 @@ mod tests {
         let chosen = Chosen {
             tag: "v0.0.2".to_string(),
             version: version("0.0.2"),
-            manifest_url: manifest_url("v0.0.2"),
         };
         assert!(check_manifest_version(&chosen, "0.0.2").is_ok());
         let refused = check_manifest_version(&chosen, "0.0.9").unwrap_err();
@@ -561,6 +738,53 @@ mod tests {
         let error = fetch_feed(&plain_client(), &listing).await.unwrap_err();
         server.join().unwrap();
         assert!(matches!(error, FeedError::Malformed(_)), "{error:?}");
+    }
+
+    /// The production client never sends a plaintext request. The server is left
+    /// unanswered on purpose, so the test does not wait for a connection.
+    #[cfg(not(feature = "updater-test-endpoints"))]
+    #[tokio::test]
+    async fn the_production_client_refuses_plain_http_before_connecting() {
+        let (listing, _server) = serve(vec![response("200 OK", "", &full_page(0, 1))]);
+        let error = fetch_feed(&client().unwrap(), &listing).await.unwrap_err();
+        assert!(matches!(error, FeedError::Unreachable(_)), "{error:?}");
+    }
+
+    /// A test build reads a loopback listing over plain HTTP.
+    #[cfg(feature = "updater-test-endpoints")]
+    #[tokio::test]
+    async fn the_test_client_reads_a_loopback_listing_over_plain_http() {
+        let (listing, server) = serve(vec![response("200 OK", "", &full_page(0, 2))]);
+        let feed = fetch_feed(&client().unwrap(), &listing).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(feed.candidates.len(), 2);
+    }
+
+    /// A test build follows a redirect to another loopback listing.
+    #[cfg(feature = "updater-test-endpoints")]
+    #[tokio::test]
+    async fn the_test_client_follows_a_redirect_to_a_loopback_address() {
+        let (second, second_server) = serve(vec![response("200 OK", "", &full_page(0, 2))]);
+        let (first, first_server) =
+            serve(vec![response("302 Found", &format!("Location: {second}\r\n"), "")]);
+        let feed = fetch_feed(&client().unwrap(), &first).await.unwrap();
+        first_server.join().unwrap();
+        second_server.join().unwrap();
+        assert_eq!(feed.candidates.len(), 2);
+    }
+
+    /// A test build refuses a redirect to a public host before connecting to it.
+    #[cfg(feature = "updater-test-endpoints")]
+    #[tokio::test]
+    async fn the_test_client_refuses_a_redirect_to_a_public_host() {
+        let (first, first_server) = serve(vec![response(
+            "302 Found",
+            "Location: http://example.com/repos/BarraDev/slashit/releases\r\n",
+            "",
+        )]);
+        let error = fetch_feed(&client().unwrap(), &first).await.unwrap_err();
+        first_server.join().unwrap();
+        assert!(matches!(error, FeedError::Unreachable(_)), "{error:?}");
     }
 
     #[tokio::test]

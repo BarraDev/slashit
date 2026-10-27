@@ -106,6 +106,15 @@ acceptance-webdriver = ["dep:tauri-plugin-wdio-webdriver"]
 # Builds the ACP fake agent binary (`acp_fixture_agent`). Enabled only by the
 # dev-dependency on this package; see the `[[bin]]` entry above.
 acp-fixture = []
+# TEST-ONLY. Lets an isolated test build read the releases listing and the
+# manifest location from a loopback address instead of GitHub, through the
+# `SLASHIT_UPDATER_TEST_*` variables in `update_feed`. Never enabled by the
+# release workflow. Without it the seam is not compiled: no variable is read
+# and no plaintext transport is accepted. A build with it is still a release
+# build (the updater refuses debug builds), and its test public key and
+# `plugins.updater.dangerousInsecureTransportProtocol` come from a test-only
+# `--config` file, never from the committed `tauri.conf.json`.
+updater-test-endpoints = []
 
 [dev-dependencies]
 # TEST-ONLY. Builds this package with `acp-fixture`, so `cargo test` builds
