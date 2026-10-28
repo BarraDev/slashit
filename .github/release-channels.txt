@@ -12,3 +12,4 @@
 # Add a stable line in the same commit that prepares its CHANGELOG section.
 
 0.0.1 prerelease
+0.0.2 prerelease

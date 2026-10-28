@@ -74,7 +74,7 @@ SlashIt is currently pre-1.0 software. The core app, CLI, IPC server, headless d
 
 Near-term roadmap:
 
-- Publish the first release, with installation walkthroughs. The procedure is written down in [`docs/releasing.md`](docs/releasing.md).
+- Publish the first public experimental prerelease, 0.0.2, with its known limitations stated in [`CHANGELOG.md`](CHANGELOG.md) and [`docs/installation.md`](docs/installation.md). The procedure is written down in [`docs/releasing.md`](docs/releasing.md).
 - Code-sign the installers, so a first launch stops triggering SmartScreen and Gatekeeper warnings.
 - Cargo workspace layout cleanup (the root crate is both a package and a workspace).
 - Continue hardening queue execution, agent recovery, and cross-platform packaging.
@@ -87,7 +87,7 @@ Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WAS
 
 ### Pre-built Binaries
 
-There are none yet. The first tagged release will publish these to [GitHub Releases](https://github.com/BarraDev/slashit/releases); until then, [build from source](#build-from-source).
+There are none published yet. The first public experimental prerelease, 0.0.2, will be published to [GitHub Releases](https://github.com/BarraDev/slashit/releases). Its installation guide, [`docs/installation.md`](docs/installation.md), names each installer, what was verified for it, and its known limitations. Until a release is published, [build from source](#build-from-source).
 
 | Platform | Format |
 |----------|--------|

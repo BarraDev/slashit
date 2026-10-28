@@ -99,11 +99,11 @@ is honest; an override that makes the installer lie about its version is not.
 
 The tag must be exactly `v` followed by the version in `tauri.conf.json`. The
 preflight job compares them and fails otherwise. The example below tags the
-planned `0.0.1` prerelease; substitute the version your `tauri.conf.json` names.
+planned `0.0.2` prerelease; substitute the version your `tauri.conf.json` names.
 
 ```bash
-git tag -a v0.0.1 -m 'SlashIt v0.0.1'
-git push origin v0.0.1
+git tag -a v0.0.2 -m 'SlashIt v0.0.2'
+git push origin v0.0.2
 ```
 
 This project's normal workflow is Jujutsu, but `jj` treats git tags as
@@ -188,7 +188,7 @@ To check a tag without pushing it, run the script with the tag and read the
 channel it prints:
 
 ```bash
-scripts/release-preflight.sh v0.0.1
+scripts/release-preflight.sh v0.0.2
 ```
 
 ### Version links in CHANGELOG.md
@@ -316,8 +316,19 @@ can be built and then refuse its own updates. `scripts/test-updater-signing.sh`
 tests the probe with disposable keys. The manual **Updater signing probe**
 workflow (`.github/workflows/updater-signing-probe.yml`) signs a fixed payload
 with the production secrets and verifies it against the configured public key.
-It runs only from `main`, publishes nothing, and reports PASS or FAIL. Until it
-has passed, the production key is **not verified**.
+It runs only from `main`, publishes nothing, and reports PASS or FAIL.
+
+The probe passed on commit `744edcb1`, the commit the `v0.0.1` tag names (run
+[40440328190](https://github.com/BarraDev/slashit/actions/runs/40440328190),
+2026-10-27). That run showed that the production secret produces a signature
+the configured public key accepts, and that signatures over a changed payload
+are rejected. The public key, the probe script and the pinned Tauri CLI are
+unchanged on `main`, so the result carries over to later commits. Run the probe
+again when the signing secret, the public key or the pinned CLI changes.
+
+The probe is a compatibility check. It does not show that an update is
+downloaded and installed. That is the end-to-end test in section 6, and it has
+not yet been run against a published release.
 
 The release workflow installs the Tauri CLI with `npm install --global
 @tauri-apps/cli@2.12.4` and passes `tauriScript: tauri` to `tauri-action`, so
@@ -331,8 +342,10 @@ from a compromised download.
 
 ## 8. Before the first release
 
-Nothing has been published. The first tag planned is `v0.0.1`, a prerelease
-declared in `.github/release-channels.txt`. Testers who choose the Prerelease
+Nothing has been published. The `v0.0.1` tag and its draft release were never
+published, and the draft predates the HTTPS-only updater transport. They are not
+the first public release. The first public release is planned as `v0.0.2`, a
+prerelease declared in `.github/release-channels.txt`. Testers who choose the Prerelease
 channel in Settings receive it and later prereleases; people on the Stable
 channel receive nothing until a stable release is published. Until then the
 README's Releases link goes to the prerelease page, and a Stable check reports

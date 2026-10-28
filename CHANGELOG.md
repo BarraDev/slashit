@@ -6,6 +6,70 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.0.2]
+
+The first public experimental prerelease. It is not production-ready, and it
+has not been validated on every platform. Read the known issues below before
+you install it.
+
+The feature set is the one described in the 0.0.1 section further down. That
+version was prepared as a draft and never published, so there is no earlier
+public install to upgrade from. This release carries 0.0.1's features forward
+and changes the points listed here.
+
+**Installing.** Choose the installer for your platform and follow
+[`docs/installation.md`](https://github.com/BarraDev/slashit/blob/v0.0.2/docs/installation.md).
+It names each file, says what was checked for it, and says what was not.
+
+### Changed
+
+- **The updater uses HTTPS only.** Release listings, update manifests and update
+  downloads are fetched over HTTPS. A redirect from HTTPS to plain HTTP is
+  refused, and a redirect chain is limited to five hops. An update whose
+  download location is not HTTPS is refused before anything is downloaded.
+  Signature checks and release selection are unchanged.
+- The contribution guide explains how pull requests reference issues, and the
+  README links to the issue tracker.
+
+### Fixed
+
+- The Windows release job stopped before it built any installer, because the
+  step that writes the release description ran under PowerShell, which rejects
+  the POSIX shell syntax the step uses. The step now names its shell. A
+  heuristic check in CI refuses workflow steps that use POSIX syntax without
+  naming a shell, so the same failure is caught before a tag is pushed.
+
+### Known issues
+
+- **The Linux AppImage may fail to start.** On some Linux systems the operating
+  system ends SlashIt during startup (a SIGKILL). The AppImage bundles its own
+  copy of WebKitGTK, and that copy's realtime scheduling watchdog is the
+  established trigger. Tracked in
+  [issue #269](https://github.com/BarraDev/slashit/issues/269). This release
+  does not fix it. Starting SlashIt again may succeed, but repeated launches are
+  not a guaranteed workaround. The `.deb` and `.rpm` packages use the WebKitGTK
+  installed on your system instead, so their behavior depends on your
+  distribution.
+- **The installers are not code-signed.** Windows SmartScreen and macOS
+  Gatekeeper warn on first launch. The updater's signatures are a different
+  mechanism and do not remove those warnings; see
+  [`docs/releasing.md`](https://github.com/BarraDev/slashit/blob/v0.0.2/docs/releasing.md).
+- **Installation and launch are not verified on every platform.** Which
+  artifacts were installed and launched for this build, and which were not, is
+  recorded in [`docs/installation.md`](https://github.com/BarraDev/slashit/blob/v0.0.2/docs/installation.md). Treat an
+  unverified platform as untested.
+- **Updates from a published release have not been run end to end.** The
+  updater signing key's compatibility probe passed. An update installed through
+  the application has been exercised only in a local experiment, with a
+  disposable test key, not with the release key or a published release.
+- **The AppImage update replaces the file without an atomic step.** An update
+  interrupted by a crash or a power loss has not been tested, and Windows
+  staged-install lifecycle defects are known and not addressed in this release.
+- The product acceptance checks use fake agent providers. A real agent provider
+  has not been run against this build.
+- A background job whose shell has already exited keeps running when its
+  terminal closes or SlashIt quits. The quit and restart dialogs say so.
+
 ## [0.0.1]
 
 A prerelease for testers. Install it by hand the first time. After that, the
@@ -114,15 +178,17 @@ Known gaps in this prerelease:
   `slashitd`, and the packages from the release workflow have not been checked.
 - The installers are not code-signed, so Windows SmartScreen and macOS Gatekeeper
   warn on first launch. The warnings have not been observed on real machines.
-- The update path has not been run against a published release. Updates are
-  signed with a key held in the release workflow's secrets, and no signed 0.0.1
-  artifact exists yet, so the signature check, the download and the install have
-  not been exercised. The Stable channel has nothing to offer until a stable
-  release newer than 0.0.1 is published, so it cannot be tested live before then.
+- The update path has not been run against a published release. The updater
+  signing probe passed on the commit this tag names, so the production key
+  matches the public key the application ships with. The download and the
+  installation of a signed update have not been exercised against a published
+  release. The Stable channel has nothing to offer until a stable release newer
+  than 0.0.1 is published, so it cannot be tested live before then.
 - A background job whose shell has already exited keeps running when its
   terminal closes or SlashIt quits. The quit and restart dialogs say so.
 - The product acceptance checks use fake agent providers. A real provider has
   not been run against this build.
 
+[0.0.2]: https://github.com/BarraDev/slashit/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/BarraDev/slashit/releases/tag/v0.0.1
-[Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.2...HEAD

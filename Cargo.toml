@@ -3,7 +3,7 @@
 # crate in src-tauri/, and two packages sharing a name in one workspace is a
 # hard Cargo error that would also make `cargo -p slashit-ui` ambiguous in CI.
 name = "slashit-frontend"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "MPL-2.0"
 description = "SlashIt frontend - Leptos/WASM UI for the AI agent workspace manager"
