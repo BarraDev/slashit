@@ -1,6 +1,6 @@
 [package]
 name = "slashit-ipc"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "MPL-2.0"
 description = "IPC protocol, framing and transports shared between the SlashIt app, daemon and CLI"
