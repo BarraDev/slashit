@@ -8,10 +8,10 @@ This page names each installer the release produces, says what was verified for
 it and what was not, and describes how to install, remove and update it. The
 release notes in [`CHANGELOG.md`](../CHANGELOG.md) list what changed.
 
-Status at the time of writing: the release is **not published**. The files
-below are what the release workflow produces for a `v0.0.2` tag. Filenames for
-platforms this document marks as "not built locally" follow the pattern of the
-0.0.1 draft release and must be checked against the real draft before use.
+The files below are what the release workflow produces for a `v0.0.2` tag.
+The Windows and macOS installers were not built or installed by the maintainers
+before this release, so their filenames follow the pattern the workflow uses
+for the earlier 0.0.1 draft.
 
 ## Choose an installer
 

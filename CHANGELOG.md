@@ -12,7 +12,7 @@ The first public experimental prerelease. It is not production-ready, and it
 has not been validated on every platform. Read the known issues below before
 you install it.
 
-The feature set is the one described in the 0.0.1 section further down. That
+The feature set is the one described in the [0.0.1 section](https://github.com/BarraDev/slashit/blob/v0.0.2/CHANGELOG.md#001) of the changelog. That
 version was prepared as a draft and never published, so there is no earlier
 public install to upgrade from. This release carries 0.0.1's features forward
 and changes the points listed here.
