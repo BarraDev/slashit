@@ -350,8 +350,11 @@ unchanged on `main`, so the result carries over to later commits. Run the probe
 again when the signing secret, the public key or the pinned CLI changes.
 
 The probe is a compatibility check. It does not show that an update is
-downloaded and installed. That is the end-to-end test in section 6, and it has
-not yet been run against a published release.
+downloaded and installed. That is the end-to-end test in section 6. A controlled
+run of it, from the published 0.0.2 AppImage to the published 0.0.3 AppImage,
+passed on one host on 2026-10-29. The run was manual, and its limits are recorded
+in [`installation.md`](installation.md#verification-update-2026-10-29). It is not
+a release gate.
 
 The release workflow installs the Tauri CLI with `npm install --global
 @tauri-apps/cli@2.12.4` and passes `tauriScript: tauri` to `tauri-action`, so
@@ -367,8 +370,8 @@ from a compromised download.
 
 The `v0.0.1` tag and its draft release were never published, and the draft
 predates the HTTPS-only updater transport. `v0.0.2` is the first public release,
-a prerelease declared in `.github/release-channels.txt`. `v0.0.3` is the next
-prerelease, declared on its own line there. Testers who choose the Prerelease
+a prerelease declared in `.github/release-channels.txt`. `v0.0.3` is also a
+prerelease, declared on its own line there, and it was published on 2026-10-29. Testers who choose the Prerelease
 channel in Settings receive these and later prereleases; people on the Stable
 channel receive nothing until a stable release is published. A Stable check
 reports that no newer Stable release is available. That is expected, and not an
