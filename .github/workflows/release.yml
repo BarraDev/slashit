@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
 
+# No token permission at workflow level. Each job declares its own below. A
+# workflow that reads the signing key must declare this, so a job cannot inherit
+# a broader token by default.
+permissions: {}
+
 jobs:
   # Everything a tag can get wrong is decided here, in seconds, before four
   # platform builds start. Two of these checks used to fail late or not at all:
@@ -52,9 +57,11 @@ jobs:
 
   release:
     needs: preflight
-    # The signing secrets reach a job only through this environment, after its
-    # protection rules pass: a required reviewer approves each run. See
-    # docs/releasing.md, "Signing".
+    # The signing secrets are meant to reach this job only through this
+    # environment, after its protection rules pass: a required reviewer approves
+    # each run. Until the secrets move into the environment they are repository
+    # secrets, and the environment does not yet exist. See docs/releasing.md,
+    # section 7, "Signing, stated accurately".
     environment: release-signing
     permissions:
       contents: write

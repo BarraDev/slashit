@@ -42,6 +42,7 @@ on:
   push:
     tags:
       - 'v*'
+permissions: {}
 jobs:
   preflight:
     runs-on: ubuntu-22.04
@@ -252,6 +253,7 @@ cat >"$probe" <<'EOF'
 name: Probe
 on:
   workflow_dispatch:
+permissions: {}
 jobs:
   probe:
     runs-on: ubuntu-22.04
@@ -266,6 +268,195 @@ expect pass "a dispatch-only probe that declares the environment passes without 
 
 f="$work/probe-no-env.yml"; sed '/^    environment: release-signing$/d' "$probe" >"$f"
 expect fail "a dispatch-only probe without the environment is refused" "$f"
+
+echo "== bypasses found after the PyYAML rewrite"
+# A condition on the signing job can run it after a failed preflight.
+f="$work/always-signing.yml"; sed 's/^    environment: release-signing$/    if: ${{ always() }}\n    environment: release-signing/' "$base" >"$f"
+expect fail "a signing job with 'if: always()' is refused, since it may run after a failed check" "$f"
+
+f="$work/failure-signing.yml"; sed 's/^    environment: release-signing$/    if: failure()\n    environment: release-signing/' "$base" >"$f"
+expect fail "a signing job with 'if: failure()' is refused, since it runs only after a failure" "$f"
+
+# continue-on-error on the job lets a failed preflight count as success for `needs`.
+f="$work/preflight-continue.yml"; sed 's/^  preflight:$/  preflight:\n    continue-on-error: true/' "$base" >"$f"
+expect fail "a preflight with 'continue-on-error' is refused, since its failure would not stop the signing job" "$f"
+
+# A command before the check in the same run block could exit first.
+f="$work/exit-before-check.yml"; sed 's@^        run: scripts/check-release-tag-on-main.sh "\$TAG"$@        run: |\n          exit 0\n          scripts/check-release-tag-on-main.sh "$TAG"@' "$base" >"$f"
+expect fail "an 'exit 0' ahead of the tag check in the same run block is refused" "$f"
+
+f="$work/check-with-comment.yml"; sed 's@^        run: scripts/check-release-tag-on-main.sh "\$TAG"$@        run: |\n          # Refuse a tag that is not on main.\n          scripts/check-release-tag-on-main.sh "$TAG"@' "$base" >"$f"
+expect pass "a comment line in the tag check's run block is ignored" "$f"
+
+# A '}}' inside a single-quoted literal does not end the expression.
+f="$work/literal-brace.yml"; cat >"$f" <<'EOF'
+name: Release
+on: workflow_dispatch
+jobs:
+  dump:
+    runs-on: ubuntu-22.04
+    steps:
+      - env:
+          K: ${{ '}}' || secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: echo x
+EOF
+expect fail "a '}}' inside a string literal does not hide a read of the key" "$f"
+
+f="$work/unterminated.yml"; cat >"$f" <<'EOF'
+name: Release
+on: workflow_dispatch
+jobs:
+  dump:
+    runs-on: ubuntu-22.04
+    steps:
+      - env:
+          K: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY
+        run: echo x
+EOF
+expect fail "an unterminated expression that names the key is refused" "$f"
+
+f="$work/token-lookalike.yml"; cat >"$f" <<'EOF'
+name: Release
+on: workflow_dispatch
+jobs:
+  dump:
+    runs-on: ubuntu-22.04
+    steps:
+      - env:
+          K: ${{ secrets.GITHUB_TOKEN2 }}
+        run: echo x
+EOF
+expect fail "a secret named like GITHUB_TOKEN2 is not mistaken for the token" "$f"
+
+# A merge key adds keys that a parser may or may not merge; GitHub reads them as written.
+f="$work/merge-key.yml"; cat >"$f" <<'EOF'
+name: Release
+on: workflow_dispatch
+jobs:
+  sign:
+    <<: {environment: release-signing}
+    runs-on: ubuntu-22.04
+    steps:
+      - env:
+          K: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: echo x
+EOF
+expect fail "a merge key (<<) is refused, so an environment cannot arrive by merge" "$f"
+
+f="$work/alias.yml"; cat >"$f" <<'EOF'
+name: Release
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: &os ubuntu-22.04
+    steps:
+      - run: echo x
+  other:
+    runs-on: *os
+    steps:
+      - run: echo y
+EOF
+expect fail "an alias is refused, so the file has one reading" "$f"
+
+f="$work/duplicate-gated-first.yml"; sed 's/^    environment: release-signing$/    environment: release-signing\n    environment: staging/' "$base" >"$f"
+expect fail "a duplicated environment key is refused, whichever value a parser keeps" "$f"
+
+f="$work/duplicate-staging-first.yml"; sed 's/^    environment: release-signing$/    environment: staging\n    environment: release-signing/' "$base" >"$f"
+expect fail "a duplicated environment key is refused with the gated value last" "$f"
+
+echo "== bypasses found in the second review"
+f="$work/uppercase-context.yml"; cat >"$f" <<'EOF'
+name: Release
+on: workflow_dispatch
+permissions: {}
+jobs:
+  dump:
+    runs-on: ubuntu-22.04
+    steps:
+      - env:
+          K: ${{ SECRETS.TAURI_SIGNING_PRIVATE_KEY }}
+        run: echo x
+EOF
+expect fail "an upper-case SECRETS context reads the key, so it is refused" "$f"
+
+f="$work/yes-job-collision.yml"; cat >"$f" <<'EOF'
+name: Release
+on: workflow_dispatch
+permissions: {}
+jobs:
+  release:
+    environment: release-signing
+    runs-on: ubuntu-22.04
+    steps:
+      - env:
+          K: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: echo x
+  yes:
+    runs-on: ubuntu-22.04
+    steps:
+      - env:
+          K: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: echo y
+EOF
+expect fail "a job id that YAML 1.1 reads as a boolean (yes) is refused, so it cannot hide a job" "$f"
+
+f="$work/root-true-key.yml"; cat >"$f" <<'EOF'
+name: Release
+on: workflow_dispatch
+permissions: {}
+true: {}
+jobs:
+  dump:
+    runs-on: ubuntu-22.04
+    steps:
+      - run: echo x
+EOF
+expect fail "a root key that YAML 1.1 reads as a boolean is refused, even beside the trigger" "$f"
+
+f="$work/check-shell-override.yml"; sed 's@^        run: scripts/check-release-tag-on-main.sh "\$TAG"$@&\n        shell: bash -c '"'"'exit 0'"'"' {0}@' "$base" >"$f"
+expect fail "a shell override on the tag check step is refused, since it can stop the check from running" "$f"
+
+f="$work/preflight-defaults.yml"; sed 's/^  preflight:$/  preflight:\n    defaults:\n      run:\n        shell: bash -c '"'"'exit 0'"'"' {0}/' "$base" >"$f"
+expect fail "a preflight job with 'defaults' is refused, since it can change the shell of the tag check" "$f"
+
+f="$work/tag-literal.yml"; sed 's@^          TAG: ${{ github.ref_name }}$@          TAG: v0.0.1@' "$base" >"$f"
+expect fail "a tag check whose TAG is a literal, not github.ref_name, is refused" "$f"
+
+f="$work/checkout-ref.yml"; sed 's@^          fetch-depth: 0$@          fetch-depth: 0\n          ref: refs/heads/main@' "$base" >"$f"
+expect fail "a full-history checkout that names a ref is refused" "$f"
+
+f="$work/actions-write.yml"; cat >"$f" <<'EOF'
+name: Dispatcher
+on:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  actions: write
+jobs:
+  dispatch:
+    runs-on: ubuntu-22.04
+    steps:
+      - run: echo x
+EOF
+expect fail "a workflow that grants 'actions: write' is refused, since it can dispatch a signing workflow" "$f"
+
+f="$work/no-top-permissions.yml"; sed '/^permissions: {}$/d' "$base" >"$f"
+expect fail "a signing workflow with no top-level 'permissions' is refused" "$f"
+
+echo "== an absent or broken Ruby fails closed"
+fakebin="$work/broken-ruby"; mkdir -p "$fakebin"
+printf '#!/usr/bin/env bash\nexit 127\n' >"$fakebin/ruby"; chmod +x "$fakebin/ruby"
+status=0
+output=$(PATH="$fakebin:$PATH" "$checker" "$base" 2>&1) || status=$?
+if [ "$status" -eq 2 ] && [[ "$output" == "INPUT ERROR"* ]]; then
+  echo "ok   a ruby that cannot load its YAML library is an input error, not a pass"
+  passed=$((passed + 1))
+else
+  echo "FAIL a broken ruby must fail closed: exited $status" >&2
+  printf '%s\n' "$output" >&2
+  failed=$((failed + 1))
+fi
 
 echo "== the repository's own workflows"
 status=0
