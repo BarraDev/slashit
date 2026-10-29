@@ -27,7 +27,7 @@ use super::restack;
 /// are not part of it, as they are not part of a commit.
 pub async fn checkout_snapshot(working_dir: &str) -> Result<String, String> {
     let scratch = std::env::temp_dir().join(format!("slashit-snapshot-{}.index", uuid::Uuid::new_v4()));
-    let seeded = match tokio::process::Command::new("git")
+    let seeded = match crate::host_process::tokio_command("git")
         .args(["rev-parse", "--git-path", "index"])
         .env("LC_ALL", "C")
         .current_dir(working_dir)
@@ -55,7 +55,7 @@ async fn snapshot_with_index(working_dir: &str, index: &Path, seeded: bool) -> R
     let run = |args: &'static [&'static str]| {
         let index = index.to_path_buf();
         async move {
-            let output = tokio::process::Command::new("git")
+            let output = crate::host_process::tokio_command("git")
                 .args(args)
                 .env("GIT_INDEX_FILE", &index)
                 .env("LC_ALL", "C")
@@ -120,7 +120,7 @@ pub enum Survival {
 /// are [`Survival::Absent`]; a Git that cannot be run is [`Survival::Unknown`].
 pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, commit: &str) -> Survival {
     let git = |args: Vec<String>, index: Option<std::path::PathBuf>| async move {
-        let mut cmd = tokio::process::Command::new("git");
+        let mut cmd = crate::host_process::tokio_command("git");
         cmd.args(["--literal-pathspecs", "-c", "apply.ignoreWhitespace=false", "-c", "apply.whitespace=nowarn"])
             .args(&args)
             .env("LC_ALL", "C")

@@ -9,6 +9,7 @@ pub mod config;
 mod session;
 mod queue;
 mod pty;
+mod host_process;
 mod worktree;
 mod main_window;
 mod storage_accounting;

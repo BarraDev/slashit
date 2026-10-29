@@ -72,7 +72,7 @@ pub async fn detect(path: &Path) -> Result<Vcs, String> {
         return Ok(Vcs::Missing);
     }
     let has_jj = path.join(".jj").is_dir();
-    let output = tokio::process::Command::new("git")
+    let output = crate::host_process::tokio_command("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .stdin(std::process::Stdio::null())

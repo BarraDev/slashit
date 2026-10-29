@@ -78,7 +78,7 @@ async fn run_unless_fetch(
     envs: &[(&str, String)],
 ) -> std::io::Result<std::process::Output> {
     if matches!(args.first(), Some(&"fetch") | Some(&"ls-remote")) {
-        return tokio::process::Command::new("git")
+        return crate::host_process::tokio_command("git")
             .args(args)
             .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
             .current_dir(dir)
@@ -1204,7 +1204,7 @@ async fn committer_env(dir: &Path, tip: &str) -> Result<Vec<(&'static str, Strin
 /// `git patch-id --stable` of `commit`'s own change with no context lines,
 /// or the empty string for a commit that changes nothing.
 async fn patch_id(dir: &Path, commit: &str) -> Result<String, String> {
-    let diff = tokio::process::Command::new("git")
+    let diff = crate::host_process::tokio_command("git")
         .args(["diff-tree", "-p", "-U0", "--no-color", "--no-ext-diff", "--no-renames", commit])
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
@@ -1217,7 +1217,7 @@ async fn patch_id(dir: &Path, commit: &str) -> Result<String, String> {
             String::from_utf8_lossy(&diff.stderr).trim()
         ));
     }
-    let mut child = tokio::process::Command::new("git")
+    let mut child = crate::host_process::tokio_command("git")
         .args(["patch-id", "--stable"])
         .current_dir(dir)
         .stdin(std::process::Stdio::piped())

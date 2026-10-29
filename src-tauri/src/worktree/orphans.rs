@@ -464,7 +464,7 @@ async fn unique_commits(repo: &str, tip: &str, durable: &[String]) -> Result<u32
         input.push_str(r);
         input.push('\n');
     }
-    let mut child = tokio::process::Command::new(git_program())
+    let mut child = crate::host_process::tokio_command(git_program())
         .args(["rev-list", "--count", "--stdin"])
         .current_dir(repo)
         .stdin(std::process::Stdio::piped())

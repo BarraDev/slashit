@@ -119,7 +119,7 @@ fn run_git_blocking_with(
     // The lock guards no data, so a holder that panicked leaves nothing
     // half-written behind it.
     let _one_at_a_time = lock.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut command = std::process::Command::new(program);
+    let mut command = crate::host_process::std_command(program);
     command.args(args).envs(envs.iter().map(|(k, v)| (k, v))).current_dir(repo_path);
     // Standard input is closed unless given: `output()` does that for us.
     match input {

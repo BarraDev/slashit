@@ -378,7 +378,7 @@ async fn at_branch(repo: &Path, prefix: &str, branch: &str) -> Result<Found, Str
 /// Whether `oid` is itself a commit, rather than a tag that peels to one: a
 /// branch created at a tag object is not a branch git can check out.
 async fn is_commit_object(repo: &Path, oid: &str) -> Result<bool, String> {
-    let output = tokio::process::Command::new("git")
+    let output = crate::host_process::tokio_command("git")
         .args(["cat-file", "-t", oid])
         .current_dir(repo)
         .stdin(std::process::Stdio::null())
@@ -426,7 +426,7 @@ pub(super) async fn jj_trunk_alias(repo: &Path) -> Option<String> {
 /// Why no base could be resolved for a project with no local base branch,
 /// and what to do about it.
 async fn refusal(repo: &Path, repo_path: &str) -> String {
-    let has_origin = tokio::process::Command::new("git")
+    let has_origin = crate::host_process::tokio_command("git")
         .args(["config", "--get", "remote.origin.url"])
         .current_dir(repo)
         .stdin(std::process::Stdio::null())

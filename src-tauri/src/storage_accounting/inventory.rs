@@ -92,7 +92,7 @@ impl BuildOutputProbe for GitBuildOutputProbe {
             return false;
         };
         let git = |args: &[&str]| {
-            let mut command = Command::new("git");
+            let mut command = crate::host_process::std_command("git");
             command
                 .arg("-C")
                 .arg(checkout)
