@@ -75,15 +75,21 @@ enum LibraryPath {
 }
 
 /// The `library_path` entries that are neither inside `appdir` nor empty.
-/// Entries are compared by path component, so `/tmp/.mount_X2/lib` is not
-/// inside `/tmp/.mount_X`. An empty entry is dropped too: the loader reads it
-/// as the current directory, and the AppImage launcher leaves one at the end
-/// of the path it sets.
+/// An entry is inside when its resolved location is inside the resolved
+/// `appdir`, so a symlink into the AppImage counts and `..` is resolved. An
+/// entry that cannot be resolved (missing, or a broken link) falls back to the
+/// component comparison. The entry itself is kept as written, so `/tmp/.mount_X2/lib`
+/// is not inside `/tmp/.mount_X`. An empty entry is dropped too: the loader
+/// reads it as the current directory, and the AppImage launcher leaves one at
+/// the end of the path it sets.
 fn host_library_path(library_path: &OsStr, appdir: &Path) -> LibraryPath {
+    let appdir_resolved = std::fs::canonicalize(appdir).ok();
     let entries: Vec<_> = std::env::split_paths(library_path).collect();
     let kept: Vec<_> = entries
         .iter()
-        .filter(|entry| !entry.as_os_str().is_empty() && !entry.starts_with(appdir))
+        .filter(|entry| {
+            !entry.as_os_str().is_empty() && !is_inside(entry, appdir, appdir_resolved.as_deref())
+        })
         .cloned()
         .collect();
     if kept.len() == entries.len() {
@@ -97,9 +103,24 @@ fn host_library_path(library_path: &OsStr, appdir: &Path) -> LibraryPath {
     }
 }
 
+/// Whether `entry` points into the AppImage. A relative entry is resolved
+/// against the child's working directory, not this process's, so it keeps the
+/// component comparison.
+fn is_inside(entry: &Path, appdir: &Path, appdir_resolved: Option<&Path>) -> bool {
+    if !entry.is_absolute() {
+        return entry.starts_with(appdir);
+    }
+    match (std::fs::canonicalize(entry), appdir_resolved) {
+        (Ok(resolved), Some(root)) => resolved.starts_with(root),
+        _ => entry.starts_with(appdir),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
 
     const MOUNT: &str = "/tmp/.mount_SlashItX";
 
@@ -155,6 +176,98 @@ mod tests {
         scrub(&mut command, Some(OsStr::new(MOUNT)), None);
         scrub(&mut command, Some(OsStr::new("")), Some(OsStr::new(MOUNT)));
         assert_eq!(command.get_envs().count(), 0);
+    }
+
+    /// Fixture: an AppImage directory with a bundled library directory, and a
+    /// host directory next to it. Returns the temporary root with the AppImage
+    /// directory `appdir` and the host directory `host`.
+    #[cfg(unix)]
+    fn appimage_fixture() -> (TempDir, PathBuf, PathBuf) {
+        let root = TempDir::new().expect("create temp dir");
+        let appdir = root.path().join("appdir");
+        let host = root.path().join("host/lib");
+        std::fs::create_dir_all(appdir.join("usr/lib")).expect("create appdir");
+        std::fs::create_dir_all(&host).expect("create host dir");
+        (root, appdir, host)
+    }
+
+    /// An entry that reaches the AppImage through a symlink is removed. Kept,
+    /// the loader would resolve it to the bundled library.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_the_appimage_is_removed() {
+        let (root, appdir, _) = appimage_fixture();
+        std::os::unix::fs::symlink(&appdir, root.path().join("alias")).expect("symlink");
+        let library_path = OsString::from(root.path().join("alias/usr/lib"));
+        assert_eq!(
+            host_library_path(&library_path, &appdir),
+            LibraryPath::Removed
+        );
+    }
+
+    /// An entry written through `..` that resolves outside the AppImage is a
+    /// host entry, and it is kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_traversal_out_of_the_appimage_is_kept() {
+        let (_root, appdir, host) = appimage_fixture();
+        let library_path = OsString::from(format!("{}/../host/lib", appdir.display()));
+        assert_eq!(
+            host_library_path(&library_path, &appdir),
+            LibraryPath::Unchanged
+        );
+        assert_eq!(
+            std::fs::canonicalize(&library_path).expect("canonicalize"),
+            std::fs::canonicalize(&host).expect("canonicalize host")
+        );
+    }
+
+    /// An entry written through `..` that resolves into the AppImage is
+    /// removed, even though its text does not start with the AppImage path.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_traversal_into_the_appimage_is_removed() {
+        let (root, appdir, _) = appimage_fixture();
+        let library_path = OsString::from(format!(
+            "{}/host/lib/../../appdir/usr/lib",
+            root.path().display()
+        ));
+        assert_eq!(
+            host_library_path(&library_path, &appdir),
+            LibraryPath::Removed
+        );
+    }
+
+    /// An AppImage directory that is itself reached through a symlink still
+    /// matches the real spelling of its entries.
+    #[cfg(unix)]
+    #[test]
+    fn an_appimage_spelled_through_a_symlink_matches_its_real_entries() {
+        let (root, appdir, _) = appimage_fixture();
+        let appdir_alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&appdir, &appdir_alias).expect("symlink");
+        let library_path = OsString::from(appdir.join("usr/lib"));
+        assert_eq!(
+            host_library_path(&library_path, &appdir_alias),
+            LibraryPath::Removed
+        );
+    }
+
+    /// An entry that does not exist cannot be resolved, so the component
+    /// comparison decides it: inside the AppImage it is removed, and a host
+    /// entry is kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_entry_keeps_the_component_comparison() {
+        let (_root, appdir, _) = appimage_fixture();
+        let library_path = OsString::from(format!(
+            "{}:/opt/host/lib",
+            appdir.join("usr/lib/missing").display()
+        ));
+        assert_eq!(
+            host_library_path(&library_path, &appdir),
+            LibraryPath::Set(OsString::from("/opt/host/lib"))
+        );
     }
 
     /// A child started through `scrub` sees the host entries of the library
