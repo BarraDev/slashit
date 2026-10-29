@@ -13,7 +13,7 @@
 //! `APPDIR` is unset) the environment is passed through unchanged.
 
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A `tokio` command for `program` whose environment has no AppImage library
 /// entries. See the module documentation.
@@ -84,7 +84,7 @@ enum LibraryPath {
 /// the end of the path it sets.
 fn host_library_path(library_path: &OsStr, appdir: &Path) -> LibraryPath {
     let appdir_resolved = std::fs::canonicalize(appdir).ok();
-    let entries: Vec<_> = std::env::split_paths(library_path).collect();
+    let entries = split_library_path(library_path);
     let kept: Vec<_> = entries
         .iter()
         .filter(|entry| {
@@ -97,10 +97,28 @@ fn host_library_path(library_path: &OsStr, appdir: &Path) -> LibraryPath {
     } else if kept.is_empty() {
         LibraryPath::Removed
     } else {
-        // `join_paths` fails only for an entry that contains the separator,
-        // and every entry came from `split_paths`, so it cannot fail here.
+        // `join_paths` fails only for an entry that contains the separator, and
+        // no entry does: `split_library_path` splits on it.
         std::env::join_paths(kept).map_or(LibraryPath::Removed, LibraryPath::Set)
     }
+}
+
+/// The entries of `library_path`, split the way the Linux loader splits them.
+/// glibc accepts both `:` and `;` as separators, so `split_paths`, which
+/// splits on `:` only, would treat `a;b` as one entry.
+#[cfg(unix)]
+fn split_library_path(library_path: &OsStr) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    library_path
+        .as_bytes()
+        .split(|byte| matches!(byte, b':' | b';'))
+        .map(|entry| PathBuf::from(OsStr::from_bytes(entry)))
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn split_library_path(library_path: &OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(library_path).collect()
 }
 
 /// Whether `entry` points into the AppImage. A relative entry is resolved
@@ -119,7 +137,6 @@ fn is_inside(entry: &Path, appdir: &Path, appdir_resolved: Option<&Path>) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     const MOUNT: &str = "/tmp/.mount_SlashItX";
@@ -267,6 +284,27 @@ mod tests {
         assert_eq!(
             host_library_path(&library_path, &appdir),
             LibraryPath::Set(OsString::from("/opt/host/lib"))
+        );
+    }
+
+    /// The loader also separates entries with `;`. An AppImage entry joined to
+    /// a host entry by `;` is split out, so the AppImage entry is removed and
+    /// the host entry is kept, whichever order they come in.
+    #[cfg(unix)]
+    #[test]
+    fn a_semicolon_separated_appimage_entry_is_split_and_removed() {
+        let (_root, appdir, host) = appimage_fixture();
+        let appimage_entry = appdir.join("usr/lib");
+        let bundled_first =
+            OsString::from(format!("{};{}", appimage_entry.display(), host.display()));
+        assert_eq!(
+            host_library_path(&bundled_first, &appdir),
+            LibraryPath::Set(OsString::from(&host))
+        );
+        let host_first = OsString::from(format!("{};{}", host.display(), appimage_entry.display()));
+        assert_eq!(
+            host_library_path(&host_first, &appdir),
+            LibraryPath::Set(OsString::from(&host))
         );
     }
 
