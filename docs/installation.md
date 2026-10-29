@@ -18,7 +18,7 @@ been checked against the built artifacts. The verification recorded for the
 
 | Platform | File | Architecture | Verified for 0.0.3 |
 |---|---|---|---|
-| Linux | `SlashIt_0.0.3_amd64.AppImage` | x86_64 | Not yet. |
+| Linux | `SlashIt_0.0.3_amd64.AppImage` | x86_64 | Partly: launched and quit cleanly on one host. See [the verification note](#verification-update-2026-10-29). |
 | Linux (Debian, Ubuntu) | `SlashIt_0.0.3_amd64.deb` | x86_64 | Not yet. |
 | Linux (Fedora, RHEL-like) | `SlashIt-0.0.3-1.x86_64.rpm` | x86_64 | Not yet. |
 | Windows | `SlashIt_0.0.3_x64-setup.exe` (NSIS) | x64 | Not yet. |
@@ -29,8 +29,34 @@ been checked against the built artifacts. The verification recorded for the
 The release also contains `.sig` files, `latest.json`, and macOS `.app.tar.gz`
 files. These are for the updater, not for installation. Do not install them.
 
-No artifact of this release has been installed or launched yet. Treat every
-platform as untested until this page says otherwise.
+Apart from the Linux AppImage, which was launched on one host, no artifact of
+this release has been installed or launched. Treat every other platform as
+untested until this page says otherwise.
+
+## Verification update (2026-10-29)
+
+This note was added after the release was published. It supersedes the
+statements about the Linux AppImage and the update path that appear below it,
+and in the 0.0.3 entry of [`CHANGELOG.md`](../CHANGELOG.md). Those statements
+are kept as they were written at publication.
+
+- **Linux AppImage startup.** The official `SlashIt_0.0.3_amd64.AppImage`
+  started and exited cooperatively in 24 of 24 launches on one Arch Linux host
+  running sway on Wayland. No launch was killed with SIGKILL. The official
+  0.0.2 AppImage, without the mitigation, was killed with SIGKILL (exit 137) in
+  2 of 2 attempts on the same host.
+- **In-app update from 0.0.2 to 0.0.3.** On the same host, the in-app updater
+  replaced an isolated copy of the official 0.0.2 AppImage with the official
+  0.0.3 AppImage. The 0.0.2 process was started with its soft `RLIMIT_RTPRIO`
+  lowered from outside SlashIt, so that it would start. The installed file
+  matched the official 0.0.3 SHA-256. Restart and state persistence passed.
+- **Not verified.** The updater's own signature check was not observed, though
+  the artifact's signature was verified separately. The embedded terminal check
+  was waived for this release. Media playback, macOS, Windows, other Linux
+  distributions, the `.deb` and `.rpm` packages, and an interrupted update were
+  not tested.
+- **Issue #269 remains open.** The upstream WebKitGTK behavior is not fixed. The
+  mitigation is temporary.
 
 ## Known issues
 
@@ -44,15 +70,17 @@ realtime scheduling watchdog is the established trigger. This is tracked in
 This release adds a temporary startup mitigation. When the loaded WebKitGTK is
 older than 2.54.1, or its version cannot be read, SlashIt lowers the soft
 realtime-priority limit of its own process before the window opens. WebKitGTK
-2.54.1 and later bypass the mitigation. It has not been validated on the
-official AppImage of this release yet.
+2.54.1 and later bypass the mitigation. The official AppImage of this release
+has been validated on one host only (see the
+[verification note](#verification-update-2026-10-29)); other systems are not
+covered.
 
 - If startup fails, you may start SlashIt again. That may succeed, but **repeated
   launches are not a guaranteed workaround**.
 - If SlashIt 0.0.2 is ended during startup on your system, the in-app updater
   cannot bring it to 0.0.3, because the updater runs inside the application that
-  does not start. Install 0.0.3 by hand from the release page once it is
-  published, using the file for your system from the table above.
+  does not start. Install 0.0.3 by hand from the release page, using the file for
+  your system from the table above.
 - Terminals and agent processes that SlashIt starts inherit the lower soft limit.
   A plain `chrt -f` is refused while it is in place. A process can raise its soft
   limit back to the inherited hard limit without privilege, and software that
@@ -81,21 +109,25 @@ installers and do not suppress the warnings above. See
 
 ### Installation and launch are not verified on every platform
 
-No installer of this release has been verified yet. For each platform, the
-table above and the sections below say what has been checked. Nothing in this
-guide is a claim of a successful installation or launch for 0.0.3.
+The Linux AppImage is the only artifact of this release that has been launched,
+and only on one host. For each platform, the table above and the sections below
+say what has been checked. Apart from that AppImage launch, nothing in this guide
+is a claim of a successful installation or launch for 0.0.3.
 
-Not verified for 0.0.3: installation of any artifact, launch of any released
-artifact on any real desktop, the startup behavior of the official AppImage,
-Windows and macOS installers of any kind, and the `.rpm` on any Fedora or
-RHEL-like system.
+Not verified for 0.0.3: installation of any artifact; launch of any artifact
+other than the official AppImage, and of that AppImage on any other desktop;
+the embedded terminal check, which was waived; the `.deb` and `.rpm` packages on
+any system; Windows and macOS installers of any kind; and every Linux
+distribution other than the test host.
 
-### The update path is not tested end to end
+### The update path is verified only in part
 
-The updater signing probe passed for the production key. An update installed
-through the application has been exercised only in a local experiment with a
-disposable test key. It has not been run against a published release. Until
-that test passes, treat in-app updates as unverified.
+The updater signing probe passed for the production key. A controlled in-app
+update from the published 0.0.2 AppImage to the published 0.0.3 AppImage passed
+on one host (see the [verification note](#verification-update-2026-10-29)). That
+run is not a general update test. The updater's own signature check was not
+observed. Interrupted updates have not been tested, and no other platform has
+been tested.
 
 ## Linux
 
@@ -109,8 +141,10 @@ chmod +x SlashIt_0.0.3_amd64.AppImage
 ./SlashIt_0.0.3_amd64.AppImage
 ```
 
-Not tested for 0.0.3. See [Installation and launch](#installation-and-launch-are-not-verified-on-every-platform).
-Whether the AppImage adds a menu entry on your desktop has not been checked.
+Launched on one Arch Linux host, with the results in the
+[verification note](#verification-update-2026-10-29). Other desktops are not
+tested. Whether the AppImage adds a menu entry on your desktop has not been
+checked.
 
 Remove it by deleting the file. Your data stays (see [Your data](#your-data)).
 

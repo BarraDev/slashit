@@ -18,6 +18,20 @@ production-ready. It does not fix the upstream WebKitGTK behavior, and issue
 [`docs/installation.md`](https://github.com/BarraDev/slashit/blob/v0.0.3/docs/installation.md).
 It names each file, says what was checked for it, and says what was not.
 
+**Verification update (2026-10-29).** Added after publication. The statements
+marked below are kept as they were written at publication.
+
+- The official Linux AppImage started and quit cooperatively in 24 of 24
+  launches on one Arch Linux host running sway on Wayland. The unmitigated
+  official 0.0.2 AppImage was killed with SIGKILL in 2 of 2 attempts on that host.
+- On the same host, the in-app updater replaced an isolated copy of the official
+  0.0.2 AppImage with the official 0.0.3 AppImage. The 0.0.2 process was started
+  with its soft `RLIMIT_RTPRIO` lowered from outside SlashIt. The installed file
+  matched the official 0.0.3 SHA-256.
+- Not verified: the updater's own signature check, which was not observed; the
+  embedded terminal check, which was waived; media playback; macOS, Windows and
+  other Linux distributions; and an interrupted update.
+
 ### Fixed
 
 - **A startup mitigation for the intermittent Linux AppImage failure.** On some
@@ -50,7 +64,8 @@ It names each file, says what was checked for it, and says what was not.
   SlashIt's own process. It does not change the kernel, RealtimeKit or WebKitGTK.
 - **Issue #269 remains open.** The official Linux artifact of this release has
   not been validated yet. Until it is, a startup failure on your system is still
-  possible, and repeated launches are not a guaranteed workaround.
+  possible, and repeated launches are not a guaranteed workaround. (Superseded
+  on 2026-10-29 for one host: see the verification update above.)
 - **Media playback was not tested for this build.**
 - **The installers are not code-signed.** Windows SmartScreen and macOS
   Gatekeeper warn on first launch. The updater's signatures are a different
@@ -61,7 +76,8 @@ It names each file, says what was checked for it, and says what was not.
   Treat an unverified platform as untested.
 - **Updates from a published release have not been run end to end.** An update
   installed through the application has been exercised only in a local
-  experiment, with a disposable test key.
+  experiment, with a disposable test key. (Superseded on 2026-10-29 for one
+  host: see the verification update above.)
 - **The AppImage update replaces the file without an atomic step.** An update
   interrupted by a crash or a power loss has not been tested.
 - The product acceptance checks use fake agent providers. A real agent provider
