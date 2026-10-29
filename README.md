@@ -70,11 +70,11 @@ The board below follows tasks from the queue through review to done. Parts of th
 
 ## Status and Roadmap
 
-SlashIt is currently pre-1.0 software. The core app, CLI, IPC server, headless daemon, queue, terminals, updater and CI/release workflows are in place. **No release has been published yet** — the Releases page below is empty until the first tag ships, so for now, build from source.
+SlashIt is currently pre-1.0 software. The core app, CLI, IPC server, headless daemon, queue, terminals, updater and CI/release workflows are in place. Experimental prereleases are published on the [Releases page](https://github.com/BarraDev/slashit/releases). They are not production-ready, and each installation guide states what was verified for it.
 
 Near-term roadmap:
 
-- Publish the first public experimental prerelease, 0.0.2, with its known limitations stated in [`CHANGELOG.md`](CHANGELOG.md) and [`docs/installation.md`](docs/installation.md). The procedure is written down in [`docs/releasing.md`](docs/releasing.md).
+- Publish experimental prereleases, each with its known limitations stated in [`CHANGELOG.md`](CHANGELOG.md) and [`docs/installation.md`](docs/installation.md). The procedure is written down in [`docs/releasing.md`](docs/releasing.md).
 - Code-sign the installers, so a first launch stops triggering SmartScreen and Gatekeeper warnings.
 - Cargo workspace layout cleanup (the root crate is both a package and a workspace).
 - Continue hardening queue execution, agent recovery, and cross-platform packaging.
@@ -87,7 +87,7 @@ Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WAS
 
 ### Pre-built Binaries
 
-There are none published yet. The first public experimental prerelease, 0.0.2, will be published to [GitHub Releases](https://github.com/BarraDev/slashit/releases). Its installation guide, [`docs/installation.md`](docs/installation.md), names each installer, what was verified for it, and its known limitations. Until a release is published, [build from source](#build-from-source).
+Experimental prereleases are published to [GitHub Releases](https://github.com/BarraDev/slashit/releases). The current installation guide, [`docs/installation.md`](docs/installation.md), names each installer, what was verified for it, and its known limitations. To build from source instead, see [build from source](#build-from-source).
 
 | Platform | Format |
 |----------|--------|

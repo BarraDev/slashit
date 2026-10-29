@@ -1,6 +1,6 @@
 # Installing SlashIt
 
-SlashIt 0.0.2 is an **experimental prerelease**. It is not production-ready, and
+SlashIt 0.0.3 is an **experimental prerelease**. It is not production-ready, and
 it has not been installed and launched on every platform. Read the
 [known issues](#known-issues) before you install it.
 
@@ -8,28 +8,29 @@ This page names each installer the release produces, says what was verified for
 it and what was not, and describes how to install, remove and update it. The
 release notes in [`CHANGELOG.md`](../CHANGELOG.md) list what changed.
 
-The files below are what the release workflow produces for a `v0.0.2` tag.
-The Windows and macOS installers were not built or installed by the maintainers
-before this release, so their filenames follow the pattern the workflow uses
-for the earlier 0.0.1 draft.
+The files below are what the release workflow is expected to produce for a
+`v0.0.3` tag. Their names follow the pattern used for 0.0.2, and they have not
+been checked against the built artifacts. The verification recorded for the
+0.0.2 prerelease applies to that build only. It is in
+[the 0.0.2 guide](https://github.com/BarraDev/slashit/blob/v0.0.2/docs/installation.md).
 
 ## Choose an installer
 
-| Platform | File | Architecture | Verified here |
+| Platform | File | Architecture | Verified for 0.0.3 |
 |---|---|---|---|
-| Linux | `SlashIt_0.0.2_amd64.AppImage` | x86_64 | Built and inspected locally. Launched once, locally, with a non-representative WebKitGTK (see below). |
-| Linux (Debian, Ubuntu) | `SlashIt_0.0.2_amd64.deb` | x86_64 | Built and inspected locally. Dependency resolution simulated on Ubuntu 22.04. Not installed. |
-| Linux (Fedora, RHEL-like) | `SlashIt-0.0.2-1.x86_64.rpm` | x86_64 | Built and inspected locally. Payload listed. Not installed. Dependencies not checked. |
-| Windows | `SlashIt_0.0.2_x64-setup.exe` (NSIS) | x64 | Not built locally. Not installed. |
-| Windows | `SlashIt_0.0.2_x64_en-US.msi` | x64 | Not built locally. Not installed. |
-| macOS, Apple silicon | `SlashIt_0.0.2_aarch64.dmg` | arm64 | Not built locally. Not installed. |
-| macOS, Intel | `SlashIt_0.0.2_x64.dmg` | x86_64 | Not built locally. Not installed. |
+| Linux | `SlashIt_0.0.3_amd64.AppImage` | x86_64 | Not yet. |
+| Linux (Debian, Ubuntu) | `SlashIt_0.0.3_amd64.deb` | x86_64 | Not yet. |
+| Linux (Fedora, RHEL-like) | `SlashIt-0.0.3-1.x86_64.rpm` | x86_64 | Not yet. |
+| Windows | `SlashIt_0.0.3_x64-setup.exe` (NSIS) | x64 | Not yet. |
+| Windows | `SlashIt_0.0.3_x64_en-US.msi` | x64 | Not yet. |
+| macOS, Apple silicon | `SlashIt_0.0.3_aarch64.dmg` | arm64 | Not yet. |
+| macOS, Intel | `SlashIt_0.0.3_x64.dmg` | x86_64 | Not yet. |
 
 The release also contains `.sig` files, `latest.json`, and macOS `.app.tar.gz`
 files. These are for the updater, not for installation. Do not install them.
 
-No Linux artifact is verified on a real desktop. The Linux checks in this
-document were run in an isolated environment on the build host.
+No artifact of this release has been installed or launched yet. Treat every
+platform as untested until this page says otherwise.
 
 ## Known issues
 
@@ -38,15 +39,23 @@ document were run in an isolated environment on the build host.
 On some Linux systems the operating system ends SlashIt during startup (a
 SIGKILL). The AppImage bundles its own copy of WebKitGTK, and that copy's
 realtime scheduling watchdog is the established trigger. This is tracked in
-[issue #269](https://github.com/BarraDev/slashit/issues/269). It is not fixed in
-this release.
+[issue #269](https://github.com/BarraDev/slashit/issues/269), which remains open.
 
-- If it happens, you may start SlashIt again. That may succeed, but **repeated
+This release adds a temporary startup mitigation. When the loaded WebKitGTK is
+older than 2.54.1, or its version cannot be read, SlashIt lowers the soft
+realtime-priority limit of its own process before the window opens. WebKitGTK
+2.54.1 and later bypass the mitigation. It has not been validated on the
+official AppImage of this release yet.
+
+- If startup fails, you may start SlashIt again. That may succeed, but **repeated
   launches are not a guaranteed workaround**.
-- The `.deb` and `.rpm` packages use the WebKitGTK installed on your system.
-  On Ubuntu 22.04 that is WebKitGTK 2.50.4, the same version the AppImage bundles,
-  so the `.deb` is not known to be unaffected there. Other distributions were not
-  tested.
+- Terminals and agent processes that SlashIt starts inherit the lower soft limit.
+  A plain `chrt -f` is refused while it is in place. A process can raise its soft
+  limit back to the inherited hard limit without privilege, and software that
+  needs realtime scheduling may need to do so.
+- The `.deb` and `.rpm` packages use the WebKitGTK installed on your system. The
+  same version check applies to them. Whether the mitigation applies depends on
+  that version. Other distributions were not tested.
 
 ### The installers are not code-signed
 
@@ -59,7 +68,7 @@ this release.
   that is a different message, and this page does not cover it. Do not turn off
   Gatekeeper or other system-wide protections.
 
-These warnings have not been observed on real machines for this build.
+These warnings have not been observed on real machines for this release.
 
 The updater's signatures are a separate mechanism. They check that an update
 came from SlashIt's release process and was not altered. They do not sign the
@@ -68,21 +77,14 @@ installers and do not suppress the warnings above. See
 
 ### Installation and launch are not verified on every platform
 
-Verified for this build, locally, on the build host:
+No installer of this release has been verified yet. For each platform, the
+table above and the sections below say what has been checked. Nothing in this
+guide is a claim of a successful installation or launch for 0.0.3.
 
-- The AppImage was extracted, and its contents were inspected.
-- The AppImage was launched once with an isolated profile under a private
-  display. It was still running when a 30-second timeout ended the test. Its
-  log contains only desktop-portal and accessibility warnings from the private
-  display. The build host has WebKitGTK 2.54.1, which the
-  AppImage bundled. The CI AppImage bundles 2.50.4, so this is
-  not evidence about the released AppImage or about issue #269.
-- The `.deb` dependencies resolved in a simulated install on an Ubuntu 22.04
-  base image. Nothing was installed.
-
-Not verified: installation of any artifact, launch of any released artifact on
-any real desktop, Windows and macOS installers of any kind, and the `.rpm` on
-any Fedora or RHEL-like system.
+Not verified for 0.0.3: installation of any artifact, launch of any released
+artifact on any real desktop, the startup behavior of the official AppImage,
+Windows and macOS installers of any kind, and the `.rpm` on any Fedora or
+RHEL-like system.
 
 ### The update path is not tested end to end
 
@@ -95,15 +97,15 @@ that test passes, treat in-app updates as unverified.
 
 ### AppImage
 
-Contents: `slashitd` and `slashit-ui`. The AppImage does not include the
+Expected contents: `slashitd` and `slashit-ui`. The AppImage does not include the
 `slashit` command-line client. Use the `.deb` or `.rpm` for that.
 
 ```bash
-chmod +x SlashIt_0.0.2_amd64.AppImage
-./SlashIt_0.0.2_amd64.AppImage
+chmod +x SlashIt_0.0.3_amd64.AppImage
+./SlashIt_0.0.3_amd64.AppImage
 ```
 
-Tested only as described under [Installation and launch](#installation-and-launch-are-not-verified-on-every-platform).
+Not tested for 0.0.3. See [Installation and launch](#installation-and-launch-are-not-verified-on-every-platform).
 Whether the AppImage adds a menu entry on your desktop has not been checked.
 
 Remove it by deleting the file. Your data stays (see [Your data](#your-data)).
@@ -113,16 +115,16 @@ Remove it by deleting the file. Your data stays (see [Your data](#your-data)).
 The package name is `slash-it`, not `slashit`.
 
 ```bash
-sudo apt install ./SlashIt_0.0.2_amd64.deb
+sudo apt install ./SlashIt_0.0.3_amd64.deb
 slashit --version
 ```
 
-Verified: the dependency set resolves on Ubuntu 22.04 in a simulated install.
-The package requires `libwebkit2gtk-4.1-0`, `libgtk-3-0`, and
-`libayatana-appindicator3-1`. Not verified: an actual install, and the commands
-above on a real system.
+Not verified for 0.0.3. The 0.0.2 package's dependency set resolved in a
+simulated install on Ubuntu 22.04. The package is expected to require
+`libwebkit2gtk-4.1-0`, `libgtk-3-0`, and `libayatana-appindicator3-1`. Not
+verified: an actual install, and the commands above on a real system.
 
-The package installs:
+The package is expected to install:
 
 - `/usr/bin/slashit` (the command-line client)
 - `/usr/bin/slashitd` (the headless daemon)
@@ -140,23 +142,23 @@ This removal command has not been run.
 ### Fedora and RHEL-like systems (`.rpm`)
 
 ```bash
-sudo dnf install ./SlashIt-0.0.2-1.x86_64.rpm
+sudo dnf install ./SlashIt-0.0.3-1.x86_64.rpm
 slashit --version
 ```
 
-Not tested. The package contains `/usr/bin/slashit`, `/usr/bin/slashitd`,
-`/usr/bin/slashit-ui`, the desktop entry and the license. Its system
-dependencies were not checked, so they may differ from the `.deb`. The
-commands above are not verified on any distribution.
+Not tested. The package is expected to contain `/usr/bin/slashit`,
+`/usr/bin/slashitd`, `/usr/bin/slashit-ui`, the desktop entry and the license.
+Its system dependencies were not checked, so they may differ from the `.deb`.
+The commands above are not verified on any distribution.
 
 Remove it with `sudo dnf remove slash-it`. That command is not tested either.
 
 ## Windows
 
-Not built locally and not installed. Expected installers:
+Not verified for 0.0.3. Expected installers:
 
-- `SlashIt_0.0.2_x64-setup.exe` (NSIS)
-- `SlashIt_0.0.2_x64_en-US.msi`
+- `SlashIt_0.0.3_x64-setup.exe` (NSIS)
+- `SlashIt_0.0.3_x64_en-US.msi`
 
 The release workflow builds both on a Windows runner and does not package the
 command-line client for Windows. Whether the headless daemon is included has not
@@ -167,10 +169,10 @@ through Settings > Apps is not tested.
 
 ## macOS
 
-Not built locally and not installed. Expected installers:
+Not verified for 0.0.3. Expected installers:
 
-- `SlashIt_0.0.2_aarch64.dmg` for Apple silicon
-- `SlashIt_0.0.2_x64.dmg` for Intel
+- `SlashIt_0.0.3_aarch64.dmg` for Apple silicon
+- `SlashIt_0.0.3_x64.dmg` for Intel
 
 Open the disk image, drag SlashIt to Applications, and start it from the
 Gatekeeper procedure described above. The command-line client is not part of the
@@ -183,8 +185,10 @@ drafts, and offers a prerelease only to installs on the Prerelease update
 channel.
 
 A new install uses the **Stable** channel. No stable release exists yet, so
-after you install 0.0.2 you will not be offered later updates until you select
-the **Prerelease** channel in Settings. Choose it if you want to receive later
+after you install 0.0.3 you will not be offered later updates until you select
+the **Prerelease** channel in Settings. The same applies to an install of 0.0.2:
+the Stable channel does not offer prereleases, so 0.0.3 is offered only on the
+Prerelease channel. Choose it if you want to receive later
 prereleases. It downloads over HTTPS only and verifies each update's signature before
 installing it. Updates to a prerelease are offered only after the prerelease is
 published.
