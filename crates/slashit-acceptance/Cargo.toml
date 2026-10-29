@@ -1,6 +1,6 @@
 [package]
 name = "slashit-acceptance"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "Rust-only desktop acceptance harness driving the real SlashIt application"
 license = "MPL-2.0"

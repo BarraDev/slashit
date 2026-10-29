@@ -6,6 +6,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.0.3]
+
+An experimental prerelease that adds a temporary startup mitigation for the
+intermittent Linux AppImage failure tracked in
+[issue #269](https://github.com/BarraDev/slashit/issues/269). It is not
+production-ready. It does not fix the upstream WebKitGTK behavior, and issue
+#269 stays open until the official artifact of this release has been validated.
+
+**Installing.** Choose the installer for your platform and follow
+[`docs/installation.md`](https://github.com/BarraDev/slashit/blob/v0.0.3/docs/installation.md).
+It names each file, says what was checked for it, and says what was not.
+
+### Fixed
+
+- **A startup mitigation for the intermittent Linux AppImage failure.** On some
+  Linux systems the operating system ended SlashIt during startup with SIGKILL.
+  WebKitGTK moves the IPC thread of its UI process to realtime scheduling when
+  the window starts. When the kernel grants that, a 200 ms CPU-time budget
+  applies to the thread, and the process is ended if the budget runs out during
+  a startup burst. SlashIt now lowers the soft realtime-priority limit of its
+  own process before the window opens, so the kernel refuses that scheduling
+  request.
+- The mitigation is temporary and version-aware. It applies when the loaded
+  WebKitGTK is older than 2.54.1, or when its version cannot be read. WebKitGTK
+  2.54.1 and later skip it. 2.54.1 is the earliest checked release that no longer
+  uses the affected path; it is not a measured minimum. The version is read from
+  the library loaded at runtime, so the `.deb` and `.rpm` packages, which use
+  the WebKitGTK installed on your system, follow the same rule.
+- Only the desktop app applies the limit. The headless `slashitd` daemon and
+  the `slashit` command-line client do not, so the agents `slashitd` runs keep
+  the limit they inherited.
+
+### Known issues
+
+- **Terminal processes inherit a reduced realtime-priority limit.** While the
+  mitigation is active, SlashIt and the terminals and agent processes it starts
+  have a soft `RLIMIT_RTPRIO` of 0. A plain `chrt -f` is refused. The hard limit
+  is unchanged, so a process can raise its soft limit back to the inherited hard
+  limit without privilege. Applications that need realtime scheduling may need
+  to do so.
+- **The upstream WebKitGTK behavior is not fixed.** The mitigation works in
+  SlashIt's own process. It does not change the kernel, RealtimeKit or WebKitGTK.
+- **Issue #269 remains open.** The official Linux artifact of this release has
+  not been validated yet. Until it is, a startup failure on your system is still
+  possible, and repeated launches are not a guaranteed workaround.
+- **Media playback was not tested for this build.**
+- **The installers are not code-signed.** Windows SmartScreen and macOS
+  Gatekeeper warn on first launch. The updater's signatures are a different
+  mechanism and do not remove those warnings.
+- **Installation and launch are not verified on every platform.** Which
+  artifacts were checked for this build, and which were not, is recorded in
+  [`docs/installation.md`](https://github.com/BarraDev/slashit/blob/v0.0.3/docs/installation.md).
+  Treat an unverified platform as untested.
+- **Updates from a published release have not been run end to end.** An update
+  installed through the application has been exercised only in a local
+  experiment, with a disposable test key.
+- **The AppImage update replaces the file without an atomic step.** An update
+  interrupted by a crash or a power loss has not been tested.
+- The product acceptance checks use fake agent providers. A real agent provider
+  has not been run against this build.
+
 ## [0.0.2]
 
 The first public experimental prerelease. It is not production-ready, and it
@@ -189,6 +250,7 @@ Known gaps in this prerelease:
 - The product acceptance checks use fake agent providers. A real provider has
   not been run against this build.
 
+[0.0.3]: https://github.com/BarraDev/slashit/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/BarraDev/slashit/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/BarraDev/slashit/releases/tag/v0.0.1
-[Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.3...HEAD

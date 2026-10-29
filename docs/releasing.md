@@ -99,11 +99,11 @@ is honest; an override that makes the installer lie about its version is not.
 
 The tag must be exactly `v` followed by the version in `tauri.conf.json`. The
 preflight job compares them and fails otherwise. The example below tags the
-planned `0.0.2` prerelease; substitute the version your `tauri.conf.json` names.
+`0.0.3` prerelease; substitute the version your `tauri.conf.json` names.
 
 ```bash
-git tag -a v0.0.2 -m 'SlashIt v0.0.2'
-git push origin v0.0.2
+git tag -a v0.0.3 -m 'SlashIt v0.0.3'
+git push origin v0.0.3
 ```
 
 This project's normal workflow is Jujutsu, but `jj` treats git tags as
@@ -188,7 +188,7 @@ To check a tag without pushing it, run the script with the tag and read the
 channel it prints:
 
 ```bash
-scripts/release-preflight.sh v0.0.2
+scripts/release-preflight.sh v0.0.3
 ```
 
 ### Version links in CHANGELOG.md
@@ -340,16 +340,16 @@ membership. It has to be said plainly in the release notes and the README,
 because a security warning that nobody warned users about is indistinguishable
 from a compromised download.
 
-## 8. Before the first release
+## 8. Release history
 
-Nothing has been published. The `v0.0.1` tag and its draft release were never
-published, and the draft predates the HTTPS-only updater transport. They are not
-the first public release. The first public release is planned as `v0.0.2`, a
-prerelease declared in `.github/release-channels.txt`. Testers who choose the Prerelease
-channel in Settings receive it and later prereleases; people on the Stable
-channel receive nothing until a stable release is published. Until then the
-README's Releases link goes to the prerelease page, and a Stable check reports
-that no newer Stable release is available. That is expected, and not an error.
+The `v0.0.1` tag and its draft release were never published, and the draft
+predates the HTTPS-only updater transport. `v0.0.2` is the first public release,
+a prerelease declared in `.github/release-channels.txt`. `v0.0.3` is the next
+prerelease, declared on its own line there. Testers who choose the Prerelease
+channel in Settings receive these and later prereleases; people on the Stable
+channel receive nothing until a stable release is published. A Stable check
+reports that no newer Stable release is available. That is expected, and not an
+error.
 
 ## 9. Recovering a partial draft
 
