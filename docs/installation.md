@@ -49,6 +49,10 @@ official AppImage of this release yet.
 
 - If startup fails, you may start SlashIt again. That may succeed, but **repeated
   launches are not a guaranteed workaround**.
+- If SlashIt 0.0.2 is ended during startup on your system, the in-app updater
+  cannot bring it to 0.0.3, because the updater runs inside the application that
+  does not start. Install 0.0.3 by hand from the release page once it is
+  published, using the file for your system from the table above.
 - Terminals and agent processes that SlashIt starts inherit the lower soft limit.
   A plain `chrt -f` is refused while it is in place. A process can raise its soft
   limit back to the inherited hard limit without privilege, and software that
