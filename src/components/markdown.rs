@@ -11,6 +11,17 @@ use crate::services::is_safe_link_destination;
 /// `prose prose-invert` Tailwind plugin. Clicks on its links are routed to the
 /// opener by `route_external_links`, installed at startup.
 pub fn render_safe_markdown(src: &str) -> String {
+    render(src, false)
+}
+
+/// Render untrusted updater release notes like `render_safe_markdown`, but
+/// keep every source line on its own line: a single newline inside a
+/// paragraph becomes `<br />` instead of collapsing into a space.
+pub fn render_release_notes_markdown(src: &str) -> String {
+    render(src, true)
+}
+
+fn render(src: &str, hard_line_breaks: bool) -> String {
     use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
 
     let mut opts = Options::empty();
@@ -30,6 +41,7 @@ pub fn render_safe_markdown(src: &str) -> String {
             keep.then_some(ev)
         }
         Event::End(TagEnd::Link) => open_links.pop().unwrap_or(false).then_some(ev),
+        Event::SoftBreak if hard_line_breaks => Some(Event::HardBreak),
         ev => Some(ev),
     });
 
@@ -40,7 +52,7 @@ pub fn render_safe_markdown(src: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_safe_markdown;
+    use super::{render_release_notes_markdown, render_safe_markdown};
     use crate::services::is_safe_link_destination;
 
     #[test]
@@ -102,9 +114,8 @@ mod tests {
 
     #[test]
     fn safe_links_stay_clickable_and_escaped() {
-        let html = render_safe_markdown(
-            "[a](https://example.com/x?a=1&b=\"2\") <mailto:a@example.com>",
-        );
+        let html =
+            render_safe_markdown("[a](https://example.com/x?a=1&b=\"2\") <mailto:a@example.com>");
         assert!(
             html.contains("<a href=\"https://example.com/x?a=1&amp;b=%222%22\">a</a>"),
             "{html}"
@@ -217,11 +228,48 @@ mod tests {
         let html = render_safe_markdown(
             "## Fixes\n\n<iframe src=\"https://evil.example\"></iframe>\n\n- [update now](javascript:fetch('//evil'))\n- ![pixel](https://evil.example/t.gif)\n- <a href=\"https://evil.example\" onclick=\"x()\">raw</a>\n- [file](file:///etc/passwd)\n",
         );
-        for banned in ["<iframe", "<img", "evil.example", "javascript", "onclick", "file:", "href"] {
+        for banned in [
+            "<iframe",
+            "<img",
+            "evil.example",
+            "javascript",
+            "onclick",
+            "file:",
+            "href",
+        ] {
             assert!(!html.contains(banned), "{banned}: {html}");
         }
-        for kept in ["<h2>Fixes</h2>", "<li>update now</li>", "<li>pixel</li>", "<li>file</li>"] {
+        for kept in [
+            "<h2>Fixes</h2>",
+            "<li>update now</li>",
+            "<li>pixel</li>",
+            "<li>file</li>",
+        ] {
             assert!(html.contains(kept), "{kept}: {html}");
         }
+    }
+
+    #[test]
+    fn release_notes_keep_each_line_on_its_own_line() {
+        assert_eq!(
+            render_release_notes_markdown("First line\nSecond line").trim(),
+            "<p>First line<br />\nSecond line</p>"
+        );
+        // PR comments and agent summaries keep CommonMark soft breaks.
+        assert_eq!(
+            render_safe_markdown("First line\nSecond line").trim(),
+            "<p>First line\nSecond line</p>"
+        );
+    }
+
+    #[test]
+    fn release_notes_line_breaks_keep_the_safety_rules() {
+        let html = render_release_notes_markdown(
+            "[x](javascript:alert(1))\n![p](https://evil.example/t.gif)\n<b onclick=x>b</b>\n[ok](https://example.com)",
+        );
+        assert_eq!(
+            html.trim(),
+            "<p>x<br />\np<br />\nb<br />\n<a href=\"https://example.com\">ok</a></p>"
+        );
     }
 }

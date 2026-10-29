@@ -2,7 +2,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use wasm_bindgen::JsCast;
-use crate::components::markdown::render_safe_markdown;
+use crate::components::markdown::render_release_notes_markdown;
 use crate::components::update_banner::{
     abandon_stalled, check_now, request_restart, set_update_channel, start_install,
     UpdaterActivity, UpdaterContext,
@@ -677,7 +677,7 @@ fn UpdatesTab() -> impl IntoView {
                                 {(!body.is_empty()).then(|| view! {
                                     <div
                                         class="text-xs text-white/70 bg-black/30 rounded-lg px-3 py-2 max-h-64 overflow-auto prose prose-sm prose-invert max-w-none leading-relaxed prose-pre:my-2 prose-pre:bg-black/40 prose-pre:text-xs prose-code:text-xs prose-code:before:hidden prose-code:after:hidden prose-headings:my-2 prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0"
-                                        inner_html=render_safe_markdown(&body)
+                                        inner_html=render_release_notes_markdown(&body)
                                     ></div>
                                 })}
                             </div>
