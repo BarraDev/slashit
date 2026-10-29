@@ -13,6 +13,9 @@ jobs:
   probe:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    # The signing secrets reach this job only through the environment, after its
+    # protection rules pass. The ref check below still applies after approval.
+    environment: release-signing
     permissions:
       contents: read
     steps:

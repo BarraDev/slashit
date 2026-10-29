@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
 
+# No token permission at workflow level. Each job declares its own below. A
+# workflow that reads the signing key must declare this, so a job cannot inherit
+# a broader token by default.
+permissions: {}
+
 jobs:
   # Everything a tag can get wrong is decided here, in seconds, before four
   # platform builds start. Two of these checks used to fail late or not at all:
@@ -25,7 +30,10 @@ jobs:
       channel: ${{ steps.version.outputs.channel }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
+      # The ancestry check below needs the commit history, not a shallow clone.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Validate the release version and choose its channel
         id: version
@@ -38,8 +46,24 @@ jobs:
           # from .github/release-channels.txt, never from the tag's shape.
           scripts/release-preflight.sh "$TAG"
 
+      # The production signing key is released only to the release jobs below,
+      # and only for a tag that names a commit reachable from main. The check
+      # resolves the tag to its commit, so it holds for an annotated tag too.
+      # It runs here, before the environment gate, so a reviewer sees its result.
+      - name: Check that the tag names a commit on main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/check-release-tag-on-main.sh "$TAG"
+
   release:
     needs: preflight
+    # The signing secrets reach this job only through this environment, after
+    # its protection rules pass: a required reviewer approves each run. The
+    # environment exists and holds the two updater signing secrets. The
+    # repository-level copies of those secrets remain until the post-merge
+    # signing probe succeeds through the environment, and are removed after it.
+    # See docs/releasing.md, section 7, "Signing, stated accurately".
+    environment: release-signing
     permissions:
       contents: write
     strategy:

@@ -29,6 +29,9 @@ jobs:
   recover-windows:
     runs-on: windows-latest
     timeout-minutes: 90
+    # The signing secrets reach this job only through the environment, after its
+    # protection rules pass. The checks below still run after approval.
+    environment: release-signing
     permissions:
       contents: write
     steps:
@@ -48,7 +51,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/v0.0.1
+          fetch-depth: 0
           persist-credentials: false
+
+      # The signing key may sign only a commit that main has accepted, so the
+      # source must be reachable from main before anything is built.
+      - name: Check that the tag names a commit on main
+        shell: bash
+        run: scripts/check-release-tag-on-main.sh "$RELEASE_TAG"
 
       - name: Check the source and the draft before building
         shell: bash

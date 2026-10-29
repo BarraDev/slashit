@@ -302,6 +302,29 @@ page. The private key lives only in GitHub Actions secrets; losing it means
 existing installs can never be auto-updated again, and a new key only reaches
 users through a manually installed build.
 
+**Who can use the key.** The workflows read the two secrets only through the
+`release-signing` environment. These repository settings must exist before the
+workflows that reference it are merged, and the two repository-level copies must
+be removed once the environment holds them:
+
+- The environment has the two secrets, and a required reviewer. Its deployment
+  branch and tag policy allows `main` and `v*` tags only. The probe and the
+  Windows recovery run from `main`, so that policy is what stops a run from
+  another branch from receiving the key.
+- A tag ruleset protects `v*` tags. Only the repository owner, through the
+  bypass list, can create, move or delete them.
+
+A job receives the secrets only after a reviewer approves its run. The preflight
+job checks that the tag names a commit reachable from `main`, and it runs before
+the approval is requested. The tagged commit's own workflow files decide what
+runs, so before approving a tag run, the reviewer checks that the tagged commit
+does not change the release machinery:
+
+    git diff --stat origin/main <tag> -- .github scripts
+
+The output must be empty. Any difference means the tag runs different workflow or
+script code from `main`, and it must be reviewed before the run is approved.
+
 **The installers are not code-signed.** There is no Windows Authenticode
 certificate and no Apple Developer ID signature or notarization. In practice:
 
