@@ -25,7 +25,10 @@ jobs:
       channel: ${{ steps.version.outputs.channel }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
+      # The ancestry check below needs the commit history, not a shallow clone.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Validate the release version and choose its channel
         id: version
@@ -38,8 +41,21 @@ jobs:
           # from .github/release-channels.txt, never from the tag's shape.
           scripts/release-preflight.sh "$TAG"
 
+      # The production signing key is released only to the release jobs below,
+      # and only for a tag that names a commit reachable from main. The check
+      # resolves the tag to its commit, so it holds for an annotated tag too.
+      # It runs here, before the environment gate, so a reviewer sees its result.
+      - name: Check that the tag names a commit on main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/check-release-tag-on-main.sh "$TAG"
+
   release:
     needs: preflight
+    # The signing secrets reach a job only through this environment, after its
+    # protection rules pass: a required reviewer approves each run. See
+    # docs/releasing.md, "Signing".
+    environment: release-signing
     permissions:
       contents: write
     strategy:
