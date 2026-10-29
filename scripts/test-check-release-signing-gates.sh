@@ -16,18 +16,20 @@ trap 'rm -rf "$work"' EXIT
 passed=0
 failed=0
 
-# expect <pass|fail> <label> <workflow-file>
+# expect <pass|fail> <label> <workflow-file> [diagnostic the refusal must contain]
 expect() {
-  local want=$1 label=$2 file=$3 output status=0
+  local want=$1 label=$2 file=$3 fragment=${4:-} output status=0
   output=$("$checker" "$file" 2>&1) || status=$?
   if [ "$want" = pass ] && [ "$status" -eq 0 ] && [[ "$output" == ok* ]]; then
     echo "ok   $label"
     passed=$((passed + 1))
-  elif [ "$want" = fail ] && [ "$status" -eq 1 ] && [[ "$output" == *"FAIL "* ]]; then
+  elif [ "$want" = fail ] && [ "$status" -eq 1 ] && [[ "$output" == *"FAIL "* ]] &&
+    { [ -z "$fragment" ] || [[ "$output" == *"$fragment"* ]]; }; then
     echo "ok   $label (refused: $(printf '%s\n' "$output" | grep -m1 '^FAIL ' | sed 's/^FAIL //'))"
     passed=$((passed + 1))
   else
     echo "FAIL $label: expected $want, checker exited $status" >&2
+    [ -z "$fragment" ] || echo "expected diagnostic: $fragment" >&2
     printf '%s\n' "$output" >&2
     failed=$((failed + 1))
   fi
@@ -215,7 +217,7 @@ jobs:
           K: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: echo x
 EOF
-expect fail "a signing workflow on a branch push with no preflight is refused" "$f"
+expect fail "a signing workflow on a branch push with no preflight is refused" "$f" "a push-triggered workflow reads the signing key but has no preflight job"
 
 f="$work/fake-preflight.yml"; sed 's/^      - name: Check the tag is on main$/      - name: Check the tag is on main\n        if: false/' "$base" >"$f"
 expect fail "a tag check that is skipped by 'if: false' is refused" "$f"

@@ -57,11 +57,12 @@ jobs:
 
   release:
     needs: preflight
-    # The signing secrets are meant to reach this job only through this
-    # environment, after its protection rules pass: a required reviewer approves
-    # each run. Until the secrets move into the environment they are repository
-    # secrets, and the environment does not yet exist. See docs/releasing.md,
-    # section 7, "Signing, stated accurately".
+    # The signing secrets reach this job only through this environment, after
+    # its protection rules pass: a required reviewer approves each run. The
+    # environment exists and holds the two updater signing secrets. The
+    # repository-level copies of those secrets remain until the post-merge
+    # signing probe succeeds through the environment, and are removed after it.
+    # See docs/releasing.md, section 7, "Signing, stated accurately".
     environment: release-signing
     permissions:
       contents: write
