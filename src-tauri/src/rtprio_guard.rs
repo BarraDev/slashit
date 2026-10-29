@@ -27,16 +27,20 @@
 //!
 //! Only the soft limit is lowered. The inherited hard limit is kept, so a
 //! process can raise its soft limit back up to that value without privilege.
-//! That keeps the change narrow: SlashIt's agents and terminals inherit the
-//! lowered limit, and a child that needs realtime scheduling can still ask for
-//! it. The guard only protects this process, and it does not change the kernel,
-//! RealtimeKit, or WebKit. A process with `CAP_SYS_NICE` ignores the soft limit,
+//! That keeps the change narrow: the terminals and agent processes that the
+//! GUI starts inherit the lowered limit, and a child that needs realtime
+//! scheduling can still ask for it. The headless `slashitd` never calls this
+//! guard, so the agents it runs keep the inherited limit unchanged. The guard
+//! only protects this process, and it does not change the kernel, RealtimeKit,
+//! or WebKit. A process with `CAP_SYS_NICE` ignores the soft limit,
 //! so the guard does not protect a privileged launch. SlashIt runs unprivileged.
 //! Other systems are unaffected because the module is compiled only for Linux,
 //! and only the GUI entry point calls it.
 //!
 //! This is a temporary compatibility workaround. It is meant to be removed once
-//! the official Linux release uses a WebKitGTK that does not need it.
+//! the official Linux release is built with a WebKitGTK that does not need it,
+//! and a CI-built release artifact passes the startup matrix with the guard
+//! removed.
 //!
 //! The guard must run before the Tauri builder creates the first window,
 //! because WebKit makes its scheduling request while the window is created.
@@ -47,9 +51,10 @@ use std::io;
 /// The `rlimit` pair as the kernel reports it.
 type Limit = libc::rlimit;
 
-/// The first WebKitGTK version that does not need the guard. Checked against
-/// the exported symbols of the installed 2.50.4, 2.52.6, 2.54.1, and 2.54.2
-/// libraries.
+/// The first WebKitGTK version treated as not needing the guard. The boundary
+/// follows the exported symbols of the installed 2.50.4, 2.52.6, 2.54.1, and
+/// 2.54.2 libraries. Short launches on 2.54.1 showed no startup kill, but no
+/// startup matrix was run on it, so the boundary is not a measured minimum.
 const FIRST_CORRECTED_VERSION: (u32, u32, u32) = (2, 54, 1);
 
 extern "C" {
@@ -157,6 +162,9 @@ mod tests {
     /// Printed by the child when the host's hard limit is zero, so the
     /// positive-limit check cannot run there. The parent reports this as a skip.
     const SKIPPED: &str = "RTPRIO_GUARD_SKIPPED";
+    /// Printed by the child when it runs as root. Root bypasses the limit, so
+    /// the `SCHED_RR` refusal is not evaluated. The parent reports this.
+    const ROOT_SKIPPED: &str = "RTPRIO_GUARD_ROOT_SKIPPED";
     /// When set, a skipped positive-limit check fails the test instead. Use it
     /// on a host where the hard limit must be non-zero.
     const REQUIRE_POSITIVE: &str = "SLASHIT_RTPRIO_GUARD_REQUIRE_POSITIVE";
@@ -283,6 +291,15 @@ mod tests {
             stdout.contains(CHECKED) || stdout.contains(SKIPPED),
             "child process ran no checks:\n{stdout}"
         );
+        if stdout.contains(ROOT_SKIPPED) {
+            // Written to stderr directly, as the positive-limit skip below is,
+            // so that libtest's capture does not hide it.
+            use std::io::Write;
+            let _ = writeln!(
+                io::stderr(),
+                "NOT EXERCISED: the SCHED_RR refusal was not checked because the test runs as root."
+            );
+        }
         stdout
     }
 
@@ -292,7 +309,7 @@ mod tests {
     fn the_real_limit_is_lowered_in_a_child_process() {
         match std::env::var(CHILD_ENV).as_deref() {
             Ok("positive") => return run_positive_child_checks(),
-            Ok(_) => return,
+            Ok(other) => panic!("unexpected {CHILD_ENV} mode: {other}"),
             Err(_) => {}
         }
 
@@ -324,7 +341,7 @@ mod tests {
     fn a_zero_hard_limit_is_left_alone_in_a_child_process() {
         match std::env::var(CHILD_ENV).as_deref() {
             Ok("zero_hard") => return run_zero_hard_child_checks(),
-            Ok(_) => return,
+            Ok(other) => panic!("unexpected {CHILD_ENV} mode: {other}"),
             Err(_) => {}
         }
 
@@ -351,7 +368,10 @@ mod tests {
         lower_soft_rtprio_limit().expect("lower the soft limit");
         let after = read_rtprio_limit().expect("read the limit after lowering");
         assert_eq!(after.rlim_cur, 0, "soft limit must be zero");
-        assert_eq!(after.rlim_max, inherited.rlim_max, "hard limit must be kept");
+        assert_eq!(
+            after.rlim_max, inherited.rlim_max,
+            "hard limit must be kept"
+        );
         assert_sched_rr_refused();
         println!("{CHECKED}");
     }
@@ -363,7 +383,11 @@ mod tests {
 
         lower_soft_rtprio_limit().expect("a zero hard limit is a valid no-op");
         let after = read_rtprio_limit().expect("read the limit after the guard");
-        assert_eq!((after.rlim_cur, after.rlim_max), (0, 0), "both limits stay zero");
+        assert_eq!(
+            (after.rlim_cur, after.rlim_max),
+            (0, 0),
+            "both limits stay zero"
+        );
         assert_sched_rr_refused();
         println!("{CHECKED}");
     }
@@ -372,16 +396,18 @@ mod tests {
     /// refusal is checked only for an unprivileged process.
     fn assert_sched_rr_refused() {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
-        if unsafe { libc::geteuid() } != 0 {
-            let param = libc::sched_param { sched_priority: 1 };
-            // SAFETY: `param` is a valid `sched_param` for the duration of the call.
-            let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_RR, &param) };
-            assert_eq!(rc, -1, "SCHED_RR must be refused with a zero soft limit");
-            assert_eq!(
-                io::Error::last_os_error().raw_os_error(),
-                Some(libc::EPERM),
-                "SCHED_RR must fail with EPERM"
-            );
+        if unsafe { libc::geteuid() } == 0 {
+            println!("{ROOT_SKIPPED}");
+            return;
         }
+        let param = libc::sched_param { sched_priority: 1 };
+        // SAFETY: `param` is a valid `sched_param` for the duration of the call.
+        let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_RR, &param) };
+        assert_eq!(rc, -1, "SCHED_RR must be refused with a zero soft limit");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM),
+            "SCHED_RR must fail with EPERM"
+        );
     }
 }
