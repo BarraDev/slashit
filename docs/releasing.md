@@ -308,9 +308,9 @@ workflows that reference it are merged, and the two repository-level copies must
 be removed once the environment holds them:
 
 - The environment has the two secrets, and a required reviewer. Its deployment
-  branch and tag policy allows `main` and `v*` tags only. The probe and the
-  Windows recovery run from `main`, so that policy is what stops a run from
-  another branch from receiving the key.
+  branch and tag policy allows `main` and `v*` tags only. The probe runs from
+  `main` and the release workflow runs from `v*` tags, so that policy is what
+  stops a run from another branch from receiving the key.
 - A tag ruleset protects `v*` tags. Only the repository owner, through the
   bypass list, can create, move or delete them.
 
@@ -379,18 +379,27 @@ error.
 A tag whose workflow failed on one platform is not re-run and is never moved.
 Re-running a tag's workflow uses the workflow file as it was at the tagged
 commit, so a fix on `main` does not reach it. Its draft is kept and the missing
-platform is added to it:
+platform is added to it.
+
+No recovery workflow is kept today. The Windows recovery workflow was pinned to
+the `v0.0.1` tag, its draft and its source commit. It was retired because that
+draft is no longer a release candidate, and the `v0.0.3` release built every
+platform through the release workflow. To recover a future partial draft:
 
 1. Fix the cause on `main` through an ordinary pull request.
-2. Run **Release Windows recovery** from `main`. It refuses any other ref, and
-   it checks before building that the tag resolves to the source commit it names,
-   that exactly one release carries the tag and it is the draft it names, that
-   the draft is still a Draft and a Prerelease, and that the description it would
-   write matches the draft's body.
-3. Its build step is the only one that receives the signing secrets. It uploads
-   the platform's installers and merges its entries into the existing
-   `latest.json`. The other platforms' assets and entries are kept.
+2. Add a workflow for that one recovery, through a reviewed pull request. It
+   names the tag, the release ID and the source commit as constants, and it
+   refuses to build unless they match the draft. Its checks must cover the tag
+   resolving to the named source commit and being reachable from `main`, as the
+   release workflow's preflight does; exactly one release carrying the tag, and
+   that release being the draft; and the draft's flags and description matching
+   what the workflow expects.
+3. Only its build step receives the signing secrets, through the
+   `release-signing` environment. It uploads the platform's installers and
+   merges its entries into the existing `latest.json`. The other platforms'
+   assets and entries are kept.
+4. Delete that workflow once the draft is published or deleted, so that no
+   workflow keeps pointing at a draft that no longer needs it.
 
-The workflow names the tag, the release ID and the source commit as constants.
-When a different tag or release needs the same recovery, change them together in
-a reviewed pull request, not by dispatch input.
+Use a new workflow file for each recovery rather than dispatch inputs, so the
+constants of each run are reviewed in the pull request that introduced them.

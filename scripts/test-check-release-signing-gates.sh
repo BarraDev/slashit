@@ -249,7 +249,7 @@ jobs:
 EOF
 expect fail "a tag check that appears only in a shell comment is refused" "$f"
 
-echo "== a dispatch-only workflow (the probe and the recovery)"
+echo "== a dispatch-only workflow (the updater signing probe)"
 probe="$work/probe.yml"
 cat >"$probe" <<'EOF'
 name: Probe
