@@ -11103,7 +11103,10 @@ mod tests {
     /// How many times the fake `gh` has been asked, counted from its log at `asks`.
     #[cfg(unix)]
     fn asks_made(asks: &std::path::Path) -> usize {
-        std::fs::read_to_string(asks).unwrap_or_default().lines().count()
+        std::fs::read_to_string(asks)
+            .unwrap_or_default()
+            .lines()
+            .count()
     }
 
     #[cfg(unix)]
@@ -11111,20 +11114,51 @@ mod tests {
     async fn a_pull_request_recorded_merged_or_closed_is_not_asked_about_again() {
         let dir = tempfile::tempdir().unwrap();
         let asks = dir.path().join("asks");
-        let gh = fake_gh(dir.path(), &format!("*) echo x >> \"{}\"; {OPEN_FAILING} ;;", asks.display()));
-        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(gh, Duration::from_secs(5)));
+        let gh = fake_gh(
+            dir.path(),
+            &format!("*) echo x >> \"{}\"; {OPEN_FAILING} ;;", asks.display()),
+        );
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(
+            gh,
+            Duration::from_secs(5),
+        ));
         let (executor, _temps) = test_executor_with_prs(statuses.clone());
-        seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 1, Some("MERGED"))).await;
-        seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 2, Some("CLOSED"))).await;
-        seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 3, Some("OPEN"))).await;
+        seed_with_pr(
+            &executor,
+            TaskStatus::PrCreated,
+            pr_ref("o/r", 1, Some("MERGED")),
+        )
+        .await;
+        seed_with_pr(
+            &executor,
+            TaskStatus::PrCreated,
+            pr_ref("o/r", 2, Some("CLOSED")),
+        )
+        .await;
+        seed_with_pr(
+            &executor,
+            TaskStatus::PrCreated,
+            pr_ref("o/r", 3, Some("OPEN")),
+        )
+        .await;
 
         executor.poll_pull_requests().await;
         executor.poll_pull_requests().await;
 
-        assert_eq!(asks_made(&asks), 1, "only the open pull request is asked, and only once in the poll interval");
-        assert!(statuses.get(&crate::pr_status::PrKey::new("o/r", 1)).is_none());
-        assert!(statuses.get(&crate::pr_status::PrKey::new("o/r", 2)).is_none());
-        assert!(statuses.get(&crate::pr_status::PrKey::new("o/r", 3)).is_some());
+        assert_eq!(
+            asks_made(&asks),
+            1,
+            "only the open pull request is asked, and only once in the poll interval"
+        );
+        assert!(statuses
+            .get(&crate::pr_status::PrKey::new("o/r", 1))
+            .is_none());
+        assert!(statuses
+            .get(&crate::pr_status::PrKey::new("o/r", 2))
+            .is_none());
+        assert!(statuses
+            .get(&crate::pr_status::PrKey::new("o/r", 3))
+            .is_some());
     }
 
     #[cfg(unix)]
@@ -11132,21 +11166,34 @@ mod tests {
     async fn an_explicit_refresh_asks_at_once_and_moves_the_poll_schedule() {
         let dir = tempfile::tempdir().unwrap();
         let asks = dir.path().join("asks");
-        let gh = fake_gh(dir.path(), &format!("*) echo x >> \"{}\"; {OPEN_FAILING} ;;", asks.display()));
-        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(gh, Duration::from_secs(5)));
+        let gh = fake_gh(
+            dir.path(),
+            &format!("*) echo x >> \"{}\"; {OPEN_FAILING} ;;", asks.display()),
+        );
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(
+            gh,
+            Duration::from_secs(5),
+        ));
         let (executor, _temps) = test_executor_with_prs(statuses.clone());
         seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 1, None)).await;
         let key = crate::pr_status::PrKey::new("o/r", 1);
 
         executor.poll_pull_requests().await;
         assert_eq!(asks_made(&asks), 1);
-        assert!(!statuses.poll_due(&key, chrono::Utc::now()), "polled, so not due again yet");
+        assert!(
+            !statuses.poll_due(&key, chrono::Utc::now()),
+            "polled, so not due again yet"
+        );
 
         // A refresh does not wait for the schedule, and it restarts the wait.
         statuses.refresh(&key).await.unwrap();
         assert_eq!(asks_made(&asks), 2, "the refresh asked gh at once");
         executor.poll_pull_requests().await;
-        assert_eq!(asks_made(&asks), 2, "the refresh moved the schedule, so the poll does not ask again");
+        assert_eq!(
+            asks_made(&asks),
+            2,
+            "the refresh moved the schedule, so the poll does not ask again"
+        );
     }
 
     #[cfg(unix)]
@@ -11161,7 +11208,10 @@ mod tests {
                 asks.display()
             ),
         );
-        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(gh, Duration::from_secs(5)));
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(
+            gh,
+            Duration::from_secs(5),
+        ));
         let (executor, _temps) = test_executor_with_prs(statuses.clone());
         seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 1, None)).await;
         let key = crate::pr_status::PrKey::new("o/r", 1);
@@ -11170,15 +11220,25 @@ mod tests {
             statuses.get(&key).unwrap().error.map(|e| e.kind),
             Some(crate::pr_status::PrFetchErrorKind::RateLimited)
         );
+        assert!(
+            !statuses.poll_due(&key, chrono::Utc::now()),
+            "the rate-limit backoff holds the pull request before the loop starts"
+        );
         let asked = asks_made(&asks);
 
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(executor.polling_loop(Some(rx)));
         // Shutdown arrives while the loop is between passes, after a pass has
         // seen the rate-limited pull request and left it alone.
-        let passes = executor.pr_check_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let passes = executor
+            .pr_check_counter
+            .load(std::sync::atomic::Ordering::Relaxed);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while executor.pr_check_counter.load(std::sync::atomic::Ordering::Relaxed) == passes {
+            while executor
+                .pr_check_counter
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == passes
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -11190,7 +11250,11 @@ mod tests {
             .await
             .expect("the loop must wake on shutdown, not wait out its 3-second sleep")
             .expect("the loop must not panic");
-        assert_eq!(asks_made(&asks), asked, "a pull request in backoff is not asked again");
+        assert_eq!(
+            asks_made(&asks),
+            asked,
+            "a pull request in backoff is not asked again"
+        );
     }
 
     #[cfg(unix)]
