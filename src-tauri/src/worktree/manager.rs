@@ -1108,7 +1108,7 @@ impl WorktreeManager {
         if held.is_empty() {
             return Ok(());
         }
-        let tip = tokio::process::Command::new(git_program())
+        let tip = crate::host_process::tokio_command(git_program())
             .args(["rev-parse", "--verify", &format!("refs/heads/{branch}^{{commit}}")])
             .current_dir(repo_path)
             .output()
@@ -1230,7 +1230,7 @@ impl WorktreeManager {
     /// The ref a checkout's `HEAD` names, `None` when it is detached, and
     /// the commit it is at.
     async fn checkout_head(worktree: &str) -> Result<(Option<String>, String), String> {
-        let symbolic = tokio::process::Command::new(git_program())
+        let symbolic = crate::host_process::tokio_command(git_program())
             .args(["symbolic-ref", "-q", "HEAD"])
             .current_dir(worktree)
             .output()
@@ -1240,7 +1240,7 @@ impl WorktreeManager {
             .status
             .success()
             .then(|| String::from_utf8_lossy(&symbolic.stdout).trim().to_string());
-        let commit = tokio::process::Command::new(git_program())
+        let commit = crate::host_process::tokio_command(git_program())
             .args(["rev-parse", "--verify", "HEAD^{commit}"])
             .current_dir(worktree)
             .output()
@@ -1332,7 +1332,7 @@ impl WorktreeManager {
     /// mean something else: a full object ID, `FETCH_HEAD` or `ORIG_HEAD`
     /// when no branch has that name, or a tag of the same name.
     async fn local_branch_tip(repo_path: &str, branch: &str) -> Result<String, String> {
-        let output = tokio::process::Command::new(git_program())
+        let output = crate::host_process::tokio_command(git_program())
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/heads/{branch}^{{commit}}"))
             .current_dir(repo_path)
@@ -1390,7 +1390,7 @@ impl WorktreeManager {
     /// stderr alongside an answer is still a failure.
     pub async fn local_branch_exists_by_status(repo_path: &str, branch: &str) -> Result<bool, String> {
         let checked = checked_task_branch(branch)?;
-        let output = tokio::process::Command::new(git_program())
+        let output = crate::host_process::tokio_command(git_program())
             .args(["show-ref", "--exists"])
             .arg(format!("refs/heads/{checked}"))
             .current_dir(repo_path)
@@ -1410,7 +1410,7 @@ impl WorktreeManager {
 
     /// Whether `ancestor` is reachable from the local branch `branch`.
     async fn branch_contains(repo_path: &str, branch: &str, ancestor: &str) -> Result<bool, String> {
-        let output = tokio::process::Command::new(git_program())
+        let output = crate::host_process::tokio_command(git_program())
             .args(["merge-base", "--is-ancestor", ancestor])
             .arg(format!("refs/heads/{branch}"))
             .current_dir(repo_path)
@@ -1431,7 +1431,7 @@ impl WorktreeManager {
     /// branch already exists. `git update-ref` takes the object ID as it is,
     /// where `git branch` would prefer a ref that happens to share its name.
     async fn create_branch_at(repo_path: &str, branch: &str, commit: &str) -> Result<(), String> {
-        let output = tokio::process::Command::new(git_program())
+        let output = crate::host_process::tokio_command(git_program())
             .args(["update-ref", &format!("refs/heads/{branch}"), commit, ""])
             .current_dir(repo_path)
             .output()
@@ -1472,7 +1472,7 @@ impl WorktreeManager {
                 }
             }
         }
-        let output = tokio::process::Command::new(git_program())
+        let output = crate::host_process::tokio_command(git_program())
             .args(["update-ref", "-d", &format!("refs/heads/{branch}"), commit])
             .current_dir(repo_path)
             .output()
@@ -1854,7 +1854,7 @@ impl WorktreeManager {
             )
         };
         let git = |args: &[&str]| {
-            tokio::process::Command::new(git_program()).args(args).current_dir(repo_path).output()
+            crate::host_process::tokio_command(git_program()).args(args).current_dir(repo_path).output()
         };
         let shown = git(&["rev-parse", "--show-ref-format"])
             .await
@@ -1987,7 +1987,7 @@ impl WorktreeManager {
 
     /// The common git directory of `repo_path`.
     async fn common_git_dir(repo_path: &str) -> Result<PathBuf, String> {
-        let output = tokio::process::Command::new(git_program())
+        let output = crate::host_process::tokio_command(git_program())
             .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .current_dir(repo_path)
             .output()
@@ -2010,7 +2010,7 @@ impl WorktreeManager {
         if present {
             // Ask the checkout itself: it answers whatever way its path is
             // spelled, where the `gitdir` files below match only git's own.
-            let output = tokio::process::Command::new(git_program())
+            let output = crate::host_process::tokio_command(git_program())
                 .args(["rev-parse", "--absolute-git-dir"])
                 .current_dir(path)
                 .output()
@@ -2538,7 +2538,7 @@ impl WorktreeRecord {
     }
 
     async fn common_dir(repo_path: &str) -> Option<PathBuf> {
-        let output = tokio::process::Command::new(git_program())
+        let output = crate::host_process::tokio_command(git_program())
             .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .current_dir(repo_path)
             .output()

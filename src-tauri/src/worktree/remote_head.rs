@@ -87,7 +87,7 @@ pub async fn detect_default_branch(repo_path: &str) -> Result<String, String> {
              Tasks do not need one."
         ));
     }
-    let mut command = tokio::process::Command::new("git");
+    let mut command = crate::host_process::tokio_command("git");
     command
         .args(["remote", "set-head", "origin", "--auto"])
         .current_dir(repo)

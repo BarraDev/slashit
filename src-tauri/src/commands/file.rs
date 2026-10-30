@@ -196,7 +196,7 @@ pub(crate) enum GitLocation {
 }
 
 pub(crate) async fn git_location(path: &Path) -> Result<GitLocation, String> {
-    let output = tokio::process::Command::new("git")
+    let output = crate::host_process::tokio_command("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .output()

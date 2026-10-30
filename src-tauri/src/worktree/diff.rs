@@ -166,7 +166,7 @@ fn append_section(into: &mut String, section: &str) {
 }
 
 async fn run_git(dir: &str, args: &[&str]) -> Result<String, TaskDiffError> {
-    let output = Command::new("git")
+    let output = crate::host_process::tokio_command("git")
         .args(args)
         .current_dir(dir)
         .output()
@@ -200,7 +200,7 @@ async fn run_output(program: &str, args: &[&str], dir: &str) -> Result<String, S
 }
 
 async fn untracked_diff(working_dir: &str, base: &str) -> Result<(String, String), TaskDiffError> {
-    let listing = Command::new("git")
+    let listing = crate::host_process::tokio_command("git")
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
         .current_dir(working_dir)
         .output()
@@ -284,7 +284,7 @@ async fn diff_one_untracked_file(
 ) -> Result<UntrackedFile, TaskDiffError> {
     let null_device: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
-    let mut child = Command::new("git")
+    let mut child = crate::host_process::tokio_command("git")
         .arg("diff")
         .arg("--no-index")
         .arg("--")

@@ -179,7 +179,7 @@ fn is_unmerged(line: &str) -> bool {
 /// Whether the index differs from `HEAD`. `git diff --cached --quiet` exits
 /// 1 for a difference and 0 for none; anything else is a failure.
 async fn has_staged_changes(working_dir: &str) -> Result<bool, String> {
-    let output = tokio::process::Command::new("git")
+    let output = crate::host_process::tokio_command("git")
         .args(["diff", "--cached", "--quiet"])
         .current_dir(working_dir)
         .output()
@@ -193,7 +193,7 @@ async fn has_staged_changes(working_dir: &str) -> Result<bool, String> {
 }
 
 async fn git(working_dir: &str, args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new("git")
+    let output = crate::host_process::tokio_command("git")
         .args(args)
         .current_dir(working_dir)
         .output()

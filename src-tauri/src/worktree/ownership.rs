@@ -259,7 +259,7 @@ pub async fn tasks_sharing_a_recorded_branch(
 /// shared state in (`--git-common-dir`), canonicalized. `None` when git
 /// cannot say.
 pub(super) async fn repository_identity(path: &str) -> Option<PathBuf> {
-    let output = tokio::process::Command::new("git")
+    let output = crate::host_process::tokio_command("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(path)
         .stdin(std::process::Stdio::null())

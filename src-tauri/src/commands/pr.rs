@@ -169,7 +169,7 @@ mod test_programs {
 
 /// Run an async command and return stdout on success, or Err with stderr.
 async fn run_cmd(cmd: &str, args: &[&str], cwd: &str) -> Result<String, String> {
-    let output = tokio::process::Command::new(program(cmd))
+    let output = crate::host_process::tokio_command(program(cmd))
         .args(args)
         .current_dir(cwd)
         .output()
@@ -196,7 +196,7 @@ fn friendly_pr_error(error: String) -> String {
 }
 
 async fn run_cmd_no_cwd(cmd: &str, args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new(cmd)
+    let output = crate::host_process::tokio_command(cmd)
         .args(args)
         .output()
         .await
@@ -221,7 +221,7 @@ fn jj_exact_bookmark_revset(branch: &str) -> String {
 }
 
 async fn is_jj_repo(working_dir: &str) -> bool {
-    tokio::process::Command::new(program("jj"))
+    crate::host_process::tokio_command(program("jj"))
         .args(["root"])
         .current_dir(working_dir)
         .output()
@@ -358,7 +358,7 @@ async fn rewrite_git_branch_tip_author(
     // name, and takes the recovered email there too, so the private address
     // survives in neither field and recovery works with no `user.name`
     // configured anywhere.
-    let mut child = tokio::process::Command::new("git")
+    let mut child = crate::host_process::tokio_command("git")
         .args(args.iter().map(|s| s.as_str()))
         .current_dir(working_dir)
         .env("GIT_AUTHOR_NAME", &plan.author_name)

@@ -725,7 +725,7 @@ async fn run_owned(dir: &Path, program: &str, args: &[String]) -> Result<String,
 
 /// `program`, with the environment a test gave this task, if any.
 fn command(program: &str) -> tokio::process::Command {
-    let command = tokio::process::Command::new(program);
+    let command = crate::host_process::tokio_command(program);
     #[cfg(test)]
     let command = test_env::apply(command);
     command

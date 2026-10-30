@@ -131,7 +131,7 @@ fn is_object_id(text: &str) -> bool {
 /// A read-only Git call. `--no-optional-locks` keeps `status` from refreshing
 /// the index, so inspection leaves the checkout byte-for-byte alone.
 async fn git_read(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new("git")
+    let output = crate::host_process::tokio_command("git")
         .arg("--no-optional-locks")
         .args(args)
         .current_dir(dir)

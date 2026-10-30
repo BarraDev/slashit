@@ -536,7 +536,7 @@ async fn resolve_commit(
     dir: &std::path::Path,
     rev: &str,
 ) -> Result<Option<String>, CheckoutRefusal> {
-    let output = tokio::process::Command::new("git")
+    let output = crate::host_process::tokio_command("git")
         .args([
             "rev-parse",
             "--verify",
@@ -2941,7 +2941,7 @@ impl TaskExecutor {
             .map_err(|e| CheckoutRefusal::RepositoryUnavailable(e.to_string()))?;
         let checkout_real = std::fs::canonicalize(checkout)
             .map_err(|e| CheckoutRefusal::CheckoutUnavailable(e.to_string()))?;
-        let listing = tokio::process::Command::new("git")
+        let listing = crate::host_process::tokio_command("git")
             .args(["worktree", "list", "--porcelain"])
             .current_dir(&repo_real)
             .output()
@@ -3029,7 +3029,7 @@ impl TaskExecutor {
             });
         }
 
-        let checkout_branch = tokio::process::Command::new("git")
+        let checkout_branch = crate::host_process::tokio_command("git")
             .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
             .current_dir(&checkout_real)
             .output()
@@ -3051,7 +3051,7 @@ impl TaskExecutor {
         }
         // Never refresh the index: validating must leave the checkout
         // byte-for-byte as it found it.
-        let status = tokio::process::Command::new("git")
+        let status = crate::host_process::tokio_command("git")
             .args([
                 "--no-optional-locks",
                 "status",
@@ -4938,7 +4938,7 @@ impl TaskExecutor {
         path: &str,
         expected_branch: &str,
     ) -> Result<(String, String), String> {
-        let branch = tokio::process::Command::new("git")
+        let branch = crate::host_process::tokio_command("git")
             .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
             .current_dir(path)
             .output()
@@ -4953,7 +4953,7 @@ impl TaskExecutor {
                 "Task Checkout is on branch {actual_branch}, expected {expected_branch}; refusing Worker launch"
             ));
         }
-        let head = tokio::process::Command::new("git")
+        let head = crate::host_process::tokio_command("git")
             .args(["rev-parse", "--verify", "HEAD^{commit}"])
             .current_dir(path)
             .output()
