@@ -3087,7 +3087,10 @@ impl TaskExecutor {
         let now = chrono::Utc::now();
         let (keys, task_ids): (Vec<_>, Vec<_>) = {
             let tasks = self.tasks.read().await;
-            polled_pull_requests(&tasks, &self.pr_statuses)
+            let polled = polled_pull_requests(&tasks, &self.pr_statuses);
+            let polled_keys: Vec<_> = polled.iter().map(|(key, _)| key.clone()).collect();
+            self.pr_statuses.retain_backoff(&polled_keys);
+            polled
                 .into_iter()
                 .filter(|(key, _)| self.pr_statuses.poll_due(key, now))
                 .unzip()
@@ -11148,7 +11151,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn shutdown_during_a_rate_limit_backoff_ends_the_loop_without_asking_again() {
+    async fn shutdown_between_passes_ends_the_loop_and_a_rate_limited_pr_is_not_asked_again() {
         let dir = tempfile::tempdir().unwrap();
         let asks = dir.path().join("asks");
         let gh = fake_gh(
@@ -11171,11 +11174,16 @@ mod tests {
 
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(executor.polling_loop(Some(rx)));
-        // Shutdown arrives while the loop is between passes, inside the backoff.
+        // Shutdown arrives while the loop is between passes, after a pass has
+        // seen the rate-limited pull request and left it alone.
         let passes = executor.pr_check_counter.load(std::sync::atomic::Ordering::Relaxed);
-        while executor.pr_check_counter.load(std::sync::atomic::Ordering::Relaxed) == passes {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while executor.pr_check_counter.load(std::sync::atomic::Ordering::Relaxed) == passes {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the loop runs a pass");
         tx.send(true).expect("the polling task holds the receiver");
 
         tokio::time::timeout(Duration::from_secs(1), handle)

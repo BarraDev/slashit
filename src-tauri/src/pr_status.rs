@@ -337,9 +337,11 @@ impl PrFetchError {
     /// needs a sign-in.
     ///
     /// `gh pr view --json` exposes no HTTP headers, so a rate limit is told
-    /// only by its text. `gh` itself prints "GitHub API rate limit exceeded.
-    /// Please wait a minute and try again." (checked in `gh` 2.102.0's binary)
-    /// and a REST refusal reads "HTTP 429: Too Many Requests".
+    /// only by its text: `gh`'s own "GitHub API rate limit exceeded. Please
+    /// wait a minute and try again.", GitHub's primary limit ("API rate limit
+    /// exceeded for user ID …", or "API rate limit already exceeded …"), its
+    /// secondary limit ("You have exceeded a secondary rate limit …"), and a
+    /// bare "HTTP 429: Too Many Requests".
     fn from_exit(code: Option<i32>, stderr: &str) -> Self {
         let said = stderr.trim();
         let lower = said.to_lowercase();
@@ -354,7 +356,11 @@ impl PrFetchError {
                 "GitHub CLI is not signed in. Run `gh auth login`, then refresh.",
             );
         }
-        if lower.contains("api rate limit exceeded") || lower.contains("http 429") {
+        let rate_limited = lower.contains("rate limit exceeded")
+            || lower.contains("rate limit already exceeded")
+            || lower.contains("secondary rate limit")
+            || lower.contains("http 429");
+        if rate_limited {
             return Self::new(
                 PrFetchErrorKind::RateLimited,
                 "GitHub is rate limiting requests. SlashIt will ask again after a pause.",
@@ -513,7 +519,9 @@ impl PrStatuses {
             return false;
         }
         self.get(key).is_none_or(|e| {
-            (now - e.attempted_at).to_std().map_or(true, |age| age >= POLL_INTERVAL)
+            // An attempt that started after `now` (the clock stepped back)
+            // is not old enough; it would otherwise be due on every pass.
+            (now - e.attempted_at).to_std().is_ok_and(|age| age >= POLL_INTERVAL)
         })
     }
 
@@ -615,6 +623,16 @@ impl PrStatuses {
         }
         self.note_backoff(key, finished, result);
         true
+    }
+
+    /// Forget the rate-limit streaks of pull requests outside `polled`, the
+    /// ones the background poll still asks about. A refresh ignores a streak,
+    /// so nothing else reads one.
+    pub fn retain_backoff(&self, polled: &[PrKey]) {
+        self.backoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, _| polled.contains(key));
     }
 
     /// Extend `key`'s rate-limit streak when this answer is a rate limit, and
@@ -986,7 +1004,14 @@ mod tests {
     fn a_rate_limit_is_its_own_kind_and_a_query_refusal_is_not() {
         let gh = "GitHub API rate limit exceeded. Please wait a minute and try again.";
         assert_eq!(PrFetchError::from_exit(Some(1), gh).kind, PrFetchErrorKind::RateLimited);
-        assert_eq!(PrFetchError::from_exit(Some(1), "HTTP 429: Too Many Requests").kind, PrFetchErrorKind::RateLimited);
+        for said in [
+            "HTTP 429: Too Many Requests",
+            "HTTP 403: API rate limit exceeded for user ID 123.",
+            "GraphQL: API rate limit already exceeded for user ID 123.",
+            "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+        ] {
+            assert_eq!(PrFetchError::from_exit(Some(1), said).kind, PrFetchErrorKind::RateLimited, "{said}");
+        }
         let refused = PrFetchError::from_exit(Some(1), "GraphQL: Could not resolve to a PullRequest");
         assert_eq!(refused.kind, PrFetchErrorKind::Failed);
     }
@@ -1020,6 +1045,7 @@ mod tests {
         statuses.record(&key, t(400), t(401), &Ok(open()));
         assert!(!statuses.poll_due(&key, t(699)));
         assert!(statuses.poll_due(&key, t(700)));
+        assert!(!statuses.poll_due(&key, t(100)), "a clock stepped back is not a due poll");
 
         // A request already in flight is not asked again by the poll.
         let Ok(claim) = statuses.claim(&key) else { panic!("nothing in flight") };
@@ -1043,6 +1069,13 @@ mod tests {
         statuses.record(&key, t(30_000), t(30_001), &limited());
         assert!(!statuses.poll_due(&key, t(30_300)), "the streak restarted at the poll interval");
         assert!(statuses.poll_due(&key, t(30_301)));
+
+        // A pull request the poll no longer asks about loses its streak.
+        statuses.record(&key, t(40_000), t(40_001), &limited());
+        statuses.retain_backoff(std::slice::from_ref(&key));
+        assert!(!statuses.poll_due(&key, t(40_300)), "still polled, still held");
+        statuses.retain_backoff(&[]);
+        assert!(statuses.poll_due(&key, t(40_300)), "forgotten once no task polls it");
     }
 
     #[tokio::test]
