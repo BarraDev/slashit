@@ -21,9 +21,11 @@ use crate::models::{
 };
 use crate::services::{list_pr_statuses, refresh_pr_status};
 
-/// How old a reading may be before it is shown as stale: four missed
-/// background polls, which run every thirty seconds.
-pub const STALE_AFTER_SECONDS: i64 = 120;
+/// How old a reading may be before it is shown as stale: two background poll
+/// intervals (`POLL_INTERVAL` in the backend's `pr_status`, five minutes), so
+/// a reading from the normal schedule, which can be up to a few minutes past
+/// its interval, is not flagged, but one a whole missed poll old is.
+pub const STALE_AFTER_SECONDS: i64 = 600;
 
 /// The board's copy of the backend cache, for one project.
 ///
@@ -908,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_goes_stale_after_four_missed_polls_or_a_failed_refresh() {
+    fn a_reading_goes_stale_after_two_poll_intervals_or_a_failed_refresh() {
         let passing = Some(status(ChecksState::Passing, None, None));
         assert!(!is_stale(&entry(passing.clone(), Some(0), false), at(STALE_AFTER_SECONDS)));
         assert!(is_stale(&entry(passing.clone(), Some(0), false), at(STALE_AFTER_SECONDS + 1)));
