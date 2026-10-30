@@ -696,14 +696,16 @@ impl PrStatuses {
         true
     }
 
-    /// Forget the rate-limit streaks of pull requests outside `polled`, the
-    /// ones the background poll still asks about, so the map stays bounded by
-    /// the linked pull requests. A refresh of a forgotten one asks at once.
-    pub fn retain_backoff(&self, polled: &[PrKey]) {
+    /// Forget the rate-limit streaks of pull requests outside `linked`, every
+    /// pull request a task still links, so the map stays bounded by them. A
+    /// linked pull request keeps its hold even when the poll skips it (say
+    /// it is recorded merged), so a refresh of it still waits. A refresh of a
+    /// forgotten one asks at once.
+    pub fn retain_backoff(&self, linked: &[PrKey]) {
         self.backoff
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|key, _| polled.contains(key));
+            .retain(|key, _| linked.contains(key));
     }
 
     /// Extend `key`'s rate-limit streak when this answer is a rate limit, and

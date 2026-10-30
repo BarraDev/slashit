@@ -806,6 +806,21 @@ fn links_pull_request(task: &Task, key: &crate::pr_status::PrKey) -> bool {
         .any(|r| matches!(r, ExternalRef::GithubPr { number, repo, .. } if *number == key.number && *repo == key.repo))
 }
 
+/// Every pull request a task links, whether or not the poll asks about it.
+/// Their rate-limit streaks are kept: see [`crate::pr_status::PrStatuses::retain_backoff`].
+fn linked_pull_requests(tasks: &HashMap<Uuid, Task>) -> Vec<crate::pr_status::PrKey> {
+    tasks
+        .values()
+        .flat_map(|t| t.external_refs.iter())
+        .filter_map(|r| match r {
+            ExternalRef::GithubPr { number, repo, .. } => {
+                Some(crate::pr_status::PrKey::new(repo.clone(), *number))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The pull requests the background poll asks about, each with the tasks
 /// linked to it, in a stable order.
 ///
@@ -3088,8 +3103,10 @@ impl TaskExecutor {
         let (keys, task_ids): (Vec<_>, Vec<_>) = {
             let tasks = self.tasks.read().await;
             let polled = polled_pull_requests(&tasks, &self.pr_statuses);
-            let polled_keys: Vec<_> = polled.iter().map(|(key, _)| key.clone()).collect();
-            self.pr_statuses.retain_backoff(&polled_keys);
+            // Keyed by every linked pull request, not only the polled ones: a
+            // merged one is skipped here but a refresh still asks about it.
+            self.pr_statuses
+                .retain_backoff(&linked_pull_requests(&tasks));
             polled
                 .into_iter()
                 .filter(|(key, _)| self.pr_statuses.poll_due(key, now))
@@ -11074,6 +11091,61 @@ mod tests {
         assert_eq!(
             recorded_pr_state(&executor.tasks.read().await[&id]).as_deref(),
             Some("OPEN")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refresh_of_a_merged_pull_request_held_by_a_rate_limit_does_not_ask_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let asks = dir.path().join("asks");
+        let gh = fake_gh(
+            dir.path(),
+            &format!(
+                "*) echo x >> \"{}\"; echo 'GitHub API rate limit exceeded. Please wait a minute and try again.' >&2; exit 1 ;;",
+                asks.display()
+            ),
+        );
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(
+            gh,
+            Duration::from_secs(5),
+        ));
+        let (executor, _temps) = test_executor_with_prs(statuses.clone());
+        let (task, _) =
+            seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 1, None)).await;
+        let key = crate::pr_status::PrKey::new("o/r", 1);
+
+        // The poll is rate limited while the pull request is still open.
+        executor.poll_pull_requests().await;
+        assert_eq!(asks_made(&asks), 1);
+        assert_eq!(
+            statuses.get(&key).unwrap().error.map(|e| e.kind),
+            Some(crate::pr_status::PrFetchErrorKind::RateLimited)
+        );
+
+        // It is then recorded merged, without a merge commit. The poll skips
+        // it, and its pass must keep the hold for the refresh that follows.
+        executor
+            .tasks
+            .write()
+            .await
+            .get_mut(&task)
+            .unwrap()
+            .external_refs = vec![pr_ref("o/r", 1, Some("MERGED"))];
+        executor.poll_pull_requests().await;
+        assert_eq!(asks_made(&asks), 1, "the poll skips a merged pull request");
+
+        // The refresh command asks for it, since there is no merge commit to
+        // backfill, and it must wait out the hold rather than ask gh.
+        let answers = statuses.refresh_each(vec![key.clone()]).await;
+        assert_eq!(
+            answers[0].1.as_ref().map_err(|e| e.kind),
+            Err(crate::pr_status::PrFetchErrorKind::RateLimited)
+        );
+        assert_eq!(
+            asks_made(&asks),
+            1,
+            "a refresh during the hold does not ask gh"
         );
     }
 
