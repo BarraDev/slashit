@@ -19,8 +19,14 @@ reviews:
 
   auto_review:
     enabled: true
-    auto_incremental_review: true
-    auto_pause_after_reviewed_commits: 0
+    # Draft PRs are skipped; a PR that is marked ready for review is reviewed.
+    drafts: false
+    # A push does not start a review. Request one deliberately with
+    # `@coderabbitai review` (see docs/development-workflow.md, section 18).
+    auto_incremental_review: false
+    # Defense in depth if incremental reviews are enabled again.
+    auto_pause_after_reviewed_commits: 2
+    # Keep all branches: stacked PRs (section 13) target other PR branches.
     base_branches:
       - ".*"
 
