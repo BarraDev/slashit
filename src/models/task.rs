@@ -859,6 +859,7 @@ pub struct PrFetchError {
 pub enum PrFetchErrorKind {
     Timeout,
     Auth,
+    RateLimited,
     NotInstalled,
     Failed,
 }
