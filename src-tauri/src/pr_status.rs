@@ -1131,7 +1131,11 @@ mod tests {
             "GraphQL: API rate limit already exceeded for user ID 123.",
             "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
         ] {
-            assert_eq!(PrFetchError::from_exit(Some(1), said).kind, PrFetchErrorKind::RateLimited, "{said}");
+            assert_eq!(
+                PrFetchError::from_exit(Some(1), said).kind,
+                PrFetchErrorKind::RateLimited,
+                "{said}"
+            );
         }
         for said in [
             "HTTP 403: Resource not accessible by integration",
