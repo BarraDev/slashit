@@ -340,6 +340,24 @@ impl PrFetchError {
         )
     }
 
+    /// The answer to a refresh refused because a rate-limit backoff holds
+    /// its pull request for `wait` more.
+    fn refresh_held(wait: chrono::TimeDelta) -> Self {
+        let minutes = (wait.num_seconds().max(0) + 59) / 60;
+        let when = if minutes <= 1 {
+            "about a minute".to_string()
+        } else {
+            format!("about {minutes} minutes")
+        };
+        Self::new(
+            PrFetchErrorKind::RateLimited,
+            format!(
+                "GitHub is rate limiting requests, so this refresh did not ask it. \
+                 Try again in {when}."
+            ),
+        )
+    }
+
     /// Classify a `gh` that exited unsuccessfully. `gh` exits with 4 when it
     /// needs a sign-in.
     ///
@@ -497,8 +515,9 @@ impl PrStatuses {
     /// A failure is recorded beside the last good status rather than in place
     /// of it, and returned. This ignores the poll's schedule, but not a
     /// rate-limit backoff: while one holds the pull request, a refresh answers
-    /// [`PrFetchErrorKind::RateLimited`] without asking GitHub, so repeated
-    /// clicks do not spend a quota that is already exhausted.
+    /// [`PrFetchErrorKind::RateLimited`] without asking GitHub, saying when
+    /// to try again, so repeated clicks do not spend a quota that is already
+    /// exhausted.
     ///
     /// Only one request per pull request is in flight. A call made while one
     /// is under way waits for it to settle and answers with what it recorded,
@@ -507,8 +526,9 @@ impl PrStatuses {
     /// anything, the waiting call asks itself.
     pub async fn refresh(&self, key: &PrKey) -> Result<PrStatus, PrFetchError> {
         loop {
-            if self.held_back(key, Utc::now()) {
-                return Err(PrFetchError::rate_limited());
+            let now = Utc::now();
+            if let Some(until) = self.held_until(key, now) {
+                return Err(PrFetchError::refresh_held(until - now));
             }
             let claim = match self.claim(key) {
                 Ok(claim) => claim,
@@ -527,13 +547,14 @@ impl PrStatuses {
         }
     }
 
-    /// Whether a rate-limit backoff holds `key` at `now`.
-    fn held_back(&self, key: &PrKey, now: DateTime<Utc>) -> bool {
+    /// When the rate-limit backoff holding `key` at `now` ends, if one does.
+    fn held_until(&self, key: &PrKey, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.backoff
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(key)
-            .is_some_and(|b| now < b.not_before)
+            .map(|b| b.not_before)
+            .filter(|&until| now < until)
     }
 
     /// Claim `key`'s request in flight, or get a receiver for the one already
@@ -584,7 +605,7 @@ impl PrStatuses {
         {
             return false;
         }
-        if self.held_back(key, now) {
+        if self.held_until(key, now).is_some() {
             return false;
         }
         self.get(key).is_none_or(|e| {
@@ -696,8 +717,8 @@ impl PrStatuses {
         true
     }
 
-    /// Forget the rate-limit streaks of pull requests outside `linked`, every
-    /// pull request a task still links, so the map stays bounded by them. A
+    /// Forget the rate-limit streak of every pull request not in `linked`,
+    /// the pull requests tasks still link, so the map never outgrows them. A
     /// linked pull request keeps its hold even when the poll skips it (say
     /// it is recorded merged), so a refresh of it still waits. A refresh of a
     /// forgotten one asks at once.
@@ -1503,6 +1524,12 @@ esac"#,
 
             let again = statuses.refresh(&key).await.unwrap_err();
             assert_eq!(again.kind, PrFetchErrorKind::RateLimited);
+            assert!(
+                again
+                    .message
+                    .contains("this refresh did not ask it. Try again in about"),
+                "a held refresh says it did not ask, and when to try: {again:?}"
+            );
             let asks = std::fs::read_to_string(dir.path().join("asks")).unwrap();
             assert_eq!(
                 asks.lines().count(),

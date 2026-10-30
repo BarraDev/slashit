@@ -1657,6 +1657,8 @@ pub struct TaskExecutor {
     storage: crate::config::Storage,
     worktree_manager: Arc<WorktreeManager>,
     events: SharedEventSink,
+    /// How many passes of `check_and_execute` reached the pull-request poll.
+    /// Nothing in the app reads it; tests wait on it to know a pass ran.
     pr_check_counter: std::sync::atomic::AtomicU32,
     /// Where the background poll asks about pull requests, and records what
     /// it heard. Shared with the refresh commands and the board.
