@@ -3104,15 +3104,18 @@ impl TaskExecutor {
         let now = chrono::Utc::now();
         let (keys, task_ids): (Vec<_>, Vec<_>) = {
             let tasks = self.tasks.read().await;
-            let polled = polled_pull_requests(&tasks, &self.pr_statuses);
-            // Keyed by every linked pull request, not only the polled ones: a
-            // merged one is skipped here but a refresh still asks about it.
-            self.pr_statuses
-                .retain_backoff(&linked_pull_requests(&tasks));
-            polled
+            let due: (Vec<_>, Vec<_>) = polled_pull_requests(&tasks, &self.pr_statuses)
                 .into_iter()
                 .filter(|(key, _)| self.pr_statuses.poll_due(key, now))
-                .unzip()
+                .unzip();
+            // Pruned only on a pass that asks, not on every short loop tick.
+            // Keyed by every linked pull request, not only the polled ones: a
+            // merged one is skipped here but a refresh still asks about it.
+            if !due.0.is_empty() {
+                self.pr_statuses
+                    .retain_backoff(&linked_pull_requests(&tasks));
+            }
+            due
         };
         let answers = self.pr_statuses.refresh_each(keys).await;
 

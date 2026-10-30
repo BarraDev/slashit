@@ -393,7 +393,7 @@ impl PrFetchError {
         let rate_limited = lower.contains("api rate limit exceeded")
             || lower.contains("api rate limit already exceeded")
             || lower.contains("secondary rate limit")
-            || lower.contains("http 429");
+            || says_status(&lower, "http 429");
         if rate_limited {
             return Self::rate_limited();
         }
@@ -409,6 +409,17 @@ impl PrFetchError {
         };
         Self::new(PrFetchErrorKind::Failed, message)
     }
+}
+
+/// Whether `text` holds `status` (say "http 429") as a whole status code,
+/// not as the start of a longer number such as "http 4290".
+fn says_status(text: &str, status: &str) -> bool {
+    text.match_indices(status).any(|(at, _)| {
+        !text[at + status.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+    })
 }
 
 /// One pull request's cache entry.
@@ -539,6 +550,13 @@ impl PrStatuses {
                     continue;
                 }
             };
+            // An attempt that settled between the check above and the claim
+            // may have started a backoff; dropping the claim wakes anyone
+            // waiting on it, and they find the same hold.
+            let now = Utc::now();
+            if let Some(until) = self.held_until(key, now) {
+                return Err(PrFetchError::refresh_held(until - now));
+            }
             let started = Utc::now();
             let result = self.fetch(key).await;
             let answer = self.settle(key, started, Utc::now(), result);
@@ -1114,6 +1132,11 @@ mod tests {
         );
         let too_many = PrFetchError::from_exit(Some(1), "HTTP 429: Too Many Requests");
         assert_eq!(too_many.kind, PrFetchErrorKind::RateLimited);
+        assert_eq!(
+            PrFetchError::from_exit(Some(1), "HTTP 4290: not a status").kind,
+            PrFetchErrorKind::Failed,
+            "a longer number is not a 429"
+        );
         let refused =
             PrFetchError::from_exit(Some(1), "GraphQL: Could not resolve to a PullRequest");
         assert_eq!(refused.kind, PrFetchErrorKind::Failed);
@@ -1153,6 +1176,8 @@ mod tests {
     fn the_board_stale_threshold_is_two_poll_intervals() {
         // The frontend cannot depend on this crate, so its threshold is a copy;
         // this keeps the copy in step with the poll it is measured against.
+        // It matches the declaration's text, so reformatting that line (a type
+        // change, a computed value) fails this test until it is updated too.
         let board = include_str!("../../src/components/pr_status.rs");
         let expected = format!(
             "pub const STALE_AFTER_SECONDS: i64 = {};",
