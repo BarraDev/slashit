@@ -22,9 +22,10 @@ use crate::models::{
 use crate::services::{list_pr_statuses, refresh_pr_status};
 
 /// How old a reading may be before it is shown as stale: two background poll
-/// intervals (`POLL_INTERVAL` in the backend's `pr_status`, five minutes), so
-/// a reading from the normal schedule, which can be up to a few minutes past
-/// its interval, is not flagged, but one a whole missed poll old is.
+/// intervals (`POLL_INTERVAL` in the backend's `pr_status`, five minutes; a
+/// backend test checks the pairing), so a reading from the normal schedule,
+/// which can be up to a few minutes past its interval, is not flagged, but
+/// one a whole missed poll old is.
 pub const STALE_AFTER_SECONDS: i64 = 600;
 
 /// The board's copy of the backend cache, for one project.

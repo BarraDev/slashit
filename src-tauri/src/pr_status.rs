@@ -333,18 +333,29 @@ impl PrFetchError {
         Self { kind, message: message.into() }
     }
 
+    fn rate_limited() -> Self {
+        Self::new(
+            PrFetchErrorKind::RateLimited,
+            "GitHub is rate limiting requests. SlashIt will ask again after a pause.",
+        )
+    }
+
     /// Classify a `gh` that exited unsuccessfully. `gh` exits with 4 when it
     /// needs a sign-in.
     ///
     /// `gh pr view --json` exposes no HTTP headers, so a rate limit is told
-    /// only by its text. Verified against the `gh` 2.102.0 binary: its own
-    /// "GitHub API rate limit exceeded. Please wait a minute and try again."
-    /// message, and `gh`'s "HTTP %d: %s" format for REST errors. The other
-    /// matches are best-effort: GitHub's "API rate limit exceeded for user
-    /// ID …", "API rate limit already exceeded …", "You have exceeded a
-    /// secondary rate limit …", and a 429 status. None was checked against a
-    /// live response in this change, so a changed wording falls back to
-    /// `Failed`, which is retried on the normal schedule.
+    /// only by its text. The patterns, by how well they are known:
+    ///
+    /// - Verified: "GitHub API rate limit exceeded" is `gh`'s own message,
+    ///   found verbatim in the `gh` 2.102.0 binary. The "HTTP %d: %s" format
+    ///   is also verified there, so "HTTP 429" is matched as a status.
+    /// - Documented: GitHub's REST error text for the primary limit,
+    ///   "API rate limit exceeded for user ID …", and for the secondary limit,
+    ///   "You have exceeded a secondary rate limit …". Both are matched by
+    ///   text, not by status, so an arbitrary HTTP 403 is never a rate limit.
+    /// - Best-effort: "API rate limit already exceeded …", GitHub's GraphQL
+    ///   wording. Not checked against a live response, so a changed wording
+    ///   falls back to `Failed`, which is retried on the normal schedule.
     fn from_exit(code: Option<i32>, stderr: &str) -> Self {
         let said = stderr.trim();
         let lower = said.to_lowercase();
@@ -359,15 +370,12 @@ impl PrFetchError {
                 "GitHub CLI is not signed in. Run `gh auth login`, then refresh.",
             );
         }
-        let rate_limited = lower.contains("rate limit exceeded")
-            || lower.contains("rate limit already exceeded")
+        let rate_limited = lower.contains("api rate limit exceeded")
+            || lower.contains("api rate limit already exceeded")
             || lower.contains("secondary rate limit")
             || lower.contains("http 429");
         if rate_limited {
-            return Self::new(
-                PrFetchErrorKind::RateLimited,
-                "GitHub is rate limiting requests. SlashIt will ask again after a pause.",
-            );
+            return Self::rate_limited();
         }
         let first_line = said.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
         let message = if first_line.is_empty() {
@@ -423,9 +431,11 @@ pub struct PrStatuses {
     program: OsString,
     timeout: Duration,
     entries: std::sync::RwLock<HashMap<PrKey, PrStatusEntry>>,
-    /// One sender per pull request with an attempt running. Dropping it
-    /// (see [`InFlight`]) wakes every caller that joined the attempt.
-    in_flight: std::sync::Mutex<HashMap<PrKey, tokio::sync::watch::Sender<()>>>,
+    /// One sender per pull request with an attempt running. It turns `true`
+    /// once the attempt has recorded its answer; dropping it (see
+    /// [`InFlight`]) wakes every caller that joined the attempt, and one still
+    /// `false` then means the attempt was cancelled.
+    in_flight: std::sync::Mutex<HashMap<PrKey, tokio::sync::watch::Sender<bool>>>,
     /// Rate-limit streaks, kept beside the cache because a rate limit is
     /// about GitHub's quota, not about any reading.
     backoff: std::sync::Mutex<HashMap<PrKey, RateLimitBackoff>>,
@@ -436,6 +446,21 @@ pub struct PrStatuses {
 struct InFlight<'a> {
     owner: &'a PrStatuses,
     key: PrKey,
+}
+
+impl InFlight<'_> {
+    /// Tell the callers that joined this attempt that its answer is recorded.
+    fn settled(self) {
+        if let Some(sender) = self
+            .owner
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.key)
+        {
+            sender.send_replace(true);
+        }
+    }
 }
 
 impl Drop for InFlight<'_> {
@@ -468,34 +493,55 @@ impl PrStatuses {
     /// Ask GitHub for `key`'s status now and record the answer.
     ///
     /// A failure is recorded beside the last good status rather than in place
-    /// of it, and returned. This ignores the poll's schedule and any rate-limit
-    /// backoff: it is one request a person asked for.
+    /// of it, and returned. This ignores the poll's schedule, but not a
+    /// rate-limit backoff: while one holds the pull request, a refresh answers
+    /// [`PrFetchErrorKind::RateLimited`] without asking GitHub, so repeated
+    /// clicks do not spend a quota that is already exhausted.
     ///
     /// Only one request per pull request is in flight. A call made while one
     /// is under way waits for it to settle and answers with what it recorded,
     /// so a refresh and the background poll never both ask for the same pull
-    /// request at once.
+    /// request at once. If that attempt is cancelled before it records
+    /// anything, the waiting call asks itself.
     pub async fn refresh(&self, key: &PrKey) -> Result<PrStatus, PrFetchError> {
-        let _claim = match self.claim(key) {
-            Ok(claim) => claim,
-            Err(mut attempt) => {
-                let _ = attempt.changed().await;
-                return self.answer(key);
+        loop {
+            if self.held_back(key, Utc::now()) {
+                return Err(PrFetchError::rate_limited());
             }
-        };
-        let started = Utc::now();
-        let result = self.fetch(key).await;
-        self.settle(key, started, Utc::now(), result)
+            let claim = match self.claim(key) {
+                Ok(claim) => claim,
+                Err(mut attempt) => {
+                    if attempt.wait_for(|settled| *settled).await.is_ok() {
+                        return self.answer(key);
+                    }
+                    continue;
+                }
+            };
+            let started = Utc::now();
+            let result = self.fetch(key).await;
+            let answer = self.settle(key, started, Utc::now(), result);
+            claim.settled();
+            return answer;
+        }
+    }
+
+    /// Whether a rate-limit backoff holds `key` at `now`.
+    fn held_back(&self, key: &PrKey, now: DateTime<Utc>) -> bool {
+        self.backoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .is_some_and(|b| now < b.not_before)
     }
 
     /// Claim `key`'s request in flight, or get a receiver for the one already
     /// under way. Its `changed` resolves once that request has settled.
-    fn claim(&self, key: &PrKey) -> Result<InFlight<'_>, tokio::sync::watch::Receiver<()>> {
+    fn claim(&self, key: &PrKey) -> Result<InFlight<'_>, tokio::sync::watch::Receiver<bool>> {
         let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sender) = in_flight.get(key) {
             return Err(sender.subscribe());
         }
-        let (sender, _) = tokio::sync::watch::channel(());
+        let (sender, _) = tokio::sync::watch::channel(false);
         in_flight.insert(key.clone(), sender);
         Ok(InFlight {
             owner: self,
@@ -536,13 +582,7 @@ impl PrStatuses {
         {
             return false;
         }
-        let not_before = self
-            .backoff
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .map(|b| b.not_before);
-        if not_before.is_some_and(|t| now < t) {
+        if self.held_back(key, now) {
             return false;
         }
         self.get(key).is_none_or(|e| {
@@ -655,8 +695,8 @@ impl PrStatuses {
     }
 
     /// Forget the rate-limit streaks of pull requests outside `polled`, the
-    /// ones the background poll still asks about. A refresh ignores a streak,
-    /// so nothing else reads one.
+    /// ones the background poll still asks about, so the map stays bounded by
+    /// the linked pull requests. A refresh of a forgotten one asks at once.
     pub fn retain_backoff(&self, polled: &[PrKey]) {
         self.backoff
             .lock()
@@ -1047,7 +1087,20 @@ mod tests {
             PrFetchError::from_exit(Some(1), gh).kind,
             PrFetchErrorKind::RateLimited
         );
+        let too_many = PrFetchError::from_exit(Some(1), "HTTP 429: Too Many Requests");
+        assert_eq!(too_many.kind, PrFetchErrorKind::RateLimited);
+        let refused =
+            PrFetchError::from_exit(Some(1), "GraphQL: Could not resolve to a PullRequest");
+        assert_eq!(refused.kind, PrFetchErrorKind::Failed);
+    }
+
+    #[test]
+    fn documented_and_verified_rate_limit_texts_are_recognized_and_a_plain_403_is_not() {
+        // Verified: gh's own message and its "HTTP %d" line (gh 2.102.0).
+        // Documented: REST primary and secondary limit texts. Best-effort:
+        // the GraphQL "already exceeded" wording.
         for said in [
+            "GitHub API rate limit exceeded. Please wait a minute and try again.",
             "HTTP 429: Too Many Requests",
             "HTTP 403: API rate limit exceeded for user ID 123.",
             "GraphQL: API rate limit already exceeded for user ID 123.",
@@ -1055,9 +1108,31 @@ mod tests {
         ] {
             assert_eq!(PrFetchError::from_exit(Some(1), said).kind, PrFetchErrorKind::RateLimited, "{said}");
         }
-        let refused =
-            PrFetchError::from_exit(Some(1), "GraphQL: Could not resolve to a PullRequest");
-        assert_eq!(refused.kind, PrFetchErrorKind::Failed);
+        for said in [
+            "HTTP 403: Resource not accessible by integration",
+            "HTTP 403: Must have push access to repository",
+        ] {
+            assert_eq!(
+                PrFetchError::from_exit(Some(1), said).kind,
+                PrFetchErrorKind::Failed,
+                "{said}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_board_stale_threshold_is_two_poll_intervals() {
+        // The frontend cannot depend on this crate, so its threshold is a copy;
+        // this keeps the copy in step with the poll it is measured against.
+        let board = include_str!("../../src/components/pr_status.rs");
+        let expected = format!(
+            "pub const STALE_AFTER_SECONDS: i64 = {};",
+            2 * POLL_INTERVAL.as_secs()
+        );
+        assert!(
+            board.contains(&expected),
+            "expected `{expected}` in the board"
+        );
     }
 
     #[test]
@@ -1161,13 +1236,31 @@ mod tests {
                 started,
                 &Ok(status(PrState::Merged, ChecksState::Passing)),
             );
-            drop(claim);
+            claim.settled();
         };
         let (answer, ()) = tokio::join!(waiting, settle);
         assert_eq!(
             answer.map(|s| s.state),
             Ok(PrState::Merged),
             "answered from the attempt it joined, without asking gh"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_joined_a_cancelled_attempt_asks_itself() {
+        // No `gh` to run, so asking is told apart from joining by its error.
+        let statuses = PrStatuses::with_program("slashit-no-such-gh", FETCH_TIMEOUT);
+        let key = PrKey::new("o/r", 7);
+        let Ok(claim) = statuses.claim(&key) else {
+            panic!("nothing in flight")
+        };
+        let waiting = statuses.refresh(&key);
+        let cancel = async { drop(claim) };
+        let (answer, ()) = tokio::join!(waiting, cancel);
+        assert_eq!(
+            answer.map_err(|e| e.kind),
+            Err(PrFetchErrorKind::NotInstalled),
+            "nothing was recorded, so the refresh asked rather than reporting a failure"
         );
     }
 
@@ -1386,7 +1479,7 @@ esac"#,
             let dir = tempfile::tempdir().unwrap();
             let gh = script(
                 dir.path(),
-                "echo 'GitHub API rate limit exceeded. Please wait a minute and try again.' >&2; exit 1",
+                r#"echo x >> "$(dirname "$0")/asks"; echo 'GitHub API rate limit exceeded. Please wait a minute and try again.' >&2; exit 1"#,
             );
             let statuses = PrStatuses::with_program(gh, Duration::from_secs(10));
             let key = PrKey::new("o/r", 6);
@@ -1397,6 +1490,56 @@ esac"#,
                 "held back for the backoff"
             );
             assert_eq!(statuses.get(&key).unwrap().error, Some(err));
+            let hold = statuses
+                .backoff
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|b| b.not_before);
+
+            let again = statuses.refresh(&key).await.unwrap_err();
+            assert_eq!(again.kind, PrFetchErrorKind::RateLimited);
+            let asks = std::fs::read_to_string(dir.path().join("asks")).unwrap();
+            assert_eq!(
+                asks.lines().count(),
+                1,
+                "a refresh during the backoff does not ask GitHub"
+            );
+            assert_eq!(
+                statuses
+                    .backoff
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .map(|b| b.not_before),
+                hold,
+                "a refresh during the backoff does not extend it"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refresh_asks_at_once_once_the_backoff_has_ended() {
+            let dir = tempfile::tempdir().unwrap();
+            let gh = script(
+                dir.path(),
+                r#"echo x >> "$(dirname "$0")/asks"; printf '{"state":"OPEN","statusCheckRollup":[],"reviewDecision":"","mergeable":"MERGEABLE"}'"#,
+            );
+            let statuses = PrStatuses::with_program(gh, Duration::from_secs(10));
+            let key = PrKey::new("o/r", 8);
+            // A rate limit answered two hours ago: its first wait is long over.
+            let past = Utc::now() - chrono::Duration::hours(2);
+            statuses.record(&key, past, past, &Err(PrFetchError::rate_limited()));
+
+            assert!(
+                statuses.refresh(&key).await.is_ok(),
+                "the hold ended, so the refresh asks GitHub"
+            );
+            let asks = std::fs::read_to_string(dir.path().join("asks")).unwrap();
+            assert_eq!(
+                asks.lines().count(),
+                1,
+                "asked once, without waiting for the poll schedule"
+            );
         }
 
         #[tokio::test]
