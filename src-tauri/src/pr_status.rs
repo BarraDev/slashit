@@ -346,9 +346,11 @@ impl PrFetchError {
     /// `gh pr view --json` exposes no HTTP headers, so a rate limit is told
     /// only by its text. The patterns, by how well they are known:
     ///
-    /// - Verified: "GitHub API rate limit exceeded" is `gh`'s own message,
-    ///   found verbatim in the `gh` 2.102.0 binary. The "HTTP %d: %s" format
-    ///   is also verified there, so "HTTP 429" is matched as a status.
+    /// - Verified: "GitHub API rate limit exceeded. Please wait a minute and
+    ///   try again." is `gh`'s own message, and `gh` prints an HTTP failure as
+    ///   "HTTP %d: %s (%s)", so "HTTP 429" is matched as a status. Both strings
+    ///   are in the `gh` 2.102.0 binary; recheck after a `gh` upgrade with
+    ///   `strings "$(command -v gh)" | grep -e 'API rate limit exceeded' -e 'HTTP %d: %s'`.
     /// - Documented: GitHub's REST error text for the primary limit,
     ///   "API rate limit exceeded for user ID …", and for the secondary limit,
     ///   "You have exceeded a secondary rate limit …". Both are matched by
@@ -715,7 +717,7 @@ impl PrStatuses {
         let mut backoff = self.backoff.lock().unwrap_or_else(|e| e.into_inner());
         match result {
             Err(e) if e.kind == PrFetchErrorKind::RateLimited => {
-                let failures = backoff.get(key).map_or(0, |b| b.failures) + 1;
+                let failures = backoff.get(key).map_or(0, |b| b.failures).saturating_add(1);
                 let wait = chrono::Duration::seconds(rate_limit_backoff(failures).as_secs() as i64);
                 backoff.insert(
                     key.clone(),

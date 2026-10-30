@@ -11198,7 +11198,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn shutdown_ends_the_loop_while_a_rate_limited_pr_is_held_in_backoff() {
+    async fn shutdown_ends_the_loop_promptly_and_without_asking_while_a_rate_limited_pr_is_held() {
         let dir = tempfile::tempdir().unwrap();
         let asks = dir.path().join("asks");
         let gh = fake_gh(
@@ -11226,16 +11226,18 @@ mod tests {
         );
         let asked = asks_made(&asks);
 
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(executor.polling_loop(Some(rx)));
         // The backoff is not a wait of its own: `poll_due` filters the pull
         // request out of each pass, and the loop keeps its usual sleep between
         // passes. So the shutdown is sent once a pass has started while the
         // backoff holds; it may land during that pass or the sleep after it,
-        // and either way the loop must end promptly without asking gh.
+        // and either way the loop must end promptly without asking gh. The
+        // pass count is read before the loop starts, so its first pass is the
+        // one waited for.
         let passes = executor
             .pr_check_counter
             .load(std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(executor.polling_loop(Some(rx)));
         tokio::time::timeout(Duration::from_secs(5), async {
             while executor
                 .pr_check_counter
