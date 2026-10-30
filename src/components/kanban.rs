@@ -15,7 +15,7 @@ use crate::components::attention::{attention_order, next_after, reveal_card, Boa
 use crate::components::task_live::{activity_from_event, changes_task_record, ActivityUpdate, LiveRuns};
 use crate::models::AgentEvent;
 use crate::services::task_run_service::{get_live_runs, listen_agent_events_with_ready};
-use crate::services::is_safe_link_destination;
+use crate::components::markdown::render_safe_markdown;
 use crate::services::{reorder_task, queue_service, promoted_message, run_queued_task, RunNowOutcome,get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
@@ -1410,7 +1410,7 @@ fn PrReviewModal(
                                     )
                                 };
                                 let summary_html = (!res.agent_summary.trim().is_empty())
-                                    .then(|| render_pr_comment_markdown(&res.agent_summary));
+                                    .then(|| render_safe_markdown(&res.agent_summary));
                                 view! {
                                     <div class=format!("px-3 py-2 rounded-md border text-xs space-y-2 {}", summary_class)>
                                         <div class="font-medium">{header}</div>
@@ -1665,41 +1665,6 @@ fn PrReviewModal(
     }
 }
 
-/// Render a PR-comment body (GitHub-flavored markdown from `gh api`) to HTML.
-/// The body is remote, untrusted text. Raw HTML is dropped, images are
-/// replaced by their alt text so nothing is fetched on render, and a link
-/// keeps its markup only when `is_safe_link_destination` accepts it; otherwise
-/// just its text remains. Output is consumed via Leptos `inner_html` and
-/// styled via the `prose prose-invert` Tailwind plugin. Clicks on its links are
-/// routed to the opener by `route_external_links`, installed at startup.
-fn render_pr_comment_markdown(src: &str) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
-
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_TASKLISTS);
-    opts.insert(Options::ENABLE_GFM);
-
-    // One entry per open link: whether its markup was kept.
-    let mut open_links: Vec<bool> = Vec::new();
-    let parser = Parser::new_ext(src, opts).filter_map(|ev| match ev {
-        Event::Html(_) | Event::InlineHtml(_) => None,
-        Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => None,
-        Event::Start(Tag::Link { ref dest_url, .. }) => {
-            let keep = is_safe_link_destination(dest_url);
-            open_links.push(keep);
-            keep.then_some(ev)
-        }
-        Event::End(TagEnd::Link) => open_links.pop().unwrap_or(false).then_some(ev),
-        ev => Some(ev),
-    });
-
-    let mut out = String::with_capacity(src.len() + src.len() / 4);
-    html::push_html(&mut out, parser);
-    out
-}
-
 /// Whether a review item stays approved after its decision changes. Only a
 /// Fix can be approved. A collaborator's Fix is approved automatically;
 /// anyone else's keeps its approval only if it was already a Fix, so a box
@@ -1918,7 +1883,7 @@ fn render_review_item(
             </div>
 
             {original_body.map(|body| {
-                let html = render_pr_comment_markdown(&body);
+                let html = render_safe_markdown(&body);
                 view! {
                     <details class="text-xs text-white/55">
                         <summary class="cursor-pointer hover:text-white/80">"Original comment"</summary>
@@ -3022,7 +2987,6 @@ mod tests {
     use super::approved_after_decision_change;
     use super::next_card_id;
     use super::{awaiting_delivery, offers_pr_sync};
-    use super::{is_safe_link_destination, render_pr_comment_markdown};
     use crate::models::{HumanReviewDecision, HumanReviewEntry, Task, TaskStatus};
     use uuid::Uuid;
 
@@ -3041,157 +3005,6 @@ mod tests {
             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
         }))
         .unwrap()
-    }
-
-    #[test]
-    fn only_absolute_web_and_mail_destinations_are_links() {
-        for ok in [
-            "https://example.com/a?b=c",
-            "HTTP://EXAMPLE.COM",
-            "mailto:a@example.com",
-        ] {
-            assert!(is_safe_link_destination(ok), "{ok}");
-        }
-        for bad in [
-            "javascript:alert(1)",
-            "JaVaScRiPt:alert(1)",
-            " javascript:alert(1)",
-            "java\tscript:alert(1)",
-            "java\nscript:alert(1)",
-            "\u{1}javascript:alert(1)",
-            "data:text/html,x",
-            "vbscript:x",
-            "file:///etc/passwd",
-            "tauri://localhost/",
-            "//example.com/x",
-            "/relative/path",
-            "relative",
-            "#fragment",
-            "https:",
-            "httpx://example.com",
-            "https://exa mple.com",
-            "",
-        ] {
-            assert!(!is_safe_link_destination(bad), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn unsafe_links_keep_their_text_but_not_their_destination() {
-        for src in [
-            "[click](javascript:alert(1))",
-            "[click](JAVASCRIPT:alert(1))",
-            "[click](&#106;avascript:alert(1))",
-            "[click](java&#9;script:alert(1))",
-            "[click](%6Aavascript:alert(1))",
-            "[click](data:text/html;base64,AAAA)",
-            "[click](//evil.example/x)",
-            "[click](/relative)",
-            "[click][r]\n\n[r]: javascript:alert(1)",
-            "<javascript:alert(1)>",
-        ] {
-            let html = render_pr_comment_markdown(src);
-            assert!(!html.contains("href"), "{src}: {html}");
-            assert!(!html.contains("<a"), "{src}: {html}");
-        }
-        assert_eq!(
-            render_pr_comment_markdown("[click](javascript:alert(1))").trim(),
-            "<p>click</p>"
-        );
-    }
-
-    #[test]
-    fn safe_links_stay_clickable_and_escaped() {
-        let html = render_pr_comment_markdown(
-            "[a](https://example.com/x?a=1&b=\"2\") <mailto:a@example.com>",
-        );
-        assert!(
-            html.contains("<a href=\"https://example.com/x?a=1&amp;b=%222%22\">a</a>"),
-            "{html}"
-        );
-        assert!(html.contains("<a href=\"mailto:a@example.com\">"), "{html}");
-        let nested =
-            render_pr_comment_markdown("**[bold](https://example.com)** and [x](javascript:1) *y*");
-        assert!(
-            nested.contains("<strong><a href=\"https://example.com\">bold</a></strong>"),
-            "{nested}"
-        );
-        assert!(nested.contains("and x <em>y</em>"), "{nested}");
-    }
-
-    #[test]
-    fn images_are_replaced_by_their_alt_text_and_never_fetched() {
-        for src in [
-            "![alt text](https://tracker.example/p.png)",
-            "![alt text][r]\n\n[r]: https://tracker.example/p.png",
-            "![alt text](javascript:alert(1))",
-        ] {
-            let html = render_pr_comment_markdown(src);
-            assert!(
-                !html.contains("<img") && !html.contains("src=") && !html.contains("tracker"),
-                "{html}"
-            );
-            assert_eq!(html.trim(), "<p>alt text</p>");
-        }
-        let linked =
-            render_pr_comment_markdown("[![logo](https://t.example/p.png)](https://example.com)");
-        assert_eq!(
-            linked.trim(),
-            "<p><a href=\"https://example.com\">logo</a></p>"
-        );
-    }
-
-    #[test]
-    fn raw_html_is_dropped_and_text_stays_escaped() {
-        let html = render_pr_comment_markdown(
-            "<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\ninline <b onclick=x>b</b> & \"q\" `<i>`",
-        );
-        assert!(
-            !html.contains("<script")
-                && !html.contains("<img")
-                && !html.contains("onerror")
-                && !html.contains("<b "),
-            "{html}"
-        );
-        assert!(
-            html.contains("&amp;") && html.contains("<code>&lt;i&gt;</code>"),
-            "{html}"
-        );
-    }
-
-    #[test]
-    fn legitimate_markdown_is_unchanged() {
-        let html = render_pr_comment_markdown("# T\n\n- [x] done\n- item\n\n```rust\nlet a = 1 < 2;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n~~s~~");
-        for needle in [
-            "<h1>T</h1>",
-            "type=\"checkbox\"",
-            "<li>item</li>",
-            "&lt; 2",
-            "<table>",
-            "<del>s</del>",
-        ] {
-            assert!(html.contains(needle), "{needle}: {html}");
-        }
-    }
-
-    #[test]
-    fn malformed_links_do_not_unbalance_the_output() {
-        for src in [
-            "[a](",
-            "[a](<",
-            "[a]()",
-            "[[a](javascript:1)](https://example.com)",
-            "[a](https://e.com",
-            "]( [a",
-        ] {
-            let html = render_pr_comment_markdown(src);
-            assert!(!html.to_lowercase().contains("javascript"), "{src}: {html}");
-            assert_eq!(
-                html.matches("<a ").count(),
-                html.matches("</a>").count(),
-                "{src}: {html}"
-            );
-        }
     }
 
     #[test]

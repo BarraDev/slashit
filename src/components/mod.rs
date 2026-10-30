@@ -21,6 +21,7 @@ pub mod new_attempt;
 pub mod close_without_merge_dialog;
 pub mod workspace_panel;
 pub mod log_viewer;
+pub mod markdown;
 pub mod badge;
 pub mod progress_bar;
 pub mod phase_badge;
