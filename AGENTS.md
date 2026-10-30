@@ -197,7 +197,7 @@ private state.
   to a future reader. They must not contain internal work-tracking labels,
   session narration, temporary verification SHAs, private report paths, or AI
   attribution (see below).
-- Do not post transient agent-status comments on PRs.
+- Do not post transient agent-status comments on PRs. Before requesting a CodeRabbit review, follow section 18 of `docs/development-workflow.md`.
 
 ### Authorization
 

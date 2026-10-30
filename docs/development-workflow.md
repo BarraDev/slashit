@@ -898,3 +898,99 @@ architecture work alike. They refine the rules above; they do not replace them.
   revisiting it.
 - **Gates stay authoritative.** A clean review verdict does not replace hosted
   CI, exact-commit validation, or the publication gates in sections 13 and 14.
+
+## 18. Pull request review lifecycle (CodeRabbit)
+
+CodeRabbit is advisory (section 14). It does not replace local checks (section
+16) or hosted CI. Its review events are a shared, rate-limited resource, so
+request them deliberately. The repository settings are in `.coderabbit.yaml`.
+
+### Capacity
+
+Read the capacity of the account, not the documentation. Run
+`@coderabbitai rate limit` on the pull request. It reports whether a review is
+available now and, if not, when to try again. Checking does not use a review.
+
+- The review run configuration on PR #281 (2026-10-29) shows the plan
+  **Advanced**. The layers were "Repository YAML (base), Repository UI
+  (inherited)". The free and OSS numbers do not apply to this repository.
+- Advanced, as documented: 10 PR reviews per hour per developer at base, with
+  a lower refill rate under the Fair Usage bands at high recent volume. Free
+  gives PR summaries only, with code reviews through the IDE and CLI. OSS uses
+  a separate tier that depends on repository popularity.
+- The allowance is per developer and rolling.
+
+### Commands
+
+| Command | Starts a review (one event) | Use |
+|---|---|---|
+| `@coderabbitai review` | Yes | Review the commits pushed since the last review. The usual request. |
+| `@coderabbitai full review` | Yes | Review every file again. Use only when an incremental review cannot cover the change. |
+| `@coderabbitai rate limit` (also `rate-limit`, `limits`, `quota`) | No | Check capacity before requesting a review. |
+| `@coderabbitai reviews remaining?` | No | Plain question; reports the same status. |
+| `@coderabbitai pause` (also `ignore`) | No | Stop automatic reviews on a PR that is not ready for feedback. |
+| `@coderabbitai resume` | Starts an incremental review of the commits pushed while paused. Counts as one event (inferred from the rate-limit table; the command page does not state the count). | Restart automatic reviews. Usually unnecessary with `auto_incremental_review: false`. |
+| `@coderabbitai ignore` in the PR description | No | Stops automatic reviews. A manual `review` still works. |
+
+A blocked or rate-limited request does not consume a review. A check named
+"CodeRabbit" with the conclusion "neutral" and the title "Review rate limited"
+is not a review. Neither is a "skipping" status.
+
+### Lifecycle
+
+1. **Local first.** Run the tests, focused adversarial reviews, clippy, and
+   rustfmt before requesting review (sections 5 and 16). Review events spent on
+   known failures are wasted.
+2. **Draft during implementation.** Open the PR as a draft with
+   `gh pr create --draft -R BarraDev/slashit`. Drafts are not reviewed while
+   `drafts: false`. The SlashIt application cannot create draft PRs yet.
+3. **Ready for review.** Run `gh pr ready <n> -R BarraDev/slashit`. The
+   rate-limit table counts marking a draft ready as one review event.
+4. **Pushes are silent.** With `auto_incremental_review: false`, a push does not
+   start a review. Keep the branch stable while findings are investigated.
+5. **Investigate before changing code.** For each finding: Claim → Reproduce →
+   Assess impact → Decide → Fix if justified → Verify → Document. Reproduce it
+   against the exact commit and record the result in the reply.
+6. **Batch, then review once.** Put related corrections in one child change
+   (section 5, Review corrections). Check capacity with `rate limit`, then post
+   one `@coderabbitai review`. Post `full review` only when justified.
+7. **Verify the review.** Compare the review's `commit_id` with the PR head, as
+   section 16 describes. A review of an older commit says nothing about the
+   head.
+8. **Merge is the owner's decision** (section 14). The review verdict does not
+   replace hosted CI or the owner's approval.
+
+### Configuration
+
+`reviews.auto_review` in `.coderabbit.yaml`:
+
+- `drafts: false` (the default, now explicit): draft PRs are skipped.
+- `auto_incremental_review: false`: pushes do not start reviews. The first review
+  on opening remains automatic, according to the documentation.
+- `auto_pause_after_reviewed_commits: 2` (default `5`; `0` never pauses): a
+  second line of defense if incremental reviews are enabled again.
+- `base_branches: [".*"]` (unchanged): stacked PRs target other PR branches
+  (section 13), so restricting the base branches would leave stacks unreviewed.
+- `inheritance: true` (unchanged). The repository file is the base layer. The
+  review metadata also lists "Repository UI (inherited)", so dashboard settings
+  can change behavior. When observed behavior differs from this file, check the
+  CodeRabbit dashboard first.
+
+Keep the review profile, path instructions, and custom checks unchanged. Do not
+disable CI or all automatic reviews to save capacity.
+
+### Verified and unverified
+
+- Verified: the file is valid YAML and validates against CodeRabbit's published
+  schema with zero errors. The schema defaults match the documentation. No CI
+  workflow references CodeRabbit.
+- Not verified by a live run: that the first review still starts on opening
+  with `auto_incremental_review: false`; that a draft marked ready is reviewed;
+  and whether dashboard settings override the file. Verify these on the next
+  real PR by reading the check runs. Do not spend review events only to test
+  settings.
+
+### Known gap
+
+SlashIt creates pull requests without a draft option. Until that changes, open
+a PR that needs time in draft form with `gh pr create --draft`.
