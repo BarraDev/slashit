@@ -1175,6 +1175,18 @@ impl Task {
         slashit_activity::next_review(&self.activity)
     }
 
+    /// The model a launch for this Task names: `None` when the Task asks for
+    /// the provider's default (an empty or `"default"` `model`), otherwise the
+    /// configured identifier, unchanged. It reads `model` only, never
+    /// `last_observed_model`. The identifier is the provider's to interpret,
+    /// so this does not check that it is one.
+    pub fn configured_model(&self) -> Option<&str> {
+        match self.model.as_str() {
+            "" | "default" => None,
+            model => Some(model),
+        }
+    }
+
     /// Whether the task cannot make progress without the user right now, and
     /// why. The rule is [`slashit_attention::Facts::needs_you`]; this only
     /// copies the task's facts into it.
@@ -2513,6 +2525,25 @@ mod tests {
         let reloaded: Task = serde_json::from_value(json).expect("reload the Task");
         assert_eq!(reloaded.model, "test-model");
         assert_eq!(reloaded.last_observed_model, None);
+    }
+
+    /// A launch names the configured model, and nothing else: an empty or
+    /// `"default"` value asks for the provider default, and an observed model
+    /// never stands in for either.
+    #[test]
+    fn a_launch_names_the_configured_model_and_never_the_observed_one() {
+        let mut task: Task = toml::from_str(LEGACY_TASK_TOML).expect("old Task TOML");
+        assert_eq!(task.configured_model(), Some("test-model"));
+        for default in ["", "default"] {
+            task.model = default.to_string();
+            task.last_observed_model = Some("claude-opus-4-0-20250514".to_string());
+            assert_eq!(task.configured_model(), None, "{default:?}");
+        }
+        task.model = "haiku".to_string();
+        assert_eq!(task.configured_model(), Some("haiku"));
+        // The value is the provider's to interpret, so it is passed as stored.
+        task.model = "Default".to_string();
+        assert_eq!(task.configured_model(), Some("Default"));
     }
 
     fn recovered_task_with_decision(run: u32) -> (Task, NewAttemptDecision) {
