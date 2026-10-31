@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::agents::coding_run::{CodingRunEvent, CodingRunner};
 use crate::agents::opencode_run::OpenCodeRunConfig;
-use crate::agents::runner::{ClaudeRunConfig, ToolAccess};
+use crate::agents::runner::{ClaudeRunConfig, LaunchError, ToolAccess};
 use crate::domain::task::ActivityKind;
 use crate::domain::task::CodingProvider;
 use crate::domain::task::ExternalRef;
@@ -57,10 +57,11 @@ impl StartFailure {
 /// refused here; none is dropped silently. That covers a Claude model name and
 /// the extra directories a meta-workspace run needs.
 ///
-/// Only the coding run uses OpenCode. AI review and review-fix still run on
-/// Claude for every Task, so an OpenCode Task that reaches review can still
-/// invoke a Claude model, billed separately from OpenCode. The test suite
-/// stands that Claude in with a fake program, so no test calls a model.
+/// Only the coding run uses OpenCode. AI review still runs on Claude for every
+/// Task, so an OpenCode Task that reaches review can still invoke a Claude
+/// model, billed separately from OpenCode. Review-fix is refused for an
+/// OpenCode Task (see `fix_agent_model`). The test suite stands that Claude in
+/// with a fake program, so no test calls a model.
 /// Where a Task's Project stood in its Workspace when a launch read it. A
 /// start commits only while the Project still stands exactly here (see
 /// `TaskExecutor::record_run_start_for`).
@@ -564,9 +565,17 @@ enum FixOutcome {
     Applied,
     /// Cancelled before or during the run; nothing is recorded.
     Cancelled,
-    /// The run could not start, exited non-zero, or reported an error.
+    /// The run never started: no provider process existed, so it made no edits.
+    NotStarted(String),
+    /// The run started and then failed, exited non-zero, or reported an error,
+    /// so it may have edited the checkout.
     Failed(String),
 }
+
+/// What a failed fix-agent run may have left in the checkout, once a process
+/// existed.
+const FIX_PARTIAL_EDITS_WARNING: &str =
+    "The task checkout may hold partial edits from the fix agent that were not recorded.";
 
 /// The lease file of a Task: one lock per Task, shared by every launch that can
 /// edit its checkout (Task Worker, review fix agent, PR apply helper and
@@ -673,17 +682,47 @@ pub(crate) fn acquire_task_provider_lease(
 /// The outcome of a fix-agent run. Only a successful run applied fixes: one
 /// that exited non-zero or reported an error failed, like one that never
 /// started.
-fn fix_outcome(outcome: Result<Option<AgentRun>, String>) -> FixOutcome {
+fn fix_outcome(outcome: Result<Option<AgentRun>, LaunchError>) -> FixOutcome {
     match outcome {
         Ok(Some(run)) if run.success => FixOutcome::Applied,
         Ok(Some(run)) => {
             let reason = run
                 .failure
                 .unwrap_or_else(|| "the fix agent run did not succeed".to_string());
-            FixOutcome::Failed(format!("Fix agent failed: {reason}"))
+            FixOutcome::Failed(format!(
+                "Fix agent failed: {reason}. {FIX_PARTIAL_EDITS_WARNING}"
+            ))
         }
         Ok(None) => FixOutcome::Cancelled,
-        Err(e) => FixOutcome::Failed(format!("Fix agent failed to start: {e}")),
+        // Refused before any process existed (a model it cannot take, a lease
+        // it could not get, a CLI that would not spawn): nothing ran, so there
+        // are no partial edits to warn about.
+        Err(e) if !e.spawned() => FixOutcome::NotStarted(format!("Fix agent did not start: {e}")),
+        Err(e) => FixOutcome::Failed(format!(
+            "Fix agent failed to start: {e}. {FIX_PARTIAL_EDITS_WARNING}"
+        )),
+    }
+}
+
+/// The model the review-fix agent runs on: the Task's own configured model,
+/// as its coding Worker was launched with it, or why no fix agent can start.
+/// `Ok(None)` is the Task's explicit request for the provider default, which
+/// the provider chooses and which is not necessarily an economical model. The
+/// model is the one requested, an alias included: the provider resolves it.
+///
+/// The fix agent runs on Claude for every Task. A model that only OpenCode
+/// can run is not one Claude can take, and starting the fix agent without it
+/// would run an unconfigured, possibly costlier, model, so that Task's fix
+/// agent is refused instead.
+fn fix_agent_model(task: &Task) -> Result<Option<String>, String> {
+    match task.provider {
+        CodingProvider::Claude => Ok(task.configured_model().map(str::to_string)),
+        CodingProvider::OpenCode => Err(match task.configured_model() {
+            Some(model) => format!(
+                "this Task's model {model} is an OpenCode model, and the review-fix agent runs on Claude, which cannot take it. No fix agent was started and no other model was substituted. Address the findings in Human Review, or run this Task with Claude"
+            ),
+            None => "this Task runs on OpenCode and names no model the review-fix agent, which runs on Claude, could use. No fix agent was started and no other model was substituted. Address the findings in Human Review, or run this Task with Claude".to_string(),
+        }),
     }
 }
 
@@ -4680,7 +4719,7 @@ impl TaskExecutor {
                 // no run number is spent, so the next attempt is the same run.
                 // Its approval ends with the failure, as a stale approval's does.
                 if t.provider == CodingProvider::OpenCode {
-                    let model = if t.model.is_empty() || t.model == "default" { None } else { Some(t.model.as_str()) };
+                    let model = t.configured_model();
                     if let Some(message) = opencode_refusal(model, no_additional_dirs) {
                         t.fail_refused_launch(&message);
                         *refusal.lock().unwrap_or_else(|p| p.into_inner()) = Some(message);
@@ -4708,7 +4747,7 @@ impl TaskExecutor {
                     }
                 }
                 // What is handed to the provider is built from this snapshot.
-                let model = if t.model.is_empty() || t.model == "default" { None } else { Some(t.model.clone()) };
+                let model = t.configured_model().map(str::to_string);
                 *launch_input.lock().unwrap_or_else(|p| p.into_inner()) = Some((
                     build_run_prompt(
                         t,
@@ -5742,7 +5781,7 @@ impl TaskExecutor {
                 isolate_customizations: true,
             }, lease)
             .await
-            .map_err(StartFailure::failed)
+            .map_err(|e| StartFailure::failed(e.to_string()))
             };
             let runner = match started {
                 Ok(r) => r,
@@ -6722,12 +6761,13 @@ impl TaskExecutor {
     /// `Ok(Some(run))` is a completed run, successful or not (see
     /// [`AgentRun::success`]); `Ok(None)` is a graceful decline (cancelled
     /// before start, or cancelled during `wait()` and killed); `Err` is a
-    /// real failure to start.
+    /// real failure to start, which says whether a process existed (see
+    /// [`LaunchError::spawned`]).
     async fn run_cancellable_agent(
         config: ClaudeRunConfig,
         lease: Option<crate::agents::provider_lease::ProviderLease>,
         cancelled: &mut tokio::sync::watch::Receiver<bool>,
-    ) -> Result<Option<AgentRun>, String> {
+    ) -> Result<Option<AgentRun>, LaunchError> {
         if *cancelled.borrow() {
             return Ok(None);
         }
@@ -7580,10 +7620,12 @@ impl TaskExecutor {
                 }
 
                 // Spawn fix agent that validates before fixing
-                let fix_prompt = {
+                // The model comes from the same read of the Task as the prompt:
+                // the Task's configured model, never what a run reported.
+                let (fix_prompt, fix_model) = {
                     let tasks_r = tasks.read().await;
                     match tasks_r.get(&task_id) {
-                        Some(t) => build_fix_prompt(t, &findings),
+                        Some(t) => (build_fix_prompt(t, &findings), fix_agent_model(t)),
                         None => {
                             reviewing_handles.write().await.remove(&task_id);
                             return;
@@ -7595,10 +7637,29 @@ impl TaskExecutor {
                 // The fix agent edits the checkout, so it takes the Task's lease
                 // first. A Worker, PR helper or Conversation Worker that still
                 // holds the checkout refuses it here, and the fix counts as not
-                // started.
-                let fix_run = match acquire_task_provider_lease(&storage, task_id) {
+                // started. A model it cannot be given refuses it before the
+                // lease is taken.
+                let fix_run = match fix_model
+                    .map_err(LaunchError::before_spawn)
+                    .and_then(|model| {
+                        acquire_task_provider_lease(&storage, task_id)
+                            .map(|lease| (model, lease))
+                            .map_err(LaunchError::before_spawn)
+                    }) {
                     Err(error) => Err(error),
-                    Ok(fix_lease) => {
+                    Ok((fix_model, fix_lease)) => {
+                        events.agent_event(AgentEvent::Log {
+                            task_id: task_id_str.clone(),
+                            level: LogLevel::Info,
+                            message: match &fix_model {
+                                Some(model) => format!(
+                                    "The fix agent is asked to run on {model}, the Task's configured model; the provider resolves it"
+                                ),
+                                None => "The fix agent runs on the provider's default model, as \
+                                         the Task is configured; the provider chooses it"
+                                    .to_string(),
+                            },
+                        });
                         Self::run_cancellable_agent(
                             ClaudeRunConfig {
                                 prompt: fix_prompt,
@@ -7614,7 +7675,7 @@ impl TaskExecutor {
                                 max_budget_usd: None,
                                 session_id: Some(Uuid::new_v4().to_string()),
                                 resume_session: None,
-                                model: None,
+                                model: fix_model,
                                 system_prompt: None,
                                 append_system_prompt: Some(worker_scratch_rule(&working_dir)),
                                 disable_mcp: true,
@@ -7696,19 +7757,15 @@ impl TaskExecutor {
                         reviewing_handles.write().await.remove(&task_id);
                         return;
                     }
-                    FixOutcome::Failed(reason) => {
-                        // The fix agent has full tools, so a run that failed
-                        // part-way may still have edited the checkout.
-                        let message = format!(
-                            "{reason}. The task checkout may hold partial edits from the fix \
-                             agent that were not recorded."
-                        );
+                    // The reason already says whether a fix agent process
+                    // existed, and warns of partial edits only if one did.
+                    FixOutcome::NotStarted(reason) | FixOutcome::Failed(reason) => {
                         events.agent_event(AgentEvent::Log {
                             task_id: task_id_str.clone(),
                             level: LogLevel::Error,
-                            message: message.clone(),
+                            message: reason.clone(),
                         });
-                        Some(message)
+                        Some(reason)
                     }
                 };
 
@@ -17612,6 +17669,10 @@ mod tests {
             struct MockReviewer {
                 _tmp: tempfile::TempDir,
                 args_file: std::path::PathBuf,
+                /// The arguments of the reviewer's run alone, one per line.
+                review_args_file: std::path::PathBuf,
+                /// The arguments of the fix agent's run alone, one per line.
+                fix_args_file: std::path::PathBuf,
                 review_prompt_file: std::path::PathBuf,
                 fix_prompt_file: std::path::PathBuf,
                 saved_path: Option<String>,
@@ -17664,6 +17725,8 @@ mod tests {
                     let bin_dir = tmp.path().join("bin");
                     std::fs::create_dir_all(&bin_dir).unwrap();
                     let args_file = tmp.path().join("args");
+                    let review_args_file = tmp.path().join("review.args");
+                    let fix_args_file = tmp.path().join("fix.args");
                     let review_prompt_file = tmp.path().join("review.prompt");
                     let fix_prompt_file = tmp.path().join("fix.prompt");
                     let result_json = serde_json::to_string(result).unwrap();
@@ -17675,15 +17738,19 @@ mod tests {
                          printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"model\":\"m\",\"permissionMode\":\"%s\"}}\\n' \"$mode\"\n\
                          case \" $* \" in\n\
                          *\" --restricted \"*)\n\
+                         for a in \"$@\"; do printf '%s\\n' \"$a\" >> {review_args:?}; done\n\
                          cat > {review_prompt:?}\n\
                          printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":{result_json}}}'\n\
                          exit {exit} ;;\n\
                          esac\n\
+                         for a in \"$@\"; do printf '%s\\n' \"$a\" >> {fix_args:?}; done\n\
                          cat > {fix_prompt:?}\n\
                          {fix_edit}\
                          printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":{fix_result_json}}}'\n\
                          exit {fix_exit}\n",
                         args = args_file,
+                        review_args = review_args_file,
+                        fix_args = fix_args_file,
                         review_prompt = review_prompt_file,
                         fix_prompt = fix_prompt_file,
                         fix_edit = fix_script,
@@ -17714,6 +17781,8 @@ mod tests {
                     MockReviewer {
                         _tmp: tmp,
                         args_file,
+                        review_args_file,
+                        fix_args_file,
                         review_prompt_file,
                         fix_prompt_file,
                         saved_path,
@@ -17731,7 +17800,21 @@ mod tests {
                 }
 
                 fn args(&self) -> Vec<String> {
-                    std::fs::read_to_string(&self.args_file)
+                    Self::lines(&self.args_file)
+                }
+
+                /// The reviewer's own arguments, empty if it never ran.
+                fn review_args(&self) -> Vec<String> {
+                    Self::lines(&self.review_args_file)
+                }
+
+                /// The fix agent's own arguments, empty if it never ran.
+                fn fix_args(&self) -> Vec<String> {
+                    Self::lines(&self.fix_args_file)
+                }
+
+                fn lines(file: &std::path::Path) -> Vec<String> {
+                    std::fs::read_to_string(file)
                         .unwrap_or_default()
                         .lines()
                         .map(str::to_string)
@@ -17763,6 +17846,27 @@ mod tests {
                 working_dir: &str,
                 base_commit: &str,
             ) -> QaSignoff {
+                review_task_in(mock, working_dir, base_commit, |_| {})
+                    .await
+                    .qa_signoff
+                    .expect("the review records a signoff")
+            }
+
+            /// Run one AI review of a Task that `configure` has changed, in a
+            /// fresh repository, and return the Task as it ends.
+            async fn review_task(mock: &MockReviewer, configure: impl FnOnce(&mut Task)) -> Task {
+                let (repo, base_commit) = git_repo_with_change();
+                review_task_in(mock, repo.path().to_str().unwrap(), &base_commit, configure).await
+            }
+
+            /// Run one AI review of the Task checkout at `working_dir`, after
+            /// `configure` has changed the Task, and return the Task as it ends.
+            async fn review_task_in(
+                mock: &MockReviewer,
+                working_dir: &str,
+                base_commit: &str,
+                configure: impl FnOnce(&mut Task),
+            ) -> Task {
                 let (executor, _temps) = test_executor();
                 // Only the Claude reviewer is under test, not a CodeRabbit CLI
                 // that may or may not be installed on this machine.
@@ -17776,7 +17880,8 @@ mod tests {
                     .await
                     .set_config(config)
                     .await;
-                let task = reviewing_task(Uuid::new_v4(), working_dir, base_commit);
+                let mut task = reviewing_task(Uuid::new_v4(), working_dir, base_commit);
+                configure(&mut task);
                 let task_id = task.id;
                 executor.tasks.write().await.insert(task_id, task);
 
@@ -17788,7 +17893,7 @@ mod tests {
                         let t = tasks.get(&task_id).expect("task still exists");
                         assert_eq!(t.status, TaskStatus::HumanReview);
                         assert!(!mock.args().is_empty(), "the stand-in reviewer ran");
-                        return t.qa_signoff.clone().expect("the review records a signoff");
+                        return t.clone();
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
@@ -17893,16 +17998,62 @@ VERDICT: APPROVED"
                 };
                 assert_eq!(
                     fix_outcome(Ok(Some(failed))),
-                    FixOutcome::Failed("Fix agent failed: exit 2".into())
+                    FixOutcome::Failed(format!(
+                        "Fix agent failed: exit 2. {FIX_PARTIAL_EDITS_WARNING}"
+                    ))
                 );
                 assert!(matches!(
                     fix_outcome(Ok(Some(run(false, "")))),
                     FixOutcome::Failed(_)
                 ));
                 assert_eq!(
-                    fix_outcome(Err("no claude".into())),
-                    FixOutcome::Failed("Fix agent failed to start: no claude".into())
+                    fix_outcome(Err(LaunchError::after_spawn("no claude"))),
+                    FixOutcome::Failed(format!(
+                        "Fix agent failed to start: no claude. {FIX_PARTIAL_EDITS_WARNING}"
+                    ))
                 );
+            }
+
+            /// A fix agent refused before any process existed is reported as
+            /// not started. It never claims partial edits, because nothing ran
+            /// to make them, whatever the refusal was.
+            #[test]
+            fn a_fix_agent_that_never_started_claims_no_partial_edits() {
+                // A model Claude cannot take, a lease it could not get, a CLI
+                // that would not spawn: each is refused before a process exists.
+                for refusal in [
+                    "this Task's model ollama/llama3.2:3b is an OpenCode model",
+                    "The Task's provider lease could not be taken; nothing was launched",
+                    "Failed to spawn claude: No such file or directory. Is claude CLI installed?",
+                ] {
+                    assert_eq!(
+                        fix_outcome(Err(LaunchError::before_spawn(refusal))),
+                        FixOutcome::NotStarted(format!("Fix agent did not start: {refusal}")),
+                    );
+                }
+            }
+
+            /// A fix agent that started and then failed keeps the warning that
+            /// its checkout may hold partial edits.
+            #[test]
+            fn a_fix_agent_that_started_and_failed_keeps_the_partial_edit_warning() {
+                let exited = AgentRun {
+                    failure: Some("exit 2".into()),
+                    ..run(false, "done")
+                };
+                for outcome in [
+                    fix_outcome(Ok(Some(exited))),
+                    fix_outcome(Err(LaunchError::after_spawn(
+                        "the lease could not be recorded",
+                    ))),
+                ] {
+                    match outcome {
+                        FixOutcome::Failed(message) => {
+                            assert!(message.contains(FIX_PARTIAL_EDITS_WARNING), "{message}");
+                        }
+                        other => panic!("a started and failed fix agent is Failed, not {other:?}"),
+                    }
+                }
             }
 
             #[tokio::test(flavor = "multi_thread")]
@@ -18003,6 +18154,198 @@ VERDICT: APPROVED"
                         .any(|a| a.contains("a.rs:1") || a.contains("under review")),
                     "no prompt text in argv: {args:?}"
                 );
+            }
+
+            const CHANGES_REQUESTED: &str =
+                "VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a.rs:1 - broken";
+
+            /// The model one stand-in `claude` launch was given: the value of
+            /// its `--model` argument, which a launch without a model lacks.
+            fn model_of(args: &[String]) -> Option<String> {
+                assert!(
+                    args.iter().filter(|a| *a == "--model").count() <= 1,
+                    "one model per launch: {args:?}"
+                );
+                args.windows(2)
+                    .find(|w| w[0] == "--model")
+                    .map(|w| w[1].clone())
+            }
+
+            #[test]
+            fn the_fix_agent_model_is_the_tasks_configured_model_or_a_refusal() {
+                let task = |provider: CodingProvider, model: &str| {
+                    let mut task =
+                        create_test_task_full("fix model", Uuid::new_v4(), TaskStatus::AiReview, 0);
+                    task.provider = provider;
+                    task.model = model.to_string();
+                    task
+                };
+                for model in ["haiku", "sonnet", "claude-haiku-4-5-20251001"] {
+                    assert_eq!(
+                        fix_agent_model(&task(CodingProvider::Claude, model)),
+                        Ok(Some(model.to_string()))
+                    );
+                }
+                // Only a Task that asks for the provider default gets it.
+                for model in ["default", ""] {
+                    assert_eq!(
+                        fix_agent_model(&task(CodingProvider::Claude, model)),
+                        Ok(None)
+                    );
+                }
+                let refused =
+                    fix_agent_model(&task(CodingProvider::OpenCode, "ollama/llama3.2:3b"))
+                        .expect_err("Claude cannot run an OpenCode model");
+                assert!(refused.contains("ollama/llama3.2:3b"), "{refused}");
+                assert!(
+                    refused.contains("no other model was substituted"),
+                    "{refused}"
+                );
+                // An OpenCode Task never falls to a default either.
+                assert!(fix_agent_model(&task(CodingProvider::OpenCode, "default")).is_err());
+            }
+
+            /// A Task configured for Haiku has its fix agent launched on
+            /// Haiku. The model is read from the `--model` argument of the
+            /// launch `spawn_review` really makes, not from a helper.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_haiku_task_runs_its_fix_agent_on_haiku() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_with_fixer(CHANGES_REQUESTED, 0, "Fixed everything.", 0);
+                let task = review_task(&mock, |task| task.model = "haiku".to_string()).await;
+
+                let signoff = task.qa_signoff.clone().expect("a signoff");
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::FixesApplied,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert_eq!(model_of(&mock.fix_args()), Some("haiku".to_string()));
+
+                // The reviewer is not part of this change: it still names no
+                // model. Review-model selection is a separate decision.
+                assert!(!mock.review_args().is_empty(), "the reviewer ran");
+                assert_eq!(model_of(&mock.review_args()), None);
+
+                // What the fix agent reported ("m") is evidence of nothing the
+                // Task records: the configuration is untouched, and no
+                // observed model was written for a review run.
+                assert_eq!(task.model, "haiku");
+                assert_eq!(task.last_observed_model, None);
+            }
+
+            /// An explicit model reaches the fix agent exactly as configured,
+            /// whether an alias or a full identifier.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_explicit_model_reaches_the_fix_agent_unchanged() {
+                let _path_guard = PATH_LOCK.lock().await;
+                for model in [
+                    "opus",
+                    "sonnet",
+                    "claude-haiku-4-5-20251001",
+                    "claude-opus-4-0-20250514",
+                ] {
+                    let mock = MockReviewer::install_with_fixer(
+                        CHANGES_REQUESTED,
+                        0,
+                        "Fixed everything.",
+                        0,
+                    );
+                    let task = review_task(&mock, |task| task.model = model.to_string()).await;
+                    assert_eq!(
+                        model_of(&mock.fix_args()),
+                        Some(model.to_string()),
+                        "fix agent model for {model}"
+                    );
+                    assert_eq!(task.model, model);
+                }
+            }
+
+            /// A Task that asks for the provider default launches its fix
+            /// agent with no model argument, as its Worker is launched.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_default_model_task_launches_its_fix_agent_without_a_model() {
+                let _path_guard = PATH_LOCK.lock().await;
+                for model in ["default", ""] {
+                    let mock = MockReviewer::install_with_fixer(
+                        CHANGES_REQUESTED,
+                        0,
+                        "Fixed everything.",
+                        0,
+                    );
+                    let task = review_task(&mock, |task| task.model = model.to_string()).await;
+                    assert_eq!(
+                        task.qa_signoff.as_ref().map(|s| &s.status),
+                        Some(&QaStatus::FixesApplied)
+                    );
+                    assert!(
+                        !mock.fix_args().is_empty(),
+                        "the fix agent ran for {model:?}"
+                    );
+                    assert_eq!(model_of(&mock.fix_args()), None, "{model:?}");
+                }
+            }
+
+            /// A model Claude cannot run is not replaced by Claude's default.
+            /// The fix agent is not started: it names the reason, the findings
+            /// stay for the person, and the Task's model is untouched.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_opencode_model_refuses_the_fix_agent_instead_of_using_a_default() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_with_fixer(CHANGES_REQUESTED, 0, "Fixed everything.", 0);
+                let task = review_task(&mock, |task| {
+                    task.provider = CodingProvider::OpenCode;
+                    task.model = "ollama/llama3.2:3b".to_string();
+                })
+                .await;
+
+                assert!(mock.fix_args().is_empty(), "no fix agent was launched");
+                assert_eq!(mock.fix_prompt(), "", "the fix agent read nothing");
+                let signoff = task.qa_signoff.clone().expect("a signoff");
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::Rejected,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|i| i.starts_with("Fix agent did not start")
+                            && i.contains("ollama/llama3.2:3b")
+                            && i.contains("no other model was substituted")),
+                    "the signoff says why: {:?}",
+                    signoff.issues_found
+                );
+                // No process ran, so the signoff must not claim partial edits.
+                assert!(
+                    !signoff
+                        .issues_found
+                        .iter()
+                        .any(|i| i.contains("partial edits")),
+                    "a refused fix agent claims no edits: {:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|i| i.contains("a.rs:1 - broken")),
+                    "the reviewer's issues are kept: {:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    task.activity
+                        .iter()
+                        .any(|entry| matches!(entry.kind, ActivityKind::AiFixFailed { .. })),
+                    "the timeline records the failed fix"
+                );
+                assert_eq!(task.model, "ollama/llama3.2:3b");
+                assert_eq!(task.provider, CodingProvider::OpenCode);
             }
 
             /// The fix agent's edits become a real Git commit on the task
@@ -20920,6 +21263,78 @@ VERDICT: APPROVED"
                 .iter()
                 .map(|l| format!("printf '%s\\n' '{}'; ", l.to_string().replace('\'', "")))
                 .collect()
+        }
+
+        /// The `--model` value a Claude Worker was launched with for a Task
+        /// configured with `model`, or `None` when it was launched without
+        /// one. Read from the argument list of the launch the executor makes.
+        async fn worker_launch_model(model: &str) -> Option<String> {
+            let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                tasks.get_mut(&w.task_id).unwrap().model = model.to_string();
+                let board: Vec<_> = tasks
+                    .values()
+                    .filter(|task| task.project_id == w.project_id)
+                    .cloned()
+                    .collect();
+                w.executor
+                    .storage
+                    .save_project_tasks(w.project_id, &board)
+                    .expect("persist the model choice");
+            }
+            let agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                "cat >/dev/null; printf 'work\\n' > agent_work.txt; \
+                 printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"model\":\"observed-model\",\"permissionMode\":\"auto\"}'; \
+                 printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'",
+            )
+            .await;
+            assert_eq!(
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(true)
+            );
+            let task = settled(&w).await;
+            assert_eq!(
+                task.status,
+                TaskStatus::AiReview,
+                "{:?}",
+                task.error_message
+            );
+            // The configuration is the Task's alone: what the run reported is
+            // evidence, kept apart from it.
+            assert_eq!(task.model, model);
+            assert_eq!(task.last_observed_model.as_deref(), Some("observed-model"));
+
+            assert_eq!(agent.launches("claude"), 1, "one Worker launch");
+            let launch = agent.invocations();
+            let words: Vec<&str> = launch.split_whitespace().collect();
+            assert!(
+                words.iter().filter(|word| **word == "--model").count() <= 1,
+                "{launch}"
+            );
+            words
+                .windows(2)
+                .find(|pair| pair[0] == "--model")
+                .map(|pair| pair[1].to_string())
+        }
+
+        /// The Worker is launched on the Task's configured model, and with
+        /// none when the Task asks for the provider default. This is what the
+        /// review-fix agent now matches.
+        #[tokio::test]
+        async fn the_worker_is_launched_on_the_tasks_configured_model() {
+            assert_eq!(worker_launch_model("haiku").await.as_deref(), Some("haiku"));
+            assert_eq!(
+                worker_launch_model("claude-opus-4-0-20250514")
+                    .await
+                    .as_deref(),
+                Some("claude-opus-4-0-20250514")
+            );
+            assert_eq!(worker_launch_model("default").await, None);
+            assert_eq!(worker_launch_model("").await, None);
         }
 
         /// A run's timeline holds its start, its tool calls -- named, with a

@@ -16,7 +16,7 @@ use tokio::sync::broadcast;
 
 use super::opencode_run::{OpenCodeRunConfig, OpenCodeRunner};
 use super::provider_lease::ProviderLease;
-use super::runner::{ClaudeRunConfig, ClaudeRunner};
+use super::runner::{ClaudeRunConfig, ClaudeRunner, LaunchError};
 
 /// Events a coding run emits while it executes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +57,7 @@ impl CodingRunner {
     pub async fn start_claude(
         config: ClaudeRunConfig,
         lease: Option<ProviderLease>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, LaunchError> {
         ClaudeRunner::start_leased(config, lease).await.map(Self::Claude)
     }
 

@@ -47,6 +47,7 @@ the security boundary of the run:
   report `"auto"`, or reports no mode, and `wait()` returns that reason.
 - `permission_mode: None` (bypass) remains only for the approved PR apply
   agent, which still needs review. An Auto run never falls back to it.
+- The coding Worker's and the review-fix agent's `--model` is `Task::configured_model()` (none for the provider default, which the provider chooses and which is not necessarily economical), never a reported model (`last_observed_model`). An alias is the model requested, not a resolved one. A review-fix agent that cannot take the Task's model, an OpenCode `provider/model`, is refused rather than run on Claude's default (`fix_agent_model`). The AI review leg names no model yet.
 - `isolate_customizations: true` for the coding Worker and the review-fix
   agent: `--setting-sources project` (the user's settings, hooks, plugins and
   `env` are not read), `--settings <path>` (every hook is off,
