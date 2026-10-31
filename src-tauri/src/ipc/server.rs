@@ -1497,6 +1497,7 @@ pub(crate) mod tests {
                 observed_commit: None,
             },
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         let task_id = task.id;
         rig.ctx.storage.save_project_tasks(project_id, std::slice::from_ref(&task)).unwrap();

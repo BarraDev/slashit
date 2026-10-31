@@ -820,6 +820,17 @@ fn run_mode_is_unproven(task: &Task) -> bool {
         .is_some_and(|handoff| handoff.review_mode_unproven)
 }
 
+/// The AI Reviewer model the Task's current run was started with. The run's
+/// own record decides, so an edit made after the run started cannot reach it.
+/// A Task with no run record has no start to fix the value at, so its
+/// configured reviewer applies, as its configured mode does.
+fn current_run_reviewer(task: &Task) -> Option<String> {
+    match task.worker_handoff.as_ref() {
+        Some(handoff) => handoff.reviewer_model.clone(),
+        None => task.reviewer_model.clone(),
+    }
+}
+
 /// Whether `task` sits where a delivered pull request lives, so that the
 /// poll may finish it when the pull request merges and record a failure when
 /// it closes.
@@ -4818,6 +4829,8 @@ impl TaskExecutor {
                     // Fixed here, under the same write that records the start,
                     // so this run's review cannot follow a later edit.
                     review_mode: t.review_mode,
+                    // The reviewer is fixed under the same write, for the same reason.
+                    reviewer_model: t.reviewer_model.clone(),
                     review_mode_unproven: false,
                 });
                 run.store(next, std::sync::atomic::Ordering::Relaxed);
@@ -7247,6 +7260,46 @@ impl TaskExecutor {
             return;
         }
 
+        // An automatic review runs only on the reviewer model its run was
+        // started with. Without one, no reviewer starts and no review is
+        // reported as done: the work waits in Human Review with the reason.
+        // Nothing falls back to the CLI's default model.
+        let configured_reviewer = {
+            let tasks = self.tasks.read().await;
+            tasks.get(&task_id).and_then(current_run_reviewer)
+        };
+        let Some(reviewer_model) = configured_reviewer else {
+            let reason = "No AI reviewer model was configured for this run, so AI Review did not start and no reviewer ran. Choose a reviewer model for this Task before its next run, or set review to Manual.";
+            self.events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: format!("AI review skipped: {reason}"),
+            });
+            let signoff = QaSignoff {
+                status: QaStatus::Rejected,
+                issues_found: vec![format!("AI review did not run: {reason}")],
+                timestamp: chrono::Utc::now(),
+                session_id: Uuid::new_v4(),
+            };
+            let trail = vec![(
+                chrono::Utc::now(),
+                ActivityKind::AiReviewSkipped {
+                    review,
+                    reason: reason.to_string(),
+                },
+            )];
+            Self::transition_to_human_review(
+                &self.tasks,
+                &self.storage,
+                &self.events,
+                task_id,
+                Some(signoff),
+                trail,
+            )
+            .await;
+            return;
+        };
+
         // The task's own worktree, or no review at all.
         //
         // This used to fall back to the repository path, and a review is not a
@@ -7469,7 +7522,9 @@ impl TaskExecutor {
                         max_budget_usd: None,
                         session_id: Some(Uuid::new_v4().to_string()),
                         resume_session: None,
-                        model: None,
+                        // The model this run was started with, exactly as
+                        // requested. Never the CLI default.
+                        model: Some(reviewer_model),
                         system_prompt: None,
                         append_system_prompt: None,
                         disable_mcp: true,
@@ -8447,6 +8502,8 @@ impl TaskExecutor {
                     // Task's configured mode is not copied: it is not evidence of
                     // the mode the run started under. See `mark_worker_recovery_required`.
                     review_mode: crate::domain::task::ReviewMode::Manual,
+                    // Not copied either: the reviewer the run started with is unknown.
+                    reviewer_model: None,
                     stage: crate::domain::task::WorkerHandoffStage::RecoveryRequired {
                         reason: reason.clone(),
                         observed_commit: observed_commit.clone(),
@@ -11643,6 +11700,7 @@ mod tests {
     /// A run record in the given mode, as the run-start write creates it.
     fn run_record(review_mode: crate::domain::task::ReviewMode) -> crate::domain::task::WorkerHandoff {
         crate::domain::task::WorkerHandoff {
+            reviewer_model: None,
             task_id: Uuid::nil(),
             project_id: Uuid::nil(),
             repository_id: None,
@@ -12188,6 +12246,7 @@ mod tests {
             let task = tasks.get_mut(&id).unwrap();
             task.phase = TaskPhase::Coding;
             task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                reviewer_model: None,
                 review_mode: Default::default(),
                 task_id: id,
                 project_id,
@@ -12262,6 +12321,7 @@ mod tests {
             task.worktree_path = Some("/preserved/task-checkout".into());
             task.branch_name = Some("task-stop-recovery".into());
             task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                reviewer_model: None,
                 review_mode: Default::default(),
                 task_id: id,
                 project_id,
@@ -12326,6 +12386,7 @@ mod tests {
                 addressing_feedback: false,
             });
             task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                reviewer_model: None,
                 review_mode: Default::default(),
                 task_id: id,
                 project_id,
@@ -16581,6 +16642,8 @@ mod tests {
             create_test_task_full("nothing to review", project_id, TaskStatus::AiReview, 0);
         task.phase = TaskPhase::QaReview;
         task.worktree_path = None;
+        // A reviewer is configured, so the worktree check is the one that decides.
+        task.reviewer_model = Some("sonnet".to_string());
         let task_id = task.id;
         executor.tasks.write().await.insert(task_id, task);
 
@@ -17657,6 +17720,9 @@ mod tests {
             task.worktree_path = Some(worktree_path.to_string());
             task.branch_name = Some("task".to_string());
             task.base_commit = Some(base_commit.to_string());
+            // An automatic review needs a configured reviewer. Tests that
+            // exercise the reviewer choose one; others clear it explicitly.
+            task.reviewer_model = Some("sonnet".to_string());
             task
         }
 
@@ -17861,8 +17927,22 @@ mod tests {
 
             /// Run one AI review of the Task checkout at `working_dir`, after
             /// `configure` has changed the Task, and return the Task as it ends.
+            /// The stand-in reviewer must have run.
             async fn review_task_in(
                 mock: &MockReviewer,
+                working_dir: &str,
+                base_commit: &str,
+                configure: impl FnOnce(&mut Task),
+            ) -> Task {
+                let task = settle_review_task(working_dir, base_commit, configure).await;
+                assert!(!mock.args().is_empty(), "the stand-in reviewer ran");
+                task
+            }
+
+            /// Run one AI review of the Task checkout at `working_dir`, after
+            /// `configure` has changed the Task, and return the Task as it
+            /// ends in Human Review, whether or not a reviewer ran.
+            async fn settle_review_task(
                 working_dir: &str,
                 base_commit: &str,
                 configure: impl FnOnce(&mut Task),
@@ -17892,12 +17972,166 @@ mod tests {
                         let tasks = executor.tasks.read().await;
                         let t = tasks.get(&task_id).expect("task still exists");
                         assert_eq!(t.status, TaskStatus::HumanReview);
-                        assert!(!mock.args().is_empty(), "the stand-in reviewer ran");
                         return t.clone();
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
                 panic!("the review never finished");
+            }
+
+            /// Review a Task that `configure` has changed, in a fresh repository,
+            /// and return the Task as it ends, whether or not a reviewer ran.
+            async fn settle_review(configure: impl FnOnce(&mut Task)) -> Task {
+                let (repo, base_commit) = git_repo_with_change();
+                settle_review_task(repo.path().to_str().unwrap(), &base_commit, configure).await
+            }
+
+            /// The Worker run a Task was started with, recording the reviewer
+            /// and review mode the run was fixed to.
+            fn started_run(
+                task: &Task,
+                reviewer_model: Option<&str>,
+                review_mode: crate::domain::task::ReviewMode,
+            ) -> crate::domain::task::WorkerHandoff {
+                crate::domain::task::WorkerHandoff {
+                    task_id: task.id,
+                    project_id: task.project_id,
+                    repository_id: None,
+                    run: Some(1),
+                    branch: Some("task".to_string()),
+                    start_head: None,
+                    stage: crate::domain::task::WorkerHandoffStage::Started {},
+                    review_mode,
+                    reviewer_model: reviewer_model.map(str::to_string),
+                    review_mode_unproven: false,
+                    acceptance: None,
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_automatic_review_without_a_reviewer_starts_none_and_is_not_approved() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
+                let task = settle_review(|t| t.reviewer_model = None).await;
+
+                assert!(
+                    mock.args().is_empty(),
+                    "no reviewer may start without a configured model: {:?}",
+                    mock.args()
+                );
+                let signoff = task
+                    .qa_signoff
+                    .expect("the skip is recorded on the signoff");
+                assert_eq!(signoff.status, QaStatus::Rejected);
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|issue| issue.contains("No AI reviewer model was configured")),
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    task.activity.iter().any(|entry| matches!(
+                        &entry.kind,
+                        ActivityKind::AiReviewSkipped { reason, .. }
+                            if reason.contains("No AI reviewer model was configured")
+                    )),
+                    "{:?}",
+                    task.activity
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_reviewer_runs_on_the_exact_model_requested_whatever_the_worker_model() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
+                let task = review_task(&mock, |t| {
+                    t.model = "haiku".to_string();
+                    t.reviewer_model = Some("claude-opus-4-6".to_string());
+                })
+                .await;
+
+                let signoff = task.qa_signoff.expect("a signoff");
+                assert_eq!(signoff.status, QaStatus::Approved);
+                assert_eq!(
+                    model_of(&mock.review_args()),
+                    Some("claude-opus-4-6".to_string())
+                );
+                // The Worker's model and the reviewer's are separate choices.
+                assert_eq!(task.model, "haiku");
+                assert_eq!(task.last_observed_model, None);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_manual_run_starts_no_reviewer_even_with_one_configured() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
+                let task = settle_review(|t| {
+                    t.reviewer_model = Some("sonnet".to_string());
+                    let run =
+                        started_run(t, Some("sonnet"), crate::domain::task::ReviewMode::Manual);
+                    t.worker_handoff = Some(run);
+                })
+                .await;
+
+                assert!(mock.args().is_empty(), "{:?}", mock.args());
+                assert!(task.qa_signoff.is_none(), "{:?}", task.qa_signoff);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_opencode_worker_with_a_configured_claude_reviewer_is_reviewed() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
+                let task = review_task(&mock, |t| {
+                    t.provider = crate::domain::task::CodingProvider::OpenCode;
+                    t.model = "ollama/llama3.2:3b".to_string();
+                    t.reviewer_model = Some("sonnet".to_string());
+                })
+                .await;
+
+                let signoff = task.qa_signoff.expect("a signoff");
+                assert_eq!(signoff.status, QaStatus::Approved);
+                assert_eq!(model_of(&mock.review_args()), Some("sonnet".to_string()));
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_started_run_keeps_the_reviewer_it_started_with() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
+                let task = review_task(&mock, |t| {
+                    // Cleared after the run started: the run's own record decides.
+                    t.reviewer_model = None;
+                    let run = started_run(
+                        t,
+                        Some("sonnet"),
+                        crate::domain::task::ReviewMode::Automatic,
+                    );
+                    t.worker_handoff = Some(run);
+                })
+                .await;
+
+                assert_eq!(model_of(&mock.review_args()), Some("sonnet".to_string()));
+                assert_eq!(task.reviewer_model, None);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_run_started_without_a_reviewer_does_not_adopt_one_chosen_later() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
+                let task = settle_review(|t| {
+                    let run = started_run(t, None, crate::domain::task::ReviewMode::Automatic);
+                    t.worker_handoff = Some(run);
+                    // Chosen after the run started.
+                    t.reviewer_model = Some("opus".to_string());
+                })
+                .await;
+
+                assert!(mock.args().is_empty(), "{:?}", mock.args());
+                let signoff = task
+                    .qa_signoff
+                    .expect("the skip is recorded on the signoff");
+                assert_eq!(signoff.status, QaStatus::Rejected);
             }
 
             fn run(success: bool, output: &str) -> AgentRun {
@@ -18224,10 +18458,10 @@ VERDICT: APPROVED"
                 );
                 assert_eq!(model_of(&mock.fix_args()), Some("haiku".to_string()));
 
-                // The reviewer is not part of this change: it still names no
-                // model. Review-model selection is a separate decision.
+                // The reviewer runs on its own configured model, not the
+                // Worker's: here the Worker is haiku and the reviewer sonnet.
                 assert!(!mock.review_args().is_empty(), "the reviewer ran");
-                assert_eq!(model_of(&mock.review_args()), None);
+                assert_eq!(model_of(&mock.review_args()), Some("sonnet".to_string()));
 
                 // What the fix agent reported ("m") is evidence of nothing the
                 // Task records: the configuration is untouched, and no
@@ -18302,6 +18536,9 @@ VERDICT: APPROVED"
                 })
                 .await;
 
+                // The configured Claude reviewer still reviews the OpenCode Task,
+                // on its own model. Only the fix agent is refused.
+                assert_eq!(model_of(&mock.review_args()), Some("sonnet".to_string()));
                 assert!(mock.fix_args().is_empty(), "no fix agent was launched");
                 assert_eq!(mock.fix_prompt(), "", "the fix agent read nothing");
                 let signoff = task.qa_signoff.clone().expect("a signoff");
@@ -19299,6 +19536,7 @@ VERDICT: APPROVED"
             let mut task =
                 reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
             task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                reviewer_model: None,
                 review_mode: Default::default(),
                 task_id: task.id,
                 project_id: task.project_id,
@@ -21614,6 +21852,7 @@ VERDICT: APPROVED"
                 let task = tasks.get_mut(&w.task_id).unwrap();
                 task.status = TaskStatus::InProgress;
                 task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                    reviewer_model: None,
                     review_mode: Default::default(),
                     task_id: w.task_id,
                     project_id: w.project_id,
@@ -22116,6 +22355,7 @@ VERDICT: APPROVED"
                     task.branch_name = Some(branch.clone());
                     task.record_activity(ActivityKind::RunStarted { run: 1, addressing_feedback: false });
                     task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                        reviewer_model: None,
                         review_mode: Default::default(),
                         task_id: id,
                         project_id: task.project_id,
@@ -24447,6 +24687,7 @@ VERDICT: APPROVED"
 
         fn handoff(task: &Task, stage: WorkerHandoffStage) -> WorkerHandoff {
             WorkerHandoff {
+                reviewer_model: None,
                 review_mode: Default::default(),
                 task_id: task.id,
                 project_id: task.project_id,
@@ -25788,6 +26029,7 @@ VERDICT: APPROVED"
             let evidence = fx.evidence().await;
             fx.executor.tasks.write().await.get_mut(&fx.task_id).unwrap().worker_handoff =
                 Some(crate::domain::task::WorkerHandoff {
+                    reviewer_model: None,
                     review_mode: Default::default(),
                     task_id: fx.task_id,
                     project_id: fx.project_id,
@@ -25816,6 +26058,7 @@ VERDICT: APPROVED"
             );
             task.record_activity_at(completed_at, ActivityKind::RunCompleted { run: 1 });
             task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                reviewer_model: None,
                 review_mode: Default::default(),
                 task_id: fx.task_id,
                 project_id: fx.project_id,

@@ -893,6 +893,7 @@ fn mark_worker_recovery_required(task: &mut Task, run: Option<u32>, reason: &str
                 observed_commit: observed_commit.clone(),
             },
             review_mode_unproven: true,
+            reviewer_model: None,
         });
     handoff.run = run.or(handoff.run);
     handoff.stage = domain::task::WorkerHandoffStage::RecoveryRequired {
@@ -1674,6 +1675,7 @@ mod tests {
                 acceptance: None,
                 review_mode: run_mode,
                 review_mode_unproven: false,
+                reviewer_model: None,
                 stage: domain::task::WorkerHandoffStage::Started {},
             });
             // The Task is then edited to the other mode before recovery.
@@ -1735,6 +1737,7 @@ mod tests {
                 commit: "b".repeat(40),
             },
             review_mode_unproven: false,
+            reviewer_model: None,
         });
 
         assert!(!migrate_task(&mut task));
@@ -1921,6 +1924,7 @@ mod tests {
             acceptance: None,
             stage: domain::task::WorkerHandoffStage::ResolvedToAiReview { commit },
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         // Recorded location no longer exists -- the trigger for adoption.
         task.worktree_path = Some(

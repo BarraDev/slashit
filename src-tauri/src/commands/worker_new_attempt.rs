@@ -743,6 +743,7 @@ mod tests {
                 observed_commit: None,
             },
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         task.record_activity(ActivityKind::RunStarted {
             run: 1,
@@ -980,6 +981,7 @@ mod tests {
             acceptance: None,
             stage: WorkerHandoffStage::Started {},
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         fx.state
             .task
@@ -1356,6 +1358,7 @@ mod tests {
                 acceptance: None,
                 stage: WorkerHandoffStage::Started {},
                 review_mode_unproven: false,
+                reviewer_model: None,
             });
         })
         .await;

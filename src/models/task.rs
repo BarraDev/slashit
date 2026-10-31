@@ -102,6 +102,10 @@ pub struct Task {
     /// Automatic.
     #[serde(default)]
     pub review_mode: ReviewMode,
+    /// The AI Reviewer model as configured. Absent when no reviewer is chosen,
+    /// and then an automatic AI Review does not start.
+    #[serde(default)]
+    pub reviewer_model: Option<String>,
     /// Evidence only: the model the provider last reported for a run. It never
     /// changes `model`, the configured policy.
     #[serde(default)]
@@ -264,6 +268,9 @@ pub struct WorkerHandoff {
     /// Absent on older records and for Automatic runs.
     #[serde(default, skip_serializing_if = "ReviewMode::is_default")]
     pub review_mode: ReviewMode,
+    /// Mirrors the backend field: the AI Reviewer model the run started with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
     /// Mirrors the backend field: the run's record was rebuilt without its
     /// evidence, so `review_mode` is not what the run started under.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1179,6 +1186,7 @@ mod tests {
             start_head: None,
             review_mode: ReviewMode::Manual,
             review_mode_unproven: false,
+            reviewer_model: None,
             stage: WorkerHandoffStage::Started {},
             acceptance: None,
         };
@@ -1201,6 +1209,7 @@ mod tests {
             start_head: None,
             review_mode: ReviewMode::Manual,
             review_mode_unproven: true,
+            reviewer_model: None,
             stage: WorkerHandoffStage::RecoveryRequired {
                 reason: "run record lost".to_string(),
                 observed_commit: None,

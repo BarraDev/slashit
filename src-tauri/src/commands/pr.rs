@@ -17280,6 +17280,7 @@ mod recovery_admission_tests {
                 observed_commit: None,
             },
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         let id = task.id;
         state.task.tasks.write().await.insert(id, task.clone());

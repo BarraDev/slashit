@@ -149,6 +149,7 @@ mod tests {
         let mut task = Task::new_backlog(
             &existing,
             NewTask {
+                reviewer_model: None,
                 id: Uuid::new_v4(),
                 project_id,
                 title: title.to_string(),

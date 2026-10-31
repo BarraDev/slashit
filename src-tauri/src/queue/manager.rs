@@ -248,6 +248,7 @@ mod tests {
                 worker_handoff: None,
                 worker_handoff_confirmed: false,
                 last_observed_model: None,
+                reviewer_model: None,
                 new_attempt: None,
                 new_attempt_confirmed: false,
                 approved_execution: None,

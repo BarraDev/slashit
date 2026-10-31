@@ -71,6 +71,8 @@ pub struct CreateTaskParams {
     pub title: String,
     pub description: Option<String>,
     pub model: String,
+    /// The AI Reviewer model. Empty or absent leaves no reviewer configured.
+    pub reviewer_model: Option<String>,
     pub planning_mode: bool,
     pub dependencies: Vec<String>,
     pub category: Option<TaskCategory>,
@@ -91,6 +93,9 @@ pub async fn create_task(
 ) -> Result<Task, String> {
     let project_id = Uuid::parse_str(&params.project_id).map_err(|e| e.to_string())?;
     let dependencies = crate::domain::task_dependencies::parse_requested(&params.dependencies)?;
+    let reviewer_model = crate::domain::task::parse_reviewer_model(
+        params.reviewer_model.as_deref().unwrap_or_default(),
+    )?;
     let id = Uuid::new_v4();
     // Checked against every Task first, so a Task of another Project is named
     // as such. The write checks again against the Tasks it stages.
@@ -107,6 +112,7 @@ pub async fn create_task(
         title: params.title,
         description: params.description,
         model: params.model,
+        reviewer_model,
         planning_mode: params.planning_mode,
         dependencies: dependencies.clone(),
         category: params.category.unwrap_or_default(),
@@ -646,6 +652,9 @@ pub struct UpdateTaskParams {
     pub impact: Option<TaskImpact>,
     pub security_severity: Option<SecuritySeverity>,
     pub model: Option<String>,
+    /// The AI Reviewer model. Applied only when given; an empty value clears
+    /// it, and then no automatic AI Review starts for the Task's next run.
+    pub reviewer_model: Option<String>,
     /// The coding Worker for the Task. Applied only when given, so an edit
     /// that does not name it leaves the Task's provider as it was.
     pub provider: Option<CodingProvider>,
@@ -663,8 +672,17 @@ pub async fn update_task(
     params: UpdateTaskParams,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&params.task_id).map_err(|e| e.to_string())?;
+    // Refused before anything is written, so a bad reviewer leaves the Task as it was.
+    let reviewer_model = params
+        .reviewer_model
+        .as_deref()
+        .map(crate::domain::task::parse_reviewer_model)
+        .transpose()?;
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
+            if let Some(reviewer_model) = reviewer_model.clone() {
+                task.reviewer_model = reviewer_model;
+            }
             if let Some(t) = params.title.clone() {
                 task.title = t;
             }
@@ -2161,6 +2179,7 @@ mod lifecycle_ownership {
                     },
                     acceptance: None,
                     review_mode_unproven: false,
+                    reviewer_model: None,
                 });
             }
             // A fixed, old timestamp: any rewrite of the record moves it.
@@ -2791,6 +2810,7 @@ mod queue_entry_from_a_status_move {
             stage: WorkerHandoffStage::Started {},
             acceptance: None,
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         let (project_id, task_id) = seed(&state, task).await;
         let executor = crate::test_helpers::attach_test_executor(&state);
@@ -2946,6 +2966,7 @@ mod task_dependency_contract {
             GuiMutation::untracked(),
             app.state(),
             CreateTaskParams {
+                reviewer_model: None,
                 project_id: project_id.to_string(),
                 title: "Dependent".to_string(),
                 description: None,
@@ -3111,6 +3132,7 @@ mod task_dependency_contract {
             GuiMutation::untracked(),
             app.state(),
             UpdateTaskParams {
+                reviewer_model: None,
                 task_id: legacy.id.to_string(),
                 title: Some("renamed".to_string()),
                 description: None,

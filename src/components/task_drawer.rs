@@ -831,6 +831,7 @@ mod tests {
             start_head: None,
             review_mode: run_mode,
             review_mode_unproven: unproven,
+            reviewer_model: None,
             stage: WorkerHandoffStage::Started,
             acceptance: None,
         });

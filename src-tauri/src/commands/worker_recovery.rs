@@ -1017,6 +1017,8 @@ mod tests {
         task.worktree_path = Some(checkout.to_string_lossy().to_string());
         task.phase = TaskPhase::Idle;
         task.error_message = Some("interrupted".into());
+        // The run started with a reviewer, so an accepted result can be reviewed.
+        task.reviewer_model = Some("sonnet".to_string());
         task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
             review_mode: Default::default(),
             task_id: task.id,
@@ -1031,6 +1033,7 @@ mod tests {
                 observed_commit: None,
             },
             review_mode_unproven: false,
+            reviewer_model: Some("sonnet".to_string()),
         });
         task.record_activity(ActivityKind::RunStarted {
             run: 1,
@@ -2689,6 +2692,7 @@ mod tests {
                 observed_commit: None,
             },
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         task.worker_handoff_confirmed = true;
         let decision = WorkerResultAcceptance {

@@ -172,6 +172,8 @@ async fn handle_create_task(
         title,
         description,
         model: "default".to_string(),
+        // No reviewer is chosen by this command; a person sets one on the Task.
+        reviewer_model: None,
         planning_mode: false,
         dependencies: Vec::new(),
         category: Default::default(),
@@ -1357,6 +1359,7 @@ mod lifecycle_ownership {
             stage: crate::domain::WorkerHandoffStage::Started {},
             acceptance: None,
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         let task_id = seed_task(&ctx, task).await;
         let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
@@ -1424,6 +1427,7 @@ mod lifecycle_ownership {
                     },
                     acceptance: None,
                     review_mode_unproven: false,
+                    reviewer_model: None,
                 });
             }
             // A fixed, old timestamp: any rewrite of the record moves it.
