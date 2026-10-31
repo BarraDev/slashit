@@ -1334,7 +1334,9 @@ impl ClaudeRunner {
         first.unwrap_or_else(|| self.event_tx.subscribe())
     }
 
-    /// Get the accumulated text output from all TextDelta and Result events.
+    /// Get the accumulated text output: streamed text deltas, assistant text
+    /// blocks and the `result` text. A final answer can appear in more than one
+    /// of these, so this is not the answer. See [`Self::final_result_text`].
     pub async fn get_output(&self) -> String {
         self.accumulated_output.read().await.clone()
     }
@@ -3049,6 +3051,30 @@ mod tests {
             .get_output()
             .await
             .contains("Worker changed the requested file"));
+    }
+
+    /// The AI Reviewer's case: the answer is streamed as assistant text and then
+    /// repeated by the `result` event. The authoritative answer is that result,
+    /// once. The accumulated output still holds the text, as it always has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_authoritative_answer_is_the_result_event_once() {
+        const ANSWER: &str =
+            "Review done.\n- ISSUE: [high] a.rs:1 - broken\nVERDICT: CHANGES_REQUESTED";
+        let fixture = Fixture::new("assistant_and_result");
+        let runner = fixture.start().await;
+        assert_eq!(bounded("assistant and result", &runner).await, Ok(true));
+        assert_eq!(runner.final_result_text().await, Ok(ANSWER.to_string()));
+        assert!(runner.get_output().await.contains(ANSWER));
+    }
+
+    /// A clean exit with no `result` event has no authoritative answer, even
+    /// when assistant text was streamed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_without_a_result_event_has_no_authoritative_answer() {
+        let fixture = Fixture::new("assistant_only");
+        let runner = fixture.start().await;
+        assert_eq!(bounded("assistant only", &runner).await, Ok(true));
+        assert!(runner.final_result_text().await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

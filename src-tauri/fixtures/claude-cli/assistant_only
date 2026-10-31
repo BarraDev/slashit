@@ -1,0 +1,6 @@
+#!/bin/sh
+# Streams an assistant text block, then exits 0 with no `result` event.
+cat > /dev/null
+printf '{"type":"system","subtype":"init","session_id":"s-partial","model":"fixture-model"}\n'
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"Looks good.\\nVERDICT: APPROVED"}]}}\n'
+exit 0
