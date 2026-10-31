@@ -20,6 +20,7 @@ use crate::components::task_live::{
     format_elapsed, output_provenance, project_run, DrawerActions, OutputProvenance, RefreshGate,
     RunBadge, StartRequest,
 };
+use crate::components::pr_publication::PublishToPrPanel;
 use crate::components::task_review::{AiReviewSection, HumanReviewPanel};
 use crate::components::toast;
 use crate::models::{AgentStatus, LogLevel, Task, TaskPhase, TaskRunSnapshot, TaskStatus};
@@ -548,6 +549,11 @@ pub fn TaskDrawer(
 
                     // Its pull request, when it has one.
                     <PullRequestSection task_id=task_id task=task now=now refresh_tasks=refresh_tasks />
+
+                    // Publishing a commit to that pull request: its own decision, never an approval.
+                    <Show when=move || task.with(|t| t.as_ref().is_some_and(|t| t.pr_url.is_some() && t.branch_name.is_some()))>
+                        <PublishToPrPanel task_id=task_id task=task refresh_tasks=refresh_tasks />
+                    </Show>
 
                     // How the task got here.
                     <TaskActivity task=task />

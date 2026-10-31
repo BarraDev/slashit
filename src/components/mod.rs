@@ -9,6 +9,7 @@ pub mod project_tabs;
 pub mod kanban;
 pub mod new_work_pause;
 pub mod task_card;
+pub mod pr_publication;
 pub mod pr_status;
 pub mod restack_published;
 pub mod task_activity;

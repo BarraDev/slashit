@@ -206,6 +206,14 @@ fn full_task(project_id: Uuid) -> Task {
     });
     task.base_commit = Some(commit('d'));
     task.branch_origin = Some(BranchOrigin::DefaultBase { branch: Some("main".into()) });
+    task.pr_publication = Some(crate::domain::publication::PrPublication::pending(
+        Uuid::new_v4(),
+        commit('e'),
+        "task-branch".into(),
+        "https://github.com/BarraDev/slashit/pull/1".into(),
+        Some(commit('f')),
+        chrono::Utc::now(),
+    ));
     task.pending_republish = Some(PendingRepublish {
         parent_branch: "parent".into(),
         parent_pr: 7,

@@ -244,3 +244,21 @@ pub async fn discard_published_restack(task_id: String) -> Result<(), String> {
     invoke("discard_published_restack", args).await?;
     Ok(())
 }
+
+/// Publish exactly `commit` to the task's existing pull request. The backend
+/// revalidates the commit, the branch and the pull request before it pushes.
+/// Publication never approves the task.
+pub async fn publish_task_to_pr(
+    task_id: String,
+    commit: String,
+    pr_url: String,
+) -> Result<crate::models::PrPublication, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "taskId": task_id,
+        "commit": commit,
+        "prUrl": pr_url,
+    }))
+    .unwrap();
+    let response = invoke("publish_task_to_pr", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}

@@ -16,6 +16,9 @@ use uuid::Uuid;
 mod republish;
 pub use republish::{RepublishOutcome, RepublishStatus};
 
+mod publication;
+pub use publication::*;
+
 /// Parse a GitHub PR URL into an ExternalRef::GithubPr
 fn parse_pr_url_to_ref(pr_url: &str) -> Option<ExternalRef> {
     let parts: Vec<&str> = pr_url.trim_end_matches('/').split('/').collect();
