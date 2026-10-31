@@ -105,7 +105,7 @@ pub fn bulk_pr_failure_message(outcomes: &[BulkPrOutcome]) -> Option<String> {
             format!("\"{}\": {}", name, o.error.as_deref().unwrap_or_default())
         })
         .collect();
-    Some(format!("{} created, {} not created. {}", created, failed.len(), reasons.join(" ")))
+    Some(format!("{} completed, {} did not finish. {}", created, failed.len(), reasons.join(" ")))
 }
 
 #[cfg(test)]
@@ -135,7 +135,7 @@ mod bulk_pr_tests {
         ];
         assert_eq!(
             bulk_pr_failure_message(&outcomes).as_deref(),
-            Some("1 created, 1 not created. \"Unreviewed change\": awaiting a Human Review decision")
+            Some("1 completed, 1 did not finish. \"Unreviewed change\": awaiting a Human Review decision")
         );
     }
 
@@ -144,7 +144,7 @@ mod bulk_pr_tests {
         let outcomes = [outcome("task-7", "", None, Some("no branch"))];
         assert_eq!(
             bulk_pr_failure_message(&outcomes).as_deref(),
-            Some("0 created, 1 not created. \"task-7\": no branch")
+            Some("0 completed, 1 did not finish. \"task-7\": no branch")
         );
     }
 }

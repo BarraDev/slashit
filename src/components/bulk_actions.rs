@@ -61,15 +61,16 @@ pub fn BulkActions(
                             on_bulk_complete.run(());
                         }
                         Some(message) => {
-                            // A mixed selection is not a success. The tasks that were
-                            // refused stay selected, and the reasons are shown here; the
-                            // ones that got a pull request are no longer selected.
-                            let refused: Vec<Uuid> = outcomes
+                            // A mixed selection is not a success. Only the tasks that
+                            // completed leave the selection; the refused ones stay selected
+                            // and their reasons are shown here. Selection changes the person
+                            // made while the request ran are kept.
+                            let completed: Vec<Uuid> = outcomes
                                 .iter()
-                                .filter(|o| o.error.is_some())
+                                .filter(|o| o.error.is_none())
                                 .filter_map(|o| Uuid::parse_str(&o.task_id).ok())
                                 .collect();
-                            set_selected_tasks.set(refused);
+                            set_selected_tasks.update(|selected| selected.retain(|id| !completed.contains(id)));
                             set_error_msg.set(Some(message));
                         }
                     },
@@ -237,7 +238,7 @@ pub fn BulkActions(
                 </Show>
 
                 <Show when=move || error_msg.get().is_some()>
-                    <span class="text-sm text-red-300 max-w-xl whitespace-normal">{move || error_msg.get().unwrap_or_default()}</span>
+                    <span class="text-sm text-red-300 max-w-xl max-h-40 overflow-y-auto whitespace-normal">{move || error_msg.get().unwrap_or_default()}</span>
                 </Show>
             </div>
         </Show>
