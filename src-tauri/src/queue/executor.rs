@@ -690,7 +690,9 @@ fn fix_outcome(outcome: Result<Option<AgentRun>, String>) -> FixOutcome {
 
 /// The model the review-fix agent runs on: the Task's own configured model,
 /// as its coding Worker was launched with it, or why no fix agent can start.
-/// `Ok(None)` is the Task's explicit request for the provider default.
+/// `Ok(None)` is the Task's explicit request for the provider default, which
+/// the provider chooses and which is not necessarily an economical model. The
+/// model is the one requested, an alias included: the provider resolves it.
 ///
 /// The fix agent runs on Claude for every Task. A model that only OpenCode
 /// can run is not one Claude can take, and starting the fix agent without it
@@ -7630,10 +7632,10 @@ impl TaskExecutor {
                             level: LogLevel::Info,
                             message: match &fix_model {
                                 Some(model) => format!(
-                                    "The fix agent runs on {model}, the Task's configured model"
+                                    "The fix agent is asked to run on {model}, the Task's configured model; the provider resolves it"
                                 ),
                                 None => "The fix agent runs on the provider's default model, as \
-                                         the Task is configured"
+                                         the Task is configured; the provider chooses it"
                                     .to_string(),
                             },
                         });

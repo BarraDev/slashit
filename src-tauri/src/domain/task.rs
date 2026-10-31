@@ -1179,7 +1179,10 @@ impl Task {
     /// the provider's default (an empty or `"default"` `model`), otherwise the
     /// configured identifier, unchanged. It reads `model` only, never
     /// `last_observed_model`. The identifier is the provider's to interpret,
-    /// so this does not check that it is one.
+    /// so this does not check that it is one, and an alias such as `haiku` is
+    /// not resolved to a concrete model here: it is the model requested, and
+    /// the provider reports the one that ran. `None` names no model, so it
+    /// does not promise an economical one.
     pub fn configured_model(&self) -> Option<&str> {
         match self.model.as_str() {
             "" | "default" => None,
