@@ -117,32 +117,60 @@ pub fn build_task_prompt(task: &Task, project_path: Option<&str>) -> String {
 /// executor's choice, not the Task's definition), so a field the prompt starts
 /// to carry is covered without a second list to keep in step. The prompt's
 /// wording is part of the hash, so changing it makes a pending, unapproved
-/// proposal refuse safely and need a new proposal.
+/// proposal refuse safely and need a new proposal. The prompt does not carry
+/// the AI Reviewer, so under Automatic review a configured reviewer is hashed
+/// in as well (see [`reviewer_identity`]).
 pub fn task_input_digest(task: &Task) -> String {
     use sha2::{Digest, Sha256};
     let prompt = build_task_prompt(task, None);
+    if let Some(reviewer) = reviewer_identity(task) {
+        return framed_digest(
+            b"slashit.task-input.v4\0",
+            &[prompt.as_bytes(), provider_name(provider_identity(task)), AUTOMATIC_REVIEW, reviewer.as_bytes()],
+        );
+    }
     match (provider_identity(task), review_identity(task)) {
         // The default provider and mode keep the digest they always had, so an
         // approval recorded for a default Task still matches.
         (None, None) => hex::encode(Sha256::digest(prompt.as_bytes())),
         (Some(provider), None) => {
-            let mut hasher = Sha256::new();
-            hasher.update(b"slashit.task-input.v2\0");
-            for field in [prompt.as_bytes(), provider.as_bytes()] {
-                hasher.update((field.len() as u64).to_be_bytes());
-                hasher.update(field);
-            }
-            hex::encode(hasher.finalize())
+            framed_digest(b"slashit.task-input.v2\0", &[prompt.as_bytes(), provider.as_bytes()])
         }
-        (provider, Some(review)) => {
-            let mut hasher = Sha256::new();
-            hasher.update(b"slashit.task-input.v3\0");
-            for field in [prompt.as_bytes(), provider_name(provider), review.as_bytes()] {
-                hasher.update((field.len() as u64).to_be_bytes());
-                hasher.update(field);
-            }
-            hex::encode(hasher.finalize())
-        }
+        (provider, Some(review)) => framed_digest(
+            b"slashit.task-input.v3\0",
+            &[prompt.as_bytes(), provider_name(provider), review.as_bytes()],
+        ),
+    }
+}
+
+/// A SHA-256 over a version `domain` and then each field, every field prefixed
+/// with its length, so no field's bytes can be read as the boundary of another.
+fn framed_digest(domain: &[u8], fields: &[&[u8]]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// The review name an automatic review is given in a digest that covers its
+/// AI Reviewer. Manual is named by [`review_identity`] instead.
+const AUTOMATIC_REVIEW: &[u8] = b"automatic";
+
+/// The AI Reviewer model an approval is bound to. An automatic review starts on
+/// this model, so under Automatic review a configured reviewer is part of the
+/// input a person approved: changing it, adding one or clearing it after
+/// approval refuses the start until the input is approved again. Under Manual
+/// review no reviewer starts, so a configured one is dormant and not input.
+/// An unset reviewer is absent here, so an approval given with none keeps the
+/// digest it had.
+fn reviewer_identity(task: &Task) -> Option<&str> {
+    match task.review_mode {
+        crate::domain::task::ReviewMode::Automatic => task.reviewer_model.as_deref(),
+        crate::domain::task::ReviewMode::Manual => None,
     }
 }
 
@@ -182,33 +210,38 @@ fn provider_name(provider: Option<&'static str>) -> &'static [u8] {
 /// which the run's launch uses. For a non-default Worker it also covers that
 /// Worker, so a Task whose Worker changed after approval no longer matches.
 /// Each field is length-prefixed, so no field's bytes can be read as the
-/// boundary of another.
+/// boundary of another. Under Automatic review with a configured AI Reviewer it
+/// also covers that reviewer, as [`task_input_digest`] does.
 pub fn approved_input_digest(task: &Task, approved_request: Option<&str>) -> String {
-    use sha2::{Digest, Sha256};
     let Some(request) = approved_request else {
         return task_input_digest(task);
     };
     let rendered = build_run_prompt(task, None, Some(request));
-    let mut fields: Vec<&[u8]> = vec![rendered.as_bytes(), task.model.as_bytes(), request.as_bytes()];
-    let domain: &[u8] = match (provider_identity(task), review_identity(task)) {
-        (None, None) => b"slashit.execute-request.v1\0",
-        (Some(provider), None) => {
-            fields.push(provider.as_bytes());
-            b"slashit.execute-request.v2\0"
-        }
-        (provider, Some(review)) => {
-            fields.push(provider_name(provider));
-            fields.push(review.as_bytes());
-            b"slashit.execute-request.v3\0"
-        }
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    for field in fields {
-        hasher.update((field.len() as u64).to_be_bytes());
-        hasher.update(field);
+    let (rendered, model, request) = (rendered.as_bytes(), task.model.as_bytes(), request.as_bytes());
+    if let Some(reviewer) = reviewer_identity(task) {
+        return framed_digest(
+            b"slashit.execute-request.v4\0",
+            &[
+                rendered,
+                model,
+                request,
+                provider_name(provider_identity(task)),
+                AUTOMATIC_REVIEW,
+                reviewer.as_bytes(),
+            ],
+        );
     }
-    hex::encode(hasher.finalize())
+    match (provider_identity(task), review_identity(task)) {
+        (None, None) => framed_digest(b"slashit.execute-request.v1\0", &[rendered, model, request]),
+        (Some(provider), None) => framed_digest(
+            b"slashit.execute-request.v2\0",
+            &[rendered, model, request, provider.as_bytes()],
+        ),
+        (provider, Some(review)) => framed_digest(
+            b"slashit.execute-request.v3\0",
+            &[rendered, model, request, provider_name(provider), review.as_bytes()],
+        ),
+    }
 }
 
 /// The coding prompt for one run: the Task's own prompt, plus the additional
@@ -1076,5 +1109,80 @@ mod tests {
         task.human_review.record_arrival();
         task.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
         assert!(!build_task_prompt(&task, None).contains("Human Review Feedback"));
+    }
+
+    /// An approval names the reviewer an automatic review will run on. A change
+    /// of that reviewer after approval refuses the start, for an ordinary
+    /// approval and for an approved request, under each Worker.
+    #[test]
+    fn a_reviewer_changed_after_approval_refuses_the_start_for_each_worker_and_request() {
+        use crate::domain::task::{ApprovedExecution, CodingProvider, ReviewMode};
+        for provider in [CodingProvider::Claude, CodingProvider::OpenCode] {
+            for request in [None, Some("extra")] {
+                let mut task = create_test_task("Reviewer bound");
+                task.provider = provider;
+                task.review_mode = ReviewMode::Automatic;
+                task.reviewer_model = Some("sonnet".into());
+                let binding = ApprovedExecution {
+                    approval_id: Uuid::new_v4(),
+                    digest: approved_input_digest(&task, request),
+                    for_run: task.next_run(),
+                    request: request.map(str::to_string),
+                    checkout: None,
+                };
+                task.approved_execution = Some(binding.clone());
+                let case = format!("{provider:?} with request {request:?}");
+                assert_eq!(check_approved_input(&task), ApprovedInputCheck::Matches, "{case}");
+
+                let mut upgraded = task.clone();
+                upgraded.reviewer_model = Some("opus".into());
+                assert_eq!(check_approved_input(&upgraded), ApprovedInputCheck::Differs, "{case}: replaced");
+
+                let mut cleared = task.clone();
+                cleared.reviewer_model = None;
+                assert_eq!(check_approved_input(&cleared), ApprovedInputCheck::Differs, "{case}: cleared");
+
+                // The approval is not an authorization of a provider default:
+                // an unset reviewer is a different input from the one approved.
+                let mut unset_at_approval = task.clone();
+                unset_at_approval.reviewer_model = None;
+                unset_at_approval.approved_execution = Some(ApprovedExecution {
+                    digest: approved_input_digest(&unset_at_approval, request),
+                    ..binding
+                });
+                let mut chosen = unset_at_approval.clone();
+                chosen.reviewer_model = Some("sonnet".into());
+                assert_eq!(check_approved_input(&chosen), ApprovedInputCheck::Differs, "{case}: added");
+            }
+        }
+    }
+
+    /// Under Manual review no reviewer starts, so a reviewer configured for it
+    /// is dormant. Changing it after approval changes nothing the run does, so
+    /// the approval still matches. Switching to Automatic is still a change.
+    #[test]
+    fn a_dormant_reviewer_under_manual_review_is_not_part_of_the_approval() {
+        use crate::domain::task::{ApprovedExecution, ReviewMode};
+        let mut task = create_test_task("Dormant reviewer");
+        task.review_mode = ReviewMode::Manual;
+        task.reviewer_model = Some("sonnet".into());
+        task.approved_execution = Some(ApprovedExecution {
+            approval_id: Uuid::new_v4(),
+            digest: task_input_digest(&task),
+            for_run: task.next_run(),
+            request: None,
+            checkout: None,
+        });
+        assert_eq!(check_approved_input(&task), ApprovedInputCheck::Matches);
+
+        let mut other = task.clone();
+        other.reviewer_model = Some("opus".into());
+        assert_eq!(check_approved_input(&other), ApprovedInputCheck::Matches);
+        other.reviewer_model = None;
+        assert_eq!(check_approved_input(&other), ApprovedInputCheck::Matches);
+
+        let mut automatic = task.clone();
+        automatic.review_mode = ReviewMode::Automatic;
+        assert_eq!(check_approved_input(&automatic), ApprovedInputCheck::Differs);
     }
 }

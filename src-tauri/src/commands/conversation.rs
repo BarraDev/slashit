@@ -1262,6 +1262,7 @@ mod tests {
         let mut task = crate::domain::Task::new_backlog(
             &existing,
             crate::domain::NewTask {
+                reviewer_model: None,
                 id: Uuid::new_v4(),
                 project_id,
                 title: "Task".into(),
@@ -1538,6 +1539,7 @@ mod tests {
                     observed_commit: None,
                 },
                 review_mode_unproven: false,
+                reviewer_model: None,
             });
             let task_id = task.id;
             state.task.tasks.write().await.insert(task_id, task.clone());

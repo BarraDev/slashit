@@ -459,6 +459,7 @@ mod tests {
         let mut task = Task::new_backlog(
             &HashMap::new(),
             NewTask {
+                reviewer_model: None,
                 id: Uuid::new_v4(),
                 project_id,
                 title: title.into(),

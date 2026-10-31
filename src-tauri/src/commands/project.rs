@@ -2025,6 +2025,7 @@ mod tests {
         // A Task whose record lands mid-transaction: plain, or owing durable
         // work, per `owed`.
         let new = crate::domain::NewTask {
+            reviewer_model: None,
             id: Uuid::new_v4(),
             project_id: id,
             title: "Born during the deletion".into(),
@@ -2962,6 +2963,7 @@ mod tests {
 
         let recreated = crate::lifecycle::create(&gate, &tasks, &projects, &storage, id, |existing| {
             let tags = crate::domain::NewTask {
+                reviewer_model: None,
                 id: Uuid::new_v4(),
                 project_id: id,
                 title: "Too late".to_string(),

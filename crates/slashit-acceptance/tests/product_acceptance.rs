@@ -63,6 +63,8 @@ mod human_review;
 mod local_first;
 #[path = "product_acceptance/manual_review.rs"]
 mod manual_review;
+#[path = "product_acceptance/reviewer_policy.rs"]
+mod reviewer_policy;
 #[path = "product_acceptance/local_integration.rs"]
 mod local_integration;
 #[path = "product_acceptance/main_window.rs"]
@@ -2262,6 +2264,9 @@ async fn create_prerequisites(
                 "title": title,
                 "description": description,
                 "model": "default",
+                // These journeys exercise the automatic AI Review, which runs only
+                // on a configured reviewer; a Task without one stops at Human Review.
+                "reviewerModel": "sonnet",
                 "planningMode": false,
                 "dependencies": [],
                 "category": Value::Null,

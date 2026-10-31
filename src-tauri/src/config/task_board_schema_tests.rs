@@ -140,6 +140,7 @@ fn full_task(project_id: Uuid) -> Task {
     task.last_observed_model = Some("observed".into());
     task.provider = crate::domain::task::CodingProvider::OpenCode;
     task.review_mode = crate::domain::task::ReviewMode::Manual;
+    task.reviewer_model = Some("sonnet".into());
     task.dependencies = vec![Uuid::new_v4()];
     task.worktree_id = Some(Uuid::new_v4());
     task.jj_change_id = Some("change".into());
@@ -315,6 +316,7 @@ fn full_task(project_id: Uuid) -> Task {
             decided_at: at(11),
         }),
         review_mode_unproven: true,
+        reviewer_model: Some("sonnet".into()),
     });
     task.new_attempt = Some(NewAttemptDecision {
         decision_id: Uuid::new_v4(),
@@ -362,6 +364,7 @@ fn variant_tasks(project_id: Uuid) -> Vec<Task> {
             stage,
             acceptance: None,
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         task
     };

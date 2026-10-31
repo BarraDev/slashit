@@ -144,6 +144,13 @@ pub struct Task {
     /// that already started.
     #[serde(default, skip_serializing_if = "ReviewMode::is_default")]
     pub review_mode: ReviewMode,
+    /// The Claude model the AI Reviewer runs on, as requested. `None` means no
+    /// reviewer is configured, so an automatic AI Review does not start:
+    /// nothing falls back to the CLI's default model. Each run keeps the value
+    /// it started with on its [`WorkerHandoff`]. Reviews run on Claude for
+    /// every Worker in this version. See [`parse_reviewer_model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
     /// The model the provider most recently reported for one of this Task's
     /// runs. It is evidence of what ran, never configuration: approvals,
     /// proposals and launches read `model` only. `None` until a run reports a
@@ -427,6 +434,12 @@ pub struct WorkerHandoff {
     /// started under. A handoff written before this field existed is Automatic.
     #[serde(default, skip_serializing_if = "ReviewMode::is_default")]
     pub review_mode: ReviewMode,
+    /// The AI Reviewer model this run was started with, fixed with
+    /// `review_mode` at the run's start boundary. `None` means no reviewer was
+    /// configured for the run, including a record written before this field
+    /// existed, so an automatic review of that run does not start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
     /// Set when this record was rebuilt for a run whose own record was lost, so
     /// `review_mode` is not evidence of the mode the run started under. Such a
     /// run is held in Manual review, and no automatic reviewer starts for it,
@@ -574,6 +587,8 @@ pub struct NewTask {
     pub title: String,
     pub description: Option<String>,
     pub model: String,
+    /// Already validated by [`parse_reviewer_model`].
+    pub reviewer_model: Option<String>,
     pub planning_mode: bool,
     pub dependencies: Vec<Uuid>,
     pub category: TaskCategory,
@@ -904,6 +919,7 @@ impl Task {
         let now = chrono::Utc::now();
         Task {
             review_mode: Default::default(),
+            reviewer_model: new.reviewer_model,
             id: new.id,
             project_id: new.project_id,
             title: new.title,
@@ -1737,6 +1753,43 @@ impl ReviewMode {
     }
 }
 
+/// The longest AI Reviewer model identifier a person can save.
+const MAX_REVIEWER_MODEL_LEN: usize = 200;
+
+/// Reads a person's AI Reviewer model choice. An empty value clears the
+/// reviewer, and that Task's automatic AI Review does not start until one is
+/// chosen. Any other value is kept as requested, an alias included: the
+/// provider resolves it, and SlashIt does not.
+///
+/// Refused: the provider default (`"default"`), which would run whatever model
+/// the CLI chose, and a `provider/model` identifier, which only OpenCode can
+/// run. Reviews run on Claude in this version.
+pub fn parse_reviewer_model(requested: &str) -> Result<Option<String>, String> {
+    let model = requested.trim();
+    if model.is_empty() {
+        return Ok(None);
+    }
+    if model.eq_ignore_ascii_case("default") {
+        return Err(
+            "Choose a model for the AI Reviewer. The provider default is not allowed for AI Review, because it is a model nobody chose."
+                .to_string(),
+        );
+    }
+    if model.contains('/') {
+        return Err(format!(
+            "{model} is a provider/model identifier. The AI Reviewer runs on Claude, so it needs a Claude model."
+        ));
+    }
+    // A leading dash would be read by the CLI as one of its own options.
+    if model.starts_with('-')
+        || model.len() > MAX_REVIEWER_MODEL_LEN
+        || model.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("The AI Reviewer model must be a single model identifier.".to_string());
+    }
+    Ok(Some(model.to_string()))
+}
+
 impl CodingProvider {
     /// True for the default provider, which is omitted from stored Tasks.
     pub fn is_default(&self) -> bool {
@@ -2391,6 +2444,7 @@ mod tests {
             stage: WorkerHandoffStage::Started {},
             acceptance: None,
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         assert!(!with_handoff.never_checked_out());
     }
@@ -2565,6 +2619,7 @@ mod tests {
                 observed_commit: None,
             },
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         let decision = NewAttemptDecision {
             decision_id: Uuid::new_v4(),
@@ -2639,6 +2694,7 @@ mod tests {
                 observed_commit: None,
             },
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         assert!(!task.is_ready_to_execute());
         assert_eq!(task.needs_you(false), Some(AttentionReason::Recovery));
@@ -2679,6 +2735,7 @@ mod tests {
                 commit: "b".repeat(40),
             },
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         task.record_activity_at(completed_at, ActivityKind::RunCompleted { run: 1 });
         task.human_review.record_arrival();
@@ -2710,6 +2767,7 @@ mod tests {
                 commit: "b".repeat(40),
             },
             review_mode_unproven: false,
+            reviewer_model: None,
         });
         task.human_review.record_arrival();
         task.human_review.push(
@@ -2865,11 +2923,90 @@ mod tests {
             stage: WorkerHandoffStage::Started {},
             review_mode: ReviewMode::Automatic,
             review_mode_unproven: false,
+            reviewer_model: None,
         };
         let stored = serde_json::to_value(&handoff).unwrap();
         assert!(stored.get("review_mode").is_none(), "a run's default is not written");
         let loaded: WorkerHandoff = serde_json::from_value(stored).unwrap();
         assert_eq!(loaded.review_mode, ReviewMode::Automatic);
+    }
+
+    /// The AI Reviewer model is stored as requested and read back unchanged. An
+    /// unset reviewer is not written, so an unchanged Task keeps its stored
+    /// form, and a record written before the field existed loads with none.
+    #[test]
+    fn a_reviewer_model_round_trips_and_an_unset_one_is_not_stored() {
+        use crate::domain::task::{ReviewMode, WorkerHandoff, WorkerHandoffStage};
+        let task = crate::test_helpers::create_test_task_full(
+            "reviewed",
+            Uuid::new_v4(),
+            TaskStatus::Backlog,
+            0,
+        );
+        let stored = serde_json::to_value(&task).unwrap();
+        assert!(
+            stored.get("reviewer_model").is_none(),
+            "an unset reviewer is not written"
+        );
+        let loaded: Task = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.reviewer_model, None);
+
+        let mut chosen = task.clone();
+        chosen.reviewer_model = Some("claude-opus-4-6".to_string());
+        let stored = serde_json::to_value(&chosen).unwrap();
+        assert_eq!(stored["reviewer_model"], "claude-opus-4-6");
+        let loaded: Task = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.reviewer_model.as_deref(), Some("claude-opus-4-6"));
+
+        let handoff = WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            acceptance: None,
+            stage: WorkerHandoffStage::Started {},
+            review_mode: ReviewMode::Automatic,
+            review_mode_unproven: false,
+            reviewer_model: Some("sonnet".to_string()),
+        };
+        let stored = serde_json::to_value(&handoff).unwrap();
+        assert_eq!(stored["reviewer_model"], "sonnet");
+        let loaded: WorkerHandoff = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.reviewer_model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn a_reviewer_model_is_kept_as_requested_or_refused() {
+        use crate::domain::task::parse_reviewer_model;
+        assert_eq!(parse_reviewer_model("").unwrap(), None);
+        assert_eq!(parse_reviewer_model("  ").unwrap(), None);
+        assert_eq!(
+            parse_reviewer_model(" haiku ").unwrap().as_deref(),
+            Some("haiku")
+        );
+        assert_eq!(
+            parse_reviewer_model("claude-haiku-4-5-20251001")
+                .unwrap()
+                .as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
+        // The provider default would run whatever model the CLI chose.
+        assert!(parse_reviewer_model("default")
+            .unwrap_err()
+            .contains("not allowed"));
+        // A provider/model identifier names an OpenCode model, which Claude cannot run.
+        assert!(parse_reviewer_model("ollama/llama3.2:3b")
+            .unwrap_err()
+            .contains("provider/model"));
+        assert!(parse_reviewer_model("son net").is_err());
+        // A case variant of the provider default is the same default, and a
+        // leading dash would be read by the CLI as one of its options.
+        assert!(parse_reviewer_model("Default").is_err());
+        assert!(parse_reviewer_model("DEFAULT").is_err());
+        assert!(parse_reviewer_model("--permission-mode").is_err());
+        assert!(parse_reviewer_model(&"a".repeat(201)).is_err());
     }
 
     /// A board written before decisions were recorded, with no `human_review`

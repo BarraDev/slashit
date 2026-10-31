@@ -421,6 +421,8 @@ async fn execute(scope: &Scope<'_>, action_id: Uuid, mutation: &TaskMutation) ->
                 title: title.clone(),
                 description: description.clone(),
                 model: project.agent_config.model.unwrap_or_else(|| "sonnet".into()),
+                // No reviewer is chosen here; a person sets one on the Task.
+                reviewer_model: None,
                 planning_mode: false,
                 dependencies: Vec::new(),
                 category: category.clone(),
@@ -785,6 +787,7 @@ mod existing_checkout_tests {
             stage,
             acceptance: None,
             review_mode_unproven: false,
+            reviewer_model: None,
         }
     }
 
@@ -1164,6 +1167,7 @@ mod tests {
                 Task::new_backlog(
                     existing,
                     NewTask {
+                        reviewer_model: None,
                         id: Uuid::new_v4(),
                         project_id,
                         title: title.into(),

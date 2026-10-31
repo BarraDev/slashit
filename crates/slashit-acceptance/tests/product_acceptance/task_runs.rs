@@ -58,6 +58,8 @@ pub(super) async fn create_task(
                 "title": title,
                 "description": "Exercises stacking and checkout recovery.",
                 "model": "default",
+                // An automatic AI Review runs only on a configured reviewer.
+                "reviewerModel": "sonnet",
                 "planningMode": false,
                 "dependencies": dependencies,
                 "category": Value::Null,

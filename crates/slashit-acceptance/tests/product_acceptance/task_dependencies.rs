@@ -107,6 +107,9 @@ async fn create_with_the_form(driver: &WebDriver, title: &str, depends_on: Optio
         let select = ui::visible(driver, DEPENDENCY_SELECT)
             .await
             .context("the Create Task form offers no Depends on control")?;
+        // The form scrolls: the AI Reviewer control sits above this one, so a
+        // person scrolls to it, and the click must not land on the footer.
+        select.scroll_into_view().await?;
         SelectElement::new(&select)
             .await?
             .select_by_partial_text(parent)

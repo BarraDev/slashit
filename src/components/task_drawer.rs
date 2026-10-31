@@ -685,19 +685,24 @@ fn TaskSummary(task: Task) -> impl IntoView {
 /// review mode could not be confirmed (its record was rebuilt) is not
 /// described as Manual: Manual was never chosen for that run. The mode is
 /// read from the run's own record, because the Task's configured mode can be
-/// edited after the run started and then applies only to the next run.
-fn no_ai_review_note(task: &Task) -> &'static str {
+/// edited after the run started and then applies only to the next run. When
+/// the record names a skipped or failed review, its reason is said as well.
+fn no_ai_review_note(task: &Task) -> String {
     let handoff = task.worker_handoff.as_ref();
     let unconfirmed = handoff.is_some_and(|handoff| handoff.review_mode_unproven);
     let manual = handoff.is_some_and(|handoff| {
         handoff.review_mode == crate::models::task::ReviewMode::Manual
     });
     if unconfirmed {
-        "No AI Review ran for these changes. Their review mode could not be confirmed, so AI Review was withheld. Nothing has been approved by AI."
+        "No AI Review ran for these changes. Their review mode could not be confirmed, so AI Review was withheld. Nothing has been approved by AI.".to_string()
     } else if manual {
-        "No AI Review ran: Manual review mode is selected. Inspect the changes yourself; nothing has been approved."
+        "No AI Review ran: Manual review mode is selected. Inspect the changes yourself; nothing has been approved.".to_string()
+    } else if let Some(summary) =
+        crate::components::task_review::no_verdict_summary(None, &task.activity)
+    {
+        format!("{summary} Nothing has been approved by AI.")
     } else {
-        "No AI Review ran for these changes. Nothing has been approved by AI."
+        "No AI Review ran for these changes. Nothing has been approved by AI.".to_string()
     }
 }
 
@@ -831,6 +836,7 @@ mod tests {
             start_head: None,
             review_mode: run_mode,
             review_mode_unproven: unproven,
+            reviewer_model: None,
             stage: WorkerHandoffStage::Started,
             acceptance: None,
         });

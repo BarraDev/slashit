@@ -4245,6 +4245,7 @@ mod tests {
                 },
                 acceptance: None,
                 review_mode_unproven: false,
+                reviewer_model: None,
             });
         })
         .await;
@@ -4292,6 +4293,7 @@ mod tests {
                         },
                         acceptance: None,
                         review_mode_unproven: false,
+                        reviewer_model: None,
                     });
                 }
             };

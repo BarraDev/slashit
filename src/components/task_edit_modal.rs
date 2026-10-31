@@ -45,6 +45,8 @@ pub fn TaskEditModal(
     let (model, set_model) = signal("default".to_string());
     let (provider, set_provider) = signal(CodingProvider::Claude);
     let (review_mode, set_review_mode) = signal(ReviewMode::Automatic);
+    // The AI Reviewer model as a text value; empty means no reviewer is chosen.
+    let (reviewer_model, set_reviewer_model) = signal(String::new());
     let (planning_mode, set_planning_mode) = signal(false);
 
     // The Depends on choice: at most one Task of this Project. The form keeps
@@ -112,6 +114,7 @@ pub fn TaskEditModal(
                     set_model.set("default".to_string());
                     set_provider.set(CodingProvider::Claude);
                     set_review_mode.set(ReviewMode::Automatic);
+                    set_reviewer_model.set(String::new());
                     set_planning_mode.set(false);
                     set_title_touched.set(false);
                     dependency.set(None);
@@ -124,6 +127,7 @@ pub fn TaskEditModal(
                     set_model.set(task.model.clone());
                     set_provider.set(task.provider);
                     set_review_mode.set(task.review_mode);
+                    set_reviewer_model.set(task.reviewer_model.clone().unwrap_or_default());
                     set_planning_mode.set(task.planning_mode);
                     set_title_touched.set(true); // Already has content
                     dependency.set(task.dependencies.first().copied());
@@ -429,6 +433,52 @@ pub fn TaskEditModal(
                             }}
                         </div>
 
+                        // AI Reviewer: the Claude model an automatic AI Review runs on. None is
+                        // chosen by default, so no reviewer starts until a person picks one.
+                        <div>
+                            <label for="task-ai-reviewer-select" class="block text-sm font-medium text-white/70 mb-1.5">"AI Reviewer (Claude)"</label>
+                            <select
+                                id="task-ai-reviewer-select"
+                                on:change=move |ev| set_reviewer_model.set(event_target_value(&ev))
+                                class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                                disabled=move || submitting.get()
+                            >
+                                {move || {
+                                    let current = reviewer_model.get();
+                                    let mut items = vec![ModelInfo {
+                                        id: String::new(),
+                                        name: "Not chosen: AI Review will not run".to_string(),
+                                        alias: None,
+                                    }];
+                                    // The provider default is not a reviewer choice.
+                                    items.extend(available_models.get().into_iter().filter(|m| m.id != "default"));
+                                    // A configured reviewer stays selectable when the list lacks it, so
+                                    // saving this form cannot clear it by accident.
+                                    if !current.is_empty() && !items.iter().any(|m| m.id == current) {
+                                        items.push(ModelInfo {
+                                            id: current.clone(),
+                                            name: format!("{current} (configured)"),
+                                            alias: None,
+                                        });
+                                    }
+                                    items.iter().map(|m| {
+                                        let id = m.id.clone();
+                                        let name = m.name.clone();
+                                        let selected = id == current;
+                                        view! {
+                                            <option value=id selected=selected>{name}</option>
+                                        }
+                                    }).collect::<Vec<_>>()
+                                }}
+                            </select>
+                            <p class="mt-1 text-xs text-white/50">
+                                {move || match review_mode.get() {
+                                    ReviewMode::Automatic => "AI Review runs on this Claude model after each coding run, whichever Worker ran it. Without one, a finished run waits in Human Review and no reviewer starts.",
+                                    ReviewMode::Manual => "Manual review runs no AI Review, so this model is not used.",
+                                }}
+                            </p>
+                        </div>
+
                         // Depends on
                         <DependencyField
                             candidates=dependency_options
@@ -527,6 +577,7 @@ pub fn TaskEditModal(
                                     let priority_val = priority.get();
                                     let provider_val = provider.get();
                                     let review_mode_val = review_mode.get();
+                                    let reviewer_val = reviewer_model.get();
                                     // OpenCode saves the provider/model id typed in the form, so a
                                     // Claude model left in the form is never saved with it.
                                     let model_val = if provider_val == CodingProvider::OpenCode {
@@ -557,6 +608,7 @@ pub fn TaskEditModal(
                                                     title: title_val,
                                                     description: if description_val.is_empty() { None } else { Some(description_val) },
                                                     model: model_val,
+                                                    reviewer_model: Some(reviewer_val),
                                                     planning_mode: planning_val,
                                                     dependencies: requested(dependency_val),
                                                     category: Some(category_val),
@@ -586,6 +638,7 @@ pub fn TaskEditModal(
                                                     impact: None,
                                                     security_severity: None,
                                                     model: Some(model_val),
+                                                    reviewer_model: Some(reviewer_val),
                                                     provider: Some(provider_val),
                                                     review_mode: Some(review_mode_val),
                                                     planning_mode: Some(planning_val),
