@@ -243,14 +243,19 @@ struct AgentRun {
     success: bool,
     /// Why the run did not succeed, when the runner said.
     failure: Option<String>,
-    output: String,
+    /// The run's authoritative final answer (its `result` event), or why there
+    /// is none. A verdict and its findings are read from this alone: the
+    /// streamed output repeats the answer, so it is never read as one.
+    final_answer: Result<String, String>,
 }
 
 /// What the AI reviewer concluded.
 #[derive(Debug, PartialEq, Eq)]
 enum ReviewVerdict {
     Approved,
-    ChangesRequested,
+    /// The authoritative answer asks for changes. Its text is the only source
+    /// of the findings.
+    ChangesRequested(String),
     /// No verdict: the run failed, or it ended without one.
     Failed(String),
 }
@@ -276,9 +281,11 @@ fn final_verdict_is_approved(output: &str) -> bool {
         })
 }
 
-/// The verdict of a reviewer run. Only a successful run whose final verdict
-/// line says `VERDICT: APPROVED` (and that requests no changes) approves; a
-/// failed run, or one with no verdict at all, is [`ReviewVerdict::Failed`].
+/// The verdict of a reviewer run, read from its authoritative answer only. A
+/// successful run whose answer's final verdict line says `VERDICT: APPROVED`
+/// (and that requests no changes) approves. A failed run, a run with no usable
+/// answer, or an answer with no verdict is [`ReviewVerdict::Failed`]: progress
+/// text is never a verdict.
 fn review_verdict(run: &AgentRun) -> ReviewVerdict {
     if !run.success {
         let reason = run
@@ -287,11 +294,19 @@ fn review_verdict(run: &AgentRun) -> ReviewVerdict {
             .unwrap_or_else(|| "the reviewer run did not succeed".to_string());
         return ReviewVerdict::Failed(reason);
     }
-    if run.output.contains("CHANGES_REQUESTED") {
-        ReviewVerdict::ChangesRequested
-    } else if final_verdict_is_approved(&run.output) {
+    let answer = match &run.final_answer {
+        Ok(answer) => answer,
+        Err(reason) => {
+            return ReviewVerdict::Failed(format!(
+                "the reviewer gave no authoritative answer: {reason}"
+            ))
+        }
+    };
+    if answer.contains("CHANGES_REQUESTED") {
+        ReviewVerdict::ChangesRequested(answer.clone())
+    } else if final_verdict_is_approved(answer) {
         ReviewVerdict::Approved
-    } else if run.output.trim().is_empty() {
+    } else if answer.trim().is_empty() {
         ReviewVerdict::Failed("the reviewer produced no output".to_string())
     } else {
         ReviewVerdict::Failed("the reviewer gave no verdict".to_string())
@@ -6790,9 +6805,11 @@ impl TaskExecutor {
             result = runner.wait() => {
                 let success = matches!(result, Ok(true));
                 let failure = result.err();
-                let output = runner.get_output().await;
+                // Read after `wait()`, which has drained the stream, so the
+                // answer is complete. Only the AI Reviewer reads it.
+                let final_answer = runner.final_result_text().await;
                 let _ = runner.kill().await;
-                Ok(Some(AgentRun { success, failure, output }))
+                Ok(Some(AgentRun { success, failure, final_answer }))
             }
             _ = cancelled.changed() => {
                 let _ = runner.kill().await;
@@ -7528,12 +7545,12 @@ impl TaskExecutor {
                     Ok(None) => AgentRun {
                         success: false,
                         failure: None,
-                        output: String::new(),
+                        final_answer: Err("the reviewer was cancelled".to_string()),
                     },
                     Err(e) => AgentRun {
                         success: false,
                         failure: Some(format!("the reviewer could not start: {e}")),
-                        output: String::new(),
+                        final_answer: Err("the reviewer did not start".to_string()),
                     },
                 }
             };
@@ -7593,9 +7610,9 @@ impl TaskExecutor {
 
             // A reviewer run that failed, or ended without a verdict, has
             // not reviewed anything, and must not read as a pass.
-            let has_claude_issues = match review_verdict(&claude_result) {
-                ReviewVerdict::ChangesRequested => true,
-                ReviewVerdict::Approved => false,
+            let (has_claude_issues, claude_answer) = match review_verdict(&claude_result) {
+                ReviewVerdict::ChangesRequested(answer) => (true, answer),
+                ReviewVerdict::Approved => (false, String::new()),
                 ReviewVerdict::Failed(reason) => {
                     let message =
                         format!("AI review failed, so the change is not approved: {reason}");
@@ -7633,7 +7650,6 @@ impl TaskExecutor {
                     return;
                 }
             };
-            let claude_result = claude_result.output;
 
             // Merge findings
             let has_coderabbit_issues = !coderabbit_result.is_empty()
@@ -7652,7 +7668,7 @@ impl TaskExecutor {
                 let mut findings = String::new();
                 if has_claude_issues {
                     findings.push_str("### Claude Code Review\n");
-                    findings.push_str(&claude_result);
+                    findings.push_str(&claude_answer);
                     findings.push('\n');
                 }
                 if has_coderabbit_issues {
@@ -17723,6 +17739,18 @@ mod tests {
         mod verdict_gate {
             use super::*;
 
+            /// How the review run's stream ends. `AssistantAndResult` is the
+            /// production shape: the answer as assistant text, then the same
+            /// answer as the `result` event.
+            #[derive(Clone, Copy, Debug)]
+            enum ReviewStream {
+                ResultOnly,
+                AssistantAndResult,
+                AssistantOnly,
+                MalformedResult,
+                ErrorResult,
+            }
+
             struct MockReviewer {
                 _tmp: tempfile::TempDir,
                 args_file: std::path::PathBuf,
@@ -17751,7 +17779,19 @@ mod tests {
                     fix_result: &str,
                     fix_exit: i32,
                 ) -> Self {
-                    Self::build(result, exit, fix_result, fix_exit, "", false)
+                    Self::build(result, exit, fix_result, fix_exit, "", false, ReviewStream::ResultOnly)
+                }
+
+                /// Like [`Self::install_with_fixer`], with the review run's
+                /// stream shaped as `stream`.
+                fn install_streaming(
+                    stream: ReviewStream,
+                    result: &str,
+                    exit: i32,
+                    fix_result: &str,
+                    fix_exit: i32,
+                ) -> Self {
+                    Self::build(result, exit, fix_result, fix_exit, "", false, stream)
                 }
 
                 /// A reviewer that asks for changes and a fix agent that
@@ -17767,6 +17807,7 @@ mod tests {
                         0,
                         &format!("{before_fix}\nprintf 'fixed\\n' > review-fix.txt\n"),
                         without_jj,
+                        ReviewStream::ResultOnly,
                     )
                 }
 
@@ -17777,6 +17818,7 @@ mod tests {
                     fix_exit: i32,
                     fix_script: &str,
                     without_jj: bool,
+                    stream: ReviewStream,
                 ) -> Self {
                     let tmp = tempfile::tempdir().expect("tempdir");
                     let bin_dir = tmp.path().join("bin");
@@ -17788,6 +17830,19 @@ mod tests {
                     let fix_prompt_file = tmp.path().join("fix.prompt");
                     let result_json = serde_json::to_string(result).unwrap();
                     let fix_result_json = serde_json::to_string(fix_result).unwrap();
+                    let assistant_line = format!(
+                        "printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":{result_json}}}]}}}}'\n"
+                    );
+                    let result_line = format!(
+                        "printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":{result_json}}}'\n"
+                    );
+                    let review_stream = match stream {
+                        ReviewStream::ResultOnly => result_line,
+                        ReviewStream::AssistantAndResult => format!("{assistant_line}{result_line}"),
+                        ReviewStream::AssistantOnly => assistant_line,
+                        ReviewStream::MalformedResult => "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\"}'\n".to_string(),
+                        ReviewStream::ErrorResult => "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"s\",\"result\":\"the model refused\"}'\n".to_string(),
+                    };
                     let script = format!(
                         "#!/bin/sh\n\
                          for a in \"$@\"; do printf '%s\\n' \"$a\" >> {args:?}; done\n\
@@ -17797,7 +17852,7 @@ mod tests {
                          *\" --restricted \"*)\n\
                          for a in \"$@\"; do printf '%s\\n' \"$a\" >> {review_args:?}; done\n\
                          cat > {review_prompt:?}\n\
-                         printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":{result_json}}}'\n\
+                         {review_stream}\
                          exit {exit} ;;\n\
                          esac\n\
                          for a in \"$@\"; do printf '%s\\n' \"$a\" >> {fix_args:?}; done\n\
@@ -17811,6 +17866,7 @@ mod tests {
                         review_prompt = review_prompt_file,
                         fix_prompt = fix_prompt_file,
                         fix_edit = fix_script,
+                        review_stream = review_stream,
                     );
                     let bin = bin_dir.join("claude");
                     std::fs::write(&bin, &script).unwrap();
@@ -18150,7 +18206,7 @@ mod tests {
                 AgentRun {
                     success,
                     failure: None,
-                    output: output.to_string(),
+                    final_answer: Ok(output.to_string()),
                 }
             }
 
@@ -18170,7 +18226,7 @@ VERDICT: APPROVED"
                         "VERDICT: CHANGES_REQUESTED
 - ISSUE: [high] a:1 - b"
                     )),
-                    ReviewVerdict::ChangesRequested
+                    ReviewVerdict::ChangesRequested("VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a:1 - b".into())
                 );
                 assert!(matches!(
                     review_verdict(&run(false, "VERDICT: APPROVED")),
@@ -18210,6 +18266,31 @@ VERDICT: APPROVED"
                 assert_eq!(
                     review_verdict(&failed),
                     ReviewVerdict::Failed("exit 2".into())
+                );
+            }
+
+            /// The verdict and its findings come from the authoritative answer
+            /// alone. Progress text that approves is not a verdict when no
+            /// answer exists, and an answer decides whatever the output says.
+            #[test]
+            fn the_verdict_is_read_from_the_authoritative_answer_alone() {
+                let no_answer = AgentRun {
+                    final_answer: Err("Claude completed without an authoritative result event".into()),
+                    ..run(true, "Looks good.\nVERDICT: APPROVED")
+                };
+                assert!(matches!(
+                    review_verdict(&no_answer),
+                    ReviewVerdict::Failed(reason) if reason.contains("no authoritative answer")
+                ));
+                let answered = AgentRun {
+                    final_answer: Ok("VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a:1 - b".into()),
+                    ..run(true, "VERDICT: APPROVED")
+                };
+                assert_eq!(
+                    review_verdict(&answered),
+                    ReviewVerdict::ChangesRequested(
+                        "VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a:1 - b".into()
+                    )
                 );
             }
 
@@ -18316,6 +18397,112 @@ VERDICT: APPROVED"
                     "{:?}",
                     signoff.issues_found
                 );
+            }
+
+            /// The production stream repeats the answer as assistant text and
+            /// again as the `result` event. One ISSUE is one finding: it is
+            /// counted once, persisted once and given to the fix agent once.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_review_answer_streamed_twice_yields_one_finding() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_streaming(
+                    ReviewStream::AssistantAndResult,
+                    "VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a.rs:1 - broken",
+                    0,
+                    "Fixed everything.",
+                    0,
+                );
+                let task = review_task(&mock, |_| {}).await;
+                let signoff = task.qa_signoff.clone().expect("the review records a signoff");
+                assert_eq!(signoff.status, QaStatus::FixesApplied, "{:?}", signoff.issues_found);
+                assert_eq!(
+                    signoff.issues_found,
+                    vec!["- ISSUE: [high] a.rs:1 - broken".to_string()],
+                    "one ISSUE is one persisted finding"
+                );
+                let fix_prompt = mock.fix_prompt();
+                assert_eq!(
+                    fix_prompt.matches("- ISSUE: [high] a.rs:1 - broken").count(),
+                    1,
+                    "the fix agent gets the finding once: {fix_prompt}"
+                );
+                assert_eq!(
+                    fix_prompt.matches("VERDICT: CHANGES_REQUESTED").count(),
+                    1,
+                    "the fix agent gets the review once: {fix_prompt}"
+                );
+                assert!(
+                    task.activity.iter().any(|e| matches!(
+                        e.kind,
+                        slashit_activity::Kind::AiReviewChangesRequested { issues: 1, .. }
+                    )),
+                    "the timeline counts one issue: {:?}",
+                    task.activity
+                );
+            }
+
+            /// An approval in progress text is not a verdict when the run has
+            /// no `result` event. The review fails closed and starts no fix.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_review_with_no_result_event_is_not_approved() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_streaming(
+                    ReviewStream::AssistantOnly,
+                    "Looks good.\nVERDICT: APPROVED",
+                    0,
+                    "",
+                    0,
+                );
+                let task = review_task(&mock, |_| {}).await;
+                let signoff = task.qa_signoff.clone().expect("a failed review records a signoff");
+                assert_eq!(signoff.status, QaStatus::Rejected, "{:?}", signoff.issues_found);
+                assert!(
+                    signoff.issues_found.iter().any(|i| i.contains("no authoritative answer")),
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert_eq!(task.status, TaskStatus::HumanReview);
+                assert!(mock.fix_prompt().is_empty(), "no fix agent runs after a failed review");
+            }
+
+            /// A malformed or Claude-level error `result` is a failed review,
+            /// never an approval and never a finding.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_review_with_an_unusable_result_event_is_a_failed_review() {
+                let _path_guard = PATH_LOCK.lock().await;
+                for stream in [ReviewStream::MalformedResult, ReviewStream::ErrorResult] {
+                    let mock = MockReviewer::install_streaming(stream, "VERDICT: APPROVED", 0, "", 0);
+                    let signoff = review_once(&mock).await;
+                    assert_eq!(
+                        signoff.status,
+                        QaStatus::Rejected,
+                        "{stream:?}: {:?}",
+                        signoff.issues_found
+                    );
+                    assert!(
+                        signoff.issues_found.iter().any(|i| i.starts_with("AI review failed")),
+                        "{stream:?}: {:?}",
+                        signoff.issues_found
+                    );
+                }
+            }
+
+            /// An approval streamed as assistant text and repeated by the
+            /// `result` event approves once and starts no fix agent.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approval_streamed_as_text_and_result_approves_without_a_fix() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_streaming(
+                    ReviewStream::AssistantAndResult,
+                    "Looks good.\nVERDICT: APPROVED",
+                    0,
+                    "",
+                    0,
+                );
+                let signoff = review_once(&mock).await;
+                assert_eq!(signoff.status, QaStatus::Approved, "{:?}", signoff.issues_found);
+                assert!(signoff.issues_found.is_empty());
+                assert!(mock.fix_prompt().is_empty());
             }
 
             #[tokio::test(flavor = "multi_thread")]
