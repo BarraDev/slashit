@@ -6843,6 +6843,10 @@ impl TaskExecutor {
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // A dropped review future (an aborted task, a runtime shutdown)
+            // must not leave the CLI running. Cancellation kills it explicitly
+            // below; this covers the paths where the future is simply dropped.
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(c) => c,
