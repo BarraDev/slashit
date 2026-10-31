@@ -189,6 +189,13 @@ pub fn TaskCard(
             // Review status - compact and clean
             {show_review.then(|| view! {
                 <div class="mt-2.5 pt-2.5 border-t border-white/[0.04] space-y-1.5">
+                    {crate::components::task_review::no_verdict_label(&task.activity)
+                        .filter(|_| task_status_in_review && task.qa_signoff.is_none())
+                        .map(|label| view! {
+                            <div data-testid="task-card-no-verdict" class="flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-md bg-white/[0.06] text-white/60">
+                                <span>{label}</span>
+                            </div>
+                        })}
                     {task.qa_signoff.as_ref().map(|qa| view! {
                         <div class=format!(
                             "flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-md {}",

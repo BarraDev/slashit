@@ -130,6 +130,45 @@ pub fn ai_review_label(status: &QaStatus) -> &'static str {
     }
 }
 
+/// What the record says about a Human Review that has no AI verdict, in one
+/// sentence. `None` when there is a verdict, or the record names no skip or
+/// failure. The reason is shown as the record kept it.
+pub fn no_verdict_summary(
+    signoff: Option<&QaSignoff>,
+    activity: &[slashit_activity::Entry],
+) -> Option<String> {
+    if signoff.is_some() {
+        return None;
+    }
+    match slashit_activity::no_verdict(activity)? {
+        slashit_activity::NoVerdict::Skipped(reason) => {
+            Some(format!("AI review was skipped: {}", as_sentence(reason)))
+        }
+        slashit_activity::NoVerdict::Failed(reason) => {
+            Some(format!("AI review failed: {}", as_sentence(reason)))
+        }
+    }
+}
+
+/// A short card label for a Human Review with no AI verdict.
+pub fn no_verdict_label(activity: &[slashit_activity::Entry]) -> Option<&'static str> {
+    match slashit_activity::no_verdict(activity)? {
+        slashit_activity::NoVerdict::Skipped(_) => Some("AI review skipped"),
+        slashit_activity::NoVerdict::Failed(_) => Some("AI review failed"),
+    }
+}
+
+/// The reason with a closing full stop, so it reads as the end of a sentence
+/// whichever way the record phrased it.
+fn as_sentence(text: &str) -> String {
+    let text = text.trim();
+    if text.ends_with(['.', '!', '?']) {
+        text.to_string()
+    } else {
+        format!("{text}.")
+    }
+}
+
 /// The AI review of the changes under review, if one ran.
 #[component]
 pub fn AiReviewSection(signoff: QaSignoff) -> impl IntoView {
@@ -594,6 +633,10 @@ pub fn HumanReviewPanel(
                             <code class="font-mono text-white/70">{tip}</code>
                         </p>
                     })}
+                // Why there is no AI verdict, when the record says why.
+                {move || task.with(|t| t.as_ref().and_then(|t| no_verdict_summary(t.qa_signoff.as_ref(), &t.activity))).map(|summary| view! {
+                    <p data-testid="human-review-ai-status" class="text-xs text-amber-200/80">{summary}</p>
+                })}
                 // A Manual run has no AI review on record, so only a recorded
                 // review is named as a check.
                 <p data-testid="human-review-test-evidence" class="text-xs text-white/50">
@@ -963,6 +1006,53 @@ mod tests {
         let created = Delivery::Created { url: Some("u".into()) };
         assert_eq!(created.clone().or_answer(Some(&failed)), created, "a recorded PR wins");
         assert_eq!(Delivery::Checking.or_answer(None), Delivery::Checking);
+    }
+
+    #[test]
+    fn a_skipped_or_failed_review_is_named_as_such_and_never_as_a_rejection() {
+        let mut entries = Vec::new();
+        slashit_activity::record(
+            &mut entries,
+            chrono::Utc::now(),
+            slashit_activity::Kind::RunStarted {
+                run: 1,
+                addressing_feedback: false,
+            },
+        );
+        slashit_activity::record(
+            &mut entries,
+            chrono::Utc::now(),
+            slashit_activity::Kind::AiReviewSkipped {
+                review: 1,
+                reason: "no reviewer model was configured".into(),
+            },
+        );
+        assert_eq!(
+            no_verdict_summary(None, &entries).as_deref(),
+            Some("AI review was skipped: no reviewer model was configured.")
+        );
+        assert_eq!(no_verdict_label(&entries), Some("AI review skipped"));
+        assert_eq!(
+            no_verdict_summary(Some(&signoff(QaStatus::Rejected, &[])), &entries),
+            None,
+            "a recorded verdict is never replaced by the skip text"
+        );
+
+        let mut failed = Vec::new();
+        slashit_activity::record(
+            &mut failed,
+            chrono::Utc::now(),
+            slashit_activity::Kind::AiReviewFailed {
+                review: 1,
+                reason: "the task's changes could not be read: git exited 128.".into(),
+            },
+        );
+        assert_eq!(
+            no_verdict_summary(None, &failed).as_deref(),
+            Some("AI review failed: the task's changes could not be read: git exited 128.")
+        );
+        assert_eq!(no_verdict_label(&failed), Some("AI review failed"));
+        assert_eq!(no_verdict_summary(None, &[]), None, "no record, no claim");
     }
 
     #[test]

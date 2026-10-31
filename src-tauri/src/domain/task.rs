@@ -1769,7 +1769,7 @@ pub fn parse_reviewer_model(requested: &str) -> Result<Option<String>, String> {
     if model.is_empty() {
         return Ok(None);
     }
-    if model == "default" {
+    if model.eq_ignore_ascii_case("default") {
         return Err(
             "Choose a model for the AI Reviewer. The provider default is not allowed for AI Review, because it is a model nobody chose."
                 .to_string(),
@@ -1780,7 +1780,9 @@ pub fn parse_reviewer_model(requested: &str) -> Result<Option<String>, String> {
             "{model} is a provider/model identifier. The AI Reviewer runs on Claude, so it needs a Claude model."
         ));
     }
-    if model.len() > MAX_REVIEWER_MODEL_LEN
+    // A leading dash would be read by the CLI as one of its own options.
+    if model.starts_with('-')
+        || model.len() > MAX_REVIEWER_MODEL_LEN
         || model.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return Err("The AI Reviewer model must be a single model identifier.".to_string());
@@ -2999,6 +3001,11 @@ mod tests {
             .unwrap_err()
             .contains("provider/model"));
         assert!(parse_reviewer_model("son net").is_err());
+        // A case variant of the provider default is the same default, and a
+        // leading dash would be read by the CLI as one of its options.
+        assert!(parse_reviewer_model("Default").is_err());
+        assert!(parse_reviewer_model("DEFAULT").is_err());
+        assert!(parse_reviewer_model("--permission-mode").is_err());
         assert!(parse_reviewer_model(&"a".repeat(201)).is_err());
     }
 

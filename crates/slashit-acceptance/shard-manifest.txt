@@ -89,3 +89,6 @@
 # Run now from a Queue card and the drawer: one journey with a full-queue refusal and a double click.
 2	run_now::run_now_refuses_a_full_queue_by_keyboard_and_runs_a_queued_task_once_by_double_click
 2	terminal_lifecycle::hiding_keeps_a_terminal_running_and_closing_or_quitting_ends_it
+3	reviewer_policy::a_task_created_in_the_editor_keeps_the_reviewer_chosen
+3	reviewer_policy::a_refused_reviewer_through_the_command_changes_no_task
+3	reviewer_policy::an_automatic_task_without_a_reviewer_stops_at_human_review_and_says_why

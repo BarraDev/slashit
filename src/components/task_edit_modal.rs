@@ -436,7 +436,7 @@ pub fn TaskEditModal(
                         // AI Reviewer: the Claude model an automatic AI Review runs on. None is
                         // chosen by default, so no reviewer starts until a person picks one.
                         <div>
-                            <label class="block text-sm font-medium text-white/70 mb-1.5">"AI Reviewer"</label>
+                            <label class="block text-sm font-medium text-white/70 mb-1.5">"AI Reviewer (Claude)"</label>
                             <select
                                 on:change=move |ev| set_reviewer_model.set(event_target_value(&ev))
                                 class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
@@ -472,7 +472,7 @@ pub fn TaskEditModal(
                             </select>
                             <p class="mt-1 text-xs text-white/50">
                                 {move || match review_mode.get() {
-                                    ReviewMode::Automatic => "AI Review runs on this model after each coding run. Without one, a finished run waits in Human Review and no reviewer starts.",
+                                    ReviewMode::Automatic => "AI Review runs on this Claude model after each coding run, whichever Worker ran it. Without one, a finished run waits in Human Review and no reviewer starts.",
                                     ReviewMode::Manual => "Manual review runs no AI Review, so this model is not used.",
                                 }}
                             </p>

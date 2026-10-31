@@ -3010,6 +3010,23 @@ mod task_dependency_contract {
         assert_eq!(disk["dependencies"], serde_json::json!([parent.id]));
     }
 
+    /// A create request that names neither keeps the defaults, as before.
+    #[tokio::test]
+    async fn a_create_request_without_a_worker_or_mode_keeps_the_defaults() {
+        let project_id = Uuid::new_v4();
+        let (_tmp, _paths, app) = app_with(vec![], &[project_id]).await;
+
+        let created = create(&app, project_id, vec![])
+            .await
+            .expect("the Task is created");
+
+        assert_eq!(created.provider, CodingProvider::Claude);
+        assert_eq!(
+            created.review_mode,
+            crate::domain::task::ReviewMode::Automatic
+        );
+    }
+
     #[tokio::test]
     async fn a_new_task_refuses_each_bad_request_and_writes_nothing() {
         let project_id = Uuid::new_v4();
@@ -3118,6 +3135,77 @@ mod task_dependency_contract {
         let error = set(&app, running.id, vec![parent.id]).await.expect_err("a checkout exists");
         assert!(error.contains("checkout"), "{error}");
         assert_eq!(both_copies(&app, project_id, running.id).await, before);
+    }
+
+    /// A reviewer the command refuses leaves the Task, in memory and on the
+    /// board, as it was, and a run already started keeps the reviewer it
+    /// started with. A valid change then applies to the Task but not to that run.
+    #[tokio::test]
+    async fn a_refused_reviewer_leaves_the_task_and_its_started_run_unchanged() {
+        let project_id = Uuid::new_v4();
+        // A resolved run is history; an unresolved one would refuse every edit.
+        let mut running = task(project_id, "running", TaskStatus::Backlog, vec![]);
+        running.reviewer_model = Some("sonnet".to_string());
+        running.worker_handoff = Some(crate::domain::WorkerHandoff {
+            review_mode: Default::default(),
+            task_id: running.id,
+            project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            stage: crate::domain::WorkerHandoffStage::ResolvedToAiReview {
+                commit: "0000000".to_string(),
+            },
+            acceptance: None,
+            review_mode_unproven: false,
+            reviewer_model: Some("sonnet".to_string()),
+        });
+        let (_tmp, _paths, app) = app_with(vec![running.clone()], &[project_id]).await;
+        let before = both_copies(&app, project_id, running.id).await;
+        let edit = |reviewer: &str| UpdateTaskParams {
+            task_id: running.id.to_string(),
+            title: None,
+            description: None,
+            category: None,
+            priority: None,
+            complexity: None,
+            impact: None,
+            security_severity: None,
+            model: None,
+            reviewer_model: Some(reviewer.to_string()),
+            provider: None,
+            review_mode: None,
+            planning_mode: None,
+        };
+
+        for refused in ["default", "ollama/llama3.2:3b", "sonnet\nopus"] {
+            let error = update_task(GuiMutation::untracked(), app.state(), edit(refused))
+                .await
+                .expect_err(refused);
+            assert!(
+                !error.is_empty(),
+                "{refused:?} must be refused with a reason"
+            );
+            assert_eq!(
+                both_copies(&app, project_id, running.id).await,
+                before,
+                "a refused reviewer {refused:?} must leave the Task and the board unchanged"
+            );
+        }
+
+        update_task(GuiMutation::untracked(), app.state(), edit("opus"))
+            .await
+            .expect("a valid reviewer is written")
+            .expect("the task exists");
+        let (memory, disk) = both_copies(&app, project_id, running.id).await;
+        assert_eq!(memory["reviewer_model"], "opus");
+        assert_eq!(disk["reviewer_model"], "opus");
+        assert_eq!(
+            memory["worker_handoff"]["reviewer_model"], "sonnet",
+            "the started run keeps the reviewer it started with"
+        );
+        assert_eq!(disk["worker_handoff"]["reviewer_model"], "sonnet");
     }
 
     #[tokio::test]

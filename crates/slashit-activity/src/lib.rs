@@ -248,7 +248,8 @@ pub enum Kind {
         review: u32,
         issues: u32,
     },
-    /// The reviewer could not produce a verdict.
+    /// The review could not produce a verdict: the reviewer failed, or the
+    /// changes it was to review could not be read.
     AiReviewFailed {
         review: u32,
         reason: String,
@@ -568,6 +569,33 @@ pub fn next_review(entries: &[Entry]) -> u32 {
         .max()
         .unwrap_or(0)
         .saturating_add(1)
+}
+
+/// Why the latest run ended in Human Review with no AI verdict, when its
+/// record says so. Only the current run counts: an earlier run's outcome
+/// describes other changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoVerdict<'a> {
+    /// No review ran; the reason is the one recorded at the skip.
+    Skipped(&'a str),
+    /// A review was attempted and produced no verdict.
+    Failed(&'a str),
+}
+
+/// The no-verdict outcome of the latest run, read from its own entries, or
+/// `None` when the run recorded no skip or failure, or reached a verdict.
+pub fn no_verdict(entries: &[Entry]) -> Option<NoVerdict<'_>> {
+    for entry in entries.iter().rev() {
+        match &entry.kind {
+            Kind::AiReviewSkipped { reason, .. } => return Some(NoVerdict::Skipped(reason)),
+            Kind::AiReviewFailed { reason, .. } => return Some(NoVerdict::Failed(reason)),
+            Kind::AiReviewApproved { .. }
+            | Kind::AiReviewChangesRequested { .. }
+            | Kind::RunStarted { .. } => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Read a task's entries leniently: an entry this version does not

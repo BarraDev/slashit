@@ -7275,12 +7275,8 @@ impl TaskExecutor {
                 level: LogLevel::Warn,
                 message: format!("AI review skipped: {reason}"),
             });
-            let signoff = QaSignoff {
-                status: QaStatus::Rejected,
-                issues_found: vec![format!("AI review did not run: {reason}")],
-                timestamp: chrono::Utc::now(),
-                session_id: Uuid::new_v4(),
-            };
+            // No signoff: no review ran, so there is no verdict to record. The
+            // skip itself is the durable record of why.
             let trail = vec![(
                 chrono::Utc::now(),
                 ActivityKind::AiReviewSkipped {
@@ -7293,7 +7289,7 @@ impl TaskExecutor {
                 &self.storage,
                 &self.events,
                 task_id,
-                Some(signoff),
+                None,
                 trail,
             )
             .await;
@@ -7329,12 +7325,6 @@ impl TaskExecutor {
                 level: LogLevel::Warn,
                 message: format!("AI review skipped: {reason}"),
             });
-            let signoff = QaSignoff {
-                status: QaStatus::Rejected,
-                issues_found: vec![format!("AI review skipped: {reason}")],
-                timestamp: chrono::Utc::now(),
-                session_id: Uuid::new_v4(),
-            };
             let trail = vec![(
                 chrono::Utc::now(),
                 ActivityKind::AiReviewSkipped {
@@ -7347,7 +7337,7 @@ impl TaskExecutor {
                 &self.storage,
                 &self.events,
                 task_id,
-                Some(signoff),
+                None,
                 trail,
             )
             .await;
@@ -7429,17 +7419,14 @@ impl TaskExecutor {
                     events.agent_event(AgentEvent::Log {
                         task_id: task_id_str.clone(),
                         level: LogLevel::Warn,
-                        message: format!("Could not compute task diff, skipping AI review: {e}"),
+                        message: format!(
+                            "AI review failed, the task's changes could not be read: {e}"
+                        ),
                     });
-                    let signoff = QaSignoff {
-                        status: QaStatus::Rejected,
-                        issues_found: vec![format!("AI review skipped: {e}")],
-                        timestamp: chrono::Utc::now(),
-                        session_id: Uuid::new_v4(),
-                    };
+                    // A failed review, not a skip: no verdict, so no signoff.
                     let trail = vec![(
                         chrono::Utc::now(),
-                        ActivityKind::AiReviewSkipped {
+                        ActivityKind::AiReviewFailed {
                             review,
                             reason: format!("the task's changes could not be read: {e}"),
                         },
@@ -7449,7 +7436,7 @@ impl TaskExecutor {
                         &storage,
                         &events,
                         task_id,
-                        Some(signoff),
+                        None,
                         trail,
                     )
                     .await;
@@ -16655,14 +16642,18 @@ mod tests {
             TaskStatus::HumanReview,
             "a review that cannot run has to hand the task to a person"
         );
-        let signoff = after
-            .qa_signoff
-            .expect("the skip must be recorded as a signoff");
-        assert_eq!(signoff.status, QaStatus::Rejected);
         assert!(
-            signoff.issues_found.iter().any(|i| i.contains("worktree")),
-            "the reason has to name what was missing: {:?}",
-            signoff.issues_found
+            after.qa_signoff.is_none(),
+            "no review ran, so no AI verdict may be recorded: {:?}",
+            after.qa_signoff
+        );
+        assert!(
+            after.activity.iter().any(|entry| matches!(
+                &entry.kind,
+                ActivityKind::AiReviewSkipped { reason, .. } if reason.contains("worktree")
+            )),
+            "the skip must name what was missing: {:?}",
+            after.activity
         );
 
         assert_eq!(
@@ -18009,7 +18000,7 @@ mod tests {
             }
 
             #[tokio::test(flavor = "multi_thread")]
-            async fn an_automatic_review_without_a_reviewer_starts_none_and_is_not_approved() {
+            async fn an_automatic_review_without_a_reviewer_records_a_skip_not_a_verdict() {
                 let _path_guard = PATH_LOCK.lock().await;
                 let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
                 let task = settle_review(|t| t.reviewer_model = None).await;
@@ -18019,18 +18010,12 @@ mod tests {
                     "no reviewer may start without a configured model: {:?}",
                     mock.args()
                 );
-                let signoff = task
-                    .qa_signoff
-                    .expect("the skip is recorded on the signoff");
-                assert_eq!(signoff.status, QaStatus::Rejected);
                 assert!(
-                    signoff
-                        .issues_found
-                        .iter()
-                        .any(|issue| issue.contains("No AI reviewer model was configured")),
-                    "{:?}",
-                    signoff.issues_found
+                    task.qa_signoff.is_none(),
+                    "a missing reviewer is not an AI verdict: {:?}",
+                    task.qa_signoff
                 );
+                assert_eq!(task.status, TaskStatus::HumanReview);
                 assert!(
                     task.activity.iter().any(|entry| matches!(
                         &entry.kind,
@@ -18128,10 +18113,37 @@ mod tests {
                 .await;
 
                 assert!(mock.args().is_empty(), "{:?}", mock.args());
-                let signoff = task
-                    .qa_signoff
-                    .expect("the skip is recorded on the signoff");
-                assert_eq!(signoff.status, QaStatus::Rejected);
+                assert!(task.qa_signoff.is_none(), "{:?}", task.qa_signoff);
+            }
+
+            /// A review whose changes cannot be read has produced no verdict:
+            /// it is recorded as failed, with no signoff, and no reviewer runs.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_review_whose_changes_cannot_be_read_fails_without_a_verdict() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
+                let task = settle_review(|t| t.base_commit = None).await;
+
+                assert!(mock.args().is_empty(), "{:?}", mock.args());
+                assert!(task.qa_signoff.is_none(), "{:?}", task.qa_signoff);
+                assert!(
+                    task.activity.iter().any(|entry| matches!(
+                        &entry.kind,
+                        ActivityKind::AiReviewFailed { reason, .. }
+                            if reason.contains("could not be read")
+                    )),
+                    "{:?}",
+                    task.activity
+                );
+                assert!(
+                    matches!(
+                        slashit_activity::no_verdict(&task.activity),
+                        Some(slashit_activity::NoVerdict::Failed(reason))
+                            if reason.contains("could not be read")
+                    ),
+                    "{:?}",
+                    slashit_activity::no_verdict(&task.activity)
+                );
             }
 
             fn run(success: bool, output: &str) -> AgentRun {

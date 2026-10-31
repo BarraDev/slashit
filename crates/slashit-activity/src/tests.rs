@@ -49,7 +49,14 @@ fn a_start_reads_as_queue_then_run() {
 #[test]
 fn a_failure_stays_in_history_after_a_retry() {
     let mut entries = Vec::new();
-    record(&mut entries, t(1), Kind::RunStarted { run: 1, addressing_feedback: false });
+    record(
+        &mut entries,
+        t(1),
+        Kind::RunStarted {
+            run: 1,
+            addressing_feedback: false,
+        },
+    );
     record(&mut entries, t(2), Kind::RunFailed { run: Some(1), reason: "claude exited\nwith 1".into() });
     record(&mut entries, t(3), Kind::Moved { from: Column::Error, to: Column::Queue });
     let run = next_run(&entries);
@@ -125,7 +132,14 @@ fn a_skipped_review_does_not_swallow_the_next_verdict() {
 fn review_decisions_interleave_with_the_runs_they_caused() {
     let mut entries = Vec::new();
     record(&mut entries, t(1), Kind::ReadyForReview { arrival: 1 });
-    record(&mut entries, t(3), Kind::RunStarted { run: 2, addressing_feedback: true });
+    record(
+        &mut entries,
+        t(3),
+        Kind::RunStarted {
+            run: 2,
+            addressing_feedback: true,
+        },
+    );
     record(&mut entries, t(4), Kind::ReadyForReview { arrival: 2 });
     let decisions = [
         Decision { sequence: 1, at: t(2), approved: false, feedback: Some("handle empty input") },
@@ -694,4 +708,81 @@ fn a_result_row_names_its_run_and_its_outcome() {
     assert_eq!(row.title(), "Coding result unavailable");
     assert_eq!(row.run_result().map(|(run, _)| run), Some(1));
     assert!(!row.is_tool());
+}
+
+/// A skipped review's reason is what the record says, and it is read from the
+/// run that skipped, not from an earlier run's verdict.
+#[test]
+fn no_verdict_reads_the_current_runs_skip_or_failure() {
+    let mut entries = Vec::new();
+    record(
+        &mut entries,
+        t(1),
+        Kind::RunStarted {
+            run: 1,
+            addressing_feedback: false,
+        },
+    );
+    record(&mut entries, t(2), Kind::AiReviewApproved { review: 1 });
+    assert_eq!(no_verdict(&entries), None);
+
+    record(
+        &mut entries,
+        t(3),
+        Kind::RunStarted {
+            run: 2,
+            addressing_feedback: true,
+        },
+    );
+    record(
+        &mut entries,
+        t(4),
+        Kind::AiReviewSkipped {
+            review: 2,
+            reason: "no reviewer".into(),
+        },
+    );
+    assert_eq!(
+        no_verdict(&entries),
+        Some(NoVerdict::Skipped("no reviewer"))
+    );
+
+    record(
+        &mut entries,
+        t(5),
+        Kind::RunStarted {
+            run: 3,
+            addressing_feedback: true,
+        },
+    );
+    assert_eq!(
+        no_verdict(&entries),
+        None,
+        "a run that has not reviewed has no verdict to read"
+    );
+}
+
+#[test]
+fn no_verdict_reports_a_failed_review_as_failed() {
+    let mut entries = Vec::new();
+    record(
+        &mut entries,
+        t(1),
+        Kind::RunStarted {
+            run: 1,
+            addressing_feedback: false,
+        },
+    );
+    record(
+        &mut entries,
+        t(2),
+        Kind::AiReviewFailed {
+            review: 1,
+            reason: "could not read the changes".into(),
+        },
+    );
+    assert_eq!(
+        no_verdict(&entries),
+        Some(NoVerdict::Failed("could not read the changes"))
+    );
 }
