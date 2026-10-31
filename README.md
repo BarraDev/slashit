@@ -54,7 +54,7 @@ It's built for people who've already outgrown a single terminal tab and a stack 
 
 ### PR review assistant
 
-Triage every reviewer comment on a pull request, decide Fix / Skip / Question per item, edit the agent's reasoning and proposed change inline, then apply all approved fixes in one pass with optional auto-push and auto-reply on the PR.
+Triage every reviewer comment on a pull request, decide Fix / Skip / Question per item, edit the agent's reasoning and proposed change inline, then apply all approved fixes in one pass with optional auto-push and auto-reply on the PR. A task still awaiting its Human Review decision keeps its fixes in the local branch until its changes are approved.
 
 <p align="center">
   <img src="docs/assets/screenshots/pr-comment-review.png" alt="SlashIt PR Comment Review modal: per-comment Fix/Skip/Question dropdown, editable reasoning and proposed change, footer toggles for auto-push, auto-reply, and only-new filter, plus Re-discuss / Re-analyze / Apply actions" width="900">

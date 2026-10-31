@@ -1807,8 +1807,28 @@ pub async fn address_pr_review_inner(
 
         // The fixes a commit now holds are owed a push, those of this apply
         // and those of an earlier one alike.
+        // "Auto-push branch" asks to publish review fixes. It is not a decision
+        // about a Task that is awaiting its Human Review decision, so for a Task
+        // nobody has approved the fixes stay in the local branch, as they do with
+        // auto-push off, and nothing reaches the remote branch.
         let to_push = owed_a_push(&updated_plan);
-        if committed_ok && !to_push.is_empty() && options.auto_push {
+        let push_held_for_review = task.unapproved_human_review_delivery_refusal().is_some();
+        if committed_ok && !to_push.is_empty() && options.auto_push && push_held_for_review {
+            let note = format!(
+                "this task is in Human Review and its changes have not been approved, so the review \
+                 fixes were committed in the task checkout but not pushed.{unpushed_replies_note}"
+            );
+            progress(PrReviewProgress {
+                task_id: task_id_str.clone(),
+                kind: "push_held_for_review".to_string(),
+                current: None,
+                total: None,
+                comment_id: None,
+                message: Some(note.clone()),
+            });
+            agent_summary.push_str(&format!("\n\n---\n\nNote: {note}\n"));
+        }
+        if committed_ok && !to_push.is_empty() && options.auto_push && !push_held_for_review {
             progress(PrReviewProgress {
                 task_id: task_id_str.clone(),
                 kind: "push_started".to_string(),
@@ -15714,6 +15734,53 @@ mod tests {
                     "the pushed branch is the committed one"
                 );
                 assert!(remote_branch_has_file(&repo, "review-fix-1.txt"), "the pushed branch carries the fix");
+            }
+
+            /// A Task in Human Review that nobody has approved is awaiting
+            /// a decision on its changes, and "Auto-push branch" is a request to
+            /// publish review fixes, not that decision. The fix is committed locally
+            /// as it is with auto-push off, but nothing reaches the remote branch, so
+            /// the pull request and its replies do not move. This holds whether or
+            /// not the Task already has a pull request.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn review_fixes_for_an_unapproved_human_review_task_are_committed_but_not_pushed() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (mut task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                task.status = TaskStatus::HumanReview;
+
+                let (result, _plan) = apply(&task, plan, &worktree, no_jj, false).await;
+
+                assert!(!result.pushed, "an unapproved Human Review task must not be pushed: {result:?}");
+                assert_eq!(repo.remote_has_branch("task-branch"), None, "nothing may reach the remote branch");
+                assert!(!remote_branch_has_file(&repo, "review-fix-1.txt"), "the fix is not published");
+                assert_ne!(git(&worktree, &["rev-parse", "task-branch"]), tip, "the fix is committed locally");
+                assert_eq!(git(&worktree, &["status", "--porcelain"]), "", "nothing is left uncommitted");
+            }
+
+            /// The other side of the same rule: an approved Human Review task still
+            /// gets its review fixes pushed when auto-push is on.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn review_fixes_for_an_approved_human_review_task_are_still_pushed() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (mut task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                task.status = TaskStatus::HumanReview;
+                task.human_review.approve(Some(git(&worktree, &["rev-parse", "task-branch"])), chrono::Utc::now());
+
+                let (result, _plan) = apply(&task, plan, &worktree, no_jj, false).await;
+
+                assert!(result.pushed, "{:?}", result.push_error);
+                assert!(remote_branch_has_file(&repo, "review-fix-1.txt"), "the approved task's fix is pushed");
             }
 
             /// jj-colocated: the fix is a real Git commit on the task
