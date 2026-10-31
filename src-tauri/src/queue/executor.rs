@@ -26783,7 +26783,7 @@ VERDICT: APPROVED"
     }
 
     /// Reads the pid a fake program recorded, once the file has been written.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn recorded_pid(path: &std::path::Path) -> i32 {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -26801,8 +26801,10 @@ VERDICT: APPROVED"
     }
 
     /// A process is running unless it is gone or has exited and is only
-    /// waiting to be reaped (state `Z`).
-    #[cfg(unix)]
+    /// waiting to be reaped (state `Z`). This reads `/proc`, which exists only
+    /// on Linux; elsewhere every process would look gone and the test would
+    /// pass without checking anything.
+    #[cfg(target_os = "linux")]
     fn process_is_running(pid: i32) -> bool {
         match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => {
@@ -26816,7 +26818,7 @@ VERDICT: APPROVED"
     /// Dropping the CodeRabbit review future, as an aborted task or a runtime
     /// shutdown does, must end the CLI it started. Without `kill_on_drop` the
     /// child outlives its owner, and nothing signals it.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn dropping_the_coderabbit_review_ends_its_cli() {
         let scratch = tempfile::tempdir().unwrap();
@@ -26858,6 +26860,9 @@ VERDICT: APPROVED"
                 libc::kill(pid, libc::SIGKILL);
             }
         }
-        assert!(!running, "dropping the review left its CLI (pid {pid}) running");
+        assert!(
+            !running,
+            "dropping the review left its CLI (pid {pid}) running"
+        );
     }
 }
