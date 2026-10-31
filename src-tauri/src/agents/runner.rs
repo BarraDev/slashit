@@ -995,6 +995,52 @@ impl Drop for ClaudeRunner {
     }
 }
 
+/// Why a Claude run did not start. `spawned` is false when the failure came
+/// before any provider process existed: an unsupported CLI, a settings file or
+/// lease mark that could not be written, or a spawn that failed. It is true
+/// when a process had been spawned, which is then ended (its child is dropped
+/// and `kill_on_drop` ends it).
+#[derive(Debug)]
+pub struct LaunchError {
+    message: String,
+    spawned: bool,
+}
+
+impl LaunchError {
+    /// A failure before any process was spawned.
+    pub fn before_spawn(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            spawned: false,
+        }
+    }
+
+    /// A failure after a process was spawned.
+    pub fn after_spawn(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            spawned: true,
+        }
+    }
+
+    /// Whether a provider process existed when the start failed.
+    pub fn spawned(&self) -> bool {
+        self.spawned
+    }
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<LaunchError> for String {
+    fn from(error: LaunchError) -> Self {
+        error.message
+    }
+}
+
 impl ClaudeRunner {
     /// Start a Claude Code CLI run with the given config. Every run that can
     /// edit a Task Checkout passes its provider lease, so a later launch can
@@ -1004,9 +1050,11 @@ impl ClaudeRunner {
     pub async fn start_leased(
         config: ClaudeRunConfig,
         lease: Option<ProviderLease>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, LaunchError> {
         if matches!(&config.tools, ToolAccess::Full { permission_mode: Some(mode), .. } if mode == "auto") {
-            ensure_auto_supported().await?;
+            ensure_auto_supported()
+                .await
+                .map_err(LaunchError::before_spawn)?;
         }
         Self::start_leased_program("claude", config, lease).await
     }
@@ -1028,7 +1076,7 @@ impl ClaudeRunner {
     async fn start_program(
         program: impl AsRef<std::ffi::OsStr>,
         config: ClaudeRunConfig,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, LaunchError> {
         Self::start_leased_program(program, config, None).await
     }
 
@@ -1037,7 +1085,7 @@ impl ClaudeRunner {
         program: impl AsRef<std::ffi::OsStr>,
         config: ClaudeRunConfig,
         lease: Option<ProviderLease>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, LaunchError> {
         let mut cmd = Command::new(program);
 
         // Start from an empty environment; see `provider_env` for what is kept.
@@ -1046,11 +1094,14 @@ impl ClaudeRunner {
         // Written before anything else is marked or spawned. If it cannot be
         // written securely the run does not start, and no file is left behind.
         let settings_file = if config.isolate_customizations {
-            Some(IsolatedSettingsFile::create(
-                &child_env,
-                std::path::Path::new(&config.working_dir),
-                instruction_env,
-            )?)
+            Some(
+                IsolatedSettingsFile::create(
+                    &child_env,
+                    std::path::Path::new(&config.working_dir),
+                    instruction_env,
+                )
+                .map_err(LaunchError::before_spawn)?,
+            )
         } else {
             None
         };
@@ -1100,7 +1151,7 @@ impl ClaudeRunner {
             // must leave evidence that a provider may be running. A mark that
             // cannot be written means nothing is spawned.
             lease.mark_spawning().map_err(|e| {
-                format!("The provider's lease could not be marked before launch, so the provider was not started: {e}")
+                LaunchError::before_spawn(format!("The provider's lease could not be marked before launch, so the provider was not started: {e}"))
             })?;
         }
 
@@ -1112,7 +1163,10 @@ impl ClaudeRunner {
                 if let Some(lease) = &lease {
                     let _ = lease.clear_spawn_mark();
                 }
-                return Err(format!("Failed to spawn claude: {}. Is claude CLI installed?", e));
+                return Err(LaunchError::before_spawn(format!(
+                    "Failed to spawn claude: {}. Is claude CLI installed?",
+                    e
+                )));
             }
         };
         eprintln!("[claude-runner] spawned pid={:?}", child.id());
@@ -1122,12 +1176,16 @@ impl ClaudeRunner {
         // while the lock is still held, and the child is dropped with it, so no
         // provider runs that a later attempt could not account for.
         if let Some(lease) = lease {
-            let pid = child
-                .id()
-                .ok_or_else(|| "The provider exited before its process could be recorded.".to_string())?;
-            lease
-                .record_group(pid)
-                .map_err(|e| format!("The provider's lease could not be recorded, so the provider was ended: {e}"))?;
+            let pid = child.id().ok_or_else(|| {
+                LaunchError::after_spawn(
+                    "The provider exited before its process could be recorded.",
+                )
+            })?;
+            lease.record_group(pid).map_err(|e| {
+                LaunchError::after_spawn(format!(
+                    "The provider's lease could not be recorded, so the provider was ended: {e}"
+                ))
+            })?;
         }
 
         // Take stdout here, while the child is still ours alone, and hand it
@@ -1146,10 +1204,9 @@ impl ClaudeRunner {
 
         // Piped above, so always present. Returning here drops the child,
         // and `kill_on_drop` ends it.
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Failed to open claude's stdin for the prompt".to_string())?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            LaunchError::after_spawn("Failed to open claude's stdin for the prompt")
+        })?;
 
         let (event_tx, first_subscriber) = broadcast::channel(512);
         let prompt_written = Arc::new(AtomicBool::new(false));
@@ -1853,7 +1910,13 @@ mod lease_launch_tests {
             Err(error) => error,
         };
         // The mark comes before the spawn, so this message proves nothing was spawned.
-        assert!(error.contains("could not be marked before launch"), "{error}");
+        assert!(!error.spawned(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("could not be marked before launch"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1872,7 +1935,12 @@ mod lease_launch_tests {
             Ok(_) => panic!("a missing program must not start"),
             Err(error) => error,
         };
-        assert!(error.contains("Failed to spawn claude"), "{error}");
+        // The spawn itself failed, so no provider process exists.
+        assert!(!error.spawned(), "{error}");
+        assert!(
+            error.to_string().contains("Failed to spawn claude"),
+            "{error}"
+        );
         // A fork in another test thread can briefly hold a copy of the lease
         // descriptor until its exec, so absence is awaited, not read once.
         let mut proven = prove_absent(&path);
@@ -3735,7 +3803,11 @@ mod tests {
             Ok(_) => panic!("a missing program must not start"),
             Err(error) => error,
         };
-        assert!(error.starts_with("Failed to spawn claude"), "{error}");
+        assert!(!error.spawned(), "{error}");
+        assert!(
+            error.to_string().starts_with("Failed to spawn claude"),
+            "{error}"
+        );
     }
 
     /// Wait until the prompt writer has ended, or fail saying it did not.

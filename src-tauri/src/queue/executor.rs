@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::agents::coding_run::{CodingRunEvent, CodingRunner};
 use crate::agents::opencode_run::OpenCodeRunConfig;
-use crate::agents::runner::{ClaudeRunConfig, ToolAccess};
+use crate::agents::runner::{ClaudeRunConfig, LaunchError, ToolAccess};
 use crate::domain::task::ActivityKind;
 use crate::domain::task::CodingProvider;
 use crate::domain::task::ExternalRef;
@@ -565,9 +565,17 @@ enum FixOutcome {
     Applied,
     /// Cancelled before or during the run; nothing is recorded.
     Cancelled,
-    /// The run could not start, exited non-zero, or reported an error.
+    /// The run never started: no provider process existed, so it made no edits.
+    NotStarted(String),
+    /// The run started and then failed, exited non-zero, or reported an error,
+    /// so it may have edited the checkout.
     Failed(String),
 }
+
+/// What a failed fix-agent run may have left in the checkout, once a process
+/// existed.
+const FIX_PARTIAL_EDITS_WARNING: &str =
+    "The task checkout may hold partial edits from the fix agent that were not recorded.";
 
 /// The lease file of a Task: one lock per Task, shared by every launch that can
 /// edit its checkout (Task Worker, review fix agent, PR apply helper and
@@ -674,17 +682,25 @@ pub(crate) fn acquire_task_provider_lease(
 /// The outcome of a fix-agent run. Only a successful run applied fixes: one
 /// that exited non-zero or reported an error failed, like one that never
 /// started.
-fn fix_outcome(outcome: Result<Option<AgentRun>, String>) -> FixOutcome {
+fn fix_outcome(outcome: Result<Option<AgentRun>, LaunchError>) -> FixOutcome {
     match outcome {
         Ok(Some(run)) if run.success => FixOutcome::Applied,
         Ok(Some(run)) => {
             let reason = run
                 .failure
                 .unwrap_or_else(|| "the fix agent run did not succeed".to_string());
-            FixOutcome::Failed(format!("Fix agent failed: {reason}"))
+            FixOutcome::Failed(format!(
+                "Fix agent failed: {reason}. {FIX_PARTIAL_EDITS_WARNING}"
+            ))
         }
         Ok(None) => FixOutcome::Cancelled,
-        Err(e) => FixOutcome::Failed(format!("Fix agent failed to start: {e}")),
+        // Refused before any process existed (a model it cannot take, a lease
+        // it could not get, a CLI that would not spawn): nothing ran, so there
+        // are no partial edits to warn about.
+        Err(e) if !e.spawned() => FixOutcome::NotStarted(format!("Fix agent did not start: {e}")),
+        Err(e) => FixOutcome::Failed(format!(
+            "Fix agent failed to start: {e}. {FIX_PARTIAL_EDITS_WARNING}"
+        )),
     }
 }
 
@@ -5765,7 +5781,7 @@ impl TaskExecutor {
                 isolate_customizations: true,
             }, lease)
             .await
-            .map_err(StartFailure::failed)
+            .map_err(|e| StartFailure::failed(e.to_string()))
             };
             let runner = match started {
                 Ok(r) => r,
@@ -6745,12 +6761,13 @@ impl TaskExecutor {
     /// `Ok(Some(run))` is a completed run, successful or not (see
     /// [`AgentRun::success`]); `Ok(None)` is a graceful decline (cancelled
     /// before start, or cancelled during `wait()` and killed); `Err` is a
-    /// real failure to start.
+    /// real failure to start, which says whether a process existed (see
+    /// [`LaunchError::spawned`]).
     async fn run_cancellable_agent(
         config: ClaudeRunConfig,
         lease: Option<crate::agents::provider_lease::ProviderLease>,
         cancelled: &mut tokio::sync::watch::Receiver<bool>,
-    ) -> Result<Option<AgentRun>, String> {
+    ) -> Result<Option<AgentRun>, LaunchError> {
         if *cancelled.borrow() {
             return Ok(None);
         }
@@ -7622,9 +7639,13 @@ impl TaskExecutor {
                 // holds the checkout refuses it here, and the fix counts as not
                 // started. A model it cannot be given refuses it before the
                 // lease is taken.
-                let fix_run = match fix_model.and_then(|model| {
-                    acquire_task_provider_lease(&storage, task_id).map(|lease| (model, lease))
-                }) {
+                let fix_run = match fix_model
+                    .map_err(LaunchError::before_spawn)
+                    .and_then(|model| {
+                        acquire_task_provider_lease(&storage, task_id)
+                            .map(|lease| (model, lease))
+                            .map_err(LaunchError::before_spawn)
+                    }) {
                     Err(error) => Err(error),
                     Ok((fix_model, fix_lease)) => {
                         events.agent_event(AgentEvent::Log {
@@ -7736,19 +7757,15 @@ impl TaskExecutor {
                         reviewing_handles.write().await.remove(&task_id);
                         return;
                     }
-                    FixOutcome::Failed(reason) => {
-                        // The fix agent has full tools, so a run that failed
-                        // part-way may still have edited the checkout.
-                        let message = format!(
-                            "{reason}. The task checkout may hold partial edits from the fix \
-                             agent that were not recorded."
-                        );
+                    // The reason already says whether a fix agent process
+                    // existed, and warns of partial edits only if one did.
+                    FixOutcome::NotStarted(reason) | FixOutcome::Failed(reason) => {
                         events.agent_event(AgentEvent::Log {
                             task_id: task_id_str.clone(),
                             level: LogLevel::Error,
-                            message: message.clone(),
+                            message: reason.clone(),
                         });
-                        Some(message)
+                        Some(reason)
                     }
                 };
 
@@ -17981,16 +17998,62 @@ VERDICT: APPROVED"
                 };
                 assert_eq!(
                     fix_outcome(Ok(Some(failed))),
-                    FixOutcome::Failed("Fix agent failed: exit 2".into())
+                    FixOutcome::Failed(format!(
+                        "Fix agent failed: exit 2. {FIX_PARTIAL_EDITS_WARNING}"
+                    ))
                 );
                 assert!(matches!(
                     fix_outcome(Ok(Some(run(false, "")))),
                     FixOutcome::Failed(_)
                 ));
                 assert_eq!(
-                    fix_outcome(Err("no claude".into())),
-                    FixOutcome::Failed("Fix agent failed to start: no claude".into())
+                    fix_outcome(Err(LaunchError::after_spawn("no claude"))),
+                    FixOutcome::Failed(format!(
+                        "Fix agent failed to start: no claude. {FIX_PARTIAL_EDITS_WARNING}"
+                    ))
                 );
+            }
+
+            /// A fix agent refused before any process existed is reported as
+            /// not started. It never claims partial edits, because nothing ran
+            /// to make them, whatever the refusal was.
+            #[test]
+            fn a_fix_agent_that_never_started_claims_no_partial_edits() {
+                // A model Claude cannot take, a lease it could not get, a CLI
+                // that would not spawn: each is refused before a process exists.
+                for refusal in [
+                    "this Task's model ollama/llama3.2:3b is an OpenCode model",
+                    "The Task's provider lease could not be taken; nothing was launched",
+                    "Failed to spawn claude: No such file or directory. Is claude CLI installed?",
+                ] {
+                    assert_eq!(
+                        fix_outcome(Err(LaunchError::before_spawn(refusal))),
+                        FixOutcome::NotStarted(format!("Fix agent did not start: {refusal}")),
+                    );
+                }
+            }
+
+            /// A fix agent that started and then failed keeps the warning that
+            /// its checkout may hold partial edits.
+            #[test]
+            fn a_fix_agent_that_started_and_failed_keeps_the_partial_edit_warning() {
+                let exited = AgentRun {
+                    failure: Some("exit 2".into()),
+                    ..run(false, "done")
+                };
+                for outcome in [
+                    fix_outcome(Ok(Some(exited))),
+                    fix_outcome(Err(LaunchError::after_spawn(
+                        "the lease could not be recorded",
+                    ))),
+                ] {
+                    match outcome {
+                        FixOutcome::Failed(message) => {
+                            assert!(message.contains(FIX_PARTIAL_EDITS_WARNING), "{message}");
+                        }
+                        other => panic!("a started and failed fix agent is Failed, not {other:?}"),
+                    }
+                }
             }
 
             #[tokio::test(flavor = "multi_thread")]
@@ -18252,10 +18315,19 @@ VERDICT: APPROVED"
                     signoff
                         .issues_found
                         .iter()
-                        .any(|i| i.starts_with("Fix agent failed to start")
+                        .any(|i| i.starts_with("Fix agent did not start")
                             && i.contains("ollama/llama3.2:3b")
                             && i.contains("no other model was substituted")),
                     "the signoff says why: {:?}",
+                    signoff.issues_found
+                );
+                // No process ran, so the signoff must not claim partial edits.
+                assert!(
+                    !signoff
+                        .issues_found
+                        .iter()
+                        .any(|i| i.contains("partial edits")),
+                    "a refused fix agent claims no edits: {:?}",
                     signoff.issues_found
                 );
                 assert!(
