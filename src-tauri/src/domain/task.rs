@@ -1149,6 +1149,16 @@ impl Task {
             // A move is a new decision about the Task, so an earlier approval
             // of its input no longer speaks for it.
             self.approved_execution = None;
+            // Leaving Human Review for work or review withdraws the approval of
+            // that arrival. A later return to Human Review by a manual move
+            // records no arrival, so without this the old approval would be
+            // reused for changes that were never decided. Done and PrCreated keep
+            // it: integration and the delivered pull request still read it.
+            if *from == TaskStatus::HumanReview
+                && !matches!(self.status, TaskStatus::HumanReview | TaskStatus::Done | TaskStatus::PrCreated)
+            {
+                self.human_review.withdraw_approval();
+            }
             let kind = ActivityKind::Moved {
                 from: from.column(),
                 to: self.status.column(),

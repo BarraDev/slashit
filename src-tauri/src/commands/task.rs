@@ -2777,6 +2777,34 @@ mod human_review_close_confirmation {
             .expect("the task is found");
         assert_eq!(closed.status, TaskStatus::Done);
     }
+
+    /// Leaving Human Review for work withdraws the approval of that arrival. A
+    /// return by a manual move records no arrival, so it must come back undecided
+    /// rather than reuse the earlier approval.
+    #[tokio::test]
+    async fn leaving_human_review_withdraws_the_approval_so_a_return_is_undecided() {
+        let (_tmp, state) = test_state().await;
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("under test", project_id, TaskStatus::HumanReview, 0);
+        task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+
+        let away = set_task_status(&state, task_id, TaskStatus::AiReview, None)
+            .await
+            .expect("a move out of Human Review is allowed")
+            .expect("the task is found");
+        assert_eq!(away.status, TaskStatus::AiReview);
+        assert!(!away.human_review.is_approved(), "the approval is withdrawn when the task leaves review");
+
+        let back = set_task_status(&state, task_id, TaskStatus::HumanReview, None)
+            .await
+            .expect("a manual move back into review is allowed")
+            .expect("the task is found");
+        assert_eq!(back.status, TaskStatus::HumanReview);
+        assert!(!back.human_review.is_approved(), "a return without a new arrival is undecided");
+    }
 }
 
 /// A status move into Queue, asked from the desktop, is refused for the same
