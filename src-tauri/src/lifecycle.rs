@@ -987,9 +987,42 @@ pub async fn enqueue_current(
     task_id: Uuid,
 ) -> Result<EnqueueVerdict, String> {
     let _lease = locks.acquire(task_id).await?;
+    enqueue_current_held(tasks, storage, running, task_id, None).await
+}
+
+/// [`enqueue_current`] for a front door that must not take a Task out of Human
+/// Review on its own (the command line). When the Task is in Human Review,
+/// `refusal` is returned as the verdict and nothing is ended or written. The
+/// desktop's own queue actions keep using [`enqueue_current`].
+pub async fn enqueue_current_refusing_human_review(
+    tasks: &Tasks,
+    storage: &Storage,
+    locks: &TaskLifecycleLocks,
+    running: Option<&dyn ExecutionOwnership>,
+    task_id: Uuid,
+    refusal: &str,
+) -> Result<EnqueueVerdict, String> {
+    let _lease = locks.acquire(task_id).await?;
+    enqueue_current_held(tasks, storage, running, task_id, Some(refusal)).await
+}
+
+/// The body of [`enqueue_current`], for a caller that already holds the Task's
+/// lifecycle lease.
+async fn enqueue_current_held(
+    tasks: &Tasks,
+    storage: &Storage,
+    running: Option<&dyn ExecutionOwnership>,
+    task_id: Uuid,
+    human_review_refusal: Option<&str>,
+) -> Result<EnqueueVerdict, String> {
     let Some(task) = tasks.read().await.get(&task_id).cloned() else {
         return Ok(EnqueueVerdict::Missing);
     };
+    if let Some(refusal) = human_review_refusal {
+        if task.status == TaskStatus::HumanReview {
+            return Ok(EnqueueVerdict::Blocked(refusal.to_string()));
+        }
+    }
     if task.status != TaskStatus::Queue {
         if let Some(reason) = task.queue_entry_refusal() {
             return Ok(EnqueueVerdict::Blocked(reason));
