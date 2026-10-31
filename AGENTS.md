@@ -44,19 +44,25 @@ cargo run -p slashit-ui
 # Validate agent documentation structure (the same check CI runs)
 scripts/check-agent-docs.sh
 
-# Desktop acceptance against the real application (Linux; needs Xvfb,
-# dbus-run-session, tauri-driver and WebKitWebDriver). Build with the script
-# CI uses: a plain `cargo build` binary never loads the embedded frontend.
-# Journeys run on a private display; --visible uses yours, --exact <name>
-# picks one journey. The harness's own journeys are a separate target.
+# Desktop acceptance: the Rust harness in crates/slashit-acceptance (Linux;
+# needs Xvfb, dbus-run-session, tauri-driver, WebKitWebDriver). Build the app
+# CI uses first: a plain `cargo build` never loads the embedded frontend.
 scripts/build-acceptance-app.sh
-scripts/run-desktop-acceptance.sh --harness
-scripts/run-desktop-acceptance.sh
+scripts/run-desktop-acceptance.sh --harness   # the harness's own journeys
+scripts/run-desktop-acceptance.sh             # product journeys
 ```
 
-See `crates/slashit-acceptance/README.md` for what the harness guarantees and
-how to run it on Arch, which ships no `WebKitWebDriver` (local driver
-troubleshooting; hosted Linux CI is the authoritative acceptance result).
+## Testing
+
+Run the tests your change touches. These are the main commands CI runs
+(`.github/workflows/ci.yml`), not a gate for every change.
+
+- Backend and shared crates: `cargo test -p slashit-ui -p slashit-ipc -p slashit-durable-fs -p slashit-attention -p slashit-activity -p slashit-review-content -p slashit-acceptance`
+- Frontend unit tests, host target, no browser: `cargo test -p slashit-frontend`
+- Lint: `cargo clippy -p slashit-ui -p slashit -p slashit-ipc -p slashit-durable-fs -p slashit-attention -p slashit-activity -p slashit-review-content -- -D warnings`, and `cargo clippy -p slashit-acceptance --all-targets --features run-acceptance -- -D warnings`
+- `#[ignore]` tests never run in CI. The PTY tests spawn real shells, the host-process tests need network and an AppImage launch, and one runner test runs the Claude Code CLI with a login. Run one by name with `--exact`; the environment is in [docs/development-workflow.md](docs/development-workflow.md) section 16.
+- Desktop acceptance journeys run on a private display; `--visible` uses yours and `--exact <name>` picks one journey. `crates/slashit-acceptance/README.md` says what the harness guarantees and how to set it up locally on Arch, which ships no `WebKitWebDriver`; hosted Linux CI is the authoritative acceptance result.
+- `tests/e2e/` and the root `package.json` are a legacy Playwright suite that no CI job runs. See section 16 of the workflow doc before touching them.
 
 ## Project Structure
 
@@ -78,19 +84,7 @@ slashit-app/
     └── tauri.conf.json
 ```
 
-Module layout and conventions live in the nested docs listed at the end; dependency versions are in the `Cargo.toml` files.
-
-## Tauri + Leptos Configuration
-
-Follows the official [Tauri Leptos guide](https://tauri.app/start/frontend/leptos/):
-
-- Client-side rendering only; Tauri does not officially support server-based
-  frontends.
-- Trunk serves `http://localhost:1420` in development (`Trunk.toml` keeps
-  `ws_protocol = "ws"` for hot reload). `src-tauri/tauri.conf.json` points
-  `devUrl` at that server and `frontendDist` at Trunk's build output.
-- Keep `withGlobalTauri: true` there; the frontend reaches the backend through
-  `window.__TAURI__`.
+Module layout and conventions live in the nested docs listed at the end; dependency versions are in the `Cargo.toml` files. Outside the tree: `tests/` holds the root frontend Kanban tests (`tests/kanban_e2e.rs`) and the legacy Playwright specs (`tests/e2e/`); `tools/` holds the standalone `updater-signing-probe` crate; `package.json` and `playwright.config.ts` belong to the legacy Playwright harness, whose version release preflight still checks. `src-tauri/tauri.conf.json` must keep `withGlobalTauri: true` (the frontend reaches the backend through `window.__TAURI__`).
 
 ## IPC Pattern
 
@@ -240,7 +234,7 @@ Before changing async lifecycles, shared state, IPC, subprocesses, persistence o
 
 ## Nested AGENTS.md
 
-Module guidance (each is also a `CLAUDE.md` stub containing only `@AGENTS.md`):
+Module guidance. AGENTS.md is the authoritative source of project instructions. Each directory's `CLAUDE.md` is a compatibility adapter containing only `@AGENTS.md`; keep it. Claude Code and SlashIt's own agent runs read the project instructions through these adapters, so a missing adapter silently drops that directory's guidance:
 - `src/AGENTS.md` -- Frontend (Leptos/WASM) patterns
 - `src-tauri/src/AGENTS.md` -- Backend (Tauri v2) overview
 - `src-tauri/src/domain/AGENTS.md` -- Domain models conventions

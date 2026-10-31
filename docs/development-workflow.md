@@ -855,6 +855,40 @@ power-loss durability, behavior on an operating system other than the one they
 ran on, or anything the hosted `ignore`d tests cover. State those limits in
 the report instead of implying them.
 
+### Ignored tests and the legacy Playwright suite
+
+Ignored tests are never run in CI, so a change that touches their area needs a
+local run that is named in the report. List them with
+`cargo test -p slashit-ui -- --list --ignored`, then run one by its full name
+with `cargo test -p slashit-ui -- --ignored --exact <name>`.
+
+- `src-tauri/src/pty/tests.rs` spawns real shells and needs a Unix shell. Some
+  tests change `SHELL` for the whole process, so run them one at a time.
+- `src-tauri/src/host_process.rs` has two ignored tests that need network and
+  an AppImage launch (`APPDIR` set).
+- `src-tauri/src/agents/runner.rs` has two ignored tests. One runs the real Claude
+  Code CLI, which needs a login and spends tokens. The other is a probe helper that
+  does nothing unless `SLASHIT_ISOLATED_SETTINGS_OUT` is set.
+
+The root `tests/e2e/` specs (15 files), `playwright.config.ts`, `package.json`
+and `package-lock.json` form a Playwright suite that is not part of the
+maintained acceptance path. Findings as of this writing:
+
+- No workflow under `.github/`, no script under `scripts/` and no documented
+  development command runs `playwright` or `npm run test:e2e*`. The Rust
+  acceptance harness (`crates/slashit-acceptance`) says no Node, npm, Bun or
+  WebdriverIO is involved.
+- One consumer remains: `scripts/release-preflight.sh` reads the `version` in
+  `package.json` and refuses a release whose version differs (see
+  `docs/releasing.md`).
+- The specs were not run for this note, so their current pass state is unknown.
+
+Recommended separate cleanup, only with the owner's agreement: first move the
+release version check off `package.json` (updating `scripts/release-preflight.sh`,
+`scripts/test-release-preflight.sh` and `docs/releasing.md`), then remove
+`tests/e2e/`, `playwright.config.ts`, `package.json`, `package-lock.json`, and the
+`playwright-report/` and `test-results/` entries in `.gitignore`.
+
 ## 17. Change size and review standards
 
 These standards apply to backend, frontend, Tauri IPC, integration, and

@@ -19,6 +19,14 @@ The app uses signal-based routing (not URL-based). `current_page` signal in `app
 
 Frontend calls backend via `invoke()` from `window.__TAURI__.core` (global Tauri enabled). Service functions in `src/services/` wrap these calls with proper typing.
 
+## Tauri and Trunk Configuration
+
+Follows the official [Tauri Leptos guide](https://tauri.app/start/frontend/leptos/):
+
+- Client-side rendering only; Tauri does not officially support server-based frontends.
+- Trunk serves `http://localhost:1420` in development (`Trunk.toml` keeps `ws_protocol = "ws"` for hot reload). `src-tauri/tauri.conf.json` points `devUrl` at that server and `frontendDist` at Trunk's build output.
+- Keep `withGlobalTauri: true` there; the frontend reaches the backend through `window.__TAURI__`.
+
 ## Leptos Patterns
 
 - Use `leptos::prelude::*` for components and signals
