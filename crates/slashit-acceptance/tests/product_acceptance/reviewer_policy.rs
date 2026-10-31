@@ -63,6 +63,7 @@ async fn create_in_editor(driver: &WebDriver, repository: &GitFixture) -> Result
         "the AI Reviewer control",
     )
     .await?;
+    assert_reviewer_is_named(driver).await?;
     driver
         .find(By::XPath(CREATE_BUTTON))
         .await
@@ -295,6 +296,25 @@ async fn skip_and_show(driver: &WebDriver, repository: &GitFixture) -> Result<Ex
 }
 
 // --- Helpers -----------------------------------------------------------------
+
+/// The AI Reviewer select is named by its own label. The browser reports the
+/// label that names a control through `HTMLSelectElement.labels`, which is what
+/// a screen reader announces, so that is what is read here.
+async fn assert_reviewer_is_named(driver: &WebDriver) -> Result<()> {
+    let name = driver
+        .execute(
+            "const select = document.getElementById('task-ai-reviewer-select'); if (!select || select.labels.length !== 1) { return null; } return select.labels[0].textContent.trim();",
+            vec![],
+        )
+        .await?
+        .json()
+        .as_str()
+        .map(str::to_string);
+    if name.as_deref() != Some("AI Reviewer (Claude)") {
+        bail!("the AI Reviewer select is named {name:?}, not by its label");
+    }
+    Ok(())
+}
 
 /// Pick the option whose text starts with `text` in the select `xpath` finds.
 async fn choose(driver: &WebDriver, xpath: &str, text: &str, what: &str) -> Result<()> {

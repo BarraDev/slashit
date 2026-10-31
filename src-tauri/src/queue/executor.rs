@@ -20952,6 +20952,274 @@ VERDICT: APPROVED"
             assert_eq!(refs_of(&w.repo), before_refs, "no branch created");
         }
 
+        /// Sets the AI Reviewer the Task's next automatic review would run on.
+        async fn set_reviewer(w: &World, reviewer: Option<&'static str>) {
+            let id = w.task_id;
+            crate::lifecycle::commit_task(&w.executor.tasks, &w.executor.storage, id, &move |staged: &mut HashMap<Uuid, Task>| {
+                staged.get_mut(&id).unwrap().reviewer_model = reviewer.map(str::to_string);
+            })
+            .await
+            .unwrap();
+        }
+
+        async fn commit_review_mode(w: &World, mode: crate::domain::task::ReviewMode) {
+            let id = w.task_id;
+            crate::lifecycle::commit_task(&w.executor.tasks, &w.executor.storage, id, &move |staged: &mut HashMap<Uuid, Task>| {
+                staged.get_mut(&id).unwrap().review_mode = mode;
+            })
+            .await
+            .unwrap();
+        }
+
+        /// Binds the Task to the input it holds now, with `request` when one is
+        /// given, as a Coordinator approval of its queue request would.
+        async fn approve_input(w: &World, for_run: u32, request: Option<&'static str>) {
+            let digest = crate::queue::prompt::approved_input_digest(&w.in_memory().await, request);
+            let id = w.task_id;
+            crate::lifecycle::commit_task(&w.executor.tasks, &w.executor.storage, id, &move |staged: &mut HashMap<Uuid, Task>| {
+                staged.get_mut(&id).unwrap().approved_execution =
+                    Some(crate::domain::task::ApprovedExecution {
+                        approval_id: Uuid::new_v4(),
+                        digest: digest.clone(),
+                        for_run,
+                        request: request.map(str::to_string),
+                        checkout: None,
+                    });
+            })
+            .await
+            .unwrap();
+        }
+
+        /// A start refused after the approved input changed: the start is refused
+        /// with the stale-approval reason before any Worker launches, the Task is
+        /// failed closed with its approval ended, nothing is recorded as started,
+        /// no branch is created, and the refusal holds after a restart.
+        async fn refused_before_any_worker_starts(
+            w: &World,
+            agents: &[&crate::test_helpers::FakeProgram],
+            refs_before: String,
+            case: &str,
+        ) {
+            let refused = w
+                .executor
+                .spawn_task_execution(w.task_id, None)
+                .await
+                .expect_err("refused");
+            assert!(
+                refused.contains("edited after its queue request was approved"),
+                "{case}: {refused}"
+            );
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.status, TaskStatus::Error, "{case}");
+                assert_eq!(task.approved_execution, None, "{case}");
+                assert_eq!(run_starts(&task), 0, "{case}: no RunStarted");
+                assert_eq!(
+                    task.error_message.as_deref(),
+                    Some(crate::domain::task::STALE_APPROVAL_REASON),
+                    "{case}"
+                );
+            }
+            for agent in agents {
+                assert_eq!(agent.invocations(), "", "{case}: no provider launch");
+            }
+            assert_eq!(refs_of(&w.repo), refs_before, "{case}: no branch created");
+
+            w.restart().await;
+            assert_eq!(
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(false),
+                "{case}: the refusal holds after a restart, and nothing is retried"
+            );
+            assert_eq!(w.on_disk().status, TaskStatus::Error, "{case}");
+            for agent in agents {
+                assert_eq!(agent.invocations(), "", "{case}: still no provider launch");
+            }
+        }
+
+        /// Under Automatic review, a Task approved to run on a reviewer starts,
+        /// and the run's own record keeps that reviewer.
+        #[tokio::test]
+        async fn an_approved_input_under_a_reviewer_starts_and_records_that_reviewer() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            set_reviewer(&w, Some("sonnet")).await;
+            approve_input(&w, 1, None).await;
+            let agent = fake_agent().await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            let invoked = agent_invoked(&agent).await;
+            w.end_run().await;
+
+            assert!(invoked, "the approved run starts");
+            assert_eq!(agent.launches("claude"), 1, "launched exactly once");
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.approved_execution, None, "one approval admits one run");
+                assert_eq!(run_starts(&task), 1);
+                assert_eq!(
+                    task.worker_handoff.as_ref().and_then(|h| h.reviewer_model.as_deref()),
+                    Some("sonnet"),
+                );
+            }
+        }
+
+        /// The approval named `sonnet`; the reviewer was replaced before the start.
+        #[tokio::test]
+        async fn a_reviewer_replaced_after_approval_is_refused_before_any_worker_starts() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            set_reviewer(&w, Some("sonnet")).await;
+            approve_input(&w, 1, None).await;
+            set_reviewer(&w, Some("opus")).await;
+            let agent = fake_agent().await;
+            let refs_before = refs_of(&w.repo);
+
+            refused_before_any_worker_starts(&w, &[&agent], refs_before, "replaced").await;
+            assert_eq!(w.on_disk().reviewer_model.as_deref(), Some("opus"), "the reviewer choice is kept");
+        }
+
+        /// The approval named `sonnet`; the reviewer was cleared before the start.
+        #[tokio::test]
+        async fn a_reviewer_cleared_after_approval_is_refused_before_any_worker_starts() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            set_reviewer(&w, Some("sonnet")).await;
+            approve_input(&w, 1, None).await;
+            set_reviewer(&w, None).await;
+            let agent = fake_agent().await;
+            let refs_before = refs_of(&w.repo);
+
+            refused_before_any_worker_starts(&w, &[&agent], refs_before, "cleared").await;
+        }
+
+        /// The approval was given with no reviewer; one was chosen before the start.
+        #[tokio::test]
+        async fn a_reviewer_added_after_approval_is_refused_before_any_worker_starts() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_input(&w, 1, None).await;
+            set_reviewer(&w, Some("sonnet")).await;
+            let agent = fake_agent().await;
+            let refs_before = refs_of(&w.repo);
+
+            refused_before_any_worker_starts(&w, &[&agent], refs_before, "added").await;
+        }
+
+        /// An approved additional request keeps its reviewer: the run starts with
+        /// the request, on the reviewer the approval named.
+        #[tokio::test]
+        async fn an_approved_request_under_a_reviewer_runs_with_the_request_on_that_reviewer() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            set_reviewer(&w, Some("sonnet")).await;
+            approve_input(&w, 1, Some("also add a changelog entry")).await;
+            let (agent, out) = prompt_capturing_agent(&w).await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            assert!(agent_invoked(&agent).await);
+            let mut seen = String::new();
+            for _ in 0..100 {
+                seen = std::fs::read_to_string(&out).unwrap_or_default();
+                if !seen.is_empty() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            w.end_run().await;
+
+            assert!(seen.contains("also add a changelog entry"), "{seen}");
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.approved_execution, None);
+                assert_eq!(
+                    task.worker_handoff.as_ref().and_then(|h| h.reviewer_model.as_deref()),
+                    Some("sonnet"),
+                );
+            }
+        }
+
+        /// An approved additional request whose reviewer was replaced before the
+        /// start is refused like an ordinary approval.
+        #[tokio::test]
+        async fn an_approved_request_whose_reviewer_changed_is_refused_before_any_worker_starts() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            set_reviewer(&w, Some("sonnet")).await;
+            approve_input(&w, 1, Some("also add a changelog entry")).await;
+            set_reviewer(&w, Some("opus")).await;
+            let agent = fake_agent().await;
+            let refs_before = refs_of(&w.repo);
+
+            refused_before_any_worker_starts(&w, &[&agent], refs_before, "request, replaced").await;
+        }
+
+        /// The approval was given under OpenCode with `sonnet`; the reviewer was
+        /// replaced before the start. Neither Worker launches.
+        #[tokio::test]
+        async fn a_reviewer_changed_under_opencode_is_refused_before_any_worker_starts() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            set_worker(&w, CodingProvider::OpenCode).await;
+            set_reviewer(&w, Some("sonnet")).await;
+            approve_input(&w, 1, None).await;
+            set_reviewer(&w, Some("opus")).await;
+            // One install per test: a second one would wait on the PATH lock held by the first.
+            let agent = crate::test_helpers::FakeProgram::install("claude", "sleep 20").await;
+            agent.add("opencode", "sleep 20");
+            let refs_before = refs_of(&w.repo);
+
+            refused_before_any_worker_starts(&w, &[&agent], refs_before, "opencode, replaced").await;
+            assert_eq!(agent.launches("claude"), 0, "no Claude launch");
+            assert_eq!(agent.launches("opencode"), 0, "no OpenCode launch");
+        }
+
+        /// Under Manual review no reviewer starts, so a reviewer changed after
+        /// approval does not refuse the approved run.
+        #[tokio::test]
+        async fn a_dormant_reviewer_changed_after_approval_does_not_refuse_a_manual_run() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            set_reviewer(&w, Some("sonnet")).await;
+            commit_review_mode(&w, crate::domain::task::ReviewMode::Manual).await;
+            approve_input(&w, 1, None).await;
+            set_reviewer(&w, Some("opus")).await;
+            let agent = fake_agent().await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            let invoked = agent_invoked(&agent).await;
+            w.end_run().await;
+            assert!(invoked, "the approved Manual run starts");
+            assert_eq!(run_starts(&w.on_disk()), 1);
+        }
+
+        /// While a run is unresolved the Task refuses every edit, a reviewer
+        /// included, so the reviewer the run recorded at its start cannot change
+        /// under it, in memory or on disk.
+        #[tokio::test]
+        async fn a_reviewer_edit_during_an_unresolved_run_is_refused_and_the_run_keeps_its_reviewer() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            set_reviewer(&w, Some("sonnet")).await;
+            let agent = fake_agent().await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            assert!(agent_invoked(&agent).await);
+            let id = w.task_id;
+            let refused = crate::lifecycle::commit_task(&w.executor.tasks, &w.executor.storage, id, &move |staged: &mut HashMap<Uuid, Task>| {
+                staged.get_mut(&id).unwrap().reviewer_model = Some("opus".to_string());
+            })
+            .await
+            .expect_err("an unresolved run refuses the edit");
+            let (memory, disk) = (w.in_memory().await, w.on_disk());
+            w.end_run().await;
+
+            assert!(refused.contains("unresolved Worker recovery evidence"), "{refused}");
+            for task in [&memory, &disk] {
+                assert_eq!(task.reviewer_model.as_deref(), Some("sonnet"), "the refused edit was not written");
+                assert_eq!(
+                    task.worker_handoff.as_ref().and_then(|h| h.reviewer_model.as_deref()),
+                    Some("sonnet"),
+                    "the run keeps the reviewer it started with",
+                );
+            }
+        }
+
         /// Ordering B: the Worker was chosen first and the Task approved after.
         /// The approval names OpenCode, so the run starts under it with the
         /// approved input.

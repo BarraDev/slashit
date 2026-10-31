@@ -436,8 +436,9 @@ pub fn TaskEditModal(
                         // AI Reviewer: the Claude model an automatic AI Review runs on. None is
                         // chosen by default, so no reviewer starts until a person picks one.
                         <div>
-                            <label class="block text-sm font-medium text-white/70 mb-1.5">"AI Reviewer (Claude)"</label>
+                            <label for="task-ai-reviewer-select" class="block text-sm font-medium text-white/70 mb-1.5">"AI Reviewer (Claude)"</label>
                             <select
+                                id="task-ai-reviewer-select"
                                 on:change=move |ev| set_reviewer_model.set(event_target_value(&ev))
                                 class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                                 disabled=move || submitting.get()
