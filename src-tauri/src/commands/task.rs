@@ -2731,6 +2731,54 @@ mod disk_pressure {
     }
 }
 
+/// U3a: the desktop's explicit close-without-merge is unchanged. A Human Review
+/// task closes only when the person has confirmed it.
+#[cfg(test)]
+mod human_review_close_confirmation {
+    use super::*;
+    use crate::test_helpers::create_test_task_full;
+
+    async fn test_state() -> (tempfile::TempDir, crate::AppState) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _report) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state should build under a fresh tempdir");
+        (tmp, state)
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_close_from_human_review_still_closes_and_an_unconfirmed_one_does_not() {
+        let (_tmp, state) = test_state().await;
+        let project_id = Uuid::new_v4();
+        let task = create_test_task_full("under test", project_id, TaskStatus::HumanReview, 0);
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+
+        let refused = set_task_status(&state, task_id, TaskStatus::Done, None)
+            .await
+            .expect_err("an unconfirmed close from Human Review must be refused");
+        assert_eq!(refused, CLOSE_WITHOUT_MERGE_REQUIRED);
+        assert_eq!(
+            state.task.tasks.read().await.get(&task_id).map(|t| t.status.clone()),
+            Some(TaskStatus::HumanReview),
+            "a refused close must leave the task in Human Review"
+        );
+
+        let closed = set_task_status(&state, task_id, TaskStatus::Done, Some(true))
+            .await
+            .expect("a confirmed close is allowed")
+            .expect("the task is found");
+        assert_eq!(closed.status, TaskStatus::Done);
+    }
+}
+
 /// A status move into Queue, asked from the desktop, is refused for the same
 /// reasons as every other queue entry, and a refused move changes nothing.
 #[cfg(test)]

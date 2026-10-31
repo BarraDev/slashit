@@ -8828,6 +8828,30 @@ impl TaskExecutor {
         cleaned_up
     }
 
+    /// A fake AI review owner whose cleanup, once cancelled, moves the task to
+    /// Human Review: the write a review's fix stage can make while it is being
+    /// ended, after a caller has already read the task's status. Used to prove
+    /// that a pull request request checks the status again once the owners are
+    /// ended. The write happens before the owner's future completes, which is
+    /// what the caller's join relies on.
+    pub(crate) async fn register_fake_reviewing_owner_writing_human_review_for_test(
+        &self,
+        task_id: Uuid,
+        tasks: Tasks,
+    ) {
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            if let Some(task) = tasks.write().await.get_mut(&task_id) {
+                task.status = TaskStatus::HumanReview;
+            }
+        });
+        self.reviewing_handles
+            .write()
+            .await
+            .insert(task_id, ReviewOwner { handle, cancel });
+    }
+
     /// Register a live execution owner whose cleanup, once cancelled, makes
     /// its own durable write to the task -- the shape a real completion path
     /// takes (`spawn_task_execution`'s own status write,

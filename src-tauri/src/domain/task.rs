@@ -607,6 +607,13 @@ pub struct NewTask {
 pub const INTEGRATION_UNFINISHED_REFUSAL: &str =
     "An integration is unfinished. Resume or Discard it before moving this Task.";
 
+/// What a person is told when a pull request is refused because the Task is in
+/// Human Review without an approval of its changes.
+pub const HUMAN_REVIEW_DELIVERY_REFUSAL: &str =
+    "This task is in Human Review and its changes have not been approved, so no pull request \
+     was opened and nothing was pushed. Approve the changes in the Human Review panel first, \
+     then create the pull request from there.";
+
 impl Task {
     /// Whether a resolved Worker handoff was followed by a durable human
     /// request for another implementation run. This does not apply to an
@@ -817,6 +824,18 @@ impl Task {
             .as_ref()
             .filter(|r| r.is_pending() && recoverable_here)
             .map(|_| INTEGRATION_UNFINISHED_REFUSAL.to_string())
+    }
+
+    /// Why a pull request may not be opened for this task right now, or `None`.
+    ///
+    /// A Task in Human Review is awaiting a person's decision, and opening a
+    /// pull request publishes its branch. Creating a pull request is not that
+    /// decision: only a current approval authorizes it, and the approved commit
+    /// is then bound by the delivery itself. Other states keep the behavior they
+    /// had before this check existed.
+    pub fn unapproved_human_review_delivery_refusal(&self) -> Option<String> {
+        (self.status == TaskStatus::HumanReview && !self.human_review.is_approved())
+            .then(|| HUMAN_REVIEW_DELIVERY_REFUSAL.to_string())
     }
 
     /// Why nothing but the restack's own recovery may change this task's

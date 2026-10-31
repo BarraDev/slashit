@@ -70,10 +70,83 @@ pub async fn create_pr(task_id: String) -> Result<String, String> {
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
-pub async fn bulk_create_prs(task_ids: Vec<String>) -> Result<Vec<String>, String> {
+/// What one task came to in a bulk pull request run. Mirrors
+/// `commands::pr::BulkPrOutcome` on the backend.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct BulkPrOutcome {
+    pub task_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub pr_url: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+pub async fn bulk_create_prs(task_ids: Vec<String>) -> Result<Vec<BulkPrOutcome>, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskIds": task_ids })).unwrap();
     let response = invoke("bulk_create_prs", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// What a bulk pull request run tells the person when any task did not get one,
+/// or `None` when every task did. A refused task is named with its reason, so a
+/// mixed selection never reads as an overall success.
+pub fn bulk_pr_failure_message(outcomes: &[BulkPrOutcome]) -> Option<String> {
+    let failed: Vec<&BulkPrOutcome> = outcomes.iter().filter(|o| o.error.is_some()).collect();
+    if failed.is_empty() {
+        return None;
+    }
+    let created = outcomes.len() - failed.len();
+    let reasons: Vec<String> = failed
+        .iter()
+        .map(|o| {
+            let name = if o.title.trim().is_empty() { o.task_id.as_str() } else { o.title.as_str() };
+            format!("\"{}\": {}", name, o.error.as_deref().unwrap_or_default())
+        })
+        .collect();
+    Some(format!("{} created, {} not created. {}", created, failed.len(), reasons.join(" ")))
+}
+
+#[cfg(test)]
+mod bulk_pr_tests {
+    use super::*;
+
+    fn outcome(task_id: &str, title: &str, pr_url: Option<&str>, error: Option<&str>) -> BulkPrOutcome {
+        BulkPrOutcome {
+            task_id: task_id.to_string(),
+            title: title.to_string(),
+            pr_url: pr_url.map(str::to_string),
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn an_all_successful_run_has_no_failure_message() {
+        let outcomes = [outcome("a", "Add export", Some("https://github.com/o/r/pull/1"), None)];
+        assert_eq!(bulk_pr_failure_message(&outcomes), None);
+    }
+
+    #[test]
+    fn a_mixed_run_names_each_refused_task_with_its_reason() {
+        let outcomes = [
+            outcome("a", "Unreviewed change", None, Some("awaiting a Human Review decision")),
+            outcome("b", "Done change", Some("https://github.com/o/r/pull/2"), None),
+        ];
+        assert_eq!(
+            bulk_pr_failure_message(&outcomes).as_deref(),
+            Some("1 created, 1 not created. \"Unreviewed change\": awaiting a Human Review decision")
+        );
+    }
+
+    #[test]
+    fn a_refused_task_without_a_title_is_named_by_its_id() {
+        let outcomes = [outcome("task-7", "", None, Some("no branch"))];
+        assert_eq!(
+            bulk_pr_failure_message(&outcomes).as_deref(),
+            Some("0 created, 1 not created. \"task-7\": no branch")
+        );
+    }
 }
 
 pub async fn sync_existing_pr(task_id: String) -> Result<Option<crate::models::Task>, String> {

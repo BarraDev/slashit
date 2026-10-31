@@ -56,9 +56,23 @@ pub fn BulkActions(
             spawn_local(async move {
                 let task_ids: Vec<String> = selected.iter().map(|id| id.to_string()).collect();
                 match crate::services::bulk_create_prs(task_ids).await {
-                    Ok(_) => {
-                        on_bulk_complete.run(());
-                    }
+                    Ok(outcomes) => match crate::services::bulk_pr_failure_message(&outcomes) {
+                        None => {
+                            on_bulk_complete.run(());
+                        }
+                        Some(message) => {
+                            // A mixed selection is not a success. The tasks that were
+                            // refused stay selected, and the reasons are shown here; the
+                            // ones that got a pull request are no longer selected.
+                            let refused: Vec<Uuid> = outcomes
+                                .iter()
+                                .filter(|o| o.error.is_some())
+                                .filter_map(|o| Uuid::parse_str(&o.task_id).ok())
+                                .collect();
+                            set_selected_tasks.set(refused);
+                            set_error_msg.set(Some(message));
+                        }
+                    },
                     Err(e) => {
                         set_error_msg.set(Some(e));
                     }
@@ -223,7 +237,7 @@ pub fn BulkActions(
                 </Show>
 
                 <Show when=move || error_msg.get().is_some()>
-                    <span class="text-sm text-red-300">{move || error_msg.get().unwrap_or_default()}</span>
+                    <span class="text-sm text-red-300 max-w-xl whitespace-normal">{move || error_msg.get().unwrap_or_default()}</span>
                 </Show>
             </div>
         </Show>
