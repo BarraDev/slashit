@@ -56,9 +56,24 @@ pub fn BulkActions(
             spawn_local(async move {
                 let task_ids: Vec<String> = selected.iter().map(|id| id.to_string()).collect();
                 match crate::services::bulk_create_prs(task_ids).await {
-                    Ok(_) => {
-                        on_bulk_complete.run(());
-                    }
+                    Ok(outcomes) => match crate::services::bulk_pr_failure_message(&outcomes) {
+                        None => {
+                            on_bulk_complete.run(());
+                        }
+                        Some(message) => {
+                            // A mixed selection is not a success. Only the tasks that
+                            // completed leave the selection; the refused ones stay selected
+                            // and their reasons are shown here. Selection changes the person
+                            // made while the request ran are kept.
+                            let completed: Vec<Uuid> = outcomes
+                                .iter()
+                                .filter(|o| o.error.is_none())
+                                .filter_map(|o| Uuid::parse_str(&o.task_id).ok())
+                                .collect();
+                            set_selected_tasks.update(|selected| selected.retain(|id| !completed.contains(id)));
+                            set_error_msg.set(Some(message));
+                        }
+                    },
                     Err(e) => {
                         set_error_msg.set(Some(e));
                     }
@@ -223,7 +238,7 @@ pub fn BulkActions(
                 </Show>
 
                 <Show when=move || error_msg.get().is_some()>
-                    <span class="text-sm text-red-300">{move || error_msg.get().unwrap_or_default()}</span>
+                    <span class="text-sm text-red-300 max-w-xl max-h-40 overflow-y-auto whitespace-normal">{move || error_msg.get().unwrap_or_default()}</span>
                 </Show>
             </div>
         </Show>

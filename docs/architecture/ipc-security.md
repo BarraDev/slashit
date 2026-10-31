@@ -84,6 +84,14 @@ pass, or a restart after hydration requeues it). The agent is spawned using
 `--dangerously-skip-permissions` and the full `Read,Edit,Write,Bash,Glob,Grep`
 tool set.
 
+`MoveTask { status: "done" }` from Human Review is refused: a Task awaiting a
+Human Review decision is closed only from the application, where the decision
+is recorded and confirmed. This is a refusal of one route, not an authorization
+boundary. The control channel does not distinguish a person from an agent that
+runs as the same OS user, and a move out of Human Review is still accepted (for
+example to Queue, then to Done), so the close can still be reached in two
+steps. Closing that route is a policy decision, not made here.
+
 There is no sandbox between "wrote a string into a task description" and
 "arbitrary command execution in a checkout of your repository". These verbs are
 marked in the protocol by `IpcRequest::spawns_agent()`, and the classification
