@@ -379,6 +379,7 @@ fn a_rows_kind_name_is_its_stored_type() {
         Kind::PrClosed { number: 1 },
         Kind::CompletedLocally {},
         Kind::IntegratedLocally { target: "main".into(), strategy: "fast_forward".into(), commit: "a".repeat(40) },
+        Kind::PrCreateUnconfirmedDiscarded { branch: "task-branch".into(), commit: "a".repeat(40), started_at: t(0) },
     ];
     let entries: Vec<Entry> =
         kinds.iter().enumerate().map(|(i, kind)| Entry { seq: i as u32 + 1, at: t(1), kind: kind.clone() }).collect();
@@ -785,4 +786,31 @@ fn no_verdict_reports_a_failed_review_as_failed() {
         no_verdict(&entries),
         Some(NoVerdict::Failed("could not read the changes"))
     );
+}
+
+#[test]
+fn a_discarded_unconfirmed_request_is_the_persons_decision_and_claims_no_proof() {
+    let kind = |started: u32| Kind::PrCreateUnconfirmedDiscarded {
+        branch: "task-branch".into(),
+        commit: "c".repeat(40),
+        started_at: t(started),
+    };
+    let mut entries = Vec::new();
+    assert!(record(&mut entries, t(10), kind(1)));
+    assert!(
+        record(&mut entries, t(20), kind(1)),
+        "a decision is recorded each time it is made; the task's record refuses a repeat"
+    );
+    assert_eq!(entries.len(), 2);
+
+    let items = timeline(t(0), [], &entries);
+    let last = items.last().expect("a row");
+    assert_eq!(last.kind_name(), "pr_create_unconfirmed_discarded");
+    assert_eq!(last.title(), "You confirmed that no pull request exists");
+    assert_eq!(last.tone(), Tone::Neutral);
+    let detail = last.detail().expect("a detail");
+    assert!(detail.contains("task-branch"), "{detail}");
+    assert!(detail.contains(&"c".repeat(12)), "{detail}");
+    assert!(detail.contains("not confirmed by GitHub"), "{detail}");
+    assert!(!detail.contains(&"c".repeat(13)), "only a short commit is shown: {detail}");
 }

@@ -80,6 +80,11 @@ fn every_activity_kind() -> Vec<Kind> {
             strategy: "fast_forward".into(),
             commit: commit('d'),
         },
+        Kind::PrCreateUnconfirmedDiscarded {
+            branch: "task/full".into(),
+            commit: commit('9'),
+            started_at: at(5),
+        },
     ];
     for kind in &kinds {
         match kind {
@@ -109,7 +114,8 @@ fn every_activity_kind() -> Vec<Kind> {
             | Kind::PrMerged { .. }
             | Kind::PrClosed { .. }
             | Kind::CompletedLocally {}
-            | Kind::IntegratedLocally { .. } => {}
+            | Kind::IntegratedLocally { .. }
+            | Kind::PrCreateUnconfirmedDiscarded { .. } => {}
         }
     }
     kinds
