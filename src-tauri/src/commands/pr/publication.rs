@@ -72,10 +72,10 @@ use crate::worktree::restack;
 /// `Err` means this call returned no record. It covers four cases: the request
 /// could not start (a running task, a pull request that is not this task's, an
 /// unreadable repository); a record write did not land before any push; an
-/// earlier publication of a different commit or pull request was still pending
-/// or unknown; and a push ran but its outcome could not be recorded, in which
-/// case the error text says whether the push succeeded. In the third case that
-/// earlier record is reconciled against the remote and its settled state is
+/// earlier publication of a different commit, branch or pull request was
+/// still pending or unknown; and a push ran but its outcome could not be
+/// recorded, in which case the error text says whether the push succeeded. In the
+/// third case that earlier record is reconciled against the remote and its settled state is
 /// written, so the stored record can change even though the request returns
 /// `Err`. A request pushes at most the commit it was given, and only after its
 /// pending record was written.

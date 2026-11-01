@@ -226,8 +226,8 @@ pub fn reconcile(
 pub enum Replay {
     /// No usable record: the request may start.
     Start,
-    /// The commit is already published to this pull request. Nothing else
-    /// is pushed, and the existing record answers the request.
+    /// The commit is already published from this branch to this pull request.
+    /// Nothing else is pushed, and the existing record answers the request.
     AlreadyPublished,
     /// An earlier request must be reconciled first.
     MustReconcile,
