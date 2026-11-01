@@ -14,6 +14,17 @@
 //! was. A push whose outcome cannot be read back is recorded as unknown, and
 //! the next request reads the remote again before it may push.
 
+//! Review fixes. A publication that is recorded as `Published` is also an
+//! observation of the remote branch, so it settles the Task's PR-review plan:
+//! a fix whose commit that read-back branch holds, with its recorded effect
+//! still in the tip, stops being marked as not yet on the remote
+//! (`fix_uncommitted`). It is the rule Apply and Sync replies use, fed with the
+//! branch this request just read, and it is written in the same board write as
+//! the `Published` record. It only ever clears that marker. It posts no reply,
+//! changes no other field, and is skipped for every outcome that is not
+//! `Published`. A repeat answered from an existing record reads nothing and
+//! settles nothing.
+//!
 //! Residual limits. The pull request is read again after the record is
 //! written and before the push, but GitHub can still merge or close it in the
 //! moments between that read and the push, and the push then reaches the
@@ -27,7 +38,8 @@ use uuid::Uuid;
 
 use crate::commands::gui_admission::GuiMutation;
 use crate::commands::pr::{
-    own_pr_url_for_branch, pr_url_for_task, push_branch_pinned_gated, refuse_if_pr_operation_cancelled,
+    delivered_against_remote, delivery_candidates, own_pr_url_for_branch, pr_url_for_task,
+    push_branch_pinned_gated, refuse_if_pr_operation_cancelled,
     reserve_task_for_explicit_publication, resolve_repository_dir, run_cmd, task_branch_tip,
 };
 use crate::domain::publication::{
@@ -178,6 +190,43 @@ mod test_seam {
     }
 }
 
+/// A review fix the remote branch, as this request read it, provably holds.
+struct DeliveredFix {
+    /// The item's place in the plan, and what identifies it there. The write
+    /// settles it only if the plan still has the same item and commit.
+    index: usize,
+    comment_id: Option<u64>,
+    commit: String,
+}
+
+/// The review fixes of the Task's plan that `remote` provably holds, by the
+/// rule Apply and Sync replies use. Empty when the Task has no plan, no branch,
+/// or nothing the remote holds. Reads Git only; the plan is worked on as a copy.
+async fn delivered_review_fixes(
+    state: &crate::AppState,
+    task_id: Uuid,
+    working_dir: &str,
+    remote: &RemoteBranch,
+) -> Vec<DeliveredFix> {
+    let Some(task) = state.task.tasks.read().await.get(&task_id).cloned() else {
+        return Vec::new();
+    };
+    let (Some(branch), Some(mut plan)) = (task.branch_name.as_deref(), task.pr_review_plan.clone()) else {
+        return Vec::new();
+    };
+    let candidates = delivery_candidates(&plan);
+    let delivered = delivered_against_remote(working_dir, branch, &mut plan, remote, &candidates).await;
+    let mut fixes: Vec<DeliveredFix> = delivered
+        .into_iter()
+        .filter_map(|index| {
+            let item = &plan.items[index];
+            Some(DeliveredFix { index, comment_id: item.comment_id, commit: item.fix_commit.clone()? })
+        })
+        .collect();
+    fixes.sort_by_key(|f| f.index);
+    fixes
+}
+
 /// Write `record` as the task's publication, but only while the task still
 /// holds `expected` (compare-and-set). `Err` says whether the write landed:
 /// `NotPublished` means the board is unchanged, including when `expected` no
@@ -189,12 +238,38 @@ async fn write_publication(
     expected: Option<&PrPublication>,
     record: &PrPublication,
 ) -> Result<(), RecordWriteError> {
+    write_publication_settling(state, task_id, expected, record, &[]).await
+}
+
+/// [`write_publication`], which also clears the not-yet-on-the-remote marker of
+/// the review `delivered` fixes in the same board write, so a restart finds the
+/// record and the plan agreeing. A fix whose item or commit changed since it
+/// was observed is left as it is.
+async fn write_publication_settling(
+    state: &crate::AppState,
+    task_id: Uuid,
+    expected: Option<&PrPublication>,
+    record: &PrPublication,
+    delivered: &[DeliveredFix],
+) -> Result<(), RecordWriteError> {
     let recorded = AtomicBool::new(false);
     let apply = |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
             if task.pr_publication.as_ref() == expected {
                 task.pr_publication = Some(record.clone());
                 recorded.store(true, Ordering::SeqCst);
+                if let Some(plan) = task.pr_review_plan.as_mut() {
+                    for fix in delivered {
+                        if let Some(item) = plan.items.get_mut(fix.index) {
+                            if item.fix_done
+                                && item.comment_id == fix.comment_id
+                                && item.fix_commit.as_deref() == Some(fix.commit.as_str())
+                            {
+                                item.fix_uncommitted = false;
+                            }
+                        }
+                    }
+                }
             }
         }
     };
@@ -308,7 +383,14 @@ async fn publish(
                 );
             };
             let updated = PrPublication { state: state_now, updated_at: chrono::Utc::now(), ..record.clone() };
-            write_publication(state, task_id, Some(&record), &updated)
+            // The remote was just read: when it holds the record's commit, it
+            // also settles the review fixes it carries.
+            let delivered = if updated.state == (PublicationState::Published {}) {
+                delivered_review_fixes(state, task_id, &working_dir, &remote).await
+            } else {
+                Vec::new()
+            };
+            write_publication_settling(state, task_id, Some(&record), &updated, &delivered)
                 .await
                 .map_err(record_write_failure)?;
             if updated.commit != commit || updated.pr_url != pr_url {
@@ -417,12 +499,20 @@ async fn publish(
         write_publication(state, task_id, Some(&pending), &record).await.map_err(record_write_failure)?;
         return Ok(record);
     }
-    let remote_after = remote_head_of(&RemoteBranch::refresh(&working_dir, Some(branch.as_str())).await);
+    let remote_read = RemoteBranch::refresh(&working_dir, Some(branch.as_str())).await;
+    let remote_after = remote_head_of(&remote_read);
     let settled = classify_outcome(commit, remote_head.as_deref(), &remote_after, &push);
+    // Only a read-back that found the commit is evidence for the review fixes.
+    // A refusal, a pending or an unknown outcome proves nothing about them.
+    let delivered = if settled == (PublicationState::Published {}) {
+        delivered_review_fixes(state, task_id, &working_dir, &remote_read).await
+    } else {
+        Vec::new()
+    };
 
     let outcome = if push.is_ok() { "succeeded" } else { "failed" };
     let finished = PrPublication { state: settled, updated_at: chrono::Utc::now(), ..record };
-    write_publication(state, task_id, Some(&pending), &finished).await.map_err(|e| match e {
+    write_publication_settling(state, task_id, Some(&pending), &finished, &delivered).await.map_err(|e| match e {
         // Nothing changed on disk or in memory: the record still says pending.
         RecordWriteError::NotPublished(_) => format!(
             "The push {outcome}, but its outcome could not be recorded: {e}. The record still says pending, so \
@@ -466,9 +556,10 @@ mod orchestration {
 
     use super::{publish, test_seam};
     use crate::domain::publication::{PrPublication, PublicationState};
-    use crate::domain::task::HumanReviewRecord;
+    use crate::domain::task::{FixEffect, HumanReviewRecord, PrReviewDecision, PrReviewItem, PrReviewPlan};
     use crate::domain::{AgentConfig, AgentType, Project, ProjectScope, Repository, Task, TaskStatus};
     use crate::test_helpers::create_test_task_full;
+    use crate::worktree::delivery;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -615,6 +706,69 @@ mod orchestration {
         fn remote_head(&self) -> Option<String> {
             let listed = git(&self.remote, &["for-each-ref", "--format=%(objectname)", &format!("refs/heads/{BRANCH}")]);
             (!listed.is_empty()).then_some(listed)
+        }
+
+        /// What a fix agent would have done: change `name` in the checkout,
+        /// recording the trees before and after, then commit it as the fix's
+        /// commit. Returns that commit and the effect.
+        async fn fix_committed(&self, name: &str) -> (String, FixEffect) {
+            git(&self.checkout, &["checkout", "-q", BRANCH]);
+            let dir = self.checkout.to_str().unwrap();
+            let before_tree = delivery::checkout_snapshot(dir).await.unwrap();
+            std::fs::write(self.checkout.join(name), format!("fix for {name}\n")).unwrap();
+            let after_tree = delivery::checkout_snapshot(dir).await.unwrap();
+            git(&self.checkout, &["add", name]);
+            git(&self.checkout, &["commit", "-q", "-m", &format!("fix {name}")]);
+            (git(&self.checkout, &["rev-parse", "HEAD"]), FixEffect { before_tree, after_tree })
+        }
+
+        /// Give the Task a review plan whose one approved Fix item was made,
+        /// committed (`commit`) and not yet seen on the remote, as a first
+        /// Apply with Auto-push off leaves it.
+        async fn seed_plan_with_unpublished_fix(&self, commit: &str, effect: FixEffect) {
+            let item = PrReviewItem {
+                comment_id: Some(7),
+                summary: "rename".into(),
+                decision: PrReviewDecision::Fix,
+                reasoning: String::new(),
+                proposed_change: String::new(),
+                approved: true,
+                user_note: String::new(),
+                fix_done: true,
+                fix_uncommitted: true,
+                fix_commit: Some(commit.to_string()),
+                fix_effect: Some(effect),
+                reply_posted: false,
+                last_agent_summary: Some("done".into()),
+                last_error: None,
+                pr_reply_text: None,
+                reply_comment_id: None,
+            };
+            let plan = PrReviewPlan {
+                generated_at: chrono::Utc::now(),
+                pr_url: PR.to_string(),
+                review_decision: None,
+                comments: Vec::new(),
+                items: vec![item],
+                raw_plan: String::new(),
+                last_apply: None,
+                fixed_content: Vec::new(),
+            };
+            let mut tasks = self.state.task.tasks.write().await;
+            tasks.get_mut(&self.task_id).unwrap().pr_review_plan = Some(plan);
+            let board: Vec<Task> = tasks.values().cloned().collect();
+            self.state.storage.save_project_tasks(self.project_id, &board).unwrap();
+        }
+
+        async fn plan_item(&self) -> PrReviewItem {
+            self.task().await.pr_review_plan.expect("the task keeps its plan").items.remove(0)
+        }
+
+        /// The plan item as the file holds it, for what a restart would find.
+        fn persisted_plan_item(&self) -> PrReviewItem {
+            let board = self.state.storage.load_project_tasks(self.project_id).unwrap();
+            let task = board.into_iter().find(|t| t.id == self.task_id).unwrap();
+            task.pr_review_plan.expect("the plan is on disk").items.remove(0)
         }
 
         async fn task(&self) -> Task {
@@ -1117,5 +1271,143 @@ mod orchestration {
         assert!(err.contains("no longer the branch you confirmed"), "{err}");
         assert!(fx.record().await.is_none(), "a refused request records nothing");
         assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()));
+    }
+
+    // ----- The review plan after a publication -----------------------------
+    //
+    // Publish to PR pushes the commit a review fix was committed in. The plan
+    // marks that fix "not delivered" until something has seen it on the remote,
+    // and Sync replies stays unavailable meanwhile. A verified publication is
+    // such an observation, so it settles the plan; nothing else about the plan
+    // changes, and no reply is posted.
+
+    #[tokio::test]
+    async fn a_verified_publication_of_the_fix_commit_settles_the_plan_without_a_reply() {
+        let fx = fixture().await;
+        let (c1, effect) = fx.fix_committed("fixed.txt").await;
+        fx.seed_plan_with_unpublished_fix(&c1, effect.clone()).await;
+        test_seam::fix_observation(true, BRANCH, true);
+        let before = fx.plan_item().await;
+        assert!(before.fix_uncommitted, "precondition: the fix is not yet seen on the remote");
+
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
+
+        assert_eq!(record.state, PublicationState::Published {});
+        assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
+        let item = fx.plan_item().await;
+        assert!(!item.fix_uncommitted, "the remote holds the fix commit and its effect");
+        assert_eq!(item, PrReviewItem { fix_uncommitted: false, ..before }, "nothing else on the item changes");
+        assert!(!item.reply_posted && item.reply_comment_id.is_none(), "publishing posts no reply");
+        assert_eq!(fx.persisted_plan_item(), item, "the file holds what memory holds, so a restart agrees");
+        // The one thing Sync's availability asks of the plan.
+        assert!(item.fix_done && item.fix_commit.is_some() && !item.fix_uncommitted);
+        assert_eq!(item.fix_effect, Some(effect));
+    }
+
+    #[tokio::test]
+    async fn a_publication_of_a_later_commit_settles_a_fix_it_contains() {
+        let fx = fixture().await;
+        let (c1, effect) = fx.fix_committed("fixed.txt").await;
+        fx.seed_plan_with_unpublished_fix(&c1, effect).await;
+        let c2 = fx.commit("unrelated");
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c2, PR).await.unwrap();
+
+        assert_eq!(record.state, PublicationState::Published {});
+        assert!(!fx.plan_item().await.fix_uncommitted, "c1 is an ancestor of the published c2");
+    }
+
+    #[tokio::test]
+    async fn a_refused_publication_never_settles_the_plan() {
+        let fx = fixture().await;
+        let (c1, effect) = fx.fix_committed("fixed.txt").await;
+        fx.seed_plan_with_unpublished_fix(&c1, effect).await;
+        test_seam::fix_observation(false, BRANCH, true);
+
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
+
+        assert!(matches!(record.state, PublicationState::Refused { .. }));
+        assert!(fx.plan_item().await.fix_uncommitted, "an attempt is not delivery");
+        assert!(fx.persisted_plan_item().fix_uncommitted);
+    }
+
+    #[tokio::test]
+    async fn a_published_commit_that_reverted_the_fix_does_not_settle_it() {
+        let fx = fixture().await;
+        let (c1, effect) = fx.fix_committed("fixed.txt").await;
+        fx.seed_plan_with_unpublished_fix(&c1, effect).await;
+        // The branch tip removes the fix again.
+        git(&fx.checkout, &["rm", "-q", "fixed.txt"]);
+        git(&fx.checkout, &["commit", "-q", "-m", "revert the fix"]);
+        let tip = git(&fx.checkout, &["rev-parse", "HEAD"]);
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let record = publish(&fx.state, fx.task_id, BRANCH, &tip, PR).await.unwrap();
+
+        assert_eq!(record.state, PublicationState::Published {});
+        let item = fx.plan_item().await;
+        assert!(item.fix_uncommitted, "the remote holds the commit but not the change");
+        assert_eq!(item.fix_commit.as_deref(), Some(c1.as_str()), "publishing never discards the fix's evidence");
+        assert!(item.fix_effect.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_fix_that_was_never_committed_stays_undelivered_after_a_publication() {
+        let fx = fixture().await;
+        let (_c1, effect) = fx.fix_committed("fixed.txt").await;
+        let tip = fx.commit("other");
+        fx.seed_plan_with_unpublished_fix("0000000000000000000000000000000000000001", effect).await;
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let record = publish(&fx.state, fx.task_id, BRANCH, &tip, PR).await.unwrap();
+
+        assert_eq!(record.state, PublicationState::Published {});
+        assert!(fx.plan_item().await.fix_uncommitted, "a commit the remote does not hold proves nothing");
+    }
+
+    #[tokio::test]
+    async fn repeating_a_published_request_changes_nothing_and_posts_no_second_reply() {
+        let fx = fixture().await;
+        let (c1, effect) = fx.fix_committed("fixed.txt").await;
+        fx.seed_plan_with_unpublished_fix(&c1, effect).await;
+        test_seam::fix_observation(true, BRANCH, true);
+        let first = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
+        let settled = fx.task().await;
+
+        let again = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
+
+        assert_eq!(again, first);
+        let after = fx.task().await;
+        assert_eq!(after.pr_review_plan, settled.pr_review_plan);
+        assert_eq!(after.updated_at, settled.updated_at, "a replay writes nothing");
+        assert!(!after.pr_review_plan.unwrap().items[0].reply_posted);
+    }
+
+    #[tokio::test]
+    async fn a_push_that_landed_before_its_record_settled_also_settles_the_plan() {
+        let fx = fixture().await;
+        let (c1, effect) = fx.fix_committed("fixed.txt").await;
+        fx.seed_plan_with_unpublished_fix(&c1, effect).await;
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{c1}:refs/heads/{BRANCH}")]);
+        fx.leave_record(pending_record(&c1, &fx.base)).await;
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
+
+        assert_eq!(record.state, PublicationState::Published {});
+        assert!(!fx.plan_item().await.fix_uncommitted, "the reconciled record is the same observation");
+    }
+
+    #[tokio::test]
+    async fn a_task_without_a_review_plan_publishes_as_before() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
+
+        assert_eq!(record.state, PublicationState::Published {});
+        assert!(fx.task().await.pr_review_plan.is_none());
     }
 }
