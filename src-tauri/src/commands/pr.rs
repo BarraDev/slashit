@@ -1255,6 +1255,12 @@ pub async fn discuss_pr_review_questions_inner(
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AddressPrReviewOptions {
+    /// Push the task branch after the fixes are committed. Off unless the
+    /// caller asks for it: a request that omits the field commits the fixes
+    /// locally and publishes nothing. This is a default, not an authorization
+    /// check: a request that sets it to true is still honoured, and the push
+    /// is by branch name, not pinned to a reviewed commit.
+    #[serde(default)]
     pub auto_push: bool,
     pub auto_reply: bool,
     /// When true, the agent runs read-only and describes what it would do, but
@@ -1671,6 +1677,7 @@ pub async fn address_pr_review_inner(
     // or pushed, not even one that succeeded. Their markers stay set and every
     // edit stays on disk; an apply without a failure commits them.
     let withheld = !options.dry_run && a_fix_failed && !uncommitted.is_empty();
+    let apply_again = apply_again_instruction(options.auto_push);
 
     if withheld {
         let also_cancelled = if cancelled {
@@ -1682,8 +1689,7 @@ pub async fn address_pr_review_inner(
             "a review fix failed and may have left partial edits in the task checkout, so the \
              fixes that succeeded were not committed or pushed with them.{also_cancelled} Review \
              the checkout and remove only what the failed fix left: the successful fixes are not \
-             made again, so their edits must stay. Then apply again to commit and push \
-             them.{unpushed_replies_note}"
+             made again, so their edits must stay. Then {apply_again}.{unpushed_replies_note}"
         );
         progress(PrReviewProgress {
             task_id: task_id_str.clone(),
@@ -1697,13 +1703,13 @@ pub async fn address_pr_review_inner(
     } else if cancelled && !options.dry_run && anything_owed {
         push_error = Some(format!(
             "the task was changed while these fixes were being applied, so they were not \
-             committed or pushed; apply again to commit and push them.{unpushed_replies_note}"
+             committed or pushed; {apply_again}.{unpushed_replies_note}"
         ));
     }
 
     // Also on an apply that made no new fix, when an earlier one left fixes
-    // uncommitted or unpushed: applying again commits and pushes them without
-    // running their fix agents again.
+    // uncommitted or unpushed: applying again commits them, and pushes them
+    // only when Auto-push is on, without running their fix agents again.
     if !options.dry_run && anything_owed && !cancelled && !withheld {
         let mut committed_ok = true;
         if !uncommitted.is_empty() {
@@ -1791,7 +1797,7 @@ pub async fn address_pr_review_inner(
                 Err(e) => Some(format!(
                     "the review fixes could not be committed, so nothing was pushed: {e}. They \
                      remain as uncommitted edits in the task checkout; once that is resolved, \
-                     apply again to commit and push them.{unpushed_replies_note}"
+                     {apply_again}.{unpushed_replies_note}"
                 )),
             };
             if let Some(error) = failure {
@@ -2004,6 +2010,18 @@ pub async fn address_pr_review_inner(
     }
 
     Ok((result, updated_plan))
+}
+
+/// The closing instruction of a message saying review fixes were not committed
+/// or pushed. Applying again commits them, and pushes them only when Auto-push
+/// is on. With it off, a push needs the person to publish the commit.
+fn apply_again_instruction(auto_push: bool) -> &'static str {
+    if auto_push {
+        "apply again to commit and push them"
+    } else {
+        "apply again to commit them. They are not pushed unless Auto-push branch is on or \
+         you publish the commit to the pull request"
+    }
 }
 
 /// What to add to a message saying review fixes were not pushed, when
@@ -17707,6 +17725,63 @@ mod tests {
                 let unrelated = git(worktree, &["commit-tree", &tree, "-p", &base, "-m", "unrelated"]);
                 git(worktree, &["push", "-q", "--force", "origin", &format!("{unrelated}:refs/heads/task-branch")]);
                 unrelated
+            }
+
+            /// A request that leaves `auto_push` out is a request not to push.
+            #[test]
+            fn apply_options_without_auto_push_deserialize_as_off() {
+                let options: AddressPrReviewOptions =
+                    serde_json::from_str(r#"{"auto_reply":true}"#).unwrap();
+                assert!(!options.auto_push);
+                assert!(!options.dry_run);
+                let explicit: AddressPrReviewOptions =
+                    serde_json::from_str(r#"{"auto_push":true,"auto_reply":false}"#).unwrap();
+                assert!(explicit.auto_push);
+            }
+
+            /// Recovery wording names a push only when Auto-push is on. With it
+            /// off, the wording says that applying again does not push and
+            /// names the publication that does.
+            #[test]
+            fn recovery_wording_names_a_push_only_with_auto_push_on() {
+                let on = apply_again_instruction(true);
+                assert!(on.contains("commit and push them"), "{on}");
+                let off = apply_again_instruction(false);
+                assert!(!off.contains("and push"), "{off}");
+                assert!(off.contains("not pushed unless Auto-push branch is on"), "{off}");
+                assert!(off.contains("publish the commit to the pull request"), "{off}");
+            }
+
+            /// With `auto_push` off the fixes are committed in the task
+            /// checkout and nothing reaches `origin`: the remote branch is
+            /// where it was, the commit exists only locally and stays owed a
+            /// push, and no reply claims a delivery that did not happen.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn with_auto_push_off_the_fix_is_committed_locally_and_not_published() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                // The branch is already on origin, as it is for a task with a
+                // pull request, at the commit before the fix.
+                git(&worktree, &["push", "-q", "origin", "task-branch"]);
+                let remote_before = repo.remote_has_branch("task-branch");
+                assert!(remote_before.is_some(), "origin holds the branch before the apply");
+
+                let (result, plan) =
+                    apply_without_push(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                assert_ne!(Some(tip.clone()), remote_before, "the fix is a new local commit");
+                assert_eq!(repo.remote_has_branch("task-branch"), remote_before, "origin was not touched");
+                assert!(!remote_branch_has_file(&repo, "review-fix-1.txt"));
+                assert!(!result.pushed && result.push_branch.is_none(), "{result:?}");
+                assert_eq!(result.replies_posted, 0, "{result:?}");
+                assert_eq!(plan.items[0].fix_commit.as_deref(), Some(tip.as_str()));
+                assert!(!plan.items[0].reply_posted);
+                assert_eq!(git(&worktree, &["status", "--porcelain"]), "", "the fix is committed, not left as edits");
             }
 
             /// Committed and pushed: the item records the commit that carries

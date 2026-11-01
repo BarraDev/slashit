@@ -211,8 +211,15 @@ pub async fn analyze_pr_comments(task_id: String) -> Result<crate::models::task:
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
+/// Whether the PR review dialog starts with "Auto-push branch" checked. Off:
+/// applying review fixes commits them locally, and publishing the branch is a
+/// choice made for that apply.
+pub const PR_REVIEW_AUTO_PUSH_DEFAULT: bool = false;
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AddressPrReviewOptions {
+    /// Absent means off, the same as the backend reads it.
+    #[serde(default)]
     pub auto_push: bool,
     pub auto_reply: bool,
     #[serde(default)]
@@ -336,4 +343,29 @@ pub async fn publish_task_to_pr(
     .unwrap();
     let response = invoke("publish_task_to_pr", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_review_dialog_starts_with_auto_push_off() {
+        const { assert!(!PR_REVIEW_AUTO_PUSH_DEFAULT) };
+    }
+
+    #[test]
+    fn options_without_auto_push_deserialize_as_off() {
+        let options: AddressPrReviewOptions =
+            serde_json::from_str(r#"{"auto_reply":true}"#).unwrap();
+        assert!(!options.auto_push);
+        assert!(!options.dry_run);
+    }
+
+    #[test]
+    fn an_explicit_auto_push_is_kept() {
+        let options: AddressPrReviewOptions =
+            serde_json::from_str(r#"{"auto_push":true,"auto_reply":false}"#).unwrap();
+        assert!(options.auto_push);
+    }
 }
