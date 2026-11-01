@@ -28,8 +28,11 @@
 //! Residual limits. The pull request is read again after the record is
 //! written and before the push, but GitHub can still merge or close it in the
 //! moments between that read and the push, and the push then reaches the
-//! branch. A repeated request for a commit already recorded as published is
-//! answered from the record, without reading the remote again. A run that
+//! branch. A repeated request for a commit already recorded as published
+//! from the same branch to the same pull request is answered from the record,
+//! without reading the remote again. A record of another branch or pull request
+//! never answers it: a pending one is settled for its own operation first, and
+//! the request is then refused for the person to confirm again. A run that
 //! starts after the live-run check and before the reservation is not refused.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -364,7 +367,7 @@ async fn publish(
     let working_dir = resolve_repository_dir(state, task_id).await?;
     let existing = task.pr_publication.clone();
 
-    match replay(existing.as_ref(), commit, pr_url) {
+    match replay(existing.as_ref(), commit, &branch, pr_url) {
         Replay::AlreadyPublished => return Ok(existing.expect("replay names an existing record")),
         Replay::Start => {}
         Replay::MustReconcile => {
@@ -398,14 +401,16 @@ async fn publish(
             write_publication_settling(state, task_id, Some(&record), &updated, &delivered)
                 .await
                 .map_err(record_write_failure)?;
-            if updated.commit != commit || updated.pr_url != pr_url {
-                // The stored record was for another commit or another pull request.
+            if updated.commit != commit || updated.branch != branch || updated.pr_url != pr_url {
+                // The stored record was for another commit, branch or pull request.
                 // Its outcome is now settled, but this request was not pushed, and
                 // reconciling must not start a push for it.
                 return Err(format!(
-                    "An earlier publication of {} to {} was settled against the remote. The commit you confirmed, \
-                     {}, was not published, and nothing was pushed for it. Confirm the publication again to publish it.",
+                    "An earlier publication of {} from {} to {} was settled against the remote. The commit you \
+                     confirmed, {}, was not published, and nothing was pushed for it. Confirm the publication \
+                     again to publish it.",
                     short_commit(&record.commit),
+                    record.branch,
                     record.pr_url,
                     short_commit(commit),
                 ));
@@ -1060,6 +1065,88 @@ mod orchestration {
         assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
     }
 
+    // A record answers a request only for the branch, commit and pull request
+    // the person confirmed. Another branch's record, pending or published, is
+    // settled for its own operation and never answers or authorizes this one.
+
+    #[tokio::test]
+    async fn a_published_record_for_another_branch_does_not_answer_a_request_for_this_branch() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let other = "other-branch";
+        let earlier = PrPublication { state: PublicationState::Published {}, branch: other.to_string(), ..pending_record(&c1, &fx.base) };
+        fx.leave_record(earlier.clone()).await;
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
+
+        assert_eq!(record.branch, BRANCH, "the answer is for the branch that was asked for");
+        assert_ne!(record.request_id, earlier.request_id, "the other branch's record is not the answer");
+        assert_eq!(record.state, PublicationState::Published {});
+        assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()), "this request, which the person confirmed, ran on its own");
+        let task = fx.task().await;
+        assert_eq!(task.human_review, HumanReviewRecord::default(), "publication must not record a decision");
+        assert_eq!(task.status, TaskStatus::HumanReview);
+    }
+
+    #[tokio::test]
+    async fn a_settled_record_for_the_same_commit_and_pull_request_on_another_branch_is_not_reported_as_published() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        // c1 reached another branch of the remote, whose earlier publication is still pending.
+        let other = "other-branch";
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{c1}:refs/heads/{other}")]);
+        fx.leave_record(PrPublication { branch: other.to_string(), ..pending_record(&c1, &fx.base) }).await;
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
+
+        assert!(err.contains("was not published"), "{err}");
+        let settled = fx.record().await.unwrap();
+        assert_eq!((settled.branch.as_str(), settled.state), (other, PublicationState::Published {}));
+        assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()), "reconciling another branch must not push this one");
+    }
+
+    #[tokio::test]
+    async fn a_refused_settlement_of_another_branch_record_does_not_answer_or_publish_this_request() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        // The earlier publication for another branch never landed: its remote lacks c1.
+        let other = "other-branch";
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{}:refs/heads/{other}", fx.base)]);
+        fx.leave_record(PrPublication { branch: other.to_string(), ..pending_record(&c1, &fx.base) }).await;
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
+
+        assert!(err.contains("was not published"), "{err}");
+        let settled = fx.record().await.unwrap();
+        assert_eq!(settled.branch, other);
+        assert!(matches!(settled.state, PublicationState::Refused { .. }));
+        assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()), "settling the old record pushed nothing");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_record_for_another_branch_stays_unknown_while_its_remote_cannot_be_read() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let other = "other-branch";
+        let earlier = PrPublication {
+            state: PublicationState::Unknown { reason: "test".into() },
+            branch: other.to_string(),
+            ..pending_record(&c1, &fx.base)
+        };
+        fx.leave_record(earlier.clone()).await;
+        test_seam::fix_observation(true, BRANCH, true);
+        git(&fx.checkout, &["remote", "set-url", "origin", "/nonexistent/remote.git"]);
+
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
+
+        assert!(err.contains("still unknown"), "{err}");
+        assert_eq!(fx.record().await, Some(earlier), "an unreadable remote settles nothing");
+        assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()));
+    }
+
     #[tokio::test]
     async fn a_failed_pending_write_pushes_nothing() {
         let fx = fixture().await;
@@ -1419,8 +1506,9 @@ mod orchestration {
         fx.leave_record(PrPublication { branch: other.to_string(), ..pending_record(&c1, &fx.base) }).await;
         test_seam::fix_observation(true, BRANCH, true);
 
-        let _ = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await;
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
 
+        assert!(err.contains("was not published"), "{err}");
         let settled = fx.record().await.unwrap();
         assert_eq!((settled.branch.as_str(), settled.state), (other, PublicationState::Published {}));
         assert!(fx.plan_item().await.fix_uncommitted, "another branch's remote does not speak for this plan");

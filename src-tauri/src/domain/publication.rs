@@ -234,13 +234,15 @@ pub enum Replay {
 }
 
 /// Decide what an existing record means for a new request to publish
-/// `commit` to `pr_url`.
-pub fn replay(existing: Option<&PrPublication>, commit: &str, pr_url: &str) -> Replay {
+/// `commit` from `branch` to `pr_url`. A published record answers the request
+/// only when it is for the same commit, branch and pull request.
+pub fn replay(existing: Option<&PrPublication>, commit: &str, branch: &str, pr_url: &str) -> Replay {
     match existing {
         None => Replay::Start,
         Some(record) if record.needs_reconciliation() => Replay::MustReconcile,
         Some(record) if record.state == PublicationState::Published {}
             && record.commit == commit
+            && record.branch == branch
             && record.pr_url == pr_url =>
         {
             Replay::AlreadyPublished
@@ -404,24 +406,30 @@ mod tests {
 
     #[test]
     fn a_pending_or_unknown_record_forces_reconciliation_before_a_new_request() {
-        assert_eq!(replay(Some(&record(PublicationState::Pending {})), NEW, PR), Replay::MustReconcile);
+        assert_eq!(replay(Some(&record(PublicationState::Pending {})), NEW, BRANCH, PR), Replay::MustReconcile);
         let unknown = record(PublicationState::Unknown { reason: "x".into() });
-        assert_eq!(replay(Some(&unknown), NEW, PR), Replay::MustReconcile);
+        assert_eq!(replay(Some(&unknown), NEW, BRANCH, PR), Replay::MustReconcile);
     }
 
     #[test]
     fn a_duplicate_request_for_a_published_commit_is_answered_without_a_push() {
         let published = record(PublicationState::Published {});
-        assert_eq!(replay(Some(&published), NEW, PR), Replay::AlreadyPublished);
+        assert_eq!(replay(Some(&published), NEW, BRANCH, PR), Replay::AlreadyPublished);
         // A different commit is a new request.
-        assert_eq!(replay(Some(&published), OLD, PR), Replay::Start);
+        assert_eq!(replay(Some(&published), OLD, BRANCH, PR), Replay::Start);
+        // The same commit and pull request from another branch is a new request.
+        assert_eq!(replay(Some(&published), NEW, "other-branch", PR), Replay::Start);
+        assert_eq!(
+            replay(Some(&published), NEW, BRANCH, "https://github.com/BarraDev/slashit/pull/10"),
+            Replay::Start
+        );
     }
 
     #[test]
     fn a_refused_record_lets_a_new_request_start() {
         let refused = record(PublicationState::Refused { reason: "x".into() });
-        assert_eq!(replay(Some(&refused), NEW, PR), Replay::Start);
-        assert_eq!(replay(None, NEW, PR), Replay::Start);
+        assert_eq!(replay(Some(&refused), NEW, BRANCH, PR), Replay::Start);
+        assert_eq!(replay(None, NEW, BRANCH, PR), Replay::Start);
     }
 
     #[test]
