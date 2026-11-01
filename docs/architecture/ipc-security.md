@@ -84,6 +84,15 @@ pass, or a restart after hydration requeues it). The agent is spawned using
 `--dangerously-skip-permissions` and the full `Read,Edit,Write,Bash,Glob,Grep`
 tool set.
 
+A Task in Human Review is not moved by the control channel. `MoveTask` to any
+other status and `EnqueueTask` are refused for it, and nothing is written. Each
+of those leaves Human Review only through a decision the application records
+(approving the changes, requesting changes, closing the Task, or the desktop's
+own queue action), so a typed command cannot discard a pending decision or reach
+Done through Queue. This is a refusal of these verbs, not an authorization
+boundary: the control channel does not distinguish a person from an agent that
+runs as the same OS user, and it does not gate the desktop's own actions.
+
 There is no sandbox between "wrote a string into a task description" and
 "arbitrary command execution in a checkout of your repository". These verbs are
 marked in the protocol by `IpcRequest::spawns_agent()`, and the classification
