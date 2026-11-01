@@ -493,6 +493,7 @@ pub fn run() {
             get_qa_history,
             check_recurring_issues,
             approve_task,
+            publish_task_to_pr,
             complete_task_locally,
             approve_task_again,
             get_approval_status,

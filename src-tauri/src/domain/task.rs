@@ -276,6 +276,12 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_republish: Option<PendingRepublish>,
 
+    /// The latest explicit request to publish a commit to this task's pull
+    /// request. It is not an approval: see [`super::publication`]. `None`
+    /// for a task that was never published this way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_publication: Option<super::publication::PrPublication>,
+
     /// The latest integration of this task's approved work into a local
     /// branch, finished or still pending. `None` for a task never
     /// integrated by SlashIt, which is what every earlier record loads as.
@@ -978,6 +984,7 @@ impl Task {
             base_commit: None,
             branch_origin: None,
             pending_republish: None,
+            pr_publication: None,
             local_integration: None,
             cleanup_in_flight: false,
             pr_review_plan: None,

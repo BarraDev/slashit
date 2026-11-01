@@ -144,6 +144,9 @@ pub struct Task {
     pub qa_signoff: Option<QaSignoff>,
     #[serde(default)]
     pub human_review: HumanReviewRecord,
+    /// The latest explicit publication of a commit to the pull request. Not an approval.
+    #[serde(default)]
+    pub pr_publication: Option<PrPublication>,
     pub stuck_since: Option<chrono::DateTime<chrono::Utc>>,
 
     #[serde(default)]
@@ -655,6 +658,31 @@ pub enum QaStatus {
     Approved,
     FixesApplied,
     Rejected,
+}
+
+/// Mirrors the backend `PrPublication`: the latest explicit request to push
+/// one commit to the task's pull request. It never approves the task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrPublication {
+    pub request_id: String,
+    pub commit: String,
+    pub branch: String,
+    pub pr_url: String,
+    #[serde(default)]
+    pub remote_before: Option<String>,
+    pub state: PublicationState,
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Mirrors the backend `PublicationState`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PublicationState {
+    Pending,
+    Published,
+    Refused { reason: String },
+    Unknown { reason: String },
 }
 
 /// Mirrors the backend `HumanReviewRecord`: decisions made at Human Review,
