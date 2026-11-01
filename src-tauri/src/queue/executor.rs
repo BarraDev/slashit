@@ -6843,6 +6843,10 @@ impl TaskExecutor {
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // A dropped review future (an aborted task, a runtime shutdown)
+            // must not leave the CLI running. Cancellation kills it explicitly
+            // below; this covers the paths where the future is simply dropped.
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(c) => c,
@@ -26776,5 +26780,89 @@ VERDICT: APPROVED"
             assert!(failed.executed_approvals.is_empty());
             assert_eq!(failed.base_commit.as_deref(), Some(fx.base.as_str()));
         }
+    }
+
+    /// Reads the pid a fake program recorded, once the file has been written.
+    #[cfg(target_os = "linux")]
+    async fn recorded_pid(path: &std::path::Path) -> i32 {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                {
+                    return pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fake CodeRabbit CLI recorded its pid")
+    }
+
+    /// A process is running unless it is gone or has exited and is only
+    /// waiting to be reaped (state `Z`). This reads `/proc`, which exists only
+    /// on Linux; elsewhere every process would look gone and the test would
+    /// pass without checking anything.
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let state = stat.rsplit(')').next().unwrap_or("").trim_start();
+                !state.starts_with('Z')
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Dropping the CodeRabbit review future, as an aborted task or a runtime
+    /// shutdown does, must end the CLI it started. Without `kill_on_drop` the
+    /// child outlives its owner, and nothing signals it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_the_coderabbit_review_ends_its_cli() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pid_file = scratch.path().join("pid");
+        let pid_tmp = scratch.path().join("pid.tmp");
+        // `exec` makes the recorded pid the pid of the blocking `sleep`.
+        let _fake = crate::test_helpers::FakeProgram::install(
+            "coderabbit",
+            &format!(
+                "echo $$ > '{}' && mv '{}' '{}'\nexec sleep 60",
+                pid_tmp.display(),
+                pid_tmp.display(),
+                pid_file.display()
+            ),
+        )
+        .await;
+        // The sender must stay alive: a dropped sender reads as cancellation.
+        let (_cancel_tx, mut cancelled) = tokio::sync::watch::channel(false);
+        // Boxed so that `drop(review)` drops the future itself, not just a pin of it.
+        let mut review = Box::pin(TaskExecutor::run_cancellable_coderabbit(
+            scratch.path().to_str().unwrap(),
+            &mut cancelled,
+        ));
+        let pid = tokio::select! {
+            _ = &mut review => panic!("the review ended before its CLI was observed"),
+            pid = recorded_pid(&pid_file) => pid,
+        };
+        drop(review);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut running = process_is_running(pid);
+        while running && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            running = process_is_running(pid);
+        }
+        if running {
+            // Leave nothing behind when the assertion below fails.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !running,
+            "dropping the review left its CLI (pid {pid}) running"
+        );
     }
 }
