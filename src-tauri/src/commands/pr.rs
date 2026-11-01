@@ -1677,6 +1677,7 @@ pub async fn address_pr_review_inner(
     // or pushed, not even one that succeeded. Their markers stay set and every
     // edit stays on disk; an apply without a failure commits them.
     let withheld = !options.dry_run && a_fix_failed && !uncommitted.is_empty();
+    let apply_again = apply_again_instruction(options.auto_push);
 
     if withheld {
         let also_cancelled = if cancelled {
@@ -1688,8 +1689,7 @@ pub async fn address_pr_review_inner(
             "a review fix failed and may have left partial edits in the task checkout, so the \
              fixes that succeeded were not committed or pushed with them.{also_cancelled} Review \
              the checkout and remove only what the failed fix left: the successful fixes are not \
-             made again, so their edits must stay. Then apply again to commit and push \
-             them.{unpushed_replies_note}"
+             made again, so their edits must stay. Then {apply_again}.{unpushed_replies_note}"
         );
         progress(PrReviewProgress {
             task_id: task_id_str.clone(),
@@ -1703,13 +1703,13 @@ pub async fn address_pr_review_inner(
     } else if cancelled && !options.dry_run && anything_owed {
         push_error = Some(format!(
             "the task was changed while these fixes were being applied, so they were not \
-             committed or pushed; apply again to commit and push them.{unpushed_replies_note}"
+             committed or pushed; {apply_again}.{unpushed_replies_note}"
         ));
     }
 
     // Also on an apply that made no new fix, when an earlier one left fixes
-    // uncommitted or unpushed: applying again commits and pushes them without
-    // running their fix agents again.
+    // uncommitted or unpushed: applying again commits them, and pushes them
+    // only when Auto-push is on, without running their fix agents again.
     if !options.dry_run && anything_owed && !cancelled && !withheld {
         let mut committed_ok = true;
         if !uncommitted.is_empty() {
@@ -1797,7 +1797,7 @@ pub async fn address_pr_review_inner(
                 Err(e) => Some(format!(
                     "the review fixes could not be committed, so nothing was pushed: {e}. They \
                      remain as uncommitted edits in the task checkout; once that is resolved, \
-                     apply again to commit and push them.{unpushed_replies_note}"
+                     {apply_again}.{unpushed_replies_note}"
                 )),
             };
             if let Some(error) = failure {
@@ -2010,6 +2010,18 @@ pub async fn address_pr_review_inner(
     }
 
     Ok((result, updated_plan))
+}
+
+/// The closing instruction of a message saying review fixes were not committed
+/// or pushed. Applying again commits them, and pushes them only when Auto-push
+/// is on. With it off, a push needs the person to publish the commit.
+fn apply_again_instruction(auto_push: bool) -> &'static str {
+    if auto_push {
+        "apply again to commit and push them"
+    } else {
+        "apply again to commit them. They are not pushed unless Auto-push branch is on or \
+         you publish the commit to the pull request"
+    }
 }
 
 /// What to add to a message saying review fixes were not pushed, when
@@ -17725,6 +17737,19 @@ mod tests {
                 let explicit: AddressPrReviewOptions =
                     serde_json::from_str(r#"{"auto_push":true,"auto_reply":false}"#).unwrap();
                 assert!(explicit.auto_push);
+            }
+
+            /// Recovery wording names a push only when Auto-push is on. With it
+            /// off, the wording says that applying again does not push and
+            /// names the publication that does.
+            #[test]
+            fn recovery_wording_names_a_push_only_with_auto_push_on() {
+                let on = apply_again_instruction(true);
+                assert!(on.contains("commit and push them"), "{on}");
+                let off = apply_again_instruction(false);
+                assert!(!off.contains("and push"), "{off}");
+                assert!(off.contains("not pushed unless Auto-push branch is on"), "{off}");
+                assert!(off.contains("publish the commit to the pull request"), "{off}");
             }
 
             /// With `auto_push` off the fixes are committed in the task
