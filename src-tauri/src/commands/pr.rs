@@ -4126,6 +4126,13 @@ async fn create_pr_reserved(
         started_at: chrono::Utc::now(),
     };
     record_pr_create_started(state, task_uuid, &attempt).await?;
+    #[cfg(test)]
+    after_record_hook::run(&working_dir);
+    // The record is a disk write, and a cancellation can land while it is
+    // made. Checked again so that `gh pr create` is not started over it. The
+    // unconfirmed record stays: it only says a pull request may exist, and a
+    // retry looks the branch's pull request up strictly before opening one.
+    refuse_if_pr_operation_cancelled(&reservation, "opening the pull request")?;
     let mut create_args = vec![
         "pr", "create",
         "--title", &pr_title,
@@ -6466,6 +6473,34 @@ async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> 
 #[cfg(test)]
 async fn push_branch_pinned(working_dir: &str, branch: &str, pinned: Option<&str>) -> Result<String, String> {
     push_branch_pinned_gated(working_dir, branch, pinned, &|| Ok(())).await
+}
+
+/// Test-only seam: one hook, armed for one working directory, runs right
+/// after the request to open a pull request was recorded and before
+/// `gh pr create` is started. A test uses it to cancel the operation in that
+/// window deterministically.
+#[cfg(test)]
+mod after_record_hook {
+    use std::sync::Mutex;
+
+    static HOOK: Mutex<Option<(String, Box<dyn FnOnce() + Send>)>> = Mutex::new(None);
+
+    pub(super) fn arm(working_dir: &str, hook: impl FnOnce() + Send + 'static) {
+        *HOOK.lock().unwrap() = Some((working_dir.to_string(), Box::new(hook)));
+    }
+
+    pub(super) fn run(working_dir: &str) {
+        let due = {
+            let mut slot = HOOK.lock().unwrap();
+            match slot.as_ref() {
+                Some((dir, _)) if dir == working_dir => slot.take().map(|(_, hook)| hook),
+                _ => None,
+            }
+        };
+        if let Some(hook) = due {
+            hook();
+        }
+    }
 }
 
 /// Test-only seam: one hook, armed for one working directory, runs in the
@@ -19796,6 +19831,81 @@ esac"#
                     Some(sha.as_str())
                 );
                 assert_nothing_recorded(&state, task_id).await;
+            }
+
+            /// A cancellation that lands once the request is recorded and before
+            /// `gh pr create` starts stops the delivery there. The record stays
+            /// (a pull request may exist as far as the task knows), nothing is
+            /// opened, and the retry opens exactly one pull request.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_cancellation_after_the_request_is_recorded_stops_before_gh_pr_create() {
+                let (repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                let executor = crate::test_helpers::attach_test_executor(&state);
+                let reservation = reserve_task_for_pr_side_effect(&state, task_id)
+                    .await
+                    .expect("the task is reserved for the operation");
+                let cancelled = reservation
+                    .as_ref()
+                    .expect("an executor is wired, so a reservation is held")
+                    .cancel_receiver();
+                let working_dir = repo.checkout.to_str().unwrap().to_string();
+                let ender = std::sync::Arc::new(std::sync::Mutex::new(None));
+                {
+                    let ender = ender.clone();
+                    let executor = executor.clone();
+                    let mut cancelled = cancelled.clone();
+                    crate::commands::pr::after_record_hook::arm(&working_dir, move || {
+                        // The transition that ends the operation runs on another
+                        // worker; the hook returns once it has cancelled it.
+                        *ender.lock().unwrap() = Some(tokio::spawn(async move {
+                            let running: Option<&dyn crate::lifecycle::ExecutionOwnership> =
+                                Some(executor.as_ref());
+                            crate::lifecycle::end_active_ownership(running, task_id).await
+                        }));
+                        tokio::task::block_in_place(|| {
+                            for _ in 0..400 {
+                                if *cancelled.borrow_and_update() {
+                                    return;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                            }
+                        });
+                    });
+                }
+
+                let error = create_pr_reserved(&state, task_id, reservation, None)
+                    .await
+                    .expect_err("a cancelled operation does not open the pull request");
+                let joined = ender.lock().unwrap().take().expect("the hook ran");
+                joined
+                    .await
+                    .expect("join")
+                    .expect("the transition ends the operation");
+
+                assert!(
+                    error.contains("stopped before opening the pull request"),
+                    "{error}"
+                );
+                assert_eq!(gh.creates(), 0, "{}", gh.fake.invocations());
+                assert_eq!(
+                    repo.remote_has_branch(BRANCH).as_deref(),
+                    Some(sha.as_str())
+                );
+                for task in [
+                    in_memory(&state, task_id).await,
+                    on_disk(&state, task_id).await,
+                ] {
+                    assert_eq!(task.pr_url, None);
+                    assert_eq!(
+                        task.pr_create_unconfirmed.map(|u| u.commit),
+                        Some(sha.clone()),
+                        "the recorded request stays"
+                    );
+                }
+
+                assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_delivered(&state, task_id).await;
             }
 
             /// The request is written before GitHub is asked to open anything. A
