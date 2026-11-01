@@ -195,7 +195,7 @@ pub fn Kanban(
     let pr_review_loading = RwSignal::new(false);
     let pr_review_applying = RwSignal::new(false);
     let pr_review_error = RwSignal::new(None::<String>);
-    let pr_review_auto_push = RwSignal::new(true);
+    let pr_review_auto_push = RwSignal::new(crate::services::PR_REVIEW_AUTO_PUSH_DEFAULT);
     let pr_review_auto_reply = RwSignal::new(true);
     let pr_review_dry_run = RwSignal::new(false);
     let pr_review_last_apply = RwSignal::new(None::<PrReviewApplyResult>);

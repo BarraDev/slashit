@@ -1255,6 +1255,12 @@ pub async fn discuss_pr_review_questions_inner(
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AddressPrReviewOptions {
+    /// Push the task branch after the fixes are committed. Off unless the
+    /// caller asks for it: a request that omits the field commits the fixes
+    /// locally and publishes nothing. This is a default, not an authorization
+    /// check: a request that sets it to true is still honoured, and the push
+    /// is by branch name, not pinned to a reviewed commit.
+    #[serde(default)]
     pub auto_push: bool,
     pub auto_reply: bool,
     /// When true, the agent runs read-only and describes what it would do, but
@@ -17707,6 +17713,50 @@ mod tests {
                 let unrelated = git(worktree, &["commit-tree", &tree, "-p", &base, "-m", "unrelated"]);
                 git(worktree, &["push", "-q", "--force", "origin", &format!("{unrelated}:refs/heads/task-branch")]);
                 unrelated
+            }
+
+            /// A request that leaves `auto_push` out is a request not to push.
+            #[test]
+            fn apply_options_without_auto_push_deserialize_as_off() {
+                let options: AddressPrReviewOptions =
+                    serde_json::from_str(r#"{"auto_reply":true}"#).unwrap();
+                assert!(!options.auto_push);
+                assert!(!options.dry_run);
+                let explicit: AddressPrReviewOptions =
+                    serde_json::from_str(r#"{"auto_push":true,"auto_reply":false}"#).unwrap();
+                assert!(explicit.auto_push);
+            }
+
+            /// With `auto_push` off the fixes are committed in the task
+            /// checkout and nothing reaches `origin`: the remote branch is
+            /// where it was, the commit exists only locally and stays owed a
+            /// push, and no reply claims a delivery that did not happen.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn with_auto_push_off_the_fix_is_committed_locally_and_not_published() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                // The branch is already on origin, as it is for a task with a
+                // pull request, at the commit before the fix.
+                git(&worktree, &["push", "-q", "origin", "task-branch"]);
+                let remote_before = repo.remote_has_branch("task-branch");
+                assert!(remote_before.is_some(), "origin holds the branch before the apply");
+
+                let (result, plan) =
+                    apply_without_push(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                assert_ne!(Some(tip.clone()), remote_before, "the fix is a new local commit");
+                assert_eq!(repo.remote_has_branch("task-branch"), remote_before, "origin was not touched");
+                assert!(!remote_branch_has_file(&repo, "review-fix-1.txt"));
+                assert!(!result.pushed && result.push_branch.is_none(), "{result:?}");
+                assert_eq!(result.replies_posted, 0, "{result:?}");
+                assert_eq!(plan.items[0].fix_commit.as_deref(), Some(tip.as_str()));
+                assert!(!plan.items[0].reply_posted);
+                assert_eq!(git(&worktree, &["status", "--porcelain"]), "", "the fix is committed, not left as edits");
             }
 
             /// Committed and pushed: the item records the commit that carries
