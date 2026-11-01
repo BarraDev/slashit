@@ -20833,11 +20833,13 @@ esac"#
                 assert_unconfirmed(&state, task_id, &sha).await;
             }
 
-            /// A lookup that fails does not settle an unconfirmed request
-            /// either: the retry opens nothing and the record stays.
+            /// A lookup that fails does not settle an unconfirmed request, and
+            /// neither does the lookup that works again and lists nothing: the
+            /// retry that reaches the admission is refused before it pushes
+            /// anything, and the record stays throughout.
             #[tokio::test(flavor = "multi_thread")]
             async fn an_unconfirmed_request_and_a_failing_lookup_open_nothing() {
-                let (_repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                let (repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
                 gh.set("create_mode", "lost");
                 gh.set("list_hides_created", "");
                 create(&state, task_id, None)
@@ -20851,6 +20853,29 @@ esac"#
 
                 assert!(error.contains("could not be asked"), "{error}");
                 assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_unconfirmed(&state, task_id, &sha).await;
+
+                // The listing answers again and still shows nothing. The remote
+                // branch is gone, so a push would be visible.
+                gh.unset("list_fails");
+                std::process::Command::new("git")
+                    .args(["update-ref", "-d", &format!("refs/heads/{BRANCH}")])
+                    .current_dir(&repo.remote)
+                    .status()
+                    .expect("git runs");
+                assert_eq!(repo.remote_has_branch(BRANCH), None);
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the earlier request is still unanswered");
+
+                assert!(error.contains("did not open another"), "{error}");
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_eq!(
+                    repo.remote_has_branch(BRANCH),
+                    None,
+                    "refused before anything was pushed"
+                );
                 assert_unconfirmed(&state, task_id, &sha).await;
             }
 
