@@ -4231,7 +4231,7 @@ async fn create_pr_reserved(
     if let Some(base) = base.base.as_deref() {
         create_args.extend(["--base", base]);
     }
-    let pr_url = match run_cmd("gh", &create_args, &working_dir).await {
+    let pr_url = match run_gh_pr_create(&create_args, &working_dir).await {
         Ok(answer) => confirm_created_pr(&working_dir, &attempt, answer).await?,
         Err(error) => {
             reconcile_failed_pr_create(state, task_uuid, &working_dir, &attempt, error).await?
@@ -4461,29 +4461,31 @@ async fn confirm_created_pr(
 ///   removed without asking GitHub;
 /// - one is found: the request did open it (or another did), and it is
 ///   confirmed as [`confirm_created_pr`] confirms a fresh one;
-/// - none is found and GitHub had refused the request: the failure is a real
-///   one, and the record is removed;
+/// - the listing was read, shows none, and GitHub had refused the request: the
+///   failure is a real one, and the record is removed;
 /// - none is found and the failure does not say that GitHub refused it: the
 ///   outcome is unknown, because the listing may not show a pull request that
 ///   was just opened. The record stays, on disk, and a retry opens nothing
 ///   until the pull request is found;
 /// - GitHub cannot be asked: the outcome is unknown too, and the record stays,
-///   unless GitHub had refused the request, which settles it.
+///   even for a refusal, since a pull request may exist that the refusal did
+///   not prevent.
 async fn reconcile_failed_pr_create(
     state: &crate::AppState,
     task_uuid: Uuid,
     working_dir: &str,
     attempt: &crate::domain::task::UnconfirmedPrCreate,
-    error: String,
+    error: GhCreateError,
 ) -> Result<String, String> {
     let failure = classify_pr_create_failure(&error);
+    let (GhCreateError::NotSpawned(error) | GhCreateError::Failed(error)) = error;
     if failure == PrCreateFailure::NotSent {
         let refused = friendly_pr_error(error);
         return Err(retract_pr_create_attempt(state, task_uuid, attempt, refused).await);
     }
     match find_existing_pr_for_branch(working_dir, &attempt.branch).await {
         Ok(Some(url)) => confirm_created_pr(working_dir, attempt, url).await,
-        Ok(None) | Err(_) if failure == PrCreateFailure::Rejected => {
+        Ok(None) if failure == PrCreateFailure::Rejected => {
             let refused = friendly_pr_error(error);
             Err(retract_pr_create_attempt(state, task_uuid, attempt, refused).await)
         }
@@ -4516,21 +4518,78 @@ enum PrCreateFailure {
     Unknown,
 }
 
+/// How a `gh pr create` that did not answer with a URL failed.
+#[derive(Debug, PartialEq, Eq)]
+enum GhCreateError {
+    /// The process could not be started: nothing was sent.
+    NotSpawned(String),
+    /// The process was started. What it reported, or that waiting for it
+    /// failed, says nothing yet about whether the request was applied.
+    Failed(String),
+}
+
+/// Runs `gh pr create` with `args`, telling a process that could not be
+/// started from one that was started and failed. [`run_cmd`] cannot: its
+/// "Failed to run" covers the wait and the reading of the output too.
+async fn run_gh_pr_create(args: &[&str], cwd: &str) -> Result<String, GhCreateError> {
+    let child = crate::host_process::tokio_command(program("gh"))
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| GhCreateError::NotSpawned(format!("Failed to run gh: {e}")))?;
+    let output = child.wait_with_output().await.map_err(|e| {
+        GhCreateError::Failed(format!("gh was started, but waiting for it failed: {e}"))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GhCreateError::Failed(format!("gh failed: {stderr}")));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The messages with which GitHub refuses a `createPullRequest` request on
+/// its merits, as `gh` prints a GraphQL error: the request was validated or
+/// authorized and turned down, so it opened nothing. They are validation,
+/// permission and not-found answers (a pull request for the head and base
+/// already exists, the two refs share no commits or are not branches, a ref has
+/// no commit, the token cannot reach the repository). A GraphQL error that is
+/// not one of these (a timeout, "We couldn't respond to your request in time",
+/// a resource limit, "Something went wrong") does not say that the request was
+/// not applied.
+const PR_CREATE_REFUSALS: [&str; 8] = [
+    "A pull request already exists",
+    "No commits between",
+    "Head sha can't be blank",
+    "Base sha can't be blank",
+    "Head ref must be a branch",
+    "Base ref must be a branch",
+    "Resource not accessible",
+    "Could not resolve to a",
+];
+
 /// Reads what [`run_cmd`] reported for a `gh pr create` that failed.
 ///
 /// A request is known to have opened nothing only in two cases. `gh` could not
-/// be started at all. Or GitHub answered it with a client error (`HTTP 4xx`,
-/// or a GraphQL error that is not its "something went wrong" fault), which is
-/// a refusal of that request. Everything else may have come after the pull
-/// request was opened: a gateway or server error (`5xx`), a request timeout
-/// (`408`), a connection dropped or timed out on the way back, output that
-/// says nothing. Those are [`PrCreateFailure::Unknown`], which is also what
-/// an error in a form this does not recognize is, so a new `gh` wording makes
-/// SlashIt ask for a recovery decision rather than open a second pull request.
-fn classify_pr_create_failure(error: &str) -> PrCreateFailure {
-    if error.starts_with("Failed to run gh:") {
-        return PrCreateFailure::NotSent;
-    }
+/// be started at all. Or GitHub answered it with a refusal, which `gh` reports
+/// as an `HTTP 4xx` (other than `408`) or as a GraphQL error carrying one of
+/// [`PR_CREATE_REFUSALS`]. Everything else may have come after the pull request
+/// was opened: a gateway or server error (`5xx`), a request timeout (`408`), a
+/// GraphQL error that is not a refusal, a connection dropped or timed out on
+/// the way back, output that says nothing. Those are
+/// [`PrCreateFailure::Unknown`], which is also what an error in a form this
+/// does not recognize is, so a new `gh` wording makes SlashIt ask for a
+/// recovery decision rather than open a second pull request.
+///
+/// `NotSent` is only a [`GhCreateError::NotSpawned`], the error of the spawn
+/// itself.
+fn classify_pr_create_failure(error: &GhCreateError) -> PrCreateFailure {
+    let error = match error {
+        GhCreateError::NotSpawned(_) => return PrCreateFailure::NotSent,
+        GhCreateError::Failed(error) => error.as_str(),
+    };
     let mut client_error = false;
     for (at, _) in error.match_indices("HTTP ") {
         let digits: String = error[at + "HTTP ".len()..].chars().take(3).collect();
@@ -4540,8 +4599,10 @@ fn classify_pr_create_failure(error: &str) -> PrCreateFailure {
             _ => {}
         }
     }
-    let graphql_refusal =
-        error.contains("GraphQL: ") && !error.to_ascii_lowercase().contains("something went wrong");
+    let graphql_refusal = error.contains("GraphQL: ")
+        && PR_CREATE_REFUSALS
+            .iter()
+            .any(|refusal| error.contains(refusal));
     if client_error || graphql_refusal {
         PrCreateFailure::Rejected
     } else {
@@ -19713,7 +19774,9 @@ mod tests {
             ///
             /// - `create_mode` (`ok`, `lost`, `refused`, `refused_http`, `moved`,
             ///   `garbled`): `lost` opens the pull request and then reports a
-            ///   server error, as a response lost on the way back does;
+            ///   server error, as a response lost on the way back does, and
+            ///   `graphql_timeout` does the same with a GraphQL error that is not
+            ///   a refusal;
             ///   `refused` and `refused_http` are GitHub's own rejections, which
             ///   open nothing; `moved` opens it after
             ///   moving the remote branch to the commit named in `moved_to`;
@@ -19725,6 +19788,8 @@ mod tests {
             /// - `list_hides_created`: `pr list` answers that there is no pull
             ///   request even once one exists, as a listing that has not caught
             ///   up with a pull request just opened does;
+            /// - `list_fails_after_attempt`: `pr list` fails once `pr create`
+            ///   has been run, whether or not it opened anything;
             /// - `list_fails`: every `pr list` fails;
             /// - `list_fails_after_push`: `pr list` fails once the remote has
             ///   the branch;
@@ -19759,15 +19824,18 @@ case "$*" in
     if [ -f {s}/list_fails ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
     if [ -f {s}/list_fails_after_push ] && has_branch; then echo 'error connecting to api.github.com' >&2; exit 1; fi
     if [ -f {s}/list_fails_after_create ] && [ -f {s}/created ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
+    if [ -f {s}/list_fails_after_attempt ] && [ -f {s}/attempted ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
     if [ -f {s}/block_after_push ] && has_branch; then rm -rf "$(cat {s}/block_after_push)"; printf 'not a directory' > "$(cat {s}/block_after_push)"; fi
     if [ -f {s}/created ] && [ ! -f {s}/list_hides_created ]; then
       if [ -f {s}/fork_pr_listed ]; then printf '%s' '[{fork},{own}]'; else printf '%s' '[{own}]'; fi
     elif [ -f {s}/fork_pr_listed ]; then printf '%s' '[{fork}]'; else printf '[]'; fi ;;
   *'pr create'*)
+    touch {s}/attempted
     case "$(cat {s}/create_mode 2>/dev/null || echo ok)" in
       ok) touch {s}/created; printf '%s' '{PR_URL}' ;;
       lost) touch {s}/created; echo 'HTTP 502: Bad Gateway (https://api.github.com/graphql)' >&2; exit 1 ;;
       refused) echo 'pull request create failed: GraphQL: No commits between main and {BRANCH}' >&2; exit 1 ;;
+      graphql_timeout) touch {s}/created; echo "pull request create failed: GraphQL: We couldn't respond to your request in time. Sorry about that. (createPullRequest)" >&2; exit 1 ;;
       refused_http) echo 'HTTP 422: Validation Failed (https://api.github.com/repos/testorg/testrepo/pulls)' >&2; exit 1 ;;
       moved) git --git-dir={remote} update-ref refs/heads/{BRANCH} "$(cat {s}/moved_to)"; touch {s}/created; printf '%s' '{PR_URL}' ;;
       garbled) touch {s}/created; printf '%s' 'created' ;;
@@ -20757,6 +20825,55 @@ esac"#
                 assert_unconfirmed(&state, task_id, &sha).await;
             }
 
+            /// A GraphQL error that is not one of GitHub's refusals of the
+            /// request (here, that it could not respond in time) may have come
+            /// after the pull request was opened. It keeps the record, and a
+            /// retry opens nothing while the listing hides the pull request.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_graphql_error_that_is_not_a_refusal_keeps_the_request_unconfirmed() {
+                let (_repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                gh.set("create_mode", "graphql_timeout");
+                gh.set("list_hides_created", "");
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the outcome is unknown");
+
+                assert!(error.contains("cannot tell whether"), "{error}");
+                assert_unconfirmed(&state, task_id, &sha).await;
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the first request is unconfirmed");
+                assert!(error.contains("did not open another"), "{error}");
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+            }
+
+            /// A refusal settles the request only when the listing was read and
+            /// shows nothing. When the listing cannot be read, a pull request may
+            /// exist that the refusal did not prevent, so the record stays.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_refusal_with_a_failing_lookup_keeps_the_request_unconfirmed() {
+                let (_repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                gh.set("create_mode", "refused_http");
+                gh.set("list_fails_after_attempt", "");
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("GitHub could not be asked afterwards");
+
+                assert!(error.contains("cannot tell whether"), "{error}");
+                assert_unconfirmed(&state, task_id, &sha).await;
+
+                gh.unset("list_fails_after_attempt");
+                gh.set("create_mode", "ok");
+                // A listing read later that shows nothing does not settle it.
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the earlier request is still unconfirmed");
+                assert!(error.contains("did not open another"), "{error}");
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+            }
+
             /// A request GitHub rejected with a client error opened nothing, and
             /// that is known without asking the listing. It leaves no record and
             /// does not stop a new attempt.
@@ -20833,8 +20950,14 @@ esac"#
             #[test]
             fn only_an_answered_rejection_is_known_to_have_opened_nothing() {
                 use PrCreateFailure::{NotSent, Rejected, Unknown};
+                assert_eq!(
+                    classify_pr_create_failure(&GhCreateError::NotSpawned(
+                        "Failed to run gh: No such file or directory (os error 2)".to_string()
+                    )),
+                    NotSent
+                );
                 for (error, expected) in [
-                    ("Failed to run gh: No such file or directory (os error 2)", NotSent),
+                    ("Failed to run gh: No such file or directory (os error 2)", Unknown),
                     (
                         "gh failed: pull request create failed: GraphQL: No commits between main and x (createPullRequest)\n",
                         Rejected,
@@ -20845,6 +20968,18 @@ esac"#
                     ("gh failed: HTTP 502: Bad Gateway (https://api.github.com/graphql)", Unknown),
                     ("gh failed: HTTP 504: Gateway Timeout", Unknown),
                     ("gh failed: GraphQL: Something went wrong while executing your query.", Unknown),
+                    (
+                        "gh failed: GraphQL: We couldn't respond to your request in time. Sorry about that. (createPullRequest)",
+                        Unknown,
+                    ),
+                    ("gh failed: GraphQL: Timeout on validation of query", Unknown),
+                    ("gh failed: GraphQL: This query exceeded a resource limit", Unknown),
+                    ("gh failed: GraphQL: A pull request already exists for o:x. (createPullRequest)", Rejected),
+                    ("gh failed: GraphQL: Head sha can't be blank, Base sha can't be blank, No commits between main and x, Head ref must be a branch (createPullRequest)", Rejected),
+                    ("gh failed: GraphQL: Base ref must be a branch (createPullRequest)", Rejected),
+                    ("gh failed: GraphQL: Resource not accessible by integration (createPullRequest)", Rejected),
+                    ("gh failed: GraphQL: Could not resolve to a Repository with the name 'o/r'.", Rejected),
+                    ("gh failed: HTTP 502: Bad Gateway (https://api.github.com/graphql) A pull request already exists", Unknown),
                     ("gh failed: error connecting to api.github.com", Unknown),
                     (
                         "gh failed: Post \"https://api.github.com/graphql\": context deadline exceeded",
@@ -20852,8 +20987,76 @@ esac"#
                     ),
                     ("gh failed: ", Unknown),
                 ] {
-                    assert_eq!(classify_pr_create_failure(error), expected, "{error}");
+                    assert_eq!(
+                        classify_pr_create_failure(&GhCreateError::Failed(error.to_string())),
+                        expected,
+                        "{error}"
+                    );
                 }
+            }
+
+            /// A `gh` that cannot be started is told from one that was started
+            /// and failed, which the text of the error alone cannot do.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn gh_that_cannot_be_started_is_told_from_gh_that_failed() {
+                let bin = tempfile::tempdir().expect("tempdir");
+                let dir = bin.path().to_str().unwrap().to_string();
+                let missing = bin.path().join("no-such-gh");
+                let failing = bin.path().join("failing-gh");
+                write_executable(
+                    &failing,
+                    "#!/bin/sh\necho 'HTTP 502: Bad Gateway' >&2\nexit 1\n",
+                );
+                let working = tempfile::tempdir().expect("tempdir");
+                let cwd = working.path().to_str().unwrap();
+
+                let not_started = test_programs::scope(
+                    [("gh", missing)],
+                    run_gh_pr_create(&["pr", "create"], cwd),
+                )
+                .await;
+                let failed = test_programs::scope(
+                    [("gh", failing)],
+                    run_gh_pr_create(&["pr", "create"], cwd),
+                )
+                .await;
+
+                assert!(
+                    matches!(not_started, Err(GhCreateError::NotSpawned(ref e)) if e.starts_with("Failed to run gh:")),
+                    "{not_started:?} in {dir}"
+                );
+                assert!(
+                    matches!(failed, Err(GhCreateError::Failed(ref e)) if e.contains("HTTP 502")),
+                    "{failed:?}"
+                );
+            }
+
+            /// A request that `gh` could not even be started for was never sent:
+            /// its record is taken back and a new attempt is not refused.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_request_gh_was_never_started_for_leaves_no_record() {
+                let (repo, sha, _gh, state, _tmp, task_id, _bin) = setup().await;
+                let attempt = crate::domain::task::UnconfirmedPrCreate {
+                    branch: BRANCH.to_string(),
+                    commit: sha,
+                    started_at: chrono::Utc::now(),
+                };
+                record_pr_create_started(&state, task_id, &attempt)
+                    .await
+                    .expect("recorded");
+
+                let error = reconcile_failed_pr_create(
+                    &state,
+                    task_id,
+                    repo.checkout.to_str().unwrap(),
+                    &attempt,
+                    GhCreateError::NotSpawned("Failed to run gh: not found".to_string()),
+                )
+                .await
+                .expect_err("nothing was sent");
+
+                assert!(error.contains("Failed to run gh"), "{error}");
+                assert_nothing_recorded(&state, task_id).await;
             }
 
             /// `git` for the future it is scoped to, in a checkout whose origin
