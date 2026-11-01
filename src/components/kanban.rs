@@ -462,32 +462,20 @@ pub fn Kanban(
         });
     }
 
+    let pr_review_dialog = PrReviewDialog {
+        show: show_pr_review_modal,
+        task: pr_review_task,
+        plan: pr_review_plan,
+        loading: pr_review_loading,
+        error: pr_review_error,
+        last_apply: pr_review_last_apply,
+        auto_push: pr_review_auto_push,
+    };
     let on_analyze_pr_comments = Callback::new({
         move |task: Task| {
-            pr_review_task.set(Some(task.clone()));
-            pr_review_error.set(None);
-            pr_review_last_apply.set(task.pr_review_plan.as_ref().and_then(|p| p.last_apply.clone()));
-            // Reuse cached plan only when it actually has content. An empty
-            // cache (from a prior empty-fetch or older app version) would block
-            // the backend call and the user could never refresh by reopening.
-            let has_useful_cache = task.pr_review_plan.as_ref()
-                .map(|p| !p.comments.is_empty() || !p.items.is_empty())
-                .unwrap_or(false);
-            if has_useful_cache {
-                // Reconcile lifecycle flags from the persisted last_apply before
-                // showing — older plans saved before per-item flags existed have
-                // fix_done/reply_posted=false on items the prior apply actually
-                // landed, so the badges would lie otherwise.
-                let mut cached = task.pr_review_plan.clone().expect("checked above");
-                cached.backfill_lifecycle_from_last_apply();
-                pr_review_plan.set(Some(cached));
-                pr_review_loading.set(false);
-                show_pr_review_modal.set(true);
+            if !pr_review_dialog.open(task.clone()) {
                 return;
             }
-            pr_review_plan.set(None);
-            pr_review_loading.set(true);
-            show_pr_review_modal.set(true);
             spawn_local(async move {
                 match analyze_pr_comments(task.id.to_string()).await {
                     Ok(plan) => {
@@ -1004,6 +992,59 @@ fn PrPushRecoveryModal(
                 </div>
             </div>
         </Show>
+    }
+}
+
+/// The board-owned state of the PR-review dialog. Opening the dialog is
+/// prepared here, so every way of opening it runs the same steps.
+#[derive(Clone, Copy)]
+struct PrReviewDialog {
+    show: RwSignal<bool>,
+    task: RwSignal<Option<Task>>,
+    plan: RwSignal<Option<PrReviewPlan>>,
+    loading: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+    last_apply: RwSignal<Option<PrReviewApplyResult>>,
+    auto_push: RwSignal<bool>,
+}
+
+impl PrReviewDialog {
+    /// Prepares and shows the dialog for `task`. Returns `true` when no usable
+    /// plan is cached, so the caller must analyze the task's comments.
+    fn open(self, task: Task) -> bool {
+        // Auto-push is a choice for one dialog opening. Every opening starts
+        // from the default, so enabling it for one Task never reaches another,
+        // or the same Task on a later opening. Nothing else resets it while
+        // the dialog is open.
+        self.auto_push
+            .set(crate::services::PR_REVIEW_AUTO_PUSH_DEFAULT);
+        self.task.set(Some(task.clone()));
+        self.error.set(None);
+        self.last_apply.set(task.pr_review_plan.as_ref().and_then(|p| p.last_apply.clone()));
+        // Reuse cached plan only when it actually has content. An empty
+        // cache (from a prior empty-fetch or older app version) would block
+        // the backend call and the user could never refresh by reopening.
+        let has_useful_cache = task
+            .pr_review_plan
+            .as_ref()
+            .map(|p| !p.comments.is_empty() || !p.items.is_empty())
+            .unwrap_or(false);
+        if has_useful_cache {
+            // Reconcile lifecycle flags from the persisted last_apply before
+            // showing — older plans saved before per-item flags existed have
+            // fix_done/reply_posted=false on items the prior apply actually
+            // landed, so the badges would lie otherwise.
+            let mut cached = task.pr_review_plan.clone().expect("checked above");
+            cached.backfill_lifecycle_from_last_apply();
+            self.plan.set(Some(cached));
+            self.loading.set(false);
+            self.show.set(true);
+            return false;
+        }
+        self.plan.set(None);
+        self.loading.set(true);
+        self.show.set(true);
+        true
     }
 }
 
@@ -1526,7 +1567,7 @@ fn PrReviewModal(
                                 let visible_count = visible.len();
                                 let hidden = total.saturating_sub(visible_count);
                                 let items_view = visible.into_iter().map(|(idx, item)| {
-                                    render_review_item(idx, item, plan, busy_memo, item_status)
+                                    render_review_item(idx, item, plan, busy_memo, item_status, auto_push)
                                 }).collect_view();
                                 view! {
                                     <div class="space-y-2">
@@ -1678,12 +1719,24 @@ fn approved_after_decision_change(
     is_fix && (from_collaborator || (was_fix && approved))
 }
 
+/// Tooltip of the "Fix not delivered" badge, for a Fix whose change is not on
+/// the PR branch yet. What applying again does depends on Auto-push: with it
+/// off, applying again commits but never pushes.
+fn fix_not_delivered_hint(auto_push: bool) -> &'static str {
+    if auto_push {
+        "The fix is not yet proven to be on the PR branch, so no reply is posted. Applying again commits any change still waiting and tries to push it to the PR branch, unless the task is awaiting its Human Review decision. If SlashIt has no record of the change, applying again makes the fix again."
+    } else {
+        "The fix is not yet proven to be on the PR branch, so no reply is posted. Applying again commits any change still waiting, but does not push it. Publish the commit with Publish to PR to deliver it. If SlashIt has no record of the change, applying again makes the fix again."
+    }
+}
+
 fn render_review_item(
     idx: usize,
     item: PrReviewItem,
     plan: RwSignal<Option<PrReviewPlan>>,
     busy: Memo<bool>,
     item_status: RwSignal<std::collections::HashMap<u64, PrItemStatus>>,
+    auto_push: RwSignal<bool>,
 ) -> impl IntoView {
     let comment_id = item.comment_id;
     let related = plan.get_untracked()
@@ -1851,7 +1904,7 @@ fn render_review_item(
                                             }.into_any()
                                         } else if fix_done_init {
                                             view! {
-                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-medium text-[10px]" title="The fix is not yet proven to be on the PR branch, so no reply is posted. Applying again pushes a commit that is waiting, or makes the fix again if its change is not in a commit.">
+                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-medium text-[10px]" title=move || fix_not_delivered_hint(auto_push.get())>
                                                     "⚠ Fix not delivered"
                                                 </span>
                                             }.into_any()
@@ -2987,8 +3040,99 @@ mod tests {
     use super::approved_after_decision_change;
     use super::next_card_id;
     use super::{awaiting_delivery, offers_pr_sync};
+    use super::PrReviewDialog;
     use crate::models::{HumanReviewDecision, HumanReviewEntry, Task, TaskStatus};
+    use crate::services::PR_REVIEW_AUTO_PUSH_DEFAULT;
+    use leptos::prelude::{GetUntracked, RwSignal, Set};
+    use leptos::reactive::owner::Owner;
     use uuid::Uuid;
+
+    /// The dialog's state, created the way the board creates it.
+    fn dialog(owner: &Owner) -> PrReviewDialog {
+        owner.with(|| PrReviewDialog {
+            show: RwSignal::new(false),
+            task: RwSignal::new(None),
+            plan: RwSignal::new(None),
+            loading: RwSignal::new(false),
+            error: RwSignal::new(None),
+            last_apply: RwSignal::new(None),
+            auto_push: RwSignal::new(PR_REVIEW_AUTO_PUSH_DEFAULT),
+        })
+    }
+
+    /// A Task whose PR-review plan is cached, so opening it does not analyze.
+    fn task_with_cached_plan(id: u128) -> Task {
+        let mut task = column_task(id, "cached");
+        task.pr_review_plan = Some(
+            serde_json::from_value(serde_json::json!({
+                "generated_at": "2026-01-01T00:00:00Z",
+                "pr_url": "https://github.com/BarraDev/slashit/pull/1",
+                "review_decision": null,
+                "comments": [],
+                "items": [{
+                    "comment_id": 7, "summary": "s", "decision": "fix",
+                    "reasoning": "r", "proposed_change": "p"
+                }],
+                "raw_plan": ""
+            }))
+            .unwrap(),
+        );
+        task
+    }
+
+    #[test]
+    fn auto_push_enabled_for_one_task_is_not_inherited_by_the_next_dialog_opening() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = column_task(1, "a");
+        let task_b = column_task(2, "b");
+
+        assert!(
+            dialog.open(task_a.clone()),
+            "no cached plan, so task A is analyzed"
+        );
+        assert!(
+            !dialog.auto_push.get_untracked(),
+            "task A opens with Auto-push off"
+        );
+        dialog.auto_push.set(true);
+        dialog.show.set(false);
+
+        assert!(dialog.open(task_b), "task B is analyzed");
+        assert!(
+            !dialog.auto_push.get_untracked(),
+            "task B opens with Auto-push off"
+        );
+
+        dialog.auto_push.set(true);
+        dialog.show.set(false);
+        assert!(dialog.open(task_a), "reopening task A is analyzed");
+        assert!(
+            !dialog.auto_push.get_untracked(),
+            "reopening task A opens with Auto-push off"
+        );
+    }
+
+    #[test]
+    fn reopening_a_task_with_a_cached_plan_also_starts_with_auto_push_off() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let cached = task_with_cached_plan(3);
+
+        assert!(
+            !dialog.open(cached.clone()),
+            "a usable cached plan is shown without analysis"
+        );
+        assert!(dialog.show.get_untracked());
+        dialog.auto_push.set(true);
+        dialog.show.set(false);
+
+        assert!(!dialog.open(cached));
+        assert!(
+            !dialog.auto_push.get_untracked(),
+            "the cached-plan opening starts with Auto-push off"
+        );
+    }
 
     fn column_task(id: u128, title: &str) -> Task {
         serde_json::from_value(serde_json::json!({
@@ -3028,6 +3172,26 @@ mod tests {
         // A collaborator's Fix is approved automatically.
         assert!(approved_after_decision_change(false, true, true, false));
         assert!(!approved_after_decision_change(true, false, true, true));
+    }
+
+    #[test]
+    fn with_auto_push_off_the_unpushed_fix_hint_says_applying_again_does_not_push() {
+        let hint = super::fix_not_delivered_hint(false);
+        assert!(!hint.contains("pushes a commit"), "{hint}");
+        assert!(hint.contains("does not push"), "{hint}");
+        assert!(hint.contains("Publish to PR"), "{hint}");
+        assert!(!hint.contains("Sync"), "Sync publishes nothing: {hint}");
+        assert!(hint.contains("makes the fix again"), "{hint}");
+    }
+
+    #[test]
+    fn with_auto_push_on_the_unpushed_fix_hint_says_a_push_is_only_attempted() {
+        let hint = super::fix_not_delivered_hint(true);
+        assert!(hint.contains("tries to push"), "{hint}");
+        assert!(!hint.contains("does not push"), "{hint}");
+        assert!(hint.contains("Human Review"), "{hint}");
+        assert!(!hint.contains("Sync"), "Sync publishes nothing: {hint}");
+        assert!(hint.contains("makes the fix again"), "{hint}");
     }
 
     fn approved(status: TaskStatus) -> Task {
