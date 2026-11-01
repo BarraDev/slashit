@@ -71,7 +71,7 @@ case "$1 $2" in
             sleep "$(cat "$dir/delay-create")"
         fi
         if [ -f "$dir/fail-create" ]; then
-            echo "fake gh: creating the pull request was scripted to fail" >&2
+            echo "fake gh: HTTP 422: Validation Failed: creating the pull request was scripted to fail" >&2
             exit 1
         fi
         if [ -z "$head" ]; then

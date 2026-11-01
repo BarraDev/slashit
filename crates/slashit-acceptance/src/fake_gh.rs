@@ -37,7 +37,8 @@ const PR_VIEW: &str = "pr-view.json";
 /// The file whose contents, a number of seconds, `pr view` sleeps first.
 const DELAY_VIEW: &str = "delay-view";
 
-/// What `pr create` prints on stderr when scripted to fail.
+/// What `pr create` prints on stderr when scripted to fail, after a GitHub
+/// refusal (`HTTP 422`), which is what proves that nothing was opened.
 pub const CREATE_FAILURE: &str = "creating the pull request was scripted to fail";
 
 pub struct FakeGh {
