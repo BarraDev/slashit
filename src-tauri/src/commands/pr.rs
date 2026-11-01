@@ -5882,37 +5882,44 @@ fn github_repository_of_remote_url(url: &str) -> Option<(String, String)> {
 async fn refuse_if_pushes_and_pull_requests_use_different_repositories(
     working_dir: &str,
 ) -> Result<(), String> {
-    let Ok(git_dir) = jj_git_dir_arg(working_dir).await else {
-        return Ok(());
+    // Every case it cannot judge is logged, so that a delivery that went on
+    // unchecked can be told from one that was checked.
+    let unchecked = |why: String| {
+        eprintln!("[pr] not checking that origin and gh use the same repository: {why}");
+        Ok(())
+    };
+    let git_dir = match jj_git_dir_arg(working_dir).await {
+        Ok(git_dir) => git_dir,
+        Err(e) => return unchecked(format!("the Git directory could not be found: {e}")),
     };
     let mut get_url: Vec<&str> = git_dir.iter().map(String::as_str).collect();
     get_url.extend(["remote", "get-url", "--push", "origin"]);
-    let Ok(push_url) = run_cmd("git", &get_url, working_dir).await else {
-        return Ok(());
+    let push_url = match run_cmd("git", &get_url, working_dir).await {
+        Ok(push_url) => push_url,
+        Err(e) => return unchecked(format!("origin's push URL could not be read: {e}")),
     };
     let Some(pushed_to) = github_repository_of_remote_url(&push_url) else {
-        return Ok(());
+        return unchecked(format!(
+            "origin's push URL {push_url:?} is not an owner/repository URL"
+        ));
     };
-    let Ok(viewed) = run_cmd(
+    let viewed = match run_cmd(
         "gh",
         &["repo", "view", "--json", "nameWithOwner"],
         working_dir,
     )
     .await
-    else {
-        return Ok(());
+    {
+        Ok(viewed) => viewed,
+        Err(e) => return unchecked(format!("gh could not name its repository: {e}")),
     };
-    let Some(opened_in) = serde_json::from_str::<serde_json::Value>(&viewed)
+    let named = serde_json::from_str::<serde_json::Value>(&viewed)
         .ok()
-        .and_then(|json| {
-            json.get("nameWithOwner")
-                .and_then(|v| v.as_str())
-                .and_then(|name| name.split_once('/'))
-                .map(|(owner, repo)| (owner.to_ascii_lowercase(), repo.to_ascii_lowercase()))
-        })
-    else {
-        return Ok(());
+        .and_then(|json| json.get("nameWithOwner")?.as_str().map(str::to_string));
+    let Some((owner, repo)) = named.as_deref().and_then(|name| name.split_once('/')) else {
+        return unchecked(format!("gh named its repository as {viewed:?}"));
     };
+    let opened_in = (owner.to_ascii_lowercase(), repo.to_ascii_lowercase());
     if pushed_to == opened_in {
         return Ok(());
     }
