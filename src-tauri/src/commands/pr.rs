@@ -4449,6 +4449,7 @@ async fn confirm_created_pr(
 ) -> Result<String, String> {
     let branch = &attempt.branch;
     if !is_pull_request_url(&answer) {
+        let answer = redact_urls_in(&answer);
         return Err(format!(
             "SlashIt asked GitHub to open a pull request for {branch}, and gh answered {answer:?}, \
              which is not a pull request URL, so SlashIt cannot tell whether one was opened. The \
@@ -4457,6 +4458,7 @@ async fn confirm_created_pr(
         ));
     }
     let unconfirmed = |why: String| {
+        let answer = redact_urls_in(&answer);
         format!(
             "Pull request is at {answer}, but SlashIt could not confirm that it carries {}: {why}. \
              It was not recorded on the task. Try again to link it; SlashIt looks for the branch's \
@@ -4501,6 +4503,9 @@ async fn reconcile_failed_pr_create(
 ) -> Result<String, String> {
     let failure = classify_pr_create_failure(&error);
     let (GhCreateError::NotSpawned(error) | GhCreateError::Failed(error)) = error;
+    // What `gh` printed may name a URL, and a remote's URL can carry
+    // credentials.
+    let error = redact_urls_in(&error);
     if failure == PrCreateFailure::NotSent {
         let refused = friendly_pr_error(error);
         return Err(retract_pr_create_attempt(state, task_uuid, attempt, refused).await);
@@ -4521,10 +4526,11 @@ async fn reconcile_failed_pr_create(
         )),
         Err(lookup) => Err(format!(
             "SlashIt cannot tell whether a pull request for {} was opened: asking GitHub to open \
-             it failed ({}), and then {lookup}. The task records this as unconfirmed. Try again: \
+             it failed ({}), and then {}. The task records this as unconfirmed. Try again: \
              SlashIt looks for the branch's pull request before it opens another.",
             attempt.branch,
-            error.trim()
+            error.trim(),
+            redact_urls_in(&lookup)
         )),
     }
 }
@@ -5822,13 +5828,16 @@ async fn pushed_branch_head(working_dir: &str, branch: &str) -> Result<Option<St
     get_url.extend(["remote", "get-url", "--push", "origin"]);
     let url = run_cmd("git", &get_url, working_dir)
         .await
-        .map_err(|e| format!("could not find where origin's pushes go: {e}"))?;
+        .map_err(|e| format!("could not find where origin's pushes go: {}", redact_urls_in(&e)))?;
     let refname = format!("refs/heads/{branch}");
     let mut ls_remote: Vec<&str> = git_dir.iter().map(String::as_str).collect();
     ls_remote.extend(["ls-remote", "--heads", "--", url.as_str(), refname.as_str()]);
-    let listed = run_cmd("git", &ls_remote, working_dir)
-        .await
-        .map_err(|e| format!("could not read {branch} back from the remote: {e}"))?;
+    let listed = run_cmd("git", &ls_remote, working_dir).await.map_err(|e| {
+        format!(
+            "could not read {branch} back from the remote: {}",
+            redact_urls_in(&e)
+        )
+    })?;
     Ok(listed.lines().find_map(|line| {
         let (oid, name) = line.split_once(char::is_whitespace)?;
         (name.trim() == refname).then(|| oid.to_string())
@@ -5864,6 +5873,58 @@ fn github_repository_of_remote_url(url: &str) -> Option<(String, String)> {
     }
 }
 
+/// `url` as it may be logged or shown: for a remote URL, without the userinfo
+/// (`user`, `user:password` or a token) that a remote can carry. Both
+/// `scheme://[userinfo@]host/...` and the scp-like `[user@]host:path` are
+/// understood; anything else is returned as it is.
+fn redact_remote_url(url: &str) -> String {
+    if url.contains("://") {
+        return redact_urls_in(url);
+    }
+    match url.split_once(':') {
+        Some((before, rest)) if !before.contains('/') => {
+            let host = before.rsplit_once('@').map_or(before, |(_, host)| host);
+            format!("{host}:{rest}")
+        }
+        _ => url.to_string(),
+    }
+}
+
+/// `text` with the userinfo of every `scheme://` URL in it dropped, for output
+/// of `git` and `gh` that names the URL it failed on. The authority ends at
+/// the first `/`, `?`, `#`, quote, bracket or whitespace, so a credential with
+/// one of those unescaped in it is not fully covered; URLs escape them.
+fn redact_urls_in(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + "://".len());
+        shown.push_str(head);
+        let end = tail
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\'' | ')' | '<' | '>')
+            })
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        shown.push_str(
+            authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host),
+        );
+        rest = &tail[end..];
+    }
+    shown.push_str(rest);
+    shown
+}
+
+/// Why the repository check of a delivery could not judge a push URL.
+fn unjudged_push_url_reason(push_url: &str) -> String {
+    format!(
+        "origin's push URL {:?} is not an owner/repository URL",
+        redact_remote_url(push_url)
+    )
+}
+
 /// Refuse when the repository `origin`'s pushes go to is not the one `gh` opens
 /// and looks up pull requests in.
 ///
@@ -5890,18 +5951,22 @@ async fn refuse_if_pushes_and_pull_requests_use_different_repositories(
     };
     let git_dir = match jj_git_dir_arg(working_dir).await {
         Ok(git_dir) => git_dir,
-        Err(e) => return unchecked(format!("the Git directory could not be found: {e}")),
+        Err(e) => {
+            let e = redact_urls_in(&e);
+            return unchecked(format!("the Git directory could not be found: {e}"));
+        }
     };
     let mut get_url: Vec<&str> = git_dir.iter().map(String::as_str).collect();
     get_url.extend(["remote", "get-url", "--push", "origin"]);
     let push_url = match run_cmd("git", &get_url, working_dir).await {
         Ok(push_url) => push_url,
-        Err(e) => return unchecked(format!("origin's push URL could not be read: {e}")),
+        Err(e) => {
+            let e = redact_urls_in(&e);
+            return unchecked(format!("origin's push URL could not be read: {e}"));
+        }
     };
     let Some(pushed_to) = github_repository_of_remote_url(&push_url) else {
-        return unchecked(format!(
-            "origin's push URL {push_url:?} is not an owner/repository URL"
-        ));
+        return unchecked(unjudged_push_url_reason(&push_url));
     };
     let viewed = match run_cmd(
         "gh",
@@ -5911,12 +5976,16 @@ async fn refuse_if_pushes_and_pull_requests_use_different_repositories(
     .await
     {
         Ok(viewed) => viewed,
-        Err(e) => return unchecked(format!("gh could not name its repository: {e}")),
+        Err(e) => {
+            let e = redact_urls_in(&e);
+            return unchecked(format!("gh could not name its repository: {e}"));
+        }
     };
     let named = serde_json::from_str::<serde_json::Value>(&viewed)
         .ok()
         .and_then(|json| json.get("nameWithOwner")?.as_str().map(str::to_string));
     let Some((owner, repo)) = named.as_deref().and_then(|name| name.split_once('/')) else {
+        let viewed = redact_urls_in(&viewed);
         return unchecked(format!("gh named its repository as {viewed:?}"));
     };
     let opened_in = (owner.to_ascii_lowercase(), repo.to_ascii_lowercase());
@@ -19865,6 +19934,7 @@ case "$*" in
       lost) touch {s}/created; echo 'HTTP 502: Bad Gateway (https://api.github.com/graphql)' >&2; exit 1 ;;
       refused) echo 'pull request create failed: GraphQL: No commits between main and {BRANCH}' >&2; exit 1 ;;
       graphql_timeout) touch {s}/created; echo "pull request create failed: GraphQL: We couldn't respond to your request in time. Sorry about that. (createPullRequest)" >&2; exit 1 ;;
+      leaky) touch {s}/created; echo "error: could not reach 'https://x-access-token:SECRET@ghe.corp/o/r.git': connection reset" >&2; exit 1 ;;
       refused_http) echo 'HTTP 422: Validation Failed (https://api.github.com/repos/testorg/testrepo/pulls)' >&2; exit 1 ;;
       moved) git --git-dir={remote} update-ref refs/heads/{BRANCH} "$(cat {s}/moved_to)"; touch {s}/created; printf '%s' '{PR_URL}' ;;
       garbled) touch {s}/created; printf '%s' 'created' ;;
@@ -21113,6 +21183,97 @@ esac"#
                     .expect_err("the record that remains refuses a retry");
                 assert!(error.contains("did not open another"), "{error}");
                 assert_eq!(gh.creates(), 0, "{}", gh.fake.invocations());
+            }
+
+            /// A remote URL can carry a token or a password, and what is logged
+            /// or shown must not.
+            #[test]
+            fn a_remote_url_is_shown_without_its_credentials() {
+                for (url, expected) in [
+                    (
+                        "https://x-access-token:SECRET@ghe.corp/git/owner/repo.git",
+                        "https://ghe.corp/git/owner/repo.git",
+                    ),
+                    (
+                        "https://user:SECRET@github.com/o/r.git",
+                        "https://github.com/o/r.git",
+                    ),
+                    ("https://SECRET@github.com/o/r", "https://github.com/o/r"),
+                    (
+                        "https://u:p%2FSECRET@github.com/o/r",
+                        "https://github.com/o/r",
+                    ),
+                    (
+                        "https://u:p@SECRET@github.com/o/r",
+                        "https://github.com/o/r",
+                    ),
+                    ("ssh://git@host:2222/o/r.git", "ssh://host:2222/o/r.git"),
+                    ("git@github.com:o/r.git", "github.com:o/r.git"),
+                    ("git-SECRET@github-work:o/r.git", "github-work:o/r.git"),
+                    ("https://github.com/o/r.git", "https://github.com/o/r.git"),
+                    ("/srv/git/o/r.git", "/srv/git/o/r.git"),
+                    ("/srv/a@b:c", "/srv/a@b:c"),
+                    ("github-work:o/r.git", "github-work:o/r.git"),
+                    ("", ""),
+                ] {
+                    let shown = redact_remote_url(url);
+                    assert_eq!(shown, expected, "{url}");
+                    assert!(!shown.contains("SECRET"), "{shown}");
+                }
+            }
+
+            /// The same for the output of `git` and `gh`, which names the URL a
+            /// command failed on.
+            #[test]
+            fn urls_inside_command_output_are_shown_without_their_credentials() {
+                for (text, expected) in [
+                    (
+                        "fatal: unable to access 'https://u:SECRET@h.example/o/r.git/': Could not resolve host",
+                        "fatal: unable to access 'https://h.example/o/r.git/': Could not resolve host",
+                    ),
+                    (
+                        "a https://SECRET@one.example/x and (https://u:SECRET@two.example:8443/y)",
+                        "a https://one.example/x and (https://two.example:8443/y)",
+                    ),
+                    ("HTTP 502: Bad Gateway (https://api.github.com/graphql)", "HTTP 502: Bad Gateway (https://api.github.com/graphql)"),
+                    ("no url here", "no url here"),
+                ] {
+                    let shown = redact_urls_in(text);
+                    assert_eq!(shown, expected);
+                    assert!(!shown.contains("SECRET"), "{shown}");
+                }
+            }
+
+            /// The reason logged when the push URL cannot be judged never carries
+            /// the URL's credentials.
+            #[test]
+            fn the_logged_reason_for_an_unjudged_push_url_carries_no_credentials() {
+                for url in [
+                    "https://x-access-token:SECRET@ghe.corp/owner",
+                    "https://user:SECRET@host/",
+                    "SECRET@host:",
+                ] {
+                    let reason = unjudged_push_url_reason(url);
+                    assert!(!reason.contains("SECRET"), "{reason}");
+                    assert!(reason.contains("not an owner/repository URL"), "{reason}");
+                }
+            }
+
+            /// What `gh` printed may name a remote URL with credentials in it, and
+            /// the message shown for an unknown outcome must not carry them.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_message_about_an_unknown_outcome_carries_no_credentials() {
+                let (_repo, _sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                gh.set("create_mode", "leaky");
+                gh.set("list_hides_created", "");
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the outcome is unknown");
+
+                assert!(error.contains("cannot tell whether"), "{error}");
+                assert!(error.contains("https://ghe.corp/o/r.git"), "{error}");
+                assert!(!error.contains("SECRET"), "{error}");
             }
 
             /// A `gh` that cannot be started is told from one that was started
