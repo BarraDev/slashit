@@ -3916,7 +3916,11 @@ async fn create_pr_inner(
 /// reconciled against GitHub ([`confirm_created_pr`],
 /// [`reconcile_failed_pr_create`]). Every attempt looks up the branch's pull
 /// request before it pushes and again before it opens one, and a lookup that
-/// cannot be answered stops the delivery, so an unknown outcome is never
+/// cannot be answered stops the delivery. A request whose outcome is unknown
+/// stays recorded on the task, and while it does a lookup that finds no pull
+/// request does not admit another request ([`refuse_while_pr_create_unconfirmed`],
+/// [`record_pr_create_started`]): only finding the pull request, or learning
+/// that no request was made, settles it. So an unknown outcome is never
 /// retried into a second pull request.
 ///
 /// Not covered: a delivery with no approval to bind pushes by branch name, so
@@ -4015,6 +4019,12 @@ async fn create_pr_reserved(
         }
         return Ok(existing_pr_url);
     }
+
+    // GitHub lists no pull request for the branch, which is not enough to open
+    // one while an earlier request to open one was never answered: that
+    // request may have been applied and the listing may not show it yet. The
+    // refusal comes before anything is pushed. See `UnconfirmedPrCreate`.
+    refuse_while_pr_create_unconfirmed(state, task_uuid).await?;
 
     // Decided before the push, so a pull request that cannot be opened
     // truthfully leaves nothing half done on the remote.
@@ -4130,9 +4140,13 @@ async fn create_pr_reserved(
     after_record_hook::run(&working_dir);
     // The record is a disk write, and a cancellation can land while it is
     // made. Checked again so that `gh pr create` is not started over it. The
-    // unconfirmed record stays: it only says a pull request may exist, and a
-    // retry looks the branch's pull request up strictly before opening one.
-    refuse_if_pr_operation_cancelled(&reservation, "opening the pull request")?;
+    // request was not sent, so the record, which says one may have been, is
+    // taken back with the refusal.
+    if let Err(refused) =
+        refuse_if_pr_operation_cancelled(&reservation, "opening the pull request")
+    {
+        return Err(retract_pr_create_attempt(state, task_uuid, &attempt, refused).await);
+    }
     let mut create_args = vec![
         "pr", "create",
         "--title", &pr_title,
@@ -4174,11 +4188,22 @@ async fn record_pr_create_started(
     attempt: &crate::domain::task::UnconfirmedPrCreate,
 ) -> Result<(), String> {
     let recorded = std::sync::atomic::AtomicBool::new(false);
+    let unsettled = std::sync::Mutex::new(None);
+    // The admission and the write that records the request are one step: a
+    // request already recorded is never replaced, however the two came to be.
     let apply = |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             if task.branch_name.as_deref() == Some(attempt.branch.as_str()) {
-                task.pr_create_unconfirmed = Some(attempt.clone());
-                recorded.store(true, std::sync::atomic::Ordering::SeqCst);
+                match &task.pr_create_unconfirmed {
+                    Some(earlier) => {
+                        let mut slot = unsettled.lock().unwrap_or_else(|e| e.into_inner());
+                        *slot = Some(earlier.clone());
+                    }
+                    None => {
+                        task.pr_create_unconfirmed = Some(attempt.clone());
+                        recorded.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
             }
         }
     };
@@ -4191,6 +4216,9 @@ async fn record_pr_create_started(
                 attempt.branch
             )
         })?;
+    if let Some(earlier) = unsettled.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        return Err(unconfirmed_pr_create_refusal(&earlier));
+    }
     if !recorded.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(format!(
             "{} is pushed, but the task no longer has that branch, so no pull request was opened.",
@@ -4200,14 +4228,76 @@ async fn record_pr_create_started(
     Ok(())
 }
 
-/// Remove `attempt` from the task once GitHub has answered that it opened
-/// nothing. Best effort: a record left behind still only says that a pull
-/// request may exist, and the next attempt asks GitHub before it opens one.
+/// Refuse, before anything is pushed or asked of GitHub, when the task still
+/// records a request to open its pull request that was never answered.
+async fn refuse_while_pr_create_unconfirmed(
+    state: &crate::AppState,
+    task_uuid: Uuid,
+) -> Result<(), String> {
+    let earlier = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .and_then(|task| task.pr_create_unconfirmed.clone());
+    match earlier {
+        Some(earlier) => Err(unconfirmed_pr_create_refusal(&earlier)),
+        None => Ok(()),
+    }
+}
+
+/// Why a second pull request is not opened while `earlier` is unanswered, for
+/// a person who has to act on it.
+///
+/// Reached after GitHub listed no pull request for the branch. That does not
+/// settle the request: a pull request that was just opened can be missing from
+/// a listing, and nothing SlashIt can read says how long. The record is kept,
+/// on disk, until a lookup finds the pull request and links it, or GitHub
+/// answers a request with a refusal. Nothing here discards it.
+fn unconfirmed_pr_create_refusal(earlier: &crate::domain::task::UnconfirmedPrCreate) -> String {
+    format!(
+        "SlashIt asked GitHub to open a pull request for {} at {} on {} and never learned \
+         whether it did. GitHub does not list one for the branch now, but a pull request that \
+         was just opened can be missing from that list, so SlashIt did not open another one, \
+         which could duplicate it. If a pull request for the branch exists on GitHub, try again \
+         and SlashIt links it. If none exists, SlashIt cannot tell that from a list that has not \
+         caught up, and it has no way yet to discard this record: the repository owner has to \
+         decide how to recover.",
+        earlier.branch,
+        earlier.commit,
+        earlier.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+    )
+}
+
+/// Take back the record of a request that was refused before it was sent, and
+/// return `refused` for the caller to report, with a note when the record could
+/// not be taken back.
+async fn retract_pr_create_attempt(
+    state: &crate::AppState,
+    task_uuid: Uuid,
+    attempt: &crate::domain::task::UnconfirmedPrCreate,
+    refused: String,
+) -> String {
+    if clear_pr_create_attempt(state, task_uuid, attempt).await {
+        refused
+    } else {
+        format!(
+            "{refused} No request was sent, but SlashIt could not remove its record that one was \
+             about to be, so a retry will refuse until that is resolved."
+        )
+    }
+}
+
+/// Remove `attempt` from the task once it is known that no request was made
+/// for it: GitHub refused it, or it was never sent. Whether the record is gone
+/// is returned. One left behind only says that a pull request may exist, and
+/// the next attempt then refuses to open another.
 async fn clear_pr_create_attempt(
     state: &crate::AppState,
     task_uuid: Uuid,
     attempt: &crate::domain::task::UnconfirmedPrCreate,
-) {
+) -> bool {
     let apply = |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             if task.pr_create_unconfirmed.as_ref() == Some(attempt) {
@@ -4215,14 +4305,16 @@ async fn clear_pr_create_attempt(
             }
         }
     };
-    if let Err(e) =
-        crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply).await
-    {
-        eprintln!(
-            "[pr] no pull request was opened for {}, but the task still records the attempt as \
-             unconfirmed: {e}",
-            attempt.branch
-        );
+    match crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply).await {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "[pr] no pull request was opened for {}, but the task still records the attempt \
+                 as unconfirmed: {e}",
+                attempt.branch
+            );
+            false
+        }
     }
 }
 
@@ -4285,16 +4377,23 @@ async fn confirm_created_pr(
     }
 }
 
-/// What a `gh pr create` that reported failure did, asked of GitHub. Its
-/// answer may have been lost after the pull request was opened, so the
-/// branch's pull request is looked up before anything is concluded:
+/// What a `gh pr create` that reported failure did, asked of GitHub and read
+/// with [`classify_pr_create_failure`]. Its answer may have been lost after the
+/// pull request was opened, so the branch's pull request is looked up before
+/// anything is concluded:
 ///
+/// - `gh` never started: nothing was sent, and the task's unconfirmed record is
+///   removed without asking GitHub;
 /// - one is found: the request did open it (or another did), and it is
 ///   confirmed as [`confirm_created_pr`] confirms a fresh one;
-/// - GitHub answers that there is none: the failure is a real one, and the
-///   task's unconfirmed record is removed;
-/// - GitHub cannot be asked: the outcome is unknown, the record stays, and
-///   the message says so rather than calling it a failure.
+/// - none is found and GitHub had refused the request: the failure is a real
+///   one, and the record is removed;
+/// - none is found and the failure does not say that GitHub refused it: the
+///   outcome is unknown, because the listing may not show a pull request that
+///   was just opened. The record stays, on disk, and a retry opens nothing
+///   until the pull request is found;
+/// - GitHub cannot be asked: the outcome is unknown too, and the record stays,
+///   unless GitHub had refused the request, which settles it.
 async fn reconcile_failed_pr_create(
     state: &crate::AppState,
     task_uuid: Uuid,
@@ -4302,12 +4401,25 @@ async fn reconcile_failed_pr_create(
     attempt: &crate::domain::task::UnconfirmedPrCreate,
     error: String,
 ) -> Result<String, String> {
+    let failure = classify_pr_create_failure(&error);
+    if failure == PrCreateFailure::NotSent {
+        let refused = friendly_pr_error(error);
+        return Err(retract_pr_create_attempt(state, task_uuid, attempt, refused).await);
+    }
     match find_existing_pr_for_branch(working_dir, &attempt.branch).await {
         Ok(Some(url)) => confirm_created_pr(working_dir, attempt, url).await,
-        Ok(None) => {
-            clear_pr_create_attempt(state, task_uuid, attempt).await;
-            Err(friendly_pr_error(error))
+        Ok(None) | Err(_) if failure == PrCreateFailure::Rejected => {
+            let refused = friendly_pr_error(error);
+            Err(retract_pr_create_attempt(state, task_uuid, attempt, refused).await)
         }
+        Ok(None) => Err(format!(
+            "SlashIt cannot tell whether a pull request for {} was opened: asking GitHub to open \
+             it failed ({}), and GitHub's list shows none, which does not prove that none was \
+             opened. The task records this as unconfirmed, and SlashIt will not open another \
+             one until it finds this one. Try again.",
+            attempt.branch,
+            error.trim()
+        )),
         Err(lookup) => Err(format!(
             "SlashIt cannot tell whether a pull request for {} was opened: asking GitHub to open \
              it failed ({}), and then {lookup}. The task records this as unconfirmed. Try again: \
@@ -4315,6 +4427,50 @@ async fn reconcile_failed_pr_create(
             attempt.branch,
             error.trim()
         )),
+    }
+}
+
+/// What a failed `gh pr create` says about whether a pull request was opened.
+#[derive(Debug, PartialEq, Eq)]
+enum PrCreateFailure {
+    /// `gh` could not be started, so no request was sent.
+    NotSent,
+    /// GitHub answered the request with a client error: it was refused.
+    Rejected,
+    /// Anything else: the request may have been applied.
+    Unknown,
+}
+
+/// Reads what [`run_cmd`] reported for a `gh pr create` that failed.
+///
+/// A request is known to have opened nothing only in two cases. `gh` could not
+/// be started at all. Or GitHub answered it with a client error (`HTTP 4xx`,
+/// or a GraphQL error that is not its "something went wrong" fault), which is
+/// a refusal of that request. Everything else may have come after the pull
+/// request was opened: a gateway or server error (`5xx`), a request timeout
+/// (`408`), a connection dropped or timed out on the way back, output that
+/// says nothing. Those are [`PrCreateFailure::Unknown`], which is also what
+/// an error in a form this does not recognize is, so a new `gh` wording makes
+/// SlashIt ask for a recovery decision rather than open a second pull request.
+fn classify_pr_create_failure(error: &str) -> PrCreateFailure {
+    if error.starts_with("Failed to run gh:") {
+        return PrCreateFailure::NotSent;
+    }
+    let mut client_error = false;
+    for (at, _) in error.match_indices("HTTP ") {
+        let digits: String = error[at + "HTTP ".len()..].chars().take(3).collect();
+        match digits.parse::<u16>() {
+            Ok(408) | Ok(500..=599) => return PrCreateFailure::Unknown,
+            Ok(400..=499) => client_error = true,
+            _ => {}
+        }
+    }
+    let graphql_refusal =
+        error.contains("GraphQL: ") && !error.to_ascii_lowercase().contains("something went wrong");
+    if client_error || graphql_refusal {
+        PrCreateFailure::Rejected
+    } else {
+        PrCreateFailure::Unknown
     }
 }
 
@@ -19231,11 +19387,16 @@ mod tests {
             /// A fake `gh` that keeps the pull request it opened in a file.
             /// Behaviour is chosen by files in `state`:
             ///
-            /// - `create_mode` (`ok`, `lost`, `refused`, `moved`, `garbled`):
-            ///   `lost` opens the pull request and then reports failure, as a
-            ///   response lost on the way back does; `moved` opens it after
+            /// - `create_mode` (`ok`, `lost`, `refused`, `refused_http`, `moved`,
+            ///   `garbled`): `lost` opens the pull request and then reports a
+            ///   server error, as a response lost on the way back does;
+            ///   `refused` and `refused_http` are GitHub's own rejections, which
+            ///   open nothing; `moved` opens it after
             ///   moving the remote branch to the commit named in `moved_to`;
             ///   `garbled` opens it and answers with text that is not its URL;
+            /// - `list_hides_created`: `pr list` answers that there is no pull
+            ///   request even once one exists, as a listing that has not caught
+            ///   up with a pull request just opened does;
             /// - `list_fails`: every `pr list` fails;
             /// - `list_fails_after_push`: `pr list` fails once the remote has
             ///   the branch;
@@ -19267,12 +19428,13 @@ case "$*" in
     if [ -f {s}/list_fails_after_push ] && has_branch; then echo 'error connecting to api.github.com' >&2; exit 1; fi
     if [ -f {s}/list_fails_after_create ] && [ -f {s}/created ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
     if [ -f {s}/block_after_push ] && has_branch; then rm -rf "$(cat {s}/block_after_push)"; printf 'not a directory' > "$(cat {s}/block_after_push)"; fi
-    if [ -f {s}/created ]; then printf '%s' '{listed}'; else printf '[]'; fi ;;
+    if [ -f {s}/created ] && [ ! -f {s}/list_hides_created ]; then printf '%s' '{listed}'; else printf '[]'; fi ;;
   *'pr create'*)
     case "$(cat {s}/create_mode 2>/dev/null || echo ok)" in
       ok) touch {s}/created; printf '%s' '{PR_URL}' ;;
       lost) touch {s}/created; echo 'HTTP 502: Bad Gateway (https://api.github.com/graphql)' >&2; exit 1 ;;
       refused) echo 'pull request create failed: GraphQL: No commits between main and {BRANCH}' >&2; exit 1 ;;
+      refused_http) echo 'HTTP 422: Validation Failed (https://api.github.com/repos/testorg/testrepo/pulls)' >&2; exit 1 ;;
       moved) git --git-dir={remote} update-ref refs/heads/{BRANCH} "$(cat {s}/moved_to)"; touch {s}/created; printf '%s' '{PR_URL}' ;;
       garbled) touch {s}/created; printf '%s' 'created' ;;
     esac ;;
@@ -19834,9 +19996,9 @@ esac"#
             }
 
             /// A cancellation that lands once the request is recorded and before
-            /// `gh pr create` starts stops the delivery there. The record stays
-            /// (a pull request may exist as far as the task knows), nothing is
-            /// opened, and the retry opens exactly one pull request.
+            /// `gh pr create` starts stops the delivery there. Nothing was sent,
+            /// so the record of the request is removed with the refusal and the
+            /// retry opens exactly one pull request.
             #[tokio::test(flavor = "multi_thread")]
             async fn a_cancellation_after_the_request_is_recorded_stops_before_gh_pr_create() {
                 let (repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
@@ -19891,17 +20053,7 @@ esac"#
                     repo.remote_has_branch(BRANCH).as_deref(),
                     Some(sha.as_str())
                 );
-                for task in [
-                    in_memory(&state, task_id).await,
-                    on_disk(&state, task_id).await,
-                ] {
-                    assert_eq!(task.pr_url, None);
-                    assert_eq!(
-                        task.pr_create_unconfirmed.map(|u| u.commit),
-                        Some(sha.clone()),
-                        "the recorded request stays"
-                    );
-                }
+                assert_nothing_recorded(&state, task_id).await;
 
                 assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
                 assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
@@ -20009,6 +20161,241 @@ esac"#
                     gh.fake.invocations()
                 );
                 assert_delivered(&state, task_id).await;
+            }
+
+            /// The board read back from its file into an empty task map, as a
+            /// restart loads it.
+            async fn restart(state: &crate::AppState, task_id: Uuid) {
+                let project_id = in_memory(state, task_id).await.project_id;
+                let persisted = state
+                    .storage
+                    .load_project_tasks(project_id)
+                    .expect("read the board back");
+                let mut tasks = state.task.tasks.write().await;
+                tasks.clear();
+                tasks.extend(persisted.into_iter().map(|t| (t.id, t)));
+            }
+
+            /// The unconfirmed request is on the task, in memory and on disk,
+            /// for `commit`.
+            async fn assert_unconfirmed(state: &crate::AppState, task_id: Uuid, commit: &str) {
+                for task in [
+                    in_memory(state, task_id).await,
+                    on_disk(state, task_id).await,
+                ] {
+                    assert_eq!(
+                        task.pr_create_unconfirmed.map(|u| u.commit).as_deref(),
+                        Some(commit),
+                        "the unconfirmed request must be kept"
+                    );
+                    assert_eq!(task.pr_url, None);
+                }
+            }
+
+            /// The pull request was opened and its answer was lost, and GitHub's
+            /// listing does not show it yet. One negative lookup is no proof that
+            /// the request failed, so the retry opens nothing while the listing
+            /// still hides it, whatever the number of retries, and links the
+            /// pull request once the listing shows it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_pull_request_the_listing_does_not_show_yet_is_not_opened_again() {
+                let (_repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                gh.set("create_mode", "lost");
+                gh.set("list_hides_created", "");
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the outcome is unknown");
+                assert!(error.contains("cannot tell whether"), "{error}");
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_unconfirmed(&state, task_id, &sha).await;
+
+                for _ in 0..2 {
+                    let error = create(&state, task_id, None)
+                        .await
+                        .expect_err("an earlier request may have opened a pull request");
+                    assert!(error.contains("did not open another"), "{error}");
+                    assert!(error.contains(BRANCH), "{error}");
+                    assert_eq!(
+                        gh.creates(),
+                        1,
+                        "no second request while the first is unconfirmed: {}",
+                        gh.fake.invocations()
+                    );
+                    assert_unconfirmed(&state, task_id, &sha).await;
+                }
+
+                gh.unset("list_hides_created");
+                assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_delivered(&state, task_id).await;
+            }
+
+            /// The same across a restart: only the board file is left, and it
+            /// still stops the retry while the listing hides the pull request.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_unconfirmed_request_still_stops_a_retry_after_a_restart() {
+                let (_repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                gh.set("create_mode", "lost");
+                gh.set("list_hides_created", "");
+                create(&state, task_id, None)
+                    .await
+                    .expect_err("the outcome is unknown");
+
+                restart(&state, task_id).await;
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the request is still unconfirmed after the restart");
+                assert!(error.contains("did not open another"), "{error}");
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_unconfirmed(&state, task_id, &sha).await;
+
+                gh.unset("list_hides_created");
+                restart(&state, task_id).await;
+                assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_delivered(&state, task_id).await;
+            }
+
+            /// An answer that is not a pull request URL leaves the same
+            /// uncertainty, and the same refusal to ask again.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_garbled_answer_and_a_hidden_pull_request_open_no_second_one() {
+                let (_repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                gh.set("create_mode", "garbled");
+                gh.set("list_hides_created", "");
+                create(&state, task_id, None)
+                    .await
+                    .expect_err("the answer is not a pull request URL");
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the first request is unconfirmed");
+
+                assert!(error.contains("did not open another"), "{error}");
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_unconfirmed(&state, task_id, &sha).await;
+            }
+
+            /// A lookup that fails does not settle an unconfirmed request
+            /// either: the retry opens nothing and the record stays.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_unconfirmed_request_and_a_failing_lookup_open_nothing() {
+                let (_repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                gh.set("create_mode", "lost");
+                gh.set("list_hides_created", "");
+                create(&state, task_id, None)
+                    .await
+                    .expect_err("the outcome is unknown");
+                gh.set("list_fails", "");
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("GitHub could not be asked");
+
+                assert!(error.contains("could not be asked"), "{error}");
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_unconfirmed(&state, task_id, &sha).await;
+            }
+
+            /// A request GitHub rejected with a client error opened nothing, and
+            /// that is known without asking the listing. It leaves no record and
+            /// does not stop a new attempt.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_request_github_rejected_does_not_block_a_new_attempt() {
+                let (_repo, _sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                gh.set("create_mode", "refused_http");
+                gh.set("list_hides_created", "");
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("GitHub rejected the request");
+                assert!(error.contains("Validation Failed"), "{error}");
+                assert_nothing_recorded(&state, task_id).await;
+
+                gh.set("create_mode", "ok");
+                gh.unset("list_hides_created");
+                assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
+                assert_eq!(gh.creates(), 2, "{}", gh.fake.invocations());
+                assert_delivered(&state, task_id).await;
+            }
+
+            /// A request whose pull request later showed a moved branch is found
+            /// again by the retry, which links it without opening another.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_retry_of_a_request_whose_branch_moved_links_the_one_pull_request() {
+                let (repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                let elsewhere = git(&repo.checkout, &["rev-parse", "main"]);
+                gh.set("create_mode", "moved");
+                gh.set("moved_to", &elsewhere);
+                create(&state, task_id, None)
+                    .await
+                    .expect_err("the commit is not confirmed");
+                assert_unconfirmed(&state, task_id, &sha).await;
+
+                assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_delivered(&state, task_id).await;
+            }
+
+            /// The check that admits a request and the write that records it are
+            /// one step: a request already recorded is not replaced by another.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn recording_a_request_does_not_replace_an_unconfirmed_one() {
+                let (_repo, sha, _gh, state, _tmp, task_id, _bin) = setup().await;
+                let first = crate::domain::task::UnconfirmedPrCreate {
+                    branch: BRANCH.to_string(),
+                    commit: sha.clone(),
+                    started_at: chrono::Utc::now(),
+                };
+                record_pr_create_started(&state, task_id, &first)
+                    .await
+                    .expect("the first request is recorded");
+                let second = crate::domain::task::UnconfirmedPrCreate {
+                    commit: "f".repeat(40),
+                    ..first.clone()
+                };
+
+                let error = record_pr_create_started(&state, task_id, &second)
+                    .await
+                    .expect_err("an unconfirmed request is already recorded");
+
+                assert!(error.contains("did not open another"), "{error}");
+                assert_eq!(
+                    on_disk(&state, task_id).await.pr_create_unconfirmed,
+                    Some(first)
+                );
+            }
+
+            /// Only a failure GitHub answered with a client error is known to
+            /// have opened nothing. A gateway or server error, a dropped
+            /// connection, a timeout and anything unrecognized may have come
+            /// after the pull request was opened.
+            #[test]
+            fn only_an_answered_rejection_is_known_to_have_opened_nothing() {
+                use PrCreateFailure::{NotSent, Rejected, Unknown};
+                for (error, expected) in [
+                    ("Failed to run gh: No such file or directory (os error 2)", NotSent),
+                    (
+                        "gh failed: pull request create failed: GraphQL: No commits between main and x (createPullRequest)\n",
+                        Rejected,
+                    ),
+                    ("gh failed: HTTP 422: Validation Failed (https://api.github.com/x)", Rejected),
+                    ("gh failed: HTTP 403: Resource not accessible", Rejected),
+                    ("gh failed: HTTP 408: Request Timeout", Unknown),
+                    ("gh failed: HTTP 502: Bad Gateway (https://api.github.com/graphql)", Unknown),
+                    ("gh failed: HTTP 504: Gateway Timeout", Unknown),
+                    ("gh failed: GraphQL: Something went wrong while executing your query.", Unknown),
+                    ("gh failed: error connecting to api.github.com", Unknown),
+                    (
+                        "gh failed: Post \"https://api.github.com/graphql\": context deadline exceeded",
+                        Unknown,
+                    ),
+                    ("gh failed: ", Unknown),
+                ] {
+                    assert_eq!(classify_pr_create_failure(error), expected, "{error}");
+                }
             }
 
             /// `gh` answers with the host of the repository it ran in, so the

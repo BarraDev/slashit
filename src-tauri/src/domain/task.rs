@@ -1348,10 +1348,16 @@ pub struct PendingRepublish {
 /// repeat blindly: a push of the same commit is, a second pull request is not.
 /// So this is written before the request is sent, and its presence means
 /// exactly "a pull request for `branch` at `commit` may exist on GitHub that
-/// this task does not record". It is removed in the write that links the pull
-/// request, or once GitHub has answered that the branch has none. A retry
-/// always asks GitHub for the branch's pull request before it opens one, so
-/// this record states the uncertainty; it does not decide what a retry does.
+/// this task does not record".
+///
+/// It decides what a retry does, in one rule. While it is set, no further
+/// request to open a pull request is made, whatever a lookup answers: a lookup
+/// that finds the branch's pull request links it (and that write removes the
+/// record), and a lookup that finds none proves nothing, because a listing can
+/// lag behind a pull request just opened. It is removed only by that link, or
+/// when it is known that no request was made: GitHub answered the request with
+/// a refusal, or the request was stopped before it was sent. It is never
+/// removed because time passed or because a lookup came back empty.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UnconfirmedPrCreate {
