@@ -3614,9 +3614,11 @@ fn refuse_unless_still_approved_now(state: &crate::AppState, task_id: Uuid) -> R
 /// the push: asking GitHub to open the pull request.
 ///
 /// An approved delivery is refused by the Human Review rule once the task is in
-/// Human Review without an approval. When it published a bound commit (`bound`
-/// is that commit), the task's current approval must still be one that covers
-/// exactly it; an approval that is gone is refused on that ground.
+/// Human Review without an approval. When the delivery was admitted against an
+/// approved commit (`bound`), the task's current approval must still cover
+/// exactly it; an approval that is gone is refused on that ground. `bound` is
+/// the approved commit, not the commit that was pushed: a restack publishes a
+/// rewritten tip while the approval keeps naming the commit it was given for.
 /// Neither the push nor the lookups before this are an approval of this step.
 /// When the task map is locked at that instant the answer is unknown, so the
 /// step is refused. Nothing has been requested of GitHub when this refuses,
@@ -3657,9 +3659,9 @@ fn refuse_before_pr_create(
         return Ok(());
     }
     Err(if approved {
-        "The task's approval now covers a different commit than the one that was pushed, so no \
-         pull request was requested. The pushed commit stays on the remote branch. Review the \
-         branch as it is and approve it again to continue."
+        "The task's approval now covers a different commit than the one this delivery was \
+         approved for, so no pull request was requested. The pushed commit stays on the remote \
+         branch. Review the branch as it is and approve it again to continue."
     } else {
         "The task is no longer in Human Review with its changes approved, so no pull request was \
          requested. The pushed commit stays on the remote branch. Approve the task again to \
@@ -4044,6 +4046,10 @@ async fn create_pr_reserved(
         Some(tip) => Some(tip),
         None => approved_commit_for_delivery(state, task_uuid).await?,
     };
+    // The commit the approval covered when this delivery was admitted. A
+    // restack below replays it and publishes a rewritten tip, but the approval
+    // keeps naming this one, and it is what the later re-check compares.
+    let admitted_tip = publish_tip.clone();
 
     if let Some(existing_pr_url) =
         find_existing_pr_for_branch(&working_dir, &task_branch_name).await?
@@ -4206,13 +4212,13 @@ async fn create_pr_reserved(
     // await between this read and the spawn of `gh pr create`. The request was
     // not sent, so the record, which says one may have been, is taken back
     // with the refusal; the push stands, as it was verified.
-    if let Err(refused) = refuse_before_pr_create(
-        state,
-        task_uuid,
-        approved_delivery,
-        approval_required.then_some(attempt.commit.as_str()),
-    )
-    .and_then(|()| refuse_if_pr_operation_cancelled(&reservation, "opening the pull request"))
+    let bound = if approval_required {
+        admitted_tip.as_deref()
+    } else {
+        None
+    };
+    if let Err(refused) = refuse_before_pr_create(state, task_uuid, approved_delivery, bound)
+        .and_then(|()| refuse_if_pr_operation_cancelled(&reservation, "opening the pull request"))
     {
         return Err(retract_pr_create_attempt(state, task_uuid, &attempt, refused).await);
     }
@@ -12478,6 +12484,153 @@ mod tests {
                     assert_eq!(task.checkout_admission.as_ref().map(|a| &a.dependencies[0].requirement), Some(&crate::domain::task::DependencyRequirement::Commits(vec![landed.merge_commit.clone()])), "{name}: parent requirement follows the verified merged parent");
                     assert_eq!(task.pr_url.as_deref(), Some(CHILD_PR_URL), "{name}");
                 }
+            }
+
+            /// A stacked task whose parent landed, approved at its current tip and
+            /// not yet delivered, with the mock `gh` that answers for it.
+            async fn approved_restackable_task(
+            ) -> (Landed, MockGh, crate::AppState, tempfile::TempDir, Uuid) {
+                let landed = land(Spec::new(Landing::Squash));
+                let mock = MockGh::setup_answering(
+                    CHILD_PR_URL,
+                    r#"{"state":"OPEN"}"#,
+                    &merged_parent_answers(&landed),
+                );
+                let (state, tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                let parent_task_id = seed_task(
+                    &state,
+                    landed.repo.checkout.to_str().unwrap(),
+                    Some("task-parent"),
+                    TaskStatus::Done,
+                )
+                .await;
+                let repository_id = {
+                    let tasks = state.task.tasks.read().await;
+                    state.project.projects.read().await[&tasks[&task_id].project_id]
+                        .repository_id
+                        .unwrap()
+                };
+                let approved = landed.child_tip.clone();
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.dependencies = vec![parent_task_id];
+                    task.checkout_admission = Some(crate::domain::task::CheckoutAdmission {
+                        format_version: crate::domain::task::CheckoutAdmission::FORMAT_VERSION,
+                        policy_version: crate::domain::task::CheckoutAdmission::POLICY_VERSION,
+                        task_id,
+                        repository_id,
+                        branch: "task-branch".to_string(),
+                        admitted_commit: landed.base_commit.clone(),
+                        dependencies: vec![crate::domain::task::DependencyAdmission {
+                            task_id: parent_task_id,
+                            requirement: crate::domain::task::DependencyRequirement::Commits(vec![
+                                landed.base_commit.clone(),
+                            ]),
+                        }],
+                    });
+                    task.status = TaskStatus::HumanReview;
+                    task.human_review
+                        .approve(Some(approved), chrono::Utc::now());
+                }
+                (landed, mock, state, tmp, task_id)
+            }
+
+            fn creates(mock: &MockGh) -> usize {
+                mock.read_log().matches("\npr\ncreate\n").count()
+            }
+
+            /// An approved delivery that restacks replays the approved commits
+            /// and publishes the rewritten tip. The approval still names the
+            /// commit it was given for, and that is the commit the delivery was
+            /// admitted against, so the re-check before `gh pr create` holds and
+            /// exactly one pull request is opened.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approved_delivery_that_restacks_opens_exactly_one_pull_request() {
+                let _guard = PATH_LOCK.lock().await;
+                let (landed, mock, state, _tmp, task_id) = approved_restackable_task().await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(CHILD_PR_URL), "{}", mock.read_log());
+                assert_eq!(creates(&mock), 1, "{}", mock.read_log());
+                let tip = local_tip(&landed);
+                assert_ne!(tip, landed.child_tip, "the branch was restacked");
+                assert_eq!(
+                    landed.repo.remote_has_branch("task-branch").as_deref(),
+                    Some(tip.as_str())
+                );
+                let task = state.task.tasks.read().await[&task_id].clone();
+                assert_eq!(task.pr_url.as_deref(), Some(CHILD_PR_URL));
+                assert_eq!(task.pr_create_unconfirmed, None);
+            }
+
+            /// The same delivery, with the approval withdrawn after the restack
+            /// and the push: no pull request is opened, the pushed rewritten tip
+            /// stays, and nothing is left recorded as sent.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approval_withdrawn_after_the_restack_and_push_opens_no_pull_request() {
+                let _guard = PATH_LOCK.lock().await;
+                let (landed, mock, state, _tmp, task_id) = approved_restackable_task().await;
+                let tasks = state.task.tasks.clone();
+                crate::commands::pr::after_record_hook::arm(
+                    landed.repo.checkout.to_str().unwrap(),
+                    move || {
+                        tasks
+                            .try_write()
+                            .expect("no reader holds the task map in the window")
+                            .get_mut(&task_id)
+                            .expect("the task")
+                            .human_review
+                            .withdraw_approval();
+                    },
+                );
+
+                let error = create_pr_inner(&state, &task_id.to_string())
+                    .await
+                    .expect_err("the approval is gone");
+
+                assert!(error.contains("no longer in Human Review"), "{error}");
+                assert_eq!(creates(&mock), 0, "{}", mock.read_log());
+                let tip = local_tip(&landed);
+                assert_ne!(tip, landed.child_tip, "the branch was restacked");
+                assert_eq!(
+                    landed.repo.remote_has_branch("task-branch").as_deref(),
+                    Some(tip.as_str()),
+                    "the verified push stands"
+                );
+                let task = state.task.tasks.read().await[&task_id].clone();
+                assert_eq!((task.pr_url, task.pr_create_unconfirmed), (None, None));
+            }
+
+            /// A different approved commit in the window is still refused after a
+            /// restack: the delivery was admitted against the commit that was
+            /// approved, not against whatever is approved now.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn another_approved_commit_after_the_restack_opens_no_pull_request() {
+                let _guard = PATH_LOCK.lock().await;
+                let (landed, mock, state, _tmp, task_id) = approved_restackable_task().await;
+                let other = remote_main(&landed);
+                let tasks = state.task.tasks.clone();
+                crate::commands::pr::after_record_hook::arm(
+                    landed.repo.checkout.to_str().unwrap(),
+                    move || {
+                        let mut tasks = tasks
+                            .try_write()
+                            .expect("no reader holds the task map in the window");
+                        let review = &mut tasks.get_mut(&task_id).expect("the task").human_review;
+                        review.withdraw_approval();
+                        review.approve(Some(other), chrono::Utc::now());
+                    },
+                );
+
+                let error = create_pr_inner(&state, &task_id.to_string())
+                    .await
+                    .expect_err("the approval covers another commit");
+
+                assert!(error.contains("different commit"), "{error}");
+                assert_eq!(creates(&mock), 0, "{}", mock.read_log());
             }
 
             /// With a merge commit the parent's own commits are on `main`
