@@ -4005,6 +4005,10 @@ async fn create_pr_reserved(
     // own worktree and refuses when there is none; see
     // `restack_onto_landed_parent`.
     let working_dir = resolve_repository_dir(state, task_uuid).await?;
+    // Before anything is looked up, pushed or opened: the pull request's
+    // identity is only the branch's name in the repository `gh` works in, so
+    // it must be the repository the branch is pushed to.
+    refuse_if_pushes_and_pull_requests_use_different_repositories(&working_dir).await?;
 
     let (pr_title, pr_body, task_branch_name, branch_origin, base_commit, has_dependencies) = {
         let tasks = state.task.tasks.read().await;
@@ -5582,6 +5586,14 @@ const PR_LOOKUP_LIMIT: usize = 30;
 /// PR_LOOKUP_LIMIT` listed, newest first, the newest one from this
 /// repository; `None` when there is none.
 ///
+/// SlashIt opens a pull request with `gh pr create --head <branch>`, and `gh`
+/// reads a head with no `<owner>:` as a branch of the base repository itself,
+/// so the pull request SlashIt opens is never from a fork: the `isCrossRepository`
+/// ones are somebody else's, and passing them over does not hide the task's
+/// own. A fork-origin checkout, whose pushes go to a repository other than the
+/// one `gh` opens pull requests in, is refused instead of looked up
+/// ([`refuse_if_pushes_and_pull_requests_use_different_repositories`]).
+///
 /// `gh pr list --head` matches the head branch by name only (it takes no
 /// `<owner>:<branch>`), so pull requests from forks whose branch happens to
 /// have the same name are listed too. Task branch names are public and
@@ -5732,6 +5744,97 @@ async fn pushed_branch_head(working_dir: &str, branch: &str) -> Result<Option<St
         let (oid, name) = line.split_once(char::is_whitespace)?;
         (name.trim() == refname).then(|| oid.to_string())
     }))
+}
+
+/// The `(owner, repository)` a git remote URL names on a GitHub-style host,
+/// lower-cased, or `None` for anything else (a local path, a URL with a
+/// different shape). Host-agnostic and alias-tolerant, as a remote on a GitHub
+/// Enterprise host or behind an ssh host alias is still `owner/repository`.
+///
+/// Understands `scheme://[user@]host[:port]/owner/repo[.git]` and the
+/// scp-like `[user@]host:owner/repo[.git]`.
+fn github_repository_of_remote_url(url: &str) -> Option<(String, String)> {
+    let url = url.trim();
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?.1,
+        None => {
+            let (host, path) = url.split_once(':')?;
+            if host.is_empty() || host.contains('/') || path.starts_with('/') {
+                return None;
+            }
+            path
+        }
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    match path.split('/').collect::<Vec<_>>().as_slice() {
+        [owner, repo] if !owner.is_empty() && !repo.is_empty() => {
+            Some((owner.to_ascii_lowercase(), repo.to_ascii_lowercase()))
+        }
+        _ => None,
+    }
+}
+
+/// Refuse when the repository `origin`'s pushes go to is not the one `gh` opens
+/// and looks up pull requests in.
+///
+/// SlashIt names a pull request by its branch alone (`gh pr create --head
+/// <branch>`, `gh pr list --head <branch>`), and `gh` reads that as a branch of
+/// its own repository. With a fork as `origin` the branch is pushed to the fork
+/// while `gh` works in the upstream repository, so the pull request SlashIt
+/// would open or link is from whatever same-named branch the upstream has, if
+/// any, and not from the one it pushed. Its identity cannot be verified, so
+/// nothing is pushed, looked up or opened.
+///
+/// Refuses only on evidence of a difference. When either side cannot be read or
+/// is not a GitHub-style `owner/repository` (a local path, a `gh` that does not
+/// answer), nothing is claimed and the delivery goes on: its own lookups fail
+/// the same way when `gh` cannot be asked.
+async fn refuse_if_pushes_and_pull_requests_use_different_repositories(
+    working_dir: &str,
+) -> Result<(), String> {
+    let Ok(git_dir) = jj_git_dir_arg(working_dir).await else {
+        return Ok(());
+    };
+    let mut get_url: Vec<&str> = git_dir.iter().map(String::as_str).collect();
+    get_url.extend(["remote", "get-url", "--push", "origin"]);
+    let Ok(push_url) = run_cmd("git", &get_url, working_dir).await else {
+        return Ok(());
+    };
+    let Some(pushed_to) = github_repository_of_remote_url(&push_url) else {
+        return Ok(());
+    };
+    let Ok(viewed) = run_cmd(
+        "gh",
+        &["repo", "view", "--json", "nameWithOwner"],
+        working_dir,
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    let Some(opened_in) = serde_json::from_str::<serde_json::Value>(&viewed)
+        .ok()
+        .and_then(|json| {
+            json.get("nameWithOwner")
+                .and_then(|v| v.as_str())
+                .and_then(|name| name.split_once('/'))
+                .map(|(owner, repo)| (owner.to_ascii_lowercase(), repo.to_ascii_lowercase()))
+        })
+    else {
+        return Ok(());
+    };
+    if pushed_to == opened_in {
+        return Ok(());
+    }
+    Err(format!(
+        "SlashIt pushes this task's branch to {}/{}, but gh opens pull requests in {}/{}. A pull \
+         request is named by its branch in the repository gh works in, so SlashIt cannot tell \
+         that one it opens or finds is from the branch it pushed. Nothing was pushed or opened. \
+         Make origin and gh's default repository the same repository (git remote set-url, or gh \
+         repo set-default), then try again.",
+        pushed_to.0, pushed_to.1, opened_in.0, opened_in.1
+    ))
 }
 
 /// Runs `gh pr list` for the pull requests whose head is `branch`, in any
@@ -19447,6 +19550,9 @@ mod tests {
             use crate::test_helpers::FakeProgram;
 
             const PR_URL: &str = "https://github.com/testorg/testrepo/pull/41";
+            /// A pull request from somebody's fork, whose branch has the task
+            /// branch's name.
+            const FORK_PR_URL: &str = "https://github.com/testorg/testrepo/pull/99";
             const BRANCH: &str = "task-branch";
 
             /// A fake `gh` that keeps the pull request it opened in a file.
@@ -19459,6 +19565,10 @@ mod tests {
             ///   open nothing; `moved` opens it after
             ///   moving the remote branch to the commit named in `moved_to`;
             ///   `garbled` opens it and answers with text that is not its URL;
+            /// - `fork_pr_listed`: `pr list` also lists a pull request from a
+            ///   fork's same-named branch, newer than any other;
+            /// - `repo_view` (holding JSON): the answer to `repo view --json
+            ///   nameWithOwner`, otherwise an empty object;
             /// - `list_hides_created`: `pr list` answers that there is no pull
             ///   request even once one exists, as a listing that has not caught
             ///   up with a pull request just opened does;
@@ -19481,19 +19591,25 @@ mod tests {
                     let state = tempfile::tempdir().expect("tempdir");
                     let s = state.path().display().to_string();
                     let remote = remote.display().to_string();
-                    let listed = format!(
-                        r#"[{{"url":"{PR_URL}","headRefName":"{BRANCH}","isCrossRepository":false}}]"#
+                    let own = format!(
+                        r#"{{"url":"{PR_URL}","headRefName":"{BRANCH}","isCrossRepository":false}}"#
+                    );
+                    let fork = format!(
+                        r#"{{"url":"{FORK_PR_URL}","headRefName":"{BRANCH}","isCrossRepository":true}}"#
                     );
                     let body = format!(
                         r#"has_branch() {{ git --git-dir={remote} rev-parse -q --verify refs/heads/{BRANCH} >/dev/null 2>&1; }}
 case "$*" in
   'repo view --json defaultBranchRef') printf '%s' '{{"defaultBranchRef":{{"name":"main"}}}}' ;;
+  'repo view --json nameWithOwner') if [ -f {s}/repo_view ]; then cat {s}/repo_view; else printf '{{}}'; fi ;;
   *'pr list'*)
     if [ -f {s}/list_fails ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
     if [ -f {s}/list_fails_after_push ] && has_branch; then echo 'error connecting to api.github.com' >&2; exit 1; fi
     if [ -f {s}/list_fails_after_create ] && [ -f {s}/created ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
     if [ -f {s}/block_after_push ] && has_branch; then rm -rf "$(cat {s}/block_after_push)"; printf 'not a directory' > "$(cat {s}/block_after_push)"; fi
-    if [ -f {s}/created ] && [ ! -f {s}/list_hides_created ]; then printf '%s' '{listed}'; else printf '[]'; fi ;;
+    if [ -f {s}/created ] && [ ! -f {s}/list_hides_created ]; then
+      if [ -f {s}/fork_pr_listed ]; then printf '%s' '[{fork},{own}]'; else printf '%s' '[{own}]'; fi
+    elif [ -f {s}/fork_pr_listed ]; then printf '%s' '[{fork}]'; else printf '[]'; fi ;;
   *'pr create'*)
     case "$(cat {s}/create_mode 2>/dev/null || echo ok)" in
       ok) touch {s}/created; printf '%s' '{PR_URL}' ;;
@@ -20584,6 +20700,155 @@ esac"#
                     ("gh failed: ", Unknown),
                 ] {
                     assert_eq!(classify_pr_create_failure(error), expected, "{error}");
+                }
+            }
+
+            /// `git` for the future it is scoped to, in a checkout whose origin
+            /// is on GitHub as `url`: it says so when asked where pushes go, and
+            /// sends the pushes and reads that name `origin` or `url` to the
+            /// fixture's real remote.
+            fn git_with_origin_on_github(
+                dir: &Path,
+                real: &Path,
+                remote: &Path,
+                url: &str,
+            ) -> PathBuf {
+                let (real, remote) = (real.display(), remote.display());
+                let script = format!(
+                    r#"#!/bin/sh
+sub=''
+for a in "$@"; do case "$a" in --git-dir=*) ;; *) sub="$a"; break ;; esac; done
+case "$sub" in
+  remote) case "$*" in *'get-url --push origin'*) printf '%s\n' '{url}'; exit 0 ;; esac ;;
+  push|ls-remote)
+    for a in "$@"; do
+      case "$a" in origin|'{url}') a='{remote}' ;; esac
+      set -- "$@" "$a"; shift
+    done ;;
+esac
+exec {real} "$@"
+"#
+                );
+                let path = dir.join("git");
+                write_executable(&path, &script);
+                path
+            }
+
+            /// A fork as `origin` while `gh` works in the upstream repository:
+            /// the branch would be pushed to the fork and the pull request named
+            /// by the same branch in the upstream. Its identity cannot be
+            /// verified, so nothing is looked up, pushed or opened.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fork_as_origin_is_refused_before_anything_is_pushed_or_opened() {
+                let (repo, _sha, gh, state, _tmp, task_id, bin) = setup().await;
+                gh.set("repo_view", r#"{"nameWithOwner":"testorg/testrepo"}"#);
+                let git = git_with_origin_on_github(
+                    bin.path(),
+                    &real_git(&gh),
+                    &repo.remote,
+                    "git@github.com:somebody/testrepo.git",
+                );
+
+                let error = create(&state, task_id, Some(git))
+                    .await
+                    .expect_err("the pull request's repository is not the pushed one");
+
+                assert!(error.contains("somebody/testrepo"), "{error}");
+                assert!(error.contains("testorg/testrepo"), "{error}");
+                assert!(error.contains("Nothing was pushed or opened"), "{error}");
+                assert_eq!(repo.remote_has_branch(BRANCH), None);
+                let invoked = gh.fake.invocations();
+                assert!(!invoked.contains("pr list"), "{invoked}");
+                assert_eq!(gh.creates(), 0, "{invoked}");
+                assert_nothing_recorded(&state, task_id).await;
+            }
+
+            /// The same repository under another spelling (an ssh alias form, a
+            /// different case) is the same repository: the delivery goes on, and
+            /// the pull request is asked for by its branch alone, which `gh`
+            /// reads as a branch of its own repository.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_same_repository_under_another_spelling_is_delivered() {
+                let (repo, _sha, gh, state, _tmp, task_id, bin) = setup().await;
+                gh.set("repo_view", r#"{"nameWithOwner":"testorg/testrepo"}"#);
+                let git = git_with_origin_on_github(
+                    bin.path(),
+                    &real_git(&gh),
+                    &repo.remote,
+                    "git@github-work:TestOrg/TestRepo.git",
+                );
+
+                let url = create(&state, task_id, Some(git))
+                    .await
+                    .expect("origin and gh use the same repository");
+
+                assert_eq!(url, PR_URL);
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                let invoked = gh.fake.invocations();
+                let create_call = invoked
+                    .lines()
+                    .find(|l| l.starts_with("gh pr create"))
+                    .expect("gh pr create ran");
+                assert!(
+                    create_call.contains(&format!("--head {BRANCH}")),
+                    "the head names the branch alone: {create_call}"
+                );
+                assert_delivered(&state, task_id).await;
+            }
+
+            /// A pull request from somebody's fork, listed for the same branch
+            /// name, is not the task's: it is not linked, a pull request is
+            /// opened, and the one linked is the task's own.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_same_named_fork_pull_request_is_not_linked_as_the_tasks_own() {
+                let (_repo, _sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                gh.set("fork_pr_listed", "");
+
+                let url = create(&state, task_id, None)
+                    .await
+                    .expect("the task's own pull request is opened");
+
+                assert_eq!(url, PR_URL);
+                assert_ne!(url, FORK_PR_URL);
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_delivered(&state, task_id).await;
+
+                // Asked again, the newest entry listed is the fork's, and the
+                // task's own is the one found.
+                assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+            }
+
+            /// Remote URLs are read for the repository they name and nothing
+            /// else.
+            #[test]
+            fn a_remote_url_names_its_repository_only_when_it_has_that_shape() {
+                for (url, expected) in [
+                    ("https://github.com/Owner/Repo.git", Some(("owner", "repo"))),
+                    ("https://github.com/owner/repo", Some(("owner", "repo"))),
+                    (
+                        "https://user@github.example.com:8443/owner/repo.git/",
+                        Some(("owner", "repo")),
+                    ),
+                    (
+                        "ssh://git@github.com/owner/repo.git",
+                        Some(("owner", "repo")),
+                    ),
+                    ("git@github.com:owner/repo.git", Some(("owner", "repo"))),
+                    ("github-work:owner/repo", Some(("owner", "repo"))),
+                    ("/srv/git/owner/repo.git", None),
+                    ("../repo.git", None),
+                    ("C:/work/repo.git", None),
+                    ("https://github.com/owner", None),
+                    ("https://github.com/org/team/repo.git", None),
+                    ("file:///srv/git/repo.git", None),
+                    ("", None),
+                ] {
+                    assert_eq!(
+                        github_repository_of_remote_url(url),
+                        expected.map(|(o, r)| (o.to_string(), r.to_string())),
+                        "{url}"
+                    );
                 }
             }
 
