@@ -168,22 +168,27 @@ pub fn PublishToPrPanel(
         notice.set(None);
         spawn_local(async move {
             let requested = commit.clone();
+            let requested_branch = branch.clone();
             let requested_pr = pr_url.clone();
             let answer = publish_task_to_pr(task_id.to_string(), branch, commit, pr_url).await;
             let _ = busy.try_set(false);
             match answer {
-                Ok(record) if answers_request(&record, &requested, &requested_pr) => {
+                Ok(record)
+                    if answers_request(&record, &requested, &requested_branch, &requested_pr) =>
+                {
                     let _ = answered.try_set(Some(record));
                     let _ = confirmation.try_set(None);
                 }
                 Ok(record) => {
-                    // The backend answered for a different commit, for example
-                    // an earlier publication it settled first. Show nothing as
-                    // published for the commit that was asked for.
+                    // The backend answered for a different commit or branch, for
+                    // example an earlier publication it settled first. Show
+                    // nothing as published for the commit that was asked for.
                     let _ = error.try_set(Some(format!(
-                        "The answer was for {}, not {}. Nothing was published for {}. Review the branch and try again.",
+                        "The answer was for {} on {}, not {} on {}. Nothing was published for {}. Review the branch and try again.",
                         short(&record.commit),
+                        record.branch,
                         short(&requested),
+                        requested_branch,
                         short(&requested),
                     )));
                 }

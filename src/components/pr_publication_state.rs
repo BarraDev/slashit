@@ -38,15 +38,19 @@ pub fn confirmation_still_matches(shown: &PublishConfirmation, live: LiveTarget<
         && live.pr_url == Some(shown.pr_url.as_str())
 }
 
-/// Whether a publication answer is for the commit and pull request the request
-/// named. A reconciled earlier record is an answer for another commit or another
-/// pull request, and must not be shown or taken as success for the requested one.
+/// Whether a publication answer is for the commit, branch and pull request the
+/// request named. A reconciled earlier record is an answer for another commit,
+/// branch or pull request, and must not be shown or taken as success for the
+/// requested one.
 pub fn answers_request(
     answer: &PrPublication,
     requested_commit: &str,
+    requested_branch: &str,
     requested_pr_url: &str,
 ) -> bool {
-    answer.commit == requested_commit && answer.pr_url == requested_pr_url
+    answer.commit == requested_commit
+        && answer.branch == requested_branch
+        && answer.pr_url == requested_pr_url
 }
 
 /// The record the panel shows: the later of the task's record and the panel's
@@ -162,14 +166,25 @@ mod tests {
     #[test]
     fn an_answer_counts_only_for_the_commit_that_was_requested() {
         let reconciled_earlier = record(TIP, 10);
-        assert!(answers_request(&reconciled_earlier, TIP, PR));
-        assert!(!answers_request(&reconciled_earlier, NEXT, PR));
+        assert!(answers_request(&reconciled_earlier, TIP, BRANCH, PR));
+        assert!(!answers_request(&reconciled_earlier, NEXT, BRANCH, PR));
         // The same commit on another pull request is a different request.
         assert!(!answers_request(
             &reconciled_earlier,
             TIP,
+            BRANCH,
             "https://github.com/BarraDev/slashit/pull/10"
         ));
+    }
+
+    #[test]
+    fn an_answer_for_the_same_commit_and_pull_request_on_another_branch_is_not_the_answer() {
+        let other_branch = PrPublication {
+            branch: "other-branch".into(),
+            ..record(TIP, 10)
+        };
+        assert!(!answers_request(&other_branch, TIP, BRANCH, PR));
+        assert!(answers_request(&other_branch, TIP, "other-branch", PR));
     }
 
     #[test]

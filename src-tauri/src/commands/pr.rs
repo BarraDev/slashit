@@ -2093,12 +2093,7 @@ async fn settle_delivery(
     plan: &mut PrReviewPlan,
 ) -> SettledDelivery {
     let branch = task.branch_name.as_deref();
-    let candidates: Vec<usize> = plan.items.iter().enumerate()
-        .filter(|(_, i)| {
-            i.approved && matches!(i.decision, PrReviewDecision::Fix) && i.fix_done
-        })
-        .map(|(idx, _)| idx)
-        .collect();
+    let candidates = delivery_candidates(plan);
     let with_commit = candidates.iter()
         .filter(|&&idx| plan.items[idx].fix_commit.is_some())
         .count();
@@ -2147,7 +2142,38 @@ async fn settle_delivery(
     }
     let remote = crate::worktree::delivery::RemoteBranch::refresh(working_dir, Some(branch)).await;
     settled.unavailable = remote.unavailable().map(str::to_string);
-    for &idx in &candidates {
+    settled.indices = delivered_against_remote(working_dir, branch, plan, &remote, &candidates).await;
+    settled.owed_delivery = owing(plan, &settled.indices);
+    settled
+}
+
+/// The approved Fix items a delivery check may settle: made (`fix_done`) and
+/// approved. Shared by [`settle_delivery`] and the settling of a verified
+/// publication, so both ask the same question of the same items.
+fn delivery_candidates(plan: &PrReviewPlan) -> Vec<usize> {
+    plan.items.iter().enumerate()
+        .filter(|(_, i)| {
+            i.approved && matches!(i.decision, PrReviewDecision::Fix) && i.fix_done
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// The per-item rule of [`settle_delivery`], against a remote branch already
+/// read: which of `candidates` have their commit in `remote` with their
+/// recorded effect still in its tip. The plan's `fix_uncommitted` (and, for a
+/// fix that can never be proven, `fix_commit`/`fix_effect`) is updated as
+/// [`settle_delivery`] documents. Reads Git only; the caller decides whether
+/// the remote branch speaks for the pull request.
+async fn delivered_against_remote(
+    working_dir: &str,
+    branch: &str,
+    plan: &mut PrReviewPlan,
+    remote: &crate::worktree::delivery::RemoteBranch,
+    candidates: &[usize],
+) -> std::collections::HashSet<usize> {
+    let mut delivered = std::collections::HashSet::new();
+    for &idx in candidates {
         let Some(commit) = plan.items[idx].fix_commit.clone() else { continue };
         let on_remote = remote.contains(&commit).await;
         // Holding the commit is not enough: a later commit on the branch
@@ -2164,7 +2190,7 @@ async fn settle_delivery(
         };
         if on_remote && verdict == Survival::Present {
             plan.items[idx].fix_uncommitted = false;
-            settled.indices.insert(idx);
+            delivered.insert(idx);
             continue;
         }
         plan.items[idx].fix_uncommitted = true;
@@ -2189,8 +2215,7 @@ async fn settle_delivery(
             plan.items[idx].fix_effect = None;
         }
     }
-    settled.owed_delivery = owing(plan, &settled.indices);
-    settled
+    delivered
 }
 
 /// Result of `sync_pr_review_replies` — counts the three operations Sync can

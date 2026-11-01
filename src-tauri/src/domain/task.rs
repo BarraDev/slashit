@@ -1596,9 +1596,9 @@ pub struct PrReviewItem {
     pub fix_done: bool,
     /// Bookkeeping for the UI and for what an apply still owes, never
     /// evidence: true from the moment this item's fix agent succeeds until an
-    /// apply or a sync has seen the fix delivered (see
-    /// [`PrReviewItem::fix_commit`] and [`PrReviewItem::fix_effect`]), and set
-    /// again if it is no longer. Clearing it proves nothing, and a plan
+    /// apply, a sync or a verified Publish to PR has seen the fix delivered
+    /// (see [`PrReviewItem::fix_commit`] and [`PrReviewItem::fix_effect`]), and
+    /// set again by an apply or a sync if it is no longer. Clearing it proves nothing, and a plan
     /// persisted before commits were recorded has it cleared without any proof
     /// (#96). Whether a reply may say the fix is done is decided only by
     /// delivery as the remote shows it at that moment.
