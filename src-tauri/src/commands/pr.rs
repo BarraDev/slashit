@@ -3610,6 +3610,64 @@ fn refuse_unless_still_approved_now(state: &crate::AppState, task_id: Uuid) -> R
     )
 }
 
+/// The approval rules of the push gate, read again for the step that follows
+/// the push: asking GitHub to open the pull request.
+///
+/// An approved delivery is refused by the Human Review rule once the task is in
+/// Human Review without an approval. When it published a bound commit (`bound`
+/// is that commit), the task's current approval must still be one that covers
+/// exactly it; an approval that is gone is refused on that ground.
+/// Neither the push nor the lookups before this are an approval of this step.
+/// When the task map is locked at that instant the answer is unknown, so the
+/// step is refused. Nothing has been requested of GitHub when this refuses,
+/// which is what the message says.
+fn refuse_before_pr_create(
+    state: &crate::AppState,
+    task_id: Uuid,
+    approved_delivery: bool,
+    bound: Option<&str>,
+) -> Result<(), String> {
+    let tasks = state.task.tasks.try_read().map_err(|_| {
+        "The task's approval could not be read just before opening the pull request, so no pull \
+         request was requested. Try again."
+            .to_string()
+    })?;
+    let task = tasks.get(&task_id);
+    let approved = task.is_some_and(|t| t.human_review.is_approved());
+    // The rule's own refusal says that nothing was pushed, which is no longer
+    // true here, so it is worded for this step.
+    if bound.is_none()
+        && approved_delivery
+        && task
+            .and_then(Task::unapproved_human_review_delivery_refusal)
+            .is_some()
+    {
+        return Err(
+            "This task is in Human Review and its changes have not been approved, so no pull \
+             request was requested. The pushed commit stays on the remote branch. Approve the \
+             changes in the Human Review panel first, then create the pull request from there."
+                .to_string(),
+        );
+    }
+    let Some(bound) = bound else {
+        return Ok(());
+    };
+    let covers_bound = task.is_some_and(|t| t.human_review.approved_tip() == Some(bound));
+    if approved && covers_bound {
+        return Ok(());
+    }
+    Err(if approved {
+        "The task's approval now covers a different commit than the one that was pushed, so no \
+         pull request was requested. The pushed commit stays on the remote branch. Review the \
+         branch as it is and approve it again to continue."
+    } else {
+        "The task is no longer in Human Review with its changes approved, so no pull request was \
+         requested. The pushed commit stays on the remote branch. Approve the task again to \
+         continue."
+    }
+    .to_string())
+}
+
 /// The Human Review rule of [`Task::unapproved_human_review_delivery_refusal`],
 /// read for the push gate. It needs no bound commit, so it also covers an
 /// approved delivery whose approval went away before the commit was bound. A
@@ -4138,12 +4196,19 @@ async fn create_pr_reserved(
     record_pr_create_started(state, task_uuid, &attempt).await?;
     #[cfg(test)]
     after_record_hook::run(&working_dir);
-    // The record is a disk write, and a cancellation can land while it is
-    // made. Checked again so that `gh pr create` is not started over it. The
-    // request was not sent, so the record, which says one may have been, is
-    // taken back with the refusal.
-    if let Err(refused) =
-        refuse_if_pr_operation_cancelled(&reservation, "opening the pull request")
+    // The record is a disk write, and an approval can be withdrawn or a
+    // cancellation can land while it is made. The push that came before is not
+    // a renewed approval of this step, so both are read again here, with no
+    // await between this read and the spawn of `gh pr create`. The request was
+    // not sent, so the record, which says one may have been, is taken back
+    // with the refusal; the push stands, as it was verified.
+    if let Err(refused) = refuse_before_pr_create(
+        state,
+        task_uuid,
+        approved_delivery,
+        approval_required.then_some(attempt.commit.as_str()),
+    )
+    .and_then(|()| refuse_if_pr_operation_cancelled(&reservation, "opening the pull request"))
     {
         return Err(retract_pr_create_attempt(state, task_uuid, &attempt, refused).await);
     }
@@ -20058,6 +20123,130 @@ esac"#
                 assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
                 assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
                 assert_delivered(&state, task_id).await;
+            }
+
+            /// The task is in Human Review with its changes approved, as
+            /// `commit`, and the delivery has not started.
+            async fn approve(state: &crate::AppState, task_id: Uuid, commit: &str) {
+                crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &|staged| {
+                    let task = staged.get_mut(&task_id).expect("the seeded task");
+                    task.status = TaskStatus::HumanReview;
+                    task.human_review
+                        .approve(Some(commit.to_string()), chrono::Utc::now());
+                })
+                .await
+                .expect("the approval is recorded");
+            }
+
+            /// Runs `change` on the task in the window between the record of the
+            /// request to open the pull request and the start of `gh pr create`.
+            fn in_the_window_before_create(
+                state: &crate::AppState,
+                repo: &RepoFixture,
+                task_id: Uuid,
+                change: impl FnOnce(&mut Task) + Send + 'static,
+            ) {
+                let tasks = state.task.tasks.clone();
+                let working_dir = repo.checkout.to_str().unwrap().to_string();
+                crate::commands::pr::after_record_hook::arm(&working_dir, move || {
+                    change(
+                        tasks
+                            .try_write()
+                            .expect("no reader holds the task map in the window")
+                            .get_mut(&task_id)
+                            .expect("the task"),
+                    );
+                });
+            }
+
+            /// An approval that is withdrawn after the push and the record of
+            /// the request, and before `gh pr create`, stops the delivery there:
+            /// the earlier successful push is not renewed approval. The push
+            /// stands, nothing is requested of GitHub, the request that was
+            /// never sent is taken back, and approving again delivers once.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approval_withdrawn_after_the_push_opens_no_pull_request() {
+                let (repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                approve(&state, task_id, &sha).await;
+                in_the_window_before_create(&state, &repo, task_id, |task| {
+                    task.human_review.withdraw_approval();
+                });
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the approval is gone");
+
+                assert!(error.contains("no longer in Human Review"), "{error}");
+                assert!(error.contains("no pull request was requested"), "{error}");
+                assert_eq!(gh.creates(), 0, "{}", gh.fake.invocations());
+                assert_eq!(
+                    repo.remote_has_branch(BRANCH).as_deref(),
+                    Some(sha.as_str()),
+                    "the push that was already verified stands"
+                );
+                for task in [
+                    in_memory(&state, task_id).await,
+                    on_disk(&state, task_id).await,
+                ] {
+                    assert_eq!(task.pr_url, None);
+                    assert_eq!(task.status, TaskStatus::HumanReview);
+                    assert_eq!(task.pr_create_unconfirmed, None, "no request was sent");
+                }
+
+                approve(&state, task_id, &sha).await;
+                assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_eq!(on_disk(&state, task_id).await.status, TaskStatus::PrCreated);
+            }
+
+            /// An approval of a different commit is not the approval of the one
+            /// that was pushed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approval_of_another_commit_in_the_window_opens_no_pull_request() {
+                let (repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                let elsewhere = git(&repo.checkout, &["rev-parse", "main"]);
+                approve(&state, task_id, &sha).await;
+                in_the_window_before_create(&state, &repo, task_id, move |task| {
+                    task.human_review.withdraw_approval();
+                    task.human_review
+                        .approve(Some(elsewhere), chrono::Utc::now());
+                });
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the approval no longer covers the pushed commit");
+
+                assert!(error.contains("different commit"), "{error}");
+                assert_eq!(gh.creates(), 0, "{}", gh.fake.invocations());
+                assert_eq!(
+                    repo.remote_has_branch(BRANCH).as_deref(),
+                    Some(sha.as_str())
+                );
+                assert_eq!(on_disk(&state, task_id).await.pr_create_unconfirmed, None);
+            }
+
+            /// The Human Review rule applies at that point too, for a delivery
+            /// that began with no approval to bind: a task that has moved into
+            /// Human Review without one in the window is not delivered.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_task_that_entered_human_review_in_the_window_opens_no_pull_request() {
+                let (repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                in_the_window_before_create(&state, &repo, task_id, |task| {
+                    task.status = TaskStatus::HumanReview;
+                });
+
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the task awaits a decision");
+
+                assert!(error.contains("have not been approved"), "{error}");
+                assert!(error.contains("no pull request was requested"), "{error}");
+                assert_eq!(gh.creates(), 0, "{}", gh.fake.invocations());
+                assert_eq!(
+                    repo.remote_has_branch(BRANCH).as_deref(),
+                    Some(sha.as_str())
+                );
+                assert_eq!(on_disk(&state, task_id).await.pr_create_unconfirmed, None);
             }
 
             /// The request is written before GitHub is asked to open anything. A
