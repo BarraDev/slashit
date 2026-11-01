@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::commands::gui_admission::GuiMutation;
 use crate::commands::pr::{
-    own_pr_url_for_branch, pr_url_for_task, push_branch_pinned, refuse_if_pr_operation_cancelled,
+    own_pr_url_for_branch, pr_url_for_task, push_branch_pinned_gated, refuse_if_pr_operation_cancelled,
     reserve_task_for_pr_side_effect, resolve_repository_dir, run_cmd, task_branch_tip,
 };
 use crate::domain::publication::{
@@ -391,7 +391,19 @@ async fn publish(
     // The owner may have been ended while the pending record was written and
     // GitHub was read again. Nothing has been pushed yet, so that is recorded
     // as a refusal rather than pushed over the move.
-    if refuse_if_pr_operation_cancelled(&lease, "pushing the branch").is_err() {
+    // Checked again by the push itself, after its last preparation step and
+    // immediately before git is spawned: a cancellation that lands while the
+    // branch is being read still stops the push here, and is recorded as a
+    // refusal rather than reported as a push that failed.
+    let stopped_before_push = AtomicBool::new(false);
+    let gate = || {
+        refuse_if_pr_operation_cancelled(&lease, "pushing the branch")
+            .inspect_err(|_| stopped_before_push.store(true, Ordering::SeqCst))
+    };
+    let push = push_branch_pinned_gated(&working_dir, &branch, Some(commit), &gate)
+        .await
+        .map(|_| ());
+    if stopped_before_push.load(Ordering::SeqCst) {
         // The reason is about this request, not the Task: an owner can be ended
         // by a move that was then refused, or by a stop that timed out.
         record.state = PublicationState::Refused {
@@ -403,8 +415,6 @@ async fn publish(
         write_publication(state, task_id, Some(&pending), &record).await.map_err(record_write_failure)?;
         return Ok(record);
     }
-
-    let push = push_branch_pinned(&working_dir, &branch, Some(commit)).await.map(|_| ());
     let remote_after = remote_head_of(&RemoteBranch::refresh(&working_dir, Some(branch.as_str())).await);
     let settled = classify_outcome(commit, remote_head.as_deref(), &remote_after, &push);
 

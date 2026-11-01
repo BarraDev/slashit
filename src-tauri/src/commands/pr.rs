@@ -3666,10 +3666,14 @@ async fn create_pr_reserved(
         );
     }
 
-    refuse_if_pr_operation_cancelled(&reservation, "pushing the branch")?;
-    let branch = push_branch_pinned(&working_dir, &task_branch_name, publish_tip.as_deref())
-        .await
-        .map_err(friendly_pr_error)?;
+    let branch = push_branch_pinned_gated(
+        &working_dir,
+        &task_branch_name,
+        publish_tip.as_deref(),
+        &|| refuse_if_pr_operation_cancelled(&reservation, "pushing the branch"),
+    )
+    .await
+    .map_err(friendly_pr_error)?;
 
     if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, &branch).await? {
         // Classified rather than flattened. A cleanup this refused is a task that
@@ -5735,6 +5739,24 @@ async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> 
 /// branch that is not an ancestor of the pinned commit is refused, never
 /// forced.
 async fn push_branch_pinned(working_dir: &str, branch: &str, pinned: Option<&str>) -> Result<String, String> {
+    push_branch_pinned_gated(working_dir, branch, pinned, &|| Ok(())).await
+}
+
+/// [`push_branch_pinned`] with `before_push` consulted as the last step before
+/// the `git push` process is spawned.
+///
+/// Every preparation await (the `jj git export`, the repository lookup and the
+/// branch read) finishes before the gate runs, so a caller whose cancellation
+/// flag is set at any point before the gate stops the push, and nothing is
+/// sent. A gate refusal returns its error without starting git. Once the gate
+/// has passed, the push has begun: whether it landed is for the caller to
+/// reconcile against the remote, not for this function to guess.
+async fn push_branch_pinned_gated(
+    working_dir: &str,
+    branch: &str,
+    pinned: Option<&str>,
+    before_push: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<String, String> {
     let branch = checked_task_branch(branch)?;
     let mut git_args: Vec<String> = Vec::new();
     if is_jj_repo(working_dir).await {
@@ -5759,6 +5781,7 @@ async fn push_branch_pinned(working_dir: &str, branch: &str, pinned: Option<&str
     };
     let refspec = format!("{source}:refs/heads/{branch}");
     git_args.extend(["push", "-u", "--", "origin", &refspec].map(String::from));
+    before_push()?;
     let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
     run_cmd("git", &git_args, working_dir).await
         .map_err(|e| format!("git push failed: {}", e))?;
@@ -7632,6 +7655,95 @@ mod tests {
             fn worktree_count(&self) -> usize {
                 git(&self.checkout, &["worktree", "list"]).lines().count()
             }
+        }
+
+        /// A refusing gate is consulted once and stops the push before git sends
+        /// anything: the remote branch stays absent.
+        #[tokio::test]
+        async fn a_push_gate_refusal_publishes_nothing() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let repo = RepoFixture::new();
+            let task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+            let consulted = AtomicUsize::new(0);
+            let gate = || -> Result<(), String> {
+                consulted.fetch_add(1, Ordering::SeqCst);
+                Err("the task was changed while this pull request was being prepared".to_string())
+            };
+
+            let err = push_branch_pinned_gated(
+                repo.checkout.to_str().unwrap(),
+                "task-branch",
+                Some(&task_sha),
+                &gate,
+            )
+            .await
+            .expect_err("a refusing gate must stop the push");
+
+            assert!(err.contains("was changed while this pull request was being prepared"), "{err}");
+            assert_eq!(consulted.load(Ordering::SeqCst), 1, "the gate is consulted exactly once");
+            assert!(repo.remote_has_branch("task-branch").is_none(), "nothing reached the remote");
+        }
+
+        /// The gate runs after the branch was read and before git sends anything:
+        /// when it is consulted the remote has not received the branch yet, and a
+        /// passing gate lets the pinned commit through.
+        #[tokio::test]
+        async fn the_push_gate_runs_after_preparation_and_before_git_sends_anything() {
+            let repo = RepoFixture::new();
+            let task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+            let remote_seen_by_gate = std::sync::Mutex::new(None);
+            let gate = || -> Result<(), String> {
+                *remote_seen_by_gate.lock().unwrap() = Some(repo.remote_has_branch("task-branch"));
+                Ok(())
+            };
+
+            push_branch_pinned_gated(
+                repo.checkout.to_str().unwrap(),
+                "task-branch",
+                Some(&task_sha),
+                &gate,
+            )
+            .await
+            .expect("a passing gate lets the push proceed");
+
+            assert_eq!(
+                remote_seen_by_gate.lock().unwrap().take(),
+                Some(None),
+                "the remote had no task branch when the gate ran"
+            );
+            assert_eq!(
+                repo.remote_has_branch("task-branch").as_deref(),
+                Some(task_sha.as_str()),
+                "the remote receives exactly the pinned commit"
+            );
+        }
+
+        /// A branch that is no longer at the pinned commit is refused during
+        /// preparation, so the gate is never consulted.
+        #[tokio::test]
+        async fn a_branch_that_moved_off_the_pinned_commit_never_reaches_the_gate() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let repo = RepoFixture::new();
+            let _task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+            let main_sha = git(&repo.checkout, &["rev-parse", "main"]);
+            let consulted = AtomicUsize::new(0);
+            let gate = || -> Result<(), String> {
+                consulted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            };
+
+            let err = push_branch_pinned_gated(
+                repo.checkout.to_str().unwrap(),
+                "task-branch",
+                Some(&main_sha),
+                &gate,
+            )
+            .await
+            .expect_err("a branch that is not at the pinned commit must not be pushed");
+
+            assert!(err.contains("changed since you approved it"), "{err}");
+            assert_eq!(consulted.load(Ordering::SeqCst), 0, "the gate is never reached");
+            assert!(repo.remote_has_branch("task-branch").is_none(), "nothing reached the remote");
         }
 
         /// Phase 5 (plain git): `push_branch` pushes only the named branch, run
