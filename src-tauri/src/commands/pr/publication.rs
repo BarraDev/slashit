@@ -35,14 +35,24 @@ use crate::domain::publication::{
     Replay, StartObservation,
 };
 use crate::domain::{Task, TaskStatus};
-use crate::lifecycle;
+use crate::lifecycle::{self, RecordWriteError};
 use crate::worktree::delivery::RemoteBranch;
 use crate::worktree::restack;
 
 /// Publish `commit` to the task's pull request. Returns the durable record of
 /// the request, whatever its state: the caller shows `Published`, `Refused`
-/// and `Unknown` alike. `Err` means nothing could be recorded, so nothing was
-/// pushed by this call.
+/// and `Unknown` alike, and only for the commit it asked for.
+///
+/// `Err` means this call returned no record. It covers four cases: the request
+/// could not start (a running task, a pull request that is not this task's, an
+/// unreadable repository); a record write did not land before any push; an
+/// earlier publication of a different commit or pull request was still pending
+/// or unknown; and a push ran but its outcome could not be recorded, in which
+/// case the error text says whether the push succeeded. In the third case that
+/// earlier record is reconciled against the remote and its settled state is
+/// written, so the stored record can change even though the request returns
+/// `Err`. A request pushes at most the commit it was given, and only after its
+/// pending record was written.
 #[tauri::command]
 pub async fn publish_task_to_pr(
     _gui: GuiMutation,
@@ -129,14 +139,16 @@ mod test_seam {
 }
 
 /// Write `record` as the task's publication, but only while the task still
-/// holds `expected`. `Err` when the write did not land, which the caller
-/// must treat as "nothing recorded".
+/// holds `expected` (compare-and-set). `Err` says whether the write landed:
+/// `NotPublished` means the board is unchanged, including when `expected` no
+/// longer matches; `PublishedNotDurable` means the new record is in place but
+/// was not confirmed on disk.
 async fn write_publication(
     state: &crate::AppState,
     task_id: Uuid,
     expected: Option<&PrPublication>,
     record: &PrPublication,
-) -> Result<(), String> {
+) -> Result<(), RecordWriteError> {
     let recorded = AtomicBool::new(false);
     let apply = |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
@@ -146,14 +158,20 @@ async fn write_publication(
             }
         }
     };
-    lifecycle::record(&state.task.tasks, &state.storage, task_id, &apply)
-        .await
-        .map_err(|e| format!("the publication could not be recorded: {e}"))?;
-    if recorded.load(Ordering::SeqCst) {
-        Ok(())
-    } else {
-        Err("the task's publication record changed while this request was running".to_string())
+    let written = lifecycle::record_typed(&state.task.tasks, &state.storage, task_id, &apply).await;
+    // The compare-and-set decides first: when `expected` no longer matches, the
+    // record was not written whatever the save reported.
+    if !recorded.load(Ordering::SeqCst) {
+        return Err(RecordWriteError::NotPublished(
+            "the task's publication record changed while this request was running".to_string(),
+        ));
     }
+    written
+}
+
+/// The message for a publication record that did not land.
+fn record_write_failure(error: RecordWriteError) -> String {
+    format!("the publication could not be recorded: {error}")
 }
 
 /// Refuse while the task is queued, being worked on, in AI review, or while
@@ -232,18 +250,30 @@ async fn publish(
                 Ok(head) => commit_on_remote(&working_dir, &record.commit, head).await,
                 Err(_) => None,
             };
-            return match reconcile(&record, &remote_now, on_remote) {
-                Some(state_now) => {
-                    let updated = PrPublication { state: state_now, updated_at: chrono::Utc::now(), ..record.clone() };
-                    write_publication(state, task_id, Some(&record), &updated).await?;
-                    Ok(updated)
-                }
-                None => Err(
+            let Some(state_now) = reconcile(&record, &remote_now, on_remote) else {
+                return Err(
                     "An earlier publication's outcome is still unknown, because the remote branch could not \
                      confirm it. Nothing new was pushed. Try again once GitHub can be reached."
                         .to_string(),
-                ),
+                );
             };
+            let updated = PrPublication { state: state_now, updated_at: chrono::Utc::now(), ..record.clone() };
+            write_publication(state, task_id, Some(&record), &updated)
+                .await
+                .map_err(record_write_failure)?;
+            if updated.commit != commit || updated.pr_url != pr_url {
+                // The stored record was for another commit or another pull request.
+                // Its outcome is now settled, but this request was not pushed, and
+                // reconciling must not start a push for it.
+                return Err(format!(
+                    "An earlier publication of {} to {} was settled against the remote. The commit you confirmed, \
+                     {}, was not published, and nothing was pushed for it. Confirm the publication again to publish it.",
+                    short_commit(&record.commit),
+                    record.pr_url,
+                    short_commit(commit),
+                ));
+            }
+            return Ok(updated);
         }
     }
 
@@ -277,16 +307,16 @@ async fn publish(
         // Nothing reached the remote. The refusal is recorded so the outcome
         // stays visible, and a new request may start afterwards.
         record.state = PublicationState::Refused { reason };
-        write_publication(state, task_id, existing.as_ref(), &record).await?;
+        write_publication(state, task_id, existing.as_ref(), &record).await.map_err(record_write_failure)?;
         return Ok(record);
     }
 
     // The record is durable before the push. If it cannot be written, nothing
     // is pushed.
     refuse_if_pr_operation_cancelled(&lease, "publishing the commit")?;
-    write_publication(state, task_id, existing.as_ref(), &record).await.map_err(|e| {
-        format!("{e}. Nothing was pushed.")
-    })?;
+    write_publication(state, task_id, existing.as_ref(), &record)
+        .await
+        .map_err(|e| format!("{}. Nothing was pushed.", record_write_failure(e)))?;
 
     let pending = record.clone();
     // The pull request is read again once the record is durable, so that a
@@ -301,13 +331,13 @@ async fn publish(
             record.state = PublicationState::Refused {
                 reason: format!("the pull request could not be read again before the push, so nothing was pushed: {error}"),
             };
-            write_publication(state, task_id, Some(&pending), &record).await?;
+            write_publication(state, task_id, Some(&pending), &record).await.map_err(record_write_failure)?;
             return Ok(record);
         }
     };
     if let Some(reason) = start_refusal(commit, &branch, &recheck) {
         record.state = PublicationState::Refused { reason };
-        write_publication(state, task_id, Some(&pending), &record).await?;
+        write_publication(state, task_id, Some(&pending), &record).await.map_err(record_write_failure)?;
         return Ok(record);
     }
 
@@ -315,15 +345,28 @@ async fn publish(
     let remote_after = remote_head_of(&RemoteBranch::refresh(&working_dir, Some(branch.as_str())).await);
     let settled = classify_outcome(commit, remote_head.as_deref(), &remote_after, &push);
 
+    let outcome = if push.is_ok() { "succeeded" } else { "failed" };
     let finished = PrPublication { state: settled, updated_at: chrono::Utc::now(), ..record };
-    write_publication(state, task_id, Some(&pending), &finished).await.map_err(|e| {
-        format!(
-            "The push {}, but its outcome could not be recorded: {e}. The record still says pending, so the \
-             next request reads the remote again before it publishes.",
-            if push.is_ok() { "succeeded" } else { "failed" },
-        )
+    write_publication(state, task_id, Some(&pending), &finished).await.map_err(|e| match e {
+        // Nothing changed on disk or in memory: the record still says pending.
+        RecordWriteError::NotPublished(_) => format!(
+            "The push {outcome}, but its outcome could not be recorded: {e}. The record still says pending, so \
+             the next request reads the remote again before it publishes."
+        ),
+        // The settled record is in memory and was written, but was not confirmed
+        // durable. A restart may bring back the pending record, which the next
+        // request reconciles against the remote before it publishes.
+        RecordWriteError::PublishedNotDurable(_) => format!(
+            "The push {outcome}, and its outcome is recorded, but the record could not be confirmed on disk: {e}. \
+             If the application restarts first, the next request reads the remote again before it publishes."
+        ),
     })?;
     Ok(finished)
+}
+
+/// The first twelve characters of a commit, for messages a person reads.
+fn short_commit(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
 }
 
 #[cfg(test)]
@@ -376,13 +419,15 @@ mod orchestration {
         project_id: Uuid,
         remote: PathBuf,
         checkout: PathBuf,
+        config: PathBuf,
         base: String,
     }
 
     async fn fixture() -> Fx {
         let tmp = tempfile::TempDir::new().unwrap();
+        let config = tmp.path().join("config");
         let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
-            tmp.path().join("config"),
+            config.clone(),
             tmp.path().join("data"),
             tmp.path().join("cache"),
             tmp.path().join("runtime"),
@@ -442,10 +487,46 @@ mod orchestration {
         state.task.tasks.write().await.insert(task_id, task.clone());
         state.storage.save_project_tasks(project_id, &[task]).unwrap();
 
-        Fx { _tmp: tmp, state, task_id, project_id, remote, checkout, base }
+        Fx { _tmp: tmp, state, task_id, project_id, remote, checkout, config, base }
     }
 
     impl Fx {
+        /// Make every save of the board fail: a regular file where the legacy
+        /// tasks directory has to be, so the atomic write cannot create it.
+        /// Behaves the same for every user, root included.
+        fn block_persistence(&self) {
+            let dir = self.config.join("tasks");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::write(&dir, b"not a directory").expect("place persistence blocker");
+        }
+
+        fn unblock_persistence(&self) {
+            let dir = self.config.join("tasks");
+            let _ = std::fs::remove_file(&dir);
+            std::fs::create_dir_all(&dir).expect("restore the tasks directory");
+        }
+
+        /// Make the next push to the bare remote block persistence after the
+        /// ref has moved: a `post-receive` hook replaces the tasks directory.
+        /// The push itself succeeds, so the settled record write is the one that fails.
+        #[cfg(unix)]
+        fn block_persistence_after_next_push(&self) {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = self.config.join("tasks");
+            let hook = self.remote.join("hooks").join("post-receive");
+            let script = format!(
+                "#!/bin/sh\nrm -rf '{d}'\nprintf 'not a directory' > '{d}'\n",
+                d = dir.display()
+            );
+            std::fs::write(&hook, script).expect("write post-receive hook");
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("make hook executable");
+        }
+
+        #[cfg(unix)]
+        fn remove_post_receive_hook(&self) {
+            let _ = std::fs::remove_file(self.remote.join("hooks").join("post-receive"));
+        }
+
         /// Commit one more change on the task branch and return its ID.
         fn commit(&self, name: &str) -> String {
             git(&self.checkout, &["checkout", "-q", BRANCH]);
@@ -706,6 +787,130 @@ mod orchestration {
         let retried = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
         assert!(matches!(&retried.state, PublicationState::Refused { reason } if reason.contains("fast-forward")));
         assert_eq!(fx.remote_head().as_deref(), Some(x.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_request_for_another_commit_is_not_reported_as_published_after_an_earlier_record_settles() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        // c1 reached the remote, but its record still says pending.
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{c1}:refs/heads/{BRANCH}")]);
+        fx.leave_record(pending_record(&c1, &fx.base)).await;
+        let c2 = fx.commit("two");
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let err = publish(&fx.state, fx.task_id, &c2, PR).await.unwrap_err();
+
+        assert!(err.contains("was not published"), "{err}");
+        assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()), "reconciling c1 must not push c2");
+        let settled = fx.record().await.unwrap();
+        assert_eq!(settled.commit, c1, "the stored record is c1's, settled");
+        assert_eq!(settled.state, PublicationState::Published {});
+    }
+
+    #[tokio::test]
+    async fn a_settled_record_for_the_same_commit_on_another_pull_request_is_not_reported_as_published() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        // c1 reached the remote for an earlier pull request; its record is still pending.
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{c1}:refs/heads/{BRANCH}")]);
+        let earlier_pr = "https://github.com/BarraDev/slashit/pull/8";
+        fx.leave_record(PrPublication { pr_url: earlier_pr.to_string(), ..pending_record(&c1, &fx.base) }).await;
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let err = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap_err();
+
+        assert!(err.contains("was not published"), "{err}");
+        let settled = fx.record().await.unwrap();
+        assert_eq!((settled.pr_url.as_str(), settled.state), (earlier_pr, PublicationState::Published {}));
+        assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_pending_write_pushes_nothing() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        test_seam::fix_observation(true, BRANCH, true);
+        fx.block_persistence();
+
+        let err = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap_err();
+
+        assert!(err.contains("Nothing was pushed"), "{err}");
+        assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()), "no push without a durable pending record");
+        assert!(fx.record().await.is_none(), "the board is unchanged");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_settled_write_after_a_push_leaves_the_record_pending_and_the_next_request_reconciles() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        test_seam::fix_observation(true, BRANCH, true);
+        fx.block_persistence_after_next_push();
+
+        let err = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap_err();
+
+        assert!(err.contains("still says pending"), "{err}");
+        assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()), "the push itself landed");
+        assert_eq!(fx.record().await.unwrap().state, PublicationState::Pending {});
+
+        fx.remove_post_receive_hook();
+        fx.unblock_persistence();
+        // The next request for c2 must reconcile c1 against the remote first and must not push c2.
+        let c2 = fx.commit("two");
+        let next = publish(&fx.state, fx.task_id, &c2, PR).await.unwrap_err();
+
+        assert!(next.contains("was not published"), "{next}");
+        assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
+        let settled = fx.record().await.unwrap();
+        assert_eq!((settled.commit.as_str(), settled.state), (c1.as_str(), PublicationState::Published {}));
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_for_different_commits_leave_a_settled_record_that_matches_the_remote() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let c2 = fx.commit("two");
+        test_seam::fix_observation(true, BRANCH, true);
+
+        // This fixture has no executor, so the per-task lifecycle guard is released
+        // when the reservation returns and does not span the publication. What
+        // keeps the two requests apart here is the compare-and-set on the stored
+        // record. c1 is no longer the tip, so only c2 may reach the remote, in
+        // whichever order the two requests run. Their results are not asserted
+        // individually.
+        let (_first, _second) = tokio::join!(
+            publish(&fx.state, fx.task_id, &c1, PR),
+            publish(&fx.state, fx.task_id, &c2, PR),
+        );
+
+        let remote = fx.remote_head();
+        assert!(
+            remote.as_deref() == Some(fx.base.as_str()) || remote.as_deref() == Some(c2.as_str()),
+            "only the current tip may reach the remote, got {remote:?}"
+        );
+        let stored = fx.record().await.expect("a request leaves a record");
+        assert!(!stored.needs_reconciliation(), "no request may leave a pending or unknown record");
+        if remote.as_deref() == Some(c2.as_str()) {
+            // c2 reached the remote, so the stored record must say so.
+            assert_eq!(stored.commit, c2, "a pushed commit must be the stored record's commit");
+            assert_eq!(stored.state, PublicationState::Published {}, "a pushed commit must be recorded as published");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_expected_record_does_not_overwrite_the_stored_publication() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let stored = PrPublication { state: PublicationState::Unknown { reason: "x".into() }, ..pending_record(&c1, &fx.base) };
+        fx.leave_record(stored.clone()).await;
+        let newer = pending_record(&c1, &fx.base);
+
+        // The caller believes there is no record; the stored one must survive.
+        let result = super::write_publication(&fx.state, fx.task_id, None, &newer).await;
+
+        assert!(matches!(result, Err(crate::lifecycle::RecordWriteError::NotPublished(_))));
+        assert_eq!(fx.record().await, Some(stored));
     }
 
     #[tokio::test]
