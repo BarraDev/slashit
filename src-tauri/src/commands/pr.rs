@@ -4282,15 +4282,31 @@ async fn record_pr_create_started(
             }
         }
     };
-    crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply)
-        .await
-        .map_err(|e| {
-            format!(
+    match crate::lifecycle::record_typed(&state.task.tasks, &state.storage, task_uuid, &apply).await
+    {
+        Ok(()) => {}
+        Err(crate::lifecycle::RecordWriteError::NotPublished(e)) => {
+            return Err(format!(
                 "{} is pushed, but SlashIt could not record that it was about to open its pull \
                  request, so it did not open one: {e}",
                 attempt.branch
-            )
-        })?;
+            ));
+        }
+        Err(crate::lifecycle::RecordWriteError::PublishedNotDurable(e)) => {
+            // The board holds the record though the write is reported as an
+            // error. Nothing has been sent, so it is taken back; one that was
+            // not this attempt's (an earlier one, which blocked this) stays.
+            let message = format!(
+                "{} is pushed, but SlashIt could not confirm that its record of the pull request \
+                 it was about to open reached stable storage ({e}), so it did not open one.",
+                attempt.branch
+            );
+            if recorded.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(retract_pr_create_attempt(state, task_uuid, attempt, message).await);
+            }
+            return Err(message);
+        }
+    }
     if let Some(earlier) = unsettled.into_inner().unwrap_or_else(|e| e.into_inner()) {
         return Err(unconfirmed_pr_create_refusal(&earlier));
     }
@@ -4354,25 +4370,24 @@ async fn retract_pr_create_attempt(
     attempt: &crate::domain::task::UnconfirmedPrCreate,
     refused: String,
 ) -> String {
-    if clear_pr_create_attempt(state, task_uuid, attempt).await {
-        refused
-    } else {
-        format!(
+    match clear_pr_create_attempt(state, task_uuid, attempt).await {
+        Ok(()) => refused,
+        Err(why) => format!(
             "{refused} No request was sent, but SlashIt could not remove its record that one was \
-             about to be, so a retry will refuse until that is resolved."
-        )
+             about to be: {why} A retry may refuse until that is resolved."
+        ),
     }
 }
 
 /// Remove `attempt` from the task once it is known that no request was made
-/// for it: GitHub refused it, or it was never sent. Whether the record is gone
-/// is returned. One left behind only says that a pull request may exist, and
-/// the next attempt then refuses to open another.
+/// for it: GitHub refused it, or it was never sent. When it cannot be removed,
+/// the error says what the task holds now. One left behind only says that a
+/// pull request may exist, and the next attempt then refuses to open another.
 async fn clear_pr_create_attempt(
     state: &crate::AppState,
     task_uuid: Uuid,
     attempt: &crate::domain::task::UnconfirmedPrCreate,
-) -> bool {
+) -> Result<(), String> {
     let apply = |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             if task.pr_create_unconfirmed.as_ref() == Some(attempt) {
@@ -4380,17 +4395,24 @@ async fn clear_pr_create_attempt(
             }
         }
     };
-    match crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply).await {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!(
-                "[pr] no pull request was opened for {}, but the task still records the attempt \
-                 as unconfirmed: {e}",
-                attempt.branch
-            );
-            false
-        }
-    }
+    let failure =
+        match crate::lifecycle::record_typed(&state.task.tasks, &state.storage, task_uuid, &apply)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(crate::lifecycle::RecordWriteError::NotPublished(e)) => {
+                format!("the record is still on the task ({e}).")
+            }
+            Err(crate::lifecycle::RecordWriteError::PublishedNotDurable(e)) => format!(
+                "the record was removed, but that was not confirmed to have reached stable \
+                 storage ({e})."
+            ),
+        };
+    eprintln!(
+        "[pr] no pull request was opened for {}, but its unconfirmed record: {failure}",
+        attempt.branch
+    );
+    Err(failure)
 }
 
 /// Whether `answer` is a single pull request URL: `https://<host>/<owner>/<repo>/pull/<number>`.
@@ -20993,6 +21015,72 @@ esac"#
                         "{error}"
                     );
                 }
+            }
+
+            /// A write of the request that reached the board file but could not be
+            /// confirmed durable is a request that is recorded, though it is
+            /// reported as an error. Nothing was sent, so the record is taken
+            /// back and the message does not say that nothing was recorded.
+            #[tokio::test]
+            async fn a_record_published_but_not_confirmed_durable_is_taken_back() {
+                use slashit_durable_fs::{fault, Stage};
+                let (_repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                let attempt = crate::domain::task::UnconfirmedPrCreate {
+                    branch: BRANCH.to_string(),
+                    commit: sha,
+                    started_at: chrono::Utc::now(),
+                };
+
+                let error = {
+                    let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+                    record_pr_create_started(&state, task_id, &attempt)
+                        .await
+                        .expect_err("the write could not be confirmed durable")
+                };
+
+                assert!(error.contains("could not confirm"), "{error}");
+                assert!(error.contains("did not open one"), "{error}");
+                assert!(!error.contains("could not remove"), "{error}");
+                assert_nothing_recorded(&state, task_id).await;
+                assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+            }
+
+            /// When the record cannot be taken back either, the message says so
+            /// and what follows from it: the record is still on the task, and a
+            /// retry refuses to open another pull request.
+            #[tokio::test]
+            async fn a_record_that_cannot_be_taken_back_is_reported_and_blocks_a_retry() {
+                use slashit_durable_fs::{fault, Stage};
+                let (_repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                let attempt = crate::domain::task::UnconfirmedPrCreate {
+                    branch: BRANCH.to_string(),
+                    commit: sha.clone(),
+                    started_at: chrono::Utc::now(),
+                };
+
+                let error = {
+                    let _fault = fault::fail_in_order(&[
+                        (Stage::SyncDirectory, std::io::ErrorKind::Other, 0),
+                        (Stage::Replace, std::io::ErrorKind::Other, 0),
+                    ]);
+                    record_pr_create_started(&state, task_id, &attempt)
+                        .await
+                        .expect_err("the write could not be confirmed durable")
+                };
+
+                assert!(error.contains("could not confirm"), "{error}");
+                assert!(error.contains("could not remove its record"), "{error}");
+                assert!(error.contains("retry may refuse"), "{error}");
+                assert_eq!(
+                    in_memory(&state, task_id).await.pr_create_unconfirmed,
+                    Some(attempt)
+                );
+                let error = create(&state, task_id, None)
+                    .await
+                    .expect_err("the record that remains refuses a retry");
+                assert!(error.contains("did not open another"), "{error}");
+                assert_eq!(gh.creates(), 0, "{}", gh.fake.invocations());
             }
 
             /// A `gh` that cannot be started is told from one that was started
