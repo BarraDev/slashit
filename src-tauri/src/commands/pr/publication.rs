@@ -384,8 +384,13 @@ async fn publish(
             };
             let updated = PrPublication { state: state_now, updated_at: chrono::Utc::now(), ..record.clone() };
             // The remote was just read: when it holds the record's commit, it
-            // also settles the review fixes it carries.
-            let delivered = if updated.state == (PublicationState::Published {}) {
+            // also settles the review fixes it carries, but only for a record
+            // of this branch and pull request: another branch's remote says
+            // nothing about this Task's plan.
+            let delivered = if updated.state == (PublicationState::Published {})
+                && record.branch == branch
+                && record.pr_url == pr_url
+            {
                 delivered_review_fixes(state, task_id, &working_dir, &remote).await
             } else {
                 Vec::new()
@@ -1397,6 +1402,50 @@ mod orchestration {
 
         assert_eq!(record.state, PublicationState::Published {});
         assert!(!fx.plan_item().await.fix_uncommitted, "the reconciled record is the same observation");
+    }
+
+    // An earlier record for another branch or pull request is settled against
+    // the remote, but what its remote branch holds says nothing about this
+    // Task's plan. The record is written as before; the plan is left alone.
+
+    #[tokio::test]
+    async fn a_reconciled_record_for_another_branch_does_not_settle_the_plan() {
+        let fx = fixture().await;
+        let (c1, effect) = fx.fix_committed("fixed.txt").await;
+        fx.seed_plan_with_unpublished_fix(&c1, effect).await;
+        // c1 is on a different branch of the remote, whose earlier publication is still pending.
+        let other = "other-branch";
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{c1}:refs/heads/{other}")]);
+        fx.leave_record(PrPublication { branch: other.to_string(), ..pending_record(&c1, &fx.base) }).await;
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let _ = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await;
+
+        let settled = fx.record().await.unwrap();
+        assert_eq!((settled.branch.as_str(), settled.state), (other, PublicationState::Published {}));
+        assert!(fx.plan_item().await.fix_uncommitted, "another branch's remote does not speak for this plan");
+        assert!(fx.persisted_plan_item().fix_uncommitted);
+        assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()), "this task's branch was not pushed");
+    }
+
+    #[tokio::test]
+    async fn a_reconciled_record_for_another_pull_request_does_not_settle_the_plan() {
+        let fx = fixture().await;
+        let (c1, effect) = fx.fix_committed("fixed.txt").await;
+        fx.seed_plan_with_unpublished_fix(&c1, effect).await;
+        // c1 reached this task's branch for an earlier pull request; its record is still pending.
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{c1}:refs/heads/{BRANCH}")]);
+        let earlier_pr = "https://github.com/BarraDev/slashit/pull/8";
+        fx.leave_record(PrPublication { pr_url: earlier_pr.to_string(), ..pending_record(&c1, &fx.base) }).await;
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
+
+        assert!(err.contains("was not published"), "{err}");
+        let settled = fx.record().await.unwrap();
+        assert_eq!((settled.pr_url.as_str(), settled.state), (earlier_pr, PublicationState::Published {}));
+        assert!(fx.plan_item().await.fix_uncommitted, "a record for another pull request settles nothing");
+        assert!(fx.persisted_plan_item().fix_uncommitted);
     }
 
     #[tokio::test]
