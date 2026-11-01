@@ -4363,7 +4363,7 @@ fn unconfirmed_pr_create_refusal(earlier: &crate::domain::task::UnconfirmedPrCre
 
 /// Take back the record of a request that was refused before it was sent, and
 /// return `refused` for the caller to report, with a note when the record could
-/// not be taken back.
+/// not be taken back or its removal is not confirmed durable.
 async fn retract_pr_create_attempt(
     state: &crate::AppState,
     task_uuid: Uuid,
@@ -4372,22 +4372,40 @@ async fn retract_pr_create_attempt(
 ) -> String {
     match clear_pr_create_attempt(state, task_uuid, attempt).await {
         Ok(()) => refused,
-        Err(why) => format!(
+        Err(PrRetractFailure::Remains(why)) => format!(
             "{refused} No request was sent, but SlashIt could not remove its record that one was \
-             about to be: {why} A retry may refuse until that is resolved."
+             about to be: the record is still on the task ({why}). A retry may refuse until that \
+             is resolved."
+        ),
+        Err(PrRetractFailure::RemovedNotDurable(why)) => format!(
+            "{refused} No request was sent, and SlashIt removed its record that one was about to \
+             be, but could not confirm that the removal reached stable storage ({why}). The board \
+             holds no record now; if the computer stops before the next successful save, the \
+             record may come back."
         ),
     }
 }
 
+/// Why the record of a request that was never sent could not be taken back.
+#[derive(Debug)]
+enum PrRetractFailure {
+    /// The write published nothing: the record is still on the task, and a
+    /// retry refuses to open another pull request.
+    Remains(String),
+    /// The board and the file hold the task without the record, but the write
+    /// could not be confirmed durable.
+    RemovedNotDurable(String),
+}
+
 /// Remove `attempt` from the task once it is known that no request was made
-/// for it: GitHub refused it, or it was never sent. When it cannot be removed,
-/// the error says what the task holds now. One left behind only says that a
-/// pull request may exist, and the next attempt then refuses to open another.
+/// for it: GitHub refused it, or it was never sent. One left behind only says
+/// that a pull request may exist, and the next attempt then refuses to open
+/// another.
 async fn clear_pr_create_attempt(
     state: &crate::AppState,
     task_uuid: Uuid,
     attempt: &crate::domain::task::UnconfirmedPrCreate,
-) -> Result<(), String> {
+) -> Result<(), PrRetractFailure> {
     let apply = |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             if task.pr_create_unconfirmed.as_ref() == Some(attempt) {
@@ -4401,15 +4419,15 @@ async fn clear_pr_create_attempt(
         {
             Ok(()) => return Ok(()),
             Err(crate::lifecycle::RecordWriteError::NotPublished(e)) => {
-                format!("the record is still on the task ({e}).")
+                PrRetractFailure::Remains(e)
             }
-            Err(crate::lifecycle::RecordWriteError::PublishedNotDurable(e)) => format!(
-                "the record was removed, but that was not confirmed to have reached stable \
-                 storage ({e})."
-            ),
+            Err(crate::lifecycle::RecordWriteError::PublishedNotDurable(e)) => {
+                PrRetractFailure::RemovedNotDurable(e)
+            }
         };
     eprintln!(
-        "[pr] no pull request was opened for {}, but its unconfirmed record: {failure}",
+        "[pr] no pull request was opened for {}, but removing its unconfirmed record failed: \
+         {failure:?}",
         attempt.branch
     );
     Err(failure)
@@ -21274,6 +21292,44 @@ esac"#
                 assert!(error.contains("cannot tell whether"), "{error}");
                 assert!(error.contains("https://ghe.corp/o/r.git"), "{error}");
                 assert!(!error.contains("SECRET"), "{error}");
+            }
+
+            /// When the record and its removal are both published but neither is
+            /// confirmed durable, the board and the file hold no record: the
+            /// message says it was removed, with the durability of the removal
+            /// unconfirmed, and does not predict a refusal.
+            #[tokio::test]
+            async fn a_removal_that_is_published_but_not_confirmed_durable_is_worded_as_removed() {
+                use slashit_durable_fs::{fault, Stage};
+                let (_repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                let attempt = crate::domain::task::UnconfirmedPrCreate {
+                    branch: BRANCH.to_string(),
+                    commit: sha,
+                    started_at: chrono::Utc::now(),
+                };
+
+                let error = {
+                    let _fault = fault::fail_every(Stage::SyncDirectory, std::io::ErrorKind::Other);
+                    record_pr_create_started(&state, task_id, &attempt)
+                        .await
+                        .expect_err("neither write could be confirmed durable")
+                };
+
+                assert!(
+                    error.contains("could not confirm that its record"),
+                    "{error}"
+                );
+                assert!(error.contains("removed its record"), "{error}");
+                assert!(
+                    error.contains("could not confirm that the removal"),
+                    "{error}"
+                );
+                assert!(!error.contains("could not remove its record"), "{error}");
+                assert!(!error.contains("retry may refuse"), "{error}");
+                assert_eq!(in_memory(&state, task_id).await.pr_create_unconfirmed, None);
+                assert_eq!(on_disk(&state, task_id).await.pr_create_unconfirmed, None);
+                assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
             }
 
             /// A `gh` that cannot be started is told from one that was started
