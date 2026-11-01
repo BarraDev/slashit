@@ -250,11 +250,13 @@ pub async fn discard_published_restack(task_id: String) -> Result<(), String> {
 /// Publication never approves the task.
 pub async fn publish_task_to_pr(
     task_id: String,
+    branch: String,
     commit: String,
     pr_url: String,
 ) -> Result<crate::models::PrPublication, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "taskId": task_id,
+        "branch": branch,
         "commit": commit,
         "prUrl": pr_url,
     }))

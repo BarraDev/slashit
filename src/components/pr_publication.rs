@@ -162,14 +162,14 @@ pub fn PublishToPrPanel(
         }
     };
 
-    let publish = move |commit: String, pr_url: String| {
+    let publish = move |branch: String, commit: String, pr_url: String| {
         busy.set(true);
         error.set(None);
         notice.set(None);
         spawn_local(async move {
             let requested = commit.clone();
             let requested_pr = pr_url.clone();
-            let answer = publish_task_to_pr(task_id.to_string(), commit, pr_url).await;
+            let answer = publish_task_to_pr(task_id.to_string(), branch, commit, pr_url).await;
             let _ = busy.try_set(false);
             match answer {
                 Ok(record) if answers_request(&record, &requested, &requested_pr) => {
@@ -267,7 +267,7 @@ pub fn PublishToPrPanel(
                                     pr_url: pr_url.as_deref(),
                                 };
                                 if confirmation_still_matches(&shown_now, live) {
-                                    publish(shown_now.commit, shown_now.pr_url);
+                                    publish(shown_now.branch, shown_now.commit, shown_now.pr_url);
                                 } else {
                                     confirmation.set(None);
                                     notice.set(Some(CHANGED_NOTICE.to_string()));

@@ -43,6 +43,17 @@ use crate::worktree::restack;
 /// the request, whatever its state: the caller shows `Published`, `Refused`
 /// and `Unknown` alike, and only for the commit it asked for.
 ///
+/// Authorization. A person's confirmation covers the commit, branch and pull
+/// request it showed. The request checks the branch and the pull request when it
+/// starts, and pushes the commit by object ID, so it never pushes a different
+/// commit. The Task's status and its Human Review approval are not part of that
+/// consent: publishing does not approve the Task. A move that ends the request's
+/// owner is honored at the request's checkpoints: before the pending record is
+/// written, after GitHub is read again, and immediately before the push. After
+/// the last checkpoint the push is not interrupted. A move that arrives while the
+/// push is being prepared is not seen, and the push completes with the confirmed
+/// commit. That window is a known limitation.
+///
 /// `Err` means this call returned no record. It covers four cases: the request
 /// could not start (a running task, a pull request that is not this task's, an
 /// unreadable repository); a record write did not land before any push; an
@@ -58,11 +69,12 @@ pub async fn publish_task_to_pr(
     _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
+    branch: String,
     commit: String,
     pr_url: String,
 ) -> Result<PrPublication, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    publish(&state, task_id, &commit, &pr_url).await
+    publish(&state, task_id, &branch, &commit, &pr_url).await
 }
 
 /// Whether `commit` has the shape of a full object ID. A short ID is not
@@ -113,6 +125,9 @@ async fn observe_pull_request(
 ) -> Result<(bool, String, bool), String> {
     #[cfg(test)]
     if let Some(fixed) = test_seam::fixed() {
+        test_seam::run_hook();
+        // Lets whatever a hook started run before the request resumes.
+        tokio::task::yield_now().await;
         return Ok(fixed);
     }
     let (open, head_branch) = pull_request_state(working_dir, pr_url).await?;
@@ -126,6 +141,8 @@ mod test_seam {
 
     thread_local! {
         static FIXED: RefCell<Option<(bool, String, bool)>> = const { RefCell::new(None) };
+        /// How many observations to let through before the hook runs, and the hook.
+        static HOOK: RefCell<Option<(u32, Box<dyn FnOnce()>)>> = const { RefCell::new(None) };
     }
 
     /// Answer as if GitHub said: open or not, head branch, own or not.
@@ -135,6 +152,29 @@ mod test_seam {
 
     pub(super) fn fixed() -> Option<(bool, String, bool)> {
         FIXED.with(|f| f.borrow().clone())
+    }
+
+    /// Run `hook` at the observation that follows `skip` earlier ones. The
+    /// request observes twice: once at its start and once after its pending
+    /// record is durable, so `skip = 1` puts the hook in that window.
+    pub(super) fn hook_observation_after(skip: u32, hook: Box<dyn FnOnce()>) {
+        HOOK.with(|h| *h.borrow_mut() = Some((skip, hook)));
+    }
+
+    /// Run the armed hook when its observation is reached.
+    pub(super) fn run_hook() {
+        let due = HOOK.with(|h| {
+            let mut slot = h.borrow_mut();
+            let (remaining, _) = slot.as_mut()?;
+            if *remaining > 0 {
+                *remaining -= 1;
+                return None;
+            }
+            slot.take().map(|(_, hook)| hook)
+        });
+        if let Some(hook) = due {
+            hook();
+        }
     }
 }
 
@@ -206,6 +246,7 @@ async fn commit_on_remote(working_dir: &str, commit: &str, head: &Option<String>
 async fn publish(
     state: &crate::AppState,
     task_id: Uuid,
+    confirmed_branch: &str,
     commit: &str,
     pr_url: &str,
 ) -> Result<PrPublication, String> {
@@ -226,6 +267,13 @@ async fn publish(
         .get(&task_id)
         .cloned()
         .ok_or("Task not found")?;
+    if task.branch_name.as_deref() != Some(confirmed_branch) {
+        return Err(
+            "The task's branch is no longer the branch you confirmed, so nothing was published. \
+             Review the commit and confirm again."
+                .to_string(),
+        );
+    }
     let branch = task
         .branch_name
         .clone()
@@ -337,6 +385,21 @@ async fn publish(
     };
     if let Some(reason) = start_refusal(commit, &branch, &recheck) {
         record.state = PublicationState::Refused { reason };
+        write_publication(state, task_id, Some(&pending), &record).await.map_err(record_write_failure)?;
+        return Ok(record);
+    }
+    // The owner may have been ended while the pending record was written and
+    // GitHub was read again. Nothing has been pushed yet, so that is recorded
+    // as a refusal rather than pushed over the move.
+    if refuse_if_pr_operation_cancelled(&lease, "pushing the branch").is_err() {
+        // The reason is about this request, not the Task: an owner can be ended
+        // by a move that was then refused, or by a stop that timed out.
+        record.state = PublicationState::Refused {
+            reason: "This publication was stopped before the push, because the task's pull request \
+                     operation was ended while it was being prepared. Nothing was pushed. Publish \
+                     again to retry."
+                .to_string(),
+        };
         write_publication(state, task_id, Some(&pending), &record).await.map_err(record_write_failure)?;
         return Ok(record);
     }
@@ -577,7 +640,7 @@ mod orchestration {
         let c1 = fx.commit("one");
         test_seam::fix_observation(true, BRANCH, true);
 
-        let record = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
 
         assert_eq!(record.state, PublicationState::Published {});
         assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
@@ -593,7 +656,7 @@ mod orchestration {
         let _c2 = fx.commit("two");
         test_seam::fix_observation(true, BRANCH, true);
 
-        let record = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
 
         assert!(matches!(&record.state, PublicationState::Refused { reason } if reason.contains("no longer at the commit")));
         assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()), "a refusal must not push");
@@ -610,7 +673,7 @@ mod orchestration {
         let c1 = fx.commit("local");
         test_seam::fix_observation(true, BRANCH, true);
 
-        let record = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
 
         assert!(matches!(&record.state, PublicationState::Refused { reason } if reason.contains("fast-forward")));
         assert_eq!(fx.remote_head().as_deref(), Some(x.as_str()), "the remote commit must survive");
@@ -622,7 +685,7 @@ mod orchestration {
         let c1 = fx.commit("one");
         test_seam::fix_observation(false, BRANCH, true);
 
-        let record = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
 
         assert!(matches!(&record.state, PublicationState::Refused { reason } if reason.contains("closed or merged")));
         assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()));
@@ -634,7 +697,7 @@ mod orchestration {
         let c1 = fx.commit("one");
         test_seam::fix_observation(true, BRANCH, false);
 
-        let record = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
 
         assert!(matches!(record.state, PublicationState::Refused { .. }));
         assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()));
@@ -645,9 +708,9 @@ mod orchestration {
         let fx = fixture().await;
         let c1 = fx.commit("one");
         test_seam::fix_observation(true, BRANCH, true);
-        let first = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let first = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
 
-        let again = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let again = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
 
         assert_eq!(again, first, "the same request id means no new publication was started");
         assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
@@ -658,18 +721,18 @@ mod orchestration {
         let fx = fixture().await;
         let c1 = fx.commit("one");
         test_seam::fix_observation(true, BRANCH, true);
-        publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
         let c2 = fx.commit("two");
 
         let first_id = fx.record().await.unwrap().request_id;
-        let older = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let older = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
         // c1 is the record already published to the remote: the same request is
         // answered by that record, and nothing is pushed.
         assert_eq!(older.request_id, first_id, "the existing record answers a repeat of c1");
         assert_eq!(older.state, PublicationState::Published {});
         assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
 
-        let newer = publish(&fx.state, fx.task_id, &c2, PR).await.unwrap();
+        let newer = publish(&fx.state, fx.task_id, BRANCH, &c2, PR).await.unwrap();
         assert_eq!(newer.state, PublicationState::Published {});
         assert_eq!(fx.remote_head().as_deref(), Some(c2.as_str()));
     }
@@ -683,7 +746,7 @@ mod orchestration {
         fx.leave_record(pending_record(&c1, &fx.base)).await;
         test_seam::fix_observation(true, BRANCH, true);
 
-        let record = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
 
         assert_eq!(record.state, PublicationState::Published {});
         assert_eq!(fx.record().await.unwrap().state, PublicationState::Published {});
@@ -696,11 +759,11 @@ mod orchestration {
         fx.leave_record(pending_record(&c1, &fx.base)).await;
         test_seam::fix_observation(true, BRANCH, true);
 
-        let settled = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let settled = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
         assert!(matches!(settled.state, PublicationState::Refused { .. }));
         assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()));
 
-        let retried = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let retried = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
         assert_eq!(retried.state, PublicationState::Published {});
         assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
     }
@@ -719,17 +782,17 @@ mod orchestration {
         let good = git(&fx.checkout, &["remote", "get-url", "origin"]);
         git(&fx.checkout, &["remote", "set-url", "origin", "/nonexistent/remote.git"]);
 
-        let blocked = publish(&fx.state, fx.task_id, &c1, PR).await;
+        let blocked = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await;
         assert!(blocked.unwrap_err().contains("still unknown"));
         assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()), "nothing may be pushed while unknown");
 
         git(&fx.checkout, &["remote", "set-url", "origin", &good]);
         // The remote is back and still holds the old head: the unknown outcome settles as refused.
-        let settled = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let settled = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
         assert!(matches!(settled.state, PublicationState::Refused { .. }));
         assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()));
 
-        let retried = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let retried = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
         assert_eq!(retried.state, PublicationState::Published {});
     }
 
@@ -739,7 +802,7 @@ mod orchestration {
         let c1 = fx.commit("one");
         test_seam::fix_observation(true, BRANCH, true);
 
-        let err = publish(&fx.state, fx.task_id, &c1, "https://github.com/BarraDev/slashit/pull/10").await.unwrap_err();
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, "https://github.com/BarraDev/slashit/pull/10").await.unwrap_err();
 
         assert!(err.contains("not this task's pull request"));
         assert!(fx.record().await.is_none());
@@ -757,7 +820,7 @@ mod orchestration {
         fx.leave_record(pending_record(&c1, &fx.base)).await;
         test_seam::fix_observation(true, BRANCH, true);
 
-        let settled = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let settled = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
 
         assert_eq!(settled.state, PublicationState::Published {});
         assert_eq!(fx.remote_head().as_deref(), Some(c2.as_str()), "reconciling must not push");
@@ -779,12 +842,12 @@ mod orchestration {
         test_seam::fix_observation(true, BRANCH, true);
 
         // The first request settles the record as refused, not as an error.
-        let settled = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let settled = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
         assert!(matches!(settled.state, PublicationState::Refused { .. }));
 
         // A new request now runs the start rules and refuses honestly: the
         // remote holds a commit this branch does not contain. Nothing is forced.
-        let retried = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap();
+        let retried = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
         assert!(matches!(&retried.state, PublicationState::Refused { reason } if reason.contains("fast-forward")));
         assert_eq!(fx.remote_head().as_deref(), Some(x.as_str()));
     }
@@ -799,7 +862,7 @@ mod orchestration {
         let c2 = fx.commit("two");
         test_seam::fix_observation(true, BRANCH, true);
 
-        let err = publish(&fx.state, fx.task_id, &c2, PR).await.unwrap_err();
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c2, PR).await.unwrap_err();
 
         assert!(err.contains("was not published"), "{err}");
         assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()), "reconciling c1 must not push c2");
@@ -818,7 +881,7 @@ mod orchestration {
         fx.leave_record(PrPublication { pr_url: earlier_pr.to_string(), ..pending_record(&c1, &fx.base) }).await;
         test_seam::fix_observation(true, BRANCH, true);
 
-        let err = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap_err();
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
 
         assert!(err.contains("was not published"), "{err}");
         let settled = fx.record().await.unwrap();
@@ -833,7 +896,7 @@ mod orchestration {
         test_seam::fix_observation(true, BRANCH, true);
         fx.block_persistence();
 
-        let err = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap_err();
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
 
         assert!(err.contains("Nothing was pushed"), "{err}");
         assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()), "no push without a durable pending record");
@@ -848,7 +911,7 @@ mod orchestration {
         test_seam::fix_observation(true, BRANCH, true);
         fx.block_persistence_after_next_push();
 
-        let err = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap_err();
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
 
         assert!(err.contains("still says pending"), "{err}");
         assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()), "the push itself landed");
@@ -858,7 +921,7 @@ mod orchestration {
         fx.unblock_persistence();
         // The next request for c2 must reconcile c1 against the remote first and must not push c2.
         let c2 = fx.commit("two");
-        let next = publish(&fx.state, fx.task_id, &c2, PR).await.unwrap_err();
+        let next = publish(&fx.state, fx.task_id, BRANCH, &c2, PR).await.unwrap_err();
 
         assert!(next.contains("was not published"), "{next}");
         assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
@@ -873,15 +936,15 @@ mod orchestration {
         let c2 = fx.commit("two");
         test_seam::fix_observation(true, BRANCH, true);
 
-        // This fixture has no executor, so the per-task lifecycle guard is released
-        // when the reservation returns and does not span the publication. What
-        // keeps the two requests apart here is the compare-and-set on the stored
-        // record. c1 is no longer the tip, so only c2 may reach the remote, in
-        // whichever order the two requests run. Their results are not asserted
-        // individually.
+        // This fixture has no executor, so there is no PR owner registration and
+        // the two requests are not serialized here. What keeps them apart is the
+        // compare-and-set on the stored record. The executor-backed test below
+        // covers the registration. c1 is no longer the tip, so only c2 may reach
+        // the remote, in whichever order the two requests run. Their results are
+        // not asserted individually.
         let (_first, _second) = tokio::join!(
-            publish(&fx.state, fx.task_id, &c1, PR),
-            publish(&fx.state, fx.task_id, &c2, PR),
+            publish(&fx.state, fx.task_id, BRANCH, &c1, PR),
+            publish(&fx.state, fx.task_id, BRANCH, &c2, PR),
         );
 
         let remote = fx.remote_head();
@@ -919,9 +982,127 @@ mod orchestration {
         let c1 = fx.commit("one");
         for status in [TaskStatus::Queue, TaskStatus::InProgress, TaskStatus::AiReview] {
             fx.state.task.tasks.write().await.get_mut(&fx.task_id).unwrap().status = status.clone();
-            let err = publish(&fx.state, fx.task_id, &c1, PR).await.unwrap_err();
+            let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
             assert!(err.contains("queued, being worked on, or in AI review"), "{status:?}: {err}");
         }
+        assert!(fx.record().await.is_none(), "a refused request records nothing");
+        assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()));
+    }
+
+    /// The executor's PR owner registration is held for the whole publication.
+    /// While the first request holds it, a second request for the same task is
+    /// refused before anything is recorded or pushed, and it proceeds once the
+    /// first has ended. The held reservation stands in for an in-flight request.
+    #[tokio::test]
+    async fn a_second_request_is_refused_while_a_publication_holds_the_task() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let executor = crate::test_helpers::attach_test_executor(&fx.state);
+        test_seam::fix_observation(true, BRANCH, true);
+        // The contract for the reservation: the caller holds the task's lifecycle lease.
+        let lifecycle = fx.state.task_lifecycle_locks.acquire(fx.task_id).await.expect("the lifecycle lease");
+        let in_flight = executor
+            .begin_pr_side_effect_under_lease(fx.task_id)
+            .await
+            .expect("the first request starts");
+        drop(lifecycle);
+
+        let refused = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
+        assert!(refused.contains("already in progress"), "{refused}");
+        assert!(fx.record().await.is_none(), "a refused request records nothing");
+        assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()));
+
+        drop(in_flight);
+        let published = publish(&fx.state, fx.task_id, BRANCH, &c1, PR)
+            .await
+            .expect("the request proceeds once the first has ended");
+        assert_eq!(published.state, PublicationState::Published {});
+        assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
+    }
+
+    /// A lifecycle move that ends the request's owner while the request re-reads
+    /// GitHub, after its pending record is durable, must stop the push. The
+    /// request records a refusal, nothing reaches the remote, and the move
+    /// completes.
+    #[tokio::test]
+    async fn a_move_that_ends_the_owner_during_the_pull_request_reread_stops_the_push() {
+        use crate::lifecycle::ExecutionOwnership;
+
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let executor = crate::test_helpers::attach_test_executor(&fx.state);
+        test_seam::fix_observation(true, BRANCH, true);
+        let task_id = fx.task_id;
+        let mover = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = mover.clone();
+        let for_move = executor.clone();
+        // The second observation is the re-read, after the pending record is durable.
+        test_seam::hook_observation_after(
+            1,
+            Box::new(move || {
+                let handle = tokio::spawn(async move {
+                    ExecutionOwnership::end_ownership_under_lease(for_move.as_ref(), task_id).await
+                });
+                *slot.lock().unwrap() = Some(handle);
+            }),
+        );
+
+        let record = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.expect("the refusal is recorded");
+
+        assert!(matches!(record.state, PublicationState::Refused { .. }), "{:?}", record.state);
+        assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()), "nothing was pushed");
+        assert_eq!(fx.record().await, Some(record), "the stored record is the refusal");
+        let moved = mover.lock().unwrap().take().expect("the move ran during the re-read");
+        moved.await.expect("the move finishes").expect("the move ends the owner");
+    }
+
+    /// A settled write that replaced the board but was not confirmed on disk is
+    /// reported as such, and memory and the file both hold the settled record.
+    /// The request is not left pending, so the next request is not held up.
+    #[tokio::test]
+    async fn a_settled_write_published_but_not_durable_is_adopted_and_reported() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        test_seam::fix_observation(true, BRANCH, true);
+        // The pending write syncs the board's directory once and passes. The
+        // settled write's sync fails after its replacement.
+        let fault = slashit_durable_fs::fault::fail_after(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+            1,
+        );
+
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
+        drop(fault);
+
+        assert!(err.contains("The push succeeded, and its outcome is recorded"), "{err}");
+        assert!(err.contains("could not be confirmed on disk"), "{err}");
+        assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()), "the push landed");
+        let adopted = fx.record().await.expect("the settled record is in memory");
+        assert_eq!(adopted.commit, c1);
+        assert_eq!(adopted.state, PublicationState::Published {});
+        let on_disk = fx.state.storage.load_project_tasks(fx.project_id).unwrap();
+        let persisted = on_disk.iter().find(|t| t.id == fx.task_id).and_then(|t| t.pr_publication.clone());
+        assert_eq!(persisted, Some(adopted), "the file holds the record memory adopted");
+
+        let c2 = fx.commit("two");
+        let next = publish(&fx.state, fx.task_id, BRANCH, &c2, PR).await.expect("the next request publishes");
+        assert_eq!(next.state, PublicationState::Published {});
+        assert_eq!(fx.remote_head().as_deref(), Some(c2.as_str()));
+    }
+
+    /// The person confirmed a branch. When the Task has since moved to another
+    /// branch, the request is refused before anything is recorded or pushed.
+    #[tokio::test]
+    async fn a_confirmation_for_a_branch_the_task_no_longer_has_is_refused_before_anything_is_pushed() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        test_seam::fix_observation(true, BRANCH, true);
+        fx.state.task.tasks.write().await.get_mut(&fx.task_id).unwrap().branch_name = Some("renamed-branch".into());
+
+        let err = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap_err();
+
+        assert!(err.contains("no longer the branch you confirmed"), "{err}");
         assert!(fx.record().await.is_none(), "a refused request records nothing");
         assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()));
     }
