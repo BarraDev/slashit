@@ -613,6 +613,13 @@ pub struct NewTask {
 pub const INTEGRATION_UNFINISHED_REFUSAL: &str =
     "An integration is unfinished. Resume or Discard it before moving this Task.";
 
+/// What a person is told when a pull request is refused because the Task is in
+/// Human Review without an approval of its changes.
+pub const HUMAN_REVIEW_DELIVERY_REFUSAL: &str =
+    "This task is in Human Review and its changes have not been approved, so no pull request \
+     was opened and nothing was pushed. Approve the changes in the Human Review panel first, \
+     then create the pull request from there.";
+
 impl Task {
     /// Whether a resolved Worker handoff was followed by a durable human
     /// request for another implementation run. This does not apply to an
@@ -823,6 +830,18 @@ impl Task {
             .as_ref()
             .filter(|r| r.is_pending() && recoverable_here)
             .map(|_| INTEGRATION_UNFINISHED_REFUSAL.to_string())
+    }
+
+    /// Why a pull request may not be opened for this task right now, or `None`.
+    ///
+    /// A Task in Human Review is awaiting a person's decision, and opening a
+    /// pull request publishes its branch. Creating a pull request is not that
+    /// decision: only a current approval authorizes it, and the approved commit
+    /// is then bound by the delivery itself. Other states keep the behavior they
+    /// had before this check existed.
+    pub fn unapproved_human_review_delivery_refusal(&self) -> Option<String> {
+        (self.status == TaskStatus::HumanReview && !self.human_review.is_approved())
+            .then(|| HUMAN_REVIEW_DELIVERY_REFUSAL.to_string())
     }
 
     /// Why nothing but the restack's own recovery may change this task's
@@ -1137,6 +1156,16 @@ impl Task {
             // A move is a new decision about the Task, so an earlier approval
             // of its input no longer speaks for it.
             self.approved_execution = None;
+            // Leaving Human Review for work or review withdraws the approval of
+            // that arrival. A later return to Human Review by a manual move
+            // records no arrival, so without this the old approval would be
+            // reused for changes that were never decided. Done and PrCreated keep
+            // it: integration and the delivered pull request still read it.
+            if *from == TaskStatus::HumanReview
+                && !matches!(self.status, TaskStatus::HumanReview | TaskStatus::Done | TaskStatus::PrCreated)
+            {
+                self.human_review.withdraw_approval();
+            }
             let kind = ActivityKind::Moved {
                 from: from.column(),
                 to: self.status.column(),

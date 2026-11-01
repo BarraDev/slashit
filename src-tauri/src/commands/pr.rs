@@ -567,22 +567,54 @@ fn is_github_remote(url: &str) -> bool {
     host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com")
 }
 
+/// What one task came to in a bulk pull request run. A task that was refused
+/// or failed carries its reason in `error`; nothing is folded into a success.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BulkPrOutcome {
+    pub task_id: String,
+    /// The task's title when it could be read, so the person can tell the tasks
+    /// apart. Empty when the task is not known.
+    pub title: String,
+    pub pr_url: Option<String>,
+    pub error: Option<String>,
+}
+
 #[tauri::command]
 pub async fn bulk_create_prs(
     _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_ids: Vec<String>,
-) -> Result<Vec<String>, String> {
-    let mut results = Vec::new();
+) -> Result<Vec<BulkPrOutcome>, String> {
+    Ok(bulk_create_prs_inner(&state, &task_ids).await)
+}
 
+/// Run [`create_pr_inner`] for each task in order, so every task meets the same
+/// refusals as a single request. One task's refusal does not stop the others:
+/// the eligible ones are still delivered, and each outcome says what happened.
+pub(crate) async fn bulk_create_prs_inner(
+    state: &crate::AppState,
+    task_ids: &[String],
+) -> Vec<BulkPrOutcome> {
+    let mut outcomes = Vec::with_capacity(task_ids.len());
     for task_id in task_ids {
-        match create_pr_inner(&state, &task_id).await {
-            Ok(url) => results.push(format!("Created PR for {}: {}", task_id, url)),
-            Err(e) => results.push(format!("Failed for {}: {}", task_id, e)),
-        }
+        let title = match Uuid::parse_str(task_id) {
+            Ok(id) => state
+                .task
+                .tasks
+                .read()
+                .await
+                .get(&id)
+                .map(|t| t.title.clone())
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        let (pr_url, error) = match create_pr_inner(state, task_id).await {
+            Ok(url) => (Some(url), None),
+            Err(error) => (None, Some(error)),
+        };
+        outcomes.push(BulkPrOutcome { task_id: task_id.clone(), title, pr_url, error });
     }
-
-    Ok(results)
+    outcomes
 }
 
 #[tauri::command]
@@ -1778,8 +1810,28 @@ pub async fn address_pr_review_inner(
 
         // The fixes a commit now holds are owed a push, those of this apply
         // and those of an earlier one alike.
+        // "Auto-push branch" asks to publish review fixes. It is not a decision
+        // about a Task that is awaiting its Human Review decision, so for a Task
+        // nobody has approved the fixes stay in the local branch, as they do with
+        // auto-push off, and nothing reaches the remote branch.
         let to_push = owed_a_push(&updated_plan);
-        if committed_ok && !to_push.is_empty() && options.auto_push {
+        let push_held_for_review = task.unapproved_human_review_delivery_refusal().is_some();
+        if committed_ok && !to_push.is_empty() && options.auto_push && push_held_for_review {
+            let note = format!(
+                "this task is in Human Review and its changes have not been approved, so the review \
+                 fixes were committed in the task checkout but not pushed.{unpushed_replies_note}"
+            );
+            progress(PrReviewProgress {
+                task_id: task_id_str.clone(),
+                kind: "push_held_for_review".to_string(),
+                current: None,
+                total: None,
+                comment_id: None,
+                message: Some(note.clone()),
+            });
+            agent_summary.push_str(&format!("\n\n---\n\nNote: {note}\n"));
+        }
+        if committed_ok && !to_push.is_empty() && options.auto_push && !push_held_for_review {
             progress(PrReviewProgress {
                 task_id: task_id_str.clone(),
                 kind: "push_started".to_string(),
@@ -1791,7 +1843,19 @@ pub async fn address_pr_review_inner(
             let branch = task.branch_name.clone().ok_or_else(|| {
                 "This task has no branch recorded, so there is nothing to push.".to_string()
             })?;
-            match push_branch(&working_dir, &branch).await {
+            // The approval this push was decided under is read from the task
+            // snapshot above. A lifecycle transition that moves the task back to
+            // work asks this flow to end, and that can land after the commit
+            // above was made. The gate reads the cancellation again just before
+            // git is spawned, so such a transition still stops the push.
+            let stop_if_cancelled = || {
+                if *cancel_rx.borrow() {
+                    Err("The task was changed while its review fixes were being committed, so nothing was pushed. Apply the fixes again to push them.".to_string())
+                } else {
+                    Ok(())
+                }
+            };
+            match push_branch_pinned_gated(&working_dir, &branch, None, &stop_if_cancelled).await {
                 Ok(b) => {
                     pushed = true;
                     push_branch_name = Some(b.clone());
@@ -3366,6 +3430,40 @@ async fn reserve_task_for_pr_side_effect(
     state: &crate::AppState,
     task_id: Uuid,
 ) -> Result<Option<crate::queue::PrHelperLease>, String> {
+    reserve_task_admitted_as(state, task_id, PrSideEffectAdmission::RequiresApproval).await
+}
+
+/// [`reserve_task_for_pr_side_effect`] for an explicit publication: a person
+/// confirmed one commit on the Publish panel and asked for it to be pushed to
+/// an existing pull request. Only the publication command reaches this; every
+/// other pull request path takes [`reserve_task_for_pr_side_effect`].
+pub(super) async fn reserve_task_for_explicit_publication(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<Option<crate::queue::PrHelperLease>, String> {
+    reserve_task_admitted_as(state, task_id, PrSideEffectAdmission::ExplicitPublication).await
+}
+
+/// What a pull request side effect is admitted as. It decides only whether a
+/// Task in Human Review must hold a current approval. Every other check and the
+/// owner handling are the same for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrSideEffectAdmission {
+    /// Generic pull request creation, bulk and private-email recovery, and the
+    /// approved delivery: a Task in Human Review needs a current approval.
+    RequiresApproval,
+    /// An explicit publication of one confirmed commit to an existing pull
+    /// request. It neither needs nor records an approval, and it never creates
+    /// a pull request.
+    ExplicitPublication,
+}
+
+async fn reserve_task_admitted_as(
+    state: &crate::AppState,
+    task_id: Uuid,
+    admission: PrSideEffectAdmission,
+) -> Result<Option<crate::queue::PrHelperLease>, String> {
+    let approval_required = admission == PrSideEffectAdmission::RequiresApproval;
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
     refuse_while_republish_pending(state, task_id).await?;
     // A pull request moves the task to PR Created, out of the column its
@@ -3384,10 +3482,48 @@ async fn reserve_task_for_pr_side_effect(
     {
         return Err(refusal);
     }
-    match state.executor.get() {
-        Some(executor) => executor.begin_pr_side_effect_under_lease(task_id).await.map(Some),
-        None => Ok(None),
+    // Every generic pull request creation passes through here (single, bulk and
+    // the private-email recovery). A Task awaiting a Human Review decision is
+    // published only with a current approval; this is decided under the lease,
+    // before any owner is ended or anything is pushed. The approved delivery
+    // (`create_pr_for_approved_task`) checks its own approval. An explicit
+    // publication is admitted without this check, and it does not approve or
+    // record anything either.
+    if approval_required {
+        if let Some(refusal) = state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .and_then(Task::unapproved_human_review_delivery_refusal)
+        {
+            return Err(refusal);
+        }
     }
+    let Some(executor) = state.executor.get() else {
+        return Ok(None);
+    };
+    let reservation = executor.begin_pr_side_effect_under_lease(task_id).await?;
+    // Checked again once the owners are ended. Ending an AI review waits for it to
+    // finish, and its fix stage can write Human Review in that window, after the
+    // check above read the status. The lease is still held, so nothing else can
+    // change the status before the reservation is returned. Dropping it on refusal
+    // retires the owner just registered.
+    if approval_required {
+        if let Some(refusal) = state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .and_then(Task::unapproved_human_review_delivery_refusal)
+        {
+            drop(reservation);
+            return Err(refusal);
+        }
+    }
+    Ok(Some(reservation))
 }
 
 /// [`reserve_task_for_pr_side_effect`] for the restack's own Resume and
@@ -3412,6 +3548,197 @@ async fn refuse_while_republish_pending(state: &crate::AppState, task_id: Uuid) 
         Some(refusal) => Err(refusal),
         None => Ok(()),
     }
+}
+
+/// Refuse a publication of an approved commit once its approval no longer
+/// stands. Callers check the approval under the task's lease before they
+/// reserve it; this is the check made again after any lookup or wait that
+/// could have let a move back to work through, and just before the push.
+async fn refuse_unless_still_approved(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<(), String> {
+    let approved = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .is_some_and(|t| t.human_review.is_approved());
+    if approved {
+        return Ok(());
+    }
+    Err(
+        "The task is no longer in Human Review with its changes approved, so nothing was pushed."
+            .to_string(),
+    )
+}
+
+/// [`refuse_unless_still_approved`] for the push gate, which is synchronous.
+/// The task map is read without waiting. When it is locked at that instant the
+/// answer is unknown, so the push is refused rather than assumed to be approved.
+fn refuse_unless_still_approved_now(state: &crate::AppState, task_id: Uuid) -> Result<(), String> {
+    let tasks = state.task.tasks.try_read().map_err(|_| {
+        "The task's approval could not be read just before the push, so nothing was pushed. \
+         Approve it again to retry."
+            .to_string()
+    })?;
+    if tasks.get(&task_id).is_some_and(|t| t.human_review.is_approved()) {
+        return Ok(());
+    }
+    Err(
+        "The task is no longer in Human Review with its changes approved, so nothing was pushed."
+            .to_string(),
+    )
+}
+
+/// The Human Review rule of [`Task::unapproved_human_review_delivery_refusal`],
+/// read for the push gate. It needs no bound commit, so it also covers an
+/// approved delivery whose approval went away before the commit was bound. A
+/// task that is not in Human Review passes. When the task map is locked at
+/// that instant the answer is unknown, so the push is refused.
+fn refuse_unapproved_human_review_now(state: &crate::AppState, task_id: Uuid) -> Result<(), String> {
+    let tasks = state.task.tasks.try_read().map_err(|_| {
+        "The task's Human Review state could not be read just before the push, so nothing was \
+         pushed. Try again."
+            .to_string()
+    })?;
+    match tasks.get(&task_id).and_then(Task::unapproved_human_review_delivery_refusal) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// Where the remote branch of a pull request stands relative to an approved
+/// commit.
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteBranchRelation {
+    /// The remote has no such branch.
+    Missing,
+    /// The remote branch is at the approved commit.
+    At,
+    /// The approved commit is an ancestor of the remote tip: it is already
+    /// published, with later commits on top.
+    Contains,
+    /// Neither: the approved commit has to be pushed, and git accepts it only
+    /// when it fast-forwards the remote branch.
+    Other,
+}
+
+/// Run `git` with the repository prefix `prefix` (the jj backing Git directory,
+/// when there is one) and return its trimmed stdout.
+async fn run_git_in(working_dir: &str, prefix: &[String], args: &[&str]) -> Result<String, String> {
+    let mut all: Vec<&str> = prefix.iter().map(String::as_str).collect();
+    all.extend_from_slice(args);
+    run_cmd("git", &all, working_dir).await
+}
+
+/// Compare the remote branch `branch` with `approved`, reading the same remote
+/// a push would write (`origin`'s push URL). When the remote tip is not known
+/// locally, it is fetched into `FETCH_HEAD`, which never moves a branch.
+async fn remote_branch_relation(
+    working_dir: &str,
+    branch: &str,
+    approved: &str,
+) -> Result<RemoteBranchRelation, String> {
+    let mut prefix: Vec<String> = Vec::new();
+    if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+        prefix.push(git_dir);
+    }
+    let url = run_git_in(working_dir, &prefix, &["remote", "get-url", "--push", "origin"]).await?;
+    let refspec = format!("refs/heads/{branch}");
+    let listed = run_git_in(working_dir, &prefix, &["ls-remote", "--heads", &url, &refspec]).await?;
+    let Some(remote_tip) = listed.split_whitespace().next().map(str::to_string) else {
+        return Ok(RemoteBranchRelation::Missing);
+    };
+    if remote_tip == approved {
+        return Ok(RemoteBranchRelation::At);
+    }
+    run_git_in(working_dir, &prefix, &["fetch", "--no-tags", "--quiet", &url, &refspec]).await?;
+    let fetched = run_git_in(working_dir, &prefix, &["rev-parse", "FETCH_HEAD"]).await?;
+    if fetched != remote_tip {
+        return Err(
+            "The branch on GitHub moved while SlashIt was checking it, so nothing was pushed. \
+             Try again."
+                .to_string(),
+        );
+    }
+    let mut ancestry = crate::host_process::tokio_command(program("git"));
+    ancestry.args(&prefix).args(["merge-base", "--is-ancestor", approved, &remote_tip]);
+    let status = ancestry
+        .current_dir(working_dir)
+        .status()
+        .await
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    match status.code() {
+        Some(0) => Ok(RemoteBranchRelation::Contains),
+        Some(1) => Ok(RemoteBranchRelation::Other),
+        _ => Err("Git could not tell whether the approved commit is on the branch on GitHub, so nothing was pushed.".to_string()),
+    }
+}
+
+/// Make the approved commit `tip` the head of the branch of the pull request
+/// `pr_url`, which already exists. Nothing is forced, and nothing is pushed
+/// unless the approved commit is actually missing from the remote branch:
+///
+/// - When the remote branch is at the approved commit, or has it as an
+///   ancestor (later commits were pushed on top), the approved commit is
+///   already published and nothing is pushed.
+/// - Otherwise the pull request must still be open. A merged or closed pull
+///   request's branch is not updated, because a push would recreate a branch
+///   GitHub removed.
+/// - The push is pinned to `tip` by object ID, and [`push_branch_pinned`]
+///   refuses a branch that moved. A remote branch with commits this task does
+///   not have is refused by git and reported with [`explain_refused_publication`].
+async fn publish_approved_to_existing_pr(
+    state: &crate::AppState,
+    task_id: Uuid,
+    working_dir: &str,
+    branch: &str,
+    tip: &str,
+    pr_url: &str,
+    reservation: &Option<crate::queue::PrHelperLease>,
+) -> Result<(), String> {
+    refuse_if_pr_operation_cancelled(reservation, "pushing the branch")?;
+    refuse_unless_still_approved(state, task_id).await?;
+    match remote_branch_relation(working_dir, branch, tip).await? {
+        RemoteBranchRelation::At | RemoteBranchRelation::Contains => return Ok(()),
+        RemoteBranchRelation::Missing | RemoteBranchRelation::Other => {}
+    }
+    let pr_state = fetch_pr_state(&state.pr_statuses, pr_url).await;
+    if pr_state.as_deref() != Some("OPEN") {
+        let described = match pr_state.as_deref() {
+            Some(found) => format!("is {}", found.to_lowercase()),
+            None => "could not be read".to_string(),
+        };
+        return Err(format!(
+            "The pull request for this branch {described}, so the approved commit was not pushed. \
+             SlashIt does not update the branch of a pull request that is not open. Review the \
+             pull request on GitHub."
+        ));
+    }
+    // The reads above are waits too: the approval and the cancellation are read
+    // again by the gate, just before git is spawned.
+    push_branch_pinned_gated(working_dir, branch, Some(tip), &|| {
+        refuse_unless_still_approved_now(state, task_id)?;
+        refuse_if_pr_operation_cancelled(reservation, "pushing the branch")
+    })
+    .await
+    .map(|_| ())
+    .map_err(explain_refused_publication)
+}
+
+/// What a refused push to an existing pull request means to the person. A
+/// rejected non-fast-forward push is named as one, with the reason it did not
+/// overwrite anything; every other failure keeps its usual wording.
+fn explain_refused_publication(error: String) -> String {
+    if error.contains("non-fast-forward") || error.contains("fetch first") {
+        return "GitHub's copy of this pull request's branch has commits this task does not have, so \
+                the approved commit was not pushed, and nothing was overwritten. Review what changed \
+                on GitHub, then approve the task's current changes again."
+            .to_string();
+    }
+    friendly_pr_error(error)
 }
 
 /// Refuse to begin `step` once a lifecycle transition has asked the PR
@@ -3609,12 +3936,33 @@ async fn create_pr_reserved(
     // re-authored it, the commit the recovery proved is that one), and the
     // push below names it by object ID so the branch moving from here on
     // cannot change what is sent.
+    // A delivery with no re-authored tip is the approved path: its publish tip, when
+    // there is one, is the commit a person approved and must be pushed by object ID.
+    let approved_delivery = reauthored_tip.is_none();
     let mut publish_tip = match reauthored_tip {
         Some(tip) => Some(tip),
         None => approved_commit_for_delivery(state, task_uuid).await?,
     };
 
-    if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, &task_branch_name).await? {
+    if let Some(existing_pr_url) =
+        find_existing_pr_for_branch(&working_dir, &task_branch_name).await?
+    {
+        // A pull request that already exists does not mean its branch has the
+        // approved commit. Publish it to that branch first, by object ID and
+        // without force, so an approved fix held locally reaches the pull
+        // request instead of being linked without it.
+        if let (true, Some(tip)) = (approved_delivery, publish_tip.as_deref()) {
+            publish_approved_to_existing_pr(
+                state,
+                task_uuid,
+                &working_dir,
+                &task_branch_name,
+                tip,
+                &existing_pr_url,
+                &reservation,
+            )
+            .await?;
+        }
         // Classified rather than flattened. A cleanup this refused is a task that
         // is simply not finished, and the refusal is already persisted onto its
         // card as `error_message`; the pull request is real either way and the
@@ -3666,11 +4014,27 @@ async fn create_pr_reserved(
         );
     }
 
+    // The approval and the cancellation are both read by the gate, which runs
+    // after the export and branch reads inside the push and just before git is
+    // spawned. A check made before those waits would let a withdrawal or a
+    // cancellation that lands during them still publish.
+    // An approved delivery is refused by the Human Review rule itself when the
+    // approval is gone, even when no commit was bound: a bound tip is then
+    // missing, and the push would otherwise go by branch name.
+    let approval_required = approved_delivery && publish_tip.is_some();
     let branch = push_branch_pinned_gated(
         &working_dir,
         &task_branch_name,
         publish_tip.as_deref(),
-        &|| refuse_if_pr_operation_cancelled(&reservation, "pushing the branch"),
+        &|| {
+            if approved_delivery {
+                refuse_unapproved_human_review_now(state, task_uuid)?;
+            }
+            if approval_required {
+                refuse_unless_still_approved_now(state, task_uuid)?;
+            }
+            refuse_if_pr_operation_cancelled(&reservation, "pushing the branch")
+        },
     )
     .await
     .map_err(friendly_pr_error)?;
@@ -5723,6 +6087,10 @@ fn build_pr_body(task: &Task) -> String {
 /// The branch is checked by [`checked_task_branch`] and, separately, never
 /// reaches `git` as a bare argument: it gets `--` and a fully qualified
 /// `refs/heads/<b>:refs/heads/<b>` refspec.
+///
+/// Test-only: production pushes go through [`push_branch_pinned_gated`], so
+/// that every push has a gate just before git is spawned.
+#[cfg(test)]
 async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> {
     push_branch_pinned(working_dir, branch, None).await
 }
@@ -5738,8 +6106,36 @@ async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> 
 /// before anything is sent. The push is still an ordinary one: a remote
 /// branch that is not an ancestor of the pinned commit is refused, never
 /// forced.
+#[cfg(test)]
 async fn push_branch_pinned(working_dir: &str, branch: &str, pinned: Option<&str>) -> Result<String, String> {
     push_branch_pinned_gated(working_dir, branch, pinned, &|| Ok(())).await
+}
+
+/// Test-only seam: one hook, armed for one working directory, runs in the
+/// window between a push's preparation and its gate. A test uses it to move
+/// approval or cancellation into that window deterministically.
+#[cfg(test)]
+mod before_gate_hook {
+    use std::sync::Mutex;
+
+    static HOOK: Mutex<Option<(String, Box<dyn FnOnce() + Send>)>> = Mutex::new(None);
+
+    pub(super) fn arm(working_dir: &str, hook: impl FnOnce() + Send + 'static) {
+        *HOOK.lock().unwrap() = Some((working_dir.to_string(), Box::new(hook)));
+    }
+
+    pub(super) fn run(working_dir: &str) {
+        let due = {
+            let mut slot = HOOK.lock().unwrap();
+            match slot.as_ref() {
+                Some((dir, _)) if dir == working_dir => slot.take().map(|(_, hook)| hook),
+                _ => None,
+            }
+        };
+        if let Some(hook) = due {
+            hook();
+        }
+    }
 }
 
 /// [`push_branch_pinned`] with `before_push` consulted as the last step before
@@ -5781,6 +6177,8 @@ async fn push_branch_pinned_gated(
     };
     let refspec = format!("{source}:refs/heads/{branch}");
     git_args.extend(["push", "-u", "--", "origin", &refspec].map(String::from));
+    #[cfg(test)]
+    before_gate_hook::run(working_dir);
     before_push()?;
     let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
     run_cmd("git", &git_args, working_dir).await
@@ -8710,6 +9108,229 @@ mod tests {
             );
         }
 
+        /// U3a: generic pull request creation, single and bulk, must not publish a
+        /// Task that is in Human Review without a current human approval.
+        #[cfg(unix)]
+        mod human_review_gate {
+            use super::*;
+            use crate::commands::human_review::approve_shown;
+
+            const PR_URL: &str = "https://github.com/testorg/testrepo/pull/7";
+
+            fn point_origin_at_github(repo: &RepoFixture) {
+                git(&repo.checkout, &["remote", "set-url", "origin", "https://github.com/testorg/testrepo.git"]);
+                git(&repo.checkout, &["remote", "set-url", "--push", "origin", repo.remote.to_str().unwrap()]);
+            }
+
+            fn create_branch(repo: &RepoFixture, branch: &str) -> String {
+                git(&repo.checkout, &["branch", branch, "main"]);
+                git(&repo.checkout, &["rev-parse", branch])
+            }
+
+            async fn task_json(state: &crate::AppState, task_id: Uuid) -> serde_json::Value {
+                let task = state.task.tasks.read().await.get(&task_id).cloned().expect("the task exists");
+                serde_json::to_value(task).expect("a task serializes")
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn generic_pr_creation_refuses_an_unapproved_human_review_task_without_side_effects() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-unreviewed");
+                let mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-unreviewed"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let before = task_json(&state, task_id).await;
+
+                let first = create_pr_inner(&state, &task_id.to_string()).await;
+                let second = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert!(first.is_err(), "an unapproved Human Review task must be refused, got {first:?}");
+                assert_eq!(first, second, "a repeated refused request must give the same answer");
+                assert_eq!(repo.remote_has_branch("task-unreviewed"), None, "a refused request must not push");
+                let log = mock.read_log();
+                assert!(!log.contains("pr\ncreate"), "a refused request must not open a pull request: {log}");
+                assert_eq!(
+                    task_json(&state, task_id).await,
+                    before,
+                    "a refused request must leave the task, its history and its checkout as they were"
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn bulk_creation_refuses_the_unreviewed_task_and_still_delivers_the_eligible_one() {
+                let _guard = PATH_LOCK.lock().await;
+                let unreviewed = RepoFixture::new();
+                point_origin_at_github(&unreviewed);
+                create_branch(&unreviewed, "task-unreviewed");
+                let eligible = RepoFixture::new();
+                point_origin_at_github(&eligible);
+                let eligible_sha = create_branch(&eligible, "task-done");
+                let mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let refused_id = seed_task(
+                    &state,
+                    unreviewed.checkout.to_str().unwrap(),
+                    Some("task-unreviewed"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let done_id = seed_task(
+                    &state,
+                    eligible.checkout.to_str().unwrap(),
+                    Some("task-done"),
+                    TaskStatus::Done,
+                )
+                .await;
+
+                let outcomes =
+                    bulk_create_prs_inner(&state, &[refused_id.to_string(), done_id.to_string()]).await;
+
+                assert_eq!(outcomes.len(), 2);
+                assert_eq!(outcomes[0].pr_url, None, "the unreviewed task must get no pull request: {outcomes:?}");
+                assert!(outcomes[0].error.is_some(), "the unreviewed task must report a refusal: {outcomes:?}");
+                assert_eq!(outcomes[1].error, None, "the eligible task must still be delivered: {outcomes:?}");
+                assert_eq!(outcomes[1].pr_url.as_deref(), Some(PR_URL));
+                assert_eq!(unreviewed.remote_has_branch("task-unreviewed"), None);
+                assert_eq!(
+                    eligible.remote_has_branch("task-done").as_deref(),
+                    Some(eligible_sha.as_str())
+                );
+                assert_eq!(mock.read_log().matches("pr\ncreate").count(), 1);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approved_human_review_task_still_delivers_through_the_generic_path() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let sha = create_branch(&repo, "task-approved");
+                let mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-approved"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                approve_shown(&state, task_id, false).await.expect("the approval is recorded");
+
+                let url = create_pr_inner(&state, &task_id.to_string())
+                    .await
+                    .expect("an approved Human Review task is delivered");
+
+                assert_eq!(url, PR_URL);
+                assert_eq!(repo.remote_has_branch("task-approved").as_deref(), Some(sha.as_str()));
+                assert_eq!(mock.read_log().matches("pr\ncreate").count(), 1);
+            }
+
+            /// An AI review's fix stage moves the task to Human Review while the
+            /// pull request flow is ending it. The status read before that point
+            /// was AiReview, so the check made after the owners are ended must
+            /// refuse the request before anything is pushed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_review_that_moves_the_task_to_human_review_while_ended_is_refused_before_any_push() {
+                use crate::test_helpers::attach_test_executor;
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-review-race");
+                let mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-review-race"),
+                    TaskStatus::AiReview,
+                )
+                .await;
+                let executor = attach_test_executor(&state);
+                executor
+                    .register_fake_reviewing_owner_writing_human_review_for_test(
+                        task_id,
+                        state.task.tasks.clone(),
+                    )
+                    .await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert!(result.is_err(), "the request must be refused, got {result:?}");
+                assert_eq!(repo.remote_has_branch("task-review-race"), None, "nothing may be pushed");
+                assert!(!mock.read_log().contains("pr\ncreate"), "no pull request may be opened");
+                assert_eq!(
+                    state.task.tasks.read().await.get(&task_id).map(|t| t.status.clone()),
+                    Some(TaskStatus::HumanReview),
+                    "the review's own write is left as it was"
+                );
+            }
+
+            /// Approval and a generic request race on the task's lifecycle lease.
+            /// The gate holds whichever order they take: a delivery that happens
+            /// is always covered by an approval that is still current afterwards,
+            /// and a refused request publishes nothing. This is an outcome check
+            /// over several rounds, not a proof of one schedule.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approval_racing_a_generic_request_never_delivers_without_one() {
+                let _guard = PATH_LOCK.lock().await;
+                for round in 0..8 {
+                    let repo = RepoFixture::new();
+                    point_origin_at_github(&repo);
+                    let sha = create_branch(&repo, "task-race");
+                    let mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                    let (state, _tmp) = build_test_state().await;
+                    let task_id = seed_task(
+                        &state,
+                        repo.checkout.to_str().unwrap(),
+                        Some("task-race"),
+                        TaskStatus::HumanReview,
+                    )
+                    .await;
+
+                    let id = task_id.to_string();
+                    let (generic, approval) = tokio::join!(
+                        create_pr_inner(&state, &id),
+                        approve_shown(&state, task_id, false),
+                    );
+                    let approved_now = state
+                        .task
+                        .tasks
+                        .read()
+                        .await
+                        .get(&task_id)
+                        .is_some_and(|t| t.human_review.is_approved());
+                    let published = repo.remote_has_branch("task-race");
+
+                    match generic {
+                        Ok(_) => {
+                            assert!(
+                                approval.is_ok() && approved_now,
+                                "round {round}: a delivery must be covered by an approval that is current afterwards \
+                                 (approval: {approval:?})"
+                            );
+                            assert_eq!(published.as_deref(), Some(sha.as_str()), "round {round}");
+                        }
+                        Err(_) => {
+                            assert_eq!(published, None, "round {round}: a refused request must not push");
+                            assert!(!mock.read_log().contains("pr\ncreate"), "round {round}");
+                        }
+                    }
+                }
+            }
+        }
+
         /// Approving at Human Review, then opening the pull request through
         /// this same flow (`commands::human_review`).
         #[cfg(unix)]
@@ -8744,6 +9365,192 @@ mod tests {
 
             async fn project_of(state: &crate::AppState, task_id: Uuid) -> Uuid {
                 state.task.tasks.read().await.get(&task_id).unwrap().project_id
+            }
+
+            /// The gate reads the approval synchronously. An unapproved task is
+            /// refused, an approved one passes, and a task map that cannot be read
+            /// at that instant is refused rather than assumed approved.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_push_gate_approval_read_refuses_unapproved_and_fails_closed_when_locked() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-gate"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+
+                let err = refuse_unless_still_approved_now(&state, task_id)
+                    .expect_err("an unapproved task must not be pushed");
+                assert!(err.contains("no longer in Human Review"), "{err}");
+
+                state
+                    .task
+                    .tasks
+                    .write()
+                    .await
+                    .get_mut(&task_id)
+                    .expect("the seeded task")
+                    .human_review
+                    .approve(Some("0123456789abcdef0123456789abcdef01234567".to_string()), chrono::Utc::now());
+                refuse_unless_still_approved_now(&state, task_id).expect("an approved task passes the gate");
+
+                {
+                    let _held = state.task.tasks.write().await;
+                    let err = refuse_unless_still_approved_now(&state, task_id)
+                        .expect_err("a locked task map must fail closed");
+                    assert!(err.contains("could not be read"), "{err}");
+                }
+            }
+
+            /// The two admissions differ in exactly one thing. For the same
+            /// unapproved Human Review Task, generic admission is refused and the
+            /// explicit publication admission is granted, and neither changes the
+            /// Task's Human Review record or status.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn only_the_explicit_publication_admission_passes_an_unapproved_human_review_task() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-admission"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let before = state.task.tasks.read().await.get(&task_id).cloned().expect("the seeded task");
+
+                let refusal = reserve_task_for_pr_side_effect(&state, task_id)
+                    .await
+                    .err()
+                    .expect("generic admission refuses an unapproved Human Review task");
+                assert!(refusal.contains("have not been approved"), "{refusal}");
+
+                reserve_task_for_explicit_publication(&state, task_id)
+                    .await
+                    .expect("explicit publication admission is granted");
+
+                let after = state.task.tasks.read().await.get(&task_id).cloned().expect("the task");
+                assert_eq!(after.human_review, before.human_review, "admission records no decision");
+                assert_eq!(after.status, TaskStatus::HumanReview);
+            }
+
+            /// The gate's Human Review rule applies to every Task in Human Review
+            /// that is not approved, whether or not a commit was bound, and to
+            /// nothing else. A locked task map is refused, not assumed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_push_gate_human_review_rule_refuses_only_an_unapproved_human_review_task() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-rule"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+
+                let refusal = refuse_unapproved_human_review_now(&state, task_id)
+                    .err()
+                    .expect("an unapproved Human Review task is refused");
+                assert!(refusal.contains("have not been approved"), "{refusal}");
+
+                state
+                    .task
+                    .tasks
+                    .write()
+                    .await
+                    .get_mut(&task_id)
+                    .expect("the seeded task")
+                    .human_review
+                    .approve(Some("0123456789abcdef0123456789abcdef01234567".to_string()), chrono::Utc::now());
+                refuse_unapproved_human_review_now(&state, task_id).expect("an approved task passes");
+
+                state.task.tasks.write().await.get_mut(&task_id).expect("the seeded task").status =
+                    TaskStatus::PrCreated;
+                state
+                    .task
+                    .tasks
+                    .write()
+                    .await
+                    .get_mut(&task_id)
+                    .expect("the seeded task")
+                    .human_review
+                    .withdraw_approval();
+                refuse_unapproved_human_review_now(&state, task_id)
+                    .expect("a task outside Human Review passes the rule");
+
+                {
+                    let _held = state.task.tasks.write().await;
+                    let refusal = refuse_unapproved_human_review_now(&state, task_id)
+                        .err()
+                        .expect("a locked task map fails closed");
+                    assert!(refusal.contains("could not be read"), "{refusal}");
+                }
+            }
+
+            /// An approval withdrawn after the existing-pull-request delivery has
+            /// finished its reads, and just before its push gate, publishes
+            /// nothing. The window is reached deterministically by the test hook.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approval_withdrawn_between_the_reads_and_the_push_gate_publishes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let sha = create_branch(&repo, "task-gate-window");
+                let _mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-gate-window"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                state
+                    .task
+                    .tasks
+                    .write()
+                    .await
+                    .get_mut(&task_id)
+                    .expect("the seeded task")
+                    .human_review
+                    .approve(Some(sha.clone()), chrono::Utc::now());
+
+                let working_dir = repo.checkout.to_str().unwrap().to_string();
+                let tasks = state.task.tasks.clone();
+                super::before_gate_hook::arm(&working_dir, move || {
+                    tasks
+                        .try_write()
+                        .expect("no reader holds the task map at the gate")
+                        .get_mut(&task_id)
+                        .expect("the task")
+                        .human_review
+                        .withdraw_approval();
+                });
+
+                let err = publish_approved_to_existing_pr(
+                    &state,
+                    task_id,
+                    &working_dir,
+                    "task-gate-window",
+                    &sha,
+                    PR_URL,
+                    &None,
+                )
+                .await
+                .err()
+                .expect("an approval withdrawn before the gate must not publish");
+                assert!(err.contains("no longer"), "{err}");
+                assert_eq!(repo.remote_has_branch("task-gate-window"), None, "nothing reached the remote");
             }
 
             #[tokio::test(flavor = "multi_thread")]
@@ -9265,6 +10072,530 @@ mod tests {
                 let task = state.task.tasks.read().await[&task_id].clone();
                 assert!(!task.human_review.is_approved());
                 assert_eq!(task.human_review.pr_error, None);
+            }
+
+            /// The `gh pr list` answer for `branch`: its own pull request is
+            /// already open at [`PR_URL`]. `before` runs first, for a test that
+            /// needs to hold the lookup.
+            fn existing_pr_answer(branch: &str, before: &str) -> (String, String) {
+                (
+                    format!("pr list --head {branch} --state all --limit {PR_LOOKUP_LIMIT} --json url,isCrossRepository"),
+                    format!(r#"{before}printf '%s' '[{{"url":"{PR_URL}","isCrossRepository":false}}]'"#),
+                )
+            }
+
+            /// Publish `branch` to the fixture's remote, as the pull request's
+            /// branch on GitHub, and return the commit it now names.
+            fn publish(repo: &RepoFixture, branch: &str) -> String {
+                git(&repo.checkout, &["push", "-q", "origin", branch]);
+                git(&repo.checkout, &["rev-parse", branch])
+            }
+
+            /// The stranded case: a pull request is already open and its last
+            /// commit is on GitHub. A review fix was committed locally after
+            /// that, and its push was held. A person approves the current
+            /// commit and asks for delivery.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approved_fix_held_locally_is_published_to_the_existing_pull_request() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-stranded");
+                let published = publish(&repo, "task-stranded");
+                let fix = advance_branch(&repo, "task-stranded");
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-stranded", "")]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-stranded"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let project_id = project_of(&state, task_id).await;
+
+                let outcome = approve_shown(&state, task_id, true).await.expect("the approval is recorded");
+
+                assert_eq!(outcome.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
+                assert_ne!(published, fix, "the fix is a commit the pull request did not have");
+                assert_eq!(
+                    repo.remote_has_branch("task-stranded").as_deref(),
+                    Some(fix.as_str()),
+                    "the approved commit reached the pull request's branch"
+                );
+                assert!(!mock.read_log().contains("pr\ncreate"), "the existing pull request is reused");
+                assert_eq!(outcome.task.status, TaskStatus::PrCreated);
+                assert_eq!(outcome.task.pr_url.as_deref(), Some(PR_URL));
+                assert_eq!(outcome.task.human_review.approved_tip(), Some(fix.as_str()));
+                assert_eq!(on_disk(&state, project_id, task_id).pr_url.as_deref(), Some(PR_URL));
+            }
+
+            /// Approving without delivery records the commit and publishes nothing,
+            /// even though a pull request already exists for the branch.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn approving_without_delivery_records_the_commit_and_publishes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-approve-only");
+                let published = publish(&repo, "task-approve-only");
+                let fix = advance_branch(&repo, "task-approve-only");
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-approve-only", "")]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-approve-only"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let project_id = project_of(&state, task_id).await;
+
+                let outcome = approve_shown(&state, task_id, false).await.expect("the approval is recorded");
+
+                assert_eq!(outcome.pr, None);
+                assert_eq!(outcome.task.status, TaskStatus::HumanReview);
+                assert_eq!(outcome.task.pr_url, None);
+                assert_eq!(outcome.task.human_review.approved_tip(), Some(fix.as_str()));
+                assert_eq!(
+                    repo.remote_has_branch("task-approve-only").as_deref(),
+                    Some(published.as_str()),
+                    "nothing was published by approving"
+                );
+                assert!(!mock.read_log().contains("pr\ncreate"));
+                assert_eq!(
+                    on_disk(&state, project_id, task_id).human_review.approved_tip(),
+                    Some(fix.as_str()),
+                    "the approved commit is on disk"
+                );
+            }
+
+            /// A commit the pull request already has is not pushed again, and
+            /// asking for delivery again opens nothing new.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_commit_already_on_the_pull_request_is_not_pushed_again_and_repeating_delivery_is_idempotent() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-repeat");
+                publish(&repo, "task-repeat");
+                let fix = advance_branch(&repo, "task-repeat");
+                let fix_on_remote = publish(&repo, "task-repeat");
+                assert_eq!(fix_on_remote, fix);
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-repeat", "")]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-repeat"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+
+                let outcome = approve_shown(&state, task_id, true).await.expect("the approval is recorded");
+                assert_eq!(outcome.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
+                assert_eq!(repo.remote_has_branch("task-repeat").as_deref(), Some(fix.as_str()));
+
+                let again = create_pr_inner(&state, &task_id.to_string()).await.expect("asked again");
+                assert_eq!(again, PR_URL);
+                assert_eq!(repo.remote_has_branch("task-repeat").as_deref(), Some(fix.as_str()));
+                assert!(!mock.read_log().contains("pr\ncreate"), "no second pull request");
+                let task = state.task.tasks.read().await[&task_id].clone();
+                assert_eq!(task.human_review.entries.len(), 1, "no second approval");
+                assert_eq!(task.pr_url.as_deref(), Some(PR_URL));
+            }
+
+            /// GitHub's branch has a commit this task does not have. The approved
+            /// commit is refused without a force push, and the approval and the
+            /// local branch both stay.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_remote_branch_that_diverged_is_refused_without_a_force_push() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let base = create_branch(&repo, "task-diverged");
+                publish(&repo, "task-diverged");
+                let fix = advance_branch(&repo, "task-diverged");
+                // Someone else pushed a different commit to the same branch.
+                let other = git(&repo.checkout, &["commit-tree", "-m", "pushed from elsewhere", "-p", &base, "main^{tree}"]);
+                git(&repo.checkout, &["push", "-q", "origin", &format!("{other}:refs/heads/task-diverged")]);
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-diverged", "")]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-diverged"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+
+                let outcome = approve_shown(&state, task_id, true).await.expect("the approval is recorded");
+
+                let Some(PrDelivery::Failed { reason }) = outcome.pr.clone() else {
+                    panic!("a diverged branch must not be published: {:?}", outcome.pr);
+                };
+                assert!(reason.contains("nothing was overwritten"), "{reason}");
+                assert_eq!(
+                    repo.remote_has_branch("task-diverged").as_deref(),
+                    Some(other.as_str()),
+                    "the remote branch was not force-pushed"
+                );
+                assert_eq!(git(&repo.checkout, &["rev-parse", "task-diverged"]), fix, "the local fix is kept");
+                assert!(!mock.read_log().contains("pr\ncreate"));
+                assert_eq!(outcome.task.status, TaskStatus::HumanReview);
+                assert!(outcome.task.human_review.is_approved());
+                assert_eq!(outcome.task.human_review.pr_error.as_deref(), Some(reason.as_str()));
+                assert_eq!(outcome.task.pr_url, None);
+            }
+
+            /// A commit made after the approval was recorded is not published to
+            /// the existing pull request under that approval.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_committed_after_the_approval_is_not_published_to_the_pull_request() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-moved-after");
+                let published = publish(&repo, "task-moved-after");
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-moved-after", "")]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-moved-after"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let project_id = project_of(&state, task_id).await;
+                approve_shown(&state, task_id, false).await.expect("approved");
+                let later = advance_branch(&repo, "task-moved-after");
+
+                let outcome = retry_delivery(&state, task_id).await.expect("asked");
+                let Some(PrDelivery::Failed { reason }) = outcome.pr else {
+                    panic!("the branch moved after approval, so nothing may be published: {:?}", outcome.pr);
+                };
+                assert!(reason.contains("changed since you approved"), "{reason}");
+                assert_eq!(repo.remote_has_branch("task-moved-after").as_deref(), Some(published.as_str()));
+                assert_eq!(git(&repo.checkout, &["rev-parse", "task-moved-after"]), later, "no commit was discarded");
+                assert!(!mock.read_log().contains("pr\ncreate"));
+                for task in [state.task.tasks.read().await[&task_id].clone(), on_disk(&state, project_id, task_id)] {
+                    assert_eq!(task.status, TaskStatus::HumanReview);
+                    assert_eq!(task.human_review.approved_tip(), Some(published.as_str()));
+                    assert_eq!(task.human_review.entries.len(), 1);
+                }
+            }
+
+            /// The push to the existing pull request fails. The approval and the
+            /// local fix survive, the failure is recorded, and asking again once
+            /// the remote is reachable publishes the same commit.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_publication_keeps_the_approval_and_the_local_fix() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-publish-fails");
+                let published = publish(&repo, "task-publish-fails");
+                let fix = advance_branch(&repo, "task-publish-fails");
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-publish-fails", "")]);
+                git(
+                    &repo.checkout,
+                    &["remote", "set-url", "--push", "origin", repo.remote.with_file_name("missing.git").to_str().unwrap()],
+                );
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-publish-fails"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let project_id = project_of(&state, task_id).await;
+
+                let outcome = approve_shown(&state, task_id, true).await.expect("the approval is recorded");
+                let Some(PrDelivery::Failed { reason }) = outcome.pr.clone() else {
+                    panic!("the push cannot reach the remote: {:?}", outcome.pr);
+                };
+                assert!(!reason.is_empty());
+                assert_eq!(outcome.task.status, TaskStatus::HumanReview);
+                assert!(outcome.task.human_review.is_approved(), "the approval survives");
+                assert_eq!(outcome.task.human_review.approved_tip(), Some(fix.as_str()));
+                assert_eq!(outcome.task.human_review.pr_error.as_deref(), Some(reason.as_str()));
+                assert_eq!(git(&repo.checkout, &["rev-parse", "task-publish-fails"]), fix, "the local fix is kept");
+                assert_eq!(repo.remote_has_branch("task-publish-fails").as_deref(), Some(published.as_str()));
+                assert_eq!(
+                    on_disk(&state, project_id, task_id).human_review.pr_error.as_deref(),
+                    Some(reason.as_str())
+                );
+                assert!(!mock.read_log().contains("pr\ncreate"));
+
+                point_origin_at_github(&repo);
+                let retried = retry_delivery(&state, task_id).await.expect("a retry is allowed");
+                assert_eq!(retried.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
+                assert_eq!(repo.remote_has_branch("task-publish-fails").as_deref(), Some(fix.as_str()));
+                assert_eq!(retried.task.human_review.entries.len(), 1, "no second approval");
+                assert_eq!(retried.task.human_review.pr_error, None);
+            }
+
+            /// Review fixes made after an earlier approval are not covered by it.
+            /// Delivery refuses them until a person approves the new commit, and
+            /// the earlier decision stays on the record.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn fixes_committed_after_an_earlier_approval_are_covered_only_by_a_new_approval() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-reapproved");
+                let first = publish(&repo, "task-reapproved");
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-reapproved", "")]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-reapproved"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                approve_shown(&state, task_id, false).await.expect("approved");
+                let fix = advance_branch(&repo, "task-reapproved");
+
+                let refused = retry_delivery(&state, task_id).await.expect("asked");
+                let Some(PrDelivery::Failed { reason }) = refused.pr else {
+                    panic!("the earlier approval does not cover the new fix: {:?}", refused.pr);
+                };
+                assert!(reason.contains("changed since you approved"), "{reason}");
+                assert_eq!(repo.remote_has_branch("task-reapproved").as_deref(), Some(first.as_str()));
+
+                let approved_again = approve_again(&state, task_id, &fix).await.expect("approved again");
+                assert_eq!(approved_again.human_review.entries.len(), 2, "the first decision stays on the record");
+                assert_eq!(approved_again.human_review.entries[0].approved_tip.as_deref(), Some(first.as_str()));
+                assert_eq!(approved_again.human_review.approved_tip(), Some(fix.as_str()));
+
+                let outcome = retry_delivery(&state, task_id).await.expect("asked");
+                assert_eq!(outcome.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
+                assert_eq!(repo.remote_has_branch("task-reapproved").as_deref(), Some(fix.as_str()));
+                assert!(!mock.read_log().contains("pr\ncreate"));
+            }
+
+            /// A task awaiting its decision is not published by any creation path
+            /// while a pull request is open for its branch.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_unapproved_review_with_an_open_pull_request_is_not_pushed_by_any_creation_path() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-held");
+                let published = publish(&repo, "task-held");
+                let fix = advance_branch(&repo, "task-held");
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-held", "")]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-held"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+
+                let generic = create_pr_inner(&state, &task_id.to_string()).await.expect_err("refused");
+                assert!(!generic.is_empty());
+                let approved = create_pr_for_approved_task(&state, task_id).await.expect_err("refused");
+                assert!(approved.contains("no longer"), "{approved}");
+
+                assert_eq!(repo.remote_has_branch("task-held").as_deref(), Some(published.as_str()));
+                assert_eq!(git(&repo.checkout, &["rev-parse", "task-held"]), fix, "the held fix is kept");
+                assert!(!mock.read_log().contains("pr\ncreate"));
+                let task = state.task.tasks.read().await[&task_id].clone();
+                assert_eq!(task.status, TaskStatus::HumanReview);
+                assert!(!task.human_review.is_approved());
+                assert_eq!(task.pr_url, None);
+            }
+
+            /// Approval is withdrawn while the existing pull request is being
+            /// looked up, after the delivery has its reservation. The approved
+            /// commit must not be published afterwards.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approval_withdrawn_while_the_existing_pull_request_is_looked_up_publishes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-withdrawn-mid");
+                let published = publish(&repo, "task-withdrawn-mid");
+                let fix = advance_branch(&repo, "task-withdrawn-mid");
+
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let started = tmp.path().join("started");
+                let release = tmp.path().join("release");
+                let hold = format!("touch {started:?}; while [ ! -f {release:?} ]; do sleep 0.02; done; ");
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-withdrawn-mid", &hold)]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-withdrawn-mid"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let project_id = project_of(&state, task_id).await;
+                approve_shown(&state, task_id, false).await.expect("approved");
+
+                let delivery = retry_delivery(&state, task_id);
+                let withdraw = async {
+                    while !started.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    // What a move back to work does: the approval is closed with it.
+                    let to_queue = |staged: &mut HashMap<Uuid, Task>| {
+                        let t = staged.get_mut(&task_id).unwrap();
+                        t.status = TaskStatus::Queue;
+                        t.human_review.withdraw_approval();
+                        t.reset_execution_state();
+                    };
+                    crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &to_queue)
+                        .await
+                        .expect("sent back to work");
+                    std::fs::write(&release, "").unwrap();
+                };
+                let (outcome, ()) = tokio::join!(delivery, withdraw);
+
+                let outcome = outcome.expect("the delivery was attempted");
+                let Some(PrDelivery::Failed { reason }) = outcome.pr else {
+                    panic!("a withdrawn approval must not publish: {:?}", outcome.pr);
+                };
+                assert!(reason.contains("no longer"), "{reason}");
+                assert_eq!(repo.remote_has_branch("task-withdrawn-mid").as_deref(), Some(published.as_str()));
+                assert_eq!(git(&repo.checkout, &["rev-parse", "task-withdrawn-mid"]), fix);
+                assert!(!mock.read_log().contains("pr\ncreate"));
+                let persisted = on_disk(&state, project_id, task_id);
+                assert_eq!(persisted.status, TaskStatus::Queue);
+                assert_eq!(persisted.pr_url, None, "no link was recorded");
+            }
+
+            /// The remote branch already has the approved commit, with a later
+            /// commit on top (an update made on GitHub, say). Nothing is pushed:
+            /// the remote is not rewound, and the existing pull request is linked.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approved_commit_under_later_remote_commits_is_linked_without_a_push() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-ahead");
+                let approved = advance_branch(&repo, "task-ahead");
+                let later = git(
+                    &repo.checkout,
+                    &["commit-tree", "-m", "update made on GitHub", "-p", &approved, "main^{tree}"],
+                );
+                git(&repo.checkout, &["push", "-q", "origin", &format!("{later}:refs/heads/task-ahead")]);
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-ahead", "")]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-ahead"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+
+                let outcome = approve_shown(&state, task_id, true).await.expect("the approval is recorded");
+
+                assert_eq!(outcome.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
+                assert_eq!(
+                    repo.remote_has_branch("task-ahead").as_deref(),
+                    Some(later.as_str()),
+                    "the remote branch was neither rewound nor pushed over"
+                );
+                assert!(!mock.read_log().contains("pr\ncreate"));
+                assert_eq!(outcome.task.human_review.approved_tip(), Some(approved.as_str()));
+            }
+
+            /// Another clone pushed a commit the checkout has never seen, so the
+            /// approved commit cannot fast-forward the branch. It is refused and the
+            /// remote commit is left as it is.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_remote_commit_unknown_to_the_checkout_is_refused_without_overwriting_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-remote-only");
+                publish(&repo, "task-remote-only");
+                let fix = advance_branch(&repo, "task-remote-only");
+                let elsewhere_parent = tempfile::tempdir().expect("tempdir");
+                let elsewhere = elsewhere_parent.path().join("elsewhere");
+                git(
+                    elsewhere_parent.path(),
+                    &["clone", "-q", repo.remote.to_str().unwrap(), elsewhere.to_str().unwrap()],
+                );
+                git(&elsewhere, &["checkout", "-q", "-b", "other", "origin/task-remote-only"]);
+                git(&elsewhere, &["commit", "-q", "--allow-empty", "-m", "pushed from elsewhere"]);
+                let other = git(&elsewhere, &["rev-parse", "HEAD"]);
+                git(&elsewhere, &["push", "-q", "origin", "HEAD:refs/heads/task-remote-only"]);
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"OPEN"}"#, &[existing_pr_answer("task-remote-only", "")]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-remote-only"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+
+                let outcome = approve_shown(&state, task_id, true).await.expect("the approval is recorded");
+
+                let Some(PrDelivery::Failed { reason }) = outcome.pr.clone() else {
+                    panic!("a remote commit the approval does not cover must not be overwritten: {:?}", outcome.pr);
+                };
+                assert!(reason.contains("nothing was overwritten"), "{reason}");
+                assert_eq!(repo.remote_has_branch("task-remote-only").as_deref(), Some(other.as_str()));
+                assert_eq!(git(&repo.checkout, &["rev-parse", "task-remote-only"]), fix);
+                assert!(!mock.read_log().contains("pr\ncreate"));
+                assert_eq!(outcome.task.status, TaskStatus::HumanReview);
+                assert!(outcome.task.human_review.is_approved());
+            }
+
+            /// The pull request for the branch was merged and its branch lacks the
+            /// approved commit. A merged or closed pull request's branch is not
+            /// updated, so nothing is pushed and the approval stays.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approved_commit_is_not_pushed_to_the_branch_of_a_merged_pull_request() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-merged");
+                let published = publish(&repo, "task-merged");
+                advance_branch(&repo, "task-merged");
+                let mock = MockGh::setup_answering(PR_URL, r#"{"state":"MERGED"}"#, &[existing_pr_answer("task-merged", "")]);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-merged"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+
+                let outcome = approve_shown(&state, task_id, true).await.expect("the approval is recorded");
+
+                let Some(PrDelivery::Failed { reason }) = outcome.pr.clone() else {
+                    panic!("a merged pull request's branch must not be updated: {:?}", outcome.pr);
+                };
+                assert!(reason.contains("is merged"), "{reason}");
+                assert!(reason.contains("was not pushed"), "{reason}");
+                assert_eq!(repo.remote_has_branch("task-merged").as_deref(), Some(published.as_str()));
+                assert!(!mock.read_log().contains("pr\ncreate"));
+                assert_eq!(outcome.task.status, TaskStatus::HumanReview);
+                assert!(outcome.task.human_review.is_approved());
+                assert_eq!(outcome.task.pr_url, None);
             }
 
             #[test]
@@ -9987,20 +11318,13 @@ mod tests {
                 seed_task(&state, repo_b.checkout.to_str().unwrap(), Some("task-b"), TaskStatus::Done)
                     .await;
 
-            // `bulk_create_prs`'s own body, verbatim: loop, call
-            // `create_pr_inner`, format success/failure. Nothing else.
-            let mut results = Vec::new();
-            for task_id in [task_a.to_string(), task_b.to_string()] {
-                match create_pr_inner(&state, &task_id).await {
-                    Ok(url) => results.push(format!("Created PR for {}: {}", task_id, url)),
-                    Err(e) => results.push(format!("Failed for {}: {}", task_id, e)),
-                }
-            }
+            let outcomes =
+                bulk_create_prs_inner(&state, &[task_a.to_string(), task_b.to_string()]).await;
 
-            assert_eq!(results.len(), 2);
+            assert_eq!(outcomes.len(), 2);
             assert!(
-                results.iter().all(|r| r.starts_with("Created PR for")),
-                "both Done, worktree-less tasks must succeed under the repository-level contract: {results:?}"
+                outcomes.iter().all(|o| o.error.is_none() && o.pr_url.is_some()),
+                "both Done, worktree-less tasks must succeed under the repository-level contract: {outcomes:?}"
             );
 
             assert_eq!(repo_a.remote_has_branch("task-a").as_deref(), Some(sha_a.as_str()));
@@ -10255,7 +11579,10 @@ mod tests {
                 let task_id = seed_origin_task(state, &landed.repo, stacked_on_parent(), true).await;
                 let mut tasks = state.task.tasks.write().await;
                 let task = tasks.get_mut(&task_id).unwrap();
-                task.status = TaskStatus::HumanReview;
+                // Not Human Review: a pull request for a task awaiting a decision
+                // is refused without an approval (U3a), and restacking reads no
+                // status, so this fixture uses a state the delivery is allowed from.
+                task.status = TaskStatus::Done;
                 task.worktree_path = Some(landed.worktree.to_str().unwrap().to_string());
                 task.base_commit = base_commit.map(str::to_string);
                 task_id
@@ -12390,6 +13717,17 @@ mod tests {
                     let _guard = PATH_LOCK.lock().await;
                     for stage in [Stage::BackedUp, Stage::Recorded, Stage::Pushed] {
                         let p = crashed_at(Spec::new(Landing::Squash), stage).await;
+                        // A published branch with an open pull request is PrCreated. The
+                        // fixture's seeded status is not Human Review, so this sets the
+                        // state the assertions below are about.
+                        p.state
+                            .task
+                            .tasks
+                            .write()
+                            .await
+                            .get_mut(&p.task_id)
+                            .expect("the fixture task exists")
+                            .status = TaskStatus::PrCreated;
                         let tip = local_tip(&p.landed);
                         for origin in [crate::lifecycle::Origin::Automatic, crate::lifecycle::Origin::User] {
                             let refusal = crate::lifecycle::terminalize(
@@ -15535,6 +16873,97 @@ mod tests {
                     "the pushed branch is the committed one"
                 );
                 assert!(remote_branch_has_file(&repo, "review-fix-1.txt"), "the pushed branch carries the fix");
+            }
+
+            /// A Task in Human Review that nobody has approved is awaiting
+            /// a decision on its changes, and "Auto-push branch" is a request to
+            /// publish review fixes, not that decision. The fix is committed locally
+            /// as it is with auto-push off, but nothing reaches the remote branch, so
+            /// the pull request and its replies do not move. This holds whether or
+            /// not the Task already has a pull request.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn review_fixes_for_an_unapproved_human_review_task_are_committed_but_not_pushed() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (mut task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                task.status = TaskStatus::HumanReview;
+
+                let (result, _plan) = apply(&task, plan, &worktree, no_jj, false).await;
+
+                assert!(!result.pushed, "an unapproved Human Review task must not be pushed: {result:?}");
+                assert_eq!(repo.remote_has_branch("task-branch"), None, "nothing may reach the remote branch");
+                assert!(!remote_branch_has_file(&repo, "review-fix-1.txt"), "the fix is not published");
+                assert_ne!(git(&worktree, &["rev-parse", "task-branch"]), tip, "the fix is committed locally");
+                assert_eq!(git(&worktree, &["status", "--porcelain"]), "", "nothing is left uncommitted");
+            }
+
+            /// A cancellation that lands after the review fixes were committed, and
+            /// before git is spawned, stops the push. The fixes stay in the local
+            /// checkout, and the remote branch is not touched. The hook delivers the
+            /// cancellation in exactly that window.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_cancellation_after_the_review_fix_commit_stops_the_push() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, mut plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                plan.backfill_lifecycle_from_last_apply();
+                let remote_before = repo.remote_has_branch("task-branch");
+
+                let working_dir = worktree.to_str().unwrap().to_string();
+                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                super::before_gate_hook::arm(&working_dir, move || {
+                    let _ = cancel_tx.send(true);
+                });
+                let lease_dir = tempfile::tempdir().unwrap();
+                let options = AddressPrReviewOptions { auto_push: true, auto_reply: false, dry_run: false };
+                let (result, _plan) = test_programs::scope(
+                    [("jj", no_jj)],
+                    address_pr_review_inner(
+                        task.clone(),
+                        working_dir,
+                        plan,
+                        options,
+                        no_progress(),
+                        cancel_rx,
+                        lease_dir.path().join("task.lock"),
+                    ),
+                )
+                .await
+                .expect("the apply flow reports per step, not as a command error");
+
+                assert!(!result.pushed, "a cancelled flow must not push");
+                let error = result.push_error.expect("the stopped push is reported");
+                assert!(error.contains("nothing was pushed"), "{error}");
+                assert_eq!(repo.remote_has_branch("task-branch"), remote_before, "the remote branch is untouched");
+            }
+
+            /// The other side of the same rule: an approved Human Review task still
+            /// gets its review fixes pushed when auto-push is on.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn review_fixes_for_an_approved_human_review_task_are_still_pushed() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (mut task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                task.status = TaskStatus::HumanReview;
+                task.human_review.approve(Some(git(&worktree, &["rev-parse", "task-branch"])), chrono::Utc::now());
+
+                let (result, _plan) = apply(&task, plan, &worktree, no_jj, false).await;
+
+                assert!(result.pushed, "{:?}", result.push_error);
+                assert!(remote_branch_has_file(&repo, "review-fix-1.txt"), "the approved task's fix is pushed");
             }
 
             /// jj-colocated: the fix is a real Git commit on the task

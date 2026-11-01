@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::commands::gui_admission::GuiMutation;
 use crate::commands::pr::{
     own_pr_url_for_branch, pr_url_for_task, push_branch_pinned_gated, refuse_if_pr_operation_cancelled,
-    reserve_task_for_pr_side_effect, resolve_repository_dir, run_cmd, task_branch_tip,
+    reserve_task_for_explicit_publication, resolve_repository_dir, run_cmd, task_branch_tip,
 };
 use crate::domain::publication::{
     classify_outcome, reconcile, replay, start_refusal, PrPublication, PublicationState, PullRequestObservation,
@@ -256,8 +256,10 @@ async fn publish(
     refuse_while_running(state, task_id).await?;
     // Serialized with every other lifecycle change and PR side effect for this
     // task. The reservation also refuses an unfinished restack, integration or
-    // worker recovery.
-    let lease = reserve_task_for_pr_side_effect(state, task_id).await?;
+    // worker recovery. It is the explicit admission: the person's confirmation
+    // of this commit stands in for the Human Review approval that a generic
+    // delivery would need, and nothing here approves the task.
+    let lease = reserve_task_for_explicit_publication(state, task_id).await?;
 
     let task = state
         .task

@@ -206,6 +206,15 @@ async fn handle_create_task(
     }
 }
 
+/// What the command line is told when asked to move or queue a Task that is in
+/// Human Review. Leaving Human Review (to Done, Queue, or any other column) is a
+/// human decision recorded in the application, and a typed command cannot
+/// confirm it, so the command line makes no such move at all.
+pub(crate) const CLI_FROM_HUMAN_REVIEW_REFUSAL: &str =
+    "This task is in Human Review, awaiting an explicit human review decision, so it was left \
+     unchanged. The command line does not move or queue it. Make that decision in the SlashIt \
+     application's Human Review panel, where it is recorded.";
+
 /// Move a task to another column from the CLI.
 ///
 /// A move into `Done` is the same terminal claim the desktop app makes, and
@@ -230,7 +239,17 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
     };
 
     if matches!(new_status, crate::domain::TaskStatus::Done) {
-        return match crate::lifecycle::terminalize(
+        // Taken under the lease, and decided on the status read under it, as the
+        // desktop's close is, so the refusal comes before terminalization begins.
+        let _lease = match ctx.task_lifecycle_locks.acquire(task_uuid).await {
+            Ok(lease) => lease,
+            Err(e) => return IpcResponse::error(e),
+        };
+        let current = ctx.tasks.read().await.get(&task_uuid).map(|t| t.status.clone());
+        if current == Some(crate::domain::TaskStatus::HumanReview) {
+            return IpcResponse::error(CLI_FROM_HUMAN_REVIEW_REFUSAL.to_string());
+        }
+        return match crate::lifecycle::terminalize_leased(
             terminalize_ctx(ctx),
             task_uuid,
             crate::lifecycle::Origin::User,
@@ -276,6 +295,15 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         Some(found) => found,
         None => return IpcResponse::error(format!("Task {task_id} not found")),
     };
+
+    // A Task in Human Review leaves that column only through the application's
+    // own decision (approve, request changes, close, or the desktop queue
+    // action). A typed move out of it would discard the pending decision, so it
+    // is refused for every target, before an owner is ended or anything is
+    // written. The same move from the desktop is not refused here.
+    if old_status == crate::domain::TaskStatus::HumanReview && new_status != old_status {
+        return IpcResponse::error(CLI_FROM_HUMAN_REVIEW_REFUSAL.to_string());
+    }
 
     // The same answer as the desktop `update_task_status`: a request for the
     // column a queued Task already holds returns the Task as it is, and writes
@@ -508,12 +536,15 @@ async fn handle_enqueue_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
         .executor
         .get()
         .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
-    match crate::lifecycle::enqueue_current(
+    // A Task in Human Review is not queued from the command line: that would
+    // leave the review without its decision and withdraw its approval.
+    match crate::lifecycle::enqueue_current_refusing_human_review(
         &ctx.tasks,
         &ctx.storage,
         &ctx.task_lifecycle_locks,
         running,
         task_uuid,
+        CLI_FROM_HUMAN_REVIEW_REFUSAL,
     )
     .await
     {
@@ -1148,6 +1179,163 @@ pub(super) mod tests {
     }
 }
 
+/// U3a: `slashit move <task> done` must not close a Task that is awaiting a
+/// Human Review decision. Driven through [`dispatch`], the path a CLI request
+/// takes, not through a helper.
+#[cfg(test)]
+mod human_review_close {
+    use super::*;
+    use crate::test_helpers::{create_test_task_full, ipc_test_context};
+    use slashit_ipc::Endpoint;
+    use std::sync::Arc;
+
+    fn peer() -> PeerContext {
+        PeerContext {
+            endpoint: Endpoint::Unix {
+                path: std::path::PathBuf::from("/nonexistent-for-tests"),
+            },
+            os_verified: true,
+        }
+    }
+
+    async fn test_ctx() -> (tempfile::TempDir, IpcContext) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        (tmp, ipc_test_context(paths))
+    }
+
+    /// Seeds one Task on its board and returns its ID and its Project's ID.
+    async fn seed(ctx: &IpcContext, status: TaskStatus) -> (Uuid, Uuid) {
+        let project_id = Uuid::new_v4();
+        let task = create_test_task_full("under test", project_id, status, 0);
+        let task_id = task.id;
+        ctx.tasks.write().await.insert(task_id, task.clone());
+        ctx.storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
+        (task_id, project_id)
+    }
+
+    async fn move_to(ctx: &IpcContext, task_id: Uuid, status: &str) -> IpcResponse {
+        dispatch(
+            IpcRequest::MoveTask { task_id: task_id.to_string(), status: status.to_string() },
+            ctx,
+            &peer(),
+        )
+        .await
+        .response
+    }
+
+    #[tokio::test]
+    async fn cli_done_refuses_a_task_awaiting_human_review_and_changes_nothing() {
+        let (_tmp, ctx) = test_ctx().await;
+        let (task_id, project_id) = seed(&ctx, TaskStatus::HumanReview).await;
+        let before = serde_json::to_value(ctx.tasks.read().await.get(&task_id).cloned().unwrap())
+            .expect("a task serializes");
+
+        let first = move_to(&ctx, task_id, "done").await;
+        let second = move_to(&ctx, task_id, "done").await;
+
+        assert!(!first.ok, "a Task in Human Review must not be closed from the CLI: {first:?}");
+        let message = first.error.clone().unwrap_or_default();
+        assert!(
+            message.contains("Human Review") && message.contains("application"),
+            "the refusal must say the decision is made in the application: {message}"
+        );
+        assert_eq!(second.error, first.error, "a repeated request gives the same refusal");
+
+        let in_memory = ctx.tasks.read().await.get(&task_id).cloned().unwrap();
+        assert_eq!(in_memory.status, TaskStatus::HumanReview);
+        assert_eq!(serde_json::to_value(&in_memory).unwrap(), before);
+        let on_disk = ctx
+            .storage
+            .load_project_tasks(project_id)
+            .expect("read the board back")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task is on disk");
+        assert_eq!(on_disk.status, TaskStatus::HumanReview);
+    }
+
+    /// Every typed move out of Human Review is refused, not only the close: the
+    /// two-step route (Human Review, then Queue, then Done) must not exist from
+    /// the command line. Each refused request leaves the task and the board as
+    /// they were.
+    #[tokio::test]
+    async fn cli_moves_out_of_human_review_are_refused_for_every_target() {
+        let (_tmp, ctx) = test_ctx().await;
+        let (task_id, project_id) = seed(&ctx, TaskStatus::HumanReview).await;
+        let before = serde_json::to_value(ctx.tasks.read().await.get(&task_id).cloned().unwrap())
+            .expect("a task serializes");
+
+        for target in ["queue", "in_progress", "backlog", "done"] {
+            let answer = move_to(&ctx, task_id, target).await;
+            assert!(!answer.ok, "a move to {target} must be refused: {answer:?}");
+            assert!(
+                answer.error.unwrap_or_default().contains("Human Review"),
+                "the refusal for {target} must name Human Review"
+            );
+        }
+
+        assert_eq!(serde_json::to_value(ctx.tasks.read().await.get(&task_id).cloned().unwrap()).unwrap(), before);
+        let on_disk = ctx
+            .storage
+            .load_project_tasks(project_id)
+            .expect("read the board back")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task is on disk");
+        assert_eq!(on_disk.status, TaskStatus::HumanReview);
+    }
+
+    /// A queue request from the command line is refused for a Task in Human
+    /// Review, and the approval it holds is kept. Queueing would withdraw it.
+    #[tokio::test]
+    async fn cli_enqueue_refuses_a_human_review_task_and_keeps_its_approval() {
+        let (_tmp, ctx) = test_ctx().await;
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("under test", project_id, TaskStatus::HumanReview, 0);
+        task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
+        let task_id = task.id;
+        ctx.tasks.write().await.insert(task_id, task.clone());
+        ctx.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+
+        let answer = dispatch(IpcRequest::EnqueueTask { task_id: task_id.to_string() }, &ctx, &peer())
+            .await
+            .response;
+
+        assert!(!answer.ok, "a Human Review task must not be queued from the CLI: {answer:?}");
+        let in_memory = ctx.tasks.read().await.get(&task_id).cloned().unwrap();
+        assert_eq!(in_memory.status, TaskStatus::HumanReview);
+        assert!(in_memory.human_review.is_approved(), "the approval is kept");
+        let on_disk = ctx
+            .storage
+            .load_project_tasks(project_id)
+            .expect("read the board back")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task is on disk");
+        assert_eq!(on_disk.status, TaskStatus::HumanReview);
+        assert!(on_disk.human_review.is_approved());
+    }
+
+    #[tokio::test]
+    async fn cli_done_still_finishes_a_task_outside_human_review() {
+        let (_tmp, ctx) = test_ctx().await;
+        let (task_id, _project_id) = seed(&ctx, TaskStatus::Backlog).await;
+
+        let answer = move_to(&ctx, task_id, "done").await;
+
+        assert!(answer.ok, "{answer:?}");
+        assert_eq!(ctx.tasks.read().await.get(&task_id).unwrap().status, TaskStatus::Done);
+    }
+}
+
 /// The IPC-side half of Unit 5C2's corrective-pass front-door parity: every
 /// scenario here is the exact one pinned against the desktop command in
 /// `crate::commands::task::lifecycle_ownership`, over the same test-only fake
@@ -1329,8 +1517,10 @@ mod lifecycle_ownership {
 
         let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
 
+        // The command line refuses any move out of Human Review before the
+        // cleanup refusal is reached, and before an owner is ended.
         assert!(!answer.ok, "{answer:?}");
-        assert!(format!("{answer:?}").contains("cleanup"), "{answer:?}");
+        assert!(format!("{answer:?}").contains("Human Review"), "{answer:?}");
         assert!(
             !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
             "a move that will be refused must not end the owner"
