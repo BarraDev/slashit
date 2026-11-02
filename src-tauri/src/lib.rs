@@ -495,6 +495,7 @@ pub fn run() {
             approve_task,
             publish_task_to_pr,
             resolve_unconfirmed_pr_create,
+            get_unconfirmed_pr_repository,
             complete_task_locally,
             approve_task_again,
             get_approval_status,

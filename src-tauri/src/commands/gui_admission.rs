@@ -80,6 +80,7 @@ const READ_ONLY: &[&str] = &[
     "get_new_work_pause",
     "get_project_readiness",
     "check_worktree_exists",
+    "get_unconfirmed_pr_repository",
     "get_task_run",
     "get_task_output",
     "get_live_runs",

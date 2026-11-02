@@ -818,6 +818,11 @@ pub fn HumanReviewPanel(
                                 }
                             })}
                             <p class="text-xs text-white/45">"Your approval is kept. Nothing was merged."</p>
+                            {move || task.with(|t| t.as_ref().is_some_and(|t| t.pr_create_unconfirmed.is_some())).then(|| view! {
+                                <p data-testid="human-review-unconfirmed-hint" class="text-xs text-amber-200">
+                                    "SlashIt asked GitHub to open this pull request and never learned the outcome. It will not open another until you settle that in Pull request recovery below."
+                                </p>
+                            })}
                             <button
                                 data-testid="human-review-retry-pr"
                                 class="px-3 py-1.5 rounded-lg text-sm bg-blue-500/15 text-blue-200 hover:bg-blue-500/25 disabled:opacity-50"

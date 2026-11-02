@@ -11,6 +11,8 @@ pub mod new_work_pause;
 pub mod task_card;
 pub mod pr_publication;
 pub mod pr_publication_state;
+pub mod unconfirmed_pr;
+pub mod unconfirmed_pr_state;
 pub mod pr_status;
 pub mod restack_published;
 pub mod task_activity;

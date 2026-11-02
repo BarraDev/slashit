@@ -76,6 +76,35 @@ pub async fn resolve_unconfirmed_pr_create(
 /// reserved as for any pull request side effect, so a running task, or another
 /// pull request operation holding it, refuses the recovery, and a lifecycle
 /// transition that ends it before the write stops it.
+/// The repository `gh` works in for the task's project, to show beside the
+/// unanswered request: `owner/repository`, or `None` when `gh` cannot say.
+/// Reads only.
+#[tauri::command]
+pub async fn get_unconfirmed_pr_repository(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<Option<String>, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let working_dir = resolve_repository_dir(&state, task_id).await?;
+    Ok(repository_gh_works_in(&working_dir).await)
+}
+
+pub(super) async fn repository_gh_works_in(working_dir: &str) -> Option<String> {
+    let viewed = run_cmd(
+        "gh",
+        &["repo", "view", "--json", "nameWithOwner"],
+        working_dir,
+    )
+    .await
+    .ok()?;
+    serde_json::from_str::<serde_json::Value>(&viewed)
+        .ok()?
+        .get("nameWithOwner")?
+        .as_str()
+        .filter(|name| name.split_once('/').is_some())
+        .map(str::to_string)
+}
+
 pub(super) async fn resolve(
     state: &crate::AppState,
     task_id: Uuid,

@@ -22500,6 +22500,25 @@ exec {real} "$@"
                     assert!(!reason.contains("cannot tell"), "{reason}");
                 }
 
+                /// The panel names the repository gh works in; when gh cannot say,
+                /// it says nothing rather than guess.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_panel_can_name_the_repository_gh_works_in() {
+                    let s = stuck().await;
+                    assert_eq!(
+                        unconfirmed::repository_gh_works_in(s.repo.checkout.to_str().unwrap())
+                            .await
+                            .as_deref(),
+                        Some("testorg/testrepo")
+                    );
+                    s.gh.set("repo_view", "{}");
+                    assert_eq!(
+                        unconfirmed::repository_gh_works_in(s.repo.checkout.to_str().unwrap())
+                            .await,
+                        None
+                    );
+                }
+
                 /// What the frontend sends and receives.
                 #[test]
                 fn the_wire_shapes_are_what_the_frontend_sends_and_reads() {

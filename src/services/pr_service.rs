@@ -345,6 +345,33 @@ pub async fn publish_task_to_pr(
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
+/// Settle the request to open a pull request whose outcome was never learned
+/// (`token` is the record the person was shown): link the pull request they
+/// found, after the backend checks it is this branch's own, or record their
+/// confirmation that none exists. Neither pushes or creates anything.
+pub async fn resolve_unconfirmed_pr_create(
+    task_id: String,
+    token: crate::models::UnconfirmedPrCreate,
+    resolution: crate::models::UnconfirmedResolution,
+) -> Result<crate::models::ResolveUnconfirmedOutcome, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "taskId": task_id,
+        "token": token,
+        "resolution": resolution,
+    }))
+    .unwrap();
+    let response = invoke("resolve_unconfirmed_pr_create", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// The `owner/repository` `gh` works in for the task's project, to show beside
+/// an unanswered request. `None` when `gh` cannot say.
+pub async fn get_unconfirmed_pr_repository(task_id: String) -> Result<Option<String>, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskId": task_id })).unwrap();
+    let response = invoke("get_unconfirmed_pr_repository", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
