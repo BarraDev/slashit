@@ -39,6 +39,40 @@ impl AboutView {
     }
 }
 
+/// Which read may still fill the dialog. Every open and every close starts a
+/// new generation, so a read started before either is stale and may not write
+/// its answer into the dialog that is open now.
+#[derive(Debug, Default)]
+pub struct ReadGeneration {
+    current: Cell<u64>,
+}
+
+impl ReadGeneration {
+    /// Starts a new generation and returns its token.
+    pub fn begin(&self) -> u64 {
+        let next = self.current.get().wrapping_add(1);
+        self.current.set(next);
+        next
+    }
+
+    /// Whether `token` belongs to the generation that is open now.
+    pub fn is_current(&self, token: u64) -> bool {
+        self.current.get() == token
+    }
+}
+
+/// The Source commit line. A commit is shown with the state it carries, in
+/// words, so a modified or unverified build is never presented as an exact
+/// snapshot of the commit. Without a commit the line reads Unknown.
+pub fn source_label(about: &AppAbout) -> String {
+    match (about.source_commit.as_deref(), about.source_state.as_str()) {
+        (Some(commit), "clean") => format!("{commit} (clean)"),
+        (Some(commit), "modified") => format!("{commit} (modified)"),
+        (Some(commit), "unverified") => format!("{commit} (unverified)"),
+        _ => "Unknown".to_string(),
+    }
+}
+
 /// The labelled facts the dialog shows, in display order. The Copy Diagnostics
 /// text is built from this same list, so the two cannot disagree.
 pub fn about_fields(about: &AppAbout) -> Vec<(&'static str, String)> {
@@ -46,7 +80,7 @@ pub fn about_fields(about: &AppAbout) -> Vec<(&'static str, String)> {
         ("Product", about.product_name.clone()),
         ("Version", about.version.clone()),
         ("Build type", about.build_type.clone()),
-        ("Source commit", about.source_commit.clone().unwrap_or_else(|| "Unknown".to_string())),
+        ("Source commit", source_label(about)),
         ("Operating system", about.operating_system.clone()),
         ("Executable", about.executable_path.clone().unwrap_or_else(|| "Unknown".to_string())),
         ("Data directory", about.data_dir.clone()),
@@ -70,14 +104,11 @@ pub fn diagnostics_text(about: &AppAbout) -> String {
 pub fn AboutSlashItDialog(show: RwSignal<bool>) -> impl IntoView {
     let view_state = RwSignal::new(AboutView::Hidden);
     let copy_status = RwSignal::new(None::<String>);
-    // Every open or close starts a new generation. A read started by an earlier
-    // open is stale once the generation has moved on, and may not write its answer.
-    let generation = Rc::new(Cell::new(0u64));
+    let generation = Rc::new(ReadGeneration::default());
 
     Effect::new(move |_| {
         let showing = show.get();
-        let this_generation = generation.get().wrapping_add(1);
-        generation.set(this_generation);
+        let this_generation = generation.begin();
         view_state.set(AboutView::for_visibility(showing));
         copy_status.set(None);
         if showing {
@@ -85,7 +116,7 @@ pub fn AboutSlashItDialog(show: RwSignal<bool>) -> impl IntoView {
             spawn_local(async move {
                 let result = app_about().await;
                 // Only the read of the dialog still open, from this open, may take the answer.
-                if generation.get() == this_generation && show.get_untracked() {
+                if generation.is_current(this_generation) && show.get_untracked() {
                     view_state.set(match result {
                         Ok(about) => AboutView::Loaded(about),
                         Err(error) => AboutView::Failed(error),
@@ -197,12 +228,13 @@ pub fn AboutSlashItDialog(show: RwSignal<bool>) -> impl IntoView {
 mod tests {
     use super::*;
 
-    fn about(commit: Option<&str>, executable: Option<&str>) -> AppAbout {
+    fn about(commit: Option<&str>, state: &str, executable: Option<&str>) -> AppAbout {
         AppAbout {
             product_name: "SlashIt".to_string(),
             version: "0.0.1".to_string(),
             build_type: "release".to_string(),
             source_commit: commit.map(str::to_string),
+            source_state: state.to_string(),
             operating_system: "linux".to_string(),
             executable_path: executable.map(str::to_string),
             data_dir: "/home/user/.local/share/slashit".to_string(),
@@ -220,7 +252,7 @@ mod tests {
 
     #[test]
     fn a_newline_in_a_value_cannot_split_a_diagnostics_line() {
-        let text = diagnostics_text(&about(None, Some("/tmp/odd\nname\r\nbin")));
+        let text = diagnostics_text(&about(None, "unknown", Some("/tmp/odd\nname\r\nbin")));
         assert!(text.contains("Executable: /tmp/odd name  bin\n"), "{text}");
         assert_eq!(text.lines().count(), 7, "{text}");
     }
@@ -228,7 +260,7 @@ mod tests {
     #[test]
     fn the_frontend_reads_the_backend_serialisation_of_the_about_facts() {
         // The same JSON the backend's `the_about_facts_serialise_with_the_names_the_frontend_reads` test pins.
-        let json = r#"{"productName":"SlashIt","version":"0.0.1","buildType":"development","sourceCommit":null,"operatingSystem":"linux","executablePath":"/opt/slashit/slashit-ui","dataDir":"/home/user/.local/share/slashit"}"#;
+        let json = r#"{"productName":"SlashIt","version":"0.0.1","buildType":"development","sourceCommit":null,"sourceState":"unknown","operatingSystem":"linux","executablePath":"/opt/slashit/slashit-ui","dataDir":"/home/user/.local/share/slashit"}"#;
         let about: AppAbout = serde_json::from_str(json).unwrap();
         assert_eq!(about.product_name, "SlashIt");
         assert_eq!(about.source_commit, None);
@@ -238,7 +270,7 @@ mod tests {
 
     #[test]
     fn the_diagnostics_block_holds_exactly_the_about_fields_in_order() {
-        let text = diagnostics_text(&about(Some("abc123"), Some("/opt/slashit/slashit-ui")));
+        let text = diagnostics_text(&about(Some("abc123"), "clean", Some("/opt/slashit/slashit-ui")));
         let labels: Vec<&str> = text
             .lines()
             .map(|line| line.split(": ").next().unwrap())
@@ -255,14 +287,55 @@ mod tests {
                 "Data directory",
             ]
         );
-        assert!(text.contains("Source commit: abc123\n"));
+        assert!(text.contains("Source commit: abc123 (clean)\n"));
         assert!(text.contains("Executable: /opt/slashit/slashit-ui\n"));
     }
 
     #[test]
     fn a_missing_commit_or_executable_is_reported_as_unknown_not_invented() {
-        let text = diagnostics_text(&about(None, None));
+        let text = diagnostics_text(&about(None, "unknown", None));
         assert!(text.contains("Source commit: Unknown\n"), "{text}");
         assert!(text.contains("Executable: Unknown\n"), "{text}");
+    }
+
+    #[test]
+    fn a_commit_is_labelled_with_the_state_it_was_built_in() {
+        let commit = "14f170b13b0f864a6322576f4512dadfb18482a2";
+        assert_eq!(source_label(&about(Some(commit), "clean", None)), format!("{commit} (clean)"));
+        assert_eq!(source_label(&about(Some(commit), "modified", None)), format!("{commit} (modified)"));
+        assert_eq!(source_label(&about(Some(commit), "unverified", None)), format!("{commit} (unverified)"));
+    }
+
+    #[test]
+    fn a_modified_build_is_never_shown_as_a_bare_commit() {
+        let commit = "14f170b13b0f864a6322576f4512dadfb18482a2";
+        let text = diagnostics_text(&about(Some(commit), "modified", None));
+        assert!(text.contains(&format!("Source commit: {commit} (modified)\n")), "{text}");
+        assert!(!text.contains(&format!("Source commit: {commit}\n")), "{text}");
+    }
+
+    #[test]
+    fn no_commit_is_unknown_whatever_state_is_reported() {
+        for state in ["clean", "modified", "unverified", "unknown"] {
+            assert_eq!(source_label(&about(None, state, None)), "Unknown", "{state}");
+        }
+    }
+
+    /// Regression for the dialog's open and close cycle: a read started before a
+    /// close, or before a reopen, may not fill the dialog that is open now.
+    #[test]
+    fn a_read_started_before_a_close_cannot_fill_a_reopened_dialog() {
+        let generation = ReadGeneration::default();
+        let first_open = generation.begin();
+        assert!(generation.is_current(first_open));
+
+        let close = generation.begin();
+        assert!(!generation.is_current(first_open), "closed: the read is stale");
+        assert!(generation.is_current(close));
+
+        let second_open = generation.begin();
+        assert!(!generation.is_current(first_open), "reopened: still stale");
+        assert!(!generation.is_current(close));
+        assert!(generation.is_current(second_open));
     }
 }

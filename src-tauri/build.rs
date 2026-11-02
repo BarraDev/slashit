@@ -3,8 +3,12 @@
 // read the declaration with one implementation. See src/release_channel.rs.
 #[path = "src/release_channel.rs"]
 mod release_channel;
+// The provenance rules are shared for the same reason. See src/source_provenance.rs.
+#[path = "src/source_provenance.rs"]
+mod source_provenance;
 
 use release_channel::{channel_for, parse_declarations, PlainVersion};
+use source_provenance::{classify, encode, is_commit_id, parse, tree_from_status, Provenance, Tree};
 use std::path::PathBuf;
 
 fn main() {
@@ -28,50 +32,72 @@ fn main() {
     });
     println!("cargo:rustc-env=SLASHIT_RELEASE_CHANNEL={}", channel.as_str());
 
-    // The commit this binary was built from, for the About dialog. Taken at
+    // Where this binary's source came from, for the About dialog. Taken at
     // build time only; the application never runs Git. Set
-    // `SLASHIT_SOURCE_COMMIT` to supply it where there is no Git checkout (a
-    // JJ workspace, a source tarball). Left unset when neither is available, and
-    // the dialog then reports the commit as unknown.
+    // `SLASHIT_SOURCE_COMMIT` to supply the commit where there is no Git
+    // checkout (a JJ workspace, a source tarball). A supplied commit is the
+    // builder's assertion, so the tree state is reported as unverified.
     println!("cargo:rerun-if-env-changed=SLASHIT_SOURCE_COMMIT");
-    let supplied = std::env::var("SLASHIT_SOURCE_COMMIT").ok().map(|c| c.trim().to_string());
-    let commit = match supplied.filter(|c| !c.is_empty()) {
-        Some(supplied) => Some(well_formed_commit(&supplied).unwrap_or_else(|| {
-            panic!("SLASHIT_SOURCE_COMMIT={supplied} is not a hexadecimal commit id")
-        })),
-        None => git_head_commit(),
-    };
-    if let Some(commit) = commit {
-        println!("cargo:rustc-env=SLASHIT_SOURCE_COMMIT={commit}");
+    watch_source_tree();
+    let provenance = build_provenance();
+    if let Some(recorded) = encode(&provenance) {
+        // The application reads this value with the same parser, so a value it
+        // could not read back is a build error, not a silent Unknown.
+        assert_eq!(parse(&recorded), Some(provenance.clone()), "{recorded} does not read back");
+        println!("cargo:rustc-env=SLASHIT_SOURCE_PROVENANCE={recorded}");
     }
 }
 
-/// Watch the files that change when a commit lands on the current branch: the
-/// `HEAD` file (which names the branch when attached) and the ref it names,
-/// which is loose or in `packed-refs`. Paths come from `git rev-parse
-/// --git-path`, so this also works in a linked worktree, where `.git` is a file.
-fn watch_git_head() {
-    for path in ["HEAD", "packed-refs"] {
-        if let Some(resolved) = git_path(path) {
+/// What this build can say about its own source.
+fn build_provenance() -> Provenance {
+    let supplied = std::env::var("SLASHIT_SOURCE_COMMIT")
+        .ok()
+        .map(|commit| commit.trim().to_string())
+        .filter(|commit| !commit.is_empty());
+    match supplied {
+        Some(supplied) => {
+            if !is_commit_id(&supplied) {
+                panic!("SLASHIT_SOURCE_COMMIT={supplied} is not a commit id");
+            }
+            classify(Some(&supplied), Tree::Unavailable)
+        }
+        None => {
+            let commit = git_head_commit();
+            let tree = tree_from_status(git_stdout(&["status", "--porcelain"]).as_deref());
+            classify(commit.as_deref(), tree)
+        }
+    }
+}
+
+/// Asks Cargo to rerun this script when anything that changes the recorded
+/// state changes: the commit (`HEAD` and the ref it names), the index, and
+/// every tracked file. Without the tracked files, an edit after a build would
+/// leave a "clean" record describing a tree that no longer matches it.
+/// A new file that is neither tracked nor staged does not trigger a rerun.
+fn watch_source_tree() {
+    for path in ["HEAD", "packed-refs", "index"] {
+        if let Some(resolved) = git_output(&["rev-parse", "--git-path", path]) {
             println!("cargo:rerun-if-changed={resolved}");
         }
     }
     if let Some(branch) = git_output(&["rev-parse", "--symbolic-full-name", "HEAD"]) {
         if branch.starts_with("refs/") {
-            if let Some(resolved) = git_path(&branch) {
+            if let Some(resolved) = git_output(&["rev-parse", "--git-path", &branch]) {
                 println!("cargo:rerun-if-changed={resolved}");
             }
         }
     }
+    // Paths are relative to this package, which is where Cargo resolves them.
+    if let Some(listing) = git_stdout(&["ls-files", "-z", "--", ":/"]) {
+        for path in listing.split('\0').filter(|path| !path.is_empty()) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
 }
 
-fn git_path(path: &str) -> Option<String> {
-    git_output(&["rev-parse", "--git-path", path])
-}
-
-/// Trimmed stdout of a Git command run in this package, or `None` outside a
-/// checkout or when the command fails.
-fn git_output(args: &[&str]) -> Option<String> {
+/// Stdout of a Git command run in this package, exactly as printed, or `None`
+/// outside a checkout or when the command fails.
+fn git_stdout(args: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(std::env::var("CARGO_MANIFEST_DIR").ok()?)
@@ -80,18 +106,16 @@ fn git_output(args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Trimmed stdout of a Git command, or `None` when it is empty or fails.
+fn git_output(args: &[&str]) -> Option<String> {
+    let text = git_stdout(args)?.trim().to_string();
     (!text.is_empty()).then_some(text)
 }
 
 /// `HEAD` of the Git checkout this package sits in, or `None` outside one.
 fn git_head_commit() -> Option<String> {
-    watch_git_head();
-    well_formed_commit(&git_output(&["rev-parse", "--verify", "--quiet", "HEAD"])?)
-}
-
-/// The commit id, when it is hexadecimal; anything else is not a commit.
-fn well_formed_commit(text: &str) -> Option<String> {
-    let well_formed = !text.is_empty() && text.bytes().all(|b| b.is_ascii_hexdigit());
-    well_formed.then(|| text.to_string())
+    git_output(&["rev-parse", "--verify", "--quiet", "HEAD"]).filter(|commit| is_commit_id(commit))
 }

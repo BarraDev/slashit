@@ -352,6 +352,8 @@ pub struct AppAbout {
     pub version: String,
     pub build_type: String,
     pub source_commit: Option<String>,
+    /// `clean`, `modified`, `unverified` or `unknown`. See `SourceState`.
+    pub source_state: String,
     pub operating_system: String,
     pub executable_path: Option<String>,
     pub data_dir: String,

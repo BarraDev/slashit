@@ -43,6 +43,7 @@ use crate::config::updates::UpdatePreferences;
 use crate::config::ConfigWriteError;
 use crate::events::EventSinkExt;
 use crate::release_channel::{PlainVersion, ReleaseChannel};
+use crate::source_provenance::{self, Provenance};
 use crate::update_feed::{self, Feed, FeedError, Selection};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -1142,9 +1143,9 @@ pub fn updater_restart(app: AppHandle, restart: tauri::State<'_, crate::RestartR
 
 /// What the About dialog shows, read from the running process.
 ///
-/// Local facts only: no network, no Git at runtime, no credentials. The commit
-/// is whatever `build.rs` recorded at build time, so a build without one reports
-/// `None` rather than a guess.
+/// Local facts only: no network, no Git at runtime, no credentials. The source
+/// is whatever `build.rs` recorded at build time. A build without a recorded
+/// commit reports `None` and `SourceState::Unknown` rather than a guess.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppAbout {
@@ -1152,10 +1153,37 @@ pub struct AppAbout {
     pub version: String,
     /// `"development"` for a debug build, `"release"` otherwise.
     pub build_type: String,
+    /// The commit the build was made from, when it is known.
     pub source_commit: Option<String>,
+    /// Whether `source_commit` describes the build exactly, and how that is known.
+    pub source_state: SourceState,
     pub operating_system: String,
     pub executable_path: Option<String>,
     pub data_dir: String,
+}
+
+/// What the About dialog may claim about the source a build came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceState {
+    /// The commit is known, and the build tree had no uncommitted modifications.
+    Clean,
+    /// The commit is known, but the build had uncommitted modifications.
+    Modified,
+    /// The builder supplied the commit, and the tree state was not checked.
+    Unverified,
+    /// Nothing about the source could be established.
+    Unknown,
+}
+
+/// The commit and state the About dialog reports for a build's recorded source.
+pub fn source_facts(provenance: &Provenance) -> (Option<String>, SourceState) {
+    match provenance {
+        Provenance::Clean { commit } => (Some(commit.clone()), SourceState::Clean),
+        Provenance::Modified { commit } => (Some(commit.clone()), SourceState::Modified),
+        Provenance::Unverified { commit } => (Some(commit.clone()), SourceState::Unverified),
+        Provenance::Unknown => (None, SourceState::Unknown),
+    }
 }
 
 /// The build type a profile is reported as. Debug assertions are the same flag
@@ -1174,6 +1202,10 @@ pub fn app_about(
     app: AppHandle,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<AppAbout, String> {
+    let provenance = option_env!("SLASHIT_SOURCE_PROVENANCE")
+        .and_then(source_provenance::parse)
+        .unwrap_or(Provenance::Unknown);
+    let (source_commit, source_state) = source_facts(&provenance);
     Ok(AppAbout {
         product_name: app
             .config()
@@ -1182,7 +1214,8 @@ pub fn app_about(
             .unwrap_or_else(|| app.package_info().name.clone()),
         version: app.package_info().version.to_string(),
         build_type: build_type_label(cfg!(debug_assertions)).to_string(),
-        source_commit: option_env!("SLASHIT_SOURCE_COMMIT").map(str::to_string),
+        source_commit,
+        source_state,
         operating_system: std::env::consts::OS.to_string(),
         executable_path: std::env::current_exe().ok().map(|path| path.display().to_string()),
         data_dir: state.paths.data_dir().display().to_string(),
@@ -1201,6 +1234,7 @@ mod tests {
             version: "0.0.1".to_string(),
             build_type: build_type_label(true).to_string(),
             source_commit: None,
+            source_state: SourceState::Unknown,
             operating_system: "linux".to_string(),
             executable_path: Some("/opt/slashit/slashit-ui".to_string()),
             data_dir: "/home/user/.local/share/slashit".to_string(),
@@ -1213,15 +1247,34 @@ mod tests {
             serde_json::Value::Null,
             "an unknown commit is null, not a guess"
         );
+        assert_eq!(value["sourceState"], "unknown");
         assert_eq!(value["executablePath"], "/opt/slashit/slashit-ui");
         assert_eq!(value["dataDir"], "/home/user/.local/share/slashit");
-        assert_eq!(value.as_object().unwrap().len(), 7, "only the About fields are exposed");
+        assert_eq!(value.as_object().unwrap().len(), 8, "only the About fields are exposed");
     }
 
     #[test]
     fn a_debug_profile_is_development_and_anything_else_is_release() {
         assert_eq!(build_type_label(true), "development");
         assert_eq!(build_type_label(false), "release");
+    }
+
+    #[test]
+    fn each_source_provenance_reports_its_commit_and_its_state() {
+        let commit = "14f170b13b0f864a6322576f4512dadfb18482a2".to_string();
+        assert_eq!(
+            source_facts(&Provenance::Clean { commit: commit.clone() }),
+            (Some(commit.clone()), SourceState::Clean)
+        );
+        assert_eq!(
+            source_facts(&Provenance::Modified { commit: commit.clone() }),
+            (Some(commit.clone()), SourceState::Modified)
+        );
+        assert_eq!(
+            source_facts(&Provenance::Unverified { commit: commit.clone() }),
+            (Some(commit), SourceState::Unverified)
+        );
+        assert_eq!(source_facts(&Provenance::Unknown), (None, SourceState::Unknown));
     }
 
     #[test]
