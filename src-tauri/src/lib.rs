@@ -16,6 +16,8 @@ mod storage_accounting;
 // Public because `build.rs` compiles this module too; the declaration parser is
 // used by the build script and by tests, not by the application's runtime.
 pub mod release_channel;
+// Public for the same reason: `build.rs` compiles the provenance rules too.
+pub mod source_provenance;
 mod update_feed;
 /// What GitHub last said about the pull requests linked to tasks.
 pub mod pr_status;
@@ -425,6 +427,7 @@ pub fn run() {
             updater_set_channel,
             updater_download_and_install,
             updater_restart,
+            app_about,
             create_repository,
             list_repositories,
             get_repository,

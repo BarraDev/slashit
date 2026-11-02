@@ -101,6 +101,8 @@ pub fn Settings(
         true
     });
 
+    let show_about = RwSignal::new(false);
+
     let (diff_collapsed, set_diff_collapsed) = signal({
         web_sys::window()
             .and_then(|w| w.local_storage().ok().flatten())
@@ -191,6 +193,20 @@ pub fn Settings(
                                                     <div class="w-11 h-6 bg-white/10 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-blue-500/50 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
                                                 </label>
                                             </div>
+                                        </div>
+
+                                        <div class="flex items-center justify-between p-4 rounded-xl bg-white/5 border border-white/10">
+                                            <div>
+                                                <p class="font-medium text-white/90">"About SlashIt"</p>
+                                                <p class="text-sm text-white/40 mt-1">"Version, build, and diagnostics for bug reports."</p>
+                                            </div>
+                                            <button
+                                                data-testid="settings-about-open"
+                                                on:click=move |_| show_about.set(true)
+                                                class="shrink-0 px-3 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-sm text-white/80"
+                                            >
+                                                "About SlashIt"
+                                            </button>
                                         </div>
                                     </div>
                                 }.into_any(),
@@ -361,6 +377,8 @@ pub fn Settings(
                     </div>
                 </div>
             </div>
+
+            <crate::components::about_dialog::AboutSlashItDialog show=show_about />
         </div>
     }
 }

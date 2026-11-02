@@ -342,6 +342,28 @@ pub async fn updater_restart() -> Result<(), String> {
     invoke("updater_restart", empty_args()).await.map(|_| ())
 }
 
+/// What the About dialog shows, as the backend reads it. Mirrors `AppAbout`
+/// in `commands/updater.rs`. `None` means the backend could not determine the
+/// value; the dialog shows that as "Unknown" rather than inventing one.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppAbout {
+    pub product_name: String,
+    pub version: String,
+    pub build_type: String,
+    pub source_commit: Option<String>,
+    /// `modified`, `unverified` or `unknown`. See `SourceState`.
+    pub source_state: String,
+    pub operating_system: String,
+    pub executable_path: Option<String>,
+    pub data_dir: String,
+}
+
+pub async fn app_about() -> Result<AppAbout, String> {
+    let response = invoke("app_about", empty_args()).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
 /// Subscribe to backend `updater://progress` events. The closure is leaked for
 /// the lifetime of the page, so call this exactly once — at app mount, not from
 /// the banner, which can be unmounted mid-download.
