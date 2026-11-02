@@ -581,6 +581,25 @@ pub async fn link_pr(
     // through, which a refresh decided before it held this lease (see
     // `refresh_task_pr_state`), so it is written under the same lease.
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    // This links whatever URL it is given. A task that holds a request to
+    // open its pull request that was never answered is settled only by the
+    // recovery that checks the pull request is this branch's own, in this
+    // repository, at this work.
+    if state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .is_some_and(|task| task.pr_create_unconfirmed.is_some())
+    {
+        return Err(
+            "This task has an unanswered request to open its pull request, so a pull request \
+             cannot be linked by URL alone. Use the pull request recovery in the task drawer, \
+             which checks that the pull request is this branch's own."
+                .to_string(),
+        );
+    }
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
             task.pr_url = Some(pr_url.clone());

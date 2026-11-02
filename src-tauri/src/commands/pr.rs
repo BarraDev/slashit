@@ -19,6 +19,9 @@ pub use republish::{RepublishOutcome, RepublishStatus};
 mod publication;
 pub use publication::*;
 
+mod unconfirmed;
+pub use unconfirmed::*;
+
 /// Parse a GitHub PR URL into an ExternalRef::GithubPr
 fn parse_pr_url_to_ref(pr_url: &str) -> Option<ExternalRef> {
     let parts: Vec<&str> = pr_url.trim_end_matches('/').split('/').collect();
@@ -3499,6 +3502,11 @@ enum PrSideEffectAdmission {
     /// request. It neither needs nor records an approval, and it never creates
     /// a pull request.
     ExplicitPublication,
+    /// A person's recovery from a request to open a pull request whose
+    /// outcome was never learned: linking the pull request they found, or
+    /// confirming that none exists. Neither needs nor records an approval, and
+    /// neither pushes or creates anything.
+    UnconfirmedRecovery,
 }
 
 async fn reserve_task_admitted_as(
@@ -4370,16 +4378,19 @@ async fn refuse_while_pr_create_unconfirmed(
 /// settle the request: a pull request that was just opened can be missing from
 /// a listing, and nothing SlashIt can read says how long. The record is kept,
 /// on disk, until a lookup finds the pull request and links it, or GitHub
-/// answers a request with a refusal. Nothing here discards it.
+/// answers a request with a refusal. Nothing automatic discards it: a person
+/// who has checked GitHub can, through `resolve_unconfirmed_pr_create`.
 fn unconfirmed_pr_create_refusal(earlier: &crate::domain::task::UnconfirmedPrCreate) -> String {
     format!(
         "SlashIt asked GitHub to open a pull request for {} at {} on {} and never learned \
          whether it did. GitHub does not list one for the branch now, but a pull request that \
          was just opened can be missing from that list, so SlashIt did not open another one, \
          which could duplicate it. If a pull request for the branch exists on GitHub, try again \
-         and SlashIt links it. If none exists, SlashIt cannot tell that from a list that has not \
-         caught up, and it has no way yet to discard this record: the repository owner has to \
-         decide how to recover.",
+         and SlashIt links it, or link it yourself in the task drawer's pull request recovery, \
+         which checks it is this branch's own. If none exists, SlashIt cannot tell that from a \
+         list that has not caught up: after checking GitHub yourself, you can confirm in the \
+         same place that no pull request exists and discard this record. A second pull request \
+         may then be created.",
         earlier.branch,
         earlier.commit,
         earlier.started_at.format("%Y-%m-%d %H:%M:%S UTC")
@@ -19926,6 +19937,8 @@ mod tests {
             ///   fork's same-named branch, newer than any other;
             /// - `repo_view` (holding JSON): the answer to `repo view --json
             ///   nameWithOwner`, otherwise an empty object;
+            /// - `pr_view` (holding JSON): the answer to `pr view <url> --json
+            ///   ...headRefOid...`, otherwise an empty object;
             /// - `list_hides_created`: `pr list` answers that there is no pull
             ///   request even once one exists, as a listing that has not caught
             ///   up with a pull request just opened does;
@@ -19982,6 +19995,7 @@ case "$*" in
       moved) git --git-dir={remote} update-ref refs/heads/{BRANCH} "$(cat {s}/moved_to)"; touch {s}/created; printf '%s' '{PR_URL}' ;;
       garbled) touch {s}/created; printf '%s' 'created' ;;
     esac ;;
+  *'pr view'*headRefOid*) if [ -f {s}/pr_view ]; then cat {s}/pr_view; else printf '{{}}'; fi ;;
   *'pr view'*) printf '%s' '{{"state":"OPEN"}}' ;;
   *) printf '{{}}' ;;
 esac"#
@@ -21589,6 +21603,936 @@ exec {real} "$@"
                     "ftp://github.com/o/r/pull/12",
                 ] {
                     assert!(!is_pull_request_url(not), "{not:?}");
+                }
+            }
+
+            /// A person's recovery from a request whose outcome was never learned.
+            mod human_recovery {
+                use super::*;
+                use crate::commands::pr::unconfirmed::after_lookup_hook;
+
+                const GH_REPO: &str = r#"{"nameWithOwner":"testorg/testrepo"}"#;
+                const ORIGIN: &str = "git@github.com:testorg/testrepo.git";
+
+                /// A task whose request to open a pull request was sent and never
+                /// answered, and whose listing does not show the pull request.
+                struct Stuck {
+                    repo: RepoFixture,
+                    sha: String,
+                    gh: Gh,
+                    state: crate::AppState,
+                    _tmp: tempfile::TempDir,
+                    task_id: Uuid,
+                    bin: tempfile::TempDir,
+                }
+
+                async fn stuck() -> Stuck {
+                    let (repo, sha, gh, state, tmp, task_id, bin) = setup().await;
+                    gh.set("repo_view", GH_REPO);
+                    gh.set("create_mode", "lost");
+                    gh.set("list_hides_created", "");
+                    create(&state, task_id, None)
+                        .await
+                        .expect_err("the outcome is unknown");
+                    assert_unconfirmed(&state, task_id, &sha).await;
+                    Stuck {
+                        repo,
+                        sha,
+                        gh,
+                        state,
+                        _tmp: tmp,
+                        task_id,
+                        bin,
+                    }
+                }
+
+                fn pr_json(url: &str, head: &str, oid: &str, cross: &str) -> String {
+                    format!(
+                        r#"{{"number":41,"url":"{url}","state":"OPEN","headRefName":"{head}","headRefOid":"{oid}","baseRefName":"main","isCrossRepository":{cross}}}"#
+                    )
+                }
+
+                impl Stuck {
+                    async fn token(&self) -> UnconfirmedToken {
+                        token_of(&in_memory(&self.state, self.task_id).await)
+                    }
+
+                    /// `git` that says origin is `url` on GitHub.
+                    fn git_for(&self, url: &str) -> PathBuf {
+                        git_with_origin_on_github(
+                            self.bin.path(),
+                            &real_git(&self.gh),
+                            &self.repo.remote,
+                            url,
+                        )
+                    }
+
+                    async fn resolve(
+                        &self,
+                        token: UnconfirmedToken,
+                        resolution: UnconfirmedResolution,
+                    ) -> Result<ResolveOutcome, String> {
+                        test_programs::scope(
+                            [("git", self.git_for(ORIGIN))],
+                            unconfirmed::resolve(&self.state, self.task_id, token, resolution),
+                        )
+                        .await
+                    }
+
+                    async fn link(&self, url: &str) -> Result<ResolveOutcome, String> {
+                        let token = self.token().await;
+                        self.resolve(
+                            token,
+                            UnconfirmedResolution::LinkExisting {
+                                pr_url: url.to_string(),
+                            },
+                        )
+                        .await
+                    }
+
+                    async fn discard(&self) -> Result<ResolveOutcome, String> {
+                        let token = self.token().await;
+                        self.resolve(token, confirm()).await
+                    }
+
+                    /// The PR GitHub would show for the branch's pull request.
+                    fn matching_pr(&self) {
+                        self.gh
+                            .set("pr_view", &pr_json(PR_URL, BRANCH, &self.sha, "false"));
+                    }
+
+                    fn drop_remote_branch(&self) {
+                        let status = std::process::Command::new("git")
+                            .args(["update-ref", "-d", &format!("refs/heads/{BRANCH}")])
+                            .current_dir(&self.repo.remote)
+                            .status()
+                            .expect("git runs");
+                        assert!(status.success());
+                        assert_eq!(self.repo.remote_has_branch(BRANCH), None);
+                    }
+
+                    /// Nothing was pushed or opened by the recovery, and the
+                    /// record is as it was.
+                    async fn assert_still_unconfirmed_and_untouched(&self) {
+                        assert_unconfirmed(&self.state, self.task_id, &self.sha).await;
+                        assert_eq!(self.gh.creates(), 1, "{}", self.gh.fake.invocations());
+                    }
+                }
+
+                fn token_of(task: &Task) -> UnconfirmedToken {
+                    let record = task.pr_create_unconfirmed.clone().expect("a record");
+                    UnconfirmedToken {
+                        branch: record.branch,
+                        commit: record.commit,
+                        started_at: record.started_at,
+                    }
+                }
+
+                fn confirm() -> UnconfirmedResolution {
+                    UnconfirmedResolution::ConfirmNoPullRequest { acknowledged: true }
+                }
+
+                /// A commit that contains `sha`.
+                fn child_of(stuck: &Stuck) -> String {
+                    let co = &stuck.repo.checkout;
+                    git(
+                        co,
+                        &[
+                            "-c",
+                            "user.name=t",
+                            "-c",
+                            "user.email=t@t",
+                            "commit-tree",
+                            &format!("{}^{{tree}}", stuck.sha),
+                            "-p",
+                            &stuck.sha,
+                            "-m",
+                            "more",
+                        ],
+                    )
+                }
+
+                // ---- linking the pull request the person found
+
+                /// 3: a pull request that is the branch's own, from this
+                /// repository, at the attempted commit, is linked, and the
+                /// record is settled by the link.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_verified_pull_request_is_linked_and_the_record_is_gone() {
+                    let s = stuck().await;
+                    s.matching_pr();
+                    s.drop_remote_branch();
+
+                    let outcome = s.link(PR_URL).await.expect("linked");
+
+                    assert_eq!(
+                        outcome.result,
+                        UnconfirmedOutcome::Linked {
+                            url: PR_URL.to_string()
+                        }
+                    );
+                    assert_delivered(&s.state, s.task_id).await;
+                    let task = on_disk(&s.state, s.task_id).await;
+                    assert!(
+                        task.activity
+                            .iter()
+                            .any(|e| matches!(e.kind, slashit_activity::Kind::PrLinked { .. })),
+                        "{:?}",
+                        task.activity
+                    );
+                    assert_eq!(
+                        s.gh.creates(),
+                        1,
+                        "no request was made: {}",
+                        s.gh.fake.invocations()
+                    );
+                    assert_eq!(s.repo.remote_has_branch(BRANCH), None, "nothing was pushed");
+                }
+
+                /// A pull request whose head contains the attempted commit (it
+                /// was pushed to since) is the same work, and is linked.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_pull_request_whose_head_contains_the_attempted_commit_is_linked() {
+                    let s = stuck().await;
+                    let child = child_of(&s);
+                    s.gh.set("pr_view", &pr_json(PR_URL, BRANCH, &child, "false"));
+
+                    let outcome = s.link(PR_URL).await.expect("linked");
+
+                    assert_eq!(
+                        outcome.result,
+                        UnconfirmedOutcome::Linked {
+                            url: PR_URL.to_string()
+                        }
+                    );
+                    assert_delivered(&s.state, s.task_id).await;
+                }
+
+                /// 4: a pull request that is not provably this branch's own, in
+                /// this repository, at this work, is refused, and the record
+                /// stays.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_pull_request_that_is_not_provably_the_branchs_own_is_refused() {
+                    let other_commit = "b".repeat(40);
+                    let main_commit = "@main".to_string();
+                    let cases: Vec<(&str, String, String, &str)> = vec![
+            ("another branch", PR_URL.to_string(), pr_json(PR_URL, "other-branch", &"a".repeat(40), "false"), "task-branch"),
+            ("a fork's pull request", PR_URL.to_string(), pr_json(PR_URL, BRANCH, &"a".repeat(40), "true"), "another repository"),
+            ("no repository flag", PR_URL.to_string(), r#"{"number":41,"url":"https://github.com/testorg/testrepo/pull/41","state":"OPEN","headRefName":"task-branch","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#.to_string(), "another repository"),
+            ("another repository", "https://github.com/testorg/other/pull/41".to_string(), pr_json("https://github.com/testorg/other/pull/41", BRANCH, &"a".repeat(40), "false"), "testorg/other"),
+            ("a different pull request than named", PR_URL.to_string(), pr_json("https://github.com/testorg/testrepo/pull/42", BRANCH, &"a".repeat(40), "false"), "different pull request"),
+            ("not a pull request URL", "https://github.com/testorg/testrepo/pull/41/files".to_string(), pr_json(PR_URL, BRANCH, &"a".repeat(40), "false"), "pull request URL"),
+            ("unrelated head commit", PR_URL.to_string(), pr_json(PR_URL, BRANCH, &main_commit, "false"), "does not contain"),
+            ("head commit unknown here", PR_URL.to_string(), pr_json(PR_URL, BRANCH, &other_commit, "false"), "cannot establish"),
+            ("no head commit", PR_URL.to_string(), r#"{"number":41,"url":"https://github.com/testorg/testrepo/pull/41","state":"OPEN","headRefName":"task-branch","isCrossRepository":false}"#.to_string(), "head commit"),
+        ];
+                    for (name, url, json, expected) in cases {
+                        let s = stuck().await;
+                        let json =
+                            json.replace("@main", &git(&s.repo.checkout, &["rev-parse", "main"]));
+                        s.gh.set("pr_view", &json);
+                        let outcome = s.link(&url).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+                        let UnconfirmedOutcome::NotThisPullRequest { reason } = outcome.result
+                        else {
+                            panic!("{name}: {:?}", outcome.result);
+                        };
+                        assert!(reason.contains(expected), "{name}: {reason}");
+                        s.assert_still_unconfirmed_and_untouched().await;
+                        assert_eq!(on_disk(&s.state, s.task_id).await.pr_url, None, "{name}");
+                    }
+                }
+
+                /// The repository `gh` works in and the one origin pushes to must
+                /// agree with the pull request's. When origin cannot be judged
+                /// the pull request is not linked.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_pull_request_is_not_linked_when_origin_and_gh_disagree_or_cannot_be_judged(
+                ) {
+                    for (name, origin, expected) in [
+                        (
+                            "a fork as origin",
+                            Some("git@github.com:somebody/testrepo.git"),
+                            "somebody/testrepo",
+                        ),
+                        ("origin that is a local path", None, "cannot check"),
+                    ] {
+                        let s = stuck().await;
+                        s.matching_pr();
+                        let token = s.token().await;
+                        let resolution = UnconfirmedResolution::LinkExisting {
+                            pr_url: PR_URL.to_string(),
+                        };
+                        let outcome = match origin {
+                            Some(url) => {
+                                test_programs::scope(
+                                    [("git", s.git_for(url))],
+                                    unconfirmed::resolve(&s.state, s.task_id, token, resolution),
+                                )
+                                .await
+                            }
+                            None => {
+                                unconfirmed::resolve(&s.state, s.task_id, token, resolution).await
+                            }
+                        }
+                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                        let UnconfirmedOutcome::NotThisPullRequest { reason } = outcome.result
+                        else {
+                            panic!("{name}: {:?}", outcome.result);
+                        };
+                        assert!(reason.contains(expected), "{name}: {reason}");
+                        s.assert_still_unconfirmed_and_untouched().await;
+                    }
+                }
+
+                /// `link_pr` takes any URL on trust. For a task that holds an
+                /// unanswered request it does not: the verified path is the only
+                /// way to settle it.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_unverified_link_is_refused_for_a_task_holding_an_unanswered_request() {
+                    use tauri::Manager;
+                    let s = stuck().await;
+                    let (task_id, sha) = (s.task_id, s.sha.clone());
+                    let app = tauri::test::mock_app();
+                    app.manage(s.state);
+
+                    let refused = crate::commands::task::link_pr(
+                        GuiMutation::untracked(),
+                        app.state(),
+                        task_id.to_string(),
+                        PR_URL.to_string(),
+                    )
+                    .await
+                    .expect_err("an unanswered request is settled by the verified path");
+
+                    assert!(refused.contains("unanswered"), "{refused}");
+                    let st = app.state::<crate::AppState>();
+                    assert_unconfirmed(&st, task_id, &sha).await;
+                }
+
+                // ---- confirming that no pull request exists
+
+                /// 7 and the audit: the person's confirmation discards the record
+                /// and says so on the timeline. It pushes nothing and opens
+                /// nothing.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_confirmed_discard_removes_the_record_and_is_recorded_without_any_remote_effect(
+                ) {
+                    let s = stuck().await;
+                    s.gh.unset("list_hides_created");
+                    // Nothing exists on GitHub, as the person says.
+                    let _ = std::fs::remove_file(s.gh.state.path().join("created"));
+                    s.drop_remote_branch();
+                    let attempt = in_memory(&s.state, s.task_id)
+                        .await
+                        .pr_create_unconfirmed
+                        .unwrap();
+
+                    let outcome = s.discard().await.expect("discarded");
+
+                    assert_eq!(
+                        outcome.result,
+                        UnconfirmedOutcome::Discarded { durable: true }
+                    );
+                    for task in [
+                        in_memory(&s.state, s.task_id).await,
+                        on_disk(&s.state, s.task_id).await,
+                    ] {
+                        assert_eq!(
+                            (task.pr_url.clone(), task.pr_create_unconfirmed.clone()),
+                            (None, None)
+                        );
+                        let entry = task
+                            .activity
+                            .iter()
+                            .find_map(|e| match &e.kind {
+                                slashit_activity::Kind::PrCreateUnconfirmedDiscarded {
+                                    branch,
+                                    commit,
+                                    started_at,
+                                } => Some((branch.clone(), commit.clone(), *started_at)),
+                                _ => None,
+                            })
+                            .expect("the decision is on the timeline");
+                        assert_eq!(
+                            entry,
+                            (
+                                attempt.branch.clone(),
+                                attempt.commit.clone(),
+                                attempt.started_at
+                            )
+                        );
+                    }
+                    assert_eq!(
+                        s.gh.creates(),
+                        1,
+                        "no request was made: {}",
+                        s.gh.fake.invocations()
+                    );
+                    assert_eq!(s.repo.remote_has_branch(BRANCH), None, "nothing was pushed");
+                }
+
+                /// The confirmation is a deliberate act: without it nothing is
+                /// discarded.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_discard_that_was_not_acknowledged_is_refused() {
+                    let s = stuck().await;
+                    let token = s.token().await;
+
+                    let error = s
+                        .resolve(
+                            token,
+                            UnconfirmedResolution::ConfirmNoPullRequest {
+                                acknowledged: false,
+                            },
+                        )
+                        .await
+                        .expect_err("not acknowledged");
+
+                    assert!(error.contains("confirm"), "{error}");
+                    s.assert_still_unconfirmed_and_untouched().await;
+                }
+
+                /// The one lookup the discard makes: when GitHub lists the
+                /// pull request, the discard is refused and linking is offered.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_discard_is_refused_when_github_lists_the_pull_request() {
+                    let s = stuck().await;
+                    s.gh.unset("list_hides_created");
+
+                    let outcome = s.discard().await.expect("answered");
+
+                    assert_eq!(
+                        outcome.result,
+                        UnconfirmedOutcome::PullRequestFound {
+                            url: PR_URL.to_string()
+                        }
+                    );
+                    s.assert_still_unconfirmed_and_untouched().await;
+                }
+
+                /// A lookup that cannot be answered proves nothing either: the
+                /// record stays.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_discard_is_refused_while_github_cannot_be_asked() {
+                    let s = stuck().await;
+                    s.gh.set("list_fails", "");
+
+                    let error = s.discard().await.expect_err("GitHub could not be asked");
+
+                    assert!(error.contains("could not be asked"), "{error}");
+                    s.assert_still_unconfirmed_and_untouched().await;
+                }
+
+                /// A negative lookup is not proof: the discard goes ahead only on
+                /// the person's confirmation, and the listing here still hides a
+                /// pull request that exists.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_discard_rests_on_the_confirmation_not_on_the_listing() {
+                    let s = stuck().await;
+                    // The listing is empty although the fake GitHub has the pull request.
+                    assert!(s.gh.state.path().join("created").exists());
+
+                    let outcome = s.discard().await.expect("discarded");
+
+                    assert_eq!(
+                        outcome.result,
+                        UnconfirmedOutcome::Discarded { durable: true }
+                    );
+                }
+
+                // ---- binding to the exact attempt
+
+                /// 5 and 6: a confirmation names the attempt the person saw. One
+                /// for another attempt, another branch, a record that has been
+                /// replaced, or no record at all is refused as stale.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_confirmation_for_another_attempt_is_refused_as_stale() {
+                    let s = stuck().await;
+                    let good = s.token().await;
+                    let wrong = [
+                        UnconfirmedToken {
+                            commit: "c".repeat(40),
+                            ..good.clone()
+                        },
+                        UnconfirmedToken {
+                            branch: "other-branch".into(),
+                            ..good.clone()
+                        },
+                        UnconfirmedToken {
+                            started_at: good.started_at + chrono::Duration::seconds(1),
+                            ..good.clone()
+                        },
+                    ];
+                    for token in wrong {
+                        for resolution in [
+                            confirm(),
+                            UnconfirmedResolution::LinkExisting {
+                                pr_url: PR_URL.to_string(),
+                            },
+                        ] {
+                            let outcome = s
+                                .resolve(token.clone(), resolution)
+                                .await
+                                .expect("answered");
+                            assert!(
+                                matches!(outcome.result, UnconfirmedOutcome::Stale { .. }),
+                                "{:?}",
+                                outcome.result
+                            );
+                            s.assert_still_unconfirmed_and_untouched().await;
+                        }
+                    }
+                }
+
+                /// The record is replaced by a newer attempt while the person is
+                /// looking: the old confirmation does not discard the new one.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_confirmation_does_not_discard_a_newer_attempt() {
+                    let s = stuck().await;
+                    let shown = s.token().await;
+                    let newer = crate::domain::task::UnconfirmedPrCreate {
+                        branch: shown.branch.clone(),
+                        commit: shown.commit.clone(),
+                        started_at: shown.started_at + chrono::Duration::minutes(5),
+                    };
+                    let replacement = newer.clone();
+                    crate::lifecycle::record(
+                        &s.state.task.tasks,
+                        &s.state.storage,
+                        s.task_id,
+                        &move |staged| {
+                            staged.get_mut(&s.task_id).unwrap().pr_create_unconfirmed =
+                                Some(replacement.clone());
+                        },
+                    )
+                    .await
+                    .expect("replaced");
+
+                    let outcome = s.resolve(shown, confirm()).await.expect("answered");
+
+                    assert!(
+                        matches!(outcome.result, UnconfirmedOutcome::Stale { .. }),
+                        "{:?}",
+                        outcome.result
+                    );
+                    assert_eq!(
+                        on_disk(&s.state, s.task_id).await.pr_create_unconfirmed,
+                        Some(newer)
+                    );
+                }
+
+                /// 11: asking again after the record was settled is refused as
+                /// stale and changes and sends nothing.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn repeating_the_recovery_is_refused_and_sends_nothing() {
+                    let s = stuck().await;
+                    let token = s.token().await;
+                    s.resolve(token.clone(), confirm())
+                        .await
+                        .expect("discarded");
+                    let before = on_disk(&s.state, s.task_id).await;
+
+                    let again = s.resolve(token.clone(), confirm()).await.expect("answered");
+                    let link = s
+                        .resolve(
+                            token,
+                            UnconfirmedResolution::LinkExisting {
+                                pr_url: PR_URL.to_string(),
+                            },
+                        )
+                        .await
+                        .expect("answered");
+
+                    for outcome in [again, link] {
+                        let UnconfirmedOutcome::Stale { reason } = outcome.result else {
+                            panic!("{:?}", outcome.result)
+                        };
+                        assert!(reason.contains("no unanswered request"), "{reason}");
+                    }
+                    let after = on_disk(&s.state, s.task_id).await;
+                    assert_eq!(
+                        after.activity.len(),
+                        before.activity.len(),
+                        "one decision, recorded once"
+                    );
+                    assert_eq!(s.gh.creates(), 1, "{}", s.gh.fake.invocations());
+                }
+
+                /// 5: a confirmation made for one task does not touch another.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_confirmation_is_bound_to_its_task() {
+                    let s = stuck().await;
+                    let other = seed_task(
+                        &s.state,
+                        s.repo.checkout.to_str().unwrap(),
+                        Some("other-task"),
+                        TaskStatus::Done,
+                    )
+                    .await;
+                    let theirs = crate::domain::task::UnconfirmedPrCreate {
+                        branch: "other-task".to_string(),
+                        commit: "d".repeat(40),
+                        started_at: chrono::Utc::now(),
+                    };
+                    let seeded = theirs.clone();
+                    crate::lifecycle::record(
+                        &s.state.task.tasks,
+                        &s.state.storage,
+                        other,
+                        &move |staged| {
+                            staged.get_mut(&other).unwrap().pr_create_unconfirmed =
+                                Some(seeded.clone());
+                        },
+                    )
+                    .await
+                    .expect("seeded");
+                    let ours = s.token().await;
+
+                    let outcome = unconfirmed::resolve(&s.state, other, ours, confirm())
+                        .await
+                        .expect("answered");
+
+                    assert!(
+                        matches!(outcome.result, UnconfirmedOutcome::Stale { .. }),
+                        "{:?}",
+                        outcome.result
+                    );
+                    assert_eq!(
+                        in_memory(&s.state, other).await.pr_create_unconfirmed,
+                        Some(theirs)
+                    );
+                    s.assert_still_unconfirmed_and_untouched().await;
+                }
+
+                /// 1: the record, and so the recovery, survives a restart.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_recovery_works_from_the_record_on_disk_after_a_restart() {
+                    let s = stuck().await;
+                    restart(&s.state, s.task_id).await;
+
+                    let outcome = s.discard().await.expect("discarded");
+
+                    assert_eq!(
+                        outcome.result,
+                        UnconfirmedOutcome::Discarded { durable: true }
+                    );
+                    assert_nothing_recorded_but_done(&s.state, s.task_id).await;
+                }
+
+                /// The task stays Done / unlinked: only the record is gone.
+                async fn assert_nothing_recorded_but_done(state: &crate::AppState, task_id: Uuid) {
+                    for task in [
+                        in_memory(state, task_id).await,
+                        on_disk(state, task_id).await,
+                    ] {
+                        assert_eq!((task.pr_url, task.pr_create_unconfirmed), (None, None));
+                        assert_eq!(task.status, TaskStatus::Done);
+                    }
+                }
+
+                // ---- the lifecycle rules
+
+                /// 9: a task that is running is not recovered under its run.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_running_task_is_not_recovered() {
+                    let s = stuck().await;
+                    crate::lifecycle::record(
+                        &s.state.task.tasks,
+                        &s.state.storage,
+                        s.task_id,
+                        &|staged| {
+                            staged
+                                .values_mut()
+                                .for_each(|t| t.status = TaskStatus::InProgress);
+                        },
+                    )
+                    .await
+                    .expect("running");
+
+                    let error = s.discard().await.expect_err("the task is running");
+
+                    assert!(error.contains("running"), "{error}");
+                    s.assert_still_unconfirmed_and_untouched().await;
+                }
+
+                /// 9: another pull request operation holding the task keeps the
+                /// recovery out until it lets go.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn another_pull_request_operation_holding_the_task_blocks_the_recovery() {
+                    let s = stuck().await;
+                    crate::test_helpers::attach_test_executor(&s.state);
+                    let held = reserve_task_for_pr_side_effect(&s.state, s.task_id)
+                        .await
+                        .expect("reserved");
+                    assert!(held.is_some());
+
+                    let error = s
+                        .discard()
+                        .await
+                        .expect_err("another operation holds the task");
+
+                    assert!(!error.is_empty());
+                    s.assert_still_unconfirmed_and_untouched().await;
+                    drop(held);
+                    assert_eq!(
+                        s.discard().await.expect("free again").result,
+                        UnconfirmedOutcome::Discarded { durable: true }
+                    );
+                }
+
+                /// 9: an operation a lifecycle transition ended while the lookup
+                /// was out does not discard anything.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_recovery_ended_by_a_lifecycle_transition_discards_nothing() {
+                    let s = stuck().await;
+                    s.gh.unset("list_hides_created");
+                    let _ = std::fs::remove_file(s.gh.state.path().join("created"));
+                    let executor = crate::test_helpers::attach_test_executor(&s.state);
+                    let task_id = s.task_id;
+                    let ender = std::sync::Arc::new(std::sync::Mutex::new(None));
+                    {
+                        let ender = ender.clone();
+                        after_lookup_hook::arm(
+                            s.repo.checkout.to_str().unwrap(),
+                            move |reservation| {
+                                *ender.lock().unwrap() = Some(tokio::spawn(async move {
+                                    let running: Option<&dyn crate::lifecycle::ExecutionOwnership> =
+                                        Some(executor.as_ref());
+                                    crate::lifecycle::end_active_ownership(running, task_id).await
+                                }));
+                                tokio::task::block_in_place(|| {
+                                    for _ in 0..400 {
+                                        if reservation.as_ref().is_some_and(|r| r.is_cancelled()) {
+                                            return;
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(25));
+                                    }
+                                });
+                            },
+                        );
+                    }
+
+                    let error = s.discard().await.expect_err("ended by a transition");
+                    let joined = ender.lock().unwrap().take().expect("the hook ran");
+                    joined
+                        .await
+                        .expect("join")
+                        .expect("the transition ends the operation");
+
+                    assert!(error.contains("stopped before"), "{error}");
+                    s.assert_still_unconfirmed_and_untouched().await;
+                }
+
+                // ---- persistence
+
+                /// 10: a write that published nothing leaves the record, and the
+                /// answer is an error, not a success.
+                #[tokio::test]
+                async fn a_discard_that_could_not_be_saved_leaves_the_record() {
+                    use slashit_durable_fs::{fault, Stage};
+                    let s = stuck().await;
+                    let token = s.token().await;
+
+                    let error = {
+                        let _fault = fault::fail_at(Stage::Replace, std::io::ErrorKind::Other);
+                        s.resolve(token, confirm()).await.expect_err("not saved")
+                    };
+
+                    assert!(error.contains("nothing was changed"), "{error}");
+                    s.assert_still_unconfirmed_and_untouched().await;
+                    let task = on_disk(&s.state, s.task_id).await;
+                    assert!(!task.activity.iter().any(|e| matches!(
+                        e.kind,
+                        slashit_activity::Kind::PrCreateUnconfirmedDiscarded { .. }
+                    )));
+                }
+
+                /// 10: a write that reached the file without being confirmed durable
+                /// is reported as such: the record is gone, and the answer says the
+                /// removal is not confirmed.
+                #[tokio::test]
+                async fn a_discard_published_but_not_confirmed_durable_says_so() {
+                    use slashit_durable_fs::{fault, Stage};
+                    let s = stuck().await;
+                    let token = s.token().await;
+
+                    let outcome = {
+                        let _fault =
+                            fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+                        s.resolve(token, confirm()).await.expect("published")
+                    };
+
+                    assert_eq!(
+                        outcome.result,
+                        UnconfirmedOutcome::Discarded { durable: false }
+                    );
+                    assert_eq!(
+                        in_memory(&s.state, s.task_id).await.pr_create_unconfirmed,
+                        None
+                    );
+                }
+
+                /// 10: the same for a link.
+                #[tokio::test]
+                async fn a_link_that_could_not_be_saved_leaves_the_record() {
+                    use slashit_durable_fs::{fault, Stage};
+                    let s = stuck().await;
+                    s.matching_pr();
+                    let token = s.token().await;
+
+                    let error = {
+                        let _fault = fault::fail_at(Stage::Replace, std::io::ErrorKind::Other);
+                        s.resolve(
+                            token,
+                            UnconfirmedResolution::LinkExisting {
+                                pr_url: PR_URL.to_string(),
+                            },
+                        )
+                        .await
+                        .expect_err("not saved")
+                    };
+
+                    assert!(error.contains(PR_URL), "{error}");
+                    assert_unconfirmed(&s.state, s.task_id, &s.sha).await;
+                }
+
+                // ---- what follows a discard
+
+                /// 8: the discard approves nothing and delivers nothing. A later
+                /// request meets the Human Review rules as before, and once
+                /// approved opens exactly one pull request.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_later_request_after_a_discard_needs_its_normal_authorization() {
+                    let (repo, sha, gh, state, _tmp, task_id, bin) = setup().await;
+                    gh.set("repo_view", GH_REPO);
+                    approve(&state, task_id, &sha).await;
+                    gh.set("create_mode", "lost");
+                    gh.set("list_hides_created", "");
+                    create(&state, task_id, None)
+                        .await
+                        .expect_err("the outcome is unknown");
+                    let s = Stuck {
+                        repo,
+                        sha: sha.clone(),
+                        gh,
+                        state,
+                        _tmp,
+                        task_id,
+                        bin,
+                    };
+                    assert_eq!(s.gh.creates(), 1);
+
+                    let outcome = s.discard().await.expect("discarded");
+                    assert_eq!(
+                        outcome.result,
+                        UnconfirmedOutcome::Discarded { durable: true }
+                    );
+                    assert!(
+                        on_disk(&s.state, s.task_id)
+                            .await
+                            .human_review
+                            .is_approved(),
+                        "the approval is untouched"
+                    );
+                    assert_eq!(s.gh.creates(), 1, "the discard opened nothing");
+
+                    // The approval goes: the next request is refused as before.
+                    crate::lifecycle::record(
+                        &s.state.task.tasks,
+                        &s.state.storage,
+                        s.task_id,
+                        &|staged| {
+                            staged
+                                .values_mut()
+                                .for_each(|t| t.human_review.withdraw_approval());
+                        },
+                    )
+                    .await
+                    .expect("withdrawn");
+                    let refused = create(&s.state, s.task_id, None)
+                        .await
+                        .expect_err("not approved");
+                    assert!(refused.contains("have not been approved"), "{refused}");
+                    assert_eq!(s.gh.creates(), 1, "{}", s.gh.fake.invocations());
+
+                    // Approved again, the normal path opens exactly one.
+                    approve(&s.state, s.task_id, &sha).await;
+                    s.gh.set("create_mode", "ok");
+                    assert_eq!(
+                        create(&s.state, s.task_id, None).await.as_deref(),
+                        Ok(PR_URL)
+                    );
+                    assert_eq!(
+                        s.gh.creates(),
+                        2,
+                        "exactly one more: {}",
+                        s.gh.fake.invocations()
+                    );
+                }
+
+                /// The reason a failed delivery showed is replaced by what is true
+                /// after the discard, and the person's decision is not presented as
+                /// a failure to try again.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_failure_reason_after_a_discard_says_what_the_person_decided() {
+                    let s = stuck().await;
+                    crate::lifecycle::record(
+                        &s.state.task.tasks,
+                        &s.state.storage,
+                        s.task_id,
+                        &|staged| {
+                            staged.values_mut().for_each(|t| {
+                                t.human_review.pr_error = Some("SlashIt cannot tell whether".into())
+                            });
+                        },
+                    )
+                    .await
+                    .expect("recorded");
+
+                    s.discard().await.expect("discarded");
+
+                    let reason = on_disk(&s.state, s.task_id)
+                        .await
+                        .human_review
+                        .pr_error
+                        .expect("still a delivery to retry");
+                    assert!(reason.contains("You confirmed"), "{reason}");
+                    assert!(!reason.contains("cannot tell"), "{reason}");
+                }
+
+                /// What the frontend sends and receives.
+                #[test]
+                fn the_wire_shapes_are_what_the_frontend_sends_and_reads() {
+                    let link: UnconfirmedResolution = serde_json::from_str(
+                        r#"{"kind":"link_existing","pr_url":"https://github.com/o/r/pull/1"}"#,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        link,
+                        UnconfirmedResolution::LinkExisting {
+                            pr_url: "https://github.com/o/r/pull/1".into()
+                        }
+                    );
+                    let confirm: UnconfirmedResolution = serde_json::from_str(
+                        r#"{"kind":"confirm_no_pull_request","acknowledged":true}"#,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        confirm,
+                        UnconfirmedResolution::ConfirmNoPullRequest { acknowledged: true }
+                    );
+                    assert_eq!(
+                        serde_json::to_value(UnconfirmedOutcome::Discarded { durable: false })
+                            .unwrap(),
+                        serde_json::json!({"outcome":"discarded","durable":false})
+                    );
+                    assert_eq!(
+                        serde_json::to_value(UnconfirmedOutcome::PullRequestFound {
+                            url: "u".into()
+                        })
+                        .unwrap(),
+                        serde_json::json!({"outcome":"pull_request_found","url":"u"})
+                    );
                 }
             }
 

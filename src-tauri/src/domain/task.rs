@@ -1357,7 +1357,11 @@ pub struct PendingRepublish {
 /// lag behind a pull request just opened. It is removed only by that link, or
 /// when it is known that no request was made: GitHub answered the request with
 /// a refusal, or the request was stopped before it was sent. It is never
-/// removed because time passed or because a lookup came back empty.
+/// removed because time passed or because a lookup came back empty. A person
+/// can settle it explicitly (`resolve_unconfirmed_pr_create`): by linking a
+/// pull request that is verified to be the branch's own, or by confirming
+/// after checking GitHub that none exists, which is their decision and is
+/// recorded as such on the timeline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UnconfirmedPrCreate {
