@@ -31,7 +31,7 @@ Each fact below was read in the cited code.
 - **Registry.** Projects and Repositories are records in `config.toml`
   (`AppConfig.projects`, `AppConfig.repositories`). A Project points at a
   Repository by `repository_id`; the path is `Repository.local_path`
-  (`config/storage.rs` `state_dir_for`, ~1048).
+  (`config/storage.rs` `state_dir_for`, ~1054).
 - **No path comparison at registration.** `create_repository` validates the
   directory and mints `Uuid::new_v4()` (`commands/repository.rs:164`);
   `create_project` also mints a fresh id (`commands/project.rs:96`). Neither
@@ -77,8 +77,10 @@ Each fact below was read in the cited code.
   (`commands/project.rs:~315`).
 - **Locking template.** Conversation mutation lock, then the Project lifecycle
   gate in write mode, then every Task lifecycle lease, then the board write
-  guard (`lock_project_conversation_for_deletion`, `project_gate.write`,
-  `hold_project_task_leases`; `lifecycle.rs:~1340-1400`).
+  guard. The Conversation lock, gate and lease acquisition are in
+  `commands/project.rs` (`lock_project_conversation_for_deletion` ~195-228 and
+  ~240-256, `project_gate.write` ~216, `hold_project_task_leases` call ~223);
+  only `hold_project_task_leases` itself is in `lifecycle.rs` (~1410).
 - **Task Checkouts** live under `<data_dir>/worktrees/<project-key>/`
   (`config/paths.rs:456-470`) and are listed by directory in storage
   accounting (`storage_accounting/inventory.rs:345-372`), with recorded owners
@@ -93,12 +95,14 @@ Each fact below was read in the cited code.
   (`domain/project.rs`, `ProjectScope`), and `delete_workspace` refuses while
   active Projects reference it (`commands/workspace.rs:~93-110`, reading the
   projects map).
-- **Secrets file mode is inconsistent in the docs.** `config/paths.rs:21` lists
-  `AgentConfig::api_key` under "Secrets … `config_dir`, mode 0600", yet the
-  key lives in `config.toml`, while `paths.rs:~320` says `credentials.toml` is
-  the file "locked to 0600 independently". The only test I found asserts that
-  `config.toml` has no group/world bits (`config/storage.rs:~4048-4058`), not
-  that the mode is exactly 0600. I did not verify the mode on the write path.
+- **Config directory mode is documented inconsistently.** `config.toml` is
+  written `OwnerOnly` (`config/storage.rs` `write_config` ~1001-1005 ->
+  `write_private_atomic` ~1356-1360 -> `slashit-durable-fs` `platform.rs`
+  ~10-16, mode 0600 at creation), so the archived section inherits 0600. The
+  inconsistency is `config/paths.rs:21`, which says secrets live in
+  `config_dir` "mode 0600" as a whole, while `workspace_registry.rs:158`,
+  `features.rs:355` and `updates.rs:82` write other files in that directory
+  with `Preserve`. That doc row should be corrected separately.
 
 ## Design
 
@@ -241,9 +245,11 @@ explicitly:
    (`storage_accounting/inventory.rs:345-372`). Removal does not free space,
    and the UI says so.
 
-Whether refusing on any recorded checkout is too strict (a Done Task may keep
-`worktree_path`, `lifecycle.rs:~1671`) is for the owner; the alternative is a
-reclaim-then-remove flow. It is listed under decision 6.
+Whether refusing on any recorded checkout is too strict is for the owner; the
+alternative is a reclaim-then-remove flow. It is listed under decision 6.
+(A terminal move clears `worktree_path` only on `Outcome::Cleaned`; on
+`Outcome::Kept` the status stays as it was, `lifecycle.rs:~1544, ~1652-1674`,
+so a Task holding a checkout is not Done.)
 
 ### 6. Refusals
 
@@ -376,10 +382,8 @@ present.
   audited for archived Projects before implementation. Startup cleanup itself
   is not one of them, per the pending-record behavior above.
 - An archived record keeps `agent_config.api_key` in `config.toml`; removal
-  does not remove a secret. The file mode is unverified (facts above): the
-  design requires that the archived section never be written with weaker
-  permissions than the active registry, and requires settling and testing the
-  exact mode (and fixing the `paths.rs:21` doc) before implementation.
+  does not remove a secret. It stays in `config.toml`, which is written
+  `OwnerOnly`, so archiving adds no new file and no weaker permissions.
 
 ## Open decisions for the owner (none adopted)
 
