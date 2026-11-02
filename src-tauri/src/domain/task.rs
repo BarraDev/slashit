@@ -3599,7 +3599,6 @@ mod tests {
         assert_eq!(task.activity[0].kind, ActivityKind::PrMerged { number: 7 });
     }
 
-    /// Every origin survives the task file (TOML) and IPC (JSON) unchanged.
     #[test]
     fn pr_create_unconfirmed_round_trips_through_toml_and_json() {
         #[derive(Serialize, Deserialize)]
@@ -3664,6 +3663,7 @@ mod tests {
         );
     }
 
+    /// Every origin survives the task file (TOML) and IPC (JSON) unchanged.
     #[test]
     fn branch_origin_round_trips_through_toml_and_json() {
         #[derive(Serialize, Deserialize)]

@@ -97,7 +97,7 @@ pub struct Facts {
     pub delivery_in_flight: bool,
     /// The record holds a local integration that is still `Pending`.
     pub integration_pending: bool,
-    /// The record holds a pull request request whose outcome is unconfirmed.
+    /// The record holds a pull request creation whose outcome is unconfirmed.
     pub pr_create_unconfirmed: bool,
 }
 
@@ -181,7 +181,11 @@ pub enum Review {
 /// `pr_create_unconfirmed` is whether a request to open a pull request has an
 /// unconfirmed outcome on the record. It asks for the user in any status, but
 /// not while a pull request is being opened: that attempt is the one SlashIt
-/// is waiting on, and it settles the record when it answers.
+/// is waiting on, and it settles the record when it answers. Among the Human
+/// Review reasons it takes precedence over `Review` and `PrNotCreated`: the
+/// person must learn whether the pull request exists before deciding or
+/// retrying, and the outcome they are shown is the unknown one, not the
+/// earlier failure. It stays below a failure and an unfinished integration.
 pub fn needs_you(
     stage: Stage,
     delivery_in_flight: bool,
