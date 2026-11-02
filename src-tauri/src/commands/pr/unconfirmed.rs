@@ -15,7 +15,7 @@ use crate::commands::pr::{
     resolve_repository_dir, run_cmd, PrSideEffectAdmission,
 };
 use crate::domain::task::{ActivityKind, UnconfirmedPrCreate};
-use crate::domain::{Task, TaskStatus};
+use crate::domain::Task;
 use crate::lifecycle::{self, RecordWriteError};
 
 /// The attempt a person was shown, exactly as the task record held it.
@@ -49,6 +49,8 @@ pub struct ResolveOutcome {
     pub result: UnconfirmedOutcome,
 }
 
+/// The command the task drawer's pull request recovery calls: [`resolve`] for
+/// the task `task_id`. Admitted like the other mutating desktop commands.
 #[tauri::command]
 pub async fn resolve_unconfirmed_pr_create(
     _gui: GuiMutation,
@@ -61,21 +63,6 @@ pub async fn resolve_unconfirmed_pr_create(
     resolve(&state, task_id, token, resolution).await
 }
 
-/// Settle the unanswered request `token` names, as the person chose.
-///
-/// Neither resolution pushes a branch, runs `gh pr create` or makes any other
-/// remote change. Linking reads the pull request the person named and links it
-/// only when it is verified to be this branch's own (see [`verify_pull_request`]).
-/// Confirming that none exists is the person's decision, not GitHub's: the one
-/// lookup made first can only refuse (it found a pull request), and an empty
-/// answer is never taken as proof.
-///
-/// Both are bound to the exact record the person was shown: if the task no
-/// longer holds it (settled, replaced by a newer attempt, or never the task's),
-/// the answer is [`UnconfirmedOutcome::Stale`] and nothing changes. The task is
-/// reserved as for any pull request side effect, so a running task, or another
-/// pull request operation holding it, refuses the recovery, and a lifecycle
-/// transition that ends it before the write stops it.
 /// The repository `gh` works in for the task's project, to show beside the
 /// unanswered request: `owner/repository`, or `None` when `gh` cannot say.
 /// Reads only.
@@ -89,6 +76,7 @@ pub async fn get_unconfirmed_pr_repository(
     Ok(repository_gh_works_in(&working_dir).await)
 }
 
+/// [`get_unconfirmed_pr_repository`]'s answer for a repository directory.
 pub(super) async fn repository_gh_works_in(working_dir: &str) -> Option<String> {
     let viewed = run_cmd(
         "gh",
@@ -105,6 +93,29 @@ pub(super) async fn repository_gh_works_in(working_dir: &str) -> Option<String> 
         .map(str::to_string)
 }
 
+/// Settle the unanswered request `token` names, as the person chose.
+///
+/// Neither resolution pushes a branch, runs `gh pr create` or makes any other
+/// remote change. Linking reads the pull request the person named and links it
+/// only when it is verified to be this branch's own (see [`verify_pull_request`]).
+/// Confirming that none exists is the person's decision, not GitHub's: the one
+/// lookup made first can only refuse (it found a pull request), and an empty
+/// answer is never taken as proof.
+///
+/// Both are bound to the exact record the person was shown: if the task no
+/// longer holds it (settled, replaced by a newer attempt, or never the task's),
+/// the answer is [`UnconfirmedOutcome::Stale`] and nothing changes. The task is
+/// reserved ([`PrSideEffectAdmission::UnconfirmedRecovery`]): anything that
+/// owns it (a run, a review, a helper, another pull request operation) refuses
+/// the recovery, decided under the lifecycle lease and without ending the
+/// owner, and a lifecycle transition that ends the operation before the write
+/// stops it.
+///
+/// Settling the record is a compare-and-set in the write itself for a discard
+/// ([`confirm_none`]). Linking depends on the reservation instead: the link
+/// clears the record unconditionally, which is sound because every writer of
+/// `pr_create_unconfirmed` (a new request, its retraction, its settlement)
+/// holds the same reservation.
 pub(super) async fn resolve(
     state: &crate::AppState,
     task_id: Uuid,
@@ -120,26 +131,6 @@ pub(super) async fn resolve(
         return Err(
             "Nothing was discarded: confirm that you checked GitHub yourself and understand that \
              a second pull request may be created."
-                .to_string(),
-        );
-    }
-    let running = state
-        .task
-        .tasks
-        .read()
-        .await
-        .get(&task_id)
-        .map(|task| {
-            matches!(
-                task.status,
-                TaskStatus::Queue | TaskStatus::InProgress | TaskStatus::AiReview
-            )
-        })
-        .ok_or("Task not found")?;
-    if running {
-        return Err(
-            "The task is running or waiting to run, so its pull request cannot be recovered now. \
-             Stop it first."
                 .to_string(),
         );
     }
@@ -334,6 +325,15 @@ enum Verification {
     Refused(String),
 }
 
+/// The lower-cased host of an `http(s)://host/...` URL.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split('/').next().filter(|host| !host.is_empty())?;
+    Some(host.to_ascii_lowercase())
+}
+
 fn owner_and_repo_of(url: &str) -> Option<(String, String)> {
     let rest = url
         .strip_prefix("https://")
@@ -377,14 +377,19 @@ async fn verify_pull_request(
     // The repository gh works in.
     let viewed = run_cmd(
         "gh",
-        &["repo", "view", "--json", "nameWithOwner"],
+        &["repo", "view", "--json", "nameWithOwner,url"],
         working_dir,
     )
     .await
     .map_err(|e| format!("gh could not name its repository: {}", redact_urls_in(&e)))?;
-    let named = serde_json::from_str::<serde_json::Value>(&viewed)
-        .ok()
+    let viewed = serde_json::from_str::<serde_json::Value>(&viewed).ok();
+    let named = viewed
+        .as_ref()
         .and_then(|json| json.get("nameWithOwner")?.as_str().map(str::to_string));
+    let gh_host = viewed
+        .as_ref()
+        .and_then(|json| json.get("url")?.as_str())
+        .and_then(host_of);
     let Some((gh_owner, gh_repo)) = named
         .as_deref()
         .and_then(|name| name.split_once('/'))
@@ -400,6 +405,23 @@ async fn verify_pull_request(
         return refused(format!(
             "The pull request is in {owner}/{repo}, but gh works in {gh_owner}/{gh_repo}, so it \
              is not in the repository this branch is delivered to."
+        ));
+    }
+
+    // The host gh works on. Origin's host is not compared: an ssh alias names
+    // the same repository under another host.
+    let Some(gh_host) = gh_host else {
+        return refused(
+            "SlashIt cannot check which host gh works on, so it cannot tell that the pull \
+             request is on it."
+                .into(),
+        );
+    };
+    let pr_host = host_of(url).unwrap_or_default();
+    if pr_host != gh_host {
+        return refused(format!(
+            "The pull request is on {pr_host}, but gh works on {gh_host}, so it is not in the \
+             repository this branch is delivered to."
         ));
     }
 
@@ -454,14 +476,14 @@ async fn verify_pull_request(
     let json: serde_json::Value = serde_json::from_str(&answer)
         .map_err(|e| format!("gh's answer about {url} could not be read: {e}"))?;
     let text = |name: &str| json.get(name).and_then(|v| v.as_str());
-    match text("url").map(|u| u.trim_end_matches('/')) {
-        Some(answered) if answered.eq_ignore_ascii_case(url) => {}
+    let canonical = match text("url").map(|u| u.trim_end_matches('/')) {
+        Some(answered) if answered.eq_ignore_ascii_case(url) => answered.to_string(),
         _ => {
             return refused(format!(
                 "gh answered with a different pull request than {url}, so nothing was linked."
             ))
         }
-    }
+    };
     match text("headRefName") {
         Some(head) if head == branch => {}
         Some(head) => {
@@ -514,7 +536,8 @@ async fn verify_pull_request(
             }
         }
     }
-    Ok(Verification::Verified(url.to_string()))
+    // What is linked is GitHub's spelling of the URL, not the person's.
+    Ok(Verification::Verified(canonical))
 }
 
 fn short(commit: &str) -> &str {

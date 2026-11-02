@@ -364,10 +364,23 @@ settled, replaced or never the Task's is refused as stale.
   attempt, and the drawer words it so. A later request goes through the usual
   admission, including the Human Review approval.
 
-Both refuse while the Task is running or waiting to run, while another pull
-request operation holds the Task, and when a lifecycle transition ended the
-operation. A write that published nothing is an error and leaves the record; a
-write that reached the file without being confirmed durable is reported as such.
+Both refuse while anything owns the Task (a run, an AI review or fix, a pull
+request helper, or another pull request operation) or the Task is waiting to
+run, and they do not end that owner: the check is made under the Task's
+lifecycle lease. They also refuse when a lifecycle transition ended the
+operation. Saving differs between the two:
+
+- Discarding writes the confirmation as a compare-and-set on the record. A write
+  that published nothing is an error and leaves the record. A write that reached
+  the file without being confirmed durable is reported as such (`durable:
+  false`), and the drawer says the record was discarded but the change may come
+  back if the computer stops before the next save.
+- Linking uses the existing link, which does not tell those two apart. When the
+  write fails either way, it answers with that link's error, "Pull request is at
+  <url>, but SlashIt could not record it on the task: ...", carrying the
+  storage's wording. The drawer shows it as an error and does not apply a task
+  record. The next refresh of the board shows what was stored: the link, if the
+  write reached the file, or the unanswered request, which can be linked again.
 
 **Downgrade.** The `pr_create_unconfirmed` table (`[tasks.pr_create_unconfirmed]`)
 and the timeline entry `pr_create_unconfirmed_discarded` are keys a build before

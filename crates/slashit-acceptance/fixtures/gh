@@ -112,7 +112,7 @@ case "$1 $2" in
         ;;
     "repo view")
         case "$*" in
-            *nameWithOwner*) printf '{"nameWithOwner":"slashit-acceptance/fixture"}' ;;
+            *nameWithOwner*) printf '{"nameWithOwner":"slashit-acceptance/fixture","url":"https://github.com/slashit-acceptance/fixture"}' ;;
             *) printf '{"defaultBranchRef":{"name":"main"}}' ;;
         esac
         ;;

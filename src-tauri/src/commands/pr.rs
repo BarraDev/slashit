@@ -3552,6 +3552,40 @@ async fn reserve_task_admitted_as(
             return Err(refusal);
         }
     }
+    // A person's recovery is not a reason to end anything that is running. The
+    // other admissions end the owner they find, because they are about to
+    // change the task's branch or deliver it; this one only reads GitHub and
+    // settles a record, so it is refused while anything owns the task: a run
+    // waiting or running, an AI review or fix, a PR helper (a deliberate
+    // difference from an explicit publication, which cancels a live helper)
+    // or another pull request operation. Decided under the lease, before the
+    // reservation below can end an owner, so a run started after any earlier
+    // look at the task is left running.
+    if admission == PrSideEffectAdmission::UnconfirmedRecovery {
+        let waiting = state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .is_some_and(|task| {
+                matches!(
+                    task.status,
+                    TaskStatus::Queue | TaskStatus::InProgress | TaskStatus::AiReview
+                )
+            });
+        let owned = match state.executor.get() {
+            Some(executor) => executor.is_task_running(task_id).await,
+            None => false,
+        };
+        if waiting || owned {
+            return Err(
+                "The task is running or waiting to run, or another operation holds it, so its \
+                 pull request cannot be recovered now. Stop it or wait for it to finish first."
+                    .to_string(),
+            );
+        }
+    }
     let Some(executor) = state.executor.get() else {
         return Ok(None);
     };
@@ -19973,7 +20007,7 @@ mod tests {
                         r#"has_branch() {{ git --git-dir={remote} rev-parse -q --verify refs/heads/{BRANCH} >/dev/null 2>&1; }}
 case "$*" in
   'repo view --json defaultBranchRef') printf '%s' '{{"defaultBranchRef":{{"name":"main"}}}}' ;;
-  'repo view --json nameWithOwner') if [ -f {s}/repo_view ]; then cat {s}/repo_view; else printf '{{}}'; fi ;;
+  'repo view --json nameWithOwner'|'repo view --json nameWithOwner,url') if [ -f {s}/repo_view ]; then cat {s}/repo_view; else printf '{{}}'; fi ;;
   *'pr list'*)
     if [ -f {s}/list_fails ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
     if [ -f {s}/list_fails_after_push ] && has_branch; then echo 'error connecting to api.github.com' >&2; exit 1; fi
@@ -21611,7 +21645,7 @@ exec {real} "$@"
                 use super::*;
                 use crate::commands::pr::unconfirmed::after_lookup_hook;
 
-                const GH_REPO: &str = r#"{"nameWithOwner":"testorg/testrepo"}"#;
+                const GH_REPO: &str = r#"{"nameWithOwner":"testorg/testrepo","url":"https://github.com/testorg/testrepo"}"#;
                 const ORIGIN: &str = "git@github.com:testorg/testrepo.git";
 
                 /// A task whose request to open a pull request was sent and never
@@ -21816,16 +21850,16 @@ exec {real} "$@"
                     let other_commit = "b".repeat(40);
                     let main_commit = "@main".to_string();
                     let cases: Vec<(&str, String, String, &str)> = vec![
-            ("another branch", PR_URL.to_string(), pr_json(PR_URL, "other-branch", &"a".repeat(40), "false"), "task-branch"),
-            ("a fork's pull request", PR_URL.to_string(), pr_json(PR_URL, BRANCH, &"a".repeat(40), "true"), "another repository"),
-            ("no repository flag", PR_URL.to_string(), r#"{"number":41,"url":"https://github.com/testorg/testrepo/pull/41","state":"OPEN","headRefName":"task-branch","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#.to_string(), "another repository"),
-            ("another repository", "https://github.com/testorg/other/pull/41".to_string(), pr_json("https://github.com/testorg/other/pull/41", BRANCH, &"a".repeat(40), "false"), "testorg/other"),
-            ("a different pull request than named", PR_URL.to_string(), pr_json("https://github.com/testorg/testrepo/pull/42", BRANCH, &"a".repeat(40), "false"), "different pull request"),
-            ("not a pull request URL", "https://github.com/testorg/testrepo/pull/41/files".to_string(), pr_json(PR_URL, BRANCH, &"a".repeat(40), "false"), "pull request URL"),
-            ("unrelated head commit", PR_URL.to_string(), pr_json(PR_URL, BRANCH, &main_commit, "false"), "does not contain"),
-            ("head commit unknown here", PR_URL.to_string(), pr_json(PR_URL, BRANCH, &other_commit, "false"), "cannot establish"),
-            ("no head commit", PR_URL.to_string(), r#"{"number":41,"url":"https://github.com/testorg/testrepo/pull/41","state":"OPEN","headRefName":"task-branch","isCrossRepository":false}"#.to_string(), "head commit"),
-        ];
+    ("another branch", PR_URL.to_string(), pr_json(PR_URL, "other-branch", &"a".repeat(40), "false"), "task-branch"),
+    ("a fork's pull request", PR_URL.to_string(), pr_json(PR_URL, BRANCH, &"a".repeat(40), "true"), "another repository"),
+    ("no repository flag", PR_URL.to_string(), r#"{"number":41,"url":"https://github.com/testorg/testrepo/pull/41","state":"OPEN","headRefName":"task-branch","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#.to_string(), "another repository"),
+    ("another repository", "https://github.com/testorg/other/pull/41".to_string(), pr_json("https://github.com/testorg/other/pull/41", BRANCH, &"a".repeat(40), "false"), "testorg/other"),
+    ("a different pull request than named", PR_URL.to_string(), pr_json("https://github.com/testorg/testrepo/pull/42", BRANCH, &"a".repeat(40), "false"), "different pull request"),
+    ("not a pull request URL", "https://github.com/testorg/testrepo/pull/41/files".to_string(), pr_json(PR_URL, BRANCH, &"a".repeat(40), "false"), "pull request URL"),
+    ("unrelated head commit", PR_URL.to_string(), pr_json(PR_URL, BRANCH, &main_commit, "false"), "does not contain"),
+    ("head commit unknown here", PR_URL.to_string(), pr_json(PR_URL, BRANCH, &other_commit, "false"), "cannot establish"),
+    ("no head commit", PR_URL.to_string(), r#"{"number":41,"url":"https://github.com/testorg/testrepo/pull/41","state":"OPEN","headRefName":"task-branch","isCrossRepository":false}"#.to_string(), "head commit"),
+];
                     for (name, url, json, expected) in cases {
                         let s = stuck().await;
                         let json =
@@ -22498,6 +22532,153 @@ exec {real} "$@"
                         .expect("still a delivery to retry");
                     assert!(reason.contains("You confirmed"), "{reason}");
                     assert!(!reason.contains("cannot tell"), "{reason}");
+                }
+
+                /// M1: the task is checked for a live owner under the lifecycle
+                /// lease, before the reservation can end anything. An owner that is
+                /// there when the reservation is taken is left running and the
+                /// recovery is refused.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_live_owner_is_left_running_and_the_recovery_is_refused() {
+                    let s = stuck().await;
+                    let executor = crate::test_helpers::attach_test_executor(&s.state);
+                    // Started after any earlier look at the task's status: the
+                    // status the task shows is not Queue, InProgress or AI Review.
+                    let ended = executor
+                        .register_fake_running_execution_for_test(s.task_id)
+                        .await;
+
+                    let error = s.discard().await.expect_err("a run owns the task");
+
+                    assert!(error.contains("running"), "{error}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    assert!(
+                        !ended.load(std::sync::atomic::Ordering::SeqCst),
+                        "the recovery ended a run it had no right to"
+                    );
+                    assert!(executor.is_task_running(s.task_id).await);
+                    s.assert_still_unconfirmed_and_untouched().await;
+                }
+
+                /// M1: a queued task is refused under the lease too, and its status
+                /// is left as it was.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_queued_task_is_refused_under_the_lease_and_left_queued() {
+                    let s = stuck().await;
+                    crate::test_helpers::attach_test_executor(&s.state);
+                    crate::lifecycle::record(
+                        &s.state.task.tasks,
+                        &s.state.storage,
+                        s.task_id,
+                        &|staged| {
+                            staged
+                                .values_mut()
+                                .for_each(|t| t.status = TaskStatus::Queue);
+                        },
+                    )
+                    .await
+                    .expect("queued");
+
+                    let error = s.discard().await.expect_err("the task is waiting to run");
+
+                    assert!(error.contains("running"), "{error}");
+                    assert_eq!(
+                        in_memory(&s.state, s.task_id).await.status,
+                        TaskStatus::Queue
+                    );
+                    s.assert_still_unconfirmed_and_untouched().await;
+                }
+
+                /// M2: the record is replaced by a newer attempt in the window between
+                /// the lookup and the write. The write itself compares the record, so
+                /// the confirmation does not discard the newer one.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_record_replaced_between_the_lookup_and_the_write_is_not_discarded() {
+                    let s = stuck().await;
+                    s.gh.unset("list_hides_created");
+                    let _ = std::fs::remove_file(s.gh.state.path().join("created"));
+                    let shown = s.token().await;
+                    let newer = crate::domain::task::UnconfirmedPrCreate {
+                        branch: shown.branch.clone(),
+                        commit: shown.commit.clone(),
+                        started_at: shown.started_at + chrono::Duration::minutes(5),
+                    };
+                    let tasks = s.state.task.tasks.clone();
+                    let task_id = s.task_id;
+                    let replacement = newer.clone();
+                    after_lookup_hook::arm(s.repo.checkout.to_str().unwrap(), move |_| {
+                        tasks
+                            .try_write()
+                            .expect("no reader holds the task map in the window")
+                            .get_mut(&task_id)
+                            .expect("the task")
+                            .pr_create_unconfirmed = Some(replacement.clone());
+                    });
+
+                    let outcome = s.resolve(shown, confirm()).await.expect("answered");
+
+                    assert!(
+                        matches!(outcome.result, UnconfirmedOutcome::Stale { .. }),
+                        "{:?}",
+                        outcome.result
+                    );
+                    for task in [
+                        in_memory(&s.state, s.task_id).await,
+                        on_disk(&s.state, s.task_id).await,
+                    ] {
+                        assert_eq!(task.pr_create_unconfirmed, Some(newer.clone()));
+                        assert!(
+                            !task.activity.iter().any(|e| matches!(
+                                e.kind,
+                                slashit_activity::Kind::PrCreateUnconfirmedDiscarded { .. }
+                            )),
+                            "no decision is recorded for a record that was not discarded"
+                        );
+                    }
+                }
+
+                /// L2: what is linked is GitHub's own spelling of the URL, not the
+                /// person's.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_pull_request_linked_is_the_url_github_answers_with() {
+                    let s = stuck().await;
+                    s.matching_pr();
+
+                    let outcome = s
+                        .link("  https://GitHub.com/TestOrg/TestRepo/pull/41/ ")
+                        .await
+                        .expect("linked");
+
+                    assert_eq!(
+                        outcome.result,
+                        UnconfirmedOutcome::Linked {
+                            url: PR_URL.to_string()
+                        }
+                    );
+                    assert_eq!(
+                        on_disk(&s.state, s.task_id).await.pr_url.as_deref(),
+                        Some(PR_URL)
+                    );
+                }
+
+                /// L3: the pull request must be on the host of the repository gh works
+                /// in; origin's host is not compared (an ssh alias names another host).
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_pull_request_on_another_host_is_refused() {
+                    let s = stuck().await;
+                    let other = "https://ghe.example.com/testorg/testrepo/pull/41";
+                    s.gh.set("pr_view", &pr_json(other, BRANCH, &s.sha, "false"));
+
+                    let outcome = s.link(other).await.expect("answered");
+
+                    let UnconfirmedOutcome::NotThisPullRequest { reason } = outcome.result else {
+                        panic!("{:?}", outcome.result);
+                    };
+                    assert!(
+                        reason.contains("ghe.example.com") && reason.contains("github.com"),
+                        "{reason}"
+                    );
+                    s.assert_still_unconfirmed_and_untouched().await;
                 }
 
                 /// The panel names the repository gh works in; when gh cannot say,
