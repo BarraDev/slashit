@@ -5,7 +5,9 @@
 # "opened" as files so a later `pr list` finds them the way GitHub would.
 #
 # A journey makes `pr create` fail by creating the file `fail-create` in the
-# fixture's directory, and makes it succeed again by removing it. A file
+# fixture's directory, and makes it succeed again by removing it. The file
+# `fail-create-unanswered` makes it fail the way a lost connection does: with
+# text that says nothing about whether GitHub opened a pull request. A file
 # `delay-create` holding a number of seconds makes `pr create` take that long
 # first, the way a real push and GitHub round trip does. A file `pr-view.json`
 # is what `pr view` prints instead of its default, so a journey can script
@@ -70,6 +72,10 @@ case "$1 $2" in
         if [ -f "$dir/delay-create" ]; then
             sleep "$(cat "$dir/delay-create")"
         fi
+        if [ -f "$dir/fail-create-unanswered" ]; then
+            echo "fake gh: error connecting to api.github.com: the connection was reset" >&2
+            exit 1
+        fi
         if [ -f "$dir/fail-create" ]; then
             echo "fake gh: HTTP 422: Validation Failed: creating the pull request was scripted to fail" >&2
             exit 1
@@ -105,7 +111,10 @@ case "$1 $2" in
         cat "$dir/pr-commits/$number"
         ;;
     "repo view")
-        printf '{"defaultBranchRef":{"name":"main"}}'
+        case "$*" in
+            *nameWithOwner*) printf '{"nameWithOwner":"slashit-acceptance/fixture"}' ;;
+            *) printf '{"defaultBranchRef":{"name":"main"}}' ;;
+        esac
         ;;
     *)
         if [ "$1" = "--version" ]; then

@@ -67,7 +67,7 @@ impl GitFixture {
     }
 
     /// What `branch` points at in the bare `origin`, if it is there at all.
-    fn origin_tip(&self, branch: &str) -> Result<Option<String>> {
+    pub(super) fn origin_tip(&self, branch: &str) -> Result<Option<String>> {
         let output = std::process::Command::new("git")
             .arg("--git-dir")
             .arg(self.origin_path()?)

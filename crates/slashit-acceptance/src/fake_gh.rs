@@ -28,6 +28,10 @@ pub const REPOSITORY_URL: &str = "https://github.com/slashit-acceptance/fixture.
 /// The file whose presence makes `pr create` fail.
 const FAIL_CREATE: &str = "fail-create";
 
+/// The file whose presence makes `pr create` fail the way a lost connection
+/// does, with text that says nothing about whether a pull request was opened.
+const FAIL_CREATE_UNANSWERED: &str = "fail-create-unanswered";
+
 /// The file whose contents, a number of seconds, `pr create` sleeps first.
 const DELAY_CREATE: &str = "delay-create";
 
@@ -77,6 +81,22 @@ impl FakeGh {
     /// Make every following `pr create` fail, or succeed again.
     pub fn fail_pr_creation(&self, fail: bool) -> Result<()> {
         let marker = self.dir.join(FAIL_CREATE);
+        if fail {
+            std::fs::write(&marker, "").with_context(|| format!("could not write {}", marker.display()))
+        } else {
+            match std::fs::remove_file(&marker) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("could not remove {}", marker.display())),
+            }
+        }
+    }
+
+    /// Make every following `pr create` fail without saying whether GitHub
+    /// opened anything (a connection reset), or answer normally again. The fake
+    /// opens nothing in that case.
+    pub fn fail_pr_creation_unanswered(&self, fail: bool) -> Result<()> {
+        let marker = self.dir.join(FAIL_CREATE_UNANSWERED);
         if fail {
             std::fs::write(&marker, "").with_context(|| format!("could not write {}", marker.display()))
         } else {
