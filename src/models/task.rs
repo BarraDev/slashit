@@ -147,6 +147,11 @@ pub struct Task {
     /// The latest explicit publication of a commit to the pull request. Not an approval.
     #[serde(default)]
     pub pr_publication: Option<PrPublication>,
+    /// A request to open a pull request that SlashIt sent and never learned
+    /// the outcome of. While it is set a pull request may exist that `pr_url`
+    /// does not name. Mirrors the backend's `UnconfirmedPrCreate`.
+    #[serde(default)]
+    pub pr_create_unconfirmed: Option<UnconfirmedPrCreate>,
     pub stuck_since: Option<chrono::DateTime<chrono::Utc>>,
 
     #[serde(default)]
@@ -673,6 +678,43 @@ pub struct PrPublication {
     pub state: PublicationState,
     pub requested_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Mirrors the backend `UnconfirmedPrCreate`: the request to open a pull
+/// request whose outcome was never learned. It is also the token a recovery
+/// names, so the backend refuses a confirmation made for another attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnconfirmedPrCreate {
+    pub branch: String,
+    pub commit: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// What a person chose to do about an [`UnconfirmedPrCreate`]. Mirrors the
+/// backend `UnconfirmedResolution`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UnconfirmedResolution {
+    LinkExisting { pr_url: String },
+    ConfirmNoPullRequest { acknowledged: bool },
+}
+
+/// How the backend answered a recovery. Mirrors `UnconfirmedOutcome`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum UnconfirmedOutcome {
+    Linked { url: String },
+    Discarded { durable: bool },
+    PullRequestFound { url: String },
+    NotThisPullRequest { reason: String },
+    Stale { reason: String },
+}
+
+/// The answer to a recovery: the task as it is now, and what happened.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ResolveUnconfirmedOutcome {
+    pub task: Option<Task>,
+    pub result: UnconfirmedOutcome,
 }
 
 /// Mirrors the backend `PublicationState`.

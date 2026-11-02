@@ -276,6 +276,19 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_republish: Option<PendingRepublish>,
 
+    /// A pull request SlashIt asked GitHub to open for this task and has not
+    /// confirmed either way (see [`UnconfirmedPrCreate`]). `None` when no such
+    /// request is outstanding, which is what every earlier record loads as.
+    /// It is kept apart from a failure the attempt is known to have had: while
+    /// it is set, a pull request may exist that `pr_url` does not name.
+    ///
+    /// Not [`Self::pr_publication`]: that record is a person's request to
+    /// publish one commit to a pull request that already exists, and it names
+    /// that pull request. This one is written before there is a pull request
+    /// to name, and by a different operation with a different authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_create_unconfirmed: Option<UnconfirmedPrCreate>,
+
     /// The latest explicit request to publish a commit to this task's pull
     /// request. It is not an approval: see [`super::publication`]. `None`
     /// for a task that was never published this way.
@@ -984,6 +997,7 @@ impl Task {
             base_commit: None,
             branch_origin: None,
             pending_republish: None,
+            pr_create_unconfirmed: None,
             pr_publication: None,
             local_integration: None,
             cleanup_in_flight: false,
@@ -1324,6 +1338,39 @@ pub struct PendingRepublish {
     /// `None` until then.
     #[serde(default)]
     pub rewritten_tip: Option<String>,
+}
+
+/// A request SlashIt sent to GitHub to open this task's pull request, whose
+/// outcome it has not confirmed, as recorded on
+/// [`Task::pr_create_unconfirmed`].
+///
+/// Opening a pull request is the one step of a delivery that is not safe to
+/// repeat blindly: a push of the same commit is, a second pull request is not.
+/// So this is written before the request is sent, and its presence means
+/// exactly "a pull request for `branch` at `commit` may exist on GitHub that
+/// this task does not record".
+///
+/// It decides what a retry does, in one rule. While it is set, no further
+/// request to open a pull request is made, whatever a lookup answers: a lookup
+/// that finds the branch's pull request links it (and that write removes the
+/// record), and a lookup that finds none proves nothing, because a listing can
+/// lag behind a pull request just opened. It is removed only by that link, or
+/// when it is known that no request was made: GitHub answered the request with
+/// a refusal, or the request was stopped before it was sent. It is never
+/// removed because time passed or because a lookup came back empty. A person
+/// can settle it explicitly (`resolve_unconfirmed_pr_create`): by linking a
+/// pull request that is verified to be the branch's own, or by confirming
+/// after checking GitHub that none exists, which is their decision and is
+/// recorded as such on the timeline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UnconfirmedPrCreate {
+    /// The branch the pull request was asked for, as its head.
+    pub branch: String,
+    /// The commit SlashIt had confirmed on the remote branch before asking.
+    pub commit: String,
+    /// When the request was about to be sent.
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// What a task's branch currently starts from, as recorded on

@@ -295,6 +295,16 @@ pub enum Kind {
     PrClosed {
         number: u32,
     },
+    /// A person confirmed that no pull request exists for `branch` and
+    /// discarded the record of a request to open one (made for `commit` at
+    /// `started_at`) whose outcome SlashIt never learned. It is the person's
+    /// decision, taken after checking GitHub themselves; GitHub did not prove
+    /// it, and nothing was sent to GitHub by it.
+    PrCreateUnconfirmedDiscarded {
+        branch: String,
+        commit: String,
+        started_at: DateTime<Utc>,
+    },
     /// A person completed approved changes locally: the task is Done, its
     /// Task Checkout is gone, and its branch was neither merged nor pushed.
     ///
@@ -354,7 +364,8 @@ impl Kind {
             | Self::NewAttemptAuthorized { .. }
             | Self::Stopped { .. }
             | Self::Interrupted { .. }
-            | Self::DeliveryFailed { .. } => return None,
+            | Self::DeliveryFailed { .. }
+            | Self::PrCreateUnconfirmedDiscarded { .. } => return None,
         })
     }
 
@@ -812,6 +823,7 @@ impl Item<'_> {
                 Kind::PrClosed { .. } => "pr_closed",
                 Kind::CompletedLocally {} => "completed_locally",
                 Kind::IntegratedLocally { .. } => "integrated_locally",
+                Kind::PrCreateUnconfirmedDiscarded { .. } => "pr_create_unconfirmed_discarded",
             },
         }
     }
@@ -883,6 +895,9 @@ fn kind_title(kind: &Kind) -> String {
         Kind::PrClosed { .. } => "Pull request closed without merge".to_string(),
         Kind::CompletedLocally {} => "Completed locally, not merged".to_string(),
         Kind::IntegratedLocally { target, .. } => format!("Integrated into {target}"),
+        Kind::PrCreateUnconfirmedDiscarded { .. } => {
+            "You confirmed that no pull request exists".to_string()
+        }
     }
 }
 
@@ -904,6 +919,18 @@ fn kind_detail(kind: &Kind) -> Option<String> {
             ..
         } => Some(format!("#{number}")),
         Kind::PrMerged { number } | Kind::PrClosed { number } => Some(format!("#{number}")),
+        Kind::PrCreateUnconfirmedDiscarded {
+            branch,
+            commit,
+            started_at,
+        } => {
+            let short: String = commit.chars().take(12).collect();
+            Some(format!(
+                "Discarded the unconfirmed request to open a pull request for {branch} at {short} \
+                 (started {}). Your decision, not confirmed by GitHub.",
+                started_at.format("%Y-%m-%d %H:%M UTC")
+            ))
+        }
         Kind::IntegratedLocally {
             strategy, commit, ..
         } => {

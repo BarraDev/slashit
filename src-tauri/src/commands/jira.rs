@@ -207,6 +207,7 @@ pub async fn import_jira_issues(
             base_commit: None,
             branch_origin: None,
             pending_republish: None,
+            pr_create_unconfirmed: None,
             pr_publication: None,
             local_integration: None,
             cleanup_in_flight: false,

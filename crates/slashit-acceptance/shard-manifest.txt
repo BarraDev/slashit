@@ -92,3 +92,5 @@
 3	reviewer_policy::a_task_created_in_the_editor_keeps_the_reviewer_chosen
 3	reviewer_policy::a_refused_reviewer_through_the_command_changes_no_task
 3	reviewer_policy::an_automatic_task_without_a_reviewer_stops_at_human_review_and_says_why
+# Recovery of a pull request request whose outcome was never learned: left unanswered, blocked, discarded by the person, then one normal retry.
+1	pr_recovery::an_unanswered_pull_request_request_is_settled_by_the_person_and_a_retry_opens_exactly_one

@@ -324,6 +324,78 @@ start rather than letting the Task begin without that work. A Task with several
 dependencies starts only from a base that holds all of them. The rules are in
 [task-checkouts-and-stacks.md](task-checkouts-and-stacks.md#stacked-tasks).
 
+### A pull request request whose outcome is unknown
+
+SlashIt records a request to open a Task's pull request (`pr_create_unconfirmed`:
+branch, commit, start time) durably before it asks GitHub, and removes it only
+when it learns the outcome. It stays when `gh pr create` fails in a way that does
+not say that GitHub refused the request (a gateway or server error, a timeout, a
+dropped connection, a GraphQL error that is not a refusal, an unrecognized
+message) and the branch's pull request is not listed: a listing can lag behind a
+pull request that was just opened. While it stays, SlashIt opens no other pull
+request for the Task, and the automatic path never discards it. It is removed
+when a lookup finds the pull request and links it, when GitHub refused the
+request (an HTTP 4xx other than 408, or one of a short list of GraphQL
+validation, permission and not-found messages) and the listing was read and
+shows none, or when the request was stopped before it was sent.
+
+A person can settle it from the task drawer (Pull request recovery), through
+`resolve_unconfirmed_pr_create`, in one of two ways. Neither pushes a branch,
+runs `gh pr create` or changes anything on GitHub, and both are bound to the
+exact record the drawer showed (branch, commit, start time): a record that was
+settled, replaced or never the Task's is refused as stale.
+
+- **Link the pull request they found.** SlashIt links it only after `gh` and
+  `git` agree on the repository, GitHub answers for exactly that pull request,
+  its head branch is the Task's branch in this repository and not a fork's, and
+  its head commit is the attempted commit or contains it. A URL that merely
+  looks valid is not enough, and a pull request SlashIt cannot verify (for
+  example when origin's push URL is not an `owner/repository` URL) is refused
+  with the reason. The existing link then records it and settles the request in
+  the same write. `link_pr` no longer links a Task that holds an unanswered
+  request by URL alone.
+- **Confirm that no pull request exists.** The person checks GitHub themselves
+  and acknowledges that a second pull request may then be created. SlashIt
+  makes one read-only lookup first: when GitHub lists the branch's pull request
+  it refuses and offers the link, and when the lookup cannot be answered it
+  refuses. An empty listing is not proof, and the discard rests on the
+  confirmation alone. The decision is recorded on the Task's timeline as the
+  person's own ("You confirmed that no pull request exists"), with the discarded
+  attempt, and the drawer words it so. A later request goes through the usual
+  admission, including the Human Review approval.
+
+Both refuse while anything owns the Task (a run, an AI review or fix, a pull
+request helper, or another pull request operation) or the Task is waiting to
+run, and they do not end that owner: the check is made under the Task's
+lifecycle lease. They also refuse when a lifecycle transition ended the
+operation. Saving differs between the two:
+
+- Discarding writes the confirmation as a compare-and-set on the record. A write
+  that published nothing is an error and leaves the record. A write that reached
+  the file without being confirmed durable is reported as such (`durable:
+  false`), and the drawer says the record was discarded but the change may come
+  back if the computer stops before the next save.
+- Linking uses the existing link, which does not tell those two apart. When the
+  write fails either way, it answers with that link's error, "Pull request is at
+  <url>, but SlashIt could not record it on the task: ...", carrying the
+  storage's wording. The drawer shows it as an error and does not apply a task
+  record. The next refresh of the board shows what was stored: the link, if the
+  write reached the file, or the unanswered request, which can be linked again.
+
+**Downgrade.** The `pr_create_unconfirmed` table (`[tasks.pr_create_unconfirmed]`)
+and the timeline entry `pr_create_unconfirmed_discarded` are keys a build before
+this change does not declare. That build reads a board that holds either as
+unreadable (the persistent types refuse undeclared keys and unknown Activity
+kinds, `Storage::inspect_tasks_file`), keeps the file byte for byte and refuses
+to save over it (`ensure_board_replaceable`; the test
+`an_unreadable_board_is_refused_and_left_byte_for_byte` and the schema tests in
+`task_board_schema_tests.rs` cover it). To go back, copy the project's tasks file
+first, then remove the `[tasks.pr_create_unconfirmed]` table and any timeline
+entry whose `type` is `pr_create_unconfirmed_discarded` by hand, or open the file
+once with this build and settle the request. Removing the table by hand drops
+the record that a pull request may exist, so check GitHub for the branch's pull
+request first.
+
 Workspace and Task Checkout are distinct concepts at different levels:
 
 | | Workspace | Task Checkout |

@@ -547,6 +547,10 @@ pub fn TaskDrawer(
                         <HumanReviewPanel task_id=task_id task=task apply_task=apply_task />
                     </Show>
 
+                    // A request to open the pull request that was never answered, and
+                    // what the person did about it.
+                    <crate::components::unconfirmed_pr::UnconfirmedPrPanel task_id=task_id task=task apply_task=apply_task />
+
                     // Its pull request, when it has one.
                     <PullRequestSection task_id=task_id task=task now=now refresh_tasks=refresh_tasks />
 

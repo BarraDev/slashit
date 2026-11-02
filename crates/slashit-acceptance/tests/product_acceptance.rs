@@ -75,6 +75,8 @@ mod needs_you;
 mod orphans;
 #[path = "product_acceptance/pr_status.rs"]
 mod pr_status;
+#[path = "product_acceptance/pr_recovery.rs"]
+mod pr_recovery;
 #[path = "product_acceptance/project_rail.rs"]
 mod project_rail;
 #[path = "product_acceptance/terminal_lifecycle.rs"]
