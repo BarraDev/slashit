@@ -66,6 +66,13 @@ pub fn can_discard(acknowledged: bool, busy: bool) -> bool {
     acknowledged && !busy
 }
 
+/// Whether the acknowledgement still stands once the backend has answered. It
+/// never does: an answer, a refusal and an error alike spend it, so whatever is
+/// confirmed next is confirmed again on purpose.
+pub fn acknowledged_after(_answer: &Result<ResolveUnconfirmedOutcome, String>) -> bool {
+    false
+}
+
 /// A cheap shape check before a URL is offered to the backend, which decides.
 pub fn looks_like_pull_request_url(url: &str) -> bool {
     let url = url.trim().trim_end_matches('/');
@@ -282,6 +289,24 @@ mod tests {
         assert!(!can_discard(false, false));
         assert!(!can_discard(true, true));
         assert!(can_discard(true, false));
+    }
+
+    #[test]
+    fn an_acknowledgement_is_spent_by_any_answer_including_a_failure() {
+        let answers: [Result<ResolveUnconfirmedOutcome, String>; 3] = [
+            Ok(ResolveUnconfirmedOutcome {
+                task: None,
+                result: UnconfirmedOutcome::Discarded { durable: true },
+            }),
+            Ok(ResolveUnconfirmedOutcome {
+                task: None,
+                result: UnconfirmedOutcome::Stale { reason: "changed".into() },
+            }),
+            Err("could not be saved".into()),
+        ];
+        for answer in &answers {
+            assert!(!acknowledged_after(answer), "a second click needs a fresh acknowledgement: {answer:?}");
+        }
     }
 
     #[test]

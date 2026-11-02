@@ -18,7 +18,7 @@ use leptos::task::spawn_local;
 use uuid::Uuid;
 
 use super::unconfirmed_pr_state::{
-    answer_task, can_discard, found_url, looks_like_pull_request_url, outcome_note, recovery_state,
+    acknowledged_after, answer_task, can_discard, found_url, looks_like_pull_request_url, outcome_note, recovery_state,
     still_current, Note, RecoveryState, Tone,
 };
 use crate::models::{
@@ -119,6 +119,7 @@ pub fn UnconfirmedPrPanel(
         spawn_local(async move {
             let answer = resolve_unconfirmed_pr_create(task_id.to_string(), attempt, resolution).await;
             busy.try_set(false);
+            acknowledged.try_set(acknowledged_after(&answer));
             match answer {
                 Ok(answer) => {
                     if let Some(task) = answer_task(&answer) {
@@ -136,7 +137,6 @@ pub fn UnconfirmedPrPanel(
                             url.try_set(String::new());
                         }
                     }
-                    acknowledged.try_set(false);
                     last.try_set(Some(answer.result));
                 }
                 Err(e) => {
