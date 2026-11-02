@@ -1140,10 +1140,78 @@ pub fn updater_restart(app: AppHandle, restart: tauri::State<'_, crate::RestartR
     app.exit(0);
 }
 
+/// What the About dialog shows, read from the running process.
+///
+/// Local facts only: no network, no Git at runtime, no credentials. The commit
+/// is whatever `build.rs` recorded at build time, so a build without one reports
+/// `None` rather than a guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppAbout {
+    pub product_name: String,
+    pub version: String,
+    /// `"development"` for a debug build, `"release"` otherwise.
+    pub build_type: String,
+    pub source_commit: Option<String>,
+    pub operating_system: String,
+    pub executable_path: Option<String>,
+    pub data_dir: String,
+}
+
+/// The build type a profile is reported as. Debug assertions are the same flag
+/// [`InstallProbe::debug_build`] uses, so the About dialog and the updater agree.
+pub fn build_type_label(debug_build: bool) -> &'static str {
+    if debug_build {
+        "development"
+    } else {
+        "release"
+    }
+}
+
+/// The About dialog's facts. Read-only, and safe with no Project selected.
+#[tauri::command]
+pub fn app_about(app: AppHandle, state: tauri::State<'_, crate::AppState>) -> Result<AppAbout, String> {
+    Ok(AppAbout {
+        product_name: app.config().product_name.clone().unwrap_or_else(|| app.package_info().name.clone()),
+        version: app.package_info().version.to_string(),
+        build_type: build_type_label(cfg!(debug_assertions)).to_string(),
+        source_commit: option_env!("SLASHIT_SOURCE_COMMIT").map(str::to_string),
+        operating_system: std::env::consts::OS.to_string(),
+        executable_path: std::env::current_exe().ok().map(|path| path.display().to_string()),
+        data_dir: state.paths.data_dir().display().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tauri_plugin_updater::Error as PluginError;
+
+    #[test]
+    fn the_about_facts_serialise_with_the_names_the_frontend_reads() {
+        let about = AppAbout {
+            product_name: "SlashIt".to_string(),
+            version: "0.0.1".to_string(),
+            build_type: build_type_label(true).to_string(),
+            source_commit: None,
+            operating_system: "linux".to_string(),
+            executable_path: Some("/opt/slashit/slashit-ui".to_string()),
+            data_dir: "/home/user/.local/share/slashit".to_string(),
+        };
+        let value = serde_json::to_value(&about).unwrap();
+        assert_eq!(value["productName"], "SlashIt");
+        assert_eq!(value["buildType"], "development");
+        assert_eq!(value["sourceCommit"], serde_json::Value::Null, "an unknown commit is null, not a guess");
+        assert_eq!(value["executablePath"], "/opt/slashit/slashit-ui");
+        assert_eq!(value["dataDir"], "/home/user/.local/share/slashit");
+        assert_eq!(value.as_object().unwrap().len(), 7, "only the About fields are exposed");
+    }
+
+    #[test]
+    fn a_debug_profile_is_development_and_anything_else_is_release() {
+        assert_eq!(build_type_label(true), "development");
+        assert_eq!(build_type_label(false), "release");
+    }
 
     #[test]
     fn only_the_newest_check_may_store_its_answer() {

@@ -79,6 +79,6 @@ pub use state_location::*;
 // `commands::updater::` so that `UpdaterState` cannot be confused with the
 // plugin type of the same name.
 pub use updater::{
-    updater_check, updater_download_and_install, updater_restart, updater_set_channel, updater_status,
+    app_about, updater_check, updater_download_and_install, updater_restart, updater_set_channel, updater_status,
 };
 // workflow commands not yet wired up

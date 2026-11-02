@@ -27,4 +27,32 @@ fn main() {
         panic!("{version} has no channel in {}; declare it there", path.display())
     });
     println!("cargo:rustc-env=SLASHIT_RELEASE_CHANNEL={}", channel.as_str());
+
+    // The commit this binary was built from, for the About dialog. Taken at
+    // build time only; the application never runs Git. Set
+    // `SLASHIT_SOURCE_COMMIT` to supply it where there is no Git checkout (a
+    // JJ workspace, a source tarball). Left unset when neither is available, and
+    // the dialog then reports the commit as unknown.
+    println!("cargo:rerun-if-env-changed=SLASHIT_SOURCE_COMMIT");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    let supplied = std::env::var("SLASHIT_SOURCE_COMMIT").ok().map(|c| c.trim().to_string());
+    let commit = supplied.filter(|c| !c.is_empty()).or_else(git_head_commit);
+    if let Some(commit) = commit {
+        println!("cargo:rustc-env=SLASHIT_SOURCE_COMMIT={commit}");
+    }
+}
+
+/// `HEAD` of the Git checkout this package sits in, or `None` outside one.
+fn git_head_commit() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .current_dir(std::env::var("CARGO_MANIFEST_DIR").ok()?)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    let well_formed = !commit.is_empty() && commit.bytes().all(|b| b.is_ascii_hexdigit());
+    well_formed.then_some(commit)
 }

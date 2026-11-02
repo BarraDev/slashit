@@ -425,6 +425,7 @@ pub fn run() {
             updater_set_channel,
             updater_download_and_install,
             updater_restart,
+            app_about,
             create_repository,
             list_repositories,
             get_repository,

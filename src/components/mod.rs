@@ -30,6 +30,7 @@ pub mod badge;
 pub mod progress_bar;
 pub mod phase_badge;
 pub mod subtask_list;
+pub mod about_dialog;
 pub mod queue_settings;
 pub mod queue_settings_modal;
 pub mod worktree_cleanup_dialog;
