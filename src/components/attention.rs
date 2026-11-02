@@ -157,7 +157,8 @@ pub fn next_after(order: &[Uuid], current: Option<Uuid>) -> Option<Uuid> {
 
 /// Classes for a reason's chip: red for a failure, violet for a review,
 /// amber for a pull request that was not created, orange for an integration
-/// that was started and not finished.
+/// that was started and not finished, fuchsia for a pull request whose
+/// outcome is unknown.
 pub fn chip_classes(reason: AttentionReason) -> &'static str {
     match reason {
         AttentionReason::Recovery => "bg-red-500/15 text-red-200 border-red-500/40",
@@ -166,6 +167,9 @@ pub fn chip_classes(reason: AttentionReason) -> &'static str {
         AttentionReason::PrNotCreated => "bg-amber-500/15 text-amber-200 border-amber-400/40",
         AttentionReason::IntegrationUnfinished => {
             "bg-orange-500/15 text-orange-200 border-orange-400/40"
+        }
+        AttentionReason::PrCreateUnconfirmed => {
+            "bg-fuchsia-500/15 text-fuchsia-200 border-fuchsia-400/40"
         }
     }
 }
@@ -301,10 +305,35 @@ mod tests {
     }
 
     #[test]
+    fn an_unconfirmed_pr_create_is_listed_while_idle_and_until_it_is_resolved() {
+        let mut waiting = task("backlog", 0, 6);
+        waiting.pr_create_unconfirmed = serde_json::from_value(serde_json::json!({
+            "branch": "task-branch",
+            "commit": "a".repeat(40),
+            "started_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        let id = Uuid::from_u128(6);
+        let reason = AttentionReason::PrCreateUnconfirmed;
+        assert_eq!(
+            attention_order(std::slice::from_ref(&waiting), rank, |_| false),
+            vec![(id, reason)]
+        );
+        assert!(
+            attention_order(std::slice::from_ref(&waiting), rank, |_| true).is_empty(),
+            "a pull request being opened right now is what SlashIt is waiting on"
+        );
+
+        waiting.pr_create_unconfirmed = None;
+        assert!(attention_order(&[waiting], rank, |_| false).is_empty());
+    }
+
+    #[test]
     fn each_reason_has_its_own_colour() {
         assert!(chip_classes(AttentionReason::Failed).contains("red"));
         assert!(chip_classes(AttentionReason::Review).contains("violet"));
         assert!(chip_classes(AttentionReason::PrNotCreated).contains("amber"));
         assert!(chip_classes(AttentionReason::IntegrationUnfinished).contains("orange"));
+        assert!(chip_classes(AttentionReason::PrCreateUnconfirmed).contains("fuchsia"));
     }
 }
