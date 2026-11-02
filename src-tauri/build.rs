@@ -83,7 +83,7 @@ fn build_provenance() -> Provenance {
 /// Asks Cargo to rerun this script when anything that changes the recorded
 /// state changes: the commit (`HEAD` and the ref it names), the index, and
 /// every tracked file. Without the tracked files, an edit after a build would
-/// leave a "clean" record describing a tree that no longer matches it.
+/// leave a record of an unmodified tree that no longer matches the source.
 /// A new file that is neither tracked nor staged does not trigger a rerun.
 fn watch_source_tree() {
     for path in ["HEAD", "packed-refs", "index"] {

@@ -61,14 +61,15 @@ impl ReadGeneration {
     }
 }
 
-/// The Source commit line. A commit is shown with the state it carries, in
-/// words, so a modified or unverified build is never presented as an exact
-/// snapshot of the commit. Without a commit the line reads Unknown.
+/// The Source commit line. The commit is always shown with what the build can
+/// claim about it, in plain words, so the commit alone is never read as an
+/// exact description of this binary. Without a commit the line reads Unknown.
 pub fn source_label(about: &AppAbout) -> String {
     match (about.source_commit.as_deref(), about.source_state.as_str()) {
-        (Some(commit), "clean") => format!("{commit} (clean)"),
-        (Some(commit), "modified") => format!("{commit} (modified)"),
-        (Some(commit), "unverified") => format!("{commit} (unverified)"),
+        (Some(commit), "modified") => format!("{commit} (uncommitted source changes)"),
+        (Some(commit), "unverified") => {
+            format!("{commit} (not verified; frontend files are not tied to this commit)")
+        }
         _ => "Unknown".to_string(),
     }
 }
@@ -270,7 +271,7 @@ mod tests {
 
     #[test]
     fn the_diagnostics_block_holds_exactly_the_about_fields_in_order() {
-        let text = diagnostics_text(&about(Some("abc123"), "clean", Some("/opt/slashit/slashit-ui")));
+        let text = diagnostics_text(&about(Some("abc123"), "unverified", Some("/opt/slashit/slashit-ui")));
         let labels: Vec<&str> = text
             .lines()
             .map(|line| line.split(": ").next().unwrap())
@@ -287,7 +288,9 @@ mod tests {
                 "Data directory",
             ]
         );
-        assert!(text.contains("Source commit: abc123 (clean)\n"));
+        assert!(text.contains(
+            "Source commit: abc123 (not verified; frontend files are not tied to this commit)\n"
+        ));
         assert!(text.contains("Executable: /opt/slashit/slashit-ui\n"));
     }
 
@@ -299,24 +302,39 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_is_labelled_with_the_state_it_was_built_in() {
+    fn a_commit_is_labelled_with_what_the_build_can_claim_about_it() {
         let commit = "14f170b13b0f864a6322576f4512dadfb18482a2";
-        assert_eq!(source_label(&about(Some(commit), "clean", None)), format!("{commit} (clean)"));
-        assert_eq!(source_label(&about(Some(commit), "modified", None)), format!("{commit} (modified)"));
-        assert_eq!(source_label(&about(Some(commit), "unverified", None)), format!("{commit} (unverified)"));
+        assert_eq!(
+            source_label(&about(Some(commit), "modified", None)),
+            format!("{commit} (uncommitted source changes)")
+        );
+        assert_eq!(
+            source_label(&about(Some(commit), "unverified", None)),
+            format!("{commit} (not verified; frontend files are not tied to this commit)")
+        );
+    }
+
+    #[test]
+    fn a_clean_source_tree_is_never_labelled_as_an_exact_build() {
+        // The recorded value a clean tree produces is `unverified`; no label
+        // says the complete binary matches the commit.
+        let commit = "14f170b13b0f864a6322576f4512dadfb18482a2";
+        let text = diagnostics_text(&about(Some(commit), "unverified", None));
+        assert!(!text.contains("(clean)"), "{text}");
+        assert!(!text.contains(&format!("Source commit: {commit}\n")), "{text}");
     }
 
     #[test]
     fn a_modified_build_is_never_shown_as_a_bare_commit() {
         let commit = "14f170b13b0f864a6322576f4512dadfb18482a2";
         let text = diagnostics_text(&about(Some(commit), "modified", None));
-        assert!(text.contains(&format!("Source commit: {commit} (modified)\n")), "{text}");
+        assert!(text.contains(&format!("Source commit: {commit} (uncommitted source changes)\n")), "{text}");
         assert!(!text.contains(&format!("Source commit: {commit}\n")), "{text}");
     }
 
     #[test]
     fn no_commit_is_unknown_whatever_state_is_reported() {
-        for state in ["clean", "modified", "unverified", "unknown"] {
+        for state in ["modified", "unverified", "unknown"] {
             assert_eq!(source_label(&about(None, state, None)), "Unknown", "{state}");
         }
     }

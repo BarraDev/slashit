@@ -1166,11 +1166,10 @@ pub struct AppAbout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceState {
-    /// The commit is known, and the build tree had no uncommitted modifications.
-    Clean,
     /// The commit is known, but the build had uncommitted modifications.
     Modified,
-    /// The builder supplied the commit, and the tree state was not checked.
+    /// The commit is known, but the complete build, including its frontend
+    /// assets, cannot be tied to it. A clean source tree does not change this.
     Unverified,
     /// Nothing about the source could be established.
     Unknown,
@@ -1179,7 +1178,6 @@ pub enum SourceState {
 /// The commit and state the About dialog reports for a build's recorded source.
 pub fn source_facts(provenance: &Provenance) -> (Option<String>, SourceState) {
     match provenance {
-        Provenance::Clean { commit } => (Some(commit.clone()), SourceState::Clean),
         Provenance::Modified { commit } => (Some(commit.clone()), SourceState::Modified),
         Provenance::Unverified { commit } => (Some(commit.clone()), SourceState::Unverified),
         Provenance::Unknown => (None, SourceState::Unknown),
@@ -1262,10 +1260,6 @@ mod tests {
     #[test]
     fn each_source_provenance_reports_its_commit_and_its_state() {
         let commit = "14f170b13b0f864a6322576f4512dadfb18482a2".to_string();
-        assert_eq!(
-            source_facts(&Provenance::Clean { commit: commit.clone() }),
-            (Some(commit.clone()), SourceState::Clean)
-        );
         assert_eq!(
             source_facts(&Provenance::Modified { commit: commit.clone() }),
             (Some(commit.clone()), SourceState::Modified)

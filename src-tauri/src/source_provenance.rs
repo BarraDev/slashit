@@ -4,8 +4,10 @@
 //! A build records the commit it was made from and whether its tree had
 //! uncommitted modifications. A commit alone is not an exact snapshot: a build
 //! from a modified tree carries the commit it started from, not the code it
-//! compiled. This module decides which of those facts a build can honestly
-//! claim.
+//! compiled. A clean tree is not enough for an exact claim either: the frontend
+//! assets packaged into the build come from `dist/`, which Git ignores, so no
+//! record of the source can vouch for them. This module decides which of those
+//! facts a build can honestly claim.
 //!
 //! This module uses only `std`, because `build.rs` compiles it as well. The
 //! application reads the recorded value and never runs Git.
@@ -13,11 +15,11 @@
 /// What is known about the source a build was compiled from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provenance {
-    /// The commit is known, and the build tree had no modifications.
-    Clean { commit: String },
     /// The commit is known, and the build tree had uncommitted modifications.
     Modified { commit: String },
-    /// The builder supplied the commit, and the state of the tree was not checked.
+    /// The commit is known, but the build's complete contents, including the
+    /// frontend assets, cannot be tied to it. This is the most a build can
+    /// claim, whether or not its own tree was clean.
     Unverified { commit: String },
     /// Neither the commit nor the state of the tree could be established.
     Unknown,
@@ -45,17 +47,16 @@ pub fn tree_from_status(porcelain: Option<&str>) -> Tree {
 }
 
 /// Combines the commit with the state of the tree. Without a commit nothing
-/// is known, whatever the tree looks like.
+/// is known, whatever the tree looks like. A modified tree is reported as
+/// modified; any other tree is unverified, because the frontend assets are not
+/// part of what Git can check.
 pub fn classify(commit: Option<&str>, tree: Tree) -> Provenance {
     match (commit, tree) {
         (None, _) => Provenance::Unknown,
-        (Some(commit), Tree::Clean) => Provenance::Clean {
-            commit: commit.to_string(),
-        },
         (Some(commit), Tree::Modified) => Provenance::Modified {
             commit: commit.to_string(),
         },
-        (Some(commit), Tree::Unavailable) => Provenance::Unverified {
+        (Some(commit), Tree::Clean | Tree::Unavailable) => Provenance::Unverified {
             commit: commit.to_string(),
         },
     }
@@ -65,7 +66,6 @@ pub fn classify(commit: Option<&str>, tree: Tree) -> Provenance {
 /// case nothing is recorded and the application reports `Unknown`.
 pub fn encode(provenance: &Provenance) -> Option<String> {
     match provenance {
-        Provenance::Clean { commit } => Some(format!("clean:{commit}")),
         Provenance::Modified { commit } => Some(format!("modified:{commit}")),
         Provenance::Unverified { commit } => Some(format!("unverified:{commit}")),
         Provenance::Unknown => None,
@@ -80,7 +80,6 @@ pub fn parse(text: &str) -> Option<Provenance> {
     }
     let commit = commit.to_string();
     match state {
-        "clean" => Some(Provenance::Clean { commit }),
         "modified" => Some(Provenance::Modified { commit }),
         "unverified" => Some(Provenance::Unverified { commit }),
         _ => None,
@@ -99,10 +98,12 @@ mod tests {
     const COMMIT: &str = "14f170b13b0f864a6322576f4512dadfb18482a2";
 
     #[test]
-    fn a_clean_tree_at_a_known_commit_is_clean() {
+    fn a_clean_tree_at_a_known_commit_is_still_only_unverified() {
+        // The frontend assets are not part of what Git can check, so a clean
+        // tree never supports an exact claim.
         assert_eq!(
             classify(Some(COMMIT), tree_from_status(Some(""))),
-            Provenance::Clean { commit: COMMIT.to_string() }
+            Provenance::Unverified { commit: COMMIT.to_string() }
         );
     }
 
@@ -149,6 +150,7 @@ mod tests {
             classify(Some(COMMIT), Tree::Modified),
             classify(Some(COMMIT), Tree::Unavailable),
         ] {
+            assert_ne!(provenance, Provenance::Unknown);
             let recorded = encode(&provenance).expect("a known commit is recorded");
             assert_eq!(parse(&recorded), Some(provenance), "{recorded}");
         }
@@ -162,10 +164,11 @@ mod tests {
     #[test]
     fn a_value_not_produced_by_encode_is_rejected() {
         assert_eq!(parse(""), None);
-        assert_eq!(parse("clean"), None);
+        assert_eq!(parse("modified"), None);
         assert_eq!(parse(&format!("dirty:{COMMIT}")), None);
-        assert_eq!(parse("clean:"), None);
-        assert_eq!(parse("clean:not-a-commit"), None);
-        assert_eq!(parse("clean:abc"), None, "too short to name a commit");
+        assert_eq!(parse(&format!("clean:{COMMIT}")), None, "clean is never a recorded state");
+        assert_eq!(parse("modified:"), None);
+        assert_eq!(parse("modified:not-a-commit"), None);
+        assert_eq!(parse("unverified:abc"), None, "too short to name a commit");
     }
 }
