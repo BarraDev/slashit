@@ -36,7 +36,10 @@ fn main() {
     // build time only; the application never runs Git. Set
     // `SLASHIT_SOURCE_COMMIT` to supply the commit where there is no Git
     // checkout (a JJ workspace, a source tarball). A supplied commit is the
-    // builder's assertion, so the tree state is reported as unverified.
+    // builder's assertion, so the tree state is reported as unverified, and a
+    // value that is not a commit id fails the build, like an unreadable
+    // channel declaration. The frontend assets in `../dist` are not part of
+    // this check: Git ignores that directory, so a record cannot vouch for them.
     println!("cargo:rerun-if-env-changed=SLASHIT_SOURCE_COMMIT");
     watch_source_tree();
     let provenance = build_provenance();
@@ -63,8 +66,16 @@ fn build_provenance() -> Provenance {
         }
         None => {
             let commit = git_head_commit();
-            let tree = tree_from_status(git_stdout(&["status", "--porcelain"]).as_deref());
-            classify(commit.as_deref(), tree)
+            // Untracked files are listed whatever the person's `status` config
+            // says, and optional index refreshes are skipped, so the check
+            // neither hides a modification nor rewrites the index it watches.
+            let status = git_stdout(&[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ]);
+            classify(commit.as_deref(), tree_from_status(status.as_deref()))
         }
     }
 }
@@ -77,17 +88,19 @@ fn build_provenance() -> Provenance {
 fn watch_source_tree() {
     for path in ["HEAD", "packed-refs", "index"] {
         if let Some(resolved) = git_output(&["rev-parse", "--git-path", path]) {
-            println!("cargo:rerun-if-changed={resolved}");
+            watch_if_present(&resolved);
         }
     }
     if let Some(branch) = git_output(&["rev-parse", "--symbolic-full-name", "HEAD"]) {
         if branch.starts_with("refs/") {
             if let Some(resolved) = git_output(&["rev-parse", "--git-path", &branch]) {
-                println!("cargo:rerun-if-changed={resolved}");
+                watch_if_present(&resolved);
             }
         }
     }
     // Paths are relative to this package, which is where Cargo resolves them.
+    // A path that is not valid UTF-8 is lossily converted, so it names no file
+    // and Cargo reruns this script on every build: the failure is safe.
     if let Some(listing) = git_stdout(&["ls-files", "-z", "--", ":/"]) {
         for path in listing.split('\0').filter(|path| !path.is_empty()) {
             println!("cargo:rerun-if-changed={path}");
@@ -95,8 +108,17 @@ fn watch_source_tree() {
     }
 }
 
-/// Stdout of a Git command run in this package, exactly as printed, or `None`
-/// outside a checkout or when the command fails.
+/// Watches a Git control path only when it exists. Cargo treats a missing
+/// watched path as always changed, which would rerun this script every time.
+fn watch_if_present(resolved: &str) {
+    if std::path::Path::new(resolved).exists() {
+        println!("cargo:rerun-if-changed={resolved}");
+    }
+}
+
+/// Stdout of a Git command run in this package, or `None` outside a checkout
+/// or when the command fails. Non-UTF-8 bytes are replaced rather than dropped,
+/// so output that is present is never mistaken for no output.
 fn git_stdout(args: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(args)
@@ -106,7 +128,7 @@ fn git_stdout(args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout).ok()
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Trimmed stdout of a Git command, or `None` when it is empty or fails.
