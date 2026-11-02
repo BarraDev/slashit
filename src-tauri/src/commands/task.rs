@@ -3157,10 +3157,15 @@ mod task_dependency_contract {
         assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
-    /// A Task created through `create_task` and then started through the
-    /// executor's real run-start write records the selected mode in the
-    /// stored `worker_handoff`, in memory and on disk. No test helper sets
-    /// the mode; an omitted mode keeps the Automatic default.
+    /// A Task created through `create_task` and then passed through the
+    /// shared run-start write (via the `cfg(test)` `record_run_start`
+    /// wrapper, which skips new-attempt authorization and the
+    /// additional-directory refusal) records the selected mode in the stored
+    /// `worker_handoff`, in memory and on disk. No test helper sets the mode;
+    /// an omitted mode keeps the Automatic default. Only the Manual iteration
+    /// discriminates the propagation: the Some(Automatic) and None iterations
+    /// would pass even if the mode were dropped, because Automatic is the
+    /// default.
     #[tokio::test]
     async fn the_mode_chosen_at_creation_reaches_the_stored_worker_handoff() {
         use crate::domain::task::ReviewMode::{Automatic, Manual};

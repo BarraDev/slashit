@@ -2534,9 +2534,13 @@ impl TaskExecutor {
         }
     }
 
-    /// Runs the production checkout acquisition and run-start write for a
-    /// Task, without launching a Worker. The stored `worker_handoff` is the
-    /// one a real start would leave.
+    /// Runs the production checkout acquisition, then the `cfg(test)`
+    /// `record_run_start` wrapper, without launching a Worker. That wrapper
+    /// passes no new-attempt authorization and no additional directories, so
+    /// this exercises the shared write that stores `review_mode` from
+    /// `t.review_mode` into `worker_handoff`. It does not exercise new-attempt
+    /// authorization or the additional-directory refusal that the production
+    /// `record_run_start_for` applies with its computed decision.
     #[cfg(test)]
     pub(crate) async fn record_run_start_for_test(
         &self,
