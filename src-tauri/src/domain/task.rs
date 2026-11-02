@@ -3663,6 +3663,101 @@ mod tests {
         );
     }
 
+    fn unresolved_pr_create() -> UnconfirmedPrCreate {
+        UnconfirmedPrCreate {
+            branch: "task-branch".to_string(),
+            commit: "a".repeat(40),
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    fn approved_in_review() -> Task {
+        let mut task = arrived_in_review();
+        task.human_review
+            .push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        task
+    }
+
+    #[test]
+    fn an_undecided_arrival_is_reviewed_before_an_unresolved_pr_create() {
+        let mut task = arrived_in_review();
+        task.pr_create_unconfirmed = Some(unresolved_pr_create());
+        assert_eq!(task.needs_you(false), Some(AttentionReason::Review));
+        assert_eq!(
+            task.needs_you(true),
+            None,
+            "a pull request being opened right now suppresses the review too"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_attempt_is_not_shown_as_a_confirmed_failure() {
+        let mut task = approved_in_review();
+        task.human_review.pr_error = Some("GitHub refused the pull request.".to_string());
+        assert_eq!(task.needs_you(false), Some(AttentionReason::PrNotCreated));
+
+        task.pr_create_unconfirmed = Some(unresolved_pr_create());
+        assert_eq!(
+            task.needs_you(false),
+            Some(AttentionReason::PrCreateUnconfirmed),
+            "the earlier refusal is not the outcome: the attempt's answer is unknown"
+        );
+    }
+
+    #[test]
+    fn a_verified_link_settles_the_unresolved_record() {
+        let mut task = approved_in_review();
+        task.human_review.pr_error = Some("GitHub refused the pull request.".to_string());
+        task.pr_create_unconfirmed = Some(unresolved_pr_create());
+        assert_eq!(
+            task.needs_you(false),
+            Some(AttentionReason::PrCreateUnconfirmed)
+        );
+
+        // A link clears the record and leaves the pull request linked, so the
+        // earlier refusal no longer asks anything either.
+        task.pr_create_unconfirmed = None;
+        task.pr_url = Some("https://github.com/example/repo/pull/1".to_string());
+        assert_eq!(task.needs_you(false), None);
+    }
+
+    #[test]
+    fn a_confirmed_discard_settles_the_record_to_the_no_pull_request_state() {
+        let mut task = approved_in_review();
+        task.human_review.pr_error = Some("GitHub refused the pull request.".to_string());
+        task.pr_create_unconfirmed = Some(unresolved_pr_create());
+
+        // A discard clears the record and records that no pull request exists.
+        task.pr_create_unconfirmed = None;
+        task.human_review.pr_error = Some(
+            "You confirmed that no pull request exists. Retry to open one.".to_string(),
+        );
+        assert_eq!(task.needs_you(false), Some(AttentionReason::PrNotCreated));
+    }
+
+    #[test]
+    fn worker_recovery_outranks_an_unresolved_pr_create() {
+        let mut task = startable_task();
+        task.pr_create_unconfirmed = Some(unresolved_pr_create());
+        task.worker_handoff = Some(WorkerHandoff {
+            review_mode: Default::default(),
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: Some("task/example".into()),
+            start_head: Some("a".repeat(40)),
+            acceptance: None,
+            stage: WorkerHandoffStage::RecoveryRequired {
+                reason: "exact commit unknown".into(),
+                observed_commit: None,
+            },
+            review_mode_unproven: false,
+            reviewer_model: None,
+        });
+        assert_eq!(task.needs_you(false), Some(AttentionReason::Recovery));
+    }
+
     /// Every origin survives the task file (TOML) and IPC (JSON) unchanged.
     #[test]
     fn branch_origin_round_trips_through_toml_and_json() {

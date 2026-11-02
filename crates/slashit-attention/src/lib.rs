@@ -181,11 +181,12 @@ pub enum Review {
 /// `pr_create_unconfirmed` is whether a request to open a pull request has an
 /// unconfirmed outcome on the record. It asks for the user in any status, but
 /// not while a pull request is being opened: that attempt is the one SlashIt
-/// is waiting on, and it settles the record when it answers. Among the Human
-/// Review reasons it takes precedence over `Review` and `PrNotCreated`: the
-/// person must learn whether the pull request exists before deciding or
-/// retrying, and the outcome they are shown is the unknown one, not the
-/// earlier failure. It stays below a failure and an unfinished integration.
+/// is waiting on, and it settles the record when it answers. The order of the
+/// reasons for a Task in Human Review is: a failure, then an unfinished
+/// integration, then an undecided arrival (`Review`), then the unresolved
+/// record, then a confirmed pull request failure (`PrNotCreated`). So an
+/// undecided arrival is still asked for its review first, while an unresolved
+/// attempt is never shown as a confirmed failure to create a pull request.
 pub fn needs_you(
     stage: Stage,
     delivery_in_flight: bool,
@@ -198,10 +199,10 @@ pub fn needs_you(
             Some(AttentionReason::IntegrationUnfinished)
         }
         Stage::HumanReview(_) if delivery_in_flight => None,
+        Stage::HumanReview(Review::Undecided) => Some(AttentionReason::Review),
         _ if pr_create_unconfirmed && !delivery_in_flight => {
             Some(AttentionReason::PrCreateUnconfirmed)
         }
-        Stage::HumanReview(Review::Undecided) => Some(AttentionReason::Review),
         Stage::HumanReview(Review::Approved {
             pr_failed: true,
             pr_linked: false,
@@ -475,8 +476,8 @@ mod tests {
     /// read in, once no pull request is being opened.
     #[test]
     fn an_unconfirmed_pr_create_needs_the_user_when_idle_in_any_status() {
+        // An undecided arrival asks for its review first; see the order test.
         for stage in [
-            Stage::HumanReview(Review::Undecided),
             Stage::HumanReview(APPROVED),
             Stage::HumanReview(PR_FAILED),
             Stage::HumanReview(Review::ChangesRequested),
@@ -518,6 +519,47 @@ mod tests {
             needs_you(Stage::Done, false, true, true),
             Some(AttentionReason::IntegrationUnfinished)
         );
+    }
+
+    /// The effective order for a Task with an unresolved PR-creation record,
+    /// one row per state. This is stage-dependent, not one global ranking.
+    #[test]
+    fn the_unresolved_pr_create_order_holds_for_each_stage_and_flag() {
+        use AttentionReason as R;
+        // stage, delivery in flight, integration pending, record unresolved, expected
+        let rows: &[(Stage, bool, bool, bool, Option<R>)] = &[
+            // An undecided arrival is asked for its review first.
+            (Stage::HumanReview(Review::Undecided), false, false, true, Some(R::Review)),
+            (Stage::HumanReview(Review::Undecided), false, false, false, Some(R::Review)),
+            // An approved arrival, or one with changes requested, asks about the outcome.
+            (Stage::HumanReview(APPROVED), false, false, true, Some(R::PrCreateUnconfirmed)),
+            (Stage::HumanReview(Review::ChangesRequested), false, false, true, Some(R::PrCreateUnconfirmed)),
+            // An unresolved attempt is never described as a confirmed failure.
+            (Stage::HumanReview(PR_FAILED), false, false, true, Some(R::PrCreateUnconfirmed)),
+            (Stage::HumanReview(PR_FAILED), false, false, false, Some(R::PrNotCreated)),
+            // A pending integration and a failure outrank the unresolved record.
+            (Stage::HumanReview(APPROVED), false, true, true, Some(R::IntegrationUnfinished)),
+            (Stage::Done, false, true, true, Some(R::IntegrationUnfinished)),
+            (Stage::Failed, false, false, true, Some(R::Failed)),
+            // A pull request being opened suppresses the record and the review.
+            (Stage::HumanReview(Review::Undecided), true, false, true, None),
+            (Stage::HumanReview(APPROVED), true, false, true, None),
+            (Stage::HumanReview(PR_FAILED), true, false, true, None),
+            (Stage::Elsewhere, true, false, true, None),
+            // Outside Human Review, an unresolved record asks in any status.
+            (Stage::Elsewhere, false, false, true, Some(R::PrCreateUnconfirmed)),
+            (Stage::Done, false, false, true, Some(R::PrCreateUnconfirmed)),
+            // No outstanding record: the rest of the rule is unchanged.
+            (Stage::HumanReview(APPROVED), false, false, false, None),
+            (Stage::Elsewhere, false, false, false, None),
+        ];
+        for &(stage, in_flight, integration, unresolved, expected) in rows {
+            assert_eq!(
+                needs_you(stage, in_flight, integration, unresolved),
+                expected,
+                "{stage:?} in_flight={in_flight} integration={integration} unresolved={unresolved}"
+            );
+        }
     }
 
     #[test]
