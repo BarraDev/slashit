@@ -616,6 +616,8 @@ pub fn TaskEditModal(
                                                     complexity: None,
                                                     impact: None,
                                                     security_severity: None,
+                                                    review_mode: review_mode_val,
+                                                    provider: provider_val,
                                                 }).await
                                             }
                                             TaskEditMode::Edit(task) => {

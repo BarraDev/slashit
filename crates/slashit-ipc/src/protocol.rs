@@ -44,6 +44,9 @@ pub enum IpcRequest {
         title: String,
         description: Option<String>,
         priority: Option<String>,
+        /// `manual` or `automatic`; absent keeps the default, automatic.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review_mode: Option<String>,
     },
     /// Move a task to a different status
     MoveTask { task_id: String, status: String },
@@ -326,6 +329,7 @@ mod tests {
             title: String::new(),
             description: None,
             priority: None,
+            review_mode: None,
         }
         .spawns_agent());
         assert!(IpcRequest::MoveTask {
@@ -368,6 +372,7 @@ mod tests {
                 title: String::new(),
                 description: None,
                 priority: None,
+                review_mode: None,
             },
             IpcRequest::MoveTask {
                 task_id: String::new(),
