@@ -3123,8 +3123,8 @@ mod task_dependency_contract {
         .await
     }
 
-    /// Each mode is written in the creating write, survives a reload, and is
-    /// what the Worker handoff is built from.
+    /// Each mode is written in the creating write and survives a reload. That
+    /// the mode reaches the Worker handoff is proved by the next test.
     #[tokio::test]
     async fn a_new_task_keeps_the_review_mode_it_was_created_with() {
         use crate::domain::task::ReviewMode::{Automatic, Manual};
@@ -3144,6 +3144,76 @@ mod task_dependency_contract {
             let reloaded = app.state::<crate::AppState>().storage.load_project_tasks(project_id).expect("reload");
             let reloaded = reloaded.into_iter().find(|t| t.id == created.id).expect("present");
             assert_eq!(reloaded.review_mode, expected);
+        }
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A Task created through `create_task` and then started through the
+    /// executor's real run-start write records the selected mode in the
+    /// stored `worker_handoff`, in memory and on disk. No test helper sets
+    /// the mode; an omitted mode keeps the Automatic default.
+    #[tokio::test]
+    async fn the_mode_chosen_at_creation_reaches_the_stored_worker_handoff() {
+        use crate::domain::task::ReviewMode::{Automatic, Manual};
+        let project_id = Uuid::new_v4();
+        let (tmp, _paths, app) = app_with(vec![], &[project_id]).await;
+        let state = app.state::<crate::AppState>();
+
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let repository_id = Uuid::new_v4();
+        state.repository.repositories.write().await.insert(
+            repository_id,
+            crate::domain::Repository {
+                id: repository_id,
+                local_path: repo.to_string_lossy().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        {
+            let mut projects = state.project.projects.write().await;
+            let project = projects.get_mut(&project_id).unwrap();
+            project.repository_id = Some(repository_id);
+            project.base = Some(crate::domain::project::ProjectBase::LocalBranch {
+                branch: "main".to_string(),
+            });
+        }
+        let executor = crate::test_helpers::attach_test_executor(&state);
+
+        for (asked, expected) in [(Some(Manual), Manual), (Some(Automatic), Automatic), (None, Automatic)] {
+            let created = create_in_mode(&app, project_id, asked).await.expect("created");
+            executor
+                .record_run_start_for_test(created.id, repo.to_str().unwrap())
+                .await
+                .expect("the run start is recorded");
+
+            let memory = state.task.tasks.read().await[&created.id].clone();
+            let disk = state
+                .storage
+                .load_project_tasks(project_id)
+                .expect("reload")
+                .into_iter()
+                .find(|t| t.id == created.id)
+                .expect("present");
+            for task in [memory, disk] {
+                let handoff = task.worker_handoff.expect("the start wrote a handoff");
+                assert!(matches!(handoff.stage, crate::domain::WorkerHandoffStage::Started {}));
+                assert_eq!(handoff.review_mode, expected, "asked {asked:?}");
+                assert!(!handoff.review_mode_unproven);
+            }
         }
     }
 

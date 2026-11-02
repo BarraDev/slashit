@@ -2534,6 +2534,23 @@ impl TaskExecutor {
         }
     }
 
+    /// Runs the production checkout acquisition and run-start write for a
+    /// Task, without launching a Worker. The stored `worker_handoff` is the
+    /// one a real start would leave.
+    #[cfg(test)]
+    pub(crate) async fn record_run_start_for_test(
+        &self,
+        task_id: Uuid,
+        repo_path: &str,
+    ) -> Result<(), String> {
+        let (_, acquired) = self.acquire_task_worktree(task_id, repo_path).await;
+        let acquired = acquired.map_err(|e| format!("{e:?}"))?;
+        self.record_run_start(task_id, repo_path, acquired)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
+    }
+
     /// Makes the current run's record the rebuilt kind that recovery writes
     /// when the original record is lost: Manual, and unproven.
     #[cfg(all(test, unix))]
