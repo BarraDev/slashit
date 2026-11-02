@@ -173,10 +173,11 @@ pub enum Review {
 /// Review and with a Done task that was completed locally, so only those ask
 /// for it. A failed task is repaired first. In a new, undecided arrival in
 /// Human Review the review is what is asked; in any other status the record
-/// waits for the task to come back. The unfinished
-/// integration outranks every Human Review reason: the target branch may
-/// already have moved. It is not hidden by `delivery_in_flight`, which
-/// describes a pull request, never an integration.
+/// waits for the task to come back. An unfinished integration of an approved
+/// (or Done) task outranks every other reason: the target branch may already
+/// have moved. It is not hidden by `delivery_in_flight`, which describes a
+/// pull request, never an integration. An undecided arrival is the exception:
+/// its review is asked for even when an older integration record is pending.
 ///
 /// `pr_create_unconfirmed` is whether a request to open a pull request has an
 /// unconfirmed outcome on the record. It asks for the user in any status, but
@@ -530,6 +531,7 @@ mod tests {
         let rows: &[(Stage, bool, bool, bool, Option<R>)] = &[
             // An undecided arrival is asked for its review first.
             (Stage::HumanReview(Review::Undecided), false, false, true, Some(R::Review)),
+            (Stage::HumanReview(Review::Undecided), false, true, true, Some(R::Review)),
             (Stage::HumanReview(Review::Undecided), false, false, false, Some(R::Review)),
             // An approved arrival, or one with changes requested, asks about the outcome.
             (Stage::HumanReview(APPROVED), false, false, true, Some(R::PrCreateUnconfirmed)),
