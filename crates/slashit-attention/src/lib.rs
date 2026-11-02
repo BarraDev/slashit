@@ -33,6 +33,10 @@ pub enum AttentionReason {
     /// finished: its plan is on disk and only a person can resume or discard
     /// it. Nothing continues it after a restart.
     IntegrationUnfinished,
+    /// A pull request was asked for and SlashIt never learned whether GitHub
+    /// opened one. It may exist without the task recording it, so only a
+    /// person can settle it, and nothing retries until they do.
+    PrCreateUnconfirmed,
 }
 
 impl AttentionReason {
@@ -44,6 +48,7 @@ impl AttentionReason {
             Self::Review => "Review",
             Self::PrNotCreated => "PR not created",
             Self::IntegrationUnfinished => "Integration unfinished",
+            Self::PrCreateUnconfirmed => "PR creation outcome unknown",
         }
     }
 
@@ -55,6 +60,7 @@ impl AttentionReason {
             Self::Review => "review",
             Self::PrNotCreated => "pr_not_created",
             Self::IntegrationUnfinished => "integration_unfinished",
+            Self::PrCreateUnconfirmed => "pr_create_unconfirmed",
         }
     }
 }
@@ -91,6 +97,8 @@ pub struct Facts {
     pub delivery_in_flight: bool,
     /// The record holds a local integration that is still `Pending`.
     pub integration_pending: bool,
+    /// The record holds a pull request request whose outcome is unconfirmed.
+    pub pr_create_unconfirmed: bool,
 }
 
 impl Facts {
@@ -109,7 +117,12 @@ impl Facts {
             Status::Done => Stage::Done,
             Status::Other => Stage::Elsewhere,
         };
-        needs_you(stage, self.delivery_in_flight, self.integration_pending)
+        needs_you(
+            stage,
+            self.delivery_in_flight,
+            self.integration_pending,
+            self.pr_create_unconfirmed,
+        )
     }
 }
 
@@ -164,10 +177,16 @@ pub enum Review {
 /// integration outranks every Human Review reason: the target branch may
 /// already have moved. It is not hidden by `delivery_in_flight`, which
 /// describes a pull request, never an integration.
+///
+/// `pr_create_unconfirmed` is whether a request to open a pull request has an
+/// unconfirmed outcome on the record. It asks for the user in any status, but
+/// not while a pull request is being opened: that attempt is the one SlashIt
+/// is waiting on, and it settles the record when it answers.
 pub fn needs_you(
     stage: Stage,
     delivery_in_flight: bool,
     integration_pending: bool,
+    pr_create_unconfirmed: bool,
 ) -> Option<AttentionReason> {
     match stage {
         Stage::Failed => Some(AttentionReason::Failed),
@@ -175,6 +194,9 @@ pub fn needs_you(
             Some(AttentionReason::IntegrationUnfinished)
         }
         Stage::HumanReview(_) if delivery_in_flight => None,
+        _ if pr_create_unconfirmed && !delivery_in_flight => {
+            Some(AttentionReason::PrCreateUnconfirmed)
+        }
         Stage::HumanReview(Review::Undecided) => Some(AttentionReason::Review),
         Stage::HumanReview(Review::Approved {
             pr_failed: true,
@@ -201,7 +223,7 @@ mod tests {
     #[test]
     fn a_failed_task_needs_the_user() {
         assert_eq!(
-            needs_you(Stage::Failed, false, false),
+            needs_you(Stage::Failed, false, false, false),
             Some(AttentionReason::Failed)
         );
     }
@@ -209,12 +231,20 @@ mod tests {
     #[test]
     fn human_review_alone_is_not_attention_only_an_undecided_one_is() {
         assert_eq!(
-            needs_you(Stage::HumanReview(Review::Undecided), false, false),
+            needs_you(Stage::HumanReview(Review::Undecided), false, false, false),
             Some(AttentionReason::Review)
         );
-        assert_eq!(needs_you(Stage::HumanReview(APPROVED), false, false), None);
         assert_eq!(
-            needs_you(Stage::HumanReview(Review::ChangesRequested), false, false),
+            needs_you(Stage::HumanReview(APPROVED), false, false, false),
+            None
+        );
+        assert_eq!(
+            needs_you(
+                Stage::HumanReview(Review::ChangesRequested),
+                false,
+                false,
+                false
+            ),
             None
         );
     }
@@ -222,7 +252,7 @@ mod tests {
     #[test]
     fn an_approval_whose_pull_request_failed_needs_the_user() {
         assert_eq!(
-            needs_you(Stage::HumanReview(PR_FAILED), false, false),
+            needs_you(Stage::HumanReview(PR_FAILED), false, false, false),
             Some(AttentionReason::PrNotCreated)
         );
     }
@@ -235,14 +265,17 @@ mod tests {
             pr_failed: true,
             pr_linked: true,
         };
-        assert_eq!(needs_you(Stage::HumanReview(linked), false, false), None);
+        assert_eq!(
+            needs_you(Stage::HumanReview(linked), false, false, false),
+            None
+        );
     }
 
     #[test]
     fn nothing_in_human_review_needs_the_user_while_its_pull_request_is_being_opened() {
         for review in [Review::Undecided, APPROVED, PR_FAILED] {
             assert_eq!(
-                needs_you(Stage::HumanReview(review), true, false),
+                needs_you(Stage::HumanReview(review), true, false, false),
                 None,
                 "{review:?}"
             );
@@ -252,15 +285,15 @@ mod tests {
     #[test]
     fn a_failure_is_not_hidden_by_a_delivery_flag() {
         assert_eq!(
-            needs_you(Stage::Failed, true, false),
+            needs_you(Stage::Failed, true, false, false),
             Some(AttentionReason::Failed)
         );
     }
 
     #[test]
     fn every_other_status_is_left_alone() {
-        assert_eq!(needs_you(Stage::Elsewhere, false, false), None);
-        assert_eq!(needs_you(Stage::Elsewhere, true, false), None);
+        assert_eq!(needs_you(Stage::Elsewhere, false, false, false), None);
+        assert_eq!(needs_you(Stage::Elsewhere, true, false, false), None);
     }
 
     #[test]
@@ -272,6 +305,7 @@ mod tests {
             pr_linked,
             delivery_in_flight: false,
             integration_pending: false,
+            pr_create_unconfirmed: false,
         };
         let approved = Some(Decision::Approved);
         assert_eq!(
@@ -327,6 +361,11 @@ mod tests {
                 "Integration unfinished",
                 "integration_unfinished",
             ),
+            (
+                AttentionReason::PrCreateUnconfirmed,
+                "PR creation outcome unknown",
+                "pr_create_unconfirmed",
+            ),
         ] {
             assert_eq!(reason.label(), label);
             assert_eq!(reason.as_str(), name);
@@ -341,11 +380,11 @@ mod tests {
     fn an_unfinished_integration_needs_the_user_in_human_review_and_when_done() {
         for stage in [Stage::HumanReview(APPROVED), Stage::Done] {
             assert_eq!(
-                needs_you(stage, false, true),
+                needs_you(stage, false, true, false),
                 Some(AttentionReason::IntegrationUnfinished),
                 "{stage:?}"
             );
-            assert_eq!(needs_you(stage, false, false), None, "{stage:?}");
+            assert_eq!(needs_you(stage, false, false, false), None, "{stage:?}");
         }
     }
 
@@ -354,11 +393,16 @@ mod tests {
     #[test]
     fn an_undecided_arrival_asks_for_its_review_even_with_an_old_pending_record() {
         assert_eq!(
-            needs_you(Stage::HumanReview(Review::Undecided), false, true),
+            needs_you(Stage::HumanReview(Review::Undecided), false, true, false),
             Some(AttentionReason::Review)
         );
         assert_eq!(
-            needs_you(Stage::HumanReview(Review::ChangesRequested), false, true),
+            needs_you(
+                Stage::HumanReview(Review::ChangesRequested),
+                false,
+                true,
+                false
+            ),
             None
         );
     }
@@ -366,11 +410,11 @@ mod tests {
     #[test]
     fn an_unfinished_integration_outranks_the_other_review_reasons_but_not_a_failure() {
         assert_eq!(
-            needs_you(Stage::HumanReview(PR_FAILED), false, true),
+            needs_you(Stage::HumanReview(PR_FAILED), false, true, false),
             Some(AttentionReason::IntegrationUnfinished)
         );
         assert_eq!(
-            needs_you(Stage::Failed, false, true),
+            needs_you(Stage::Failed, false, true, false),
             Some(AttentionReason::Failed)
         );
     }
@@ -378,14 +422,14 @@ mod tests {
     #[test]
     fn an_opening_pull_request_does_not_hide_an_unfinished_integration() {
         assert_eq!(
-            needs_you(Stage::HumanReview(APPROVED), true, true),
+            needs_you(Stage::HumanReview(APPROVED), true, true, false),
             Some(AttentionReason::IntegrationUnfinished)
         );
     }
 
     #[test]
     fn an_integration_record_waits_silently_in_statuses_that_offer_no_way_to_finish_it() {
-        assert_eq!(needs_you(Stage::Elsewhere, false, true), None);
+        assert_eq!(needs_you(Stage::Elsewhere, false, true, false), None);
     }
 
     #[test]
@@ -397,6 +441,7 @@ mod tests {
             pr_linked: false,
             delivery_in_flight: false,
             integration_pending: true,
+            pr_create_unconfirmed: false,
         };
         assert_eq!(
             facts(Status::HumanReview).needs_you(),
@@ -420,5 +465,86 @@ mod tests {
             None,
             "an Integrated or absent record asks nothing"
         );
+    }
+
+    /// An unresolved record asks for the user in every status it can be
+    /// read in, once no pull request is being opened.
+    #[test]
+    fn an_unconfirmed_pr_create_needs_the_user_when_idle_in_any_status() {
+        for stage in [
+            Stage::HumanReview(Review::Undecided),
+            Stage::HumanReview(APPROVED),
+            Stage::HumanReview(PR_FAILED),
+            Stage::HumanReview(Review::ChangesRequested),
+            Stage::Done,
+            Stage::Elsewhere,
+        ] {
+            assert_eq!(
+                needs_you(stage, false, false, true),
+                Some(AttentionReason::PrCreateUnconfirmed),
+                "{stage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_active_pr_operation_suppresses_an_unconfirmed_pr_create() {
+        for stage in [
+            Stage::HumanReview(Review::Undecided),
+            Stage::HumanReview(APPROVED),
+            Stage::HumanReview(PR_FAILED),
+            Stage::Done,
+            Stage::Elsewhere,
+        ] {
+            assert_eq!(needs_you(stage, true, false, true), None, "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_pr_create_does_not_outrank_a_failure_or_an_unfinished_integration() {
+        assert_eq!(
+            needs_you(Stage::Failed, false, false, true),
+            Some(AttentionReason::Failed)
+        );
+        assert_eq!(
+            needs_you(Stage::HumanReview(APPROVED), false, true, true),
+            Some(AttentionReason::IntegrationUnfinished)
+        );
+        assert_eq!(
+            needs_you(Stage::Done, false, true, true),
+            Some(AttentionReason::IntegrationUnfinished)
+        );
+    }
+
+    #[test]
+    fn a_resolved_record_leaves_the_rest_of_the_rule_unchanged() {
+        assert_eq!(needs_you(Stage::Elsewhere, false, false, false), None);
+        assert_eq!(
+            needs_you(Stage::HumanReview(Review::Undecided), false, false, false),
+            Some(AttentionReason::Review)
+        );
+        assert_eq!(
+            needs_you(Stage::HumanReview(PR_FAILED), false, false, false),
+            Some(AttentionReason::PrNotCreated)
+        );
+    }
+
+    #[test]
+    fn facts_carry_an_unconfirmed_pr_create_through_the_rule() {
+        let facts = |delivery_in_flight, pr_create_unconfirmed| Facts {
+            status: Status::HumanReview,
+            decision: Some(Decision::Approved),
+            pr_error_recorded: false,
+            pr_linked: false,
+            delivery_in_flight,
+            integration_pending: false,
+            pr_create_unconfirmed,
+        };
+        assert_eq!(
+            facts(false, true).needs_you(),
+            Some(AttentionReason::PrCreateUnconfirmed)
+        );
+        assert_eq!(facts(true, true).needs_you(), None);
+        assert_eq!(facts(false, false).needs_you(), None);
     }
 }

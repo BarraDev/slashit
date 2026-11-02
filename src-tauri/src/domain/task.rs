@@ -1296,6 +1296,7 @@ impl Task {
                 .local_integration
                 .as_ref()
                 .is_some_and(|r| r.is_pending()),
+            pr_create_unconfirmed: self.pr_create_unconfirmed.is_some(),
         }
         .needs_you()
     }
@@ -3599,6 +3600,70 @@ mod tests {
     }
 
     /// Every origin survives the task file (TOML) and IPC (JSON) unchanged.
+    #[test]
+    fn pr_create_unconfirmed_round_trips_through_toml_and_json() {
+        #[derive(Serialize, Deserialize)]
+        struct File {
+            tasks: Vec<Task>,
+        }
+        let record = UnconfirmedPrCreate {
+            branch: "task-branch".to_string(),
+            commit: "a".repeat(40),
+            started_at: chrono::Utc::now(),
+        };
+        let mut task = startable_task();
+        task.pr_create_unconfirmed = Some(record.clone());
+
+        let toml_text = toml::to_string_pretty(&File {
+            tasks: vec![task.clone()],
+        })
+        .unwrap();
+        let loaded: File = toml::from_str(&toml_text).expect(&toml_text);
+        assert_eq!(
+            loaded.tasks[0].pr_create_unconfirmed.as_ref(),
+            Some(&record),
+            "{toml_text}"
+        );
+
+        let json = serde_json::to_string(&task).unwrap();
+        let loaded: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.pr_create_unconfirmed.as_ref(),
+            Some(&record),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_pr_create_needs_the_user_until_it_is_resolved() {
+        let mut task = arrived_in_review();
+        task.human_review
+            .push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        assert_eq!(task.needs_you(false), None);
+
+        task.pr_create_unconfirmed = Some(UnconfirmedPrCreate {
+            branch: "task-branch".to_string(),
+            commit: "a".repeat(40),
+            started_at: chrono::Utc::now(),
+        });
+        assert_eq!(
+            task.needs_you(false),
+            Some(AttentionReason::PrCreateUnconfirmed)
+        );
+        assert_eq!(
+            task.needs_you(true),
+            None,
+            "a pull request being opened right now is the attempt SlashIt is waiting on"
+        );
+
+        task.pr_create_unconfirmed = None;
+        assert_eq!(
+            task.needs_you(false),
+            None,
+            "a resolved record asks nothing"
+        );
+    }
+
     #[test]
     fn branch_origin_round_trips_through_toml_and_json() {
         #[derive(Serialize, Deserialize)]

@@ -254,6 +254,7 @@ impl Task {
                 .local_integration
                 .as_ref()
                 .is_some_and(|r| r.state == crate::models::integration::IntegrationState::Pending),
+            pr_create_unconfirmed: self.pr_create_unconfirmed.is_some(),
         }
         .needs_you()
     }
@@ -1380,6 +1381,27 @@ mod tests {
             .unwrap(),
         );
         task
+    }
+
+    /// The same answer as the backend's `an_unconfirmed_pr_create_needs_the_user_until_it_is_resolved`.
+    #[test]
+    fn an_unconfirmed_pr_create_needs_the_user_until_it_is_resolved() {
+        let approved = decided("approved", None);
+        let mut task = task_json("human_review", approved, None);
+        assert_eq!(task.needs_you(false), None);
+        task.pr_create_unconfirmed = serde_json::from_value(serde_json::json!({
+            "branch": "task-branch",
+            "commit": "a".repeat(40),
+            "started_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        assert_eq!(
+            task.needs_you(false),
+            Some(AttentionReason::PrCreateUnconfirmed)
+        );
+        assert_eq!(task.needs_you(true), None);
+        task.pr_create_unconfirmed = None;
+        assert_eq!(task.needs_you(false), None);
     }
 
     /// The same table as the backend's `a_pending_integration_needs_the_user_...`.
