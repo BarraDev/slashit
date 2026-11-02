@@ -8,6 +8,8 @@
 use crate::services::updater_service::{app_about, AppAbout};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use std::cell::Cell;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -52,11 +54,15 @@ pub fn about_fields(about: &AppAbout) -> Vec<(&'static str, String)> {
 }
 
 /// The plain-text block Copy Diagnostics puts on the clipboard: one
-/// `Label: value` line per field, and nothing else.
+/// `Label: value` line per field, and nothing else. A value cannot break its
+/// line: a newline in a path (legal on Linux) is written as a space.
 pub fn diagnostics_text(about: &AppAbout) -> String {
     about_fields(about)
         .into_iter()
-        .map(|(label, value)| format!("{label}: {value}\n"))
+        .map(|(label, value)| {
+            let value = value.replace(['\n', '\r'], " ");
+            format!("{label}: {value}\n")
+        })
         .collect()
 }
 
@@ -64,16 +70,22 @@ pub fn diagnostics_text(about: &AppAbout) -> String {
 pub fn AboutSlashItDialog(show: RwSignal<bool>) -> impl IntoView {
     let view_state = RwSignal::new(AboutView::Hidden);
     let copy_status = RwSignal::new(None::<String>);
+    // Every open or close starts a new generation. A read started by an earlier
+    // open is stale once the generation has moved on, and may not write its answer.
+    let generation = Rc::new(Cell::new(0u64));
 
     Effect::new(move |_| {
         let showing = show.get();
+        let this_generation = generation.get().wrapping_add(1);
+        generation.set(this_generation);
         view_state.set(AboutView::for_visibility(showing));
         copy_status.set(None);
         if showing {
+            let generation = Rc::clone(&generation);
             spawn_local(async move {
                 let result = app_about().await;
-                // Only the dialog that is still open may take the answer.
-                if show.get_untracked() {
+                // Only the read of the dialog still open, from this open, may take the answer.
+                if generation.get() == this_generation && show.get_untracked() {
                     view_state.set(match result {
                         Ok(about) => AboutView::Loaded(about),
                         Err(error) => AboutView::Failed(error),
@@ -198,14 +210,30 @@ mod tests {
     }
 
     #[test]
-    fn opening_loads_and_closing_drops_what_was_shown() {
+    fn visibility_selects_the_loading_or_hidden_state() {
+        // Only the state mapping is tested here. That closing clears the loaded
+        // facts and the copy status is done by the Effect, which needs a
+        // rendering harness to test.
         assert_eq!(AboutView::for_visibility(true), AboutView::Loading);
         assert_eq!(AboutView::for_visibility(false), AboutView::Hidden);
+    }
 
-        // A loaded dialog that closes must not keep its facts for the next open.
-        let loaded = AboutView::Loaded(about(None, None));
-        assert_ne!(AboutView::for_visibility(false), loaded);
-        assert_eq!(AboutView::for_visibility(true), AboutView::Loading);
+    #[test]
+    fn a_newline_in_a_value_cannot_split_a_diagnostics_line() {
+        let text = diagnostics_text(&about(None, Some("/tmp/odd\nname\r\nbin")));
+        assert!(text.contains("Executable: /tmp/odd name  bin\n"), "{text}");
+        assert_eq!(text.lines().count(), 7, "{text}");
+    }
+
+    #[test]
+    fn the_frontend_reads_the_backend_serialisation_of_the_about_facts() {
+        // The same JSON the backend's `the_about_facts_serialise_with_the_names_the_frontend_reads` test pins.
+        let json = r#"{"productName":"SlashIt","version":"0.0.1","buildType":"development","sourceCommit":null,"operatingSystem":"linux","executablePath":"/opt/slashit/slashit-ui","dataDir":"/home/user/.local/share/slashit"}"#;
+        let about: AppAbout = serde_json::from_str(json).unwrap();
+        assert_eq!(about.product_name, "SlashIt");
+        assert_eq!(about.source_commit, None);
+        assert_eq!(about.executable_path.as_deref(), Some("/opt/slashit/slashit-ui"));
+        assert_eq!(about.data_dir, "/home/user/.local/share/slashit");
     }
 
     #[test]

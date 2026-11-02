@@ -1170,9 +1170,16 @@ pub fn build_type_label(debug_build: bool) -> &'static str {
 
 /// The About dialog's facts. Read-only, and safe with no Project selected.
 #[tauri::command]
-pub fn app_about(app: AppHandle, state: tauri::State<'_, crate::AppState>) -> Result<AppAbout, String> {
+pub fn app_about(
+    app: AppHandle,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<AppAbout, String> {
     Ok(AppAbout {
-        product_name: app.config().product_name.clone().unwrap_or_else(|| app.package_info().name.clone()),
+        product_name: app
+            .config()
+            .product_name
+            .clone()
+            .unwrap_or_else(|| app.package_info().name.clone()),
         version: app.package_info().version.to_string(),
         build_type: build_type_label(cfg!(debug_assertions)).to_string(),
         source_commit: option_env!("SLASHIT_SOURCE_COMMIT").map(str::to_string),
@@ -1201,7 +1208,11 @@ mod tests {
         let value = serde_json::to_value(&about).unwrap();
         assert_eq!(value["productName"], "SlashIt");
         assert_eq!(value["buildType"], "development");
-        assert_eq!(value["sourceCommit"], serde_json::Value::Null, "an unknown commit is null, not a guess");
+        assert_eq!(
+            value["sourceCommit"],
+            serde_json::Value::Null,
+            "an unknown commit is null, not a guess"
+        );
         assert_eq!(value["executablePath"], "/opt/slashit/slashit-ui");
         assert_eq!(value["dataDir"], "/home/user/.local/share/slashit");
         assert_eq!(value.as_object().unwrap().len(), 7, "only the About fields are exposed");
