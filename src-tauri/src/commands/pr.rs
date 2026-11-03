@@ -1324,8 +1324,7 @@ pub async fn address_pr_review(
     // is what the Task was analyzed under, so the plan sent by the webview
     // must agree with it and both must match the PR's head as it is now.
     let pr_url = pr_url_for_task(&task)?;
-    let current_head = current_pr_head_oid(&pr_url).await?;
-    check_apply_provenance(task.pr_review_plan.as_ref(), &plan, &current_head)?;
+    check_apply_preflight(task.pr_review_plan.as_ref(), &plan, &pr_url).await?;
 
     let app_handle = app.clone();
     let progress: ProgressSink = std::sync::Arc::new(move |ev: PrReviewProgress| {
@@ -1391,14 +1390,37 @@ fn check_plan_matches_pr_head(plan: &PrReviewPlan, current_head: &str) -> Result
     }
 }
 
-/// Refuses an Apply unless the sent plan is the stored plan of the Task and
-/// that plan was analyzed at `current_head`. A Task without a stored plan, or
-/// with a stored plan that has no provenance, has nothing to check against.
-fn check_apply_provenance(
-    stored: Option<&PrReviewPlan>,
+/// What an Apply may change in a plan the webview sent back: the per-item
+/// decision and lifecycle fields, and the run bookkeeping. Everything else is
+/// content (comment ids, bodies, paths, the fix instructions) that the
+/// analysis fixed, and the stored plan is the only authority for it.
+fn review_content(plan: &PrReviewPlan) -> PrReviewPlan {
+    let mut content = plan.clone();
+    content.last_apply = None;
+    content.fixed_content.clear();
+    for item in &mut content.items {
+        item.decision = PrReviewDecision::Fix;
+        item.approved = false;
+        item.user_note.clear();
+        item.fix_done = false;
+        item.fix_uncommitted = false;
+        item.fix_commit = None;
+        item.fix_effect = None;
+        item.reply_posted = false;
+        item.last_agent_summary = None;
+        item.last_error = None;
+        item.reply_comment_id = None;
+    }
+    content
+}
+
+/// Refuses an Apply unless the sent plan is the stored plan of the Task, as
+/// far as its analysis is concerned. A Task without a stored plan has nothing
+/// to check against. Returns the stored plan, which is authoritative.
+fn stored_plan_for_apply<'a>(
+    stored: Option<&'a PrReviewPlan>,
     sent: &PrReviewPlan,
-    current_head: &str,
-) -> Result<(), String> {
+) -> Result<&'a PrReviewPlan, String> {
     let Some(stored) = stored else {
         return Err(
             "This Task has no stored review plan to apply. Analyze the PR comments again. \
@@ -1415,7 +1437,29 @@ fn check_apply_provenance(
                 .to_string(),
         );
     }
-    check_plan_matches_pr_head(stored, current_head)
+    if review_content(sent) != review_content(stored) {
+        return Err(
+            "The review plan being applied differs from the one stored for this Task in its \
+             comments or fix instructions. Re-analyze the PR comments, then apply again. \
+             Nothing was changed."
+                .to_string(),
+        );
+    }
+    Ok(stored)
+}
+
+/// Everything the Apply command checks before any file edit, push or reply:
+/// the sent plan must be the stored one (content included, checked before any
+/// `gh` call), and the stored plan must have been analyzed at the PR's current
+/// head. A plan without provenance counts as unknown and is refused.
+async fn check_apply_preflight(
+    stored: Option<&PrReviewPlan>,
+    sent: &PrReviewPlan,
+    pr_url: &str,
+) -> Result<(), String> {
+    let stored = stored_plan_for_apply(stored, sent)?;
+    let current_head = current_pr_head_oid(pr_url).await?;
+    check_plan_matches_pr_head(stored, &current_head)
 }
 
 /// Re-reads the PR head and refuses when `plan` was analyzed at another one.
@@ -23396,7 +23440,7 @@ mod review_plan_provenance {
     #[cfg(unix)]
     #[tokio::test]
     async fn fetch_reads_the_head_and_keeps_only_actionable_inline_comments() {
-        let inline = format!("[{},{}]", inline_comment(11, "fix this").to_string(), inline_comment(12, "old").to_string());
+        let inline = format!("[{},{}]", inline_comment(11, "fix this"), inline_comment(12, "old"));
         let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), &inline, &open_threads()).await;
 
         let (head, decision, comments) = fetch_pr_review_data(PR_URL).await.expect("review is read");
@@ -23468,7 +23512,7 @@ mod review_plan_provenance {
     #[cfg(unix)]
     #[tokio::test]
     async fn fetch_reads_every_inline_page_gh_api_paginate_prints() {
-        let pages = format!("[{}]\n[{}]", inline_comment(21, "first").to_string(), inline_comment(22, "second").to_string());
+        let pages = format!("[{}]\n[{}]", inline_comment(21, "first"), inline_comment(22, "second"));
         let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), &pages, &open_threads()).await;
         let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("both pages are read");
         let ids: Vec<_> = comments.iter().filter(|c| c.kind == PrCommentKind::Inline).map(|c| c.id).collect();
@@ -23478,19 +23522,131 @@ mod review_plan_provenance {
     #[test]
     fn apply_needs_a_stored_plan_and_a_sent_plan_that_is_the_stored_one() {
         let stored = plan_analyzed_at(Some(ANALYZED));
-        let err = check_apply_provenance(None, &stored, ANALYZED).unwrap_err();
+        let err = stored_plan_for_apply(None, &stored).unwrap_err();
         assert!(err.contains("no stored review plan"), "{err}");
 
         let mut other = stored.clone();
         other.analyzed_at = Some(chrono::Utc::now() + chrono::Duration::seconds(1));
-        let err = check_apply_provenance(Some(&stored), &other, ANALYZED).unwrap_err();
+        let err = stored_plan_for_apply(Some(&stored), &other).unwrap_err();
         assert!(err.contains("not the one stored"), "{err}");
 
         let unknown = plan_analyzed_at(None);
-        assert!(check_apply_provenance(Some(&unknown), &unknown, ANALYZED).is_err());
+        assert!(stored_plan_for_apply(Some(&unknown), &unknown).is_ok());
+        assert!(check_plan_matches_pr_head(&unknown, ANALYZED).is_err());
 
-        assert_eq!(check_apply_provenance(Some(&stored), &stored.clone(), ANALYZED), Ok(()));
-        let err = check_apply_provenance(Some(&stored), &stored.clone(), MOVED).unwrap_err();
+        assert_eq!(stored_plan_for_apply(Some(&stored), &stored.clone()), Ok(&stored));
+        assert!(check_plan_matches_pr_head(&stored, MOVED).unwrap_err().contains("moved"));
+    }
+
+    /// A plan with two items to change, analyzed at `ANALYZED`, as stored on
+    /// the Task.
+    fn analyzed_plan_with_items() -> (Task, PrReviewPlan) {
+        let (mut task, mut plan) = crate::test_helpers::create_test_pr_review_setup();
+        plan.analyzed_head_oid = Some(ANALYZED.to_string());
+        plan.analyzed_at = Some(chrono::Utc::now());
+        task.pr_review_plan = Some(plan.clone());
+        (task, plan)
+    }
+
+    #[test]
+    fn a_changed_item_body_is_refused_even_with_matching_provenance() {
+        let (task, stored) = analyzed_plan_with_items();
+        let mut sent = stored.clone();
+        sent.items[0].proposed_change = "rewrite the whole module".to_string();
+        let err = stored_plan_for_apply(task.pr_review_plan.as_ref(), &sent).unwrap_err();
+        assert!(err.contains("differs from the one stored"), "{err}");
+    }
+
+    #[test]
+    fn added_removed_or_retargeted_items_and_comments_are_refused() {
+        let (task, _) = analyzed_plan_with_items();
+        let stored = task.pr_review_plan.as_ref();
+
+        let mut removed = stored.unwrap().clone();
+        removed.items.pop();
+        assert!(stored_plan_for_apply(stored, &removed).is_err());
+
+        let mut added = stored.unwrap().clone();
+        added.items.push(added.items[0].clone());
+        assert!(stored_plan_for_apply(stored, &added).is_err());
+
+        let mut retargeted = stored.unwrap().clone();
+        retargeted.items[0].comment_id = Some(999);
+        assert!(stored_plan_for_apply(stored, &retargeted).is_err());
+
+        let mut reworded = stored.unwrap().clone();
+        reworded.comments[0].body = "something else".to_string();
+        assert!(stored_plan_for_apply(stored, &reworded).is_err());
+    }
+
+    #[test]
+    fn decision_and_lifecycle_changes_are_allowed() {
+        let (task, stored) = analyzed_plan_with_items();
+        let mut sent = stored.clone();
+        sent.items[0].approved = false;
+        sent.items[0].decision = PrReviewDecision::Skip;
+        sent.items[1].fix_done = true;
+        sent.items[1].reply_posted = true;
+        sent.items[1].last_error = Some("earlier failure".to_string());
+        sent.last_apply = None;
+        assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &sent).is_ok());
+    }
+
+    /// The command's pre-flight, with a fake `gh` answering the head read. A
+    /// plan whose content was changed is refused before `gh` is even asked,
+    /// so no agent, push or reply can follow.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_refuses_changed_content_before_any_gh_call() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let (task, stored) = analyzed_plan_with_items();
+        let mut sent = stored.clone();
+        sent.items[0].proposed_change = "rewrite the whole module".to_string();
+
+        let err = check_apply_preflight(task.pr_review_plan.as_ref(), &sent, PR_URL)
+            .await
+            .expect_err("changed content is refused");
+        assert!(err.contains("differs from the one stored"), "{err}");
+        assert_eq!(gh.launches("gh"), 0, "no head read, no reply, no push");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+    }
+
+    /// A stored plan analyzed at an older head is refused by the pre-flight:
+    /// the head is read, but no agent, push or reply follows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_refuses_a_stale_stored_plan_and_runs_no_agent() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{MOVED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let (task, stored) = analyzed_plan_with_items();
+
+        let err = check_apply_preflight(task.pr_review_plan.as_ref(), &stored, PR_URL)
+            .await
+            .expect_err("a stale plan is refused");
         assert!(err.contains("moved"), "{err}");
+        assert_eq!(gh.launches("gh"), 1, "only the head is read");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+    }
+
+    /// The same pre-flight with the PR head unchanged passes for the stored plan.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_passes_for_the_stored_plan_at_the_current_head() {
+        let _gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        let (task, stored) = analyzed_plan_with_items();
+        assert!(check_apply_preflight(task.pr_review_plan.as_ref(), &stored, PR_URL).await.is_ok());
     }
 }
