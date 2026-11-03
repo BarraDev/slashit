@@ -2557,6 +2557,12 @@ pub async fn sync_pr_review_replies_inner(
     // The same rule Apply's reply pass uses, asked once for the whole plan.
     let delivered = settle_delivery(&working_dir, &task, &mut updated_plan).await;
 
+    // Resolved once, before the reply loop: a reply on GitHub is adopted as
+    // ours (or, for a lost response, takes the place of a new POST) only
+    // when its author is the account this `gh` posts as. Without that
+    // account, nothing can be verified and no reply is adopted.
+    let authenticated_login = gh_authenticated_login().await;
+
     for orig_idx in approved_indices {
         let item = updated_plan.items[orig_idx].clone();
         // A fix that is not on disk yet, or whose commit the pull request's
@@ -2588,7 +2594,18 @@ pub async fn sync_pr_review_replies_inner(
                 // Look for a reply first: an earlier POST may have succeeded
                 // with its response lost, and a second one would duplicate it.
                 Some(original_id) => {
-                    match discover_reply_comment_id(&repo, &number, original_id).await {
+                    // No adoption without a verified author: failing closed
+                    // also refuses to post blind, which could duplicate a
+                    // reply whose response was lost.
+                    let discovered_id = match authenticated_login.as_deref() {
+                        None => Err("the GitHub account that posts replies could not be \
+                                     determined, so an existing reply could not be verified"
+                                     .to_string()),
+                        Some(expected) => {
+                            discover_reply_comment_id(&repo, &number, original_id, expected).await
+                        }
+                    };
+                    match discovered_id {
                         Ok(Some(found_id)) => {
                             discovered += 1;
                             let it = &mut updated_plan.items[orig_idx];
@@ -2647,7 +2664,15 @@ pub async fn sync_pr_review_replies_inner(
                 unmatched += 1;
                 continue;
             };
-            match discover_reply_comment_id(&repo, &number, original_id).await {
+            // Discovery only adopts a reply written by this account.
+            let discovered_id = match authenticated_login.as_deref() {
+                // Fail closed: with no verified account, no reply is ours.
+                None => Ok(None),
+                Some(expected) => {
+                    discover_reply_comment_id(&repo, &number, original_id, expected).await
+                }
+            };
+            match discovered_id {
                 Ok(Some(found_id)) => {
                     updated_plan.items[orig_idx].reply_comment_id = Some(found_id);
                     discovered += 1;
@@ -3673,15 +3698,29 @@ async fn post_inline_reply_only(
     .map_err(|e| format!("threaded reply failed: {e}"))
 }
 
-/// Walks the PR's inline review comments and returns the id of the reply
-/// whose `in_reply_to_id` matches `original_comment_id`. Picks the most
-/// recently created when there are multiple. Returns `Ok(None)` when no
-/// inline reply exists for that comment — the original reply may have been a
-/// PR-level fallback (no `in_reply_to_id`) or it was deleted.
+/// The account that posts replies through the same `gh`.
+async fn gh_authenticated_login() -> Option<String> {
+    run_cmd_no_cwd("gh", &["api", "user", "--jq", ".login"])
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Walks the PR's inline review comments and returns the id of *our* reply:
+/// one whose `in_reply_to_id` matches `original_comment_id` and whose author
+/// is `expected_login`. The author check is what keeps a reply another person
+/// left on the same thread from being adopted as ours and rewritten. Among
+/// the matching replies the most recently created wins. A comment without a
+/// `user.login`, or written by anyone else, is never a candidate. Returns
+/// `Ok(None)` when no candidate survives — the original reply may have been a
+/// PR-level fallback (no `in_reply_to_id`), it was deleted, or none of the
+/// replies on the thread is provably ours.
 async fn discover_reply_comment_id(
     repo: &str,
     number: &str,
     original_comment_id: u64,
+    expected_login: &str,
 ) -> Result<Option<u64>, String> {
     let endpoint = format!("repos/{}/pulls/{}/comments?per_page=100", repo, number);
     let raw = run_cmd_no_cwd("gh", &["api", "--paginate", &endpoint]).await
@@ -3693,6 +3732,12 @@ async fn discover_reply_comment_id(
     for c in arr {
         let in_reply_to = c.get("in_reply_to_id").and_then(|v| v.as_u64());
         if in_reply_to != Some(original_comment_id) { continue; }
+        // Only a reply written by the expected account is a candidate.
+        let author = c.get("user")
+            .and_then(|u| u.get("login"))
+            .and_then(|v| v.as_str())
+            .map(str::trim);
+        if !author.is_some_and(|login| login.eq_ignore_ascii_case(expected_login)) { continue; }
         let Some(id) = c.get("id").and_then(|v| v.as_u64()) else { continue; };
         let created = parse_gh_ts(c.get("created_at"))
             .unwrap_or_else(chrono::Utc::now);
@@ -19278,12 +19323,17 @@ mod tests {
                 assert_eq!((synced.replied, synced.fix_pending), (0, 0), "no duplicate reply: {synced:?}");
             }
 
+            /// The login the sync fixture's `gh` reports for `gh api user`.
+            const SYNC_FIXTURE_LOGIN: &str = "slashit-fixture";
+
             /// A fake `gh` for Sync's reply path that logs every call to
             /// `log`. `post` is the shell run for a threaded POST, `existing`
-            /// the JSON answered to the list of inline comments.
+            /// the JSON answered to the list of inline comments. It posts as
+            /// the account `login`.
             fn sync_gh(claude: &EditingClaude, log: &Path, post: &str, existing: &str) {
                 let script = format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'-X POST'*) {post} ;;\n  *'pr comment'*) echo done ;;\n  *'--paginate'*) printf '%s' '{existing}' ;;\n  *) echo 4242 ;;\nesac\n"
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'api user --jq .login'*) echo {login:?} ;;\n  *'-X POST'*) {post} ;;\n  *'pr comment'*) echo done ;;\n  *'--paginate'*) printf '%s' '{existing}' ;;\n  *) echo 4242 ;;\nesac\n",
+                    login = SYNC_FIXTURE_LOGIN,
                 );
                 write_executable(&claude.gh, &script);
             }
@@ -19373,12 +19423,153 @@ mod tests {
                 let (state, tmp) = build_test_state().await;
                 let (task, plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
                 let log = tmp.path().join("gh.log");
-                sync_gh(&claude, &log, "echo 1", r#"[{"id":901,"in_reply_to_id":1,"created_at":"2026-01-01T00:00:00Z"}]"#);
+                sync_gh(&claude, &log, "echo 1", r#"[{"id":901,"in_reply_to_id":1,"user":{"login":"slashit-fixture"},"created_at":"2026-01-01T00:00:00Z"}]"#);
 
                 let (_synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
                 assert_eq!(call_count(&log, "-X POST"), 0);
                 assert_eq!(call_count(&log, "pr comment"), 0);
                 assert!(plan.items[0].reply_posted && plan.items[0].reply_comment_id == Some(901), "{:?}", plan.items[0]);
+            }
+
+            /// The authenticated login is what the `gh` in use reports for
+            /// `gh api user --jq .login`, and `None` when it cannot be answered.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_authenticated_login_is_what_gh_reports_and_none_when_it_cannot() {
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[("api user --jq .login".to_string(), "printf 'someone'".to_string())],
+                );
+                assert_eq!(gh_authenticated_login().await.as_deref(), Some("someone"));
+
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[("api user --jq .login".to_string(), "exit 1".to_string())],
+                );
+                assert!(gh_authenticated_login().await.is_none());
+            }
+
+            /// Discovery picks our latest reply, even when another user's
+            /// newer reply sits on the same thread, and never a comment that
+            /// is not a reply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discovery_adopts_our_latest_reply_even_when_another_user_replied_later() {
+                let _guard = PATH_LOCK.lock().await;
+                let comments = r#"[
+                    {"id":333,"body":"not a reply"},
+                    {"id":111,"in_reply_to_id":99,"user":{"login":"slashit-fixture"},"created_at":"2026-01-01T00:00:00Z"},
+                    {"id":222,"in_reply_to_id":99,"user":{"login":"someone-else"},"created_at":"2026-01-02T00:00:00Z"}
+                ]"#;
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[
+                        ("api user --jq .login".to_string(), "printf 'slashit-fixture'".to_string()),
+                        (
+                            "api --paginate repos/owner/repo/pulls/42/comments?per_page=100".to_string(),
+                            format!("printf '{comments}'"),
+                        ),
+                    ],
+                );
+
+                let found = discover_reply_comment_id("owner/repo", "42", 99, "slashit-fixture")
+                    .await
+                    .expect("discovery asks, it does not fail");
+                assert_eq!(found, Some(111), "another user's newer reply is not ours");
+                let caseless = discover_reply_comment_id("owner/repo", "42", 99, "SLaShIt-FiXtUrE")
+                    .await
+                    .expect("discovery asks, it does not fail");
+                assert_eq!(caseless, Some(111), "the author check ignores ASCII case");
+            }
+
+            /// A reply written only by someone else is never adopted as ours.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discovery_adopts_no_reply_written_by_someone_else() {
+                let _guard = PATH_LOCK.lock().await;
+                let comments = r#"[
+                    {"id":222,"in_reply_to_id":99,"user":{"login":"someone-else"},"created_at":"2026-01-02T00:00:00Z"}
+                ]"#;
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[
+                        ("api user --jq .login".to_string(), "printf 'slashit-fixture'".to_string()),
+                        (
+                            "api --paginate repos/owner/repo/pulls/42/comments?per_page=100".to_string(),
+                            format!("printf '{comments}'"),
+                        ),
+                    ],
+                );
+
+                let found = discover_reply_comment_id("owner/repo", "42", 99, "slashit-fixture")
+                    .await
+                    .expect("discovery asks, it does not fail");
+                assert_eq!(found, None, "someone else's reply is not ours");
+            }
+
+            /// A candidate whose JSON carries no `user.login` is not a match.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discovery_adopts_no_reply_without_a_user_login() {
+                let _guard = PATH_LOCK.lock().await;
+                let comments = r#"[
+                    {"id":901,"in_reply_to_id":99,"created_at":"2026-01-01T00:00:00Z"}
+                ]"#;
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[
+                        ("api user --jq .login".to_string(), "printf 'slashit-fixture'".to_string()),
+                        (
+                            "api --paginate repos/owner/repo/pulls/42/comments?per_page=100".to_string(),
+                            format!("printf '{comments}'"),
+                        ),
+                    ],
+                );
+
+                let found = discover_reply_comment_id("owner/repo", "42", 99, "slashit-fixture")
+                    .await
+                    .expect("discovery asks, it does not fail");
+                assert_eq!(found, None, "a reply with no known author is not ours");
+            }
+
+            /// With no authenticated login, Sync adopts no reply: each item
+            /// becomes unmatched rather than letting an unverified comment on
+            /// the thread stand in for the account's own reply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_sync_whose_login_cannot_be_determined_adopts_no_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, mut plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                // A legacy reply: posted, its GitHub id never tracked — the
+                // shape Sync would otherwise resolve by discovery.
+                plan.items[0].reply_posted = true;
+                plan.items[0].reply_comment_id = None;
+
+                let log = tmp.path().join("gh.log");
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'api user'*) exit 1 ;;\n  *'pr list'*) printf '[]' ;;\n  *) exit 1 ;;\nesac\n"
+                );
+                write_executable(&claude.gh, &script);
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+
+                assert_eq!(
+                    (synced.replied, synced.discovered, synced.rewritten, synced.unmatched),
+                    (0, 0, 0, 1),
+                    "{synced:?}"
+                );
+                assert_eq!(
+                    call_count(&log, "--paginate"),
+                    0,
+                    "no reply list is asked for when the account is unknown"
+                );
+                assert_eq!(call_count(&log, "-X PATCH"), 0, "nothing unverifiable is rewritten");
+                assert!(plan.items[0].reply_comment_id.is_none(), "{:?}", plan.items[0]);
             }
 
             /// A uniquely identified non-inline comment gets one PR-level
@@ -19559,13 +19750,14 @@ mod tests {
                 (task, plan, worktree, log)
             }
 
-            /// Every logged `gh` call except the reads: the task branch's own pull
-            /// request and the list of inline comments.
+            /// Every logged `gh` call except the reads: the task branch's own
+            /// pull request, the authenticated login and the list of inline
+            /// comments.
             fn gh_writes(log: &Path) -> Vec<String> {
                 std::fs::read_to_string(log)
                     .unwrap_or_default()
                     .lines()
-                    .filter(|l| !l.starts_with("pr list") && !l.starts_with("api --paginate"))
+                    .filter(|l| !l.starts_with("pr list") && !l.starts_with("api --paginate") && !l.starts_with("api user"))
                     .map(str::to_string)
                     .collect()
             }
