@@ -51,6 +51,11 @@ enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Show one task's full record as JSON (read-only)
+    Inspect {
+        /// Task ID
+        task_id: String,
+    },
     /// Create a new task
     Create {
         /// Project ID
@@ -139,6 +144,9 @@ async fn main() -> Result<()> {
         Commands::Tasks { project } => IpcRequest::ListTasks {
             project_id: project.clone(),
         },
+        Commands::Inspect { task_id } => IpcRequest::GetTask {
+            task_id: task_id.clone(),
+        },
         Commands::Create {
             project,
             title,
@@ -201,6 +209,8 @@ async fn main() -> Result<()> {
 
     // Format output based on command type
     match &cli.command {
+        // The record is JSON by nature; there is no table form.
+        Commands::Inspect { .. } => println!("{}", serde_json::to_string_pretty(&response.data)?),
         Commands::Status => output::print_status(&response.data),
         Commands::Projects => output::print_projects(&response.data),
         Commands::Tasks { .. } => output::print_tasks(&response.data),

@@ -55,6 +55,7 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
         IpcRequest::ListTasks { project_id } => {
             Dispatch::reply(handle_list_tasks(ctx, project_id).await)
         }
+        IpcRequest::GetTask { task_id } => Dispatch::reply(handle_get_task(ctx, task_id).await),
         IpcRequest::CreateTask {
             project_id,
             title,
@@ -145,6 +146,23 @@ async fn handle_list_tasks(ctx: &IpcContext, project_id: Option<String>) -> IpcR
         .collect();
 
     IpcResponse::success(serde_json::to_value(summaries).unwrap_or_default())
+}
+
+/// Read one Task as its full record, under the same field names the Task is
+/// stored with. Answered from the in-memory Task store; nothing is written.
+async fn handle_get_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
+    let task_uuid = match Uuid::parse_str(&task_id) {
+        Ok(id) => id,
+        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
+    };
+    let tasks = ctx.tasks.read().await;
+    match tasks.get(&task_uuid) {
+        Some(task) => match serde_json::to_value(task) {
+            Ok(value) => IpcResponse::success(value),
+            Err(e) => IpcResponse::error(format!("Could not encode task {task_id}: {e}")),
+        },
+        None => IpcResponse::error(format!("Task {task_id} not found")),
+    }
 }
 
 async fn handle_create_task(
@@ -1789,5 +1807,142 @@ mod enqueue_from_the_cli {
         assert_eq!(on_disk.status, TaskStatus::Queue);
         assert_eq!(on_disk.phase, TaskPhase::Idle);
         assert_eq!(on_disk.error_message, None);
+    }
+}
+
+/// `GetTask`: the full Task record, read-only.
+#[cfg(test)]
+mod get_task {
+    use super::*;
+    use crate::domain::task::{
+        CodingProvider, HumanReviewDecision, HumanReviewEntry, ReviewMode,
+    };
+    use crate::domain::publication::{PrPublication, PublicationState};
+    use crate::test_helpers::{create_test_task_full, ipc_test_context};
+    use slashit_ipc::Endpoint;
+    use std::sync::Arc;
+
+    fn peer() -> PeerContext {
+        PeerContext {
+            endpoint: Endpoint::Unix {
+                path: std::path::PathBuf::from("/nonexistent-for-tests"),
+            },
+            os_verified: true,
+        }
+    }
+
+    async fn get(ctx: &IpcContext, id: &str) -> IpcResponse {
+        dispatch(IpcRequest::GetTask { task_id: id.to_string() }, ctx, &peer())
+            .await
+            .response
+    }
+
+    fn files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    out.push((path, bytes));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    async fn rich_world() -> (tempfile::TempDir, IpcContext, Uuid) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        let project_id = Uuid::new_v4();
+        let dependency = Uuid::new_v4();
+        let mut task = create_test_task_full("Inspect me", project_id, TaskStatus::HumanReview, 0);
+        task.model = "claude-sonnet-5-5".to_string();
+        task.provider = CodingProvider::OpenCode;
+        task.review_mode = ReviewMode::Manual;
+        task.reviewer_model = Some("claude-opus-5-5".to_string());
+        task.dependencies = vec![dependency];
+        task.pr_url = Some("https://github.com/o/r/pull/7".to_string());
+        task.human_review.entries.push(HumanReviewEntry {
+            sequence: 1,
+            arrival: 1,
+            decision: HumanReviewDecision::Approved,
+            feedback: None,
+            decided_at: chrono::Utc::now(),
+            approved_tip: Some("a".repeat(40)),
+            tip_reconfirmed: false,
+        });
+        task.pr_publication = Some(PrPublication {
+            request_id: Uuid::new_v4(),
+            commit: "a".repeat(40),
+            branch: "task-1".to_string(),
+            pr_url: "https://github.com/o/r/pull/7".to_string(),
+            remote_before: None,
+            state: PublicationState::Published {},
+            requested_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        });
+        let id = task.id;
+        ctx.tasks.write().await.insert(id, task.clone());
+        ctx.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        (tmp, ctx, id)
+    }
+
+    #[tokio::test]
+    async fn returns_every_field_group_under_the_task_record_names() {
+        let (_tmp, ctx, id) = rich_world().await;
+        let reply = get(&ctx, &id.to_string()).await;
+        assert!(reply.ok, "{:?}", reply.error);
+        let d = reply.data;
+
+        assert_eq!(d["id"], id.to_string());
+        assert_eq!(d["title"], "Inspect me");
+        assert_eq!(d["status"], serde_json::to_value(TaskStatus::HumanReview).unwrap());
+        assert!(d.get("phase").is_some());
+        assert_eq!(d["model"], "claude-sonnet-5-5");
+        assert_eq!(d["provider"], "opencode");
+        assert_eq!(d["review_mode"], "manual");
+        assert_eq!(d["reviewer_model"], "claude-opus-5-5");
+        assert_eq!(d["dependencies"].as_array().unwrap().len(), 1);
+        assert_eq!(d["human_review"]["entries"][0]["decision"], "approved");
+        assert_eq!(d["human_review"]["entries"][0]["approved_tip"], "a".repeat(40));
+        assert_eq!(d["pr_url"], "https://github.com/o/r/pull/7");
+        assert_eq!(d["pr_publication"]["commit"], "a".repeat(40));
+        assert_eq!(d["pr_publication"]["state"]["kind"], "published");
+
+        // Same shape as the stored record: it round-trips into a Task.
+        let task: crate::domain::Task = serde_json::from_value(d).expect("a Task record");
+        assert_eq!(task.id, id);
+    }
+
+    #[tokio::test]
+    async fn makes_no_write() {
+        let (tmp, ctx, id) = rich_world().await;
+        let before = files_under(tmp.path());
+        assert!(before.iter().any(|(p, b)| p.extension().is_some_and(|e| e == "toml") && String::from_utf8_lossy(b).contains("Inspect me")), "the seeded board is on disk");
+        let reply = get(&ctx, &id.to_string()).await;
+        assert!(reply.ok);
+        assert_eq!(files_under(tmp.path()), before, "the Task store must be byte-identical");
+    }
+
+    #[tokio::test]
+    async fn unknown_or_malformed_id_is_an_error() {
+        let (_tmp, ctx, _id) = rich_world().await;
+        let missing = get(&ctx, &Uuid::new_v4().to_string()).await;
+        assert!(!missing.ok);
+        assert!(missing.error.unwrap().contains("not found"));
+        let bad = get(&ctx, "nope").await;
+        assert!(!bad.ok);
+        assert!(bad.error.unwrap().contains("Invalid task_id"));
     }
 }
