@@ -451,6 +451,7 @@ fn agent_spawning_requests() -> Vec<IpcRequest> {
             title: "from a remote peer".to_string(),
             description: Some("rm -rf".to_string()),
             priority: None,
+            review_mode: None,
         },
         IpcRequest::MoveTask {
             task_id: uuid::Uuid::new_v4().to_string(),

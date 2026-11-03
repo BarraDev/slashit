@@ -33,6 +33,8 @@ pub struct CreateTaskParams {
     pub complexity: Option<TaskComplexity>,
     pub impact: Option<TaskImpact>,
     pub security_severity: Option<SecuritySeverity>,
+    pub review_mode: ReviewMode,
+    pub provider: CodingProvider,
 }
 
 pub async fn create_task(params: CreateTaskParams) -> Result<Task, String> {
@@ -50,6 +52,8 @@ pub async fn create_task(params: CreateTaskParams) -> Result<Task, String> {
             "complexity": params.complexity,
             "impact": params.impact,
             "securitySeverity": params.security_severity,
+            "reviewMode": params.review_mode,
+            "provider": params.provider,
         }
     })).unwrap();
 

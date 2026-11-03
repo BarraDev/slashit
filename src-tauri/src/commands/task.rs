@@ -83,6 +83,10 @@ pub struct CreateTaskParams {
     pub github_issue_url: Option<String>,
     pub gitlab_issue_url: Option<String>,
     pub linear_ticket_id: Option<String>,
+    /// How a finished run is reviewed. Absent keeps the default, Automatic.
+    pub review_mode: Option<crate::domain::task::ReviewMode>,
+    /// The coding Worker. Absent keeps the default, Claude Code.
+    pub provider: Option<CodingProvider>,
 }
 
 #[tauri::command]
@@ -106,6 +110,8 @@ pub async fn create_task(
         &dependencies,
     )?;
 
+    let review_mode = params.review_mode.unwrap_or_default();
+    let provider = params.provider.unwrap_or_default();
     let new = NewTask {
         id,
         project_id,
@@ -132,7 +138,10 @@ pub async fn create_task(
         project_id,
         move |existing| {
             crate::domain::task_dependencies::check_targets(existing, id, project_id, &dependencies)?;
-            Ok(Task::new_backlog(existing, new))
+            let mut task = Task::new_backlog(existing, new);
+            task.review_mode = review_mode;
+            task.provider = provider;
+            Ok(task)
         },
     )
     .await
@@ -3076,9 +3085,141 @@ mod task_dependency_contract {
                 github_issue_url: None,
                 gitlab_issue_url: None,
                 linear_ticket_id: None,
+                review_mode: None,
+                provider: None,
             },
         )
         .await
+    }
+
+    async fn create_in_mode(
+        app: &App,
+        project_id: Uuid,
+        review_mode: Option<crate::domain::task::ReviewMode>,
+    ) -> Result<Task, String> {
+        create_task(
+            GuiMutation::untracked(),
+            app.state(),
+            CreateTaskParams {
+                reviewer_model: None,
+                project_id: project_id.to_string(),
+                title: "Moded".to_string(),
+                description: None,
+                model: "default".to_string(),
+                planning_mode: false,
+                dependencies: vec![],
+                category: None,
+                priority: None,
+                complexity: None,
+                impact: None,
+                security_severity: None,
+                github_issue_url: None,
+                gitlab_issue_url: None,
+                linear_ticket_id: None,
+                review_mode,
+                provider: None,
+            },
+        )
+        .await
+    }
+
+    /// Each mode is written in the creating write and survives a reload. That
+    /// the mode reaches the Worker handoff is proved by the next test.
+    #[tokio::test]
+    async fn a_new_task_keeps_the_review_mode_it_was_created_with() {
+        use crate::domain::task::ReviewMode::{Automatic, Manual};
+        let project_id = Uuid::new_v4();
+        let (_tmp, _paths, app) = app_with(vec![], &[project_id]).await;
+
+        for (asked, expected) in [(Some(Manual), Manual), (Some(Automatic), Automatic), (None, Automatic)] {
+            let created = create_in_mode(&app, project_id, asked).await.expect("created");
+            assert_eq!(created.review_mode, expected);
+            let (memory, disk) = both_copies(&app, project_id, created.id).await;
+            let mode = |v: &serde_json::Value| v.get("review_mode").and_then(|m| m.as_str()).map(str::to_owned);
+            let stored = (mode(&memory), mode(&disk));
+            match expected {
+                Manual => assert_eq!(stored, (Some("manual".into()), Some("manual".into()))),
+                Automatic => assert_eq!(stored, (None, None), "the default is omitted"),
+            }
+            let reloaded = app.state::<crate::AppState>().storage.load_project_tasks(project_id).expect("reload");
+            let reloaded = reloaded.into_iter().find(|t| t.id == created.id).expect("present");
+            assert_eq!(reloaded.review_mode, expected);
+        }
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A Task created through `create_task` and then passed through the
+    /// shared run-start write (via the `cfg(test)` `record_run_start`
+    /// wrapper, which skips new-attempt authorization and the
+    /// additional-directory refusal) records the selected mode in the stored
+    /// `worker_handoff`, in memory and on disk. No test helper sets the mode;
+    /// an omitted mode keeps the Automatic default. Only the Manual iteration
+    /// discriminates the propagation: the Some(Automatic) and None iterations
+    /// would pass even if the mode were dropped, because Automatic is the
+    /// default.
+    #[tokio::test]
+    async fn the_mode_chosen_at_creation_reaches_the_stored_worker_handoff() {
+        use crate::domain::task::ReviewMode::{Automatic, Manual};
+        let project_id = Uuid::new_v4();
+        let (tmp, _paths, app) = app_with(vec![], &[project_id]).await;
+        let state = app.state::<crate::AppState>();
+
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let repository_id = Uuid::new_v4();
+        state.repository.repositories.write().await.insert(
+            repository_id,
+            crate::domain::Repository {
+                id: repository_id,
+                local_path: repo.to_string_lossy().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        {
+            let mut projects = state.project.projects.write().await;
+            let project = projects.get_mut(&project_id).unwrap();
+            project.repository_id = Some(repository_id);
+            project.base = Some(crate::domain::project::ProjectBase::LocalBranch {
+                branch: "main".to_string(),
+            });
+        }
+        let executor = crate::test_helpers::attach_test_executor(&state);
+
+        for (asked, expected) in [(Some(Manual), Manual), (Some(Automatic), Automatic), (None, Automatic)] {
+            let created = create_in_mode(&app, project_id, asked).await.expect("created");
+            executor
+                .record_run_start_for_test(created.id, repo.to_str().unwrap())
+                .await
+                .expect("the run start is recorded");
+
+            let memory = state.task.tasks.read().await[&created.id].clone();
+            let disk = state
+                .storage
+                .load_project_tasks(project_id)
+                .expect("reload")
+                .into_iter()
+                .find(|t| t.id == created.id)
+                .expect("present");
+            for task in [memory, disk] {
+                let handoff = task.worker_handoff.expect("the start wrote a handoff");
+                assert!(matches!(handoff.stage, crate::domain::WorkerHandoffStage::Started {}));
+                assert_eq!(handoff.review_mode, expected, "asked {asked:?}");
+                assert!(!handoff.review_mode_unproven);
+            }
+        }
     }
 
     async fn set(app: &App, task_id: Uuid, dependencies: Vec<Uuid>) -> Result<Option<Task>, String> {

@@ -64,6 +64,10 @@ enum Commands {
         /// Priority: urgent, high, medium, low
         #[arg(long)]
         priority: Option<String>,
+        /// Review mode: manual (no AI Review, run goes to Human Review) or
+        /// automatic (AI Review runs after each run; the default)
+        #[arg(long, value_parser = ["manual", "automatic"])]
+        review_mode: Option<String>,
     },
     /// Move a task to a different status
     Move {
@@ -140,11 +144,13 @@ async fn main() -> Result<()> {
             title,
             description,
             priority,
+            review_mode,
         } => IpcRequest::CreateTask {
             project_id: project.clone(),
             title: title.clone(),
             description: description.clone(),
             priority: priority.clone(),
+            review_mode: review_mode.clone(),
         },
         Commands::Move { task_id, status } => IpcRequest::MoveTask {
             task_id: task_id.clone(),

@@ -60,7 +60,10 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
             title,
             description,
             priority,
-        } => Dispatch::reply(handle_create_task(ctx, project_id, title, description, priority).await),
+            review_mode,
+        } => Dispatch::reply(
+            handle_create_task(ctx, project_id, title, description, priority, review_mode).await,
+        ),
         IpcRequest::MoveTask { task_id, status } => {
             Dispatch::reply(handle_move_task(ctx, task_id, status).await)
         }
@@ -150,10 +153,20 @@ async fn handle_create_task(
     title: String,
     description: Option<String>,
     priority: Option<String>,
+    review_mode: Option<String>,
 ) -> IpcResponse {
     let project_uuid = match Uuid::parse_str(&project_id) {
         Ok(id) => id,
         Err(_) => return IpcResponse::error(format!("Invalid project_id: {project_id}")),
+    };
+    let review_mode = match review_mode.as_deref() {
+        None | Some("automatic") => crate::domain::task::ReviewMode::Automatic,
+        Some("manual") => crate::domain::task::ReviewMode::Manual,
+        Some(other) => {
+            return IpcResponse::error(format!(
+                "Invalid review mode: {other}. Use manual or automatic."
+            ))
+        }
     };
 
     // Verify project exists and get its name
@@ -192,7 +205,9 @@ async fn handle_create_task(
         &ctx.storage,
         project_uuid,
         move |existing| {
-            crate::domain::Task::new_backlog(existing, new)
+            let mut task = crate::domain::Task::new_backlog(existing, new);
+            task.review_mode = review_mode;
+            task
         },
     )
     .await;
@@ -1069,6 +1084,7 @@ pub(super) mod tests {
                     title: format!("task {i}"),
                     description: None,
                     priority: None,
+                    review_mode: None,
                 },
                 &ctx,
                 &peer(),
