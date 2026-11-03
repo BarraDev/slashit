@@ -249,8 +249,8 @@ fn full_task(project_id: Uuid) -> Task {
     });
     task.cleanup_in_flight = true;
     task.pr_review_plan = Some(PrReviewPlan {
-        analyzed_head_oid: None,
-        analyzed_at: None,
+        analyzed_head_oid: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+        analyzed_at: Some(at(6)),
         generated_at: at(6),
         pr_url: "https://github.com/o/r/pull/1".into(),
         review_decision: Some("APPROVED".into()),

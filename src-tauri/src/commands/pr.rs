@@ -1320,11 +1320,12 @@ pub async fn address_pr_review(
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
 
-    // Refuse before anything is edited, pushed or replied to: the plan must
-    // have been analyzed at the PR's head as it is now.
+    // Refuse before anything is edited, pushed or replied to. The stored plan
+    // is what the Task was analyzed under, so the plan sent by the webview
+    // must agree with it and both must match the PR's head as it is now.
     let pr_url = pr_url_for_task(&task)?;
     let current_head = current_pr_head_oid(&pr_url).await?;
-    check_plan_matches_pr_head(&plan, &current_head)?;
+    check_apply_provenance(task.pr_review_plan.as_ref(), &plan, &current_head)?;
 
     let app_handle = app.clone();
     let progress: ProgressSink = std::sync::Arc::new(move |ev: PrReviewProgress| {
@@ -1390,6 +1391,44 @@ fn check_plan_matches_pr_head(plan: &PrReviewPlan, current_head: &str) -> Result
     }
 }
 
+/// Refuses an Apply unless the sent plan is the stored plan of the Task and
+/// that plan was analyzed at `current_head`. A Task without a stored plan, or
+/// with a stored plan that has no provenance, has nothing to check against.
+fn check_apply_provenance(
+    stored: Option<&PrReviewPlan>,
+    sent: &PrReviewPlan,
+    current_head: &str,
+) -> Result<(), String> {
+    let Some(stored) = stored else {
+        return Err(
+            "This Task has no stored review plan to apply. Analyze the PR comments again. \
+             Nothing was changed."
+                .to_string(),
+        );
+    };
+    if sent.analyzed_head_oid != stored.analyzed_head_oid
+        || sent.analyzed_at != stored.analyzed_at
+    {
+        return Err(
+            "The review plan being applied is not the one stored for this Task. Re-analyze \
+             the PR comments, then apply again. Nothing was changed."
+                .to_string(),
+        );
+    }
+    check_plan_matches_pr_head(stored, current_head)
+}
+
+/// Re-reads the PR head and refuses when `plan` was analyzed at another one.
+/// A plan without provenance is not checked here: [`address_pr_review`]
+/// refuses those before it reaches this flow.
+async fn ensure_plan_matches_pr_head(pr_url: &str, plan: &PrReviewPlan) -> Result<(), String> {
+    if plan.analyzed_head_oid.is_none() {
+        return Ok(());
+    }
+    let current_head = current_pr_head_oid(pr_url).await?;
+    check_plan_matches_pr_head(plan, &current_head)
+}
+
 /// The first seven characters of a commit id, for a message a person reads.
 fn short_oid(oid: &str) -> &str {
     oid.get(..7).unwrap_or(oid)
@@ -1444,6 +1483,10 @@ pub async fn address_pr_review_inner(
     } else {
         parse_pr_url(&pr_url)?
     };
+
+    // Nothing is edited, committed, pushed or replied to for a plan the PR
+    // head has moved away from.
+    ensure_plan_matches_pr_head(&pr_url, &plan).await?;
 
     // We mutate the plan in place to record per-item lifecycle. `updated_plan`
     // is what we hand back to the caller; the in-loop snapshot of an item is
@@ -1912,7 +1955,14 @@ pub async fn address_pr_review_inner(
                     Ok(())
                 }
             };
-            match push_branch_pinned_gated(&working_dir, &branch, None, &stop_if_cancelled).await {
+            // The head may have moved while the fixes were being made. It is
+            // read again here, so a push never lands on a review the plan did
+            // not analyze.
+            let gated_push = match ensure_plan_matches_pr_head(&pr_url, &updated_plan).await {
+                Ok(()) => push_branch_pinned_gated(&working_dir, &branch, None, &stop_if_cancelled).await,
+                Err(e) => Err(e),
+            };
+            match gated_push {
                 Ok(b) => {
                     pushed = true;
                     push_branch_name = Some(b.clone());
@@ -2548,45 +2598,49 @@ async fn fetch_pr_review_data(
     let head_oid = pr_head_oid_from_json(&review_json)?;
     let json: serde_json::Value = serde_json::from_str(&review_json)
         .map_err(|e| format!("GitHub's review answer is not JSON: {e}"))?;
-    let review_decision = json.get("reviewDecision").and_then(|v| v.as_str()).map(String::from);
-    if let Some(reviews) = json.get("reviews").and_then(|v| v.as_array()) {
-        for review in reviews {
-            let body = review.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if body.is_empty() && state != "CHANGES_REQUESTED" {
-                continue;
-            }
-            let id = review.get("id")
-                .or_else(|| review.get("databaseId"))
-                .and_then(|v| v.as_u64());
-            let author = review.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-            let author_association = review.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
-            let url = review.get("url").and_then(|v| v.as_str()).map(String::from);
-            let display_body = if body.is_empty() { format!("[{}]", state) } else { body };
-            let created_at = parse_gh_ts(review.get("submittedAt").or_else(|| review.get("createdAt")));
-            comments.push(PrReviewComment {
-                id, kind: PrCommentKind::Review, author, author_association, body: display_body,
-                path: None, line: None, url,
-                created_at, updated_at: created_at,
-            });
+    let review_decision = match json.get("reviewDecision") {
+        Some(v) if v.is_null() => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or("GitHub's review decision is not a string")?
+                .to_string(),
+        ),
+        None => return Err("GitHub's PR answer has no review decision field".to_string()),
+    };
+    for review in gh_pr_view_list(&json, "reviews")? {
+        let body = review.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if body.is_empty() && state != "CHANGES_REQUESTED" {
+            continue;
         }
+        let id = review.get("id")
+            .or_else(|| review.get("databaseId"))
+            .and_then(|v| v.as_u64());
+        let author = review.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let author_association = review.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
+        let url = review.get("url").and_then(|v| v.as_str()).map(String::from);
+        let display_body = if body.is_empty() { format!("[{}]", state) } else { body };
+        let created_at = parse_gh_ts(review.get("submittedAt").or_else(|| review.get("createdAt")));
+        comments.push(PrReviewComment {
+            id, kind: PrCommentKind::Review, author, author_association, body: display_body,
+            path: None, line: None, url,
+            created_at, updated_at: created_at,
+        });
     }
-    if let Some(conv) = json.get("comments").and_then(|v| v.as_array()) {
-        for c in conv {
-            let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            if body.is_empty() { continue; }
-            let id = c.get("id").or_else(|| c.get("databaseId")).and_then(|v| v.as_u64());
-            let author = c.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-            let author_association = c.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
-            let url = c.get("url").and_then(|v| v.as_str()).map(String::from);
-            let created_at = parse_gh_ts(c.get("createdAt"));
-            let updated_at = parse_gh_ts(c.get("updatedAt")).or(created_at);
-            comments.push(PrReviewComment {
-                id, kind: PrCommentKind::Conversation, author, author_association, body,
-                path: None, line: None, url,
-                created_at, updated_at,
-            });
-        }
+    for c in gh_pr_view_list(&json, "comments")? {
+        let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if body.is_empty() { continue; }
+        let id = c.get("id").or_else(|| c.get("databaseId")).and_then(|v| v.as_u64());
+        let author = c.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let author_association = c.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
+        let url = c.get("url").and_then(|v| v.as_str()).map(String::from);
+        let created_at = parse_gh_ts(c.get("createdAt"));
+        let updated_at = parse_gh_ts(c.get("updatedAt")).or(created_at);
+        comments.push(PrReviewComment {
+            id, kind: PrCommentKind::Conversation, author, author_association, body,
+            path: None, line: None, url,
+            created_at, updated_at,
+        });
     }
 
     // `--paginate` prints one JSON array per page, back to back.
@@ -2610,10 +2664,16 @@ async fn fetch_pr_review_data(
     }
     let non_actionable = fetch_non_actionable_review_comment_ids(&repo, &number).await?;
     for c in inline {
-        let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        // The id is what a reply and a resolved-thread check address, so a
+        // comment without one cannot be kept or left out safely.
+        let id = c.get("id").and_then(|v| v.as_u64()).ok_or(
+            "an inline review comment has no numeric id, so the review cannot be read in full",
+        )?;
+        let body = c.get("body").and_then(|v| v.as_str())
+            .ok_or("an inline review comment has no body")?
+            .trim().to_string();
         if body.is_empty() { continue; }
-        let id = c.get("id").and_then(|v| v.as_u64());
-        if id.is_some_and(|id| non_actionable.contains(&id)) { continue; }
+        if non_actionable.contains(&id) { continue; }
         let author = c.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let author_association = c.get("author_association").and_then(|v| v.as_str()).map(String::from);
         let path = c.get("path").and_then(|v| v.as_str()).map(String::from);
@@ -2622,12 +2682,36 @@ async fn fetch_pr_review_data(
         let created_at = parse_gh_ts(c.get("created_at"));
         let updated_at = parse_gh_ts(c.get("updated_at")).or(created_at);
         comments.push(PrReviewComment {
-            id, kind: PrCommentKind::Inline, author, author_association, body, path, line, url,
+            id: Some(id), kind: PrCommentKind::Inline, author, author_association, body, path, line, url,
             created_at, updated_at,
         });
     }
 
     Ok((head_oid, review_decision, comments))
+}
+
+/// `gh pr view` lists reviews and comments with `first: 100` and no more
+/// pages, so a list of that size may have been cut short. Such a list is an
+/// error, never a partial review.
+const GH_PR_VIEW_LIST_LIMIT: usize = 100;
+
+/// The list `key` of a `gh pr view` answer, read in full.
+fn gh_pr_view_list<'a>(
+    json: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a Vec<serde_json::Value>, String> {
+    let list = json
+        .get(key)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("GitHub's PR answer has no {key} list"))?;
+    if list.len() >= GH_PR_VIEW_LIST_LIMIT {
+        return Err(format!(
+            "GitHub's PR answer lists {} {key}, which is the most it returns, so the review \
+             cannot be read in full",
+            list.len(),
+        ));
+    }
+    Ok(list)
 }
 
 /// The head commit a `gh pr view --json headRefOid` answer names.
@@ -23223,5 +23307,190 @@ mod review_plan_provenance {
         let current = current_pr_head_oid(PR_URL).await.expect("head is read");
         assert_eq!(current, MOVED);
         assert!(check_plan_matches_pr_head(&plan, &current).is_err());
+    }
+
+    /// The apply path, given a plan analyzed at `ANALYZED` while the PR head
+    /// is now `MOVED`, refuses before any agent runs: the only `gh` call is
+    /// the head read (so no reply is posted), no `claude` launch happens, and
+    /// the checkout stays empty.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stale_stored_plan_runs_no_agent_and_posts_nothing() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!(
+                "case \"$1 $2\" in\n  \"pr view\") printf '%s' '{{\"headRefOid\":\"{MOVED}\"}}' ;;\n  *) exit 1 ;;\nesac"
+            ),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let (task, mut plan) = crate::test_helpers::create_test_pr_review_setup();
+        plan.analyzed_head_oid = Some(ANALYZED.to_string());
+        plan.analyzed_at = Some(chrono::Utc::now());
+        let checkout = tempfile::tempdir().unwrap();
+        let lease_dir = tempfile::tempdir().unwrap();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let options = AddressPrReviewOptions { auto_push: true, auto_reply: true, dry_run: false };
+
+        let err = address_pr_review_inner(
+            task,
+            checkout.path().to_str().unwrap().to_string(),
+            plan,
+            options,
+            no_progress(),
+            cancel_rx,
+            lease_dir.path().join("task.lock"),
+        )
+        .await
+        .expect_err("a plan analyzed at an older head is refused");
+
+        assert!(err.contains("moved"), "{err}");
+        assert_eq!(gh.launches("gh"), 1, "only the head is read: no reply, no push");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+        assert!(std::fs::read_dir(checkout.path()).unwrap().next().is_none(), "nothing was written");
+    }
+
+    /// The three reads `fetch_pr_review_data` makes, answered by a fake `gh`.
+    /// `pr_view`, `inline` and `threads` are JSON printed verbatim, so they
+    /// must not contain single quotes.
+    #[cfg(unix)]
+    async fn fake_gh_reads(
+        pr_view: &str,
+        inline: &str,
+        threads: &str,
+    ) -> crate::test_helpers::FakeProgram {
+        crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!(
+                "case \"$1 $2\" in\n  \"pr view\") printf '%s' '{pr_view}' ;;\n  \"api graphql\") printf '%s' '{threads}' ;;\n  \"api --paginate\") printf '%s' '{inline}' ;;\n  *) exit 1 ;;\nesac"
+            ),
+        )
+        .await
+    }
+
+    fn pr_view_json(extra: serde_json::Value) -> String {
+        let mut view = serde_json::json!({
+            "headRefOid": ANALYZED,
+            "reviewDecision": null,
+            "reviews": [],
+            "comments": [{ "id": "IC_1", "body": "general remark", "author": { "login": "a" } }],
+        });
+        view.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        view.to_string()
+    }
+
+    fn inline_comment(id: u64, body: &str) -> serde_json::Value {
+        serde_json::json!({ "id": id, "body": body, "path": "src/lib.rs", "line": 3,
+            "html_url": "https://github.com/o/r/pull/1#r", "user": { "login": "rev" } })
+    }
+
+    fn open_threads() -> String {
+        serde_json::json!({ "data": { "repository": { "pullRequest": { "reviewThreads": {
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": [{ "isResolved": true, "isOutdated": false,
+                "comments": { "totalCount": 1, "nodes": [{ "databaseId": 12 }] } }],
+        } } } } })
+        .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_reads_the_head_and_keeps_only_actionable_inline_comments() {
+        let inline = format!("[{},{}]", inline_comment(11, "fix this").to_string(), inline_comment(12, "old").to_string());
+        let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), &inline, &open_threads()).await;
+
+        let (head, decision, comments) = fetch_pr_review_data(PR_URL).await.expect("review is read");
+        assert_eq!(head, ANALYZED);
+        assert_eq!(decision, None);
+        let inline_ids: Vec<_> = comments.iter().filter(|c| c.kind == PrCommentKind::Inline).map(|c| c.id).collect();
+        assert_eq!(inline_ids, vec![Some(11)], "the resolved thread's comment is left out");
+        assert!(comments.iter().any(|c| c.kind == PrCommentKind::Conversation), "conversation comments are kept");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_when_gh_fails_instead_of_returning_no_comments() {
+        let _gh = crate::test_helpers::FakeProgram::install("gh", "exit 1").await;
+        assert!(fetch_pr_review_data(PR_URL).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_on_an_empty_inline_answer() {
+        let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), "", &open_threads()).await;
+        let err = fetch_pr_review_data(PR_URL).await.expect_err("an empty answer is not an empty review");
+        assert!(err.contains("inline"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_on_an_empty_thread_answer() {
+        let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), "[]", "").await;
+        assert!(fetch_pr_review_data(PR_URL).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_when_a_key_is_missing_from_the_pr_answer() {
+        let mut no_reviews: serde_json::Value = serde_json::from_str(&pr_view_json(serde_json::json!({}))).unwrap();
+        no_reviews.as_object_mut().unwrap().remove("reviews");
+        let _gh = fake_gh_reads(&no_reviews.to_string(), "[]", &open_threads()).await;
+        assert!(fetch_pr_review_data(PR_URL).await.unwrap_err().contains("reviews"));
+        drop(_gh);
+
+        let mut no_decision: serde_json::Value = serde_json::from_str(&pr_view_json(serde_json::json!({}))).unwrap();
+        no_decision.as_object_mut().unwrap().remove("reviewDecision");
+        let _gh = fake_gh_reads(&no_decision.to_string(), "[]", &open_threads()).await;
+        assert!(fetch_pr_review_data(PR_URL).await.unwrap_err().contains("review decision"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_on_a_list_at_gh_page_size_because_it_may_be_cut_short() {
+        let reviews: Vec<_> = (0..100)
+            .map(|_| serde_json::json!({ "body": "b", "state": "COMMENTED" }))
+            .collect();
+        let view = pr_view_json(serde_json::json!({ "reviews": reviews }));
+        let _gh = fake_gh_reads(&view, "[]", &open_threads()).await;
+        let err = fetch_pr_review_data(PR_URL).await.expect_err("a full page is not read in full");
+        assert!(err.contains("cannot be read in full"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_on_an_inline_comment_without_an_id() {
+        let mut no_id = inline_comment(0, "fix this");
+        no_id.as_object_mut().unwrap().remove("id");
+        let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), &format!("[{no_id}]"), &open_threads()).await;
+        assert!(fetch_pr_review_data(PR_URL).await.unwrap_err().contains("numeric id"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_reads_every_inline_page_gh_api_paginate_prints() {
+        let pages = format!("[{}]\n[{}]", inline_comment(21, "first").to_string(), inline_comment(22, "second").to_string());
+        let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), &pages, &open_threads()).await;
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("both pages are read");
+        let ids: Vec<_> = comments.iter().filter(|c| c.kind == PrCommentKind::Inline).map(|c| c.id).collect();
+        assert_eq!(ids, vec![Some(21), Some(22)]);
+    }
+
+    #[test]
+    fn apply_needs_a_stored_plan_and_a_sent_plan_that_is_the_stored_one() {
+        let stored = plan_analyzed_at(Some(ANALYZED));
+        let err = check_apply_provenance(None, &stored, ANALYZED).unwrap_err();
+        assert!(err.contains("no stored review plan"), "{err}");
+
+        let mut other = stored.clone();
+        other.analyzed_at = Some(chrono::Utc::now() + chrono::Duration::seconds(1));
+        let err = check_apply_provenance(Some(&stored), &other, ANALYZED).unwrap_err();
+        assert!(err.contains("not the one stored"), "{err}");
+
+        let unknown = plan_analyzed_at(None);
+        assert!(check_apply_provenance(Some(&unknown), &unknown, ANALYZED).is_err());
+
+        assert_eq!(check_apply_provenance(Some(&stored), &stored.clone(), ANALYZED), Ok(()));
+        let err = check_apply_provenance(Some(&stored), &stored.clone(), MOVED).unwrap_err();
+        assert!(err.contains("moved"), "{err}");
     }
 }
