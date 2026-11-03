@@ -190,8 +190,8 @@ Preconditions, evaluated under the locks in section 5.1:
   1. The Repository record exists in `repositories` (`storage.rs:203`).
   2. Its `local_path` still exists and canonicalizes to the same path as stored. A moved folder fails this check.
   3. The repository identity check that the orphan scan uses (`repository_identity` in `worktree/orphans.rs`) reports the same repository, using `remote_url` when it is recorded. The exact call is an implementation detail to be confirmed. This is the "expected original identity" check of D4.
-  4. For a `state_location` of `Auto`, the board file at the resolved route exists, and no conflicting second board exists (see section 2.2). If both a routed board and a legacy board exist with different contents, restore refuses with a message. It does not guess.
-- If a precondition fails, restore is refused with a specific message, for example "The folder recorded for this Project is not available at <path>. Moved-folder recovery is not available in this version." The message does not suggest creating a new Project for that folder.
+  4. For a `state_location` of `Auto`, a board that the loader reads exists: the routed board at the resolved route or, when that file is absent, the legacy board (`legacy_tasks_path`, `storage.rs:1078`, read by the fallback at `storage.rs:1524-1541`). A legacy-only board is restorable without migration. If both boards exist with different contents, restore refuses with a message. It does not guess.
+- If a precondition fails, restore is refused with a specific message, for example "The folder recorded for this Project is not available at `{path}`. Moved-folder recovery is not available in this version." The message does not suggest creating a new Project for that folder.
 
 Other rules:
 
@@ -204,7 +204,7 @@ Other rules:
 
 The Add flow calls `create_repository` first (`src/components/create_project_modal.rs:230`), then `create_project`. `create_repository_core` (`src-tauri/src/commands/repository.rs:149-170`) mints a new Repository id and performs no path comparison, so a re-added folder receives a new id and an id-based check cannot match. Today no duplicate-path refusal exists.
 
-Under this proposal, `create_repository` would compare the canonicalized `local_path` against the `local_path` of every Repository referenced by a **hidden** Project, before any record is written. A match would be refused with "This folder belongs to the hidden Project <name>. Restore that Project instead." A folder used only by visible Projects keeps today's behavior, because shared Repository records are already allowed. This refusal is the add-flow form of D4. It is recommended as **O7**; the wording and the choice between restoring and adding remain open.
+Under this proposal, `create_repository` would compare the canonicalized `local_path` against the `local_path` of every Repository referenced by a **hidden** Project, before any record is written. A match would be refused with "This folder belongs to the hidden Project `{name}`. Restore that Project instead." A folder used only by visible Projects keeps today's behavior, because shared Repository records are already allowed. This refusal is the add-flow form of D4. It is recommended as **O7**; the wording and the choice between restoring and adding remain open.
 
 ### 3.7 Backlog and inert Tasks (PROPOSED)
 
@@ -291,7 +291,7 @@ Deletion needs a multi-step protocol because it removes files in several places:
 
 - **Task creation.** A creation waiting on the gate (`lifecycle.rs:613`) finishes before hide takes the gate in write mode. If it created a Backlog Task, that Task has no checkout and hide can proceed; the hidden Project then holds that Backlog Task. Any creation after hide is refused by row 2.
 - **Lease waiters.** A start that is waiting on a lease re-checks the predicate after it acquires the lease (row 7). Hide holds every lease, so a waiter sees the `hidden_at` that hide adopted before it released them.
-- **Concurrent Project writers (lost update).** `try_persist_projects` writes the whole table from an in-memory clone. If `update_project`, `create_project`, or attach cloned the map before hide adopted `hidden_at` and then persisted, their write would revert the hide on disk. This is prevented because every writer takes the same `projects` write lock across clone, persist, and adopt (step 4 above). The implementation test T26 must cover it.
+- **Concurrent Project writers (lost update).** `try_persist_projects` writes the whole table from an in-memory clone. If `update_project`, `create_project`, or attach cloned the map before hide adopted `hidden_at` and then persisted, their write would revert the hide on disk. This is prevented because every writer takes the same `projects` write lock across clone, persist, and adopt (step 5 of section 5.1). The implementation test T26 must cover it.
 - **Concurrent hide and restore.** Both take the same gate and lease sequence, so two operations on one Project serialize.
 
 ### 5.4 Crash and failure (PROPOSED)
@@ -304,14 +304,14 @@ Deletion needs a multi-step protocol because it removes files in several places:
 | After the rename, before the directory sync | New (usually) | Hidden in this process; may revert after power loss | Refused in this process; visible after a revert |
 | After a confirmed write | Hidden | Hidden | Refused at every boundary in section 4 |
 
-The one window that can revert is the unconfirmed directory sync. It is reported to the user and reconfirmed at the next start (section 5.5).
+The one window that can revert is the unconfirmed directory sync. It is reported to the user as unconfirmed. Phase 1 gives no startup notice for it (section 5.5).
 
 ### 5.5 Failure details (PROPOSED)
 
 - **Failure before the rename.** `update_config` returns `NotPublished` (`storage.rs:1024-1026`). Memory and disk keep the Project visible, and the user sees a failed hide.
 - **Crash before the rename.** The Project stays visible. This is the status quo.
 - **Crash after the rename.** The Project is hidden. Every boundary reads the persisted flag, so no operation starts after restart.
-- **`PublishedNotDurable`** (`storage.rs:1015-1022`). Memory adopts `hidden_at`, and the error reports that durability is unconfirmed. Power loss before the directory sync could revert the file to visible. The proposal would report "hide not confirmed" to the user and rely on `reconfirm_config_durable` (`storage.rs:977-983`). Startup calls it today only when other deletions are owed (`app_core.rs:236-257`). The proposal would extend the startup call to run whenever the configuration is unconfirmed.
+- **`PublishedNotDurable`** (`storage.rs:1015-1022`). Memory adopts `hidden_at`, and the error reports that durability is unconfirmed. Power loss before the directory sync could revert the file to visible. The proposal reports "hide not confirmed" to the user at the time of the failed write. It does not rely on a later startup check, because none can detect the revert: `config_unconfirmed` is process-local and starts `false` in every new `Storage` (`storage.rs:726`), and `reconfirm_config_durable` (`storage.rs:977-983`) only confirms what is now on disk, which is the visible state. Startup calls it today only when other deletions are owed (`app_core.rs:236-257`). Phase 1 accepts this as a documented limitation, subject to decision O8. The consequence is safe: a reverted hide restores the pre-hide state, and no Task data is lost or changed. A persisted marker would give startup that knowledge, but it would be a second file and would break the single-file invariant of section 3.2 (T14), so it is deferred.
 - **Restore after an interrupted write** follows the same table with the roles reversed. A crash before the rename leaves the Project hidden, and the user retries.
 
 ## 6. Startup, restart, surfaces, and risks
@@ -321,7 +321,7 @@ The one window that can revert is the unconfirmed directory sync. It is reported
 - Routes for hidden Projects remain, because `refresh_routes` iterates every Project (`storage.rs:1033-1050`). Their boards load as they do today.
 - The reconciliation loop (`app_core.rs:403-418`) visits every Task. Under section 3.4, a hidden Project's Tasks have no checkout and no unfinished marker, so the loop writes nothing for them.
 - Migration (`app_core.rs:766`) can rewrite an old-format board on the first start. That is existing behavior. The byte-identity test (T13) uses current-format fixtures so that migration does not affect it.
-- Test T22 asserts that `build_state` starts no run for a hidden Project and leaves its Task and Conversation files unchanged.
+- Test T22 asserts that `build_state` starts no run for a hidden Project and leaves its Task and Conversation files unchanged. It uses current-format fixtures, because startup migration (`app_core.rs:384`, `migrate_task` at `app_core.rs:766`) runs for every loaded Task and can rewrite an old-format Task on a hidden Project, as stated above.
 
 ### 6.2 Surfaces (PROPOSED)
 
@@ -363,7 +363,7 @@ The one window that can revert is the unconfirmed directory sync. It is reported
 
 ### 8.2 Consequence for hidden Tasks
 
-Section 3.4 refuses hide when any Task is in an active or awaiting-decision state, has a checkout, or has an unfinished marker. So a hidden Project's Tasks are inert in an older build too. An older build would show the Project, and a person could move a Backlog Task into Queue by hand, which would start work. That is the real exposure, and the downgrade procedure must prevent it by restoring first.
+Section 3.4 refuses hide when any Task is in an active or awaiting-decision state, has a checkout, or has an unfinished marker. Under the new build, a hidden Project's Tasks are inert because admission refuses them (section 3.7). An older build does not read `hidden_at`. It would show the Project as active, and a person could move a Backlog Task into Queue by hand, which would start work. That is the real exposure, and the downgrade procedure must prevent it by restoring first.
 
 ### 8.3 Alternatives considered
 
@@ -378,7 +378,8 @@ Section 3.4 refuses hide when any Task is in an active or awaiting-decision stat
 2. **Configuration backup.** No backup mechanism exists in the code (verified only as far as the config write path, not exhaustively). The procedure recommends copying the config directory before any downgrade or manual edit. Hide itself adds no backup.
 3. **Startup notice (later, not required for phase 1).** A later build may list the hidden Projects it loaded, in a non-blocking and non-intrusive way. The notice would be informational only. It is not a guarantee against older builds, and phase 1 does not depend on it.
 4. **Compatibility safeguard for phase 1: none.** A detection marker in a separate file, written at hide time, would let the new build warn when `hidden_at` disappeared after a downgrade. It would not block anything, and it would break the single-file invariant. Recommended for a later phase if evidence shows the procedure is not followed.
-5. **No fail-closed claim.** The proposal does not claim that older builds enforce hiding. **Decision O1** accepts or rejects this policy.
+5. **Downgrade is unsupported while a hidden Project cannot be restored.** Item 1 cannot be completed for a Project whose folder is missing or moved (section 3.5), and the new build refuses that restore. Until moved-folder recovery exists, the owner must choose between refusing the downgrade and a documented manual unhide after copying the configuration directory. This choice is decision O9.
+6. **No fail-closed claim.** The proposal does not claim that older builds enforce hiding. **Decision O1** accepts or rejects this policy.
 
 ## 9. Deferred, not part of this phase
 
@@ -426,9 +427,9 @@ All tests are PROPOSED. None exists today. "Fixture" names an existing test whos
 | T17 | `list_projects` and `get_project` exclude hidden Projects, and `list_hidden_projects` contains no `api_key` field | Serialized output has no key material | New |
 | T18 | `update_project` refuses any change while hidden, including agent-type changes (row 11) | Refusal; config and `api_key` unchanged | New |
 | T19 | `delete_workspace` refused with a hidden member; `detach_project_from_workspace` allowed; attach refused (row 16) | Three outcomes | `workspace.rs:154-181` pattern |
-| T20 | A failing config write leaves memory and disk unchanged | Equality | `project.rs:1204`, `:1223` pattern |
-| T21 | `PublishedNotDurable` on hide: memory hidden, error reported, reconfirmed on next start | Behavior as in section 5.5 | New |
-| T22 | `build_state` with a hidden Project starts no run and writes no Task or Conversation file | No change | New |
+| T20 | A write that fails before publication (`NotPublished`) leaves memory and disk unchanged. `PublishedNotDurable` is covered by T21 | Equality, for `NotPublished` only | `project.rs:1204`, `:1223` pattern |
+| T21 | `PublishedNotDurable` on hide: memory adopts `hidden_at`, error reports the hide as unconfirmed, no startup notice (section 5.5) | Behavior as in section 5.5 | New |
+| T22 | `build_state` with a hidden Project, using current-format fixtures, starts no run and writes no Task or Conversation file | No change | New |
 | T23 | Hide never calls `delete_project`'s path (no pending deletion record is created) | Record directory empty | New |
 | T24 | A config without `hidden_at` loads and round-trips unchanged | Equality | New |
 | T25 | An older-build downgrade is documented, not automated | Manual check only | None |
@@ -465,6 +466,8 @@ The owner has settled O1, O6 and O7 for phase 1 at the defaults shown below. O2 
 - **O4. Workspace-delete consequence. Open.** Accept that a hidden member blocks Workspace deletion until it is restored or detached (default). Section 10.
 - **O6. Open pull requests on hide. Settled: warn and do not block.** Section 3.4.
 - **O7. Add with a hidden Project's folder. Settled: refuse and point to restore.** Section 3.6.
+- **O8. Power loss after an unconfirmed hide. Open.** Accept the documented limitation that a reverted hide is not announced at startup (default), or add a persisted marker, which requires a second file and an exception to the single-file invariant (section 5.5, T14). Section 5.5.
+- **O9. Downgrade while a hidden Project is unrestorable. Open.** Refuse the downgrade until the Project is restorable (default), or allow a documented manual unhide after copying the configuration directory. Section 8.4, item 5.
 
 ### 12.3 Recommendations that are technical defaults (not decisions)
 
