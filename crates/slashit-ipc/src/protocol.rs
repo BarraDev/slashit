@@ -38,6 +38,8 @@ pub enum IpcRequest {
     ListProjects,
     /// List tasks, optionally filtered by project
     ListTasks { project_id: Option<String> },
+    /// Read one task as its full stored record. Never writes.
+    GetTask { task_id: String },
     /// Create a new task
     CreateTask {
         project_id: String,
@@ -93,6 +95,7 @@ impl IpcRequest {
             Self::Status
                 | Self::ListProjects
                 | Self::ListTasks { .. }
+                | Self::GetTask { .. }
                 | Self::QueueStatus
                 | Self::ListTerminals
                 | Self::Features
@@ -126,6 +129,7 @@ impl IpcRequest {
             Self::Status => "status",
             Self::ListProjects => "list_projects",
             Self::ListTasks { .. } => "list_tasks",
+            Self::GetTask { .. } => "get_task",
             Self::CreateTask { .. } => "create_task",
             Self::MoveTask { .. } => "move_task",
             Self::EditTask { .. } => "edit_task",
