@@ -1454,6 +1454,26 @@ pub struct FixedContent {
 }
 
 impl PrReviewPlan {
+    /// The stored comment `comment_id` names. A numeric id is unique within a
+    /// plan (the analysis withholds a number that two comments share), so the
+    /// id alone names one comment, and that comment's `kind` names its GitHub
+    /// resource type.
+    pub fn comment_for(&self, comment_id: u64) -> Option<&PrReviewComment> {
+        self.comments.iter().find(|c| c.id == Some(comment_id))
+    }
+
+    /// The id a reply to `comment_id` is addressed by on GitHub's inline reply
+    /// endpoint. Only an inline comment has one there: a review or a
+    /// conversation comment's number names another resource, and the inline
+    /// endpoint would act on an unrelated comment. `None` otherwise, and for an
+    /// id the plan does not hold.
+    pub fn inline_reply_target(&self, comment_id: Option<u64>) -> Option<u64> {
+        comment_id.filter(|&id| {
+            self.comment_for(id)
+                .is_some_and(|c| c.kind == PrCommentKind::Inline)
+        })
+    }
+
     /// Record that a fix for `comment_id` was just made from the text this
     /// plan holds for it. A comment the plan does not hold is not recorded:
     /// nothing is known about what the agent saw, and the entry stays absent

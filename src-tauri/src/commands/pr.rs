@@ -1054,6 +1054,19 @@ pub async fn triage_pr_comments(
 /// backfill cannot restore it from a timestamp that happens to fit. It fails
 /// toward reprocessing: that costs one apply, whereas wrongly calling it fixed
 /// would repeat the bug and could never be noticed.
+/// Whether the comment `cid` of the prior plan and the one of the new analysis
+/// are the same kind of GitHub resource. A number names a resource only with
+/// its type, so a record made for a review or a conversation comment says
+/// nothing about an inline comment that has the same number, and the reverse.
+fn same_resource_kind(prior: &PrReviewPlan, comments: &[PrReviewComment], cid: u64) -> bool {
+    let Some(fresh) = comments.iter().find(|c| c.id == Some(cid)) else {
+        return false;
+    };
+    prior
+        .comment_for(cid)
+        .is_none_or(|old| old.kind == fresh.kind)
+}
+
 fn carry_forward_reanalysis_lifecycle(
     items: &mut [PrReviewItem],
     prior: &PrReviewPlan,
@@ -1073,7 +1086,7 @@ fn carry_forward_reanalysis_lifecycle(
 
     let mut fixed_content = Vec::new();
     for cid in ids {
-        if !comments.iter().any(|c| c.id == Some(cid)) {
+        if !comments.iter().any(|c| c.id == Some(cid)) || !same_resource_kind(prior, comments, cid) {
             continue;
         }
         if let Some(recorded) = prior.fixed_fingerprint(cid) {
@@ -1108,6 +1121,7 @@ fn carry_forward_reanalysis_lifecycle(
     for item in items.iter_mut() {
         let Some(cid) = item.comment_id else { continue; };
         let Some(prev_item) = prior.items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
+        if !same_resource_kind(prior, comments, cid) { continue; }
 
         // An undelivered fix is a fact about the checkout, not about the
         // comment's wording, so it survives an edit: dropping it would let
@@ -1442,6 +1456,21 @@ fn stored_plan_for_apply<'a>(
             "The review plan being applied differs from the one stored for this Task in its \
              comments or fix instructions. Re-analyze the PR comments, then apply again. \
              Nothing was changed."
+                .to_string(),
+        );
+    }
+    // A fix acts on the comment its item names. An item whose comment has no
+    // numeric id here (GitHub did not give one, or it was withheld) has no
+    // identity to act on, so Apply refuses before any edit, push or reply.
+    let unidentified = stored.items.iter().any(|i| {
+        matches!(i.decision, PrReviewDecision::Fix)
+            && i.approved
+            && i.comment_id.and_then(|id| stored.comment_for(id)).is_none()
+    });
+    if unidentified {
+        return Err(
+            "A fix in this review plan names a comment that has no GitHub id this plan can \
+             act on. Re-analyze the PR comments, then apply again. Nothing was changed."
                 .to_string(),
         );
     }
@@ -2081,7 +2110,7 @@ pub async fn address_pr_review_inner(
                     comment_id: item.comment_id,
                     message: None,
                 });
-                match post_pr_reply(&reply_repo, &reply_number, item.comment_id, &body).await {
+                match post_pr_reply(&reply_repo, &reply_number, updated_plan.inline_reply_target(item.comment_id), &body).await {
                     Ok(reply_id) => {
                         replies_posted += 1;
                         updated_plan.items[orig_idx].reply_posted = true;
@@ -2483,7 +2512,7 @@ pub async fn sync_pr_review_replies_inner(
 
         // Case A: no reply on GitHub yet — POST a new one.
         if !item.reply_posted {
-            match post_pr_reply(&repo, &number, item.comment_id, &body).await {
+            match post_pr_reply(&repo, &number, updated_plan.inline_reply_target(item.comment_id), &body).await {
                 Ok(reply_id) => {
                     replied += 1;
                     updated_plan.items[orig_idx].reply_posted = true;
@@ -2502,7 +2531,7 @@ pub async fn sync_pr_review_replies_inner(
         // our original comment. No text heuristics. If we still can't find it,
         // the reply was likely a PR-level fallback comment — count as unmatched.
         if updated_plan.items[orig_idx].reply_comment_id.is_none() {
-            let Some(original_id) = item.comment_id else {
+            let Some(original_id) = updated_plan.inline_reply_target(item.comment_id) else {
                 unmatched += 1;
                 continue;
             };
@@ -2651,15 +2680,25 @@ async fn fetch_pr_review_data(
         ),
         None => return Err("GitHub's PR answer has no review decision field".to_string()),
     };
+    // `gh pr view` names reviews and comments by GraphQL node id only. Their
+    // numeric ids come from the REST lists, matched by node id. A list that
+    // cannot be read in full fails the read; an entry the list does not match
+    // keeps no id, and Apply refuses it.
+    let review_ids = numeric_ids_by_node_id(
+        &gh_api_list(&format!("repos/{}/pulls/{}/reviews?per_page=100", repo, number), "reviews").await?,
+    );
+    let conversation_ids = numeric_ids_by_node_id(
+        &gh_api_list(&format!("repos/{}/issues/{}/comments?per_page=100", repo, number), "conversation comments").await?,
+    );
     for review in gh_pr_view_list(&json, "reviews")? {
         let body = review.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if body.is_empty() && state != "CHANGES_REQUESTED" {
             continue;
         }
-        let id = review.get("id")
-            .or_else(|| review.get("databaseId"))
-            .and_then(|v| v.as_u64());
+        let id = review.get("id").and_then(|v| v.as_str())
+            .and_then(|node| review_ids.get(node))
+            .copied();
         let author = review.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let author_association = review.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
         let url = review.get("url").and_then(|v| v.as_str()).map(String::from);
@@ -2674,7 +2713,9 @@ async fn fetch_pr_review_data(
     for c in gh_pr_view_list(&json, "comments")? {
         let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if body.is_empty() { continue; }
-        let id = c.get("id").or_else(|| c.get("databaseId")).and_then(|v| v.as_u64());
+        let id = c.get("id").and_then(|v| v.as_str())
+            .and_then(|node| conversation_ids.get(node))
+            .copied();
         let author = c.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let author_association = c.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
         let url = c.get("url").and_then(|v| v.as_str()).map(String::from);
@@ -2687,37 +2728,21 @@ async fn fetch_pr_review_data(
         });
     }
 
-    // `--paginate` prints one JSON array per page, back to back.
-    let inline_json = run_cmd_no_cwd(
-        "gh",
-        &["api", "--paginate", &format!("repos/{}/pulls/{}/comments?per_page=100", repo, number)],
-    ).await
-    .map_err(|e| format!("inline review comments could not be fetched: {e}"))?;
-    let mut inline: Vec<serde_json::Value> = Vec::new();
-    let mut pages_read = 0usize;
-    for page in serde_json::Deserializer::from_str(&inline_json)
-        .into_iter::<Vec<serde_json::Value>>()
-    {
-        inline.extend(
-            page.map_err(|e| format!("inline review comments are not a JSON list: {e}"))?,
-        );
-        pages_read += 1;
-    }
-    if pages_read == 0 {
-        return Err("inline review comments answer was empty".to_string());
-    }
+    let inline = gh_api_list(
+        &format!("repos/{}/pulls/{}/comments?per_page=100", repo, number),
+        "inline review comments",
+    ).await?;
     let non_actionable = fetch_non_actionable_review_comment_ids(&repo, &number).await?;
     for c in inline {
-        // The id is what a reply and a resolved-thread check address, so a
-        // comment without one cannot be kept or left out safely.
-        let id = c.get("id").and_then(|v| v.as_u64()).ok_or(
-            "an inline review comment has no numeric id, so the review cannot be read in full",
-        )?;
+        // A comment without a numeric id is still shown, and Apply refuses it.
+        // Its thread cannot be matched to the resolved set, so it is not
+        // treated as resolved.
+        let id = c.get("id").and_then(|v| v.as_u64());
         let body = c.get("body").and_then(|v| v.as_str())
             .ok_or("an inline review comment has no body")?
             .trim().to_string();
         if body.is_empty() { continue; }
-        if non_actionable.contains(&id) { continue; }
+        if id.is_some_and(|id| non_actionable.contains(&id)) { continue; }
         let author = c.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let author_association = c.get("author_association").and_then(|v| v.as_str()).map(String::from);
         let path = c.get("path").and_then(|v| v.as_str()).map(String::from);
@@ -2726,12 +2751,73 @@ async fn fetch_pr_review_data(
         let created_at = parse_gh_ts(c.get("created_at"));
         let updated_at = parse_gh_ts(c.get("updated_at")).or(created_at);
         comments.push(PrReviewComment {
-            id: Some(id), kind: PrCommentKind::Inline, author, author_association, body, path, line, url,
+            id, kind: PrCommentKind::Inline, author, author_association, body, path, line, url,
             created_at, updated_at,
         });
     }
+    withhold_unusable_comment_ids(&mut comments);
 
     Ok((head_oid, review_decision, comments))
+}
+
+/// Largest integer a JavaScript number holds exactly. The webview parses the
+/// plan as JSON numbers, so a larger id would reach it altered.
+const MAX_WEBVIEW_EXACT_ID: u64 = (1 << 53) - 1;
+
+/// The numeric ids of a REST list, keyed by GraphQL node id. An entry without
+/// either field is left out, so the comment it would name keeps no id.
+fn numeric_ids_by_node_id(items: &[serde_json::Value]) -> std::collections::HashMap<String, u64> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let node = item.get("node_id")?.as_str()?;
+            let id = item.get("id")?.as_u64()?;
+            Some((node.to_string(), id))
+        })
+        .collect()
+}
+
+/// Withholds the numeric id of every comment that cannot be trusted to name
+/// one resource. A number two comments of the plan share names neither: a
+/// review and an inline comment may carry the same number, and the plan keys
+/// its fixed-content record and its carried-forward lifecycle by number alone.
+/// So does a number the webview cannot hold exactly. A withheld comment stays
+/// listed, and Apply refuses to act on it.
+fn withhold_unusable_comment_ids(comments: &mut [PrReviewComment]) {
+    for c in comments.iter_mut() {
+        if c.id.is_some_and(|id| id > MAX_WEBVIEW_EXACT_ID) {
+            c.id = None;
+        }
+    }
+    let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for id in comments.iter().filter_map(|c| c.id) {
+        *counts.entry(id).or_default() += 1;
+    }
+    for c in comments.iter_mut() {
+        if c.id.is_some_and(|id| counts.get(&id).copied().unwrap_or(0) > 1) {
+            c.id = None;
+        }
+    }
+}
+
+/// Every page of a REST list, read in full. `gh api --paginate` prints one
+/// JSON array per page, back to back. A page that is not a complete JSON list
+/// is an error, and so is an answer with no page at all: an empty list is
+/// `[]`, a page of its own.
+async fn gh_api_list(endpoint: &str, what: &str) -> Result<Vec<serde_json::Value>, String> {
+    let raw = run_cmd_no_cwd("gh", &["api", "--paginate", endpoint])
+        .await
+        .map_err(|e| format!("{what} could not be fetched: {e}"))?;
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut pages_read = 0usize;
+    for page in serde_json::Deserializer::from_str(&raw).into_iter::<Vec<serde_json::Value>>() {
+        items.extend(page.map_err(|e| format!("{what} are not a complete JSON list: {e}"))?);
+        pages_read += 1;
+    }
+    if pages_read == 0 {
+        return Err(format!("{what} answer was empty"));
+    }
+    Ok(items)
 }
 
 /// `gh pr view` lists reviews and comments with `first: 100` and no more
@@ -2772,7 +2858,7 @@ fn pr_head_oid_from_json(json: &str) -> Result<String, String> {
 }
 
 /// GraphQL for the review threads of a PR, one page per `$endCursor`.
-const REVIEW_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { isResolved isOutdated comments(first: 100) { totalCount nodes { databaseId } } } } } } }";
+const REVIEW_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { isResolved isOutdated comments(first: 100) { totalCount nodes { fullDatabaseId } } } } } } }";
 
 /// The ids of the inline review comments in threads GitHub reports as
 /// resolved or outdated.
@@ -2830,7 +2916,10 @@ fn non_actionable_review_comment_ids(
                 return Err("a resolved or outdated review thread has more comments than were fetched".to_string());
             }
             for c in listed {
-                let id = c.get("databaseId").and_then(|v| v.as_u64())
+                // GraphQL sends the full database id as a string; `databaseId`
+                // is deprecated and is not used.
+                let id = c.get("fullDatabaseId").and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
                     .ok_or("a review thread comment has no database id")?;
                 ids.insert(id);
             }
@@ -3409,13 +3498,17 @@ fn build_reply_body(item: &PrReviewItem) -> String {
 /// reply so the caller can persist it on the item for future PATCH-edit.
 /// Returns `Ok(None)` only for the legacy `gh pr comment` fallback path where
 /// gh's CLI doesn't surface a JSON id.
+///
+/// `inline_comment_id` is only an inline comment's id (see
+/// [`PrReviewPlan::inline_reply_target`]). Any other comment is answered with
+/// a PR-level comment, never by number on the inline endpoint.
 async fn post_pr_reply(
     repo: &str,
     number: &str,
-    comment_id: Option<u64>,
+    inline_comment_id: Option<u64>,
     body: &str,
 ) -> Result<Option<u64>, String> {
-    if let Some(id) = comment_id {
+    if let Some(id) = inline_comment_id {
         let endpoint = format!("repos/{}/pulls/{}/comments/{}/replies", repo, number, id);
         let body_arg = format!("body={}", body);
         if let Ok(out) = run_cmd_no_cwd(
@@ -23289,7 +23382,7 @@ mod review_plan_provenance {
     fn thread(resolved: bool, outdated: bool, ids: &[u64]) -> serde_json::Value {
         let nodes: Vec<_> = ids
             .iter()
-            .map(|id| serde_json::json!({ "databaseId": id }))
+            .map(|id| serde_json::json!({ "fullDatabaseId": id.to_string() }))
             .collect();
         serde_json::json!({
             "isResolved": resolved,
@@ -23334,7 +23427,7 @@ mod review_plan_provenance {
         // A resolved thread whose comments were cut short cannot be trusted.
         let truncated = serde_json::json!({
             "isResolved": true, "isOutdated": false,
-            "comments": { "totalCount": 3, "nodes": [{ "databaseId": 1 }] },
+            "comments": { "totalCount": 3, "nodes": [{ "fullDatabaseId": "1" }] },
         });
         assert!(non_actionable_review_comment_ids(&page(vec![truncated])).is_err());
     }
@@ -23403,10 +23496,24 @@ mod review_plan_provenance {
         inline: &str,
         threads: &str,
     ) -> crate::test_helpers::FakeProgram {
+        fake_gh_reads_with(pr_view, "[]", "[]", inline, threads).await
+    }
+
+    /// The same reads, with the REST lists of reviews and conversation
+    /// comments (numeric ids) given as `reviews` and `conversation`. Each
+    /// endpoint is matched on the whole command line.
+    #[cfg(unix)]
+    async fn fake_gh_reads_with(
+        pr_view: &str,
+        reviews: &str,
+        conversation: &str,
+        inline: &str,
+        threads: &str,
+    ) -> crate::test_helpers::FakeProgram {
         crate::test_helpers::FakeProgram::install(
             "gh",
             &format!(
-                "case \"$1 $2\" in\n  \"pr view\") printf '%s' '{pr_view}' ;;\n  \"api graphql\") printf '%s' '{threads}' ;;\n  \"api --paginate\") printf '%s' '{inline}' ;;\n  *) exit 1 ;;\nesac"
+                "case \"$*\" in\n  \"pr view\"*) printf '%s' '{pr_view}' ;;\n  \"api graphql\"*) printf '%s' '{threads}' ;;\n  *\"/reviews?\"*) printf '%s' '{reviews}' ;;\n  *\"/issues/\"*\"/comments?\"*) printf '%s' '{conversation}' ;;\n  *\"/pulls/\"*\"/comments?\"*) printf '%s' '{inline}' ;;\n  *) exit 1 ;;\nesac"
             ),
         )
         .await
@@ -23432,7 +23539,7 @@ mod review_plan_provenance {
         serde_json::json!({ "data": { "repository": { "pullRequest": { "reviewThreads": {
             "pageInfo": { "hasNextPage": false, "endCursor": null },
             "nodes": [{ "isResolved": true, "isOutdated": false,
-                "comments": { "totalCount": 1, "nodes": [{ "databaseId": 12 }] } }],
+                "comments": { "totalCount": 1, "nodes": [{ "fullDatabaseId": "12" }] } }],
         } } } } })
         .to_string()
     }
@@ -23449,6 +23556,209 @@ mod review_plan_provenance {
         let inline_ids: Vec<_> = comments.iter().filter(|c| c.kind == PrCommentKind::Inline).map(|c| c.id).collect();
         assert_eq!(inline_ids, vec![Some(11)], "the resolved thread's comment is left out");
         assert!(comments.iter().any(|c| c.kind == PrCommentKind::Conversation), "conversation comments are kept");
+    }
+
+    fn identity_comment(id: Option<u64>, kind: PrCommentKind) -> PrReviewComment {
+        PrReviewComment {
+            id,
+            kind,
+            author: "rev".to_string(),
+            author_association: Some("MEMBER".to_string()),
+            body: format!("comment {id:?}"),
+            path: None,
+            line: None,
+            url: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn identity_fix(comment_id: Option<u64>) -> PrReviewItem {
+        PrReviewItem {
+            comment_id,
+            summary: "s".to_string(),
+            decision: PrReviewDecision::Fix,
+            reasoning: String::new(),
+            proposed_change: "change".to_string(),
+            approved: true,
+            user_note: String::new(),
+            fix_done: false,
+            fix_uncommitted: false,
+            fix_commit: None,
+            fix_effect: None,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
+        }
+    }
+
+    fn identity_plan(comments: Vec<PrReviewComment>, items: Vec<PrReviewItem>) -> PrReviewPlan {
+        PrReviewPlan {
+            generated_at: chrono::Utc::now(),
+            pr_url: PR_URL.to_string(),
+            review_decision: None,
+            comments,
+            items,
+            raw_plan: String::new(),
+            last_apply: None,
+            fixed_content: Vec::new(),
+            analyzed_head_oid: Some(ANALYZED.to_string()),
+            analyzed_at: Some(chrono::Utc::now()),
+        }
+    }
+
+    /// Regression: an approved Fix naming a comment with no numeric id was
+    /// accepted into an Apply plan, so Apply could run an agent for it.
+    #[test]
+    fn apply_refuses_an_approved_fix_whose_comment_has_no_numeric_id() {
+        let plan = identity_plan(
+            vec![identity_comment(None, PrCommentKind::Review)],
+            vec![identity_fix(None)],
+        );
+        let err = stored_plan_for_apply(Some(&plan), &plan).expect_err("no identity, no apply");
+        assert!(err.contains("Nothing was changed"), "{err}");
+    }
+
+    /// An id from one resource type never names a comment of another: a
+    /// review and an inline comment with the same number are both withheld,
+    /// so neither can be fixed or replied to by that number.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_review_and_an_inline_comment_sharing_a_number_are_not_conflated() {
+        let pr = pr_view_json(serde_json::json!({
+            "reviews": [{ "id": "PRR_1", "body": "overall", "state": "COMMENTED" }],
+        }));
+        let _gh = fake_gh_reads_with(
+            &pr,
+            r#"[{"id":11,"node_id":"PRR_1"}]"#,
+            "[]",
+            &format!("[{}]", inline_comment(11, "fix this")),
+            &open_threads(),
+        ).await;
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("review is read");
+        let review = comments.iter().find(|c| c.kind == PrCommentKind::Review).expect("review kept");
+        let inline = comments.iter().find(|c| c.kind == PrCommentKind::Inline).expect("inline kept");
+        assert_eq!((review.id, inline.id), (None, None), "a shared number names neither");
+        let plan = identity_plan(comments.clone(), vec![identity_fix(Some(11))]);
+        assert!(stored_plan_for_apply(Some(&plan), &plan).is_err());
+    }
+
+    /// Reviews and conversation comments get their numeric ids from the REST
+    /// lists, matched by node id, and keep their own resource type.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_gives_reviews_and_conversation_comments_their_numeric_ids() {
+        let pr = pr_view_json(serde_json::json!({
+            "reviews": [{ "id": "PRR_1", "body": "overall", "state": "COMMENTED" }],
+        }));
+        let _gh = fake_gh_reads_with(
+            &pr,
+            r#"[{"id":101,"node_id":"PRR_1"}]"#,
+            r#"[{"id":202,"node_id":"IC_1"}]"#,
+            &format!("[{}]", inline_comment(11, "fix this")),
+            &open_threads(),
+        ).await;
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("review is read");
+        let id_of = |kind: PrCommentKind| comments.iter().find(|c| c.kind == kind).and_then(|c| c.id);
+        assert_eq!(id_of(PrCommentKind::Review), Some(101));
+        assert_eq!(id_of(PrCommentKind::Conversation), Some(202));
+        assert_eq!(id_of(PrCommentKind::Inline), Some(11));
+    }
+
+    /// A review whose node id the REST list does not match, or whose REST
+    /// entry is malformed, is still listed for display, with no id.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_review_without_a_numeric_id_is_listed_but_keeps_none() {
+        let pr = pr_view_json(serde_json::json!({
+            "reviews": [{ "id": "PRR_9", "body": "unmatched", "state": "COMMENTED" }],
+        }));
+        let _gh = fake_gh_reads_with(&pr, r#"[{"node_id":"PRR_1"}]"#, "[]", "[]", &open_threads()).await;
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("display still works");
+        let review = comments.iter().find(|c| c.kind == PrCommentKind::Review).expect("review listed");
+        assert_eq!(review.id, None);
+        assert_eq!(review.body, "unmatched");
+    }
+
+    /// A reply to a review or conversation comment never goes to the inline
+    /// endpoint by number; only an inline comment gets an inline reply.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reply_uses_the_inline_endpoint_only_for_an_inline_comment() {
+        let _gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            "case \"$*\" in\n  *\"/replies\"*) printf '%s' '999' ;;\n  \"pr comment\"*) exit 0 ;;\n  *) exit 1 ;;\nesac",
+        )
+        .await;
+        let plan = identity_plan(
+            vec![
+                identity_comment(Some(11), PrCommentKind::Review),
+                identity_comment(Some(12), PrCommentKind::Inline),
+            ],
+            Vec::new(),
+        );
+        let review_target = plan.inline_reply_target(Some(11));
+        assert_eq!(review_target, None);
+        assert_eq!(post_pr_reply("o/r", "1", review_target, "thanks").await, Ok(None));
+        let inline_target = plan.inline_reply_target(Some(12));
+        assert_eq!(inline_target, Some(12));
+        assert_eq!(post_pr_reply("o/r", "1", inline_target, "thanks").await, Ok(Some(999)));
+    }
+
+    /// Re-analysis must not carry a fix or a reply from a comment of one
+    /// resource type onto a comment of another with the same number.
+    #[test]
+    fn carry_forward_does_not_cross_resource_types() {
+        let prior = identity_plan(
+            vec![identity_comment(Some(5), PrCommentKind::Review)],
+            vec![PrReviewItem { fix_done: true, reply_posted: true, ..identity_fix(Some(5)) }],
+        );
+        let comments = vec![identity_comment(Some(5), PrCommentKind::Inline)];
+        let mut items = vec![identity_fix(Some(5))];
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &comments);
+        assert!(!items[0].fix_done && !items[0].reply_posted, "{:?}", items[0]);
+    }
+
+    /// Every page of a REST list is read; a truncated page is an error, and an
+    /// empty list is valid.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rest_lists_read_every_page_and_fail_on_a_truncated_one() {
+        let _two = crate::test_helpers::FakeProgram::install(
+            "gh", "printf '%s' '[{\"id\":1}][{\"id\":2}]'",
+        ).await;
+        assert_eq!(gh_api_list("repos/o/r/pulls/1/reviews", "reviews").await.map(|v| v.len()), Ok(2));
+        drop(_two);
+
+        let _cut = crate::test_helpers::FakeProgram::install(
+            "gh", "printf '%s' '[{\"id\":1}][{\"id\":2'",
+        ).await;
+        assert!(gh_api_list("repos/o/r/pulls/1/reviews", "reviews").await.is_err());
+        drop(_cut);
+
+        let _empty = crate::test_helpers::FakeProgram::install("gh", "printf '%s' '[]'").await;
+        assert_eq!(gh_api_list("repos/o/r/pulls/1/reviews", "reviews").await, Ok(Vec::new()));
+    }
+
+    /// A plan saved before resource types were tracked keeps its inline ids
+    /// and its replies; its numeric ids always named inline comments.
+    #[test]
+    fn a_legacy_plan_still_loads_and_replies_to_its_inline_comments() {
+        let legacy = serde_json::json!({
+            "generated_at": "2026-01-01T00:00:00Z",
+            "pr_url": PR_URL,
+            "review_decision": null,
+            "comments": [{ "id": 11, "kind": "inline", "author": "rev", "body": "fix" }],
+            "items": [{
+                "comment_id": 11, "summary": "s", "decision": "fix",
+                "reasoning": "r", "proposed_change": "c", "approved": true,
+            }],
+            "raw_plan": "",
+        });
+        let plan: PrReviewPlan = serde_json::from_value(legacy).expect("legacy plan loads");
+        assert_eq!(plan.inline_reply_target(plan.items[0].comment_id), Some(11));
     }
 
     #[cfg(unix)]
@@ -23502,11 +23812,14 @@ mod review_plan_provenance {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn fetch_fails_on_an_inline_comment_without_an_id() {
+    async fn an_inline_comment_without_an_id_is_listed_with_none() {
         let mut no_id = inline_comment(0, "fix this");
         no_id.as_object_mut().unwrap().remove("id");
         let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), &format!("[{no_id}]"), &open_threads()).await;
-        assert!(fetch_pr_review_data(PR_URL).await.unwrap_err().contains("numeric id"));
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("display still works");
+        let inline: Vec<_> = comments.iter().filter(|c| c.kind == PrCommentKind::Inline).collect();
+        assert_eq!(inline.len(), 1, "the comment is not dropped");
+        assert_eq!(inline[0].id, None);
     }
 
     #[cfg(unix)]
