@@ -1,6 +1,6 @@
 # Logical hide for Projects
 
-**Status: Proposed. Not implemented. Not adopted. Decisions in section 12 remain open.**
+**Status: Proposed. Not implemented. Not adopted. Section 12 marks which decisions are settled for phase 1 and which remain open.**
 
 This document replaces the earlier version of this proposal, which described a true archive. It describes logical hide only. Permanent deletion and moved-folder recovery are deferred (section 9). No code, configuration, or test is changed by this document.
 
@@ -164,7 +164,18 @@ Hide would refuse before any write if any of the following holds. The check woul
 
 - `Backlog` Tasks with no checkout and no marker in item 6. These are inert: nothing promotes them (section 4, rows 4-5), and their admission refuses while hidden.
 - `Done` Tasks and `Error` Tasks that have no checkout and no marker in item 6.
-- `PrCreated` Tasks. The pull request is a GitHub-side object. SlashIt would stop refreshing its state until the Project is restored. **Recommendation (O6):** the hide confirmation would list the count of Tasks with open pull requests and say that their status will not update while the Project is hidden. It would not block.
+- `PrCreated` Tasks that have no `worktree_path` (item 5) and no marker in item 6. The pull request is a GitHub-side object. SlashIt would stop refreshing its state until the Project is restored. **Recommendation (O6):** the hide confirmation would list the count of Tasks with open pull requests and say that their status will not update while the Project is hidden. It would not block.
+
+A `PrCreated` Task that still holds a checkout is not in this list. Item 5 applies to it, so it blocks hide regardless of status. A `PrCreated` status alone does not make a Task safe to hide.
+
+**Checkout release (open requirement).** Hide does not release, detach, delete, or reclaim a Task Checkout to make hiding possible. Any of those would change or destroy Task state that the owner must keep. As a result, phase 1 may refuse hide for some Projects until their checkouts are handled by a separate, explicit mechanism. Defining that mechanism is a lifecycle requirement, not a shortcut. The implementation must establish, before offering hide for such a Project:
+
+- which existing or new release path, if any, is safe for a `PrCreated` Task;
+- that no delivery is in flight, no marker in item 6 is present, and no run is live;
+- what happens to the Task branch, the recovery refs, and the Task's Git state;
+- how the user starts the release, and that it is a deliberate action with its own tests and review.
+
+The hide refusal must name the Task and its checkout, and it must point to that resolution path. It must not suggest deleting the Task or the Project.
 
 **Idempotence.** Hiding an already hidden Project would succeed without a write.
 
@@ -365,8 +376,8 @@ Section 3.4 refuses hide when any Task is in an active or awaiting-decision stat
 
 1. **Documented downgrade procedure.** Before running an older build against the same configuration, restore every hidden Project. The procedure states that an older build reactivates hidden Projects silently and that its Tasks can then be queued by hand.
 2. **Configuration backup.** No backup mechanism exists in the code (verified only as far as the config write path, not exhaustively). The procedure recommends copying the config directory before any downgrade or manual edit. Hide itself adds no backup.
-3. **Startup notice in the new build.** The new build logs, and shows in the GUI, a notice listing each hidden Project it loaded. The notice changes no behavior. It is informational only and is not a guarantee against older builds.
-4. **Compatibility safeguard for phase 1: none beyond the notice.** A detection marker in a separate file, written at hide time, would let the new build warn when `hidden_at` disappeared after a downgrade. It would not block anything, and it would break the single-file invariant. Recommended for a later phase if evidence shows the procedure is not followed.
+3. **Startup notice (later, not required for phase 1).** A later build may list the hidden Projects it loaded, in a non-blocking and non-intrusive way. The notice would be informational only. It is not a guarantee against older builds, and phase 1 does not depend on it.
+4. **Compatibility safeguard for phase 1: none.** A detection marker in a separate file, written at hide time, would let the new build warn when `hidden_at` disappeared after a downgrade. It would not block anything, and it would break the single-file invariant. Recommended for a later phase if evidence shows the procedure is not followed.
 5. **No fail-closed claim.** The proposal does not claim that older builds enforce hiding. **Decision O1** accepts or rejects this policy.
 
 ## 9. Deferred, not part of this phase
@@ -443,15 +454,17 @@ All tests are PROPOSED. None exists today. "Fixture" names an existing test whos
 - **D6 Preserve credentials, restrict exposure.** Kept on disk and not returned for hidden Projects (section 7). The active-Project exposure is recorded.
 - **D7 No permanent deletion.** Not in phase 1 (section 9).
 
-### 12.2 Open decisions (each has a default)
+### 12.2 Phase-1 decisions
 
 Former items O3 and O5 are settled by D3 and D7 and are not listed here.
 
-- **O1. Downgrade policy.** Documented procedure plus startup notice (section 8.4). Default: accept.
-- **O2. Active-Project `api_key` exposure.** Leave unchanged in phase 1 and schedule as a separate security item (default), or include active-Project redaction in this phase. Section 7.
-- **O4. Workspace-delete consequence.** Accept that a hidden member blocks Workspace deletion until it is restored or detached (default). Section 10.
-- **O6. Open pull requests on hide.** Warn in the hide confirmation and do not block (default). Section 3.4.
-- **O7. Add with a hidden Project's folder.** Refuse and point to restore (default). Section 3.6.
+The owner has settled O1, O6 and O7 for phase 1 at the defaults shown below. O2 and O4 remain open; each default applies until the owner decides otherwise.
+
+- **O1. Downgrade policy. Settled: accept.** A documented procedure, with the limitation in section 8. Section 8.4.
+- **O2. Active-Project `api_key` exposure. Open.** Leave unchanged in phase 1 and schedule as a separate security item (default), or include active-Project redaction in this phase. Section 7.
+- **O4. Workspace-delete consequence. Open.** Accept that a hidden member blocks Workspace deletion until it is restored or detached (default). Section 10.
+- **O6. Open pull requests on hide. Settled: warn and do not block.** Section 3.4.
+- **O7. Add with a hidden Project's folder. Settled: refuse and point to restore.** Section 3.6.
 
 ### 12.3 Recommendations that are technical defaults (not decisions)
 
@@ -474,7 +487,7 @@ The lock order and the write path are resolved from the code (sections 2 and 5).
 - The Conversation Coordinator path that approves a `CreateTask` action: whether it reaches `create_checked` or another creation function. Row 1 covers the conversation entry points, and the implementation must search for every caller of `lifecycle::create*`.
 - Whether any reader outside the listed boundaries reads `projects` to decide activity. Rows 24 to 28 came from the search described in section 4.3. The implementation must repeat that search and confirm the unclassified callers: `repository_paths_by_project` (`app_core.rs:752`) and the call chain for `project_facts` (`conversation.rs:709`).
 - Whether any path holds Task state and then waits for the `projects` lock, or the reverse (for example `executor.rs:2872` and the `try_read` at `executor.rs:4742`). The lock-order rule in section 5.1 assumes none does.
-- Whether `Project` serializes `api_key` in every path (`skip_serializing` was not checked).
+- Resolved: `AgentConfig` serializes `api_key`. It has no skip attribute (`src-tauri/src/domain/project.rs:138-144`), so the configured key is returned by the active-Project commands. Section 7 records the consequence.
 - The body of `projects_referencing` was not read; only its call site in `delete_workspace` (`workspace.rs:104-105`) was.
 - The downgrade behavior of older builds was verified by the absence of `deny_unknown_fields` and `flatten`. It was not run against a real older binary.
 - Desktop behavior of the Removed Projects view and the copy has not been checked. No GUI check has been made.
