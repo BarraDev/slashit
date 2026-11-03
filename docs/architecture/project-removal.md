@@ -16,7 +16,7 @@ Vocabulary follows `docs/architecture/product-model.md`. Storage locations follo
 
 **VERIFIED CURRENT.** The only way to remove a Project from the sidebar is `delete_project` (`src-tauri/src/commands/project.rs:173-238`). After refusing on live work, it removes the Project from `config.toml`, deletes the Project's Task board file and primary Conversation (`delete_project_committed`, `project.rs:283`). Tasks, Activity, and Human Review records live in the board file, so they are erased with it. No reversible option exists.
 
-**Goal (agreed direction).** Remove a Project from the active SlashIt workspace without deleting the Project, its repository, files, Tasks, Conversations, history, configuration, or identity, and allow it to be restored later. This is not permanent deletion and not an archive-management framework.
+**Goal (proposed direction).** Remove a Project from the active SlashIt workspace without deleting the Project, its repository, files, Tasks, Conversations, history, configuration, or identity, and allow it to be restored later. This is not permanent deletion and not an archive-management framework.
 
 **PROPOSED.** Add a reversible state, logical hide. The Project record, its UUID, its repository association, its Task history, its Conversation, its review records, its configuration, and its Workspace membership would all stay in place. A hidden Project would be inactive: ineligible for new work and absent from ordinary navigation. Enforcement would be backend admission checks (section 4), not frontend filtering.
 
@@ -33,7 +33,7 @@ Each item is VERIFIED CURRENT on main after PR #299 was merged, unless marked ot
 - `Repository` has `id`, `local_path`, `remote_url: Option<String>`, `remote_type`, `created_at` (`src-tauri/src/domain/repository.rs:6-12`).
 - `update_config` reads the file strictly, runs a mutation, and writes (`storage.rs:929-940`). `write_config` serializes the whole `AppConfig` (`storage.rs:1001-1005`) and replaces the file atomically with `Permissions::OwnerOnly` (`storage.rs:1356-1361`, permission argument at line 1360).
 - `try_persist_projects` rebuilds the entire `projects` table from the in-memory map it is given, through `update_config` (`src-tauri/src/commands/project.rs:33-48`). **The in-memory map is authoritative for the whole table whenever a Project writer persists.**
-- Every Project writer clones the map under the in-memory `projects` write lock, persists the clone, and adopts it on success or durable-unconfirmed success. Verified for create (`commands/project.rs:139-151`, lock at 141), update (`project.rs:717-750`, lock and clone at 720-721, adoption at 743), and workspace attach (`project.rs:783-812`, lock at 790, clone at 795, persist at 808). `adopt_published` is the adoption helper.
+- Every Project writer clones the map under the in-memory `projects` write lock, persists the clone, and adopts it on success or durable-unconfirmed success. Verified for create (`commands/project.rs:139-151`, lock at 141), update (`project.rs:717-750`, lock and clone at 720-721, adoption at 743), workspace attach (`project.rs:783-812`, lock at 790, clone at 795, persist at 808), and workspace detach (`project.rs:814-850`, lock at 831, persist at 844). `adopt_published` is the adoption helper.
 - `ProjectScope` is `Standalone` or `InWorkspace { workspace_id }` (`domain/project.rs:14-18`).
 
 ### 2.2 Routes, board location, and StateLocation
@@ -76,9 +76,9 @@ Each item is VERIFIED CURRENT on main after PR #299 was merged, unless marked ot
 
 - `TaskStatus` is `Backlog`, `Queue`, `InProgress`, `AiReview`, `HumanReview`, `Done`, `PrCreated`, `Error` (`src-tauri/src/domain/task.rs:1902-1911`).
 - **Durable markers of unfinished work on a Task** (VERIFIED CURRENT):
-  - `local_integration` pending (`domain/task.rs:836`, `lifecycle.rs:1363`).
+  - `local_integration` pending (`domain/task.rs:836`, `lifecycle.rs:1364`).
   - `pending_republish` present (`domain/task.rs:870`; `PendingRepublish` at `task.rs:1315`).
-  - `cleanup_in_flight` (`lifecycle.rs:1375`).
+  - `cleanup_in_flight` (`lifecycle.rs:1379`).
   - `worktree_path` present (`lifecycle.rs:1385`).
   - `new_attempt` present (`domain/task.rs:760`, `settled_checkout_refusal`).
   - `worker_handoff` stage `Started`, `CommittedAwaitingReview`, or `RecoveryRequired`, or `ResolvedToAiReview` that was not superseded (`domain/task.rs:760-790`).
@@ -138,7 +138,7 @@ Two conditions make this hold, and both are part of the design:
 | Repository record | `config.toml` `repositories` | Unchanged | PROPOSED |
 | Tasks, Activity, Human Review decisions, delivery facts | Routed board file (`paths.rs:438-450`) | Bytes unchanged | PROPOSED |
 | Primary Conversation | `primary_conversation_file` (`paths.rs:377`) | Bytes unchanged | PROPOSED |
-| Task Checkouts | `worktrees_root` (`paths.rs:464-470`) | Unchanged; hide refuses if any exists | PROPOSED |
+| Task Checkouts | `worktrees_root` (`paths.rs:464-470`) | Unchanged; hide refuses if any Task records one. Directories no Task records are not checked | PROPOSED |
 | Task branches and Git recovery refs | The repository | Unchanged | PROPOSED |
 | Workspace membership | `Project.scope` | Unchanged | PROPOSED |
 | `api_key` | `config.toml` | Kept on disk; never returned for a hidden Project (section 7) | PROPOSED |
@@ -204,7 +204,7 @@ Other rules:
 
 The Add flow calls `create_repository` first (`src/components/create_project_modal.rs:230`), then `create_project`. `create_repository_core` (`src-tauri/src/commands/repository.rs:149-170`) mints a new Repository id and performs no path comparison, so a re-added folder receives a new id and an id-based check cannot match. Today no duplicate-path refusal exists.
 
-Under this proposal, `create_repository` would compare the canonicalized `local_path` against the `local_path` of every Repository referenced by a **hidden** Project, before any record is written. A match would be refused with "This folder belongs to the hidden Project `{name}`. Restore that Project instead." A folder used only by visible Projects keeps today's behavior, because shared Repository records are already allowed. This refusal is the add-flow form of D4. It is recommended as **O7**; the wording and the choice between restoring and adding remain open.
+Under this proposal, `create_repository` would compare the canonicalized `local_path` against the `local_path` of every Repository referenced by a **hidden** Project, before any record is written. A match would be refused with "This folder belongs to the hidden Project `{name}`. Restore that Project instead." A folder used only by visible Projects keeps today's behavior, because shared Repository records are already allowed. This refusal is the add-flow form of D4. O7 is settled as refuse and point to restore (section 12.2). The exact wording remains open.
 
 ### 3.7 Backlog and inert Tasks (PROPOSED)
 
@@ -291,7 +291,7 @@ Deletion needs a multi-step protocol because it removes files in several places:
 
 - **Task creation.** A creation waiting on the gate (`lifecycle.rs:613`) finishes before hide takes the gate in write mode. If it created a Backlog Task, that Task has no checkout and hide can proceed; the hidden Project then holds that Backlog Task. Any creation after hide is refused by row 2.
 - **Lease waiters.** A start that is waiting on a lease re-checks the predicate after it acquires the lease (row 7). Hide holds every lease, so a waiter sees the `hidden_at` that hide adopted before it released them.
-- **Concurrent Project writers (lost update).** `try_persist_projects` writes the whole table from an in-memory clone. If `update_project`, `create_project`, or attach cloned the map before hide adopted `hidden_at` and then persisted, their write would revert the hide on disk. This is prevented because every writer takes the same `projects` write lock across clone, persist, and adopt (step 5 of section 5.1). The implementation test T26 must cover it.
+- **Concurrent Project writers (lost update).** `try_persist_projects` writes the whole table from an in-memory clone. If `update_project`, `create_project`, attach, or detach cloned the map before hide adopted `hidden_at` and then persisted, their write would revert the hide on disk. This is prevented because every writer takes the same `projects` write lock across clone, persist, and adopt (step 5 of section 5.1). The implementation test T26 must cover it.
 - **Concurrent hide and restore.** Both take the same gate and lease sequence, so two operations on one Project serialize.
 
 ### 5.4 Crash and failure (PROPOSED)
@@ -378,8 +378,8 @@ Section 3.4 refuses hide when any Task is in an active or awaiting-decision stat
 2. **Configuration backup.** No backup mechanism exists in the code (verified only as far as the config write path, not exhaustively). The procedure recommends copying the config directory before any downgrade or manual edit. Hide itself adds no backup.
 3. **Startup notice (later, not required for phase 1).** A later build may list the hidden Projects it loaded, in a non-blocking and non-intrusive way. The notice would be informational only. It is not a guarantee against older builds, and phase 1 does not depend on it.
 4. **Compatibility safeguard for phase 1: none.** A detection marker in a separate file, written at hide time, would let the new build warn when `hidden_at` disappeared after a downgrade. It would not block anything, and it would break the single-file invariant. Recommended for a later phase if evidence shows the procedure is not followed.
-5. **Downgrade is unsupported while a hidden Project cannot be restored.** Item 1 cannot be completed for a Project whose folder is missing or moved (section 3.5), and the new build refuses that restore. Until moved-folder recovery exists, the owner must choose between refusing the downgrade and a documented manual unhide after copying the configuration directory. This choice is decision O9.
-6. **No fail-closed claim.** The proposal does not claim that older builds enforce hiding. **Decision O1** accepts or rejects this policy.
+5. **Downgrade is unsupported while a hidden Project cannot be restored.** Item 1 cannot be completed for a Project whose folder is missing or moved (section 3.5), and the new build refuses that restore. The downgrade is refused until the Project is restorable through the expected folder or an explicit assisted recovery process. Silent reactivation or duplication is not permitted. Decision O9 records the alternative of a documented manual unhide.
+6. **No fail-closed claim.** The proposal does not claim that older builds enforce hiding. The owner's settlement of **Decision O1** (section 12.2) covers this policy.
 
 ## 9. Deferred, not part of this phase
 
@@ -433,7 +433,7 @@ All tests are PROPOSED. None exists today. "Fixture" names an existing test whos
 | T23 | Hide never calls `delete_project`'s path (no pending deletion record is created) | Record directory empty | New |
 | T24 | A config without `hidden_at` loads and round-trips unchanged | Equality | New |
 | T25 | An older-build downgrade is documented, not automated | Manual check only | None |
-| T26 | A concurrent `update_project`, `create_project`, or attach that started before hide cannot revert `hidden_at` on disk (section 5.3) | Disk shows hidden after both complete | New |
+| T26 | A concurrent `update_project`, `create_project`, attach, or detach that started before hide cannot revert `hidden_at` on disk (section 5.3) | Disk shows hidden after both complete | New |
 | T27 | A repository-less Project hides, restores without a path check, and keeps its UUID | Round trip; no Repository created | New |
 | T28 | Adding a folder whose canonical path a hidden Project's Repository uses is refused before any record is written, and the message names the hidden Project (section 3.6) | Refusal; no new Repository or Project | New |
 | T29 | A hidden Project's Backlog Task without a checkout survives hide and restore unchanged, and is not promoted while hidden (sections 3.7, row 5) | Bytes equal; status Backlog | New |
@@ -467,7 +467,7 @@ The owner has settled O1, O6 and O7 for phase 1 at the defaults shown below. O2 
 - **O6. Open pull requests on hide. Settled: warn and do not block.** Section 3.4.
 - **O7. Add with a hidden Project's folder. Settled: refuse and point to restore.** Section 3.6.
 - **O8. Power loss after an unconfirmed hide. Open.** Accept the documented limitation that a reverted hide is not announced at startup (default), or add a persisted marker, which requires a second file and an exception to the single-file invariant (section 5.5, T14). Section 5.5.
-- **O9. Downgrade while a hidden Project is unrestorable. Open.** Refuse the downgrade until the Project is restorable (default), or allow a documented manual unhide after copying the configuration directory. Section 8.4, item 5.
+- **O9. Downgrade while a hidden Project is unrestorable. Open.** Refuse the downgrade until the Project is restorable (default). Restore requires the expected folder or an explicit assisted recovery process. A documented manual unhide after copying the configuration directory is the alternative. No silent reactivation or duplication. Section 8.4, item 5.
 
 ### 12.3 Recommendations that are technical defaults (not decisions)
 
@@ -479,7 +479,7 @@ The owner has settled O1, O6 and O7 for phase 1 at the defaults shown below. O2 
 
 ### 12.4 Settled by the source, not listed as choices
 
-The lock order and the write path are resolved from the code (sections 2 and 5). The boundary list and the restore identity check remain open (section 13).
+The write path for the Project writers listed in section 2.1 is resolved from the code. The complete lock-order inventory and the boundary list remain open (section 13).
 
 ## 13. Unknowns and checks left for implementation
 
@@ -491,7 +491,6 @@ The lock order and the write path are resolved from the code (sections 2 and 5).
 - Whether any reader outside the listed boundaries reads `projects` to decide activity. Rows 24 to 28 came from the search described in section 4.3. The implementation must repeat that search and confirm the unclassified callers: `repository_paths_by_project` (`app_core.rs:752`) and the call chain for `project_facts` (`conversation.rs:709`).
 - Whether any path holds Task state and then waits for the `projects` lock, or the reverse (for example `executor.rs:2872` and the `try_read` at `executor.rs:4742`). The lock-order rule in section 5.1 assumes none does.
 - Resolved: `AgentConfig` serializes `api_key`. It has no skip attribute (`src-tauri/src/domain/project.rs:138-144`), so the configured key is returned by the active-Project commands. Section 7 records the consequence.
-- The body of `projects_referencing` was not read; only its call site in `delete_workspace` (`workspace.rs:104-105`) was.
 - The downgrade behavior of older builds was verified by the absence of `deny_unknown_fields` and `flatten`. It was not run against a real older binary.
 - Desktop behavior of the Removed Projects view and the copy has not been checked. No GUI check has been made.
 
