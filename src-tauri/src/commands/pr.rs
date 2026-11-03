@@ -2583,22 +2583,48 @@ pub async fn sync_pr_review_replies_inner(
         // Case A: no reply on GitHub yet — POST a new one.
         if !item.reply_posted {
             let target = updated_plan.inline_reply_target(item.comment_id);
-            // A PR-level comment has no thread, so it names the comment it
-            // answers. The stored text stays the bare reply.
             let posted = match target {
-                Some(_) => body.clone(),
+                // A valid inline comment is answered only in its own thread.
+                // Look for a reply first: an earlier POST may have succeeded
+                // with its response lost, and a second one would duplicate it.
+                Some(original_id) => {
+                    match discover_reply_comment_id(&repo, &number, original_id).await {
+                        Ok(Some(found_id)) => {
+                            discovered += 1;
+                            let it = &mut updated_plan.items[orig_idx];
+                            it.reply_posted = true;
+                            it.reply_comment_id = Some(found_id);
+                            it.pr_reply_text = Some(body);
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            errors.push(format!("comment {} (discover): {}", label, e));
+                            continue;
+                        }
+                    }
+                    post_inline_reply_only(&repo, &number, original_id, &body).await
+                }
+                // A PR-level comment has no thread, so it names the comment it
+                // answers, which must be exactly one. The stored text stays
+                // the bare reply.
                 None => {
-                    let original = item.comment_id
-                        .and_then(|id| updated_plan.comment_for(id))
-                        .map(|c| match c.url.as_deref() {
-                            Some(url) => format!("Re {url}"),
-                            None => format!("Re the comment by @{}", c.author),
-                        })
-                        .unwrap_or_default();
-                    format!("{original}\n\n{body}")
+                    let original = item.comment_id.and_then(|id| updated_plan.comment_for(id));
+                    let Some(original) = original else {
+                        errors.push(format!(
+                            "comment {label}: the plan does not identify the comment this \
+                             reply answers, so nothing was posted. Re-analyze the PR comments."
+                        ));
+                        continue;
+                    };
+                    let named = match original.url.as_deref() {
+                        Some(url) => format!("Re {url}"),
+                        None => format!("Re the comment by @{}", original.author),
+                    };
+                    post_pr_reply(&repo, &number, None, &format!("{named}\n\n{body}")).await
                 }
             };
-            match post_pr_reply(&repo, &number, target, &posted).await {
+            match posted {
                 Ok(reply_id) => {
                     replied += 1;
                     updated_plan.items[orig_idx].reply_posted = true;
@@ -3615,6 +3641,26 @@ async fn post_pr_reply(
     run_cmd_no_cwd("gh", &["pr", "comment", number, "--repo", repo, "--body", body])
         .await
         .map(|_| None)
+}
+
+/// Answers an inline review comment in its own thread and nowhere else:
+/// unlike [`post_pr_reply`] there is no PR-level fallback, because a bare
+/// comment would name nothing and the thread would never be retried.
+async fn post_inline_reply_only(
+    repo: &str,
+    number: &str,
+    comment_id: u64,
+    body: &str,
+) -> Result<Option<u64>, String> {
+    let endpoint = format!("repos/{}/pulls/{}/comments/{}/replies", repo, number, comment_id);
+    let body_arg = format!("body={}", body);
+    run_cmd_no_cwd(
+        "gh",
+        &["api", "-X", "POST", &endpoint, "-f", &body_arg, "--jq", ".id"],
+    )
+    .await
+    .map(|out| out.trim().parse::<u64>().ok())
+    .map_err(|e| format!("threaded reply failed: {e}"))
 }
 
 /// Walks the PR's inline review comments and returns the id of the reply
@@ -18268,7 +18314,7 @@ mod tests {
                     let gh = bin_dir.join("gh");
                     write_executable(
                         &gh,
-                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}]' ;;\n  *) echo 4242 ;;\nesac\n",
+                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}]' ;;\n  *'--paginate'*) echo '[]' ;;\n  *) echo 4242 ;;\nesac\n",
                     );
                     let saved_path = std::env::var("PATH").ok();
                     let new_path = match &saved_path {
@@ -18295,7 +18341,7 @@ mod tests {
                 /// could do in production.
                 fn set_pr_list_url(&self, url: &str) {
                     let script = format!(
-                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"{url}\",\"isCrossRepository\":false}}]' ;;\n  *) echo 4242 ;;\nesac\n"
+                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"{url}\",\"isCrossRepository\":false}}]' ;;\n  *'--paginate'*) echo '[]' ;;\n  *) echo 4242 ;;\nesac\n"
                     );
                     write_executable(&self.gh, &script);
                 }
@@ -19178,6 +19224,161 @@ mod tests {
                 assert_eq!((synced.replied, synced.fix_pending), (0, 0), "no duplicate reply: {synced:?}");
             }
 
+            /// A fake `gh` for Sync's reply path that logs every call to
+            /// `log`. `post` is the shell run for a threaded POST, `existing`
+            /// the JSON answered to the list of inline comments.
+            fn sync_gh(claude: &EditingClaude, log: &Path, post: &str, existing: &str) {
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'-X POST'*) {post} ;;\n  *'pr comment'*) echo done ;;\n  *'--paginate'*) printf '%s' '{existing}' ;;\n  *) echo 4242 ;;\nesac\n"
+                );
+                write_executable(&claude.gh, &script);
+            }
+
+            /// A delivered fix whose reply has not been posted yet, and the
+            /// Sync entry point for it.
+            async fn delivered_unanswered_fix(
+                state: &crate::AppState,
+                repo: &RepoFixture,
+                worktree: &Path,
+                tmp: &Path,
+            ) -> (Task, PrReviewPlan) {
+                let (task, plan) = task_with_one_fix(state, repo, worktree).await;
+                let (first, mut plan) = apply(&task, plan, worktree, tmp.join("no-such-jj"), false).await;
+                assert!(first.pushed && first.replies_posted == 0, "{first:?}");
+                plan.backfill_lifecycle_from_last_apply();
+                (task, plan)
+            }
+
+            async fn sync_plan(
+                task: &Task,
+                worktree: &Path,
+                plan: PrReviewPlan,
+            ) -> Result<(SyncPrRepliesResult, PrReviewPlan), String> {
+                sync_pr_review_replies_inner(task.clone(), worktree.to_str().unwrap().to_string(), plan).await
+            }
+
+            fn call_count(log: &Path, needle: &str) -> usize {
+                std::fs::read_to_string(log).unwrap_or_default().lines().filter(|l| l.contains(needle)).count()
+            }
+
+            /// Sync answers an inline comment once, in its own thread.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_answers_an_inline_comment_only_in_its_thread() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "echo 777", "[]");
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 1);
+                assert_eq!(call_count(&log, "pr comment"), 0);
+                assert!(plan.items[0].reply_posted && plan.items[0].reply_comment_id == Some(777), "{:?}", plan.items[0]);
+            }
+
+            /// A failed threaded POST posts nothing else and is retried.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_threaded_reply_is_not_replaced_and_is_retried() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "exit 1", "[]");
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 0, "{synced:?}");
+                assert!(!synced.errors.is_empty(), "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 1);
+                assert_eq!(call_count(&log, "pr comment"), 0, "no unnamed PR-level fallback");
+                assert!(!plan.items[0].reply_posted && plan.items[0].pr_reply_text.is_none(), "{:?}", plan.items[0]);
+
+                // The endpoint works again: one threaded reply, no PR comment.
+                std::fs::remove_file(&log).unwrap();
+                sync_gh(&claude, &log, "echo 778", "[]");
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 1);
+                assert_eq!(call_count(&log, "pr comment"), 0);
+                assert!(plan.items[0].reply_posted, "{:?}", plan.items[0]);
+            }
+
+            /// An earlier POST whose response was lost is found, not repeated.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_reply_already_on_github_is_adopted_not_posted_again() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "echo 1", r#"[{"id":901,"in_reply_to_id":1,"created_at":"2026-01-01T00:00:00Z"}]"#);
+
+                let (_synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(call_count(&log, "-X POST"), 0);
+                assert_eq!(call_count(&log, "pr comment"), 0);
+                assert!(plan.items[0].reply_posted && plan.items[0].reply_comment_id == Some(901), "{:?}", plan.items[0]);
+            }
+
+            /// A uniquely identified non-inline comment gets one PR-level
+            /// comment that begins with its URL.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_non_inline_comment_gets_a_named_pr_level_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, mut plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                plan.comments[0].kind = PrCommentKind::Conversation;
+                plan.comments[0].url = Some("https://github.com/testorg/testrepo/pull/405#issuecomment-1".to_string());
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "echo 1", "[]");
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 0);
+                assert_eq!(call_count(&log, "pr comment"), 1);
+                assert!(
+                    call_count(&log, "--body Re https://github.com/testorg/testrepo/pull/405#issuecomment-1") == 1,
+                    "{}", std::fs::read_to_string(&log).unwrap()
+                );
+                assert!(plan.items[0].reply_posted, "{:?}", plan.items[0]);
+            }
+
+            /// A missing or duplicated original identity, like any failed
+            /// preflight, makes no public call and changes nothing.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_missing_or_ambiguous_identity_makes_no_public_call() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "echo 1", "[]");
+
+                let mut missing = plan.clone();
+                missing.comments.clear();
+                let mut duplicate = plan.clone();
+                duplicate.comments.push(duplicate.comments[0].clone());
+                for broken in [missing, duplicate] {
+                    let before = broken.items[0].clone();
+                    let err = sync_plan(&task, &worktree, broken).await.expect_err("preflight refuses");
+                    assert!(err.contains("Nothing was posted"), "{err}");
+                    assert!(!before.reply_posted);
+                }
+                assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "", "no gh call at all");
+            }
+
             /// #96 case 1, a plan persisted by a build that cleared
             /// `fix_uncommitted` as soon as the commit succeeded: the fix is
             /// committed locally, the push failed, no reply was posted.
@@ -19298,19 +19499,19 @@ mod tests {
                 edit(&mut plan);
                 let log = repo.checkout.parent().unwrap().join("gh-calls.log");
                 let script = format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *) echo 4242 ;;\nesac\n"
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'--paginate'*) echo '[]' ;;\n  *) echo 4242 ;;\nesac\n"
                 );
                 write_executable(&claude.gh, &script);
                 (task, plan, worktree, log)
             }
 
-            /// Every logged `gh` call except the read of the task branch's own
-            /// pull request.
+            /// Every logged `gh` call except the reads: the task branch's own pull
+            /// request and the list of inline comments.
             fn gh_writes(log: &Path) -> Vec<String> {
                 std::fs::read_to_string(log)
                     .unwrap_or_default()
                     .lines()
-                    .filter(|l| !l.starts_with("pr list"))
+                    .filter(|l| !l.starts_with("pr list") && !l.starts_with("api --paginate"))
                     .map(str::to_string)
                     .collect()
             }
