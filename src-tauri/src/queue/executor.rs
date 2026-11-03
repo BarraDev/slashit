@@ -1947,6 +1947,18 @@ impl RunEventForwarder {
                 )
                 .await;
             }
+            CodingRunEvent::SystemNotice { subtype, summary } => {
+                // Not a session start and never a model claim — it only stays
+                // visible: the subtype and the runner's bounded summary, with
+                // no provider payload beside them, in the run's output.
+                record_output(
+                    &self.logs,
+                    self.execution_id,
+                    LogLevel::Info,
+                    format!("Provider system event: {subtype} — {summary}"),
+                )
+                .await;
+            }
             CodingRunEvent::Error { message } => {
                 record_output(
                     &self.logs,
@@ -9868,14 +9880,21 @@ mod tests {
         let (executor, _temps) = test_executor();
         let (task_id, project_id) = seed_configured_task(&executor, "default").await;
 
-        report_model(&executor, task_id, 1, Some("claude-sonnet-5-5")).await;
-        forwarder(&executor, task_id, 1)
-            .handle(CodingRunEvent::SystemInit {
-                session_id: "session".into(),
-                model: None,
-                message: None,
-            })
-            .await;
+        // Both reports go through one execution. A `forwarder()` call opens a
+        // log of its own keyed by its execution id, and the map below is read
+        // back flattened across those keys, so a second call would make the
+        // order of the entries the map's — not the run's. One shared forwarder
+        // keeps a single ordered sequence.
+        let forwarder = forwarder(&executor, task_id, 1);
+        for model in [Some("claude-sonnet-5-5"), None] {
+            forwarder
+                .handle(CodingRunEvent::SystemInit {
+                    session_id: "session".into(),
+                    model: model.map(str::to_string),
+                    message: None,
+                })
+                .await;
+        }
 
         let persisted = persisted_task(&executor, project_id, task_id);
         assert_eq!(persisted.model, "default");
@@ -9900,6 +9919,39 @@ mod tests {
             started.iter().all(|m| !m.contains("model: unknown")),
             "no session start reports an unknown model"
         );
+    }
+
+    /// A non-init system event stays visible without being a session start:
+    /// the run's output records the subtype and the runner's bounded summary,
+    /// and no session start, model note or payload appears (#220).
+    #[tokio::test]
+    async fn a_non_init_system_event_is_visible_but_is_not_a_session_start() {
+        let (executor, _temps) = test_executor();
+        let (task_id, project_id) = seed_configured_task(&executor, "default").await;
+
+        forwarder(&executor, task_id, 1)
+            .handle(CodingRunEvent::SystemNotice {
+                subtype: "api_retry".into(),
+                summary: "the provider is retrying an API call".into(),
+            })
+            .await;
+
+        let logs = executor.logs.read().await;
+        let messages: Vec<&str> =
+            logs.values().flatten().map(|entry| entry.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec!["Provider system event: api_retry — the provider is retrying an API call"],
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().all(|m| !m.contains("Session started")),
+            "a notice is never a session start: {messages:?}"
+        );
+
+        let persisted = persisted_task(&executor, project_id, task_id);
+        assert_eq!(persisted.model, "default");
+        assert_eq!(persisted.last_observed_model, None, "a notice claims no model");
     }
 
     /// The approval names the configured policy. An observed model does not
@@ -22153,8 +22205,8 @@ VERDICT: APPROVED"
                 "claude",
                 "cat >/dev/null; \
                  printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"model\":\"observed-model\",\"permissionMode\":\"auto\"}'; \
-                 printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"hook_started\",\"session_id\":\"s-worker\"}'; \
-                 printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"status_notice\",\"session_id\":\"s-worker\"}'; \
+                 printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"api_retry\",\"session_id\":\"s-worker\"}'; \
+                 printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"informational\",\"session_id\":\"s-worker\"}'; \
                  printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'",
             )
             .await;

@@ -1790,6 +1790,23 @@ impl ClaudeRunner {
     }
 }
 
+/// How long a provider system event's subtype name may be in a notice: a
+/// diagnostic label, so at most a label is repeated — never a payload.
+const SYSTEM_SUBTYPE_LIMIT: usize = 48;
+
+/// The bounded line a non-init system subtype reads as. Fixed per subtype, so
+/// nothing the provider placed beside its name is echoed.
+fn system_notice_summary(subtype: &str) -> String {
+    match subtype {
+        "api_retry" => "the provider is retrying an API call",
+        "compact_boundary" => "the provider compacted the conversation",
+        "informational" => "an informational notice from the provider",
+        "notification" => "a notification from the provider",
+        _ => "a provider system event",
+    }
+    .to_string()
+}
+
 /// Parse a JSON line from Claude CLI stream-json output into a CodingRunEvent.
 async fn parse_claude_event(
     json: &serde_json::Value,
@@ -1805,14 +1822,21 @@ async fn parse_claude_event(
                 *session_id.lock().await = Some(s.clone());
             }
             // Only the `init` subtype initializes the provider session. Any
-            // other system subtype (a hook notice, a status report, ...) is
-            // not a session start: it carries no `model` field, so if it were
-            // presented as initialization its log entry would claim
-            // `model: unknown` again for a session that already reported its
-            // model. The session id above is still taken from it, so identity
-            // is kept whatever the subtype; the event is just not one.
+            // other system subtype — a retry notice, a status report — carries
+            // no `model` field, so presenting it as an initialization is what
+            // repeated "Session started ... (model: unknown)" for a session
+            // whose model had already been announced. The session id above is
+            // still taken from it, whatever the subtype, so identity is kept.
             if subtype != "init" {
-                return None;
+                // Not silence, though: the notice stays observable on the
+                // stream (#220). Only the subtype shapes what the executor
+                // later logs — cut to a bounded line, and with no payload
+                // field echoed, so nothing the provider wrote beside it is
+                // repeated.
+                return Some(CodingRunEvent::SystemNotice {
+                    subtype: truncate_one_line(subtype, SYSTEM_SUBTYPE_LIMIT),
+                    summary: system_notice_summary(subtype),
+                });
             }
             let model = json.get("model").and_then(|s| s.as_str()).map(|s| s.to_string());
             Some(CodingRunEvent::SystemInit {
@@ -1889,19 +1913,21 @@ mod system_event_tests {
     /// One provider session, one session start (#220): the stream-json of a
     /// real session is the `init` event followed by, between turns, other
     /// `system` subtypes that carry no model. Only the `init` is a session
-    /// initialization; the rest produce no event at all, so a repeated
+    /// initialization; the rest come through as notices, so a repeated
     /// "Session started" line with `model: unknown` cannot arise from them.
     #[tokio::test]
     async fn only_the_init_subtype_of_a_system_event_initializes_the_session() {
+        let session = "34f3456e-76c8-4343-84ec-ecf8f4b79592";
         let stream = vec![
             serde_json::json!({
                 "type": "system", "subtype": "init",
-                "session_id": "34f3456e-76c8-4343-84ec-ecf8f4b79592",
+                "session_id": session,
                 "model": "haiku"
             }),
-            serde_json::json!({"type": "system", "subtype": "hook_started", "session_id": "34f3456e-76c8-4343-84ec-ecf8f4b79592"}),
-            serde_json::json!({"type": "system", "subtype": "hook_response", "session_id": "34f3456e-76c8-4343-84ec-ecf8f4b79592"}),
-            serde_json::json!({"type": "system", "subtype": "status_notice", "session_id": "34f3456e-76c8-4343-84ec-ecf8f4b79592"}),
+            serde_json::json!({"type": "system", "subtype": "api_retry", "session_id": session}),
+            serde_json::json!({"type": "system", "subtype": "notification", "session_id": session}),
+            serde_json::json!({"type": "system", "subtype": "informational", "session_id": session}),
+            serde_json::json!({"type": "system", "subtype": "compact_boundary", "session_id": session}),
             serde_json::json!({"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "a.rs"}}
             ]}}),
@@ -1910,7 +1936,7 @@ mod system_event_tests {
             ]}}),
             serde_json::json!({
                 "type": "result", "subtype": "success", "is_error": false,
-                "session_id": "34f3456e-76c8-4343-84ec-ecf8f4b79592", "result": "done"
+                "session_id": session, "result": "done"
             }),
         ];
         let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -1922,66 +1948,126 @@ mod system_event_tests {
             }
         }
 
-        // One init in, one SystemInit out; the other system subtypes vanish.
-        let inits = events.iter().filter(|e| matches!(e, CodingRunEvent::SystemInit { .. }));
-        assert_eq!(inits.count(), 1, "{events:?}");
-
-        // The init leads, and the session's order after it is untouched: the
-        // tool call, the assistant's words and the result follow, and no
-        // event implies a new process or run.
+        // One session start, then its notices, then the session's own events:
+        // the whole order of one run, from one init to its result. Nothing
+        // implies a new process or run in between.
+        let kinds: Vec<&str> = events.iter().map(describe_event).collect();
         assert_eq!(
-            events.last().map(describe_event),
-            Some("result"),
-            "{events:?}"
+            kinds,
+            vec![
+                "system_init",
+                "system_notice",
+                "system_notice",
+                "system_notice",
+                "system_notice",
+                "tool_use",
+                "assistant_message",
+                "result",
+            ],
+            "{kinds:?}"
         );
-        match (&events[..]) {
+
+        match &events[..] {
             [
                 CodingRunEvent::SystemInit { session_id, model, message },
-                CodingRunEvent::ToolUse { tool, input: Some(_) },
-                CodingRunEvent::AssistantMessage { content },
-                CodingRunEvent::Result { .. },
+                ..,
+                CodingRunEvent::Result { session_id: result_session, .. },
             ] => {
-                assert_eq!(session_id, "34f3456e-76c8-4343-84ec-ecf8f4b79592");
+                assert_eq!(session_id, session);
                 assert_eq!(model.as_deref(), Some("haiku"));
                 assert_eq!(message.as_deref(), Some("system:init"));
-                assert_eq!(tool, "Read");
-                assert!(content.is_object() || content.is_array(), "{content:?}");
+                assert_eq!(result_session, session, "one session all the way through");
             }
             other => panic!("unexpected event order: {other:?}"),
         }
 
+        // The notices name their subtypes, in the order the provider sent them.
+        let subtypes_planned = ["api_retry", "notification", "informational", "compact_boundary"];
+        let subtypes_seen: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                CodingRunEvent::SystemNotice { subtype, summary } => {
+                    assert!(!summary.is_empty(), "{summary:?}");
+                    Some(subtype.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subtypes_seen, subtypes_planned, "{subtypes_seen:?}");
+
         // Identity is kept: every system event carries the session id, so the
         // runner knows it whatever the subtype.
-        assert_eq!(
-            *session_id.lock().await,
-            Some("34f3456e-76c8-4343-84ec-ecf8f4b79592".to_string())
-        );
+        assert_eq!(*session_id.lock().await, Some(session.to_string()));
     }
 
-    /// A system event that names no model has nothing to say about the model.
-    /// If it were presented as an initialization, its `model` would be
-    /// `None`; this is what stops a second "Session started (model: unknown)"
-    /// from replacing the model the session's init reported.
+    /// A non-init system event is a notice, not an initialization: no
+    /// "Session started" can come from it, so a system event that names no
+    /// model has nothing to say about the model and nothing can overwrite the
+    /// model the session's init reported (#220).
     #[tokio::test]
     async fn a_model_less_system_event_is_not_an_initialization() {
         let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let cases = vec![
-            serde_json::json!({"type": "system", "subtype": "status_notice", "session_id": "s"}),
+            (
+                serde_json::json!({"type": "system", "subtype": "api_retry", "session_id": "s"}),
+                "api_retry",
+            ),
             // A model field next to a non-init subtype is not an
-            // initialization either: only `init` is.
-            serde_json::json!({"type": "system", "subtype": "hook_response", "session_id": "s", "model": "some-model"}),
+            // initialization either: only `init` is one.
+            (
+                serde_json::json!({
+                    "type": "system", "subtype": "informational",
+                    "session_id": "s", "model": "some-model"
+                }),
+                "informational",
+            ),
         ];
-        for event in &cases {
+        for (event, named) in &cases {
+            let (notice_named, summary) = match parse_claude_event(event, &session_id).await {
+                Some(CodingRunEvent::SystemNotice { subtype, summary }) => (subtype, summary),
+                other => panic!("expected a notice from {event:?}, got {other:?}"),
+            };
+            assert_eq!(notice_named, *named, "{event:?}");
             assert!(
-                parse_claude_event(event, &session_id).await.is_none(),
-                "{event:?}"
+                !summary.contains("model"),
+                "a notice never claims a model: {summary:?}"
             );
         }
+    }
+
+    /// A notice repeats the subtype and nothing else: the subtype is cut to a
+    /// bounded line, and no payload field the provider wrote beside it —
+    /// content, reason, model — is echoed (#220).
+    #[tokio::test]
+    async fn a_system_notice_is_bounded_and_names_no_payload() {
+        let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let event = serde_json::json!({
+            "type": "system", "subtype": "x".repeat(500), "session_id": "s",
+            "model": "whatever sits here is not a model claim",
+            "errors": ["the provider says something secret"],
+        });
+
+        let (notice_subtype, summary) = match parse_claude_event(&event, &session_id).await {
+            Some(CodingRunEvent::SystemNotice { subtype, summary }) => (subtype, summary),
+            other => panic!("expected a notice, got {other:?}"),
+        };
+        let head = "x".repeat(SYSTEM_SUBTYPE_LIMIT);
+        assert!(
+            notice_subtype.starts_with(&head) && notice_subtype.ends_with('…'),
+            "the cut keeps the head and marks it: {notice_subtype:?}"
+        );
+        assert_eq!(summary, "a provider system event", "{summary:?}");
+        assert!(
+            !summary.contains("secret") && !summary.contains("model"),
+            "no payload in the summary: {summary:?}"
+        );
+        assert_eq!(*session_id.lock().await, Some("s".to_string()));
     }
 
     fn describe_event(event: &CodingRunEvent) -> &'static str {
         match event {
             CodingRunEvent::SystemInit { .. } => "system_init",
+            CodingRunEvent::SystemNotice { .. } => "system_notice",
             CodingRunEvent::TextDelta { .. } => "text_delta",
             CodingRunEvent::ToolUse { .. } => "tool_use",
             CodingRunEvent::AssistantMessage { .. } => "assistant_message",
@@ -2945,6 +3031,7 @@ mod tests {
                 "the fixture script {} is missing",
                 program.display()
             );
+            fixture_executable(&program);
             Self { dir, program }
         }
 
@@ -3088,25 +3175,30 @@ mod tests {
         }
     }
 
-    /// `name`'s checked-in fixture program, with one bit repaired.
+    /// Prove the checked-in fixture program carries its executable bit.
     ///
     /// The fixture scripts are checked in and executed directly, so they are
-    /// meant to carry their executable bit. A checkout that lost it (a mode
-    /// the platform cannot represent, a tool that wrote the file plain) makes
-    /// the spawn fail with EACCES, which reads as a runner bug; the tests that
-    /// use the fixture restore the bit first. `set_permissions` never opens
-    /// the file, so this cannot hit the ETXTBSY the checked-in scripts exist
-    /// to avoid.
+    /// meant to carry their executable bit, as every other fixture in their
+    /// directory does. A checkout that lost it (a mode the platform cannot
+    /// represent, a tool that wrote the file plain) makes the spawn fail with
+    /// EACCES, which reads as a runner bug; the test fails here instead, on
+    /// the file and not the runner. The mode is verified, never repaired: a
+    /// repair would write to the checked-in fixtures and leave the tree dirty
+    /// after the tests, so a wrong mode must be fixed in the repository
+    /// itself.
     #[cfg(test)]
     fn fixture_executable(program: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions =
-            std::fs::metadata(program).expect("the fixture program exists").permissions();
-        if permissions.mode() & 0o111 != 0o111 {
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(program, permissions)
-                .expect("restore the fixture's executable bit");
-        }
+        let mode =
+            std::fs::metadata(program).expect("the fixture program exists").permissions().mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "the fixture script {} is not executable (mode {:o}); it must be \
+             committed 0755 like every fixture beside it",
+            program.display(),
+            mode
+        );
     }
 
     fn read_only() -> ToolAccess {
@@ -3326,8 +3418,8 @@ mod tests {
             "every event should have been broadcast, in order"
         );
 
-        // One provider session, one session start (#220): the non-init system
-        // subtypes between turns produce no event at all.
+        // One provider session, one session start (#220): whatever else the
+        // stream carries, exactly one init is the whole session's start.
         let inits = seen
             .iter()
             .filter(|e| matches!(e, CodingRunEvent::SystemInit { .. }))
@@ -3348,6 +3440,7 @@ mod tests {
     fn describe(event: &CodingRunEvent) -> &'static str {
         match event {
             CodingRunEvent::SystemInit { .. } => "system_init",
+            CodingRunEvent::SystemNotice { .. } => "system_notice",
             CodingRunEvent::TextDelta { .. } => "text_delta",
             CodingRunEvent::ToolUse { .. } => "tool_use",
             CodingRunEvent::AssistantMessage { .. } => "assistant_message",
@@ -3362,11 +3455,11 @@ mod tests {
     /// the executor gains from it — carrying the init's session id and model,
     /// and the events after it keep their order. On the code that turned every
     /// system event into an initialization, this run produced one extra
-    /// SystemInit per subtype, each logging `model: unknown`.
+    /// SystemInit per subtype, each logging `model: unknown`; the subtypes
+    /// themselves stay visible as notices, never as session starts.
     #[tokio::test(flavor = "multi_thread")]
     async fn non_init_system_subtypes_produce_no_session_start() {
         let fixture = Fixture::new(SYSTEM_SUBTYPES);
-        fixture_executable(&fixture.program);
         let runner = fixture.start().await;
         let mut events = runner.subscribe();
         let collector = tokio::spawn(async move {
@@ -3385,8 +3478,18 @@ mod tests {
         let kinds = seen.iter().map(describe).collect::<Vec<_>>();
         assert_eq!(
             kinds,
-            vec!["system_init", "tool_use", "assistant_message", "result"],
-            "the session starts once and its events follow in order"
+            vec![
+                "system_init",
+                "system_notice",
+                "system_notice",
+                "system_notice",
+                "system_notice",
+                "tool_use",
+                "assistant_message",
+                "result",
+            ],
+            "the session starts once, its events follow in order, and the other \
+             system subtypes are notices beside them"
         );
         match seen.first() {
             Some(CodingRunEvent::SystemInit {
