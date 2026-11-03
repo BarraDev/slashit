@@ -459,15 +459,15 @@ All tests are PROPOSED. None exists today. "Fixture" names an existing test whos
 
 Former items O3 and O5 are settled by D3 and D7 and are not listed here.
 
-The owner has settled O1, O6 and O7 for phase 1 at the defaults shown below. O2 and O4 remain open; each default applies until the owner decides otherwise.
+The owner has settled O1, O6, O7, O8 and O9 for phase 1 at the defaults shown below. O2 and O4 remain open; each default applies until the owner decides otherwise.
 
 - **O1. Downgrade policy. Settled: accept.** A documented procedure, with the limitation in section 8. Section 8.4.
 - **O2. Active-Project `api_key` exposure. Open.** Leave unchanged in phase 1 and schedule as a separate security item (default), or include active-Project redaction in this phase. Section 7.
 - **O4. Workspace-delete consequence. Open.** Accept that a hidden member blocks Workspace deletion until it is restored or detached (default). Section 10.
 - **O6. Open pull requests on hide. Settled: warn and do not block.** Section 3.4.
 - **O7. Add with a hidden Project's folder. Settled: refuse and point to restore.** Section 3.6.
-- **O8. Power loss after an unconfirmed hide. Open.** Accept the documented limitation that a reverted hide is not announced at startup (default), or add a persisted marker, which requires a second file and an exception to the single-file invariant (section 5.5, T14). Section 5.5.
-- **O9. Downgrade while a hidden Project is unrestorable. Open.** Refuse the downgrade until the Project is restorable (default). Restore requires the expected folder or an explicit assisted recovery process. A documented manual unhide after copying the configuration directory is the alternative. No silent reactivation or duplication. Section 8.4, item 5.
+- **O8. Power loss after an unconfirmed hide. Settled: accept the default.** Accept the documented limitation that a published but unconfirmed-durable hide may revert after power loss without a startup notification. Nothing in this design guarantees persistence or detection in that case. A persisted marker would need a second file and an exception to the single-file invariant (section 5.5, T14), and was not adopted. Section 5.5.
+- **O9. Downgrade while a hidden Project is unrestorable. Settled: accept the default.** Downgrade is unsupported while a hidden Project cannot safely be restored. Older builds cannot technically enforce this; it is an operator procedure, not a code guarantee. Restore requires the expected folder or an explicit assisted recovery process. A documented manual unhide after copying the configuration directory is the alternative. No silent reactivation or duplication. Section 8.4, item 5.
 
 ### 12.3 Recommendations that are technical defaults (not decisions)
 
