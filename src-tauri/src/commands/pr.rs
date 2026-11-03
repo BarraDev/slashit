@@ -3608,12 +3608,16 @@ fn build_reply_body(item: &PrReviewItem) -> String {
 
 /// Posts a reply on the PR. Returns the GitHub comment ID of the created
 /// reply so the caller can persist it on the item for future PATCH-edit.
-/// Returns `Ok(None)` only for the legacy `gh pr comment` fallback path where
-/// gh's CLI doesn't surface a JSON id.
+/// `Ok(None)` is only for a posted non-inline reply (`gh pr comment`, which
+/// doesn't surface a JSON id).
 ///
 /// `inline_comment_id` is only an inline comment's id (see
 /// [`PrReviewPlan::inline_reply_target`]). Any other comment is answered with
 /// a PR-level comment, never by number on the inline endpoint.
+///
+/// A failed threaded reply is not a delivered reply: it returns `Err`, is
+/// recovered when the caller retries, and is never silently replaced by a
+/// PR-level comment.
 async fn post_pr_reply(
     repo: &str,
     number: &str,
@@ -3623,15 +3627,21 @@ async fn post_pr_reply(
     if let Some(id) = inline_comment_id {
         let endpoint = format!("repos/{}/pulls/{}/comments/{}/replies", repo, number, id);
         let body_arg = format!("body={}", body);
-        if let Ok(out) = run_cmd_no_cwd(
+        return match run_cmd_no_cwd(
             "gh",
             &["api", "-X", "POST", &endpoint, "-f", &body_arg, "--jq", ".id"],
-        ).await {
-            let parsed = out.trim().parse::<u64>().ok();
-            return Ok(parsed);
-        }
-        // Inline reply failed (e.g. comment was on a Review, not an inline thread).
-        // Fall through to a global PR comment so the reply is not lost.
+        )
+        .await
+        {
+            Ok(out) => Ok(out.trim().parse::<u64>().ok()),
+            Err(e) => {
+                let line = e.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                let reason: String = line.chars().take(200).collect();
+                Err(format!(
+                    "threaded reply to comment {id} on {repo}#{number} failed: {reason}"
+                ))
+            }
+        };
     }
     // The PR is named by the number and repository parsed out of `pr_url`,
     // never by the URL itself: `pr_url` is read back from `tasks.toml` like
@@ -10340,6 +10350,50 @@ mod tests {
                     vec!["pr", "comment", "7", "--repo", "owner/repo", "--body", "thanks"],
                 ],
             );
+        }
+
+        /// A failed threaded reply is an error, never a PR-level comment.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failed_threaded_reply_is_an_error_and_never_a_pr_comment() {
+            let _guard = PATH_LOCK.lock().await;
+            let replies = "api -X POST repos/owner/repo/pulls/42/comments/99/replies -f body=thanks --jq .id";
+            let mock = MockGh::setup_answering(
+                "unused",
+                "{}",
+                &[(replies.to_string(), "printf 'HTTP 422 nope' >&2; exit 1".to_string())],
+            );
+
+            let err = post_pr_reply("owner/repo", "42", Some(99), "thanks")
+                .await
+                .expect_err("a failed threaded reply must not be Ok");
+            assert!(err.contains("owner/repo") && err.contains("42") && err.contains("99"), "{err}");
+            assert!(err.contains("HTTP 422"), "{err}");
+            assert!(!err.contains('\n'), "{err}");
+
+            let log = mock.read_log();
+            assert!(log.contains("replies"), "the threaded POST was attempted: {log}");
+            assert!(!log.contains("comment\n42"), "no PR-level comment may be posted: {log}");
+            assert!(!log.lines().any(|l| l == "pr"), "no `pr` call at all: {log}");
+        }
+
+        /// A threaded reply that succeeds returns the parsed comment id.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_successful_threaded_reply_returns_its_id() {
+            let _guard = PATH_LOCK.lock().await;
+            let replies = "api -X POST repos/owner/repo/pulls/42/comments/99/replies -f body=thanks --jq .id";
+            let mock = MockGh::setup_answering(
+                "unused",
+                "{}",
+                &[(replies.to_string(), "printf '123456789'".to_string())],
+            );
+
+            let id = post_pr_reply("owner/repo", "42", Some(99), "thanks")
+                .await
+                .expect("threaded reply posts");
+            assert_eq!(id, Some(123456789));
+            assert!(!mock.read_log().lines().any(|l| l == "pr"));
         }
 
         /// Unix-only: the mock `gh` is a `#!/bin/sh` script made executable
