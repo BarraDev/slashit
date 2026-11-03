@@ -1454,12 +1454,24 @@ pub struct FixedContent {
 }
 
 impl PrReviewPlan {
-    /// The stored comment `comment_id` names. A numeric id is unique within a
-    /// plan (the analysis withholds a number that two comments share), so the
-    /// id alone names one comment, and that comment's `kind` names its GitHub
-    /// resource type.
+    /// The stored comment `comment_id` names, only when that number is unique
+    /// in the plan. The analysis withholds a number that two comments share,
+    /// but a legacy plan can still hold one, and a number shared by comments
+    /// of different GitHub resource types names none of them. A repeated
+    /// number therefore resolves to `None`, never to the first match.
     pub fn comment_for(&self, comment_id: u64) -> Option<&PrReviewComment> {
-        self.comments.iter().find(|c| c.id == Some(comment_id))
+        self.comment_count_for(comment_id).1
+    }
+
+    /// How many stored comments carry `comment_id`, and the one comment when
+    /// there is exactly one. Lets a caller tell a missing identity from an
+    /// ambiguous one.
+    pub fn comment_count_for(&self, comment_id: u64) -> (usize, Option<&PrReviewComment>) {
+        let mut matches: Vec<&PrReviewComment> =
+            self.comments.iter().filter(|c| c.id == Some(comment_id)).collect();
+        let count = matches.len();
+        let unique = if count == 1 { matches.pop() } else { None };
+        (count, unique)
     }
 
     /// The id a reply to `comment_id` is addressed by on GitHub's inline reply

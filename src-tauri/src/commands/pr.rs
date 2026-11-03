@@ -1407,7 +1407,9 @@ fn check_plan_matches_pr_head(plan: &PrReviewPlan, current_head: &str) -> Result
 /// What an Apply may change in a plan the webview sent back: the per-item
 /// decision and lifecycle fields, and the run bookkeeping. Everything else is
 /// content (comment ids, bodies, paths, the fix instructions) that the
-/// analysis fixed, and the stored plan is the only authority for it.
+/// analysis fixed, and the stored plan is the only authority for it. The
+/// decision fields are left out here because [`stored_plan_for_apply`] checks
+/// each approved Fix item on its own.
 fn review_content(plan: &PrReviewPlan) -> PrReviewPlan {
     let mut content = plan.clone();
     content.last_apply = None;
@@ -1459,20 +1461,36 @@ fn stored_plan_for_apply<'a>(
                 .to_string(),
         );
     }
-    // A fix acts on the comment its item names. An item whose comment has no
-    // numeric id here (GitHub did not give one, or it was withheld) has no
-    // identity to act on, so Apply refuses before any edit, push or reply.
-    let unidentified = stored.items.iter().any(|i| {
-        matches!(i.decision, PrReviewDecision::Fix)
-            && i.approved
-            && i.comment_id.and_then(|id| stored.comment_for(id)).is_none()
-    });
-    if unidentified {
-        return Err(
-            "A fix in this review plan names a comment that has no GitHub id this plan can \
-             act on. Re-analyze the PR comments, then apply again. Nothing was changed."
-                .to_string(),
-        );
+    // The approved items Apply runs come from the sent plan, and the client
+    // may approve an item the stored plan left unapproved. Each approved Fix
+    // is checked against the stored item at the same position (the content
+    // above already agrees), and the comment it names must resolve to exactly
+    // one stored comment. A comment with no id, or a number the plan repeats,
+    // has no identity to act on, so Apply refuses before any edit, push or
+    // reply.
+    for (stored_item, sent_item) in stored.items.iter().zip(&sent.items) {
+        if !(sent_item.approved && matches!(sent_item.decision, PrReviewDecision::Fix)) {
+            continue;
+        }
+        match stored_item.comment_id.map(|id| stored.comment_count_for(id)) {
+            Some((_, Some(_))) => {}
+            Some((count, None)) if count > 1 => {
+                return Err(
+                    "A fix in this review plan names a comment number that more than one \
+                     comment in the plan shares, so it cannot tell which comment to act on. \
+                     Re-analyze the PR comments, then apply again. Nothing was changed."
+                        .to_string(),
+                );
+            }
+            _ => {
+                return Err(
+                    "A fix in this review plan names a comment that has no GitHub id this \
+                     plan can act on. Re-analyze the PR comments, then apply again. Nothing \
+                     was changed."
+                        .to_string(),
+                );
+            }
+        }
     }
     Ok(stored)
 }
@@ -23961,5 +23979,86 @@ mod review_plan_provenance {
         .await;
         let (task, stored) = analyzed_plan_with_items();
         assert!(check_apply_preflight(task.pr_review_plan.as_ref(), &stored, PR_URL).await.is_ok());
+    }
+
+    fn unapproved_fix(comment_id: Option<u64>) -> PrReviewItem {
+        PrReviewItem { approved: false, ..identity_fix(comment_id) }
+    }
+
+    /// Regression: the approved items Apply runs come from the sent plan, so a
+    /// client approving a Fix the stored plan left unapproved, whose comment
+    /// has no identity, used to pass the gate.
+    #[test]
+    fn a_client_approval_of_an_unidentified_fix_is_refused() {
+        let stored = identity_plan(
+            vec![identity_comment(None, PrCommentKind::Review)],
+            vec![unapproved_fix(None)],
+        );
+        let mut sent = stored.clone();
+        sent.items[0].approved = true;
+        let err = stored_plan_for_apply(Some(&stored), &sent).expect_err("no identity, no apply");
+        assert!(err.contains("Nothing was changed"), "{err}");
+    }
+
+    /// A user's approval of a canonical, identified item is a legitimate
+    /// decision and still reaches the point where Apply proceeds.
+    #[test]
+    fn a_user_approval_of_an_identified_fix_is_accepted() {
+        let stored = identity_plan(
+            vec![identity_comment(Some(7), PrCommentKind::Inline)],
+            vec![unapproved_fix(Some(7))],
+        );
+        let mut sent = stored.clone();
+        sent.items[0].approved = true;
+        assert!(stored_plan_for_apply(Some(&stored), &sent).is_ok());
+    }
+
+    /// A legacy plan whose comment numbers repeat loads and displays, but an
+    /// approved Fix naming a repeated number is refused: the number names no
+    /// one comment, and the first match is never taken.
+    #[test]
+    fn duplicate_numbers_in_a_legacy_plan_load_but_refuse_an_approved_fix() {
+        let legacy = identity_plan(
+            vec![
+                identity_comment(Some(7), PrCommentKind::Inline),
+                identity_comment(Some(7), PrCommentKind::Review),
+            ],
+            vec![unapproved_fix(Some(7))],
+        );
+        let json = serde_json::to_string(&legacy).expect("serializes");
+        let loaded: PrReviewPlan = serde_json::from_str(&json).expect("a legacy plan still loads");
+        assert_eq!(loaded.comments.len(), 2, "display keeps every comment");
+        assert!(loaded.comment_for(7).is_none(), "a repeated number names no comment");
+        assert!(stored_plan_for_apply(Some(&loaded), &loaded).is_ok(), "read-only plans are unaffected");
+
+        let mut sent = loaded.clone();
+        sent.items[0].approved = true;
+        let err = stored_plan_for_apply(Some(&loaded), &sent).expect_err("ambiguous identity");
+        assert!(err.contains("Nothing was changed"), "{err}");
+    }
+
+    /// The command's pre-flight refuses a client approval of an unidentified
+    /// Fix before the head is read, so no agent, push or reply can follow.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_refuses_a_client_approval_without_identity_before_any_side_effect() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let stored = identity_plan(
+            vec![identity_comment(None, PrCommentKind::Review)],
+            vec![unapproved_fix(None)],
+        );
+        let mut sent = stored.clone();
+        sent.items[0].approved = true;
+        let err = check_apply_preflight(Some(&stored), &sent, PR_URL)
+            .await
+            .expect_err("an unidentified approval is refused");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        assert_eq!(gh.launches("gh"), 0, "no head read, no reply, no push");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
     }
 }
