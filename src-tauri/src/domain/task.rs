@@ -1431,6 +1431,15 @@ pub struct PrReviewPlan {
     /// [`PrReviewPlan::fixed_content_is_current`] for what that means.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fixed_content: Vec<FixedContent>,
+    /// The pull request's head commit when this plan was analyzed. Apply
+    /// refuses unless the head is still this commit. `None` for every plan
+    /// saved before it was recorded: such a plan is unknown and must be
+    /// analyzed again before it can be applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_head_oid: Option<String>,
+    /// When the analysis that recorded `analyzed_head_oid` ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The fingerprint ([`slashit_review_content::fingerprint`]) of the text of

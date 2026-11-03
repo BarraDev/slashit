@@ -334,6 +334,12 @@ pub struct PrReviewPlan {
     /// fingerprints existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fixed_content: Vec<FixedContent>,
+    /// Mirrors the backend fields of the same names. They must survive a round
+    /// trip, because Apply is refused unless the PR head still matches them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_head_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Mirrors the backend type of the same name.

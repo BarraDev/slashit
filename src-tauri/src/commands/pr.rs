@@ -914,16 +914,17 @@ pub async fn analyze_pr_comments(
         .filter(|p| p.pr_url == pr_url);
 
     eprintln!("[pr-review] analyze {} for task {}", pr_url, task_uuid);
-    let (review_decision, comments) = fetch_pr_review_data(&pr_url).await?;
+    let (head_oid, review_decision, comments) = fetch_pr_review_data(&pr_url).await?;
     eprintln!(
         "[pr-review] {} comments fetched (decision={:?})",
         comments.len(), review_decision,
     );
+    let generated_at = chrono::Utc::now();
     if comments.is_empty() {
         // Don't cache empty plans — reviewers can still leave comments later
         // and the user shouldn't have to remember to hit Re-analyze.
         return Ok(PrReviewPlan {
-            generated_at: chrono::Utc::now(),
+            generated_at,
             pr_url,
             review_decision,
             comments,
@@ -931,6 +932,8 @@ pub async fn analyze_pr_comments(
             raw_plan: String::new(),
             last_apply: prior_plan.as_ref().and_then(|p| p.last_apply.clone()),
             fixed_content: prior_plan.map(|p| p.fixed_content).unwrap_or_default(),
+            analyzed_head_oid: Some(head_oid),
+            analyzed_at: Some(generated_at),
         });
     }
 
@@ -952,7 +955,7 @@ pub async fn analyze_pr_comments(
     };
 
     let plan = PrReviewPlan {
-        generated_at: chrono::Utc::now(),
+        generated_at,
         pr_url,
         review_decision,
         comments,
@@ -960,6 +963,8 @@ pub async fn analyze_pr_comments(
         raw_plan: raw_output,
         last_apply: prior_plan.and_then(|p| p.last_apply),
         fixed_content,
+        analyzed_head_oid: Some(head_oid),
+        analyzed_at: Some(generated_at),
     };
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, plan.clone()).await?;
     Ok(plan)
@@ -1315,6 +1320,12 @@ pub async fn address_pr_review(
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
 
+    // Refuse before anything is edited, pushed or replied to: the plan must
+    // have been analyzed at the PR's head as it is now.
+    let pr_url = pr_url_for_task(&task)?;
+    let current_head = current_pr_head_oid(&pr_url).await?;
+    check_plan_matches_pr_head(&plan, &current_head)?;
+
     let app_handle = app.clone();
     let progress: ProgressSink = std::sync::Arc::new(move |ev: PrReviewProgress| {
         if let Err(e) = app_handle.emit("pr-review-progress", &ev) {
@@ -1345,6 +1356,43 @@ pub async fn address_pr_review(
     .await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
+}
+
+/// The head commit GitHub reports for `pr_url` now.
+async fn current_pr_head_oid(pr_url: &str) -> Result<String, String> {
+    let (repo, number) = parse_pr_url(pr_url)?;
+    let json = run_cmd_no_cwd(
+        "gh",
+        &["pr", "view", &number, "--repo", &repo, "--json", "headRefOid"],
+    ).await?;
+    pr_head_oid_from_json(&json)
+}
+
+/// Refuses a plan that was not analyzed at `current_head`. A plan saved
+/// before its analyzed head was recorded has no provenance and counts as
+/// unknown, so it must be analyzed again. The plan is left as it is: nothing
+/// here changes it.
+fn check_plan_matches_pr_head(plan: &PrReviewPlan, current_head: &str) -> Result<(), String> {
+    match plan.analyzed_head_oid.as_deref() {
+        None => Err(
+            "This review plan does not record which pull request head it was analyzed at, \
+             so it cannot be applied. Re-analyze the PR comments, then apply again. \
+             Nothing was changed."
+                .to_string(),
+        ),
+        Some(analyzed) if analyzed != current_head => Err(format!(
+            "The pull request head moved from {} to {} after this review plan was analyzed. \
+             Re-analyze the PR comments, then apply again. Nothing was changed.",
+            short_oid(analyzed),
+            short_oid(current_head),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The first seven characters of a commit id, for a message a person reads.
+fn short_oid(oid: &str) -> &str {
+    oid.get(..7).unwrap_or(oid)
 }
 
 /// Core logic of `address_pr_review` extracted for testability. Owns no
@@ -2480,93 +2528,190 @@ fn parse_gh_ts(v: Option<&serde_json::Value>) -> Option<chrono::DateTime<chrono:
         .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
+/// The review data of a PR: its head commit, its review decision and its
+/// comments that are still actionable.
+///
+/// Fails closed. A review that cannot be read in full is an error, never an
+/// empty list: an empty list would make the plan look analyzed, and an Apply
+/// on it would act on a review nobody read. A resolved or outdated review
+/// thread is left out, because there is nothing left in it to fix.
 async fn fetch_pr_review_data(
     pr_url: &str,
-) -> Result<(Option<String>, Vec<PrReviewComment>), String> {
+) -> Result<(String, Option<String>, Vec<PrReviewComment>), String> {
     let (repo, number) = parse_pr_url(pr_url)?;
     let mut comments: Vec<PrReviewComment> = Vec::new();
-    let mut review_decision: Option<String> = None;
 
     let review_json = run_cmd_no_cwd(
         "gh",
-        &["pr", "view", &number, "--repo", &repo, "--json", "reviews,comments,reviewDecision,createdAt,updatedAt"],
+        &["pr", "view", &number, "--repo", &repo, "--json", "headRefOid,reviews,comments,reviewDecision,createdAt,updatedAt"],
     ).await?;
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&review_json) {
-        review_decision = json.get("reviewDecision").and_then(|v| v.as_str()).map(String::from);
-        if let Some(reviews) = json.get("reviews").and_then(|v| v.as_array()) {
-            for review in reviews {
-                let body = review.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if body.is_empty() && state != "CHANGES_REQUESTED" {
-                    continue;
-                }
-                let id = review.get("id")
-                    .or_else(|| review.get("databaseId"))
-                    .and_then(|v| v.as_u64());
-                let author = review.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                let author_association = review.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
-                let url = review.get("url").and_then(|v| v.as_str()).map(String::from);
-                let display_body = if body.is_empty() { format!("[{}]", state) } else { body };
-                let created_at = parse_gh_ts(review.get("submittedAt").or_else(|| review.get("createdAt")));
-                comments.push(PrReviewComment {
-                    id, kind: PrCommentKind::Review, author, author_association, body: display_body,
-                    path: None, line: None, url,
-                    created_at, updated_at: created_at,
-                });
+    let head_oid = pr_head_oid_from_json(&review_json)?;
+    let json: serde_json::Value = serde_json::from_str(&review_json)
+        .map_err(|e| format!("GitHub's review answer is not JSON: {e}"))?;
+    let review_decision = json.get("reviewDecision").and_then(|v| v.as_str()).map(String::from);
+    if let Some(reviews) = json.get("reviews").and_then(|v| v.as_array()) {
+        for review in reviews {
+            let body = review.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if body.is_empty() && state != "CHANGES_REQUESTED" {
+                continue;
             }
+            let id = review.get("id")
+                .or_else(|| review.get("databaseId"))
+                .and_then(|v| v.as_u64());
+            let author = review.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let author_association = review.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
+            let url = review.get("url").and_then(|v| v.as_str()).map(String::from);
+            let display_body = if body.is_empty() { format!("[{}]", state) } else { body };
+            let created_at = parse_gh_ts(review.get("submittedAt").or_else(|| review.get("createdAt")));
+            comments.push(PrReviewComment {
+                id, kind: PrCommentKind::Review, author, author_association, body: display_body,
+                path: None, line: None, url,
+                created_at, updated_at: created_at,
+            });
         }
-        if let Some(conv) = json.get("comments").and_then(|v| v.as_array()) {
-            for c in conv {
-                let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                if body.is_empty() { continue; }
-                let id = c.get("id").or_else(|| c.get("databaseId")).and_then(|v| v.as_u64());
-                let author = c.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                let author_association = c.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
-                let url = c.get("url").and_then(|v| v.as_str()).map(String::from);
-                let created_at = parse_gh_ts(c.get("createdAt"));
-                let updated_at = parse_gh_ts(c.get("updatedAt")).or(created_at);
-                comments.push(PrReviewComment {
-                    id, kind: PrCommentKind::Conversation, author, author_association, body,
-                    path: None, line: None, url,
-                    created_at, updated_at,
-                });
-            }
+    }
+    if let Some(conv) = json.get("comments").and_then(|v| v.as_array()) {
+        for c in conv {
+            let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            if body.is_empty() { continue; }
+            let id = c.get("id").or_else(|| c.get("databaseId")).and_then(|v| v.as_u64());
+            let author = c.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let author_association = c.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
+            let url = c.get("url").and_then(|v| v.as_str()).map(String::from);
+            let created_at = parse_gh_ts(c.get("createdAt"));
+            let updated_at = parse_gh_ts(c.get("updatedAt")).or(created_at);
+            comments.push(PrReviewComment {
+                id, kind: PrCommentKind::Conversation, author, author_association, body,
+                path: None, line: None, url,
+                created_at, updated_at,
+            });
         }
     }
 
+    // `--paginate` prints one JSON array per page, back to back.
     let inline_json = run_cmd_no_cwd(
         "gh",
         &["api", "--paginate", &format!("repos/{}/pulls/{}/comments?per_page=100", repo, number)],
-    ).await.unwrap_or_else(|e| {
-        eprintln!("[pr-review] inline comments fetch failed: {}", e);
-        String::new()
-    });
-    match serde_json::from_str::<Vec<serde_json::Value>>(&inline_json) {
-        Ok(arr) => {
-            for c in arr {
-                let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                if body.is_empty() { continue; }
-                let id = c.get("id").and_then(|v| v.as_u64());
-                let author = c.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                let author_association = c.get("author_association").and_then(|v| v.as_str()).map(String::from);
-                let path = c.get("path").and_then(|v| v.as_str()).map(String::from);
-                let line = c.get("line").or_else(|| c.get("original_line")).and_then(|v| v.as_i64());
-                let url = c.get("html_url").and_then(|v| v.as_str()).map(String::from);
-                let created_at = parse_gh_ts(c.get("created_at"));
-                let updated_at = parse_gh_ts(c.get("updated_at")).or(created_at);
-                comments.push(PrReviewComment {
-                    id, kind: PrCommentKind::Inline, author, author_association, body, path, line, url,
-                    created_at, updated_at,
-                });
-            }
-        }
-        Err(e) if !inline_json.is_empty() => {
-            eprintln!("[pr-review] inline comments parse failed: {}", e);
-        }
-        Err(_) => {}
+    ).await
+    .map_err(|e| format!("inline review comments could not be fetched: {e}"))?;
+    let mut inline: Vec<serde_json::Value> = Vec::new();
+    let mut pages_read = 0usize;
+    for page in serde_json::Deserializer::from_str(&inline_json)
+        .into_iter::<Vec<serde_json::Value>>()
+    {
+        inline.extend(
+            page.map_err(|e| format!("inline review comments are not a JSON list: {e}"))?,
+        );
+        pages_read += 1;
+    }
+    if pages_read == 0 {
+        return Err("inline review comments answer was empty".to_string());
+    }
+    let non_actionable = fetch_non_actionable_review_comment_ids(&repo, &number).await?;
+    for c in inline {
+        let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if body.is_empty() { continue; }
+        let id = c.get("id").and_then(|v| v.as_u64());
+        if id.is_some_and(|id| non_actionable.contains(&id)) { continue; }
+        let author = c.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let author_association = c.get("author_association").and_then(|v| v.as_str()).map(String::from);
+        let path = c.get("path").and_then(|v| v.as_str()).map(String::from);
+        let line = c.get("line").or_else(|| c.get("original_line")).and_then(|v| v.as_i64());
+        let url = c.get("html_url").and_then(|v| v.as_str()).map(String::from);
+        let created_at = parse_gh_ts(c.get("created_at"));
+        let updated_at = parse_gh_ts(c.get("updated_at")).or(created_at);
+        comments.push(PrReviewComment {
+            id, kind: PrCommentKind::Inline, author, author_association, body, path, line, url,
+            created_at, updated_at,
+        });
     }
 
-    Ok((review_decision, comments))
+    Ok((head_oid, review_decision, comments))
+}
+
+/// The head commit a `gh pr view --json headRefOid` answer names.
+fn pr_head_oid_from_json(json: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("GitHub's PR answer is not JSON: {e}"))?;
+    value
+        .get("headRefOid")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "GitHub's PR answer names no head commit".to_string())
+}
+
+/// GraphQL for the review threads of a PR, one page per `$endCursor`.
+const REVIEW_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { isResolved isOutdated comments(first: 100) { totalCount nodes { databaseId } } } } } } }";
+
+/// The ids of the inline review comments in threads GitHub reports as
+/// resolved or outdated.
+async fn fetch_non_actionable_review_comment_ids(
+    repo: &str,
+    number: &str,
+) -> Result<std::collections::HashSet<u64>, String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository name {repo}"))?;
+    let pages = run_cmd_no_cwd(
+        "gh",
+        &[
+            "api", "graphql", "--paginate",
+            "-F", &format!("owner={owner}"),
+            "-F", &format!("name={name}"),
+            "-F", &format!("number={number}"),
+            "-f", &format!("query={REVIEW_THREADS_QUERY}"),
+        ],
+    ).await
+    .map_err(|e| format!("review threads could not be fetched: {e}"))?;
+    non_actionable_review_comment_ids(&pages)
+}
+
+/// Reads the pages of a `reviewThreads` answer (`gh api graphql --paginate`
+/// prints one JSON object per page). A malformed or empty answer is an
+/// error, never an empty set: an empty set would leave resolved threads
+/// actionable.
+fn non_actionable_review_comment_ids(
+    pages: &str,
+) -> Result<std::collections::HashSet<u64>, String> {
+    let mut ids = std::collections::HashSet::new();
+    let mut pages_read = 0usize;
+    for page in serde_json::Deserializer::from_str(pages).into_iter::<serde_json::Value>() {
+        let page = page.map_err(|e| format!("review threads answer is not JSON: {e}"))?;
+        pages_read += 1;
+        let threads = page
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|v| v.as_array())
+            .ok_or("review threads answer has no thread list")?;
+        for thread in threads {
+            let resolved = thread.get("isResolved").and_then(|v| v.as_bool())
+                .ok_or("a review thread has no resolved flag")?;
+            let outdated = thread.get("isOutdated").and_then(|v| v.as_bool())
+                .ok_or("a review thread has no outdated flag")?;
+            if !resolved && !outdated {
+                continue;
+            }
+            let comments = thread.get("comments").ok_or("a review thread has no comment list")?;
+            let listed = comments.get("nodes").and_then(|v| v.as_array())
+                .ok_or("a review thread has no comment nodes")?;
+            let total = comments.get("totalCount").and_then(|v| v.as_u64())
+                .ok_or("a review thread has no comment count")?;
+            if (listed.len() as u64) < total {
+                return Err("a resolved or outdated review thread has more comments than were fetched".to_string());
+            }
+            for c in listed {
+                let id = c.get("databaseId").and_then(|v| v.as_u64())
+                    .ok_or("a review thread comment has no database id")?;
+                ids.insert(id);
+            }
+        }
+    }
+    if pages_read == 0 {
+        return Err("review threads answer was empty".to_string());
+    }
+    Ok(ids)
 }
 
 // ---- Untrusted review text in helper prompts ----
@@ -7426,6 +7571,8 @@ mod tests {
 
     fn plan_with_marker(marker: &str) -> PrReviewPlan {
         PrReviewPlan {
+            analyzed_head_oid: None,
+            analyzed_at: None,
             generated_at: chrono::Utc::now(),
             pr_url: "https://github.com/org/repo/pull/1".to_string(),
             review_decision: None,
@@ -8431,6 +8578,8 @@ mod tests {
     ) -> PrReviewPlan {
         let fixed_ids = items.iter().filter(|i| i.fix_done).filter_map(|i| i.comment_id).collect();
         PrReviewPlan {
+            analyzed_head_oid: None,
+            analyzed_at: None,
             generated_at: at("2024-05-31T00:00:00Z"),
             pr_url: String::new(),
             review_decision: None,
@@ -17196,6 +17345,8 @@ mod tests {
                 };
 
                 let plan = PrReviewPlan {
+                    analyzed_head_oid: None,
+                    analyzed_at: None,
                     generated_at: chrono::Utc::now(),
                     pr_url: "https://github.com/testorg/testrepo/pull/321".to_string(),
                     review_decision: None,
@@ -17699,6 +17850,8 @@ mod tests {
                     task.clone()
                 };
                 let plan = PrReviewPlan {
+                    analyzed_head_oid: None,
+                    analyzed_at: None,
                     generated_at: chrono::Utc::now(),
                     pr_url: pr_url.to_string(),
                     review_decision: None,
@@ -17907,6 +18060,8 @@ mod tests {
                     task.clone()
                 };
                 let plan = PrReviewPlan {
+                    analyzed_head_oid: None,
+                    analyzed_at: None,
                     generated_at: chrono::Utc::now(),
                     pr_url: pr_url.to_string(),
                     review_decision: None,
@@ -22917,5 +23072,156 @@ mod recovery_admission_tests {
                 WorkerHandoffStage::RecoveryRequired { .. }
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod review_plan_provenance {
+    use super::*;
+
+    const ANALYZED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const MOVED: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const PR_URL: &str = "https://github.com/o/r/pull/1";
+
+    fn plan_analyzed_at(head: Option<&str>) -> PrReviewPlan {
+        PrReviewPlan {
+            generated_at: chrono::Utc::now(),
+            pr_url: PR_URL.to_string(),
+            review_decision: None,
+            comments: Vec::new(),
+            items: Vec::new(),
+            raw_plan: String::new(),
+            last_apply: None,
+            fixed_content: Vec::new(),
+            analyzed_head_oid: head.map(str::to_string),
+            analyzed_at: head.map(|_| chrono::Utc::now()),
+        }
+    }
+
+    #[test]
+    fn apply_is_refused_when_the_head_moved_after_analysis() {
+        let plan = plan_analyzed_at(Some(ANALYZED));
+        let err = check_plan_matches_pr_head(&plan, MOVED).unwrap_err();
+        assert!(err.contains("aaaaaaa"), "names the analyzed head: {err}");
+        assert!(err.contains("bbbbbbb"), "names the current head: {err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+    }
+
+    #[test]
+    fn apply_proceeds_when_the_head_is_the_analyzed_head() {
+        let plan = plan_analyzed_at(Some(ANALYZED));
+        assert_eq!(check_plan_matches_pr_head(&plan, ANALYZED), Ok(()));
+    }
+
+    #[test]
+    fn apply_is_refused_for_a_plan_without_provenance() {
+        let plan = plan_analyzed_at(None);
+        let err = check_plan_matches_pr_head(&plan, ANALYZED).unwrap_err();
+        assert!(err.contains("Re-analyze"), "{err}");
+    }
+
+    #[test]
+    fn plan_saved_before_provenance_loads_as_unknown_and_round_trips_without_it() {
+        let legacy = serde_json::json!({
+            "generated_at": "2026-01-01T00:00:00Z",
+            "pr_url": PR_URL,
+            "review_decision": null,
+            "comments": [],
+            "items": [],
+            "raw_plan": "",
+        });
+        let plan: PrReviewPlan = serde_json::from_value(legacy).expect("legacy plan loads");
+        assert_eq!(plan.analyzed_head_oid, None);
+        assert_eq!(plan.analyzed_at, None);
+        let back = serde_json::to_value(&plan).unwrap();
+        assert!(back.get("analyzed_head_oid").is_none(), "{back}");
+        assert!(check_plan_matches_pr_head(&plan, ANALYZED).is_err());
+    }
+
+    #[test]
+    fn provenance_round_trips_through_serde() {
+        let plan = plan_analyzed_at(Some(ANALYZED));
+        let json = serde_json::to_value(&plan).unwrap();
+        let back: PrReviewPlan = serde_json::from_value(json).unwrap();
+        assert_eq!(back.analyzed_head_oid.as_deref(), Some(ANALYZED));
+        assert_eq!(back.analyzed_at, plan.analyzed_at);
+    }
+
+    #[test]
+    fn head_oid_must_be_present_in_the_gh_answer() {
+        assert_eq!(
+            pr_head_oid_from_json(&format!(r#"{{"headRefOid":"{ANALYZED}"}}"#)),
+            Ok(ANALYZED.to_string()),
+        );
+        assert!(pr_head_oid_from_json("{}").is_err());
+        assert!(pr_head_oid_from_json(r#"{"headRefOid":""}"#).is_err());
+        assert!(pr_head_oid_from_json("not json").is_err());
+    }
+
+    fn thread(resolved: bool, outdated: bool, ids: &[u64]) -> serde_json::Value {
+        let nodes: Vec<_> = ids
+            .iter()
+            .map(|id| serde_json::json!({ "databaseId": id }))
+            .collect();
+        serde_json::json!({
+            "isResolved": resolved,
+            "isOutdated": outdated,
+            "comments": { "totalCount": ids.len(), "nodes": nodes },
+        })
+    }
+
+    fn page(threads: Vec<serde_json::Value>) -> String {
+        serde_json::json!({
+            "data": { "repository": { "pullRequest": { "reviewThreads": {
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": threads,
+            } } } }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn resolved_and_outdated_threads_are_non_actionable_open_ones_are_not() {
+        let pages = page(vec![
+            thread(false, false, &[1]),
+            thread(true, false, &[2, 3]),
+            thread(false, true, &[4]),
+        ]);
+        let ids = non_actionable_review_comment_ids(&pages).unwrap();
+        assert_eq!(ids, [2, 3, 4].into_iter().collect());
+    }
+
+    #[test]
+    fn threads_across_pages_are_all_read() {
+        let pages = format!("{}\n{}", page(vec![thread(true, false, &[7])]), page(vec![thread(false, true, &[8])]));
+        let ids = non_actionable_review_comment_ids(&pages).unwrap();
+        assert_eq!(ids, [7, 8].into_iter().collect());
+    }
+
+    #[test]
+    fn a_failed_or_malformed_thread_read_is_an_error_not_an_empty_set() {
+        assert!(non_actionable_review_comment_ids("").is_err());
+        assert!(non_actionable_review_comment_ids("not json").is_err());
+        assert!(non_actionable_review_comment_ids(r#"{"data":{"repository":null}}"#).is_err());
+        // A resolved thread whose comments were cut short cannot be trusted.
+        let truncated = serde_json::json!({
+            "isResolved": true, "isOutdated": false,
+            "comments": { "totalCount": 3, "nodes": [{ "databaseId": 1 }] },
+        });
+        assert!(non_actionable_review_comment_ids(&page(vec![truncated])).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_is_refused_when_the_pr_head_moved_between_analysis_and_apply() {
+        let _gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{MOVED}\"}}'"),
+        )
+        .await;
+        let plan = plan_analyzed_at(Some(ANALYZED));
+        let current = current_pr_head_oid(PR_URL).await.expect("head is read");
+        assert_eq!(current, MOVED);
+        assert!(check_plan_matches_pr_head(&plan, &current).is_err());
     }
 }

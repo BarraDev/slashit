@@ -755,6 +755,8 @@ mod orchestration {
                 reply_comment_id: None,
             };
             let plan = PrReviewPlan {
+                analyzed_head_oid: None,
+                analyzed_at: None,
                 generated_at: chrono::Utc::now(),
                 pr_url: PR.to_string(),
                 review_decision: None,
