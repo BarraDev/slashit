@@ -4,6 +4,12 @@ cat > /dev/null
 sleep 0.2
 printf '{"type":"system","subtype":"init","session_id":"s-stream","model":"fixture-model"}\n'
 sleep 0.1
+# Non-init system subtypes a real session emits between turns. None is a
+# session start, and none carries a model.
+printf '{"type":"system","subtype":"hook_started","session_id":"s-stream"}\n'
+printf '{"type":"system","subtype":"status_notice","session_id":"s-stream"}\n'
+sleep 0.1
+printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.rs"}}]}}\n'
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"alpha"}]}}\n'
 sleep 0.1
 printf '{"type":"content_block_delta","delta":{"type":"text_delta","text":"beta"}}\n'
