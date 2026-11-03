@@ -1059,12 +1059,21 @@ pub async fn triage_pr_comments(
 /// its type, so a record made for a review or a conversation comment says
 /// nothing about an inline comment that has the same number, and the reverse.
 fn same_resource_kind(prior: &PrReviewPlan, comments: &[PrReviewComment], cid: u64) -> bool {
-    let Some(fresh) = comments.iter().find(|c| c.id == Some(cid)) else {
+    // Delivery state is copied only between comments that each resolve to
+    // exactly one resource: a missing or repeated number names none, and a
+    // guess would carry a fix or a reply onto the wrong comment.
+    let mut fresh = comments.iter().filter(|c| c.id == Some(cid));
+    let (Some(fresh), None) = (fresh.next(), fresh.next()) else {
         return false;
     };
-    prior
-        .comment_for(cid)
-        .is_none_or(|old| old.kind == fresh.kind)
+    // A number the prior plan repeats names none of its comments. One it does
+    // not hold at all is let through here only so the caller can record the
+    // fix as unprovable; the caller copies no delivery state for it.
+    match prior.comment_count_for(cid) {
+        (0, _) => true,
+        (_, Some(old)) => old.kind == fresh.kind,
+        _ => false,
+    }
 }
 
 fn carry_forward_reanalysis_lifecycle(
@@ -1098,9 +1107,7 @@ fn carry_forward_reanalysis_lifecycle(
         // re-analysis, so a plan analyzed again after its apply (by a build
         // that did not record fixed content) holds the re-fetched text.
         let copy_is_apply_input = applied_at.is_none_or(|at| prior.generated_at <= at);
-        let used = prior.comments.iter()
-            .find(|c| c.id == Some(cid))
-            .filter(|_| copy_is_apply_input);
+        let used = prior.comment_for(cid).filter(|_| copy_is_apply_input);
         match used {
             Some(used) if applied_at.is_none_or(|at| !slashit_review_content::edited_since(used.updated_at, at)) => {
                 fixed_content.push(FixedContent { comment_id: cid, fingerprint: used.fingerprint() });
@@ -1120,7 +1127,8 @@ fn carry_forward_reanalysis_lifecycle(
 
     for item in items.iter_mut() {
         let Some(cid) = item.comment_id else { continue; };
-        let Some(prev_item) = prior.items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
+        let mut prev_items = prior.items.iter().filter(|i| i.comment_id == Some(cid));
+        let (Some(prev_item), None) = (prev_items.next(), prev_items.next()) else { continue; };
         if !same_resource_kind(prior, comments, cid) { continue; }
 
         // An undelivered fix is a fact about the checkout, not about the
@@ -1129,6 +1137,9 @@ fn carry_forward_reanalysis_lifecycle(
         // it, and a reply would then call a fix that was never pushed
         // delivered (see #79).
         if prev_item.fix_uncommitted { item.fix_uncommitted = true; }
+
+        // Delivery state follows only a comment the prior plan holds exactly once.
+        if prior.comment_for(cid).is_none() { continue; }
 
         let Some(fresh) = comments.iter().find(|c| c.id == Some(cid)) else { continue; };
         let fixed_text_unchanged = fixed_content.iter()
@@ -1430,6 +1441,27 @@ fn review_content(plan: &PrReviewPlan) -> PrReviewPlan {
     content
 }
 
+/// Why an approved fix has no comment this plan can act on.
+enum IdentityFault {
+    /// The item names no comment, or one the plan does not hold.
+    Missing,
+    /// More than one stored comment carries the number.
+    Repeated,
+}
+
+/// The identity rule of every public action on a fix (Apply and Sync): the
+/// comment the item names must resolve to exactly one stored comment.
+fn approved_fix_identity(
+    stored: &PrReviewPlan,
+    item: &PrReviewItem,
+) -> Result<(), IdentityFault> {
+    match item.comment_id.map(|id| stored.comment_count_for(id)) {
+        Some((_, Some(_))) => Ok(()),
+        Some((count, None)) if count > 1 => Err(IdentityFault::Repeated),
+        _ => Err(IdentityFault::Missing),
+    }
+}
+
 /// Refuses an Apply unless the sent plan is the stored plan of the Task, as
 /// far as its analysis is concerned. A Task without a stored plan has nothing
 /// to check against. Returns the stored plan, which is authoritative.
@@ -1472,9 +1504,9 @@ fn stored_plan_for_apply<'a>(
         if !(sent_item.approved && matches!(sent_item.decision, PrReviewDecision::Fix)) {
             continue;
         }
-        match stored_item.comment_id.map(|id| stored.comment_count_for(id)) {
-            Some((_, Some(_))) => {}
-            Some((count, None)) if count > 1 => {
+        match approved_fix_identity(stored, stored_item) {
+            Ok(()) => {}
+            Err(IdentityFault::Repeated) => {
                 return Err(
                     "A fix in this review plan names a comment number that more than one \
                      comment in the plan shares, so it cannot tell which comment to act on. \
@@ -1482,7 +1514,7 @@ fn stored_plan_for_apply<'a>(
                         .to_string(),
                 );
             }
-            _ => {
+            Err(IdentityFault::Missing) => {
                 return Err(
                     "A fix in this review plan names a comment that has no GitHub id this \
                      plan can act on. Re-analyze the PR comments, then apply again. Nothing \
@@ -2489,6 +2521,26 @@ pub async fn sync_pr_review_replies_inner(
     let (repo, number) = parse_pr_url(&pr_url)?;
     let mut updated_plan = plan;
 
+    // The identity rule Apply uses, before any call to GitHub or Git: an item
+    // that names no unique comment would be answered at PR level with a claim
+    // about a comment nobody can identify.
+    for item in updated_plan.items.iter()
+        .filter(|i| i.approved && matches!(i.decision, PrReviewDecision::Fix))
+    {
+        if let Err(fault) = approved_fix_identity(&updated_plan, item) {
+            let why = match fault {
+                IdentityFault::Repeated => "names a comment number that more than one comment in the plan shares",
+                IdentityFault::Missing => "names a comment that has no GitHub id this plan can act on",
+            };
+            return Err(format!(
+                "The fix \"{}\" (comment {}) {why}. Re-analyze the PR comments, then sync \
+                 again. Nothing was posted and the plan was not changed.",
+                item.summary.trim(),
+                item.comment_id.map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+            ));
+        }
+    }
+
     let mut replied = 0u32;
     let mut errors: Vec<String> = Vec::new();
     let mut fix_pending = 0u32;
@@ -2530,7 +2582,23 @@ pub async fn sync_pr_review_replies_inner(
 
         // Case A: no reply on GitHub yet — POST a new one.
         if !item.reply_posted {
-            match post_pr_reply(&repo, &number, updated_plan.inline_reply_target(item.comment_id), &body).await {
+            let target = updated_plan.inline_reply_target(item.comment_id);
+            // A PR-level comment has no thread, so it names the comment it
+            // answers. The stored text stays the bare reply.
+            let posted = match target {
+                Some(_) => body.clone(),
+                None => {
+                    let original = item.comment_id
+                        .and_then(|id| updated_plan.comment_for(id))
+                        .map(|c| match c.url.as_deref() {
+                            Some(url) => format!("Re {url}"),
+                            None => format!("Re the comment by @{}", c.author),
+                        })
+                        .unwrap_or_default();
+                    format!("{original}\n\n{body}")
+                }
+            };
+            match post_pr_reply(&repo, &number, target, &posted).await {
                 Ok(reply_id) => {
                     replied += 1;
                     updated_plan.items[orig_idx].reply_posted = true;
@@ -18304,7 +18372,18 @@ mod tests {
                     generated_at: chrono::Utc::now(),
                     pr_url: pr_url.to_string(),
                     review_decision: None,
-                    comments: Vec::new(),
+                    comments: vec![PrReviewComment {
+                        id: Some(1),
+                        kind: PrCommentKind::Inline,
+                        author: "rev".to_string(),
+                        author_association: None,
+                        body: "please fix".to_string(),
+                        path: None,
+                        line: None,
+                        url: None,
+                        created_at: None,
+                        updated_at: None,
+                    }],
                     items: vec![fix_item(1)],
                     raw_plan: String::new(),
                     last_apply: None,
@@ -19181,6 +19260,172 @@ mod tests {
                 sync_pr_review_replies_inner(task.clone(), worktree.to_str().unwrap().to_string(), plan)
                     .await
                     .expect("sync reports per item, not as a command error")
+            }
+
+            /// A comment of `kind` numbered `id`, for the Sync identity tests.
+            fn sync_comment(id: Option<u64>, kind: PrCommentKind, url: Option<&str>) -> PrReviewComment {
+                PrReviewComment {
+                    id,
+                    kind,
+                    author: "rev".to_string(),
+                    author_association: Some("MEMBER".to_string()),
+                    body: format!("comment {id:?}"),
+                    path: None,
+                    line: None,
+                    url: url.map(str::to_string),
+                    created_at: None,
+                    updated_at: None,
+                }
+            }
+
+            /// A fix pushed to the pull request's branch (so the delivery check
+            /// confirms it), with the forge replaced by one that logs every call.
+            /// Returns the plan, the checkout and the log; the plan holds `comments`
+            /// and `edit` has changed it before Sync runs.
+            async fn delivered_fix_with_logging_gh(
+                claude: &EditingClaude,
+                state: &crate::AppState,
+                repo: &RepoFixture,
+                comments: Vec<PrReviewComment>,
+                edit: impl FnOnce(&mut PrReviewPlan),
+            ) -> (Task, PrReviewPlan, PathBuf, PathBuf) {
+                let worktree = task_checkout_for_review(repo, false);
+                let no_jj = repo.checkout.join("no-such-jj");
+                let (task, plan) = task_with_one_fix(state, repo, &worktree).await;
+                let (first, mut plan) = apply(&task, plan, &worktree, no_jj, false).await;
+                assert!(first.pushed && plan.items[0].fix_done && !plan.items[0].fix_uncommitted, "{first:?}");
+                plan.comments = comments;
+                edit(&mut plan);
+                let log = repo.checkout.parent().unwrap().join("gh-calls.log");
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *) echo 4242 ;;\nesac\n"
+                );
+                write_executable(&claude.gh, &script);
+                (task, plan, worktree, log)
+            }
+
+            /// Every logged `gh` call except the read of the task branch's own
+            /// pull request.
+            fn gh_writes(log: &Path) -> Vec<String> {
+                std::fs::read_to_string(log)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| !l.starts_with("pr list"))
+                    .map(str::to_string)
+                    .collect()
+            }
+
+            /// Sync refuses an approved fix whose comment has no id, before any
+            /// forge call, and names the item.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_refuses_an_approved_fix_without_a_comment_id() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude, &state, &repo,
+                    vec![sync_comment(Some(7), PrCommentKind::Inline, None)],
+                    |p| p.items[0].comment_id = None,
+                ).await;
+                let before = serde_json::to_value(&plan).unwrap();
+                let err = sync_pr_review_replies_inner(task, worktree.to_str().unwrap().to_string(), plan.clone())
+                    .await
+                    .expect_err("an item without identity is refused");
+                assert!(err.contains("Nothing was posted"), "{err}");
+                assert!(!log.exists(), "no forge call: {:?}", std::fs::read_to_string(&log));
+                assert_eq!(serde_json::to_value(&plan).unwrap(), before);
+            }
+
+            /// A number two stored comments share names neither.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_refuses_an_approved_fix_whose_comment_number_is_repeated() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude, &state, &repo,
+                    vec![
+                        sync_comment(Some(1), PrCommentKind::Review, None),
+                        sync_comment(Some(1), PrCommentKind::Inline, None),
+                    ],
+                    |_| {},
+                ).await;
+                let before = serde_json::to_value(&plan).unwrap();
+                let err = sync_pr_review_replies_inner(task, worktree.to_str().unwrap().to_string(), plan.clone())
+                    .await
+                    .expect_err("a repeated number is refused");
+                assert!(err.contains("Nothing was posted"), "{err}");
+                assert!(!log.exists(), "no forge call: {:?}", std::fs::read_to_string(&log));
+                assert_eq!(serde_json::to_value(&plan).unwrap(), before);
+            }
+
+            /// A unique inline comment is answered inline, once; a second Sync
+            /// posts nothing.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_replies_inline_once_to_a_unique_inline_comment() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude, &state, &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Inline, None)],
+                    |_| {},
+                ).await;
+                let (result, plan) = sync(&task, &worktree, plan).await;
+                assert_eq!(result.replied, 1, "{result:?}");
+                assert!(plan.items[0].reply_posted && plan.items[0].fix_done, "{:?}", plan.items[0]);
+                let writes = gh_writes(&log);
+                assert_eq!(writes.len(), 1, "{writes:?}");
+                assert!(writes[0].contains("pulls/405/comments/1/replies"), "{writes:?}");
+
+                let (again, _plan) = sync(&task, &worktree, plan).await;
+                assert_eq!(again.replied, 0, "{again:?}");
+                assert_eq!(gh_writes(&log).len(), 1, "a second Sync posted again: {:?}", gh_writes(&log));
+            }
+
+            /// A unique conversation comment is answered at PR level, and the
+            /// body says which comment it answers.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_answers_a_unique_conversation_comment_at_pr_level_naming_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-77";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude, &state, &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                ).await;
+                let (result, plan) = sync(&task, &worktree, plan).await;
+                assert_eq!(result.replied, 1, "{result:?}");
+                assert!(plan.items[0].reply_posted);
+                // A multi-line body spans several log lines.
+                let writes = gh_writes(&log);
+                assert_eq!(writes.iter().filter(|l| l.starts_with("pr comment")).count(), 1, "{writes:?}");
+                assert!(writes[0].starts_with("pr comment 405"), "{writes:?}");
+                assert!(writes[0].contains(url), "the body names the original comment: {writes:?}");
+            }
+
+            /// A fix whose delivery is not confirmed gets no reply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_does_not_claim_a_fix_that_delivery_does_not_confirm() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude, &state, &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Inline, None)],
+                    |p| { p.items[0].fix_commit = None; p.items[0].fix_effect = None; },
+                ).await;
+                let (result, plan) = sync(&task, &worktree, plan).await;
+                assert_eq!((result.replied, result.fix_pending), (0, 1), "{result:?}");
+                assert!(!plan.items[0].reply_posted);
+                assert!(gh_writes(&log).is_empty(), "{:?}", gh_writes(&log));
             }
 
             /// [`apply`] with pushing switched off.
@@ -23737,6 +23982,37 @@ mod review_plan_provenance {
         let mut items = vec![identity_fix(Some(5))];
         carry_forward_reanalysis_lifecycle(&mut items, &prior, &comments);
         assert!(!items[0].fix_done && !items[0].reply_posted, "{:?}", items[0]);
+    }
+
+    /// A number the prior plan repeats names no comment, so nothing is carried
+    /// onto a fresh comment that has it.
+    #[test]
+    fn carry_forward_does_not_copy_state_for_a_repeated_number() {
+        let prior = identity_plan(
+            vec![
+                identity_comment(Some(5), PrCommentKind::Review),
+                identity_comment(Some(5), PrCommentKind::Inline),
+            ],
+            vec![PrReviewItem { fix_done: true, reply_posted: true, ..identity_fix(Some(5)) }],
+        );
+        let comments = vec![identity_comment(Some(5), PrCommentKind::Inline)];
+        let mut items = vec![identity_fix(Some(5))];
+        let fixed = carry_forward_reanalysis_lifecycle(&mut items, &prior, &comments);
+        assert!(!items[0].fix_done && !items[0].reply_posted, "{:?}", items[0]);
+        assert!(fixed.is_empty(), "{fixed:?}");
+    }
+
+    /// A unique comment of the same kind is still carried.
+    #[test]
+    fn carry_forward_still_carries_a_unique_same_kind_comment() {
+        let prior = identity_plan(
+            vec![identity_comment(Some(5), PrCommentKind::Inline)],
+            vec![PrReviewItem { fix_done: true, reply_posted: true, ..identity_fix(Some(5)) }],
+        );
+        let comments = vec![identity_comment(Some(5), PrCommentKind::Inline)];
+        let mut items = vec![identity_fix(Some(5))];
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &comments);
+        assert!(items[0].fix_done && items[0].reply_posted, "{:?}", items[0]);
     }
 
     /// Every page of a REST list is read; a truncated page is an error, and an
