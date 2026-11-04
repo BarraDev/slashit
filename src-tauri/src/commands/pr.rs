@@ -1750,13 +1750,15 @@ fn null_paths(listing: &str) -> Vec<String> {
 /// One hashable record of a worktree path: its status letter, the kind the
 /// file system now shows (deleted, file, executable, symlink with target)
 /// and the SHA-256 of its content. Failures fail the whole capture loudly.
+/// The executable kind is the POSIX mode-bit check; where mode bits do not
+/// exist every non-link path records as a plain file, which stays consistent
+/// because a fingerprint only ever compares captures of the same checkout.
 async fn worktree_record(working_dir: &str, status: &str, rel: &str) -> Result<String, String> {
-    use std::os::unix::fs::PermissionsExt;
     let base = std::path::Path::new(working_dir);
     let path = base.join(rel);
     match tokio::fs::symlink_metadata(&path).await {
         Ok(meta) => {
-            let (kind, content) = if meta.file_type().is_symlink() {
+            let content = if meta.file_type().is_symlink() {
                 let target = tokio::fs::read_link(&path)
                     .await
                     .map_err(|e| format!("reading the checkout link {rel} failed: {e}"))?;
@@ -1764,26 +1766,37 @@ async fn worktree_record(working_dir: &str, status: &str, rel: &str) -> Result<S
                     "symlink".to_string(),
                     target.as_os_str().to_string_lossy().into_owned().into_bytes(),
                 )
-            } else if meta.permissions().mode() & 0o111 != 0 {
-                ("exec".to_string(), tokio::fs::read(&path).await.map_err(
-                    |e| format!("reading the checkout file {rel} failed: {e}"),
-                )?)
             } else {
                 (
-                    "file".to_string(),
-                    tokio::fs::read(&path).await
-                        .map_err(|e| format!("reading the checkout file {rel} failed: {e}"))?,
+                    path_kind(&meta).to_string(),
+                    tokio::fs::read(&path).await.map_err(
+                        |e| format!("reading the checkout file {rel} failed: {e}"),
+                    )?,
                 )
             };
             Ok(format!(
-                "{rel}\t[{status}]\t{kind}\t{}\t{:x}",
-                content.len(),
-                sha2::Sha256::digest(&content)
+                "{rel}\t[{status}]\t{}\t{}\t{:x}",
+                content.0,
+                content.1.len(),
+                sha2::Sha256::digest(&content.1)
             ))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(format!("{rel}\t[{status}]\tdeleted")),
         Err(e) => Err(format!("reading the checkout state of {rel} failed: {e}")),
     }
+}
+
+/// The kind of a non-link checkout path: executable where mode bits exist,
+/// a plain file everywhere else.
+#[cfg(unix)]
+fn path_kind(meta: &std::fs::Metadata) -> &'static str {
+    use std::os::unix::fs::PermissionsExt;
+    if meta.permissions().mode() & 0o111 != 0 { "exec" } else { "file" }
+}
+
+#[cfg(not(unix))]
+fn path_kind(_meta: &std::fs::Metadata) -> &'static str {
+    "file"
 }
 /// Re-reads the PR head and refuses when `plan` was analyzed at another one.
 /// A plan without provenance is not checked here: [`address_pr_review`]
