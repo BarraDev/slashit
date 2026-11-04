@@ -76,6 +76,16 @@ struct MockEnv {
 #[cfg(unix)]
 const END_PROMPT: &str = "---END-PROMPT---";
 
+/// The GitHub account the mock `gh` answers `gh api user` with.
+///
+/// The reply code adopts, or refuses to post, replies based on this identity
+/// (`gh_authenticated_login`), so a mock without this answer fails closed and
+/// blocks every reply assertion. Each listing fixture below carries
+/// `user.login` values that either name this account or do not, and both
+/// outcomes are asserted.
+#[cfg(unix)]
+const GH_LOGIN: &str = "test-account";
+
 #[cfg(unix)]
 impl MockEnv {
     fn setup(claude_result: &str) -> Self {
@@ -117,10 +127,12 @@ impl MockEnv {
         );
         write_executable(&bin_dir.join("claude"), &claude_script);
 
-        // Mock `gh` — records argv, reports the fixture's own PR for the
-        // task branch, and returns successful empty JSON for reply calls.
+        // Mock `gh` — records argv, answers `gh api user` with the account
+        // that posts replies ([`GH_LOGIN`]), reports the fixture's own PR for
+        // the task branch, answers a full comment listing with an empty
+        // array, and returns successful empty JSON for other calls.
         let gh_script = format!(
-            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/test-org/test-repo/pull/42\",\"isCrossRepository\":false}}]' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\n",
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n  *'api user'*) printf '%s\\n' '{GH_LOGIN}' ;;\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/test-org/test-repo/pull/42\",\"isCrossRepository\":false}}]' ;;\n  *'pulls/42/comments?per_page=100'*) printf '%s\\n' '[]' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\n",
             log = gh_log,
         );
         write_executable(&bin_dir.join("gh"), &gh_script);
@@ -532,6 +544,10 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
     ];
 
     let plan = PrReviewPlan {
+        analyzed_head_oid: None,
+        analyzed_worktree_oid: None,
+        analyzed_worktree_fingerprint: None,
+        analyzed_at: None,
         generated_at: chrono::Utc::now(),
         pr_url: task.pr_url.clone().unwrap(),
         review_decision: None,
@@ -772,6 +788,10 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
     ];
 
     let plan = PrReviewPlan {
+        analyzed_head_oid: None,
+        analyzed_worktree_oid: None,
+        analyzed_worktree_fingerprint: None,
+        analyzed_at: None,
         generated_at: chrono::Utc::now(),
         pr_url: task.pr_url.clone().unwrap(),
         review_decision: None,
@@ -978,6 +998,11 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
             .expect("sync succeeds");
 
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
+    let gh_log = env.read_gh_log();
+    assert!(
+        gh_log.lines().any(|l| l == "api") && gh_log.lines().any(|l| l == "user"),
+        "sync verifies the posting account before it looks for existing replies"
+    );
     assert_eq!(env.gh_invocations(), 1, "sync should reply exactly once (only item 0)");
     assert_eq!(result.replied, 1);
     assert_eq!(result.discovered, 0);
@@ -996,13 +1021,13 @@ async fn sync_pr_review_replies_discovers_and_rewrites_a_legacy_reply() {
 
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
-    // Override the default mock `gh` (which always returns `{}`) with one
-    // that answers the two calls this path actually makes: the paginated
-    // comment listing `discover_reply_comment_id` parses as a JSON array,
-    // and the `-X PATCH` rewrite. Anything else falls back to `{}`, matching
-    // `MockEnv`'s own default.
+    // Override the default mock `gh` with one that answers the calls this
+    // path actually makes: the posting account the identity lookup consults,
+    // the paginated comment listing `discover_reply_comment_id` parses as a
+    // JSON array, and the `-X PATCH` rewrite. Anything else falls back to
+    // `{}`, matching `MockEnv`'s own default.
     let gh_script = format!(
-        "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n  *'-X PATCH'*) printf '%s\\n' '{{}}' ;;\n  *'pulls/42/comments?per_page=100'*) printf '%s\\n' '[{{\"id\":9001,\"in_reply_to_id\":301,\"created_at\":\"2024-01-01T00:00:00Z\"}}]' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\n",
+        "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n  *'api user'*) printf '%s\\n' '{GH_LOGIN}' ;;\n  *'-X PATCH'*) printf '%s\\n' '{{}}' ;;\n  *'pulls/42/comments?per_page=100'*) printf '%s\\n' '[{{\"id\":9001,\"in_reply_to_id\":301,\"created_at\":\"2024-01-01T00:00:00Z\",\"user\":{{\"login\":\"{GH_LOGIN}\"}}}}]' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\n",
         log = env.gh_log,
     );
     write_executable(&env.bin_dir.join("gh"), &gh_script);
@@ -1033,6 +1058,85 @@ async fn sync_pr_review_replies_discovers_and_rewrites_a_legacy_reply() {
         "discovered id must be persisted so a future sync can PATCH directly"
     );
     assert!(updated_plan.items[0].pr_reply_text.is_some(), "rewrite records the body it wrote");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_pr_review_replies_adopts_no_reply_written_by_a_different_account() {
+    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
+
+    let _guard = PATH_LOCK.lock().await;
+    let env = MockEnv::setup("not used");
+    // The account is verified (`gh api user` works), but the reply on the
+    // thread is not this account's: one written by someone else, one with no
+    // `user` at all. Discovery must adopt neither, so nothing was verified
+    // ours to rewrite, and the item stays unaccounted for.
+    let gh_script = format!(
+        "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n  *'api user'*) printf '%s\\n' '{GH_LOGIN}' ;;\n  *'-X PATCH'*) printf '%s\\n' '{{}}' ;;\n  *'pulls/42/comments?per_page=100'*) printf '%s\\n' '[{{\"id\":9002,\"in_reply_to_id\":301,\"created_at\":\"2024-01-01T00:00:00Z\",\"user\":{{\"login\":\"someone-else\"}}}},{{\"id\":9003,\"in_reply_to_id\":301,\"created_at\":\"2024-01-02T00:00:00Z\"}}]' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\n",
+        log = env.gh_log,
+    );
+    write_executable(&env.bin_dir.join("gh"), &gh_script);
+
+    let (task, mut plan) = create_test_two_fix_setup();
+    plan.items[0].fix_done = true;
+    plan.items[0].reply_posted = true;
+    plan.items[0].reply_comment_id = None;
+    plan.items[0].pr_reply_text = None;
+
+    let (result, updated_plan) =
+        sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await
+            .expect("sync succeeds");
+
+    assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
+    assert_eq!(result.discovered, 0, "no reply by another account is ours to adopt");
+    assert_eq!(result.unmatched, 1, "the item's own reply stays unaccounted for");
+    assert_eq!(result.rewritten, 0, "nothing was rewritten on somebody else's reply");
+    assert_eq!(result.replied, 0);
+    assert_eq!(env.gh_invocations(), 0, "no POST and no PATCH reached GitHub");
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    assert_eq!(updated_plan.items[0].reply_comment_id, None, "adoption was refused, nothing recorded");
+    assert!(updated_plan.items[0].pr_reply_text.is_none(), "no body claims a rewrite that never happened");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_pr_review_replies_posts_no_reply_the_account_cannot_verify() {
+    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
+
+    let _guard = PATH_LOCK.lock().await;
+    let env = MockEnv::setup("not used");
+    // The posting account cannot be verified: `gh api user` fails. With no
+    // verified identity, a reply already on the thread cannot be recognized
+    // as ours, so a second POST could duplicate a reply whose response was
+    // lost. Sync refuses to post and reports the reason instead.
+    let gh_script = format!(
+        "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n  *'api user'*) exit 1 ;;\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/test-org/test-repo/pull/42\",\"isCrossRepository\":false}}]' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\n",
+        log = env.gh_log,
+    );
+    write_executable(&env.bin_dir.join("gh"), &gh_script);
+
+    let (task, mut plan) = create_test_two_fix_setup();
+    plan.items[0].fix_done = true;
+    let (commit, effect) = env.deliver_fix("fix-a.txt");
+    plan.items[0].fix_commit = Some(commit);
+    plan.items[0].fix_effect = Some(effect);
+    plan.items[0].reply_posted = false;
+
+    let (result, updated_plan) =
+        sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await
+            .expect("sync succeeds");
+
+    assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
+    assert_eq!(result.replied, 0, "no reply was posted without a verified account");
+    assert_eq!(env.gh_invocations(), 0, "no POST reached GitHub");
+    assert_eq!(result.errors.len(), 1, "errors: {:?}", result.errors);
+    assert!(
+        result.errors[0].contains("could not be"),
+        "the refusal names the unverifiable account: {:?}",
+        result.errors[0],
+    );
+    assert!(!updated_plan.items[0].reply_posted, "nothing was marked posted");
+    assert!(updated_plan.items[0].pr_reply_text.is_none(), "no body was recorded");
 }
 
 #[cfg(unix)]
@@ -1134,6 +1238,10 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
 
     // Dry-run results are intentionally ignored.
     let mut dry_plan = PrReviewPlan {
+        analyzed_head_oid: None,
+        analyzed_worktree_oid: None,
+        analyzed_worktree_fingerprint: None,
+        analyzed_at: None,
         generated_at: chrono::Utc::now(),
         pr_url: "x".to_string(),
         review_decision: None,

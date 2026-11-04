@@ -261,14 +261,24 @@ impl FakeProgram {
     pub fn add(&self, name: &str, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         let program = self.dir.path().join(name);
-        std::fs::write(
-            &program,
-            format!(
-                "#!/bin/sh\nprintf '%s %s\\n' {name:?} \"$*\" >> {:?}\n{body}\n",
-                self.log
-            ),
-        )
-        .expect("write fake program");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s %s\\n' {name:?} \"$*\" >> {:?}\n{body}\n",
+            self.log
+        );
+        // The script is written by a short-lived child, not by this process.
+        // A descriptor this process holds open for writing is inherited by
+        // any thread's fork until that child execs, and executing the script
+        // then fails with ETXTBSY.
+        let written = std::process::Command::new("/bin/sh")
+            .env_clear()
+            .arg("-c")
+            .arg(r#"printf '%s' "$1" > "$2""#)
+            .arg("sh")
+            .arg(&script)
+            .arg(&program)
+            .status()
+            .expect("run sh to write fake program");
+        assert!(written.success(), "writing fake program failed: {written}");
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake program");
     }
@@ -764,6 +774,10 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
         raw_plan: String::new(),
         last_apply: None,
         fixed_content: Vec::new(),
+        analyzed_head_oid: None,
+        analyzed_worktree_oid: None,
+        analyzed_worktree_fingerprint: None,
+        analyzed_at: None,
     };
 
     (task, plan)
@@ -784,6 +798,74 @@ mod tests {
     fn test_create_test_task_with_status() {
         let task = create_test_task_with_status("In Progress Task", TaskStatus::InProgress);
         assert!(matches!(task.status, TaskStatus::InProgress));
+    }
+}
+
+/// Installing a fake program must not race other threads' `fork`: a fork
+/// that happens while the script is still open for writing hands the child
+/// that writable descriptor until its `exec`, and executing the script then
+/// fails with `ETXTBSY`.
+#[cfg(all(test, unix))]
+mod fake_install_race_tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Eight threads that run `/bin/true` until dropped, each joined: the
+    /// spawner pressure the fake-program install must survive, stopped
+    /// deterministically even when the test body panics (the guard's `Drop`
+    /// runs during unwinding).
+    struct SpawnerThreads {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handles: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl SpawnerThreads {
+        fn start(count: usize) -> Self {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+            let stop = Arc::new(AtomicBool::new(false));
+            let handles: Vec<_> = (0..count)
+                .map(|_| {
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            let _ = Command::new("/bin/true").status();
+                        }
+                    })
+                })
+                .collect();
+            Self { stop, handles }
+        }
+    }
+
+    impl Drop for SpawnerThreads {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            self.stop.store(true, Ordering::Relaxed);
+            for handle in self.handles.drain(..) {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_installed_program_executes_while_other_threads_spawn() {
+        let fake = FakeProgram::install("seed", "exit 0").await;
+        let spawners = SpawnerThreads::start(8);
+        for i in 0..200 {
+            let name = format!("fake-{i}");
+            fake.add(&name, "exit 0");
+            let program = fake.dir.path().join(&name);
+            let status = Command::new(&program)
+                .status()
+                .unwrap_or_else(|error| panic!("{} did not execute: {error}", program.display()));
+            assert!(
+                status.success(),
+                "{} exited with {status}",
+                program.display()
+            );
+        }
+        drop(spawners);
     }
 }
 

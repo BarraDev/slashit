@@ -10,6 +10,7 @@ use crate::config::Storage;
 use crate::queue::PrHelperPurpose;
 use crate::worktree::checked_task_branch;
 use crate::agents::runner::truncate_one_line;
+use sha2::Digest as _;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -905,6 +906,18 @@ pub async fn analyze_pr_comments(
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
     let pr_url = pr_url_for_task(&task)?;
+    // Record the checkout state the triage helper is about to read: its
+    // branch tip and the content of its uncommitted changes. An analysis
+    // that cannot prove which checkout state it runs on must not produce
+    // one.
+    let facts = worktree_state_facts(
+        &working_dir,
+        task.branch_name.as_deref().ok_or(
+            "this task records no branch, so the checkout state could not be recorded",
+        )?,
+    )
+    .await
+    .map_err(|e| format!("the checkout state could not be recorded, so no analysis ran: {e}"))?;
 
     // Preserve apply history across a re-analyze: same PR URL means the user
     // is refreshing comments, not switching contexts, so `last_apply` and the
@@ -914,16 +927,17 @@ pub async fn analyze_pr_comments(
         .filter(|p| p.pr_url == pr_url);
 
     eprintln!("[pr-review] analyze {} for task {}", pr_url, task_uuid);
-    let (review_decision, comments) = fetch_pr_review_data(&pr_url).await?;
+    let (head_oid, review_decision, comments) = fetch_pr_review_data(&pr_url).await?;
     eprintln!(
         "[pr-review] {} comments fetched (decision={:?})",
         comments.len(), review_decision,
     );
+    let generated_at = chrono::Utc::now();
     if comments.is_empty() {
         // Don't cache empty plans — reviewers can still leave comments later
         // and the user shouldn't have to remember to hit Re-analyze.
         return Ok(PrReviewPlan {
-            generated_at: chrono::Utc::now(),
+            generated_at,
             pr_url,
             review_decision,
             comments,
@@ -931,6 +945,10 @@ pub async fn analyze_pr_comments(
             raw_plan: String::new(),
             last_apply: prior_plan.as_ref().and_then(|p| p.last_apply.clone()),
             fixed_content: prior_plan.map(|p| p.fixed_content).unwrap_or_default(),
+            analyzed_head_oid: Some(head_oid),
+            analyzed_worktree_oid: Some(facts.tip.clone()),
+            analyzed_worktree_fingerprint: Some(facts.fingerprint.clone()),
+            analyzed_at: Some(generated_at),
         });
     }
 
@@ -951,8 +969,24 @@ pub async fn analyze_pr_comments(
         None => Vec::new(),
     };
 
+    // The triage helper read the checkout as the first capture saw it. A
+    // checkout that moved under the analysis — a commit, a discarded edit, a
+    // freshly saved file, a changed mode — would leave fix instructions
+    // formed from a content nothing re-reads, so the record is refused
+    // instead of saved. This is read-only; re-analyzing binds the checkout
+    // as it stands now.
+    let after = worktree_state_facts(
+        &working_dir,
+        task.branch_name.as_deref()
+            .expect("the first capture demanded the branch"),
+    )
+    .await?;
+    if after != facts {
+        return Err(analysis_not_stable(&facts, &after));
+    }
+
     let plan = PrReviewPlan {
-        generated_at: chrono::Utc::now(),
+        generated_at,
         pr_url,
         review_decision,
         comments,
@@ -960,6 +994,10 @@ pub async fn analyze_pr_comments(
         raw_plan: raw_output,
         last_apply: prior_plan.and_then(|p| p.last_apply),
         fixed_content,
+        analyzed_head_oid: Some(head_oid),
+        analyzed_worktree_oid: Some(facts.tip),
+        analyzed_worktree_fingerprint: Some(facts.fingerprint),
+        analyzed_at: Some(generated_at),
     };
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, plan.clone()).await?;
     Ok(plan)
@@ -1049,6 +1087,28 @@ pub async fn triage_pr_comments(
 /// backfill cannot restore it from a timestamp that happens to fit. It fails
 /// toward reprocessing: that costs one apply, whereas wrongly calling it fixed
 /// would repeat the bug and could never be noticed.
+/// Whether the comment `cid` of the prior plan and the one of the new analysis
+/// are the same kind of GitHub resource. A number names a resource only with
+/// its type, so a record made for a review or a conversation comment says
+/// nothing about an inline comment that has the same number, and the reverse.
+fn same_resource_kind(prior: &PrReviewPlan, comments: &[PrReviewComment], cid: u64) -> bool {
+    // Delivery state is copied only between comments that each resolve to
+    // exactly one resource: a missing or repeated number names none, and a
+    // guess would carry a fix or a reply onto the wrong comment.
+    let mut fresh = comments.iter().filter(|c| c.id == Some(cid));
+    let (Some(fresh), None) = (fresh.next(), fresh.next()) else {
+        return false;
+    };
+    // A number the prior plan repeats names none of its comments. One it does
+    // not hold at all is let through here only so the caller can record the
+    // fix as unprovable; the caller copies no delivery state for it.
+    match prior.comment_count_for(cid) {
+        (0, _) => true,
+        (_, Some(old)) => old.kind == fresh.kind,
+        _ => false,
+    }
+}
+
 fn carry_forward_reanalysis_lifecycle(
     items: &mut [PrReviewItem],
     prior: &PrReviewPlan,
@@ -1068,7 +1128,7 @@ fn carry_forward_reanalysis_lifecycle(
 
     let mut fixed_content = Vec::new();
     for cid in ids {
-        if !comments.iter().any(|c| c.id == Some(cid)) {
+        if !comments.iter().any(|c| c.id == Some(cid)) || !same_resource_kind(prior, comments, cid) {
             continue;
         }
         if let Some(recorded) = prior.fixed_fingerprint(cid) {
@@ -1080,9 +1140,7 @@ fn carry_forward_reanalysis_lifecycle(
         // re-analysis, so a plan analyzed again after its apply (by a build
         // that did not record fixed content) holds the re-fetched text.
         let copy_is_apply_input = applied_at.is_none_or(|at| prior.generated_at <= at);
-        let used = prior.comments.iter()
-            .find(|c| c.id == Some(cid))
-            .filter(|_| copy_is_apply_input);
+        let used = prior.comment_for(cid).filter(|_| copy_is_apply_input);
         match used {
             Some(used) if applied_at.is_none_or(|at| !slashit_review_content::edited_since(used.updated_at, at)) => {
                 fixed_content.push(FixedContent { comment_id: cid, fingerprint: used.fingerprint() });
@@ -1102,7 +1160,9 @@ fn carry_forward_reanalysis_lifecycle(
 
     for item in items.iter_mut() {
         let Some(cid) = item.comment_id else { continue; };
-        let Some(prev_item) = prior.items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
+        let mut prev_items = prior.items.iter().filter(|i| i.comment_id == Some(cid));
+        let (Some(prev_item), None) = (prev_items.next(), prev_items.next()) else { continue; };
+        if !same_resource_kind(prior, comments, cid) { continue; }
 
         // An undelivered fix is a fact about the checkout, not about the
         // comment's wording, so it survives an edit: dropping it would let
@@ -1110,6 +1170,9 @@ fn carry_forward_reanalysis_lifecycle(
         // it, and a reply would then call a fix that was never pushed
         // delivered (see #79).
         if prev_item.fix_uncommitted { item.fix_uncommitted = true; }
+
+        // Delivery state follows only a comment the prior plan holds exactly once.
+        if prior.comment_for(cid).is_none() { continue; }
 
         let Some(fresh) = comments.iter().find(|c| c.id == Some(cid)) else { continue; };
         let fixed_text_unchanged = fixed_content.iter()
@@ -1309,11 +1372,31 @@ pub async fn address_pr_review(
 ) -> Result<PrReviewApplyResult, String> {
     use tauri::Emitter;
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    // Record the dry-run decision first; it is what the helper lease is
+    // acquired for, and the pre-flight runs under that lease so no analysis
+    // can save a different plan between the checks and the final persist.
+    let purpose =
+        if options.dry_run { PrHelperPurpose::Inspection } else { PrHelperPurpose::Editing };
+    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid, purpose).await?;
     let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let task = {
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
+
+    // Refuse before anything is edited, pushed or replied to. The stored plan
+    // is what the Task was analyzed under, so the plan sent by the webview
+    // must agree with it, both must match the PR's head as it is now, and the
+    // checkout must still be the state the analysis read.
+    let pr_url = pr_url_for_task(&task)?;
+    check_apply_preflight(
+        task.pr_review_plan.as_ref(),
+        &plan,
+        &pr_url,
+        &working_dir,
+        task.branch_name.as_deref(),
+    )
+    .await?;
 
     let app_handle = app.clone();
     let progress: ProgressSink = std::sync::Arc::new(move |ev: PrReviewProgress| {
@@ -1329,9 +1412,6 @@ pub async fn address_pr_review(
     plan.backfill_lifecycle_from_last_apply();
     // A dry run is the same flag that makes every provider call below
     // read-only and skips the commit, push and replies; anything else can edit.
-    let purpose =
-        if options.dry_run { PrHelperPurpose::Inspection } else { PrHelperPurpose::Editing };
-    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid, purpose).await?;
     let provider_lease_path = crate::queue::task_provider_lease_path(&state.storage, task_uuid);
     let (result, updated_plan) = address_pr_review_inner(
         task,
@@ -1345,6 +1425,393 @@ pub async fn address_pr_review(
     .await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
+}
+
+/// The head commit GitHub reports for `pr_url` now.
+async fn current_pr_head_oid(pr_url: &str) -> Result<String, String> {
+    let (repo, number) = parse_pr_url(pr_url)?;
+    let json = run_cmd_no_cwd(
+        "gh",
+        &["pr", "view", &number, "--repo", &repo, "--json", "headRefOid"],
+    ).await?;
+    pr_head_oid_from_json(&json)
+}
+
+/// Refuses a plan that was not analyzed at `current_head`. A plan saved
+/// before its analyzed head was recorded has no provenance and counts as
+/// unknown, so it must be analyzed again. The plan is left as it is: nothing
+/// here changes it.
+fn check_plan_matches_pr_head(plan: &PrReviewPlan, current_head: &str) -> Result<(), String> {
+    match plan.analyzed_head_oid.as_deref() {
+        None => Err(
+            "This review plan does not record which pull request head it was analyzed at, \
+             so it cannot be applied. Re-analyze the PR comments, then apply again. \
+             Nothing was changed."
+                .to_string(),
+        ),
+        Some(analyzed) if analyzed != current_head => Err(format!(
+            "The pull request head moved from {} to {} after this review plan was analyzed. \
+             Re-analyze the PR comments, then apply again. Nothing was changed.",
+            short_oid(analyzed),
+            short_oid(current_head),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// What an Apply may change in a plan the webview sent back: the per-item
+/// decision and lifecycle fields, and the run bookkeeping. Everything else is
+/// content (comment ids, bodies, paths, the fix instructions) that the
+/// analysis fixed, and the stored plan is the only authority for it. The
+/// decision fields are left out here because [`stored_plan_for_apply`] checks
+/// each approved Fix item on its own.
+fn review_content(plan: &PrReviewPlan) -> PrReviewPlan {
+    let mut content = plan.clone();
+    content.last_apply = None;
+    content.fixed_content.clear();
+    for item in &mut content.items {
+        item.decision = PrReviewDecision::Fix;
+        item.approved = false;
+        item.user_note.clear();
+        item.fix_done = false;
+        item.fix_uncommitted = false;
+        item.fix_commit = None;
+        item.fix_effect = None;
+        item.reply_posted = false;
+        item.last_agent_summary = None;
+        item.last_error = None;
+        item.reply_comment_id = None;
+    }
+    content
+}
+
+/// Why an approved fix has no comment this plan can act on.
+enum IdentityFault {
+    /// The item names no comment, or one the plan does not hold.
+    Missing,
+    /// More than one stored comment carries the number.
+    Repeated,
+}
+
+/// The identity rule of every public action on a fix (Apply and Sync): the
+/// comment the item names must resolve to exactly one stored comment.
+fn approved_fix_identity(
+    stored: &PrReviewPlan,
+    item: &PrReviewItem,
+) -> Result<(), IdentityFault> {
+    match item.comment_id.map(|id| stored.comment_count_for(id)) {
+        Some((_, Some(_))) => Ok(()),
+        Some((count, None)) if count > 1 => Err(IdentityFault::Repeated),
+        _ => Err(IdentityFault::Missing),
+    }
+}
+
+/// Refuses an Apply unless the sent plan is the stored plan of the Task, as
+/// far as its analysis is concerned. A Task without a stored plan has nothing
+/// to check against. Returns the stored plan, which is authoritative.
+fn stored_plan_for_apply<'a>(
+    stored: Option<&'a PrReviewPlan>,
+    sent: &PrReviewPlan,
+) -> Result<&'a PrReviewPlan, String> {
+    let Some(stored) = stored else {
+        return Err(
+            "This Task has no stored review plan to apply. Analyze the PR comments again. \
+             Nothing was changed."
+                .to_string(),
+        );
+    };
+    if sent.analyzed_head_oid != stored.analyzed_head_oid
+        || sent.analyzed_at != stored.analyzed_at
+        || sent.analyzed_worktree_oid != stored.analyzed_worktree_oid
+        || sent.analyzed_worktree_fingerprint != stored.analyzed_worktree_fingerprint
+    {
+        return Err(
+            "The review plan being applied is not the one stored for this Task. Re-analyze \
+             the PR comments, then apply again. Nothing was changed."
+                .to_string(),
+        );
+    }
+    if review_content(sent) != review_content(stored) {
+        return Err(
+            "The review plan being applied differs from the one stored for this Task in its \
+             comments or fix instructions. Re-analyze the PR comments, then apply again. \
+             Nothing was changed."
+                .to_string(),
+        );
+    }
+    // The approved items Apply runs come from the sent plan, and the client
+    // may approve an item the stored plan left unapproved. Each approved Fix
+    // is checked against the stored item at the same position (the content
+    // above already agrees), and the comment it names must resolve to exactly
+    // one stored comment. A comment with no id, or a number the plan repeats,
+    // has no identity to act on, so Apply refuses before any edit, push or
+    // reply.
+    for (stored_item, sent_item) in stored.items.iter().zip(&sent.items) {
+        if !(sent_item.approved && matches!(sent_item.decision, PrReviewDecision::Fix)) {
+            continue;
+        }
+        match approved_fix_identity(stored, stored_item) {
+            Ok(()) => {}
+            Err(IdentityFault::Repeated) => {
+                return Err(
+                    "A fix in this review plan names a comment number that more than one \
+                     comment in the plan shares, so it cannot tell which comment to act on. \
+                     Re-analyze the PR comments, then apply again. Nothing was changed."
+                        .to_string(),
+                );
+            }
+            Err(IdentityFault::Missing) => {
+                return Err(
+                    "A fix in this review plan names a comment that has no GitHub id this \
+                     plan can act on. Re-analyze the PR comments, then apply again. Nothing \
+                     was changed."
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(stored)
+}
+
+/// Everything the Apply command checks before any file edit, push or reply:
+/// the sent plan must be the stored one (content included, checked before any
+/// `gh` call), and the stored plan must have been analyzed at the PR's current
+/// head. A plan without provenance counts as unknown and is refused.
+async fn check_apply_preflight(
+    stored: Option<&PrReviewPlan>,
+    sent: &PrReviewPlan,
+    pr_url: &str,
+    working_dir: &str,
+    branch: Option<&str>,
+) -> Result<(), String> {
+    let stored = stored_plan_for_apply(stored, sent)?;
+    check_plan_matches_worktree(stored, working_dir, branch).await?;
+    let current_head = current_pr_head_oid(pr_url).await?;
+    check_plan_matches_pr_head(stored, &current_head)
+}
+
+/// Refuses an Apply unless the checkout the fix instructions were formed from
+/// is the checkout they would be applied to. Every refusal is read-only: the
+/// checkout's commits and edits are never reset, discarded or replaced, and
+/// the recorded state is only ever refreshed by a new analysis.
+///
+/// A plan that does not record the checkout's provenance counts as unknown
+/// and must be analyzed again, exactly like a plan without the analyzed PR
+/// head. The task branch and its uncommitted state are checked separately so
+/// the two refusals say which part moved.
+async fn check_plan_matches_worktree(
+    plan: &PrReviewPlan,
+    working_dir: &str,
+    branch: Option<&str>,
+) -> Result<(), String> {
+    let unknown = || {
+        "This review plan does not record the checkout state it was analyzed under, so it \
+         cannot be applied. Re-analyze the PR comments, then apply again. Nothing was changed."
+            .to_string()
+    };
+    // Unknown provenance is refused before the checkout is touched at all:
+    // the pre-fix records carry no worktree id or content fingerprint. The
+    // branch and uncommitted-content provenance are a pair from one analysis.
+    if plan.analyzed_worktree_oid.is_none() || plan.analyzed_worktree_fingerprint.is_none() {
+        return Err(unknown());
+    }
+    let branch = branch.ok_or(
+        "The task has no branch recorded, so its checkout state cannot be checked against \
+         this review plan. Analyze the PR comments again, then apply again. Nothing was changed.",
+    )?;
+    let tip = match git_branch_tip(working_dir, branch).await? {
+        Some(tip) => tip,
+        None => {
+            return Err(format!(
+                "the task's branch '{branch}' has no tip in the checkout, so the checkout state \
+                 cannot be checked. Resolve the checkout, then re-analyze the PR comments. \
+                 Nothing was changed."
+            ))
+        }
+    };
+    match plan.analyzed_worktree_oid.as_deref() {
+        None => Err(unknown()),
+        Some(analyzed) if analyzed != tip => Err(format!(
+            "The task's checkout moved from {} to {} after this review plan was analyzed. \
+             Re-analyze the PR comments against the checkout as it is, then apply again. \
+             Nothing was changed.",
+            short_oid(analyzed),
+            short_oid(&tip),
+        )),
+        Some(_) => Ok(()),
+    }?;
+    let fingerprint = worktree_content_fingerprint(working_dir).await?;
+    match plan.analyzed_worktree_fingerprint.as_deref() {
+        None => Err(unknown()),
+        Some(analyzed) if analyzed != fingerprint => Err(
+            "The checkout's content is not what this review plan was analyzed under: a file \
+             it names can have been edited again, restaged, deleted or added since the \
+             analysis read it, while its status letter looks unchanged. Re-analyze the PR \
+             comments against the checkout as it is, then apply again. Nothing was changed \
+             and no edit was discarded."
+                .to_string(),
+        ),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The checkout facts one analysis binds: the task branch's tip and the
+/// content fingerprint of its uncommitted state. Recorded at the start of
+/// the analysis and re-read before the plan is saved, so a checkout that
+/// moved under the triage helper cannot be recorded as stable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckoutFacts {
+    tip: String,
+    fingerprint: String,
+}
+
+/// The refusal when the checkout moved under the analysis: the fix
+/// instructions must not be recorded for a content that then went away.
+fn analysis_not_stable(recording: &CheckoutFacts, after: &CheckoutFacts) -> String {
+    let _ = (recording, after);
+    "The checkout changed during the analysis, so its fix instructions were formed from a \
+     content that then went away. The plan was not recorded and nothing was edited. \
+     Re-analyze the PR comments against the checkout as it stands now."
+        .to_string()
+}
+
+async fn worktree_state_facts(working_dir: &str, branch: &str) -> Result<CheckoutFacts, String> {
+    let tip = git_branch_tip(working_dir, branch)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "the task's branch '{branch}' has no tip in {working_dir}, so the checkout state \
+                 could not be recorded"
+            )
+        })?;
+    let fingerprint = worktree_content_fingerprint(working_dir).await?;
+    Ok(CheckoutFacts { tip, fingerprint })
+}
+
+/// Fingerprint the checkout's uncommitted state as content, not as a listing.
+/// `git status`-shape digests record paths and status codes only, so a file
+/// that keeps its `M` letter through a second edit would hash the same and an
+/// Apply would run fix instructions formed from an older content. Instead,
+/// every tracked path that differs from HEAD (staged or unstaged, deletions
+/// and type changes included) and every untracked path is read from the file
+/// system, and the record hashes its status, current kind (deleted, file,
+/// executable, symlink target), size and SHA-256 content — what the triage
+/// helper actually reads. `--no-renames` turns every rename into a deletion
+/// plus an addition, keeping each `git diff -z` record single-path.
+async fn worktree_content_fingerprint(working_dir: &str) -> Result<String, String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+        args.push(git_dir);
+    }
+    args.extend(["diff", "HEAD", "--no-renames", "--name-status", "-z"].map(String::from));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let tracked = run_cmd("git", &args, working_dir)
+        .await
+        .map_err(|e| format!("listing the checkout's tracked changes failed: {e}"))?;
+    let mut args: Vec<String> = Vec::new();
+    if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+        args.push(git_dir);
+    }
+    args.extend(["ls-files", "--others", "--exclude-standard", "-z"].map(String::from));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let untracked = run_cmd("git", &args, working_dir)
+        .await
+        .map_err(|e| format!("listing the checkout's untracked files failed: {e}"))?;
+
+    let changed = record_pairs(&tracked);
+    let mut records = Vec::new();
+    for (status, path) in &changed {
+        records.push(worktree_record(working_dir, status, path).await?);
+    }
+    for path in null_paths(&untracked) {
+        records.push(worktree_record(working_dir, "??", &path).await?);
+    }
+    records.sort();
+    let text = records.join("\n");
+    Ok(format!("{:x}", sha2::Sha256::digest(text.as_bytes())))
+}
+
+/// The (status, path) pairs of a `git diff -z --name-status` listing: fields
+/// alternate status and path, and empty trailing records are skipped.
+fn record_pairs(listing: &str) -> Vec<(String, String)> {
+    let fields: Vec<&str> = listing.split('\0').filter(|f| !f.is_empty()).collect();
+    fields
+        .chunks(2)
+        .filter(|c| c.len() == 2)
+        .map(|c| (c[0].to_string(), c[1].to_string()))
+        .collect()
+}
+
+/// The paths of a `git ls-files -z` listing (one path per record).
+fn null_paths(listing: &str) -> Vec<String> {
+    listing.split('\0').filter(|f| !f.is_empty()).map(String::from).collect()
+}
+
+/// One hashable record of a worktree path: its status letter, the kind the
+/// file system now shows (deleted, file, executable, symlink with target)
+/// and the SHA-256 of its content. Failures fail the whole capture loudly.
+/// The executable kind is the POSIX mode-bit check; where mode bits do not
+/// exist every non-link path records as a plain file, which stays consistent
+/// because a fingerprint only ever compares captures of the same checkout.
+async fn worktree_record(working_dir: &str, status: &str, rel: &str) -> Result<String, String> {
+    let base = std::path::Path::new(working_dir);
+    let path = base.join(rel);
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(meta) => {
+            let content = if meta.file_type().is_symlink() {
+                let target = tokio::fs::read_link(&path)
+                    .await
+                    .map_err(|e| format!("reading the checkout link {rel} failed: {e}"))?;
+                (
+                    "symlink".to_string(),
+                    target.as_os_str().to_string_lossy().into_owned().into_bytes(),
+                )
+            } else {
+                (
+                    path_kind(&meta).to_string(),
+                    tokio::fs::read(&path).await.map_err(
+                        |e| format!("reading the checkout file {rel} failed: {e}"),
+                    )?,
+                )
+            };
+            Ok(format!(
+                "{rel}\t[{status}]\t{}\t{}\t{:x}",
+                content.0,
+                content.1.len(),
+                sha2::Sha256::digest(&content.1)
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(format!("{rel}\t[{status}]\tdeleted")),
+        Err(e) => Err(format!("reading the checkout state of {rel} failed: {e}")),
+    }
+}
+
+/// The kind of a non-link checkout path: executable where mode bits exist,
+/// a plain file everywhere else.
+#[cfg(unix)]
+fn path_kind(meta: &std::fs::Metadata) -> &'static str {
+    use std::os::unix::fs::PermissionsExt;
+    if meta.permissions().mode() & 0o111 != 0 { "exec" } else { "file" }
+}
+
+#[cfg(not(unix))]
+fn path_kind(_meta: &std::fs::Metadata) -> &'static str {
+    "file"
+}
+/// Re-reads the PR head and refuses when `plan` was analyzed at another one.
+/// A plan without provenance is not checked here: [`address_pr_review`]
+/// refuses those before it reaches this flow.
+async fn ensure_plan_matches_pr_head(pr_url: &str, plan: &PrReviewPlan) -> Result<(), String> {
+    if plan.analyzed_head_oid.is_none() {
+        return Ok(());
+    }
+    let current_head = current_pr_head_oid(pr_url).await?;
+    check_plan_matches_pr_head(plan, &current_head)
+}
+
+/// The first seven characters of a commit id, for a message a person reads.
+fn short_oid(oid: &str) -> &str {
+    oid.get(..7).unwrap_or(oid)
 }
 
 /// Core logic of `address_pr_review` extracted for testability. Owns no
@@ -1396,6 +1863,10 @@ pub async fn address_pr_review_inner(
     } else {
         parse_pr_url(&pr_url)?
     };
+
+    // Nothing is edited, committed, pushed or replied to for a plan the PR
+    // head has moved away from.
+    ensure_plan_matches_pr_head(&pr_url, &plan).await?;
 
     // We mutate the plan in place to record per-item lifecycle. `updated_plan`
     // is what we hand back to the caller; the in-loop snapshot of an item is
@@ -1864,7 +2335,14 @@ pub async fn address_pr_review_inner(
                     Ok(())
                 }
             };
-            match push_branch_pinned_gated(&working_dir, &branch, None, &stop_if_cancelled).await {
+            // The head may have moved while the fixes were being made. It is
+            // read again here, so a push never lands on a review the plan did
+            // not analyze.
+            let gated_push = match ensure_plan_matches_pr_head(&pr_url, &updated_plan).await {
+                Ok(()) => push_branch_pinned_gated(&working_dir, &branch, None, &stop_if_cancelled).await,
+                Err(e) => Err(e),
+            };
+            match gated_push {
                 Ok(b) => {
                     pushed = true;
                     push_branch_name = Some(b.clone());
@@ -1939,7 +2417,7 @@ pub async fn address_pr_review_inner(
                     comment_id: item.comment_id,
                     message: None,
                 });
-                match post_pr_reply(&reply_repo, &reply_number, item.comment_id, &body).await {
+                match post_pr_reply(&reply_repo, &reply_number, updated_plan.inline_reply_target(item.comment_id), &body).await {
                     Ok(reply_id) => {
                         replies_posted += 1;
                         updated_plan.items[orig_idx].reply_posted = true;
@@ -2300,6 +2778,26 @@ pub async fn sync_pr_review_replies_inner(
     let (repo, number) = parse_pr_url(&pr_url)?;
     let mut updated_plan = plan;
 
+    // The identity rule Apply uses, before any call to GitHub or Git: an item
+    // that names no unique comment would be answered at PR level with a claim
+    // about a comment nobody can identify.
+    for item in updated_plan.items.iter()
+        .filter(|i| i.approved && matches!(i.decision, PrReviewDecision::Fix))
+    {
+        if let Err(fault) = approved_fix_identity(&updated_plan, item) {
+            let why = match fault {
+                IdentityFault::Repeated => "names a comment number that more than one comment in the plan shares",
+                IdentityFault::Missing => "names a comment that has no GitHub id this plan can act on",
+            };
+            return Err(format!(
+                "The fix \"{}\" (comment {}) {why}. Re-analyze the PR comments, then sync \
+                 again. Nothing was posted and the plan was not changed.",
+                item.summary.trim(),
+                item.comment_id.map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+            ));
+        }
+    }
+
     let mut replied = 0u32;
     let mut errors: Vec<String> = Vec::new();
     let mut fix_pending = 0u32;
@@ -2315,6 +2813,12 @@ pub async fn sync_pr_review_replies_inner(
 
     // The same rule Apply's reply pass uses, asked once for the whole plan.
     let delivered = settle_delivery(&working_dir, &task, &mut updated_plan).await;
+
+    // Resolved once, before the reply loop: a reply on GitHub is adopted as
+    // ours (or, for a lost response, takes the place of a new POST) only
+    // when its author is the account this `gh` posts as. Without that
+    // account, nothing can be verified and no reply is adopted.
+    let authenticated_login = gh_authenticated_login().await;
 
     for orig_idx in approved_indices {
         let item = updated_plan.items[orig_idx].clone();
@@ -2341,7 +2845,60 @@ pub async fn sync_pr_review_replies_inner(
 
         // Case A: no reply on GitHub yet — POST a new one.
         if !item.reply_posted {
-            match post_pr_reply(&repo, &number, item.comment_id, &body).await {
+            let target = updated_plan.inline_reply_target(item.comment_id);
+            let posted = match target {
+                // A valid inline comment is answered only in its own thread.
+                // Look for a reply first: an earlier POST may have succeeded
+                // with its response lost, and a second one would duplicate it.
+                Some(original_id) => {
+                    // No adoption without a verified author: failing closed
+                    // also refuses to post blind, which could duplicate a
+                    // reply whose response was lost.
+                    let discovered_id = match authenticated_login.as_deref() {
+                        None => Err("the GitHub account that posts replies could not be \
+                                     determined, so an existing reply could not be verified"
+                                     .to_string()),
+                        Some(expected) => {
+                            discover_reply_comment_id(&repo, &number, original_id, expected).await
+                        }
+                    };
+                    match discovered_id {
+                        Ok(Some(found_id)) => {
+                            discovered += 1;
+                            let it = &mut updated_plan.items[orig_idx];
+                            it.reply_posted = true;
+                            it.reply_comment_id = Some(found_id);
+                            it.pr_reply_text = Some(body);
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            errors.push(format!("comment {} (discover): {}", label, e));
+                            continue;
+                        }
+                    }
+                    post_inline_reply_only(&repo, &number, original_id, &body).await
+                }
+                // A PR-level comment has no thread, so it names the comment it
+                // answers, which must be exactly one. The stored text stays
+                // the bare reply.
+                None => {
+                    let original = item.comment_id.and_then(|id| updated_plan.comment_for(id));
+                    let Some(original) = original else {
+                        errors.push(format!(
+                            "comment {label}: the plan does not identify the comment this \
+                             reply answers, so nothing was posted. Re-analyze the PR comments."
+                        ));
+                        continue;
+                    };
+                    let named = match original.url.as_deref() {
+                        Some(url) => format!("Re {url}"),
+                        None => format!("Re the comment by @{}", original.author),
+                    };
+                    post_pr_reply(&repo, &number, None, &format!("{named}\n\n{body}")).await
+                }
+            };
+            match posted {
                 Ok(reply_id) => {
                     replied += 1;
                     updated_plan.items[orig_idx].reply_posted = true;
@@ -2360,11 +2917,19 @@ pub async fn sync_pr_review_replies_inner(
         // our original comment. No text heuristics. If we still can't find it,
         // the reply was likely a PR-level fallback comment — count as unmatched.
         if updated_plan.items[orig_idx].reply_comment_id.is_none() {
-            let Some(original_id) = item.comment_id else {
+            let Some(original_id) = updated_plan.inline_reply_target(item.comment_id) else {
                 unmatched += 1;
                 continue;
             };
-            match discover_reply_comment_id(&repo, &number, original_id).await {
+            // Discovery only adopts a reply written by this account.
+            let discovered_id = match authenticated_login.as_deref() {
+                // Fail closed: with no verified account, no reply is ours.
+                None => Ok(None),
+                Some(expected) => {
+                    discover_reply_comment_id(&repo, &number, original_id, expected).await
+                }
+            };
+            match discovered_id {
                 Ok(Some(found_id)) => {
                     updated_plan.items[orig_idx].reply_comment_id = Some(found_id);
                     discovered += 1;
@@ -2480,93 +3045,284 @@ fn parse_gh_ts(v: Option<&serde_json::Value>) -> Option<chrono::DateTime<chrono:
         .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
+/// The review data of a PR: its head commit, its review decision and its
+/// comments that are still actionable.
+///
+/// Fails closed. A review that cannot be read in full is an error, never an
+/// empty list: an empty list would make the plan look analyzed, and an Apply
+/// on it would act on a review nobody read. A resolved or outdated review
+/// thread is left out, because there is nothing left in it to fix.
 async fn fetch_pr_review_data(
     pr_url: &str,
-) -> Result<(Option<String>, Vec<PrReviewComment>), String> {
+) -> Result<(String, Option<String>, Vec<PrReviewComment>), String> {
     let (repo, number) = parse_pr_url(pr_url)?;
     let mut comments: Vec<PrReviewComment> = Vec::new();
-    let mut review_decision: Option<String> = None;
 
     let review_json = run_cmd_no_cwd(
         "gh",
-        &["pr", "view", &number, "--repo", &repo, "--json", "reviews,comments,reviewDecision,createdAt,updatedAt"],
+        &["pr", "view", &number, "--repo", &repo, "--json", "headRefOid,reviews,comments,reviewDecision,createdAt,updatedAt"],
     ).await?;
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&review_json) {
-        review_decision = json.get("reviewDecision").and_then(|v| v.as_str()).map(String::from);
-        if let Some(reviews) = json.get("reviews").and_then(|v| v.as_array()) {
-            for review in reviews {
-                let body = review.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if body.is_empty() && state != "CHANGES_REQUESTED" {
-                    continue;
-                }
-                let id = review.get("id")
-                    .or_else(|| review.get("databaseId"))
-                    .and_then(|v| v.as_u64());
-                let author = review.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                let author_association = review.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
-                let url = review.get("url").and_then(|v| v.as_str()).map(String::from);
-                let display_body = if body.is_empty() { format!("[{}]", state) } else { body };
-                let created_at = parse_gh_ts(review.get("submittedAt").or_else(|| review.get("createdAt")));
-                comments.push(PrReviewComment {
-                    id, kind: PrCommentKind::Review, author, author_association, body: display_body,
-                    path: None, line: None, url,
-                    created_at, updated_at: created_at,
-                });
-            }
+    let head_oid = pr_head_oid_from_json(&review_json)?;
+    let json: serde_json::Value = serde_json::from_str(&review_json)
+        .map_err(|e| format!("GitHub's review answer is not JSON: {e}"))?;
+    let review_decision = match json.get("reviewDecision") {
+        Some(v) if v.is_null() => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or("GitHub's review decision is not a string")?
+                .to_string(),
+        ),
+        None => return Err("GitHub's PR answer has no review decision field".to_string()),
+    };
+    // `gh pr view` names reviews and comments by GraphQL node id only. Their
+    // numeric ids come from the REST lists, matched by node id. A list that
+    // cannot be read in full fails the read; an entry the list does not match
+    // keeps no id, and Apply refuses it.
+    let review_ids = numeric_ids_by_node_id(
+        &gh_api_list(&format!("repos/{}/pulls/{}/reviews?per_page=100", repo, number), "reviews").await?,
+    );
+    let conversation_ids = numeric_ids_by_node_id(
+        &gh_api_list(&format!("repos/{}/issues/{}/comments?per_page=100", repo, number), "conversation comments").await?,
+    );
+    for review in gh_pr_view_list(&json, "reviews")? {
+        let body = review.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if body.is_empty() && state != "CHANGES_REQUESTED" {
+            continue;
         }
-        if let Some(conv) = json.get("comments").and_then(|v| v.as_array()) {
-            for c in conv {
-                let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                if body.is_empty() { continue; }
-                let id = c.get("id").or_else(|| c.get("databaseId")).and_then(|v| v.as_u64());
-                let author = c.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                let author_association = c.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
-                let url = c.get("url").and_then(|v| v.as_str()).map(String::from);
-                let created_at = parse_gh_ts(c.get("createdAt"));
-                let updated_at = parse_gh_ts(c.get("updatedAt")).or(created_at);
-                comments.push(PrReviewComment {
-                    id, kind: PrCommentKind::Conversation, author, author_association, body,
-                    path: None, line: None, url,
-                    created_at, updated_at,
-                });
-            }
-        }
+        let id = review.get("id").and_then(|v| v.as_str())
+            .and_then(|node| review_ids.get(node))
+            .copied();
+        let author = review.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let author_association = review.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
+        let url = review.get("url").and_then(|v| v.as_str()).map(String::from);
+        let display_body = if body.is_empty() { format!("[{}]", state) } else { body };
+        let created_at = parse_gh_ts(review.get("submittedAt").or_else(|| review.get("createdAt")));
+        comments.push(PrReviewComment {
+            id, kind: PrCommentKind::Review, author, author_association, body: display_body,
+            path: None, line: None, url,
+            created_at, updated_at: created_at,
+        });
+    }
+    for c in gh_pr_view_list(&json, "comments")? {
+        let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if body.is_empty() { continue; }
+        let id = c.get("id").and_then(|v| v.as_str())
+            .and_then(|node| conversation_ids.get(node))
+            .copied();
+        let author = c.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let author_association = c.get("authorAssociation").and_then(|v| v.as_str()).map(String::from);
+        let url = c.get("url").and_then(|v| v.as_str()).map(String::from);
+        let created_at = parse_gh_ts(c.get("createdAt"));
+        let updated_at = parse_gh_ts(c.get("updatedAt")).or(created_at);
+        comments.push(PrReviewComment {
+            id, kind: PrCommentKind::Conversation, author, author_association, body,
+            path: None, line: None, url,
+            created_at, updated_at,
+        });
     }
 
-    let inline_json = run_cmd_no_cwd(
+    let inline = gh_api_list(
+        &format!("repos/{}/pulls/{}/comments?per_page=100", repo, number),
+        "inline review comments",
+    ).await?;
+    let non_actionable = fetch_non_actionable_review_comment_ids(&repo, &number).await?;
+    for c in inline {
+        // A comment without a numeric id is still shown, and Apply refuses it.
+        // Its thread cannot be matched to the resolved set, so it is not
+        // treated as resolved.
+        let id = c.get("id").and_then(|v| v.as_u64());
+        let body = c.get("body").and_then(|v| v.as_str())
+            .ok_or("an inline review comment has no body")?
+            .trim().to_string();
+        if body.is_empty() { continue; }
+        if id.is_some_and(|id| non_actionable.contains(&id)) { continue; }
+        let author = c.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let author_association = c.get("author_association").and_then(|v| v.as_str()).map(String::from);
+        let path = c.get("path").and_then(|v| v.as_str()).map(String::from);
+        let line = c.get("line").or_else(|| c.get("original_line")).and_then(|v| v.as_i64());
+        let url = c.get("html_url").and_then(|v| v.as_str()).map(String::from);
+        let created_at = parse_gh_ts(c.get("created_at"));
+        let updated_at = parse_gh_ts(c.get("updated_at")).or(created_at);
+        comments.push(PrReviewComment {
+            id, kind: PrCommentKind::Inline, author, author_association, body, path, line, url,
+            created_at, updated_at,
+        });
+    }
+    withhold_unusable_comment_ids(&mut comments);
+
+    Ok((head_oid, review_decision, comments))
+}
+
+/// Largest integer a JavaScript number holds exactly. The webview parses the
+/// plan as JSON numbers, so a larger id would reach it altered.
+const MAX_WEBVIEW_EXACT_ID: u64 = (1 << 53) - 1;
+
+/// The numeric ids of a REST list, keyed by GraphQL node id. An entry without
+/// either field is left out, so the comment it would name keeps no id.
+fn numeric_ids_by_node_id(items: &[serde_json::Value]) -> std::collections::HashMap<String, u64> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let node = item.get("node_id")?.as_str()?;
+            let id = item.get("id")?.as_u64()?;
+            Some((node.to_string(), id))
+        })
+        .collect()
+}
+
+/// Withholds the numeric id of every comment that cannot be trusted to name
+/// one resource. A number two comments of the plan share names neither: a
+/// review and an inline comment may carry the same number, and the plan keys
+/// its fixed-content record and its carried-forward lifecycle by number alone.
+/// So does a number the webview cannot hold exactly. A withheld comment stays
+/// listed, and Apply refuses to act on it.
+fn withhold_unusable_comment_ids(comments: &mut [PrReviewComment]) {
+    for c in comments.iter_mut() {
+        if c.id.is_some_and(|id| id > MAX_WEBVIEW_EXACT_ID) {
+            c.id = None;
+        }
+    }
+    let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for id in comments.iter().filter_map(|c| c.id) {
+        *counts.entry(id).or_default() += 1;
+    }
+    for c in comments.iter_mut() {
+        if c.id.is_some_and(|id| counts.get(&id).copied().unwrap_or(0) > 1) {
+            c.id = None;
+        }
+    }
+}
+
+/// Every page of a REST list, read in full. `gh api --paginate` prints one
+/// JSON array per page, back to back. A page that is not a complete JSON list
+/// is an error, and so is an answer with no page at all: an empty list is
+/// `[]`, a page of its own.
+async fn gh_api_list(endpoint: &str, what: &str) -> Result<Vec<serde_json::Value>, String> {
+    let raw = run_cmd_no_cwd("gh", &["api", "--paginate", endpoint])
+        .await
+        .map_err(|e| format!("{what} could not be fetched: {e}"))?;
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut pages_read = 0usize;
+    for page in serde_json::Deserializer::from_str(&raw).into_iter::<Vec<serde_json::Value>>() {
+        items.extend(page.map_err(|e| format!("{what} are not a complete JSON list: {e}"))?);
+        pages_read += 1;
+    }
+    if pages_read == 0 {
+        return Err(format!("{what} answer was empty"));
+    }
+    Ok(items)
+}
+
+/// `gh pr view` lists reviews and comments with `first: 100` and no more
+/// pages, so a list of that size may have been cut short. Such a list is an
+/// error, never a partial review.
+const GH_PR_VIEW_LIST_LIMIT: usize = 100;
+
+/// The list `key` of a `gh pr view` answer, read in full.
+fn gh_pr_view_list<'a>(
+    json: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a Vec<serde_json::Value>, String> {
+    let list = json
+        .get(key)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("GitHub's PR answer has no {key} list"))?;
+    if list.len() >= GH_PR_VIEW_LIST_LIMIT {
+        return Err(format!(
+            "GitHub's PR answer lists {} {key}, which is the most it returns, so the review \
+             cannot be read in full",
+            list.len(),
+        ));
+    }
+    Ok(list)
+}
+
+/// The head commit a `gh pr view --json headRefOid` answer names.
+fn pr_head_oid_from_json(json: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("GitHub's PR answer is not JSON: {e}"))?;
+    value
+        .get("headRefOid")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "GitHub's PR answer names no head commit".to_string())
+}
+
+/// GraphQL for the review threads of a PR, one page per `$endCursor`.
+const REVIEW_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { isResolved isOutdated comments(first: 100) { totalCount nodes { fullDatabaseId } } } } } } }";
+
+/// The ids of the inline review comments in threads GitHub reports as
+/// resolved or outdated.
+async fn fetch_non_actionable_review_comment_ids(
+    repo: &str,
+    number: &str,
+) -> Result<std::collections::HashSet<u64>, String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository name {repo}"))?;
+    let pages = run_cmd_no_cwd(
         "gh",
-        &["api", "--paginate", &format!("repos/{}/pulls/{}/comments?per_page=100", repo, number)],
-    ).await.unwrap_or_else(|e| {
-        eprintln!("[pr-review] inline comments fetch failed: {}", e);
-        String::new()
-    });
-    match serde_json::from_str::<Vec<serde_json::Value>>(&inline_json) {
-        Ok(arr) => {
-            for c in arr {
-                let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-                if body.is_empty() { continue; }
-                let id = c.get("id").and_then(|v| v.as_u64());
-                let author = c.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                let author_association = c.get("author_association").and_then(|v| v.as_str()).map(String::from);
-                let path = c.get("path").and_then(|v| v.as_str()).map(String::from);
-                let line = c.get("line").or_else(|| c.get("original_line")).and_then(|v| v.as_i64());
-                let url = c.get("html_url").and_then(|v| v.as_str()).map(String::from);
-                let created_at = parse_gh_ts(c.get("created_at"));
-                let updated_at = parse_gh_ts(c.get("updated_at")).or(created_at);
-                comments.push(PrReviewComment {
-                    id, kind: PrCommentKind::Inline, author, author_association, body, path, line, url,
-                    created_at, updated_at,
-                });
+        &[
+            "api", "graphql", "--paginate",
+            "-F", &format!("owner={owner}"),
+            "-F", &format!("name={name}"),
+            "-F", &format!("number={number}"),
+            "-f", &format!("query={REVIEW_THREADS_QUERY}"),
+        ],
+    ).await
+    .map_err(|e| format!("review threads could not be fetched: {e}"))?;
+    non_actionable_review_comment_ids(&pages)
+}
+
+/// Reads the pages of a `reviewThreads` answer (`gh api graphql --paginate`
+/// prints one JSON object per page). A malformed or empty answer is an
+/// error, never an empty set: an empty set would leave resolved threads
+/// actionable.
+fn non_actionable_review_comment_ids(
+    pages: &str,
+) -> Result<std::collections::HashSet<u64>, String> {
+    let mut ids = std::collections::HashSet::new();
+    let mut pages_read = 0usize;
+    for page in serde_json::Deserializer::from_str(pages).into_iter::<serde_json::Value>() {
+        let page = page.map_err(|e| format!("review threads answer is not JSON: {e}"))?;
+        pages_read += 1;
+        let threads = page
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|v| v.as_array())
+            .ok_or("review threads answer has no thread list")?;
+        for thread in threads {
+            let resolved = thread.get("isResolved").and_then(|v| v.as_bool())
+                .ok_or("a review thread has no resolved flag")?;
+            let outdated = thread.get("isOutdated").and_then(|v| v.as_bool())
+                .ok_or("a review thread has no outdated flag")?;
+            if !resolved && !outdated {
+                continue;
+            }
+            let comments = thread.get("comments").ok_or("a review thread has no comment list")?;
+            let listed = comments.get("nodes").and_then(|v| v.as_array())
+                .ok_or("a review thread has no comment nodes")?;
+            let total = comments.get("totalCount").and_then(|v| v.as_u64())
+                .ok_or("a review thread has no comment count")?;
+            if (listed.len() as u64) < total {
+                return Err("a resolved or outdated review thread has more comments than were fetched".to_string());
+            }
+            for c in listed {
+                // GraphQL sends the full database id as a string; `databaseId`
+                // is deprecated and is not used.
+                let id = c.get("fullDatabaseId").and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or("a review thread comment has no database id")?;
+                ids.insert(id);
             }
         }
-        Err(e) if !inline_json.is_empty() => {
-            eprintln!("[pr-review] inline comments parse failed: {}", e);
-        }
-        Err(_) => {}
     }
-
-    Ok((review_decision, comments))
+    if pages_read == 0 {
+        return Err("review threads answer was empty".to_string());
+    }
+    Ok(ids)
 }
 
 // ---- Untrusted review text in helper prompts ----
@@ -3134,26 +3890,40 @@ fn build_reply_body(item: &PrReviewItem) -> String {
 
 /// Posts a reply on the PR. Returns the GitHub comment ID of the created
 /// reply so the caller can persist it on the item for future PATCH-edit.
-/// Returns `Ok(None)` only for the legacy `gh pr comment` fallback path where
-/// gh's CLI doesn't surface a JSON id.
+/// `Ok(None)` is only for a posted non-inline reply (`gh pr comment`, which
+/// doesn't surface a JSON id).
+///
+/// `inline_comment_id` is only an inline comment's id (see
+/// [`PrReviewPlan::inline_reply_target`]). Any other comment is answered with
+/// a PR-level comment, never by number on the inline endpoint.
+///
+/// A failed threaded reply is not a delivered reply: it returns `Err`, is
+/// recovered when the caller retries, and is never silently replaced by a
+/// PR-level comment.
 async fn post_pr_reply(
     repo: &str,
     number: &str,
-    comment_id: Option<u64>,
+    inline_comment_id: Option<u64>,
     body: &str,
 ) -> Result<Option<u64>, String> {
-    if let Some(id) = comment_id {
+    if let Some(id) = inline_comment_id {
         let endpoint = format!("repos/{}/pulls/{}/comments/{}/replies", repo, number, id);
         let body_arg = format!("body={}", body);
-        if let Ok(out) = run_cmd_no_cwd(
+        return match run_cmd_no_cwd(
             "gh",
             &["api", "-X", "POST", &endpoint, "-f", &body_arg, "--jq", ".id"],
-        ).await {
-            let parsed = out.trim().parse::<u64>().ok();
-            return Ok(parsed);
-        }
-        // Inline reply failed (e.g. comment was on a Review, not an inline thread).
-        // Fall through to a global PR comment so the reply is not lost.
+        )
+        .await
+        {
+            Ok(out) => Ok(out.trim().parse::<u64>().ok()),
+            Err(e) => {
+                let line = e.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                let reason: String = line.chars().take(200).collect();
+                Err(format!(
+                    "threaded reply to comment {id} on {repo}#{number} failed: {reason}"
+                ))
+            }
+        };
     }
     // The PR is named by the number and repository parsed out of `pr_url`,
     // never by the URL itself: `pr_url` is read back from `tasks.toml` like
@@ -3165,15 +3935,49 @@ async fn post_pr_reply(
         .map(|_| None)
 }
 
-/// Walks the PR's inline review comments and returns the id of the reply
-/// whose `in_reply_to_id` matches `original_comment_id`. Picks the most
-/// recently created when there are multiple. Returns `Ok(None)` when no
-/// inline reply exists for that comment — the original reply may have been a
-/// PR-level fallback (no `in_reply_to_id`) or it was deleted.
+/// Answers an inline review comment in its own thread and nowhere else:
+/// unlike [`post_pr_reply`] there is no PR-level fallback, because a bare
+/// comment would name nothing and the thread would never be retried.
+async fn post_inline_reply_only(
+    repo: &str,
+    number: &str,
+    comment_id: u64,
+    body: &str,
+) -> Result<Option<u64>, String> {
+    let endpoint = format!("repos/{}/pulls/{}/comments/{}/replies", repo, number, comment_id);
+    let body_arg = format!("body={}", body);
+    run_cmd_no_cwd(
+        "gh",
+        &["api", "-X", "POST", &endpoint, "-f", &body_arg, "--jq", ".id"],
+    )
+    .await
+    .map(|out| out.trim().parse::<u64>().ok())
+    .map_err(|e| format!("threaded reply failed: {e}"))
+}
+
+/// The account that posts replies through the same `gh`.
+async fn gh_authenticated_login() -> Option<String> {
+    run_cmd_no_cwd("gh", &["api", "user", "--jq", ".login"])
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Walks the PR's inline review comments and returns the id of *our* reply:
+/// one whose `in_reply_to_id` matches `original_comment_id` and whose author
+/// is `expected_login`. The author check is what keeps a reply another person
+/// left on the same thread from being adopted as ours and rewritten. Among
+/// the matching replies the most recently created wins. A comment without a
+/// `user.login`, or written by anyone else, is never a candidate. Returns
+/// `Ok(None)` when no candidate survives — the original reply may have been a
+/// PR-level fallback (no `in_reply_to_id`), it was deleted, or none of the
+/// replies on the thread is provably ours.
 async fn discover_reply_comment_id(
     repo: &str,
     number: &str,
     original_comment_id: u64,
+    expected_login: &str,
 ) -> Result<Option<u64>, String> {
     let endpoint = format!("repos/{}/pulls/{}/comments?per_page=100", repo, number);
     let raw = run_cmd_no_cwd("gh", &["api", "--paginate", &endpoint]).await
@@ -3185,6 +3989,12 @@ async fn discover_reply_comment_id(
     for c in arr {
         let in_reply_to = c.get("in_reply_to_id").and_then(|v| v.as_u64());
         if in_reply_to != Some(original_comment_id) { continue; }
+        // Only a reply written by the expected account is a candidate.
+        let author = c.get("user")
+            .and_then(|u| u.get("login"))
+            .and_then(|v| v.as_str())
+            .map(str::trim);
+        if !author.is_some_and(|login| login.eq_ignore_ascii_case(expected_login)) { continue; }
         let Some(id) = c.get("id").and_then(|v| v.as_u64()) else { continue; };
         let created = parse_gh_ts(c.get("created_at"))
             .unwrap_or_else(chrono::Utc::now);
@@ -7426,6 +8236,10 @@ mod tests {
 
     fn plan_with_marker(marker: &str) -> PrReviewPlan {
         PrReviewPlan {
+            analyzed_head_oid: None,
+            analyzed_worktree_oid: None,
+            analyzed_worktree_fingerprint: None,
+            analyzed_at: None,
             generated_at: chrono::Utc::now(),
             pr_url: "https://github.com/org/repo/pull/1".to_string(),
             review_decision: None,
@@ -8431,6 +9245,10 @@ mod tests {
     ) -> PrReviewPlan {
         let fixed_ids = items.iter().filter(|i| i.fix_done).filter_map(|i| i.comment_id).collect();
         PrReviewPlan {
+            analyzed_head_oid: None,
+            analyzed_worktree_oid: None,
+            analyzed_worktree_fingerprint: None,
+            analyzed_at: None,
             generated_at: at("2024-05-31T00:00:00Z"),
             pr_url: String::new(),
             review_decision: None,
@@ -9838,6 +10656,50 @@ mod tests {
                     vec!["pr", "comment", "7", "--repo", "owner/repo", "--body", "thanks"],
                 ],
             );
+        }
+
+        /// A failed threaded reply is an error, never a PR-level comment.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failed_threaded_reply_is_an_error_and_never_a_pr_comment() {
+            let _guard = PATH_LOCK.lock().await;
+            let replies = "api -X POST repos/owner/repo/pulls/42/comments/99/replies -f body=thanks --jq .id";
+            let mock = MockGh::setup_answering(
+                "unused",
+                "{}",
+                &[(replies.to_string(), "printf 'HTTP 422 nope' >&2; exit 1".to_string())],
+            );
+
+            let err = post_pr_reply("owner/repo", "42", Some(99), "thanks")
+                .await
+                .expect_err("a failed threaded reply must not be Ok");
+            assert!(err.contains("owner/repo") && err.contains("42") && err.contains("99"), "{err}");
+            assert!(err.contains("HTTP 422"), "{err}");
+            assert!(!err.contains('\n'), "{err}");
+
+            let log = mock.read_log();
+            assert!(log.contains("replies"), "the threaded POST was attempted: {log}");
+            assert!(!log.contains("comment\n42"), "no PR-level comment may be posted: {log}");
+            assert!(!log.lines().any(|l| l == "pr"), "no `pr` call at all: {log}");
+        }
+
+        /// A threaded reply that succeeds returns the parsed comment id.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_successful_threaded_reply_returns_its_id() {
+            let _guard = PATH_LOCK.lock().await;
+            let replies = "api -X POST repos/owner/repo/pulls/42/comments/99/replies -f body=thanks --jq .id";
+            let mock = MockGh::setup_answering(
+                "unused",
+                "{}",
+                &[(replies.to_string(), "printf '123456789'".to_string())],
+            );
+
+            let id = post_pr_reply("owner/repo", "42", Some(99), "thanks")
+                .await
+                .expect("threaded reply posts");
+            assert_eq!(id, Some(123456789));
+            assert!(!mock.read_log().lines().any(|l| l == "pr"));
         }
 
         /// Unix-only: the mock `gh` is a `#!/bin/sh` script made executable
@@ -17196,6 +18058,10 @@ mod tests {
                 };
 
                 let plan = PrReviewPlan {
+                    analyzed_head_oid: None,
+                    analyzed_worktree_oid: None,
+                    analyzed_worktree_fingerprint: None,
+                    analyzed_at: None,
                     generated_at: chrono::Utc::now(),
                     pr_url: "https://github.com/testorg/testrepo/pull/321".to_string(),
                     review_decision: None,
@@ -17699,6 +18565,10 @@ mod tests {
                     task.clone()
                 };
                 let plan = PrReviewPlan {
+                    analyzed_head_oid: None,
+                    analyzed_worktree_oid: None,
+                    analyzed_worktree_fingerprint: None,
+                    analyzed_at: None,
                     generated_at: chrono::Utc::now(),
                     pr_url: pr_url.to_string(),
                     review_decision: None,
@@ -17808,7 +18678,7 @@ mod tests {
                     let gh = bin_dir.join("gh");
                     write_executable(
                         &gh,
-                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}]' ;;\n  *) echo 4242 ;;\nesac\n",
+                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}]' ;;\n  *'--paginate'*) echo '[]' ;;\n  *) echo 4242 ;;\nesac\n",
                     );
                     let saved_path = std::env::var("PATH").ok();
                     let new_path = match &saved_path {
@@ -17835,7 +18705,7 @@ mod tests {
                 /// could do in production.
                 fn set_pr_list_url(&self, url: &str) {
                     let script = format!(
-                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"{url}\",\"isCrossRepository\":false}}]' ;;\n  *) echo 4242 ;;\nesac\n"
+                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"{url}\",\"isCrossRepository\":false}}]' ;;\n  *'--paginate'*) echo '[]' ;;\n  *) echo 4242 ;;\nesac\n"
                     );
                     write_executable(&self.gh, &script);
                 }
@@ -17907,10 +18777,25 @@ mod tests {
                     task.clone()
                 };
                 let plan = PrReviewPlan {
+                    analyzed_head_oid: None,
+                    analyzed_worktree_oid: None,
+                    analyzed_worktree_fingerprint: None,
+                    analyzed_at: None,
                     generated_at: chrono::Utc::now(),
                     pr_url: pr_url.to_string(),
                     review_decision: None,
-                    comments: Vec::new(),
+                    comments: vec![PrReviewComment {
+                        id: Some(1),
+                        kind: PrCommentKind::Inline,
+                        author: "rev".to_string(),
+                        author_association: None,
+                        body: "please fix".to_string(),
+                        path: None,
+                        line: None,
+                        url: None,
+                        created_at: None,
+                        updated_at: None,
+                    }],
                     items: vec![fix_item(1)],
                     raw_plan: String::new(),
                     last_apply: None,
@@ -18705,6 +19590,307 @@ mod tests {
                 assert_eq!((synced.replied, synced.fix_pending), (0, 0), "no duplicate reply: {synced:?}");
             }
 
+            /// The login the sync fixture's `gh` reports for `gh api user`.
+            const SYNC_FIXTURE_LOGIN: &str = "slashit-fixture";
+
+            /// A fake `gh` for Sync's reply path that logs every call to
+            /// `log`. `post` is the shell run for a threaded POST, `existing`
+            /// the JSON answered to the list of inline comments. It posts as
+            /// the account `login`.
+            fn sync_gh(claude: &EditingClaude, log: &Path, post: &str, existing: &str) {
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'api user --jq .login'*) echo {login:?} ;;\n  *'-X POST'*) {post} ;;\n  *'pr comment'*) echo done ;;\n  *'--paginate'*) printf '%s' '{existing}' ;;\n  *) echo 4242 ;;\nesac\n",
+                    login = SYNC_FIXTURE_LOGIN,
+                );
+                write_executable(&claude.gh, &script);
+            }
+
+            /// A delivered fix whose reply has not been posted yet, and the
+            /// Sync entry point for it.
+            async fn delivered_unanswered_fix(
+                state: &crate::AppState,
+                repo: &RepoFixture,
+                worktree: &Path,
+                tmp: &Path,
+            ) -> (Task, PrReviewPlan) {
+                let (task, plan) = task_with_one_fix(state, repo, worktree).await;
+                let (first, mut plan) = apply(&task, plan, worktree, tmp.join("no-such-jj"), false).await;
+                assert!(first.pushed && first.replies_posted == 0, "{first:?}");
+                plan.backfill_lifecycle_from_last_apply();
+                (task, plan)
+            }
+
+            async fn sync_plan(
+                task: &Task,
+                worktree: &Path,
+                plan: PrReviewPlan,
+            ) -> Result<(SyncPrRepliesResult, PrReviewPlan), String> {
+                sync_pr_review_replies_inner(task.clone(), worktree.to_str().unwrap().to_string(), plan).await
+            }
+
+            fn call_count(log: &Path, needle: &str) -> usize {
+                std::fs::read_to_string(log).unwrap_or_default().lines().filter(|l| l.contains(needle)).count()
+            }
+
+            /// Sync answers an inline comment once, in its own thread.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_answers_an_inline_comment_only_in_its_thread() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "echo 777", "[]");
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 1);
+                assert_eq!(call_count(&log, "pr comment"), 0);
+                assert!(plan.items[0].reply_posted && plan.items[0].reply_comment_id == Some(777), "{:?}", plan.items[0]);
+            }
+
+            /// A failed threaded POST posts nothing else and is retried.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_threaded_reply_is_not_replaced_and_is_retried() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "exit 1", "[]");
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 0, "{synced:?}");
+                assert!(!synced.errors.is_empty(), "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 1);
+                assert_eq!(call_count(&log, "pr comment"), 0, "no unnamed PR-level fallback");
+                assert!(!plan.items[0].reply_posted && plan.items[0].pr_reply_text.is_none(), "{:?}", plan.items[0]);
+
+                // The endpoint works again: one threaded reply, no PR comment.
+                std::fs::remove_file(&log).unwrap();
+                sync_gh(&claude, &log, "echo 778", "[]");
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 1);
+                assert_eq!(call_count(&log, "pr comment"), 0);
+                assert!(plan.items[0].reply_posted, "{:?}", plan.items[0]);
+            }
+
+            /// An earlier POST whose response was lost is found, not repeated.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_reply_already_on_github_is_adopted_not_posted_again() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "echo 1", r#"[{"id":901,"in_reply_to_id":1,"user":{"login":"slashit-fixture"},"created_at":"2026-01-01T00:00:00Z"}]"#);
+
+                let (_synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(call_count(&log, "-X POST"), 0);
+                assert_eq!(call_count(&log, "pr comment"), 0);
+                assert!(plan.items[0].reply_posted && plan.items[0].reply_comment_id == Some(901), "{:?}", plan.items[0]);
+            }
+
+            /// The authenticated login is what the `gh` in use reports for
+            /// `gh api user --jq .login`, and `None` when it cannot be answered.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_authenticated_login_is_what_gh_reports_and_none_when_it_cannot() {
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[("api user --jq .login".to_string(), "printf 'someone'".to_string())],
+                );
+                assert_eq!(gh_authenticated_login().await.as_deref(), Some("someone"));
+
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[("api user --jq .login".to_string(), "exit 1".to_string())],
+                );
+                assert!(gh_authenticated_login().await.is_none());
+            }
+
+            /// Discovery picks our latest reply, even when another user's
+            /// newer reply sits on the same thread, and never a comment that
+            /// is not a reply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discovery_adopts_our_latest_reply_even_when_another_user_replied_later() {
+                let _guard = PATH_LOCK.lock().await;
+                let comments = r#"[
+                    {"id":333,"body":"not a reply"},
+                    {"id":111,"in_reply_to_id":99,"user":{"login":"slashit-fixture"},"created_at":"2026-01-01T00:00:00Z"},
+                    {"id":222,"in_reply_to_id":99,"user":{"login":"someone-else"},"created_at":"2026-01-02T00:00:00Z"}
+                ]"#;
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[
+                        ("api user --jq .login".to_string(), "printf 'slashit-fixture'".to_string()),
+                        (
+                            "api --paginate repos/owner/repo/pulls/42/comments?per_page=100".to_string(),
+                            format!("printf '{comments}'"),
+                        ),
+                    ],
+                );
+
+                let found = discover_reply_comment_id("owner/repo", "42", 99, "slashit-fixture")
+                    .await
+                    .expect("discovery asks, it does not fail");
+                assert_eq!(found, Some(111), "another user's newer reply is not ours");
+                let caseless = discover_reply_comment_id("owner/repo", "42", 99, "SLaShIt-FiXtUrE")
+                    .await
+                    .expect("discovery asks, it does not fail");
+                assert_eq!(caseless, Some(111), "the author check ignores ASCII case");
+            }
+
+            /// A reply written only by someone else is never adopted as ours.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discovery_adopts_no_reply_written_by_someone_else() {
+                let _guard = PATH_LOCK.lock().await;
+                let comments = r#"[
+                    {"id":222,"in_reply_to_id":99,"user":{"login":"someone-else"},"created_at":"2026-01-02T00:00:00Z"}
+                ]"#;
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[
+                        ("api user --jq .login".to_string(), "printf 'slashit-fixture'".to_string()),
+                        (
+                            "api --paginate repos/owner/repo/pulls/42/comments?per_page=100".to_string(),
+                            format!("printf '{comments}'"),
+                        ),
+                    ],
+                );
+
+                let found = discover_reply_comment_id("owner/repo", "42", 99, "slashit-fixture")
+                    .await
+                    .expect("discovery asks, it does not fail");
+                assert_eq!(found, None, "someone else's reply is not ours");
+            }
+
+            /// A candidate whose JSON carries no `user.login` is not a match.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discovery_adopts_no_reply_without_a_user_login() {
+                let _guard = PATH_LOCK.lock().await;
+                let comments = r#"[
+                    {"id":901,"in_reply_to_id":99,"created_at":"2026-01-01T00:00:00Z"}
+                ]"#;
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[
+                        ("api user --jq .login".to_string(), "printf 'slashit-fixture'".to_string()),
+                        (
+                            "api --paginate repos/owner/repo/pulls/42/comments?per_page=100".to_string(),
+                            format!("printf '{comments}'"),
+                        ),
+                    ],
+                );
+
+                let found = discover_reply_comment_id("owner/repo", "42", 99, "slashit-fixture")
+                    .await
+                    .expect("discovery asks, it does not fail");
+                assert_eq!(found, None, "a reply with no known author is not ours");
+            }
+
+            /// With no authenticated login, Sync adopts no reply: each item
+            /// becomes unmatched rather than letting an unverified comment on
+            /// the thread stand in for the account's own reply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_sync_whose_login_cannot_be_determined_adopts_no_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, mut plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                // A legacy reply: posted, its GitHub id never tracked — the
+                // shape Sync would otherwise resolve by discovery.
+                plan.items[0].reply_posted = true;
+                plan.items[0].reply_comment_id = None;
+
+                let log = tmp.path().join("gh.log");
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'api user'*) exit 1 ;;\n  *'pr list'*) printf '[]' ;;\n  *) exit 1 ;;\nesac\n"
+                );
+                write_executable(&claude.gh, &script);
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+
+                assert_eq!(
+                    (synced.replied, synced.discovered, synced.rewritten, synced.unmatched),
+                    (0, 0, 0, 1),
+                    "{synced:?}"
+                );
+                assert_eq!(
+                    call_count(&log, "--paginate"),
+                    0,
+                    "no reply list is asked for when the account is unknown"
+                );
+                assert_eq!(call_count(&log, "-X PATCH"), 0, "nothing unverifiable is rewritten");
+                assert!(plan.items[0].reply_comment_id.is_none(), "{:?}", plan.items[0]);
+            }
+
+            /// A uniquely identified non-inline comment gets one PR-level
+            /// comment that begins with its URL.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_non_inline_comment_gets_a_named_pr_level_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, mut plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                plan.comments[0].kind = PrCommentKind::Conversation;
+                plan.comments[0].url = Some("https://github.com/testorg/testrepo/pull/405#issuecomment-1".to_string());
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "echo 1", "[]");
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 0);
+                assert_eq!(call_count(&log, "pr comment"), 1);
+                assert!(
+                    call_count(&log, "--body Re https://github.com/testorg/testrepo/pull/405#issuecomment-1") == 1,
+                    "{}", std::fs::read_to_string(&log).unwrap()
+                );
+                assert!(plan.items[0].reply_posted, "{:?}", plan.items[0]);
+            }
+
+            /// A missing or duplicated original identity, like any failed
+            /// preflight, makes no public call and changes nothing.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_missing_or_ambiguous_identity_makes_no_public_call() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "echo 1", "[]");
+
+                let mut missing = plan.clone();
+                missing.comments.clear();
+                let mut duplicate = plan.clone();
+                duplicate.comments.push(duplicate.comments[0].clone());
+                for broken in [missing, duplicate] {
+                    let before = broken.items[0].clone();
+                    let err = sync_plan(&task, &worktree, broken).await.expect_err("preflight refuses");
+                    assert!(err.contains("Nothing was posted"), "{err}");
+                    assert!(!before.reply_posted);
+                }
+                assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "", "no gh call at all");
+            }
+
             /// #96 case 1, a plan persisted by a build that cleared
             /// `fix_uncommitted` as soon as the commit succeeded: the fix is
             /// committed locally, the push failed, no reply was posted.
@@ -18787,6 +19973,173 @@ mod tests {
                 sync_pr_review_replies_inner(task.clone(), worktree.to_str().unwrap().to_string(), plan)
                     .await
                     .expect("sync reports per item, not as a command error")
+            }
+
+            /// A comment of `kind` numbered `id`, for the Sync identity tests.
+            fn sync_comment(id: Option<u64>, kind: PrCommentKind, url: Option<&str>) -> PrReviewComment {
+                PrReviewComment {
+                    id,
+                    kind,
+                    author: "rev".to_string(),
+                    author_association: Some("MEMBER".to_string()),
+                    body: format!("comment {id:?}"),
+                    path: None,
+                    line: None,
+                    url: url.map(str::to_string),
+                    created_at: None,
+                    updated_at: None,
+                }
+            }
+
+            /// A fix pushed to the pull request's branch (so the delivery check
+            /// confirms it), with the forge replaced by one that logs every call.
+            /// Returns the plan, the checkout and the log; the plan holds `comments`
+            /// and `edit` has changed it before Sync runs.
+            async fn delivered_fix_with_logging_gh(
+                claude: &EditingClaude,
+                state: &crate::AppState,
+                repo: &RepoFixture,
+                comments: Vec<PrReviewComment>,
+                edit: impl FnOnce(&mut PrReviewPlan),
+            ) -> (Task, PrReviewPlan, PathBuf, PathBuf) {
+                let worktree = task_checkout_for_review(repo, false);
+                let no_jj = repo.checkout.join("no-such-jj");
+                let (task, plan) = task_with_one_fix(state, repo, &worktree).await;
+                let (first, mut plan) = apply(&task, plan, &worktree, no_jj, false).await;
+                assert!(first.pushed && plan.items[0].fix_done && !plan.items[0].fix_uncommitted, "{first:?}");
+                plan.comments = comments;
+                edit(&mut plan);
+                let log = repo.checkout.parent().unwrap().join("gh-calls.log");
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'--paginate'*) echo '[]' ;;\n  *) echo 4242 ;;\nesac\n"
+                );
+                write_executable(&claude.gh, &script);
+                (task, plan, worktree, log)
+            }
+
+            /// Every logged `gh` call except the reads: the task branch's own
+            /// pull request, the authenticated login and the list of inline
+            /// comments.
+            fn gh_writes(log: &Path) -> Vec<String> {
+                std::fs::read_to_string(log)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| !l.starts_with("pr list") && !l.starts_with("api --paginate") && !l.starts_with("api user"))
+                    .map(str::to_string)
+                    .collect()
+            }
+
+            /// Sync refuses an approved fix whose comment has no id, before any
+            /// forge call, and names the item.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_refuses_an_approved_fix_without_a_comment_id() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude, &state, &repo,
+                    vec![sync_comment(Some(7), PrCommentKind::Inline, None)],
+                    |p| p.items[0].comment_id = None,
+                ).await;
+                let before = serde_json::to_value(&plan).unwrap();
+                let err = sync_pr_review_replies_inner(task, worktree.to_str().unwrap().to_string(), plan.clone())
+                    .await
+                    .expect_err("an item without identity is refused");
+                assert!(err.contains("Nothing was posted"), "{err}");
+                assert!(!log.exists(), "no forge call: {:?}", std::fs::read_to_string(&log));
+                assert_eq!(serde_json::to_value(&plan).unwrap(), before);
+            }
+
+            /// A number two stored comments share names neither.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_refuses_an_approved_fix_whose_comment_number_is_repeated() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude, &state, &repo,
+                    vec![
+                        sync_comment(Some(1), PrCommentKind::Review, None),
+                        sync_comment(Some(1), PrCommentKind::Inline, None),
+                    ],
+                    |_| {},
+                ).await;
+                let before = serde_json::to_value(&plan).unwrap();
+                let err = sync_pr_review_replies_inner(task, worktree.to_str().unwrap().to_string(), plan.clone())
+                    .await
+                    .expect_err("a repeated number is refused");
+                assert!(err.contains("Nothing was posted"), "{err}");
+                assert!(!log.exists(), "no forge call: {:?}", std::fs::read_to_string(&log));
+                assert_eq!(serde_json::to_value(&plan).unwrap(), before);
+            }
+
+            /// A unique inline comment is answered inline, once; a second Sync
+            /// posts nothing.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_replies_inline_once_to_a_unique_inline_comment() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude, &state, &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Inline, None)],
+                    |_| {},
+                ).await;
+                let (result, plan) = sync(&task, &worktree, plan).await;
+                assert_eq!(result.replied, 1, "{result:?}");
+                assert!(plan.items[0].reply_posted && plan.items[0].fix_done, "{:?}", plan.items[0]);
+                let writes = gh_writes(&log);
+                assert_eq!(writes.len(), 1, "{writes:?}");
+                assert!(writes[0].contains("pulls/405/comments/1/replies"), "{writes:?}");
+
+                let (again, _plan) = sync(&task, &worktree, plan).await;
+                assert_eq!(again.replied, 0, "{again:?}");
+                assert_eq!(gh_writes(&log).len(), 1, "a second Sync posted again: {:?}", gh_writes(&log));
+            }
+
+            /// A unique conversation comment is answered at PR level, and the
+            /// body says which comment it answers.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_answers_a_unique_conversation_comment_at_pr_level_naming_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-77";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude, &state, &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                ).await;
+                let (result, plan) = sync(&task, &worktree, plan).await;
+                assert_eq!(result.replied, 1, "{result:?}");
+                assert!(plan.items[0].reply_posted);
+                // A multi-line body spans several log lines.
+                let writes = gh_writes(&log);
+                assert_eq!(writes.iter().filter(|l| l.starts_with("pr comment")).count(), 1, "{writes:?}");
+                assert!(writes[0].starts_with("pr comment 405"), "{writes:?}");
+                assert!(writes[0].contains(url), "the body names the original comment: {writes:?}");
+            }
+
+            /// A fix whose delivery is not confirmed gets no reply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_does_not_claim_a_fix_that_delivery_does_not_confirm() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude, &state, &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Inline, None)],
+                    |p| { p.items[0].fix_commit = None; p.items[0].fix_effect = None; },
+                ).await;
+                let (result, plan) = sync(&task, &worktree, plan).await;
+                assert_eq!((result.replied, result.fix_pending), (0, 1), "{result:?}");
+                assert!(!plan.items[0].reply_posted);
+                assert!(gh_writes(&log).is_empty(), "{:?}", gh_writes(&log));
             }
 
             /// [`apply`] with pushing switched off.
@@ -22917,5 +24270,1059 @@ mod recovery_admission_tests {
                 WorkerHandoffStage::RecoveryRequired { .. }
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod review_plan_provenance {
+    use super::*;
+
+    const ANALYZED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const MOVED: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const PR_URL: &str = "https://github.com/o/r/pull/1";
+
+    fn plan_analyzed_at(head: Option<&str>) -> PrReviewPlan {
+        PrReviewPlan {
+            generated_at: chrono::Utc::now(),
+            pr_url: PR_URL.to_string(),
+            review_decision: None,
+            comments: Vec::new(),
+            items: Vec::new(),
+            raw_plan: String::new(),
+            last_apply: None,
+            fixed_content: Vec::new(),
+            analyzed_head_oid: head.map(str::to_string),
+            analyzed_worktree_oid: head.map(str::to_string),
+            analyzed_worktree_fingerprint: None,
+            analyzed_at: head.map(|_| chrono::Utc::now()),
+        }
+    }
+
+    #[test]
+    fn apply_is_refused_when_the_head_moved_after_analysis() {
+        let plan = plan_analyzed_at(Some(ANALYZED));
+        let err = check_plan_matches_pr_head(&plan, MOVED).unwrap_err();
+        assert!(err.contains("aaaaaaa"), "names the analyzed head: {err}");
+        assert!(err.contains("bbbbbbb"), "names the current head: {err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+    }
+
+    #[test]
+    fn apply_proceeds_when_the_head_is_the_analyzed_head() {
+        let plan = plan_analyzed_at(Some(ANALYZED));
+        assert_eq!(check_plan_matches_pr_head(&plan, ANALYZED), Ok(()));
+    }
+
+    #[test]
+    fn apply_is_refused_for_a_plan_without_provenance() {
+        let plan = plan_analyzed_at(None);
+        let err = check_plan_matches_pr_head(&plan, ANALYZED).unwrap_err();
+        assert!(err.contains("Re-analyze"), "{err}");
+    }
+
+    #[test]
+    fn plan_saved_before_provenance_loads_as_unknown_and_round_trips_without_it() {
+        let legacy = serde_json::json!({
+            "generated_at": "2026-01-01T00:00:00Z",
+            "pr_url": PR_URL,
+            "review_decision": null,
+            "comments": [],
+            "items": [],
+            "raw_plan": "",
+        });
+        let plan: PrReviewPlan = serde_json::from_value(legacy).expect("legacy plan loads");
+        assert_eq!(plan.analyzed_head_oid, None);
+        assert_eq!(plan.analyzed_at, None);
+        let back = serde_json::to_value(&plan).unwrap();
+        assert!(back.get("analyzed_head_oid").is_none(), "{back}");
+        assert!(check_plan_matches_pr_head(&plan, ANALYZED).is_err());
+    }
+
+    #[test]
+    fn provenance_round_trips_through_serde() {
+        let plan = plan_analyzed_at(Some(ANALYZED));
+        let json = serde_json::to_value(&plan).unwrap();
+        let back: PrReviewPlan = serde_json::from_value(json).unwrap();
+        assert_eq!(back.analyzed_head_oid.as_deref(), Some(ANALYZED));
+        assert_eq!(back.analyzed_at, plan.analyzed_at);
+    }
+
+    #[test]
+    fn head_oid_must_be_present_in_the_gh_answer() {
+        assert_eq!(
+            pr_head_oid_from_json(&format!(r#"{{"headRefOid":"{ANALYZED}"}}"#)),
+            Ok(ANALYZED.to_string()),
+        );
+        assert!(pr_head_oid_from_json("{}").is_err());
+        assert!(pr_head_oid_from_json(r#"{"headRefOid":""}"#).is_err());
+        assert!(pr_head_oid_from_json("not json").is_err());
+    }
+
+    fn thread(resolved: bool, outdated: bool, ids: &[u64]) -> serde_json::Value {
+        let nodes: Vec<_> = ids
+            .iter()
+            .map(|id| serde_json::json!({ "fullDatabaseId": id.to_string() }))
+            .collect();
+        serde_json::json!({
+            "isResolved": resolved,
+            "isOutdated": outdated,
+            "comments": { "totalCount": ids.len(), "nodes": nodes },
+        })
+    }
+
+    fn page(threads: Vec<serde_json::Value>) -> String {
+        serde_json::json!({
+            "data": { "repository": { "pullRequest": { "reviewThreads": {
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": threads,
+            } } } }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn resolved_and_outdated_threads_are_non_actionable_open_ones_are_not() {
+        let pages = page(vec![
+            thread(false, false, &[1]),
+            thread(true, false, &[2, 3]),
+            thread(false, true, &[4]),
+        ]);
+        let ids = non_actionable_review_comment_ids(&pages).unwrap();
+        assert_eq!(ids, [2, 3, 4].into_iter().collect());
+    }
+
+    #[test]
+    fn threads_across_pages_are_all_read() {
+        let pages = format!("{}\n{}", page(vec![thread(true, false, &[7])]), page(vec![thread(false, true, &[8])]));
+        let ids = non_actionable_review_comment_ids(&pages).unwrap();
+        assert_eq!(ids, [7, 8].into_iter().collect());
+    }
+
+    #[test]
+    fn a_failed_or_malformed_thread_read_is_an_error_not_an_empty_set() {
+        assert!(non_actionable_review_comment_ids("").is_err());
+        assert!(non_actionable_review_comment_ids("not json").is_err());
+        assert!(non_actionable_review_comment_ids(r#"{"data":{"repository":null}}"#).is_err());
+        // A resolved thread whose comments were cut short cannot be trusted.
+        let truncated = serde_json::json!({
+            "isResolved": true, "isOutdated": false,
+            "comments": { "totalCount": 3, "nodes": [{ "fullDatabaseId": "1" }] },
+        });
+        assert!(non_actionable_review_comment_ids(&page(vec![truncated])).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_is_refused_when_the_pr_head_moved_between_analysis_and_apply() {
+        let _gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{MOVED}\"}}'"),
+        )
+        .await;
+        let plan = plan_analyzed_at(Some(ANALYZED));
+        let current = current_pr_head_oid(PR_URL).await.expect("head is read");
+        assert_eq!(current, MOVED);
+        assert!(check_plan_matches_pr_head(&plan, &current).is_err());
+    }
+
+    /// The apply path, given a plan analyzed at `ANALYZED` while the PR head
+    /// is now `MOVED`, refuses before any agent runs: the only `gh` call is
+    /// the head read (so no reply is posted), no `claude` launch happens, and
+    /// the checkout stays empty.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stale_stored_plan_runs_no_agent_and_posts_nothing() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!(
+                "case \"$1 $2\" in\n  \"pr view\") printf '%s' '{{\"headRefOid\":\"{MOVED}\"}}' ;;\n  *) exit 1 ;;\nesac"
+            ),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let (task, mut plan) = crate::test_helpers::create_test_pr_review_setup();
+        plan.analyzed_head_oid = Some(ANALYZED.to_string());
+        plan.analyzed_at = Some(chrono::Utc::now());
+        let checkout = tempfile::tempdir().unwrap();
+        let lease_dir = tempfile::tempdir().unwrap();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let options = AddressPrReviewOptions { auto_push: true, auto_reply: true, dry_run: false };
+
+        let err = address_pr_review_inner(
+            task,
+            checkout.path().to_str().unwrap().to_string(),
+            plan,
+            options,
+            no_progress(),
+            cancel_rx,
+            lease_dir.path().join("task.lock"),
+        )
+        .await
+        .expect_err("a plan analyzed at an older head is refused");
+
+        assert!(err.contains("moved"), "{err}");
+        assert_eq!(gh.launches("gh"), 1, "only the head is read: no reply, no push");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+        assert!(std::fs::read_dir(checkout.path()).unwrap().next().is_none(), "nothing was written");
+    }
+
+    /// The three reads `fetch_pr_review_data` makes, answered by a fake `gh`.
+    /// `pr_view`, `inline` and `threads` are JSON printed verbatim, so they
+    /// must not contain single quotes.
+    #[cfg(unix)]
+    async fn fake_gh_reads(
+        pr_view: &str,
+        inline: &str,
+        threads: &str,
+    ) -> crate::test_helpers::FakeProgram {
+        fake_gh_reads_with(pr_view, "[]", "[]", inline, threads).await
+    }
+
+    /// The same reads, with the REST lists of reviews and conversation
+    /// comments (numeric ids) given as `reviews` and `conversation`. Each
+    /// endpoint is matched on the whole command line.
+    #[cfg(unix)]
+    async fn fake_gh_reads_with(
+        pr_view: &str,
+        reviews: &str,
+        conversation: &str,
+        inline: &str,
+        threads: &str,
+    ) -> crate::test_helpers::FakeProgram {
+        crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!(
+                "case \"$*\" in\n  \"pr view\"*) printf '%s' '{pr_view}' ;;\n  \"api graphql\"*) printf '%s' '{threads}' ;;\n  *\"/reviews?\"*) printf '%s' '{reviews}' ;;\n  *\"/issues/\"*\"/comments?\"*) printf '%s' '{conversation}' ;;\n  *\"/pulls/\"*\"/comments?\"*) printf '%s' '{inline}' ;;\n  *) exit 1 ;;\nesac"
+            ),
+        )
+        .await
+    }
+
+    fn pr_view_json(extra: serde_json::Value) -> String {
+        let mut view = serde_json::json!({
+            "headRefOid": ANALYZED,
+            "reviewDecision": null,
+            "reviews": [],
+            "comments": [{ "id": "IC_1", "body": "general remark", "author": { "login": "a" } }],
+        });
+        view.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        view.to_string()
+    }
+
+    fn inline_comment(id: u64, body: &str) -> serde_json::Value {
+        serde_json::json!({ "id": id, "body": body, "path": "src/lib.rs", "line": 3,
+            "html_url": "https://github.com/o/r/pull/1#r", "user": { "login": "rev" } })
+    }
+
+    fn open_threads() -> String {
+        serde_json::json!({ "data": { "repository": { "pullRequest": { "reviewThreads": {
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": [{ "isResolved": true, "isOutdated": false,
+                "comments": { "totalCount": 1, "nodes": [{ "fullDatabaseId": "12" }] } }],
+        } } } } })
+        .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_reads_the_head_and_keeps_only_actionable_inline_comments() {
+        let inline = format!("[{},{}]", inline_comment(11, "fix this"), inline_comment(12, "old"));
+        let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), &inline, &open_threads()).await;
+
+        let (head, decision, comments) = fetch_pr_review_data(PR_URL).await.expect("review is read");
+        assert_eq!(head, ANALYZED);
+        assert_eq!(decision, None);
+        let inline_ids: Vec<_> = comments.iter().filter(|c| c.kind == PrCommentKind::Inline).map(|c| c.id).collect();
+        assert_eq!(inline_ids, vec![Some(11)], "the resolved thread's comment is left out");
+        assert!(comments.iter().any(|c| c.kind == PrCommentKind::Conversation), "conversation comments are kept");
+    }
+
+    fn identity_comment(id: Option<u64>, kind: PrCommentKind) -> PrReviewComment {
+        PrReviewComment {
+            id,
+            kind,
+            author: "rev".to_string(),
+            author_association: Some("MEMBER".to_string()),
+            body: format!("comment {id:?}"),
+            path: None,
+            line: None,
+            url: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn identity_fix(comment_id: Option<u64>) -> PrReviewItem {
+        PrReviewItem {
+            comment_id,
+            summary: "s".to_string(),
+            decision: PrReviewDecision::Fix,
+            reasoning: String::new(),
+            proposed_change: "change".to_string(),
+            approved: true,
+            user_note: String::new(),
+            fix_done: false,
+            fix_uncommitted: false,
+            fix_commit: None,
+            fix_effect: None,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
+        }
+    }
+
+    fn identity_plan(comments: Vec<PrReviewComment>, items: Vec<PrReviewItem>) -> PrReviewPlan {
+        PrReviewPlan {
+            generated_at: chrono::Utc::now(),
+            pr_url: PR_URL.to_string(),
+            review_decision: None,
+            comments,
+            items,
+            raw_plan: String::new(),
+            last_apply: None,
+            fixed_content: Vec::new(),
+            analyzed_head_oid: Some(ANALYZED.to_string()),
+            analyzed_worktree_oid: Some(ANALYZED.to_string()),
+            analyzed_worktree_fingerprint: None,
+            analyzed_at: Some(chrono::Utc::now()),
+        }
+    }
+
+    /// Regression: an approved Fix naming a comment with no numeric id was
+    /// accepted into an Apply plan, so Apply could run an agent for it.
+    #[test]
+    fn apply_refuses_an_approved_fix_whose_comment_has_no_numeric_id() {
+        let plan = identity_plan(
+            vec![identity_comment(None, PrCommentKind::Review)],
+            vec![identity_fix(None)],
+        );
+        let err = stored_plan_for_apply(Some(&plan), &plan).expect_err("no identity, no apply");
+        assert!(err.contains("Nothing was changed"), "{err}");
+    }
+
+    /// An id from one resource type never names a comment of another: a
+    /// review and an inline comment with the same number are both withheld,
+    /// so neither can be fixed or replied to by that number.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_review_and_an_inline_comment_sharing_a_number_are_not_conflated() {
+        let pr = pr_view_json(serde_json::json!({
+            "reviews": [{ "id": "PRR_1", "body": "overall", "state": "COMMENTED" }],
+        }));
+        let _gh = fake_gh_reads_with(
+            &pr,
+            r#"[{"id":11,"node_id":"PRR_1"}]"#,
+            "[]",
+            &format!("[{}]", inline_comment(11, "fix this")),
+            &open_threads(),
+        ).await;
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("review is read");
+        let review = comments.iter().find(|c| c.kind == PrCommentKind::Review).expect("review kept");
+        let inline = comments.iter().find(|c| c.kind == PrCommentKind::Inline).expect("inline kept");
+        assert_eq!((review.id, inline.id), (None, None), "a shared number names neither");
+        let plan = identity_plan(comments.clone(), vec![identity_fix(Some(11))]);
+        assert!(stored_plan_for_apply(Some(&plan), &plan).is_err());
+    }
+
+    /// Reviews and conversation comments get their numeric ids from the REST
+    /// lists, matched by node id, and keep their own resource type.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_gives_reviews_and_conversation_comments_their_numeric_ids() {
+        let pr = pr_view_json(serde_json::json!({
+            "reviews": [{ "id": "PRR_1", "body": "overall", "state": "COMMENTED" }],
+        }));
+        let _gh = fake_gh_reads_with(
+            &pr,
+            r#"[{"id":101,"node_id":"PRR_1"}]"#,
+            r#"[{"id":202,"node_id":"IC_1"}]"#,
+            &format!("[{}]", inline_comment(11, "fix this")),
+            &open_threads(),
+        ).await;
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("review is read");
+        let id_of = |kind: PrCommentKind| comments.iter().find(|c| c.kind == kind).and_then(|c| c.id);
+        assert_eq!(id_of(PrCommentKind::Review), Some(101));
+        assert_eq!(id_of(PrCommentKind::Conversation), Some(202));
+        assert_eq!(id_of(PrCommentKind::Inline), Some(11));
+    }
+
+    /// A review whose node id the REST list does not match, or whose REST
+    /// entry is malformed, is still listed for display, with no id.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_review_without_a_numeric_id_is_listed_but_keeps_none() {
+        let pr = pr_view_json(serde_json::json!({
+            "reviews": [{ "id": "PRR_9", "body": "unmatched", "state": "COMMENTED" }],
+        }));
+        let _gh = fake_gh_reads_with(&pr, r#"[{"node_id":"PRR_1"}]"#, "[]", "[]", &open_threads()).await;
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("display still works");
+        let review = comments.iter().find(|c| c.kind == PrCommentKind::Review).expect("review listed");
+        assert_eq!(review.id, None);
+        assert_eq!(review.body, "unmatched");
+    }
+
+    /// A reply to a review or conversation comment never goes to the inline
+    /// endpoint by number; only an inline comment gets an inline reply.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reply_uses_the_inline_endpoint_only_for_an_inline_comment() {
+        let _gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            "case \"$*\" in\n  *\"/replies\"*) printf '%s' '999' ;;\n  \"pr comment\"*) exit 0 ;;\n  *) exit 1 ;;\nesac",
+        )
+        .await;
+        let plan = identity_plan(
+            vec![
+                identity_comment(Some(11), PrCommentKind::Review),
+                identity_comment(Some(12), PrCommentKind::Inline),
+            ],
+            Vec::new(),
+        );
+        let review_target = plan.inline_reply_target(Some(11));
+        assert_eq!(review_target, None);
+        assert_eq!(post_pr_reply("o/r", "1", review_target, "thanks").await, Ok(None));
+        let inline_target = plan.inline_reply_target(Some(12));
+        assert_eq!(inline_target, Some(12));
+        assert_eq!(post_pr_reply("o/r", "1", inline_target, "thanks").await, Ok(Some(999)));
+    }
+
+    /// Re-analysis must not carry a fix or a reply from a comment of one
+    /// resource type onto a comment of another with the same number.
+    #[test]
+    fn carry_forward_does_not_cross_resource_types() {
+        let prior = identity_plan(
+            vec![identity_comment(Some(5), PrCommentKind::Review)],
+            vec![PrReviewItem { fix_done: true, reply_posted: true, ..identity_fix(Some(5)) }],
+        );
+        let comments = vec![identity_comment(Some(5), PrCommentKind::Inline)];
+        let mut items = vec![identity_fix(Some(5))];
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &comments);
+        assert!(!items[0].fix_done && !items[0].reply_posted, "{:?}", items[0]);
+    }
+
+    /// A number the prior plan repeats names no comment, so nothing is carried
+    /// onto a fresh comment that has it.
+    #[test]
+    fn carry_forward_does_not_copy_state_for_a_repeated_number() {
+        let prior = identity_plan(
+            vec![
+                identity_comment(Some(5), PrCommentKind::Review),
+                identity_comment(Some(5), PrCommentKind::Inline),
+            ],
+            vec![PrReviewItem { fix_done: true, reply_posted: true, ..identity_fix(Some(5)) }],
+        );
+        let comments = vec![identity_comment(Some(5), PrCommentKind::Inline)];
+        let mut items = vec![identity_fix(Some(5))];
+        let fixed = carry_forward_reanalysis_lifecycle(&mut items, &prior, &comments);
+        assert!(!items[0].fix_done && !items[0].reply_posted, "{:?}", items[0]);
+        assert!(fixed.is_empty(), "{fixed:?}");
+    }
+
+    /// A unique comment of the same kind is still carried.
+    #[test]
+    fn carry_forward_still_carries_a_unique_same_kind_comment() {
+        let prior = identity_plan(
+            vec![identity_comment(Some(5), PrCommentKind::Inline)],
+            vec![PrReviewItem { fix_done: true, reply_posted: true, ..identity_fix(Some(5)) }],
+        );
+        let comments = vec![identity_comment(Some(5), PrCommentKind::Inline)];
+        let mut items = vec![identity_fix(Some(5))];
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &comments);
+        assert!(items[0].fix_done && items[0].reply_posted, "{:?}", items[0]);
+    }
+
+    /// Every page of a REST list is read; a truncated page is an error, and an
+    /// empty list is valid.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rest_lists_read_every_page_and_fail_on_a_truncated_one() {
+        let _two = crate::test_helpers::FakeProgram::install(
+            "gh", "printf '%s' '[{\"id\":1}][{\"id\":2}]'",
+        ).await;
+        assert_eq!(gh_api_list("repos/o/r/pulls/1/reviews", "reviews").await.map(|v| v.len()), Ok(2));
+        drop(_two);
+
+        let _cut = crate::test_helpers::FakeProgram::install(
+            "gh", "printf '%s' '[{\"id\":1}][{\"id\":2'",
+        ).await;
+        assert!(gh_api_list("repos/o/r/pulls/1/reviews", "reviews").await.is_err());
+        drop(_cut);
+
+        let _empty = crate::test_helpers::FakeProgram::install("gh", "printf '%s' '[]'").await;
+        assert_eq!(gh_api_list("repos/o/r/pulls/1/reviews", "reviews").await, Ok(Vec::new()));
+    }
+
+    /// A plan saved before resource types were tracked keeps its inline ids
+    /// and its replies; its numeric ids always named inline comments.
+    #[test]
+    fn a_legacy_plan_still_loads_and_replies_to_its_inline_comments() {
+        let legacy = serde_json::json!({
+            "generated_at": "2026-01-01T00:00:00Z",
+            "pr_url": PR_URL,
+            "review_decision": null,
+            "comments": [{ "id": 11, "kind": "inline", "author": "rev", "body": "fix" }],
+            "items": [{
+                "comment_id": 11, "summary": "s", "decision": "fix",
+                "reasoning": "r", "proposed_change": "c", "approved": true,
+            }],
+            "raw_plan": "",
+        });
+        let plan: PrReviewPlan = serde_json::from_value(legacy).expect("legacy plan loads");
+        assert_eq!(plan.inline_reply_target(plan.items[0].comment_id), Some(11));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_when_gh_fails_instead_of_returning_no_comments() {
+        let _gh = crate::test_helpers::FakeProgram::install("gh", "exit 1").await;
+        assert!(fetch_pr_review_data(PR_URL).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_on_an_empty_inline_answer() {
+        let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), "", &open_threads()).await;
+        let err = fetch_pr_review_data(PR_URL).await.expect_err("an empty answer is not an empty review");
+        assert!(err.contains("inline"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_on_an_empty_thread_answer() {
+        let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), "[]", "").await;
+        assert!(fetch_pr_review_data(PR_URL).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_when_a_key_is_missing_from_the_pr_answer() {
+        let mut no_reviews: serde_json::Value = serde_json::from_str(&pr_view_json(serde_json::json!({}))).unwrap();
+        no_reviews.as_object_mut().unwrap().remove("reviews");
+        let _gh = fake_gh_reads(&no_reviews.to_string(), "[]", &open_threads()).await;
+        assert!(fetch_pr_review_data(PR_URL).await.unwrap_err().contains("reviews"));
+        drop(_gh);
+
+        let mut no_decision: serde_json::Value = serde_json::from_str(&pr_view_json(serde_json::json!({}))).unwrap();
+        no_decision.as_object_mut().unwrap().remove("reviewDecision");
+        let _gh = fake_gh_reads(&no_decision.to_string(), "[]", &open_threads()).await;
+        assert!(fetch_pr_review_data(PR_URL).await.unwrap_err().contains("review decision"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_fails_on_a_list_at_gh_page_size_because_it_may_be_cut_short() {
+        let reviews: Vec<_> = (0..100)
+            .map(|_| serde_json::json!({ "body": "b", "state": "COMMENTED" }))
+            .collect();
+        let view = pr_view_json(serde_json::json!({ "reviews": reviews }));
+        let _gh = fake_gh_reads(&view, "[]", &open_threads()).await;
+        let err = fetch_pr_review_data(PR_URL).await.expect_err("a full page is not read in full");
+        assert!(err.contains("cannot be read in full"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_inline_comment_without_an_id_is_listed_with_none() {
+        let mut no_id = inline_comment(0, "fix this");
+        no_id.as_object_mut().unwrap().remove("id");
+        let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), &format!("[{no_id}]"), &open_threads()).await;
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("display still works");
+        let inline: Vec<_> = comments.iter().filter(|c| c.kind == PrCommentKind::Inline).collect();
+        assert_eq!(inline.len(), 1, "the comment is not dropped");
+        assert_eq!(inline[0].id, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_reads_every_inline_page_gh_api_paginate_prints() {
+        let pages = format!("[{}]\n[{}]", inline_comment(21, "first"), inline_comment(22, "second"));
+        let _gh = fake_gh_reads(&pr_view_json(serde_json::json!({})), &pages, &open_threads()).await;
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("both pages are read");
+        let ids: Vec<_> = comments.iter().filter(|c| c.kind == PrCommentKind::Inline).map(|c| c.id).collect();
+        assert_eq!(ids, vec![Some(21), Some(22)]);
+    }
+
+    #[test]
+    fn apply_needs_a_stored_plan_and_a_sent_plan_that_is_the_stored_one() {
+        let stored = plan_analyzed_at(Some(ANALYZED));
+        let err = stored_plan_for_apply(None, &stored).unwrap_err();
+        assert!(err.contains("no stored review plan"), "{err}");
+
+        let mut other = stored.clone();
+        other.analyzed_at = Some(chrono::Utc::now() + chrono::Duration::seconds(1));
+        let err = stored_plan_for_apply(Some(&stored), &other).unwrap_err();
+        assert!(err.contains("not the one stored"), "{err}");
+
+        let unknown = plan_analyzed_at(None);
+        assert!(stored_plan_for_apply(Some(&unknown), &unknown).is_ok());
+        assert!(check_plan_matches_pr_head(&unknown, ANALYZED).is_err());
+
+        assert_eq!(stored_plan_for_apply(Some(&stored), &stored.clone()), Ok(&stored));
+        assert!(check_plan_matches_pr_head(&stored, MOVED).unwrap_err().contains("moved"));
+    }
+
+    /// A plan with two items to change, analyzed at `ANALYZED`, as stored on
+    /// the Task. Its checkout provenance starts unset; the pre-flight tests
+    /// record a fixture checkout's facts into a clone before running.
+    fn analyzed_plan_with_items() -> (Task, PrReviewPlan) {
+        let (mut task, mut plan) = crate::test_helpers::create_test_pr_review_setup();
+        plan.analyzed_head_oid = Some(ANALYZED.to_string());
+        plan.analyzed_at = Some(chrono::Utc::now());
+        task.pr_review_plan = Some(plan.clone());
+        (task, plan)
+    }
+
+    /// The stored plan of the fixture Task, with the checkout's provenance
+    /// recorded as the facts give it.
+    fn stored_with_provenance(
+        stored: &PrReviewPlan,
+        facts: (String, String),
+    ) -> (Task, PrReviewPlan) {
+        let mut sent = stored.clone();
+        sent.analyzed_worktree_oid = Some(facts.0);
+        sent.analyzed_worktree_fingerprint = Some(facts.1);
+        let (mut task, _) = analyzed_plan_with_items();
+        task.pr_review_plan = Some(sent.clone());
+        (task, sent)
+    }
+
+    /// The task branch the fake checkout checkout serves.
+    const FIXTURE_BRANCH: &str = "test-branch";
+    /// A tip that answers the moved-checkout run of the fixture git.
+    /// A real git checkout for the facts the analysis binds: branch
+    /// `test-branch` at one commit. The fingerprint's own git calls run the
+    /// real git, like every other test that spawns processes, so no `PATH` is
+    /// taken over for git here: a PATH-wide git fake would be picked up by
+    /// the suite's other, parallel, git-spawning tests.
+    fn real_checkout(dir: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", FIXTURE_BRANCH]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("committed.txt"), b"committed").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "fixture"]);
+    }
+
+    /// Record the fixture checkout's provenance: what the analysis records.
+    async fn checkout_facts(dir: &std::path::Path) -> (String, String) {
+        let facts = worktree_state_facts(dir.to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("the fixture checkout is readable");
+        (facts.tip, facts.fingerprint)
+    }
+
+    /// Run the Apply pre-flight against the fixture checkout.
+    async fn preflight(
+        task: &Task,
+        sent: &PrReviewPlan,
+        dir: &tempfile::TempDir,
+    ) -> Result<(), String> {
+        check_apply_preflight(
+            task.pr_review_plan.as_ref(),
+            sent,
+            PR_URL,
+            dir.path().to_str().unwrap(),
+            Some(FIXTURE_BRANCH),
+        )
+        .await
+    }
+
+    #[test]
+    fn a_changed_item_body_is_refused_even_with_matching_provenance() {
+        let (task, stored) = analyzed_plan_with_items();
+        let mut sent = stored.clone();
+        sent.items[0].proposed_change = "rewrite the whole module".to_string();
+        let err = stored_plan_for_apply(task.pr_review_plan.as_ref(), &sent).unwrap_err();
+        assert!(err.contains("differs from the one stored"), "{err}");
+    }
+
+    #[test]
+    fn added_removed_or_retargeted_items_and_comments_are_refused() {
+        let (task, _) = analyzed_plan_with_items();
+        let stored = task.pr_review_plan.as_ref();
+
+        let mut removed = stored.unwrap().clone();
+        removed.items.pop();
+        assert!(stored_plan_for_apply(stored, &removed).is_err());
+
+        let mut added = stored.unwrap().clone();
+        added.items.push(added.items[0].clone());
+        assert!(stored_plan_for_apply(stored, &added).is_err());
+
+        let mut retargeted = stored.unwrap().clone();
+        retargeted.items[0].comment_id = Some(999);
+        assert!(stored_plan_for_apply(stored, &retargeted).is_err());
+
+        let mut reworded = stored.unwrap().clone();
+        reworded.comments[0].body = "something else".to_string();
+        assert!(stored_plan_for_apply(stored, &reworded).is_err());
+    }
+
+    #[test]
+    fn decision_and_lifecycle_changes_are_allowed() {
+        let (task, stored) = analyzed_plan_with_items();
+        let mut sent = stored.clone();
+        sent.items[0].approved = false;
+        sent.items[0].decision = PrReviewDecision::Skip;
+        sent.items[1].fix_done = true;
+        sent.items[1].reply_posted = true;
+        sent.items[1].last_error = Some("earlier failure".to_string());
+        sent.last_apply = None;
+        assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &sent).is_ok());
+    }
+
+    /// The command's pre-flight, with a fake `gh` answering the head read. A
+    /// plan whose content was changed is refused before `gh` is even asked,
+    /// so no agent, push or reply can follow.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_refuses_changed_content_before_any_gh_call() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (task, stored) = analyzed_plan_with_items();
+        let mut sent = stored.clone();
+        sent.items[0].proposed_change = "rewrite the whole module".to_string();
+
+        let err = check_apply_preflight(
+            task.pr_review_plan.as_ref(),
+            &sent,
+            PR_URL,
+            dir.path().to_str().unwrap(),
+            Some("test-branch"),
+        )
+        .await
+        .expect_err("changed content is refused");
+        assert!(err.contains("differs from the one stored"), "{err}");
+        assert_eq!(gh.launches("gh"), 0, "no head read, no reply, no push");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+    }
+
+    /// A stored plan analyzed at an older head is refused by the pre-flight:
+    /// the head is read, but no agent, push or reply follows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_refuses_a_stale_stored_plan_and_runs_no_agent() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{MOVED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        let (_, stored) = analyzed_plan_with_items();
+        let (task, sent) = stored_with_provenance(&stored, checkout_facts(dir.path()).await);
+
+        let err = preflight(&task, &sent, &dir)
+            .await
+            .expect_err("a stale plan is refused");
+        assert!(err.contains("moved"), "{err}");
+        assert_eq!(gh.launches("gh"), 1, "only the head is read");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+    }
+
+    /// The same pre-flight with the PR head unchanged passes for the stored plan.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_passes_for_the_stored_plan_at_the_current_head() {
+        // The fake `gh` is only held for its PATH presence: the pre-flight
+        // spawns it and compares heads without touching this value.
+        let _gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        let (_, stored) = analyzed_plan_with_items();
+        let (task, sent) = stored_with_provenance(&stored, checkout_facts(dir.path()).await);
+        assert!(preflight(&task, &sent, &dir).await.is_ok());
+    }
+
+    /// An Apply is refused when the checkout's branch tip is not the commit
+    /// the analysis read, without the PR head even being asked about. The
+    /// refusal is read-only: nothing about the checkout is changed, and the
+    /// user's local commits and edits all stay where they are.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_refuses_a_moved_checkout_and_touches_nothing() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        // The plan's provenance is recorded at this tip; the branch then
+        // moves to a further commit, as a publication would.
+        let facts = checkout_facts(dir.path()).await;
+        std::fs::write(dir.path().join("committed.txt"), b"moved").unwrap();
+        let ok = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["commit", "-aqm", "move"])
+            .status()
+            .expect("git commit");
+        assert!(ok.success());
+        let (_, stored) = analyzed_plan_with_items();
+        let (task, sent) = stored_with_provenance(&stored, facts);
+
+        let err = preflight(&task, &sent, &dir)
+            .await
+            .expect_err("a moved checkout is refused");
+        assert!(err.contains("checkout moved"), "{err}");
+        assert!(err.contains("Re-analyze"), "{err}");
+        assert_eq!(gh.launches("gh"), 0, "the local refusal needs no head read");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+    }
+
+    /// An Apply is refused when the checkout's uncommitted content is no
+    /// longer the content the analysis read, even at the same tip — the fix
+    /// instructions were formed from that content. The refusal preserves the
+    /// edits where they are; only a re-analyze records the state as it is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_refuses_when_the_uncommitted_edits_content_changed() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        // The checkout is dirty already: a tracked edit the analysis read.
+        std::fs::write(dir.path().join("committed.txt"), b"analyzed content").unwrap();
+        let (_, stored) = analyzed_plan_with_items();
+        let (task, sent) = stored_with_provenance(&stored, checkout_facts(dir.path()).await);
+
+        // Same status letter (`M committed.txt` both times), different bytes.
+        std::fs::write(dir.path().join("committed.txt"), b"rewritten content").unwrap();
+        let err = preflight(&task, &sent, &dir)
+            .await
+            .expect_err("an edit hidden by the status letter is refused");
+        assert!(err.contains("content is not what"), "{err}");
+        assert!(err.contains("no edit was discarded"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.path().join("committed.txt")).unwrap(),
+            b"rewritten content".to_vec(),
+            "the refusal changed nothing"
+        );
+        assert_eq!(gh.launches("gh"), 0, "the local refusal needs no head read");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+    }
+
+    /// A plan saved by the previous code records the PR head but not the
+    /// checkout state. It is unknown and refused, in the same words as a
+    /// plan without the analyzed head: re-analyze, nothing changed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_legacy_plan_without_the_checkout_provenance_is_refused() {
+        // Same: the fake is held for its PATH presence and its answer is
+        // never read, because the unknown-provenance check runs first.
+        let _gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut task, stored) = analyzed_plan_with_items();
+        let mut legacy = stored.clone();
+        legacy.analyzed_worktree_oid = None;
+        legacy.analyzed_worktree_fingerprint = None;
+        task.pr_review_plan = Some(legacy.clone());
+
+        let err = preflight(&task, &legacy, &dir)
+            .await
+            .expect_err("a plan without checkout provenance is refused");
+        assert!(err.contains("does not record the checkout state"), "{err}");
+    }
+
+    /// The capture hashes content, not the status listing: a second edit the
+    /// listing does not report, a mode change, a link-only change, a new
+    /// untracked file and a deletion each make the second capture differ, so
+    /// neither an analysis nor an Apply can be fooled by a stable listing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_state_facts_hash_the_content_the_listing_hides() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        std::fs::write(dir.path().join("committed.txt"), b"first").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"untracked").unwrap();
+        let facts = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+
+        // The same status letter, different bytes: the reported gap.
+        std::fs::write(dir.path().join("committed.txt"), b"second").unwrap();
+        let second = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+        assert_ne!(second.fingerprint, facts.fingerprint, "a content edit shows");
+
+        // Same bytes, a mode flip: still a different state.
+        let mut perms =
+            std::fs::metadata(dir.path().join("committed.txt")).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.path().join("committed.txt"), perms.clone()).unwrap();
+        let exec = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+        assert_ne!(exec.fingerprint, second.fingerprint, "a mode change shows");
+        perms.set_mode(0o644);
+        std::fs::set_permissions(dir.path().join("committed.txt"), perms).unwrap();
+
+        // An untracked file hashes its content, not just its name.
+        std::fs::write(dir.path().join("notes.txt"), b"edited").unwrap();
+        let untracked_changed = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+        assert_ne!(
+            untracked_changed.fingerprint, facts.fingerprint,
+            "an untracked edit shows"
+        );
+
+        // A symlink's target is content.
+        std::fs::remove_file(dir.path().join("notes.txt")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("committed.txt"),
+            dir.path().join("notes.txt"),
+        )
+        .unwrap();
+        let linked = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+        assert_ne!(linked.fingerprint, untracked_changed.fingerprint, "a symlink shows");
+
+        // A deletion removes content, not just the status letter.
+        std::fs::remove_file(dir.path().join("committed.txt")).unwrap();
+        let deleted = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+        assert_ne!(deleted.fingerprint, linked.fingerprint, "a deletion shows");
+    }
+
+    /// An analysis on a moved checkout is refused, and the refusal is named
+    /// in this exact wording.
+    #[test]
+    fn an_analysis_that_ran_on_a_moved_checkout_is_refused() {
+        let recording = CheckoutFacts {
+            tip: ANALYZED.to_string(),
+            fingerprint: "one".to_string(),
+        };
+        let moved = CheckoutFacts {
+            tip: ANALYZED.to_string(),
+            fingerprint: "two".to_string(),
+        };
+        let err = analysis_not_stable(&recording, &moved);
+        assert!(err.contains("during the analysis"), "{err}");
+        assert!(err.contains("was not recorded"), "{err}");
+    }
+
+    fn unapproved_fix(comment_id: Option<u64>) -> PrReviewItem {
+        PrReviewItem { approved: false, ..identity_fix(comment_id) }
+    }
+
+    /// Regression: the approved items Apply runs come from the sent plan, so a
+    /// client approving a Fix the stored plan left unapproved, whose comment
+    /// has no identity, used to pass the gate.
+    #[test]
+    fn a_client_approval_of_an_unidentified_fix_is_refused() {
+        let stored = identity_plan(
+            vec![identity_comment(None, PrCommentKind::Review)],
+            vec![unapproved_fix(None)],
+        );
+        let mut sent = stored.clone();
+        sent.items[0].approved = true;
+        let err = stored_plan_for_apply(Some(&stored), &sent).expect_err("no identity, no apply");
+        assert!(err.contains("Nothing was changed"), "{err}");
+    }
+
+    /// A user's approval of a canonical, identified item is a legitimate
+    /// decision and still reaches the point where Apply proceeds.
+    #[test]
+    fn a_user_approval_of_an_identified_fix_is_accepted() {
+        let stored = identity_plan(
+            vec![identity_comment(Some(7), PrCommentKind::Inline)],
+            vec![unapproved_fix(Some(7))],
+        );
+        let mut sent = stored.clone();
+        sent.items[0].approved = true;
+        assert!(stored_plan_for_apply(Some(&stored), &sent).is_ok());
+    }
+
+    /// A legacy plan whose comment numbers repeat loads and displays, but an
+    /// approved Fix naming a repeated number is refused: the number names no
+    /// one comment, and the first match is never taken.
+    #[test]
+    fn duplicate_numbers_in_a_legacy_plan_load_but_refuse_an_approved_fix() {
+        let legacy = identity_plan(
+            vec![
+                identity_comment(Some(7), PrCommentKind::Inline),
+                identity_comment(Some(7), PrCommentKind::Review),
+            ],
+            vec![unapproved_fix(Some(7))],
+        );
+        let json = serde_json::to_string(&legacy).expect("serializes");
+        let loaded: PrReviewPlan = serde_json::from_str(&json).expect("a legacy plan still loads");
+        assert_eq!(loaded.comments.len(), 2, "display keeps every comment");
+        assert!(loaded.comment_for(7).is_none(), "a repeated number names no comment");
+        assert!(stored_plan_for_apply(Some(&loaded), &loaded).is_ok(), "read-only plans are unaffected");
+
+        let mut sent = loaded.clone();
+        sent.items[0].approved = true;
+        let err = stored_plan_for_apply(Some(&loaded), &sent).expect_err("ambiguous identity");
+        assert!(err.contains("Nothing was changed"), "{err}");
+    }
+
+    /// The command's pre-flight refuses a client approval of an unidentified
+    /// Fix before the head is read, so no agent, push or reply can follow.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_refuses_a_client_approval_without_identity_before_any_side_effect() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let stored = identity_plan(
+            vec![identity_comment(None, PrCommentKind::Review)],
+            vec![unapproved_fix(None)],
+        );
+        let mut sent = stored.clone();
+        sent.items[0].approved = true;
+        // The refusal happens in the sent-vs-stored identity check, before
+        // the checkout is read at all: no git fake is needed here, and adding
+        // one would double-acquire PATH_LOCK this test already holds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = check_apply_preflight(
+            Some(&stored),
+            &sent,
+            PR_URL,
+            dir.path().to_str().unwrap(),
+            Some("test-branch"),
+        )
+        .await
+        .expect_err("an unidentified approval is refused");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        assert_eq!(gh.launches("gh"), 0, "no head read, no reply, no push");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
     }
 }

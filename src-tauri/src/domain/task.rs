@@ -1431,6 +1431,34 @@ pub struct PrReviewPlan {
     /// [`PrReviewPlan::fixed_content_is_current`] for what that means.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fixed_content: Vec<FixedContent>,
+    /// The pull request's head commit when this plan was analyzed. Apply
+    /// refuses unless the head is still this commit. `None` for every plan
+    /// saved before it was recorded: such a plan is unknown and must be
+    /// analyzed again before it can be applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_head_oid: Option<String>,
+    /// The task's branch tip in the checkout the analysis read. The triage
+    /// helper reads the checkout, not the pull request, so this is the state
+    /// the fix instructions were formed from. Apply refuses unless the tip
+    /// is still this commit. `None` for every plan saved before it was
+    /// recorded: such a plan is unknown and must be analyzed again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_worktree_oid: Option<String>,
+    /// A fingerprint of the checkout's uncommitted content when the analysis
+    /// ran: every tracked path that differs from HEAD (staged or unstaged,
+    /// deletions and type changes included) and every untracked path, hashed
+    /// with its current kind (deleted, regular, executable, symlink target),
+    /// size and content. It binds what the triage helper actually read, so
+    /// an Apply also refuses when a file that still carries its old status
+    /// letter has had its content or mode changed since — or when the edits
+    /// the analysis saw are no longer there. Refusing is read-only: nothing
+    /// about the checkout is changed, and re-analyzing records the state as
+    /// it is now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_worktree_fingerprint: Option<String>,
+    /// When the analysis that recorded `analyzed_head_oid` ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The fingerprint ([`slashit_review_content::fingerprint`]) of the text of
@@ -1445,6 +1473,38 @@ pub struct FixedContent {
 }
 
 impl PrReviewPlan {
+    /// The stored comment `comment_id` names, only when that number is unique
+    /// in the plan. The analysis withholds a number that two comments share,
+    /// but a legacy plan can still hold one, and a number shared by comments
+    /// of different GitHub resource types names none of them. A repeated
+    /// number therefore resolves to `None`, never to the first match.
+    pub fn comment_for(&self, comment_id: u64) -> Option<&PrReviewComment> {
+        self.comment_count_for(comment_id).1
+    }
+
+    /// How many stored comments carry `comment_id`, and the one comment when
+    /// there is exactly one. Lets a caller tell a missing identity from an
+    /// ambiguous one.
+    pub fn comment_count_for(&self, comment_id: u64) -> (usize, Option<&PrReviewComment>) {
+        let mut matches: Vec<&PrReviewComment> =
+            self.comments.iter().filter(|c| c.id == Some(comment_id)).collect();
+        let count = matches.len();
+        let unique = if count == 1 { matches.pop() } else { None };
+        (count, unique)
+    }
+
+    /// The id a reply to `comment_id` is addressed by on GitHub's inline reply
+    /// endpoint. Only an inline comment has one there: a review or a
+    /// conversation comment's number names another resource, and the inline
+    /// endpoint would act on an unrelated comment. `None` otherwise, and for an
+    /// id the plan does not hold.
+    pub fn inline_reply_target(&self, comment_id: Option<u64>) -> Option<u64> {
+        comment_id.filter(|&id| {
+            self.comment_for(id)
+                .is_some_and(|c| c.kind == PrCommentKind::Inline)
+        })
+    }
+
     /// Record that a fix for `comment_id` was just made from the text this
     /// plan holds for it. A comment the plan does not hold is not recorded:
     /// nothing is known about what the agent saw, and the entry stays absent
