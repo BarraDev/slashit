@@ -317,7 +317,14 @@ async fn evaluate(state: &crate::AppState, task: &Task) -> Evaluation {
 
         if let (Some(tip), Some(start)) = (evidence.branch_tip.as_deref(), start_head.as_deref()) {
             if tip == start {
-                refusals.push("The branch tip is still the commit the run started from; there is no result to accept.".into());
+                // Only a completed commit step can have observed the unchanged
+                // start head: a run that finished and found nothing to commit
+                // (`observed_commit == start_head`). Without that observation
+                // the tip's stationarity points at no result at all, so keep
+                // refusing — fail closed for anything else.
+                if evidence.observed_commit.as_deref() != Some(start) {
+                    refusals.push("The branch tip is still the commit the run started from; there is no result to accept.".into());
+                }
             } else {
                 match crate::worktree::restack::is_ancestor(repo_dir, start, tip).await {
                     Ok(true) => {}
@@ -1470,6 +1477,78 @@ mod tests {
         git(&fx.checkout, &["reset", "-q", "--hard", &fx.start]);
         let mut request = fx.request(Uuid::new_v4());
         request.tip = fx.start.clone();
+
+        let reason = refusal(accept_result(&fx.state, request).await);
+
+        assert!(reason.contains("no result to accept"), "{reason}");
+    }
+
+    /// A clean run whose handoff write did not publish: the run's completed
+    /// commit step found nothing to commit and observed exactly that, so the
+    /// recorded commit is the unchanged start head. Recovery may accept it —
+    /// the observation is the proof that the tip's stationarity is the work.
+    #[tokio::test]
+    async fn an_unchanged_tip_with_the_recorded_commit_equal_to_the_start_is_accepted() {
+        let fx = fixture().await;
+        git(&fx.checkout, &["reset", "-q", "--hard", &fx.start]);
+        fx.edit(|t| {
+            t.worker_handoff.as_mut().unwrap().stage =
+                WorkerHandoffStage::RecoveryRequired {
+                    reason: "not published".into(),
+                    observed_commit: Some(fx.start.clone()),
+                };
+        })
+        .await;
+        let mut request = fx.request(Uuid::new_v4());
+        request.tip = fx.start.clone();
+        request.observed_commit = Some(fx.start.clone());
+
+        let outcome = accept_result(&fx.state, request).await.unwrap();
+
+        let AcceptWorkerResultOutcome::Accepted { task } = outcome else {
+            panic!("expected Accepted, got {outcome:?}");
+        };
+        assert_eq!(task.status, TaskStatus::AiReview);
+        assert_eq!(
+            task.worker_handoff.as_ref().unwrap().stage,
+            WorkerHandoffStage::ResolvedToAiReview {
+                commit: fx.start.clone()
+            }
+        );
+        assert_eq!(completions(&task), 1);
+    }
+
+    /// Without the completed-commit observation the unchanged tip points at
+    /// no result at all, so the unchanged start head keeps refusing: a stale
+    /// observation (some other commit) is exactly as pointless.
+    #[tokio::test]
+    async fn an_unchanged_tip_without_the_matching_recorded_commit_still_refuses() {
+        let fx = fixture().await;
+        git(&fx.checkout, &["reset", "-q", "--hard", &fx.start]);
+        let mut request = fx.request(Uuid::new_v4());
+        request.tip = fx.start.clone();
+
+        let reason = refusal(accept_result(&fx.state, request).await);
+
+        assert!(reason.contains("no result to accept"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_tip_with_a_contradictory_recorded_commit_still_refuses() {
+        let fx = fixture().await;
+        let other = "c".repeat(40);
+        git(&fx.checkout, &["reset", "-q", "--hard", &fx.start]);
+        fx.edit(|t| {
+            t.worker_handoff.as_mut().unwrap().stage =
+                WorkerHandoffStage::RecoveryRequired {
+                    reason: "not published".into(),
+                    observed_commit: Some(other.clone()),
+                };
+        })
+        .await;
+        let mut request = fx.request(Uuid::new_v4());
+        request.tip = fx.start.clone();
+        request.observed_commit = Some(other);
 
         let reason = refusal(accept_result(&fx.state, request).await);
 
