@@ -59,6 +59,25 @@ pub enum IpcRequest {
         description: Option<String>,
         priority: Option<String>,
     },
+    /// Set the coding model a Task's runs are started on.
+    ///
+    /// The identifier is saved exactly as it is given: nothing is substituted,
+    /// so the model a run is started on is the model that was requested. The
+    /// instance refuses an identifier no model picker would offer (or, for an
+    /// OpenCode Task, one that is not a `provider/model` id).
+    SetTaskModel { task_id: String, model: String },
+    /// Set how a Task's finished coding runs are reviewed: `manual` or
+    /// `automatic`. A change affects only runs that have not started.
+    SetTaskReviewMode { task_id: String, review_mode: String },
+    /// Replace a Task's structured dependencies. An empty list clears them.
+    ///
+    /// Validated by the instance with the same rules the desktop applies: at
+    /// most one Task of the same Project, no self-dependency, no cycle, and
+    /// only while the Task holds no checkout and nothing is unfinished.
+    SetTaskDependencies {
+        task_id: String,
+        dependencies: Vec<String>,
+    },
     /// Delete a task
     DeleteTask { task_id: String },
     /// Get queue status
@@ -133,6 +152,9 @@ impl IpcRequest {
             Self::CreateTask { .. } => "create_task",
             Self::MoveTask { .. } => "move_task",
             Self::EditTask { .. } => "edit_task",
+            Self::SetTaskModel { .. } => "set_task_model",
+            Self::SetTaskReviewMode { .. } => "set_task_review_mode",
+            Self::SetTaskDependencies { .. } => "set_task_dependencies",
             Self::DeleteTask { .. } => "delete_task",
             Self::QueueStatus => "queue_status",
             Self::EnqueueTask { .. } => "enqueue_task",
@@ -428,6 +450,59 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for v in all {
             assert!(seen.insert(v), "duplicate verb {v}");
+        }
+    }
+
+    /// Task configuration writes carry no agent-launching reach — they only
+    /// change what a *later* run is started with — but they do change state, so
+    /// both classifications are pinned here, as
+    /// `every_spawning_verb_is_also_mutating` pins the spawning verbs'.
+    #[test]
+    fn task_configuration_writes_are_mutating_and_spawn_nothing() {
+        let all = [
+            IpcRequest::SetTaskModel {
+                task_id: String::new(),
+                model: String::new(),
+            },
+            IpcRequest::SetTaskReviewMode {
+                task_id: String::new(),
+                review_mode: String::new(),
+            },
+            IpcRequest::SetTaskDependencies {
+                task_id: String::new(),
+                dependencies: Vec::new(),
+            },
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for req in &all {
+            assert!(
+                req.is_mutating(),
+                "{} changes state and must be classified as mutating",
+                req.verb()
+            );
+            assert!(
+                !req.spawns_agent(),
+                "{} must not be classified as a code-execution verb",
+                req.verb()
+            );
+            assert!(seen.insert(req.verb()), "duplicate verb {}", req.verb());
+        }
+    }
+
+    #[test]
+    fn a_task_configuration_write_round_trips_on_the_wire() {
+        let env = IpcEnvelope::new(IpcRequest::SetTaskDependencies {
+            task_id: "6f96fefa-0000-0000-0000-000000000001".into(),
+            dependencies: vec!["6f96fefa-0000-0000-0000-000000000002".into()],
+        });
+        let line = serde_json::to_string(&env).unwrap();
+        let back: IpcEnvelope = serde_json::from_str(&line).unwrap();
+        match back.request {
+            IpcRequest::SetTaskDependencies { task_id, dependencies } => {
+                assert!(task_id.ends_with("0001"));
+                assert_eq!(dependencies.len(), 1);
+            }
+            other => panic!("decoded as {other:?}"),
         }
     }
 }

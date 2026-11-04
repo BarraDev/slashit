@@ -95,6 +95,41 @@ enum Commands {
         #[arg(long)]
         priority: Option<String>,
     },
+    /// Set the model a Task's coding runs are started on.
+    ///
+    /// The value is saved exactly as given: for a Claude Code Task it is `default`
+    /// or a model the model picker offers, and for an OpenCode Task it is a
+    /// `provider/model` id. The instance refuses an identifier it cannot give the
+    /// Task's Worker rather than saving something else.
+    SetModel {
+        /// Task ID
+        task_id: String,
+        /// Model identifier for the Task's coding runs
+        model: String,
+    },
+    /// Set how a Task's finished coding runs are reviewed
+    ///
+    /// manual (no AI Review, the run goes to Human Review) or automatic (AI
+    /// Review runs after each run; the default). A change affects only runs
+    /// that have not started.
+    SetReviewMode {
+        /// Task ID
+        task_id: String,
+        #[arg(value_parser = ["manual", "automatic"])]
+        review_mode: String,
+    },
+    /// Set or clear a Task's structured dependency
+    ///
+    /// `slashit set-dependencies <task> <dependency>` names the single Task this
+    /// Task runs after, and `slashit set-dependencies <task>` clears it. The
+    /// instance refuses a malformed or foreign Task id, a cycle, and a Task that
+    /// holds a checkout or is awaiting a review decision.
+    SetDependencies {
+        /// Task ID
+        task_id: String,
+        /// Task ID this Task depends on; at most one
+        dependencies: Vec<String>,
+    },
     /// Delete a task
     Delete {
         /// Task ID
@@ -174,6 +209,18 @@ async fn main() -> Result<()> {
             title: title.clone(),
             description: description.clone(),
             priority: priority.clone(),
+        },
+        Commands::SetModel { task_id, model } => IpcRequest::SetTaskModel {
+            task_id: task_id.clone(),
+            model: model.clone(),
+        },
+        Commands::SetReviewMode { task_id, review_mode } => IpcRequest::SetTaskReviewMode {
+            task_id: task_id.clone(),
+            review_mode: review_mode.clone(),
+        },
+        Commands::SetDependencies { task_id, dependencies } => IpcRequest::SetTaskDependencies {
+            task_id: task_id.clone(),
+            dependencies: dependencies.clone(),
         },
         Commands::Delete { task_id } => IpcRequest::DeleteTask {
             task_id: task_id.clone(),
