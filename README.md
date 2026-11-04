@@ -143,6 +143,9 @@ slashit tasks [--project ID]                # List tasks
 slashit create --project ID "Task title"    # Create task
 slashit move TASK_ID queue                  # Move task to status
 slashit edit TASK_ID --title "New title"    # Edit task
+slashit set-model TASK_ID MODEL             # Set the model a Task's runs use
+slashit set-review-mode TASK_ID manual      # Set how finished runs are reviewed
+slashit set-dependencies TASK_ID DEP_TASK   # Set or clear a structured dependency
 slashit delete TASK_ID                      # Delete task
 slashit queue                               # Queue status
 slashit enqueue TASK_ID                     # Add task to queue

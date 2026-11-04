@@ -152,3 +152,109 @@ pub async fn list_available_models() -> Result<Vec<ModelInfo>, String> {
 
     Ok(models)
 }
+
+/// Why `model` may not be saved as a Task's Worker model, or `None` when it may.
+///
+/// The rule is the one the desktop's own Task form applies to the field, so the
+/// control channel adds none of its own: the identifier is read through the
+/// same list the model picker is built from, and for an OpenCode Worker it
+/// must be a `provider/model` id, the only form the run's launch accepts —
+/// so a Task can never be configured to a model it would be refused a run on.
+///
+/// The requested identifier is what callers save, whatever this returns:
+/// choices are kept exactly as made, because the provider resolves them and
+/// SlashIt never substitutes another model.
+pub(crate) async fn worker_model_refusal(
+    provider: crate::domain::task::CodingProvider,
+    model: &str,
+) -> Option<String> {
+    match provider {
+        // An OpenCode Task is never run on an implicit or Claude-shaped model
+        // either; the same check refuses the launch.
+        crate::domain::task::CodingProvider::OpenCode => {
+            if crate::queue::executor::is_opencode_model_id(model) {
+                None
+            } else {
+                Some(format!(
+                    "OpenCode takes a model as provider/model, for example \
+                     ollama/llama3.2:3b, and {model} is not one, so it was not saved. Choose an \
+                     OpenCode model for this Task, or run it with Claude."
+                ))
+            }
+        }
+        crate::domain::task::CodingProvider::Claude => {
+            let offered = match list_available_models().await {
+                Ok(models) => models,
+                Err(e) => return Some(format!(
+                    "the list of models the Claude Worker can take could not be read, so \
+                     \"{model}\" was not saved: {e}"
+                )),
+            };
+            if offered.iter().any(|m| m.id == model) {
+                None
+            } else {
+                let ids = offered
+                    .iter()
+                    .map(|m| m.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!(
+                    "\"{model}\" is not a model a Claude Worker can take, so it was not saved. \
+                     The model picker offers: {ids}. A provider/model identifier belongs to an \
+                     OpenCode Task."
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod worker_model_refusal_tests {
+    use super::*;
+
+    /// Whatever the environment offers, every offered identifier is written
+    /// and an identifier outside it is refused. The offered list is read the
+    /// same way the write reads it, so the test tracks the model picker.
+    #[tokio::test]
+    async fn a_claude_worker_takes_exactly_what_the_model_picker_offers() {
+        let offered = list_available_models().await.expect("the offered models");
+        for id in &offered {
+            assert!(
+                worker_model_refusal(crate::domain::task::CodingProvider::Claude, &id.id)
+                    .await
+                    .is_none(),
+                "{:?} is offered, so a Task may be configured to it",
+                id.id
+            );
+        }
+        let refusal = worker_model_refusal(
+            crate::domain::task::CodingProvider::Claude,
+            "not-a-model-the-picker-offers",
+        )
+        .await
+        .expect("refused");
+        assert!(refusal.contains("not-a-model-the-picker-offers"), "{refusal}");
+        assert!(refusal.contains("was not saved"), "{refusal}");
+    }
+
+    /// A `provider/model` id is never a Claude model, and an OpenCode Worker
+    /// takes no other form — the launch would refuse it later, so the write
+    /// refuses it now.
+    #[tokio::test]
+    async fn an_opencode_worker_takes_only_a_provider_model_id() {
+        use crate::domain::task::CodingProvider;
+
+        assert!(
+            worker_model_refusal(CodingProvider::OpenCode, "ollama/llama3.2:3b")
+                .await
+                .is_none()
+        );
+        for refused in ["default", "sonnet", "ollama/", "/llama3.2:3b", "ollama/llama 3"] {
+            let refusal = worker_model_refusal(CodingProvider::OpenCode, refused)
+                .await
+                .unwrap_or_else(|| panic!("{refused} must be refused"));
+            assert!(refusal.contains("provider/model"), "{refusal}");
+            assert!(refusal.contains("was not saved"), "{refusal}");
+        }
+    }
+}

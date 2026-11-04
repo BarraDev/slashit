@@ -347,13 +347,39 @@ pub async fn set_task_dependencies(
     dependencies: Vec<String>,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    set_task_dependencies_via(
+        &state.task.tasks,
+        &state.storage,
+        &state.task_lifecycle_locks,
+        task_id,
+        dependencies,
+    )
+    .await
+}
+
+/// Change one Task's structured dependencies, the way the desktop's
+/// `set_task_dependencies` does.
+///
+/// The desktop command and the IPC handler for `SetTaskDependencies` both call
+/// this, so the typed command line cannot decide dependencies by different
+/// rules: the same parser, the same lifecycle lease, the same two-stage check
+/// and the same refuses-nothing-on-failure write. `Ok(None)` answers a Task id
+/// that is not on the board; every refusal leaves the Task and its board
+/// exactly as they were.
+pub(crate) async fn set_task_dependencies_via(
+    tasks: &crate::lifecycle::Tasks,
+    storage: &crate::config::Storage,
+    task_lifecycle_locks: &crate::lifecycle::TaskLifecycleLocks,
+    task_id: Uuid,
+    dependencies: Vec<String>,
+) -> Result<Option<Task>, String> {
     let requested = crate::domain::task_dependencies::parse_requested(&dependencies)?;
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = task_lifecycle_locks.acquire(task_id).await?;
 
     // Checked against every Task first, so a Task of another Project is named
     // as such. The write checks again against the Tasks it stages.
     {
-        let tasks = state.task.tasks.read().await;
+        let tasks = tasks.read().await;
         if !tasks.contains_key(&task_id) {
             return Ok(None);
         }
@@ -376,26 +402,20 @@ pub async fn set_task_dependencies(
             }
         }
     };
-    let written = crate::lifecycle::record_typed_if_changed(
-        &state.task.tasks,
-        &state.storage,
-        task_id,
-        &revise,
-    )
-    .await;
+    let written = crate::lifecycle::record_typed_if_changed(tasks, storage, task_id, &revise).await;
     if let Some(error) = refusal.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
         return Err(error);
     }
     match written {
         Ok(_) => {}
         Err(crate::lifecycle::RecordWriteError::NotPublished(_))
-            if !state.task.tasks.read().await.contains_key(&task_id) =>
+            if !tasks.read().await.contains_key(&task_id) =>
         {
             return Ok(None);
         }
         Err(error) => return Err(error.to_string()),
     }
-    Ok(state.task.tasks.read().await.get(&task_id).cloned())
+    Ok(tasks.read().await.get(&task_id).cloned())
 }
 
 /// Whether `task_id`'s dependencies may become `requested` in `graph`, and
@@ -666,6 +686,34 @@ pub async fn unstick_task(
         }
     };
     crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
+}
+
+/// Write a Task's Worker model and review mode, storing each field exactly as
+/// the desktop's `update_task` stores it: only a `Some` changes its field, the
+/// value is kept as it is given, and the write goes through the same lifecycle
+/// boundary (`commit_task`), so its refusals — a Task whose last run needs
+/// recovery, for one — arrive before anything is changed.
+///
+/// The IPC handlers for `SetTaskModel` and `SetTaskReviewMode` call this
+/// instead of re-deciding how the fields are stored.
+pub(crate) async fn set_task_model_and_review_mode(
+    tasks: &crate::lifecycle::Tasks,
+    storage: &crate::config::Storage,
+    task_id: Uuid,
+    model: Option<String>,
+    review_mode: Option<crate::domain::task::ReviewMode>,
+) -> Result<Option<Task>, String> {
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            if let Some(m) = model.clone() {
+                task.model = m;
+            }
+            if let Some(review_mode) = review_mode {
+                task.review_mode = review_mode;
+            }
+        }
+    };
+    crate::lifecycle::commit_task(tasks, storage, task_id, &amend).await
 }
 
 #[derive(serde::Deserialize)]

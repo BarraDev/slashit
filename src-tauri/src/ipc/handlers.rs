@@ -74,6 +74,15 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
             description,
             priority,
         } => Dispatch::reply(handle_edit_task(ctx, task_id, title, description, priority).await),
+        IpcRequest::SetTaskModel { task_id, model } => {
+            Dispatch::reply(handle_set_task_model(ctx, task_id, model).await)
+        }
+        IpcRequest::SetTaskReviewMode { task_id, review_mode } => {
+            Dispatch::reply(handle_set_task_review_mode(ctx, task_id, review_mode).await)
+        }
+        IpcRequest::SetTaskDependencies { task_id, dependencies } => {
+            Dispatch::reply(handle_set_task_dependencies(ctx, task_id, dependencies).await)
+        }
         IpcRequest::DeleteTask { task_id } => {
             Dispatch::reply(handle_delete_task(ctx, task_id).await)
         }
@@ -536,6 +545,114 @@ async fn handle_delete_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
         Ok(true) => IpcResponse::success(serde_json::json!({"deleted": task_id})),
         Ok(false) => IpcResponse::error(format!("Task {task_id} not found")),
         Err(refusal) => IpcResponse::error(refusal.to_string()),
+    }
+}
+
+/// Set a Task's Worker model from the command line.
+///
+/// The field is written through the desktop's own `update_task` boundary
+/// (`commands::task::set_task_model_and_review_mode`), so the persisted board
+/// ends in the same state as that command's for the same input. The
+/// identifier is checked the way the desktop's own Task form checks it —
+/// through `commands::agent::worker_model_refusal`, from the model picker's
+/// list, or for an OpenCode Task the `provider/model` launch rule — and an
+/// identifier that is refused leaves the Task and its board as they were.
+async fn handle_set_task_model(ctx: &IpcContext, task_id: String, model: String) -> IpcResponse {
+    let task_uuid = match Uuid::parse_str(&task_id) {
+        Ok(id) => id,
+        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
+    };
+    let provider = match ctx.tasks.read().await.get(&task_uuid) {
+        Some(task) => task.provider,
+        None => return IpcResponse::error(format!("Task {task_id} not found")),
+    };
+    if let Some(refusal) = crate::commands::agent::worker_model_refusal(provider, &model).await {
+        return IpcResponse::error(refusal);
+    }
+    match crate::commands::task::set_task_model_and_review_mode(
+        &ctx.tasks,
+        &ctx.storage,
+        task_uuid,
+        Some(model),
+        None,
+    )
+    .await
+    {
+        Ok(Some(task)) => task_summary_reply(ctx, &task).await,
+        Ok(None) => IpcResponse::error(format!("Task {task_id} not found")),
+        Err(e) => IpcResponse::error(e),
+    }
+}
+
+/// Set how a Task's finished coding runs are reviewed from the command line.
+///
+/// Written through `commands::task::set_task_model_and_review_mode`, as the
+/// desktop's `update_task` stores the field, so a run that already started
+/// keeps the mode it started with and the write adopts the refusals that
+/// boundary gives. The request may carry only the two modes the desktop names,
+/// in the same words.
+async fn handle_set_task_review_mode(
+    ctx: &IpcContext,
+    task_id: String,
+    review_mode: String,
+) -> IpcResponse {
+    let task_uuid = match Uuid::parse_str(&task_id) {
+        Ok(id) => id,
+        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
+    };
+    let mode = match review_mode.as_str() {
+        "automatic" => crate::domain::task::ReviewMode::Automatic,
+        "manual" => crate::domain::task::ReviewMode::Manual,
+        other => {
+            return IpcResponse::error(format!(
+                "Invalid review mode: {other}. Use manual or automatic."
+            ))
+        }
+    };
+    match crate::commands::task::set_task_model_and_review_mode(
+        &ctx.tasks,
+        &ctx.storage,
+        task_uuid,
+        None,
+        Some(mode),
+    )
+    .await
+    {
+        Ok(Some(task)) => task_summary_reply(ctx, &task).await,
+        Ok(None) => IpcResponse::error(format!("Task {task_id} not found")),
+        Err(e) => IpcResponse::error(e),
+    }
+}
+
+/// Replace a Task's structured dependencies from the command line.
+///
+/// The write is the desktop command's own
+/// (`commands::task::set_task_dependencies_via`) -- the same parser, the same
+/// lifecycle lease and the same refusal messages -- so a cycle, a
+/// cross-Project dependency, a malformed identifier, a second dependency, a
+/// Task that holds a checkout or one that is awaiting a decision changes
+/// nothing and answers with the refusal the desktop gives.
+async fn handle_set_task_dependencies(
+    ctx: &IpcContext,
+    task_id: String,
+    dependencies: Vec<String>,
+) -> IpcResponse {
+    let task_uuid = match Uuid::parse_str(&task_id) {
+        Ok(id) => id,
+        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
+    };
+    match crate::commands::task::set_task_dependencies_via(
+        &ctx.tasks,
+        &ctx.storage,
+        &ctx.task_lifecycle_locks,
+        task_uuid,
+        dependencies,
+    )
+    .await
+    {
+        Ok(Some(task)) => task_summary_reply(ctx, &task).await,
+        Ok(None) => IpcResponse::error(format!("Task {task_id} not found")),
+        Err(e) => IpcResponse::error(e),
     }
 }
 
@@ -1944,5 +2061,611 @@ mod get_task {
         let bad = get(&ctx, "nope").await;
         assert!(!bad.ok);
         assert!(bad.error.unwrap().contains("Invalid task_id"));
+    }
+}
+
+/// The Task configuration writes: `SetTaskModel`, `SetTaskReviewMode` and
+/// `SetTaskDependencies` change what a Task's runs are later started with, and
+/// are held here to the desktop commands' own contract. For the same input the
+/// persisted Task field and the refusal messages must match what
+/// `update_task` and `set_task_dependencies` produce, a refused request must
+/// leave memory and the board file byte-for-byte as they were, and `GetTask`
+/// (the slice 1 read verb) must confirm what was written.
+#[cfg(test)]
+mod task_configuration_writes {
+    use super::*;
+    use crate::commands::gui_admission::GuiMutation;
+    use crate::config::paths::{AppPaths, StateLocation};
+    use crate::domain::task::ReviewMode;
+    use crate::domain::{AgentConfig, AgentType, Project, ProjectScope};
+    use crate::test_helpers::{create_test_task_full, ipc_test_context};
+    use slashit_ipc::Endpoint;
+    use std::sync::Arc;
+    use tauri::Manager;
+
+    type App = tauri::App<tauri::test::MockRuntime>;
+
+    fn peer() -> PeerContext {
+        PeerContext {
+            endpoint: Endpoint::Unix {
+                path: std::path::PathBuf::from("/nonexistent-for-tests"),
+            },
+            os_verified: true,
+        }
+    }
+
+    async fn test_ctx() -> (tempfile::TempDir, IpcContext) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        (tmp, ipc_test_context(paths))
+    }
+
+    /// Seeds one Task on its board and answers (task id, project id).
+    async fn seed(ctx: &IpcContext, task: crate::domain::Task) -> (Uuid, Uuid) {
+        let project_id = task.project_id;
+        let task_id = task.id;
+        ctx.tasks.write().await.insert(task_id, task.clone());
+        ctx.storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
+        (task_id, project_id)
+    }
+
+    fn backlog_task(project_id: Uuid, title: &str) -> crate::domain::Task {
+        create_test_task_full(title, project_id, TaskStatus::Backlog, 0)
+    }
+
+    fn persisted(ctx: &IpcContext, project_id: Uuid, task_id: Uuid) -> crate::domain::Task {
+        ctx.storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task must be on disk")
+    }
+
+    /// The Task's whole record as the board file holds it.
+    fn persisted_json(ctx: &IpcContext, project_id: Uuid, task_id: Uuid) -> serde_json::Value {
+        serde_json::to_value(persisted(ctx, project_id, task_id)).unwrap()
+    }
+
+    /// Read one value back through `GetTask`, the slice 1 read verb.
+    async fn read_back(ctx: &IpcContext, task_id: Uuid) -> serde_json::Value {
+        let answer = dispatch(
+            IpcRequest::GetTask {
+                task_id: task_id.to_string(),
+            },
+            ctx,
+            &peer(),
+        )
+        .await
+        .response;
+        assert!(answer.ok, "{answer:?}");
+        answer.data
+    }
+
+    fn project_for(id: Uuid) -> Project {
+        Project {
+            id,
+            name: "Configuration Project".to_string(),
+            repository_id: None,
+            scope: ProjectScope::Standalone,
+            state_location: StateLocation::External,
+            base: None,
+            agent_type: AgentType::ClaudeCode,
+            agent_config: AgentConfig {
+                agent_type: AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The desktop half of a parity test: a running application over its own
+    /// state root, holding the Project and the Tasks the caller seeded.
+    async fn gui_app(
+        project_id: Uuid,
+        tasks: Vec<crate::domain::Task>,
+    ) -> (tempfile::TempDir, App) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _report) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state should build under a fresh tempdir");
+        state.project.projects.write().await.insert(project_id, project_for(project_id));
+        {
+            let mut memory = state.task.tasks.write().await;
+            for task in &tasks {
+                memory.insert(task.id, task.clone());
+            }
+            let board: Vec<crate::domain::Task> =
+                memory.values().filter(|t| t.project_id == project_id).cloned().collect();
+            state.storage.save_project_tasks(project_id, &board).expect("seed the board");
+        }
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        (tmp, app)
+    }
+
+    fn new_params(task_id: Uuid, model: Option<String>, review_mode: Option<ReviewMode>) -> crate::commands::task::UpdateTaskParams {
+        crate::commands::task::UpdateTaskParams {
+            task_id: task_id.to_string(),
+            title: None,
+            description: None,
+            category: None,
+            priority: None,
+            complexity: None,
+            impact: None,
+            security_severity: None,
+            model,
+            reviewer_model: None,
+            provider: None,
+            review_mode,
+            planning_mode: None,
+        }
+    }
+
+    /// A Worker model identifier the model picker actually offers, so both
+    /// paths take the same, accepted input whatever the environment installs.
+    async fn an_offered_model() -> String {
+        let offered = crate::commands::agent::list_available_models().await.expect("models");
+        offered
+            .iter()
+            .find(|m| m.id != "default")
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Acceptance: for the same input, the CLI write and the desktop's own
+    /// `update_task` leave the field the board file persists in the same
+    /// state, and `GetTask` reads the CLI's value back.
+    #[tokio::test]
+    async fn set_model_persists_what_the_desktop_update_task_persists() {
+        let chosen = an_offered_model().await;
+
+        let gui_project_id = Uuid::new_v4();
+        let gui_task = backlog_task(gui_project_id, "desktop");
+        let gui_task_id = gui_task.id;
+        let (_gui_tmp, gui_app) = gui_app(gui_project_id, vec![gui_task]).await;
+        crate::commands::task::update_task(
+            GuiMutation::untracked(),
+            gui_app.state(),
+            new_params(gui_task_id, Some(chosen.clone()), None),
+        )
+        .await
+        .expect("the desktop write is stored")
+        .expect("the task exists");
+        let gui_state = gui_app.state::<crate::AppState>();
+        let gui_on_disk = gui_state
+            .storage
+            .load_project_tasks(gui_project_id)
+            .expect("read the board back")
+            .into_iter()
+            .find(|t| t.id == gui_task_id)
+            .expect("on disk");
+
+        let (_tmp, ctx) = test_ctx().await;
+        let project_id = Uuid::new_v4();
+        let (task_id, ipc_project_id) = seed(&ctx, backlog_task(project_id, "cli")).await;
+        let answer = dispatch(
+            IpcRequest::SetTaskModel {
+                task_id: task_id.to_string(),
+                model: chosen.clone(),
+            },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+        assert!(answer.ok, "{answer:?}");
+        assert_eq!(
+            persisted(&ctx, ipc_project_id, task_id).model,
+            chosen,
+            "the model is stored exactly as requested, not substituted"
+        );
+        assert_eq!(
+            gui_on_disk.model, chosen,
+            "the desktop write reaches the same value for the same input"
+        );
+
+        let shown = read_back(&ctx, task_id).await;
+        assert_eq!(shown["model"], chosen, "the slice 1 read verb confirms it");
+    }
+
+    /// An identifier no model picker offers is refused and nothing is written:
+    /// the record, in memory and on the board file, keeps the value it had.
+    #[tokio::test]
+    async fn set_model_refuses_an_unknown_identifier_and_changes_nothing() {
+        let (_tmp, ctx) = test_ctx().await;
+        let project_id = Uuid::new_v4();
+        let mut task = backlog_task(project_id, "under test");
+        task.model = "default".to_string();
+        let (task_id, project_id) = seed(&ctx, task).await;
+        let memory_before = serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap();
+        let disk_before = persisted_json(&ctx, project_id, task_id);
+
+        let answer = dispatch(
+            IpcRequest::SetTaskModel {
+                task_id: task_id.to_string(),
+                model: "not-in-the-model-picker".to_string(),
+            },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+
+        assert!(!answer.ok, "an unknown model must be refused: {answer:?}");
+        let message = answer.error.unwrap_or_default();
+        assert!(message.contains("not-in-the-model-picker"), "{message}");
+        assert!(message.contains("was not saved"), "{message}");
+        assert_eq!(
+            serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap(),
+            memory_before,
+            "the refused model must not be written"
+        );
+        assert_eq!(persisted_json(&ctx, project_id, task_id), disk_before);
+        let shown = read_back(&ctx, task_id).await;
+        assert_eq!(shown["model"], "default", "the read-back still answers the old value");
+    }
+
+    /// Same parity, for the review mode the run's finish is handed in.
+    #[tokio::test]
+    async fn set_review_mode_persists_what_the_desktop_update_task_persists() {
+        let gui_project_id = Uuid::new_v4();
+        let gui_task = backlog_task(gui_project_id, "desktop");
+        let gui_task_id = gui_task.id;
+        let (_gui_tmp, gui_app) = gui_app(gui_project_id, vec![gui_task]).await;
+        crate::commands::task::update_task(
+            GuiMutation::untracked(),
+            gui_app.state(),
+            new_params(gui_task_id, None, Some(ReviewMode::Manual)),
+        )
+        .await
+        .expect("the desktop write is stored")
+        .expect("the task exists");
+        let gui_state = gui_app.state::<crate::AppState>();
+        let gui_on_disk = gui_state
+            .storage
+            .load_project_tasks(gui_project_id)
+            .expect("read the board back")
+            .into_iter()
+            .find(|t| t.id == gui_task_id)
+            .expect("on disk");
+
+        let (_tmp, ctx) = test_ctx().await;
+        let project_id = Uuid::new_v4();
+        let (task_id, ipc_project_id) = seed(&ctx, backlog_task(project_id, "cli")).await;
+        let answer = dispatch(
+            IpcRequest::SetTaskReviewMode {
+                task_id: task_id.to_string(),
+                review_mode: "manual".to_string(),
+            },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+        assert!(answer.ok, "{answer:?}");
+        assert_eq!(
+            persisted(&ctx, ipc_project_id, task_id).review_mode,
+            ReviewMode::Manual,
+        );
+        assert_eq!(
+            gui_on_disk.review_mode,
+            ReviewMode::Manual,
+            "the desktop write reaches the same value for the same input"
+        );
+
+        let shown = read_back(&ctx, task_id).await;
+        assert_eq!(shown["review_mode"], "manual", "the slice 1 read verb confirms it");
+    }
+
+    #[tokio::test]
+    async fn set_review_mode_refuses_an_unknown_mode_and_changes_nothing() {
+        let (_tmp, ctx) = test_ctx().await;
+        let project_id = Uuid::new_v4();
+        let (task_id, project_id) = seed(&ctx, backlog_task(project_id, "under test")).await;
+        let memory_before = serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap();
+        let disk_before = persisted_json(&ctx, project_id, task_id);
+
+        let answer = dispatch(
+            IpcRequest::SetTaskReviewMode {
+                task_id: task_id.to_string(),
+                review_mode: "sometimes".to_string(),
+            },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+
+        assert!(!answer.ok, "{answer:?}");
+        let message = answer.error.unwrap_or_default();
+        assert!(message.contains("Invalid review mode"), "{message}");
+        assert_eq!(
+            serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap(),
+            memory_before,
+        );
+        assert_eq!(persisted_json(&ctx, project_id, task_id), disk_before);
+    }
+
+    /// Same parity, for the structured dependency. Clearing the dependency is
+    /// the empty request, and that is written too.
+    #[tokio::test]
+    async fn set_dependencies_persists_what_the_desktop_set_task_dependencies_persists() {
+        let gui_project_id = Uuid::new_v4();
+        let gui_parent = backlog_task(gui_project_id, "parent");
+        let gui_child = backlog_task(gui_project_id, "child");
+        let (gui_parent_id, gui_child_id) = (gui_parent.id, gui_child.id);
+        let (_gui_tmp, gui_app) = gui_app(gui_project_id, vec![gui_parent, gui_child]).await;
+        let written = crate::commands::task::set_task_dependencies(
+            GuiMutation::untracked(),
+            gui_app.state(),
+            gui_child_id.to_string(),
+            vec![gui_parent_id.to_string()],
+        )
+        .await
+        .expect("the desktop write is stored")
+        .expect("the task exists");
+        assert_eq!(written.dependencies, vec![gui_parent_id]);
+        let gui_state = gui_app.state::<crate::AppState>();
+        let gui_on_disk = gui_state
+            .storage
+            .load_project_tasks(gui_project_id)
+            .expect("read the board back")
+            .into_iter()
+            .find(|t| t.id == gui_child_id)
+            .expect("on disk");
+        assert_eq!(gui_on_disk.dependencies, vec![gui_parent_id]);
+
+        let (_tmp, ctx) = test_ctx().await;
+        let project_id = Uuid::new_v4();
+        let parent = backlog_task(project_id, "parent");
+        let child = backlog_task(project_id, "child");
+        let parent_id = parent.id;
+        let (_, ipc_project_id) = seed(&ctx, parent).await;
+        let (task_id, _) = seed(&ctx, child).await;
+        let answer = dispatch(
+            IpcRequest::SetTaskDependencies {
+                task_id: task_id.to_string(),
+                dependencies: vec![parent_id.to_string()],
+            },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+        assert!(answer.ok, "{answer:?}");
+        assert_eq!(
+            persisted(&ctx, ipc_project_id, task_id).dependencies,
+            vec![parent_id],
+            "the desktop write reaches the same value for the same input"
+        );
+
+        let shown = read_back(&ctx, task_id).await;
+        assert_eq!(
+            shown["dependencies"][0],
+            parent_id.to_string(),
+            "the slice 1 read verb confirms it"
+        );
+
+        // An empty request is a clearing, and that is persisted as well.
+        let answer = dispatch(
+            IpcRequest::SetTaskDependencies { task_id: task_id.to_string(), dependencies: Vec::new() },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+        assert!(answer.ok, "{answer:?}");
+        assert_eq!(persisted(&ctx, ipc_project_id, task_id).dependencies, Vec::<uuid::Uuid>::new());
+    }
+
+    /// A request that closes a dependency cycle is refused with the desktop's
+    /// own message and nothing is written — in memory, on the board file, and
+    /// in what `GetTask` answers.
+    #[tokio::test]
+    async fn set_dependencies_rejects_a_cycle_and_writes_nothing() {
+        let (_tmp, ctx) = test_ctx().await;
+        let project_id = Uuid::new_v4();
+        let lower = backlog_task(project_id, "lower");
+        let mut upper = backlog_task(project_id, "upper");
+        // `upper` already runs after `lower`; pointing `lower` at `upper` would
+        // close a cycle.
+        upper.dependencies = vec![lower.id];
+        let (lower_id, upper_id) = (lower.id, upper.id);
+        {
+            let mut tasks = ctx.tasks.write().await;
+            tasks.insert(lower_id, lower);
+            tasks.insert(upper_id, upper.clone());
+        }
+        let board = ctx
+            .tasks
+            .read()
+            .await
+            .values()
+            .filter(|t| t.project_id == project_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        ctx.storage.save_project_tasks(project_id, &board).expect("seed the board");
+        let memory_before = serde_json::to_value(ctx.tasks.read().await[&lower_id].clone()).unwrap();
+        let disk_before = persisted_json(&ctx, project_id, lower_id);
+
+        let answer = dispatch(
+            IpcRequest::SetTaskDependencies {
+                task_id: lower_id.to_string(),
+                dependencies: vec![upper_id.to_string()],
+            },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+
+        assert!(!answer.ok, "a cycle must be refused: {answer:?}");
+        let message = answer.error.unwrap_or_default();
+        assert!(message.contains("depend on itself"), "{message}");
+        assert_eq!(
+            serde_json::to_value(ctx.tasks.read().await[&lower_id].clone()).unwrap(),
+            memory_before,
+            "the refused request must not be written"
+        );
+        assert_eq!(persisted_json(&ctx, project_id, lower_id), disk_before);
+        let shown = read_back(&ctx, lower_id).await;
+        assert_eq!(
+            shown["dependencies"].as_array().map(Vec::len),
+            Some(0),
+            "the Task keeps its empty dependency set"
+        );
+    }
+
+    /// A live run's Task refuses a configuration write, with the desktop's own
+    /// refusal, and the board keeps everything it held — the model and review
+    /// mode through `commit_task`'s recovery refusal, the dependency through
+    /// the checkout rule.
+    #[tokio::test]
+    async fn a_task_awaiting_a_decision_or_holding_a_checkout_refuses_every_write() {
+        let (_tmp, ctx) = test_ctx().await;
+        let project_id = Uuid::new_v4();
+        let mut running = backlog_task(project_id, "running");
+        running.status = TaskStatus::InProgress;
+        // The durable start of a run is the evidence the desktop's own edit
+        // boundary refuses on.
+        running.worker_handoff = Some(crate::domain::WorkerHandoff {
+            review_mode: Default::default(),
+            task_id: running.id,
+            project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            stage: crate::domain::WorkerHandoffStage::Started {},
+            acceptance: None,
+            review_mode_unproven: false,
+            reviewer_model: None,
+        });
+        let running_id = running.id;
+
+        let mut checked_out = backlog_task(project_id, "checked out");
+        checked_out.branch_name = Some("slashit/checked-out".to_string());
+        let checked_out_id = checked_out.id;
+        {
+            let mut tasks = ctx.tasks.write().await;
+            tasks.insert(running_id, running.clone());
+            tasks.insert(checked_out_id, checked_out.clone());
+        }
+        let board = ctx
+            .tasks
+            .read()
+            .await
+            .values()
+            .filter(|t| t.project_id == project_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        ctx.storage.save_project_tasks(project_id, &board).expect("seed the board");
+        let running_memory =
+            serde_json::to_value(ctx.tasks.read().await[&running_id].clone()).unwrap();
+        let running_disk = persisted_json(&ctx, project_id, running_id);
+        let checked_out_memory =
+            serde_json::to_value(ctx.tasks.read().await[&checked_out_id].clone()).unwrap();
+        let checked_out_disk = persisted_json(&ctx, project_id, checked_out_id);
+
+        let model = dispatch(
+            IpcRequest::SetTaskModel {
+                task_id: running_id.to_string(),
+                model: "default".to_string(),
+            },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+        assert!(!model.ok, "a running Task must refuse a model edit: {model:?}");
+        assert!(
+            model
+                .error
+                .clone()
+                .unwrap_or_default()
+                .contains("unresolved Worker recovery evidence"),
+            "{model:?}"
+        );
+
+        let review_mode = dispatch(
+            IpcRequest::SetTaskReviewMode {
+                task_id: running_id.to_string(),
+                review_mode: "manual".to_string(),
+            },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+        assert!(!review_mode.ok, "a running Task must refuse a review mode edit: {review_mode:?}");
+
+        let dependencies = dispatch(
+            IpcRequest::SetTaskDependencies {
+                task_id: checked_out_id.to_string(),
+                dependencies: vec![running_id.to_string()],
+            },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+        assert!(!dependencies.ok, "a checkout must refuse a dependency edit: {dependencies:?}");
+        assert!(
+            dependencies.error.clone().unwrap_or_default().contains("checkout"),
+            "{dependencies:?}"
+        );
+
+        assert_eq!(
+            serde_json::to_value(ctx.tasks.read().await[&running_id].clone()).unwrap(),
+            running_memory,
+            "the refused model and review mode edits changed nothing"
+        );
+        assert_eq!(persisted_json(&ctx, project_id, running_id), running_disk);
+        assert_eq!(
+            serde_json::to_value(ctx.tasks.read().await[&checked_out_id].clone()).unwrap(),
+            checked_out_memory,
+            "the refused dependency edit changed nothing"
+        );
+        assert_eq!(persisted_json(&ctx, project_id, checked_out_id), checked_out_disk);
+    }
+
+    #[tokio::test]
+    async fn the_configuration_verbs_answer_a_task_that_is_not_on_the_board() {
+        let (_tmp, ctx) = test_ctx().await;
+        let missing = Uuid::new_v4().to_string();
+        for request in [
+            IpcRequest::SetTaskModel { task_id: missing.clone(), model: "default".to_string() },
+            IpcRequest::SetTaskReviewMode {
+                task_id: missing.clone(),
+                review_mode: "manual".to_string(),
+            },
+            IpcRequest::SetTaskDependencies { task_id: missing.clone(), dependencies: Vec::new() },
+        ] {
+            let answer = dispatch(request, &ctx, &peer()).await.response;
+            assert!(!answer.ok, "a task that is not on the board cannot be changed: {answer:?}");
+            assert!(
+                answer.error.clone().unwrap_or_default().contains("not found"),
+                "{answer:?}"
+            );
+        }
     }
 }

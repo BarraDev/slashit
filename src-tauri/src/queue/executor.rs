@@ -99,7 +99,7 @@ impl Membership {
 /// Whether `model` is an OpenCode model id, `provider/model`: both parts are
 /// present, and the id has no whitespace or control characters. A Claude alias
 /// such as `sonnet` has no provider part, so it is not one.
-fn is_opencode_model_id(model: &str) -> bool {
+pub(crate) fn is_opencode_model_id(model: &str) -> bool {
     let Some((provider, name)) = model.split_once('/') else {
         return false;
     };

@@ -93,6 +93,17 @@ Done through Queue. This is a refusal of these verbs, not an authorization
 boundary: the control channel does not distinguish a person from an agent that
 runs as the same OS user, and it does not gate the desktop's own actions.
 
+Other verbs change state without running anything: `SetTaskModel`,
+`SetTaskReviewMode` and `SetTaskDependencies` edit what a Task's *next* run is
+started with (`task.model`, `review_mode`, `dependencies`). They are classified
+as mutating — they are audited and refused while the instance shuts down — but
+the question "does this run an agent?" is what `spawns_agent()` answers, and
+they do not reach it: a Task whose runs are unresolved refuses the write with
+the same refusal the desktop gives, an unknown model identifier is refused
+rather than substituted, and a dependency cycle or a Task that holds a checkout
+is refused with nothing written. These writes go through the desktop command's
+own handlers rather than a second copy of the rules.
+
 There is no sandbox between "wrote a string into a task description" and
 "arbitrary command execution in a checkout of your repository". These verbs are
 marked in the protocol by `IpcRequest::spawns_agent()`, and the classification
