@@ -807,23 +807,49 @@ mod tests {
 mod fake_install_race_tests {
     use super::*;
     use std::process::Command;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+
+    /// Eight threads that run `/bin/true` until dropped, each joined: the
+    /// spawner pressure the fake-program install must survive, stopped
+    /// deterministically even when the test body panics (the guard's `Drop`
+    /// runs during unwinding).
+    struct SpawnerThreads {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handles: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl SpawnerThreads {
+        fn start(count: usize) -> Self {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+            let stop = Arc::new(AtomicBool::new(false));
+            let handles: Vec<_> = (0..count)
+                .map(|_| {
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            let _ = Command::new("/bin/true").status();
+                        }
+                    })
+                })
+                .collect();
+            Self { stop, handles }
+        }
+    }
+
+    impl Drop for SpawnerThreads {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            self.stop.store(true, Ordering::Relaxed);
+            for handle in self.handles.drain(..) {
+                let _ = handle.join();
+            }
+        }
+    }
 
     #[tokio::test]
     async fn every_installed_program_executes_while_other_threads_spawn() {
         let fake = FakeProgram::install("seed", "exit 0").await;
-        let stop = Arc::new(AtomicBool::new(false));
-        let spawners: Vec<_> = (0..8)
-            .map(|_| {
-                let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let _ = Command::new("/bin/true").status();
-                    }
-                })
-            })
-            .collect();
+        let spawners = SpawnerThreads::start(8);
         for i in 0..200 {
             let name = format!("fake-{i}");
             fake.add(&name, "exit 0");
@@ -837,10 +863,7 @@ mod fake_install_race_tests {
                 program.display()
             );
         }
-        stop.store(true, Ordering::Relaxed);
-        for spawner in spawners {
-            spawner.join().expect("spawner thread");
-        }
+        drop(spawners);
     }
 }
 
