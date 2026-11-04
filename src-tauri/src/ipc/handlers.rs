@@ -2474,7 +2474,7 @@ mod task_configuration_writes {
         .await
         .response;
         assert!(answer.ok, "{answer:?}");
-        assert_eq!(persisted(&ctx, ipc_project_id, task_id).dependencies, Vec::new());
+        assert_eq!(persisted(&ctx, ipc_project_id, task_id).dependencies, Vec::<uuid::Uuid>::new());
     }
 
     /// A request that closes a dependency cycle is refused with the desktop's
@@ -2600,6 +2600,7 @@ mod task_configuration_writes {
         assert!(
             model
                 .error
+                .clone()
                 .unwrap_or_default()
                 .contains("unresolved Worker recovery evidence"),
             "{model:?}"
@@ -2629,7 +2630,7 @@ mod task_configuration_writes {
         .response;
         assert!(!dependencies.ok, "a checkout must refuse a dependency edit: {dependencies:?}");
         assert!(
-            dependencies.error.unwrap_or_default().contains("checkout"),
+            dependencies.error.clone().unwrap_or_default().contains("checkout"),
             "{dependencies:?}"
         );
 
@@ -2662,7 +2663,7 @@ mod task_configuration_writes {
             let answer = dispatch(request, &ctx, &peer()).await.response;
             assert!(!answer.ok, "a task that is not on the board cannot be changed: {answer:?}");
             assert!(
-                answer.error.unwrap_or_default().contains("not found"),
+                answer.error.clone().unwrap_or_default().contains("not found"),
                 "{answer:?}"
             );
         }
