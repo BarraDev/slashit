@@ -340,6 +340,14 @@ pub struct PrReviewPlan {
     pub analyzed_head_oid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Mirrors the backend fields of the same names: the checkout state the
+    /// analysis read. They must survive a round trip, because Apply is
+    /// refused unless the checkout is still the state the analysis recorded;
+    /// dropping them here would refuse every Apply of a valid plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_worktree_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_worktree_fingerprint: Option<String>,
 }
 
 /// Mirrors the backend type of the same name.
@@ -1019,6 +1027,28 @@ mod tests {
             },
         }))
         .expect("a plan in the backend's shape")
+    }
+
+    /// The checkout-provenance mirror fields survive the frontend round trip:
+    /// a plan without them deserializes to `None`, and they are carried back
+    /// out when the plan is serialized to the backend for Apply, which
+    /// compares them with the stored plan.
+    #[test]
+    fn checkout_provenance_survives_the_frontend_round_trip() {
+        let mut plan = plan_applied_at("2026-09-30T12:30:00Z", [None, None]);
+        assert!(
+            plan.analyzed_worktree_oid.is_none() && plan.analyzed_worktree_fingerprint.is_none(),
+            "absent provenance stays unset"
+        );
+        plan.analyzed_worktree_oid = Some("1111111111111111111111111111111111111111".into());
+        plan.analyzed_worktree_fingerprint = Some("fp".into());
+        let text = serde_json::to_string(&plan).expect("the mirror plan serializes");
+        let back: PrReviewPlan = serde_json::from_str(&text).expect("the round trip parses");
+        assert_eq!(
+            back.analyzed_worktree_oid.as_deref(),
+            Some("1111111111111111111111111111111111111111"),
+        );
+        assert_eq!(back.analyzed_worktree_fingerprint.as_deref(), Some("fp"),);
     }
 
     #[test]
