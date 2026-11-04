@@ -775,6 +775,8 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
         last_apply: None,
         fixed_content: Vec::new(),
         analyzed_head_oid: None,
+        analyzed_worktree_oid: None,
+        analyzed_worktree_fingerprint: None,
         analyzed_at: None,
     };
 

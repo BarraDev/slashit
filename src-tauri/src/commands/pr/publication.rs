@@ -756,6 +756,8 @@ mod orchestration {
             };
             let plan = PrReviewPlan {
                 analyzed_head_oid: None,
+                analyzed_worktree_oid: None,
+                analyzed_worktree_fingerprint: None,
                 analyzed_at: None,
                 generated_at: chrono::Utc::now(),
                 pr_url: PR.to_string(),

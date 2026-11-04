@@ -1437,6 +1437,25 @@ pub struct PrReviewPlan {
     /// analyzed again before it can be applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzed_head_oid: Option<String>,
+    /// The task's branch tip in the checkout the analysis read. The triage
+    /// helper reads the checkout, not the pull request, so this is the state
+    /// the fix instructions were formed from. Apply refuses unless the tip
+    /// is still this commit. `None` for every plan saved before it was
+    /// recorded: such a plan is unknown and must be analyzed again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_worktree_oid: Option<String>,
+    /// A fingerprint of the checkout's uncommitted content when the analysis
+    /// ran: every tracked path that differs from HEAD (staged or unstaged,
+    /// deletions and type changes included) and every untracked path, hashed
+    /// with its current kind (deleted, regular, executable, symlink target),
+    /// size and content. It binds what the triage helper actually read, so
+    /// an Apply also refuses when a file that still carries its old status
+    /// letter has had its content or mode changed since — or when the edits
+    /// the analysis saw are no longer there. Refusing is read-only: nothing
+    /// about the checkout is changed, and re-analyzing records the state as
+    /// it is now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_worktree_fingerprint: Option<String>,
     /// When the analysis that recorded `analyzed_head_oid` ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzed_at: Option<chrono::DateTime<chrono::Utc>>,

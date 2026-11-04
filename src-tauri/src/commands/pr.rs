@@ -10,6 +10,7 @@ use crate::config::Storage;
 use crate::queue::PrHelperPurpose;
 use crate::worktree::checked_task_branch;
 use crate::agents::runner::truncate_one_line;
+use sha2::Digest as _;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -905,6 +906,18 @@ pub async fn analyze_pr_comments(
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
     let pr_url = pr_url_for_task(&task)?;
+    // Record the checkout state the triage helper is about to read: its
+    // branch tip and the content of its uncommitted changes. An analysis
+    // that cannot prove which checkout state it runs on must not produce
+    // one.
+    let facts = worktree_state_facts(
+        &working_dir,
+        task.branch_name.as_deref().ok_or(
+            "this task records no branch, so the checkout state could not be recorded",
+        )?,
+    )
+    .await
+    .map_err(|e| format!("the checkout state could not be recorded, so no analysis ran: {e}"))?;
 
     // Preserve apply history across a re-analyze: same PR URL means the user
     // is refreshing comments, not switching contexts, so `last_apply` and the
@@ -933,6 +946,8 @@ pub async fn analyze_pr_comments(
             last_apply: prior_plan.as_ref().and_then(|p| p.last_apply.clone()),
             fixed_content: prior_plan.map(|p| p.fixed_content).unwrap_or_default(),
             analyzed_head_oid: Some(head_oid),
+            analyzed_worktree_oid: Some(facts.tip.clone()),
+            analyzed_worktree_fingerprint: Some(facts.fingerprint.clone()),
             analyzed_at: Some(generated_at),
         });
     }
@@ -954,6 +969,22 @@ pub async fn analyze_pr_comments(
         None => Vec::new(),
     };
 
+    // The triage helper read the checkout as the first capture saw it. A
+    // checkout that moved under the analysis — a commit, a discarded edit, a
+    // freshly saved file, a changed mode — would leave fix instructions
+    // formed from a content nothing re-reads, so the record is refused
+    // instead of saved. This is read-only; re-analyzing binds the checkout
+    // as it stands now.
+    let after = worktree_state_facts(
+        &working_dir,
+        task.branch_name.as_deref()
+            .expect("the first capture demanded the branch"),
+    )
+    .await?;
+    if after != facts {
+        return Err(analysis_not_stable(&facts, &after));
+    }
+
     let plan = PrReviewPlan {
         generated_at,
         pr_url,
@@ -964,6 +995,8 @@ pub async fn analyze_pr_comments(
         last_apply: prior_plan.and_then(|p| p.last_apply),
         fixed_content,
         analyzed_head_oid: Some(head_oid),
+        analyzed_worktree_oid: Some(facts.tip),
+        analyzed_worktree_fingerprint: Some(facts.fingerprint),
         analyzed_at: Some(generated_at),
     };
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, plan.clone()).await?;
@@ -1339,6 +1372,12 @@ pub async fn address_pr_review(
 ) -> Result<PrReviewApplyResult, String> {
     use tauri::Emitter;
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    // Record the dry-run decision first; it is what the helper lease is
+    // acquired for, and the pre-flight runs under that lease so no analysis
+    // can save a different plan between the checks and the final persist.
+    let purpose =
+        if options.dry_run { PrHelperPurpose::Inspection } else { PrHelperPurpose::Editing };
+    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid, purpose).await?;
     let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let task = {
         let tasks = state.task.tasks.read().await;
@@ -1347,9 +1386,17 @@ pub async fn address_pr_review(
 
     // Refuse before anything is edited, pushed or replied to. The stored plan
     // is what the Task was analyzed under, so the plan sent by the webview
-    // must agree with it and both must match the PR's head as it is now.
+    // must agree with it, both must match the PR's head as it is now, and the
+    // checkout must still be the state the analysis read.
     let pr_url = pr_url_for_task(&task)?;
-    check_apply_preflight(task.pr_review_plan.as_ref(), &plan, &pr_url).await?;
+    check_apply_preflight(
+        task.pr_review_plan.as_ref(),
+        &plan,
+        &pr_url,
+        &working_dir,
+        task.branch_name.as_deref(),
+    )
+    .await?;
 
     let app_handle = app.clone();
     let progress: ProgressSink = std::sync::Arc::new(move |ev: PrReviewProgress| {
@@ -1365,9 +1412,6 @@ pub async fn address_pr_review(
     plan.backfill_lifecycle_from_last_apply();
     // A dry run is the same flag that makes every provider call below
     // read-only and skips the commit, push and replies; anything else can edit.
-    let purpose =
-        if options.dry_run { PrHelperPurpose::Inspection } else { PrHelperPurpose::Editing };
-    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid, purpose).await?;
     let provider_lease_path = crate::queue::task_provider_lease_path(&state.storage, task_uuid);
     let (result, updated_plan) = address_pr_review_inner(
         task,
@@ -1478,6 +1522,8 @@ fn stored_plan_for_apply<'a>(
     };
     if sent.analyzed_head_oid != stored.analyzed_head_oid
         || sent.analyzed_at != stored.analyzed_at
+        || sent.analyzed_worktree_oid != stored.analyzed_worktree_oid
+        || sent.analyzed_worktree_fingerprint != stored.analyzed_worktree_fingerprint
     {
         return Err(
             "The review plan being applied is not the one stored for this Task. Re-analyze \
@@ -1535,12 +1581,210 @@ async fn check_apply_preflight(
     stored: Option<&PrReviewPlan>,
     sent: &PrReviewPlan,
     pr_url: &str,
+    working_dir: &str,
+    branch: Option<&str>,
 ) -> Result<(), String> {
     let stored = stored_plan_for_apply(stored, sent)?;
+    check_plan_matches_worktree(stored, working_dir, branch).await?;
     let current_head = current_pr_head_oid(pr_url).await?;
     check_plan_matches_pr_head(stored, &current_head)
 }
 
+/// Refuses an Apply unless the checkout the fix instructions were formed from
+/// is the checkout they would be applied to. Every refusal is read-only: the
+/// checkout's commits and edits are never reset, discarded or replaced, and
+/// the recorded state is only ever refreshed by a new analysis.
+///
+/// A plan that does not record the checkout's provenance counts as unknown
+/// and must be analyzed again, exactly like a plan without the analyzed PR
+/// head. The task branch and its uncommitted state are checked separately so
+/// the two refusals say which part moved.
+async fn check_plan_matches_worktree(
+    plan: &PrReviewPlan,
+    working_dir: &str,
+    branch: Option<&str>,
+) -> Result<(), String> {
+    let unknown = || {
+        "This review plan does not record the checkout state it was analyzed under, so it \
+         cannot be applied. Re-analyze the PR comments, then apply again. Nothing was changed."
+            .to_string()
+    };
+    // Unknown provenance is refused before the checkout is touched at all:
+    // the pre-fix records carry no worktree id or content fingerprint. The
+    // branch and uncommitted-content provenance are a pair from one analysis.
+    if plan.analyzed_worktree_oid.is_none() || plan.analyzed_worktree_fingerprint.is_none() {
+        return Err(unknown());
+    }
+    let branch = branch.ok_or(
+        "The task has no branch recorded, so its checkout state cannot be checked against \
+         this review plan. Analyze the PR comments again, then apply again. Nothing was changed.",
+    )?;
+    let tip = match git_branch_tip(working_dir, branch).await? {
+        Some(tip) => tip,
+        None => {
+            return Err(format!(
+                "the task's branch '{branch}' has no tip in the checkout, so the checkout state \
+                 cannot be checked. Resolve the checkout, then re-analyze the PR comments. \
+                 Nothing was changed."
+            ))
+        }
+    };
+    match plan.analyzed_worktree_oid.as_deref() {
+        None => Err(unknown()),
+        Some(analyzed) if analyzed != tip => Err(format!(
+            "The task's checkout moved from {} to {} after this review plan was analyzed. \
+             Re-analyze the PR comments against the checkout as it is, then apply again. \
+             Nothing was changed.",
+            short_oid(analyzed),
+            short_oid(&tip),
+        )),
+        Some(_) => Ok(()),
+    }?;
+    let fingerprint = worktree_content_fingerprint(working_dir).await?;
+    match plan.analyzed_worktree_fingerprint.as_deref() {
+        None => Err(unknown()),
+        Some(analyzed) if analyzed != fingerprint => Err(
+            "The checkout's content is not what this review plan was analyzed under: a file \
+             it names can have been edited again, restaged, deleted or added since the \
+             analysis read it, while its status letter looks unchanged. Re-analyze the PR \
+             comments against the checkout as it is, then apply again. Nothing was changed \
+             and no edit was discarded."
+                .to_string(),
+        ),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The checkout facts one analysis binds: the task branch's tip and the
+/// content fingerprint of its uncommitted state. Recorded at the start of
+/// the analysis and re-read before the plan is saved, so a checkout that
+/// moved under the triage helper cannot be recorded as stable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckoutFacts {
+    tip: String,
+    fingerprint: String,
+}
+
+/// The refusal when the checkout moved under the analysis: the fix
+/// instructions must not be recorded for a content that then went away.
+fn analysis_not_stable(recording: &CheckoutFacts, after: &CheckoutFacts) -> String {
+    let _ = (recording, after);
+    "The checkout changed during the analysis, so its fix instructions were formed from a \
+     content that then went away. The plan was not recorded and nothing was edited. \
+     Re-analyze the PR comments against the checkout as it stands now."
+        .to_string()
+}
+
+async fn worktree_state_facts(working_dir: &str, branch: &str) -> Result<CheckoutFacts, String> {
+    let tip = git_branch_tip(working_dir, branch)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "the task's branch '{branch}' has no tip in {working_dir}, so the checkout state \
+                 could not be recorded"
+            )
+        })?;
+    let fingerprint = worktree_content_fingerprint(working_dir).await?;
+    Ok(CheckoutFacts { tip, fingerprint })
+}
+
+/// Fingerprint the checkout's uncommitted state as content, not as a listing.
+/// `git status`-shape digests record paths and status codes only, so a file
+/// that keeps its `M` letter through a second edit would hash the same and an
+/// Apply would run fix instructions formed from an older content. Instead,
+/// every tracked path that differs from HEAD (staged or unstaged, deletions
+/// and type changes included) and every untracked path is read from the file
+/// system, and the record hashes its status, current kind (deleted, file,
+/// executable, symlink target), size and SHA-256 content — what the triage
+/// helper actually reads. `--no-renames` turns every rename into a deletion
+/// plus an addition, keeping each `git diff -z` record single-path.
+async fn worktree_content_fingerprint(working_dir: &str) -> Result<String, String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+        args.push(git_dir);
+    }
+    args.extend(["diff", "HEAD", "--no-renames", "--name-status", "-z"].map(String::from));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let tracked = run_cmd("git", &args, working_dir)
+        .await
+        .map_err(|e| format!("listing the checkout's tracked changes failed: {e}"))?;
+    let mut args: Vec<String> = Vec::new();
+    if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+        args.push(git_dir);
+    }
+    args.extend(["ls-files", "--others", "--exclude-standard", "-z"].map(String::from));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let untracked = run_cmd("git", &args, working_dir)
+        .await
+        .map_err(|e| format!("listing the checkout's untracked files failed: {e}"))?;
+
+    let changed = record_pairs(&tracked);
+    let mut records = Vec::new();
+    for (status, path) in &changed {
+        records.push(worktree_record(working_dir, status, path).await?);
+    }
+    for path in null_paths(&untracked) {
+        records.push(worktree_record(working_dir, "??", &path).await?);
+    }
+    records.sort();
+    let text = records.join("\n");
+    Ok(format!("{:x}", sha2::Sha256::digest(text.as_bytes())))
+}
+
+/// The (status, path) pairs of a `git diff -z --name-status` listing: fields
+/// alternate status and path, and empty trailing records are skipped.
+fn record_pairs(listing: &str) -> Vec<(String, String)> {
+    let fields: Vec<&str> = listing.split('\0').filter(|f| !f.is_empty()).collect();
+    fields
+        .chunks(2)
+        .filter(|c| c.len() == 2)
+        .map(|c| (c[0].to_string(), c[1].to_string()))
+        .collect()
+}
+
+/// The paths of a `git ls-files -z` listing (one path per record).
+fn null_paths(listing: &str) -> Vec<String> {
+    listing.split('\0').filter(|f| !f.is_empty()).map(String::from).collect()
+}
+
+/// One hashable record of a worktree path: its status letter, the kind the
+/// file system now shows (deleted, file, executable, symlink with target)
+/// and the SHA-256 of its content. Failures fail the whole capture loudly.
+async fn worktree_record(working_dir: &str, status: &str, rel: &str) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::path::Path::new(working_dir);
+    let path = base.join(rel);
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(meta) => {
+            let (kind, content) = if meta.file_type().is_symlink() {
+                let target = tokio::fs::read_link(&path)
+                    .await
+                    .map_err(|e| format!("reading the checkout link {rel} failed: {e}"))?;
+                (
+                    "symlink".to_string(),
+                    target.as_os_str().to_string_lossy().into_owned().into_bytes(),
+                )
+            } else if meta.permissions().mode() & 0o111 != 0 {
+                ("exec".to_string(), tokio::fs::read(&path).await.map_err(
+                    |e| format!("reading the checkout file {rel} failed: {e}"),
+                )?)
+            } else {
+                (
+                    "file".to_string(),
+                    tokio::fs::read(&path).await
+                        .map_err(|e| format!("reading the checkout file {rel} failed: {e}"))?,
+                )
+            };
+            Ok(format!(
+                "{rel}\t[{status}]\t{kind}\t{}\t{:x}",
+                content.len(),
+                sha2::Sha256::digest(&content)
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(format!("{rel}\t[{status}]\tdeleted")),
+        Err(e) => Err(format!("reading the checkout state of {rel} failed: {e}")),
+    }
+}
 /// Re-reads the PR head and refuses when `plan` was analyzed at another one.
 /// A plan without provenance is not checked here: [`address_pr_review`]
 /// refuses those before it reaches this flow.
@@ -7980,6 +8224,8 @@ mod tests {
     fn plan_with_marker(marker: &str) -> PrReviewPlan {
         PrReviewPlan {
             analyzed_head_oid: None,
+            analyzed_worktree_oid: None,
+            analyzed_worktree_fingerprint: None,
             analyzed_at: None,
             generated_at: chrono::Utc::now(),
             pr_url: "https://github.com/org/repo/pull/1".to_string(),
@@ -8987,6 +9233,8 @@ mod tests {
         let fixed_ids = items.iter().filter(|i| i.fix_done).filter_map(|i| i.comment_id).collect();
         PrReviewPlan {
             analyzed_head_oid: None,
+            analyzed_worktree_oid: None,
+            analyzed_worktree_fingerprint: None,
             analyzed_at: None,
             generated_at: at("2024-05-31T00:00:00Z"),
             pr_url: String::new(),
@@ -17798,6 +18046,8 @@ mod tests {
 
                 let plan = PrReviewPlan {
                     analyzed_head_oid: None,
+                    analyzed_worktree_oid: None,
+                    analyzed_worktree_fingerprint: None,
                     analyzed_at: None,
                     generated_at: chrono::Utc::now(),
                     pr_url: "https://github.com/testorg/testrepo/pull/321".to_string(),
@@ -18303,6 +18553,8 @@ mod tests {
                 };
                 let plan = PrReviewPlan {
                     analyzed_head_oid: None,
+                    analyzed_worktree_oid: None,
+                    analyzed_worktree_fingerprint: None,
                     analyzed_at: None,
                     generated_at: chrono::Utc::now(),
                     pr_url: pr_url.to_string(),
@@ -18513,6 +18765,8 @@ mod tests {
                 };
                 let plan = PrReviewPlan {
                     analyzed_head_oid: None,
+                    analyzed_worktree_oid: None,
+                    analyzed_worktree_fingerprint: None,
                     analyzed_at: None,
                     generated_at: chrono::Utc::now(),
                     pr_url: pr_url.to_string(),
@@ -24025,6 +24279,8 @@ mod review_plan_provenance {
             last_apply: None,
             fixed_content: Vec::new(),
             analyzed_head_oid: head.map(str::to_string),
+            analyzed_worktree_oid: head.map(str::to_string),
+            analyzed_worktree_fingerprint: None,
             analyzed_at: head.map(|_| chrono::Utc::now()),
         }
     }
@@ -24315,6 +24571,8 @@ mod review_plan_provenance {
             last_apply: None,
             fixed_content: Vec::new(),
             analyzed_head_oid: Some(ANALYZED.to_string()),
+            analyzed_worktree_oid: Some(ANALYZED.to_string()),
+            analyzed_worktree_fingerprint: None,
             analyzed_at: Some(chrono::Utc::now()),
         }
     }
@@ -24593,13 +24851,77 @@ mod review_plan_provenance {
     }
 
     /// A plan with two items to change, analyzed at `ANALYZED`, as stored on
-    /// the Task.
+    /// the Task. Its checkout provenance starts unset; the pre-flight tests
+    /// record a fixture checkout's facts into a clone before running.
     fn analyzed_plan_with_items() -> (Task, PrReviewPlan) {
         let (mut task, mut plan) = crate::test_helpers::create_test_pr_review_setup();
         plan.analyzed_head_oid = Some(ANALYZED.to_string());
         plan.analyzed_at = Some(chrono::Utc::now());
         task.pr_review_plan = Some(plan.clone());
         (task, plan)
+    }
+
+    /// The stored plan of the fixture Task, with the checkout's provenance
+    /// recorded as the facts give it.
+    fn stored_with_provenance(
+        stored: &PrReviewPlan,
+        facts: (String, String),
+    ) -> (Task, PrReviewPlan) {
+        let mut sent = stored.clone();
+        sent.analyzed_worktree_oid = Some(facts.0);
+        sent.analyzed_worktree_fingerprint = Some(facts.1);
+        let (mut task, _) = analyzed_plan_with_items();
+        task.pr_review_plan = Some(sent.clone());
+        (task, sent)
+    }
+
+    /// The task branch the fake checkout checkout serves.
+    const FIXTURE_BRANCH: &str = "test-branch";
+    /// A tip that answers the moved-checkout run of the fixture git.
+    /// A real git checkout for the facts the analysis binds: branch
+    /// `test-branch` at one commit. The fingerprint's own git calls run the
+    /// real git, like every other test that spawns processes, so no `PATH` is
+    /// taken over for git here: a PATH-wide git fake would be picked up by
+    /// the suite's other, parallel, git-spawning tests.
+    fn real_checkout(dir: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", FIXTURE_BRANCH]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("committed.txt"), b"committed").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "fixture"]);
+    }
+
+    /// Record the fixture checkout's provenance: what the analysis records.
+    async fn checkout_facts(dir: &std::path::Path) -> (String, String) {
+        let facts = worktree_state_facts(dir.to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("the fixture checkout is readable");
+        (facts.tip, facts.fingerprint)
+    }
+
+    /// Run the Apply pre-flight against the fixture checkout.
+    async fn preflight(
+        task: &Task,
+        sent: &PrReviewPlan,
+        dir: &tempfile::TempDir,
+    ) -> Result<(), String> {
+        check_apply_preflight(
+            task.pr_review_plan.as_ref(),
+            sent,
+            PR_URL,
+            dir.path().to_str().unwrap(),
+            Some(FIXTURE_BRANCH),
+        )
+        .await
     }
 
     #[test]
@@ -24658,13 +24980,20 @@ mod review_plan_provenance {
         )
         .await;
         gh.add("claude", "exit 0");
+        let dir = tempfile::tempdir().expect("tempdir");
         let (task, stored) = analyzed_plan_with_items();
         let mut sent = stored.clone();
         sent.items[0].proposed_change = "rewrite the whole module".to_string();
 
-        let err = check_apply_preflight(task.pr_review_plan.as_ref(), &sent, PR_URL)
-            .await
-            .expect_err("changed content is refused");
+        let err = check_apply_preflight(
+            task.pr_review_plan.as_ref(),
+            &sent,
+            PR_URL,
+            dir.path().to_str().unwrap(),
+            Some("test-branch"),
+        )
+        .await
+        .expect_err("changed content is refused");
         assert!(err.contains("differs from the one stored"), "{err}");
         assert_eq!(gh.launches("gh"), 0, "no head read, no reply, no push");
         assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
@@ -24681,9 +25010,12 @@ mod review_plan_provenance {
         )
         .await;
         gh.add("claude", "exit 0");
-        let (task, stored) = analyzed_plan_with_items();
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        let (_, stored) = analyzed_plan_with_items();
+        let (task, sent) = stored_with_provenance(&stored, checkout_facts(dir.path()).await);
 
-        let err = check_apply_preflight(task.pr_review_plan.as_ref(), &stored, PR_URL)
+        let err = preflight(&task, &sent, &dir)
             .await
             .expect_err("a stale plan is refused");
         assert!(err.contains("moved"), "{err}");
@@ -24695,13 +25027,199 @@ mod review_plan_provenance {
     #[cfg(unix)]
     #[tokio::test]
     async fn apply_preflight_passes_for_the_stored_plan_at_the_current_head() {
+        // The fake `gh` is only held for its PATH presence: the pre-flight
+        // spawns it and compares heads without touching this value.
         let _gh = crate::test_helpers::FakeProgram::install(
             "gh",
             &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
         )
         .await;
-        let (task, stored) = analyzed_plan_with_items();
-        assert!(check_apply_preflight(task.pr_review_plan.as_ref(), &stored, PR_URL).await.is_ok());
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        let (_, stored) = analyzed_plan_with_items();
+        let (task, sent) = stored_with_provenance(&stored, checkout_facts(dir.path()).await);
+        assert!(preflight(&task, &sent, &dir).await.is_ok());
+    }
+
+    /// An Apply is refused when the checkout's branch tip is not the commit
+    /// the analysis read, without the PR head even being asked about. The
+    /// refusal is read-only: nothing about the checkout is changed, and the
+    /// user's local commits and edits all stay where they are.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_refuses_a_moved_checkout_and_touches_nothing() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        // The plan's provenance is recorded at this tip; the branch then
+        // moves to a further commit, as a publication would.
+        let facts = checkout_facts(dir.path()).await;
+        std::fs::write(dir.path().join("committed.txt"), b"moved").unwrap();
+        let ok = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["commit", "-aqm", "move"])
+            .status()
+            .expect("git commit");
+        assert!(ok.success());
+        let (_, stored) = analyzed_plan_with_items();
+        let (task, sent) = stored_with_provenance(&stored, facts);
+
+        let err = preflight(&task, &sent, &dir)
+            .await
+            .expect_err("a moved checkout is refused");
+        assert!(err.contains("checkout moved"), "{err}");
+        assert!(err.contains("Re-analyze"), "{err}");
+        assert_eq!(gh.launches("gh"), 0, "the local refusal needs no head read");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+    }
+
+    /// An Apply is refused when the checkout's uncommitted content is no
+    /// longer the content the analysis read, even at the same tip — the fix
+    /// instructions were formed from that content. The refusal preserves the
+    /// edits where they are; only a re-analyze records the state as it is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_preflight_refuses_when_the_uncommitted_edits_content_changed() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        // The checkout is dirty already: a tracked edit the analysis read.
+        std::fs::write(dir.path().join("committed.txt"), b"analyzed content").unwrap();
+        let (_, stored) = analyzed_plan_with_items();
+        let (task, sent) = stored_with_provenance(&stored, checkout_facts(dir.path()).await);
+
+        // Same status letter (`M committed.txt` both times), different bytes.
+        std::fs::write(dir.path().join("committed.txt"), b"rewritten content").unwrap();
+        let err = preflight(&task, &sent, &dir)
+            .await
+            .expect_err("an edit hidden by the status letter is refused");
+        assert!(err.contains("content is not what"), "{err}");
+        assert!(err.contains("no edit was discarded"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.path().join("committed.txt")).unwrap(),
+            b"rewritten content".to_vec(),
+            "the refusal changed nothing"
+        );
+        assert_eq!(gh.launches("gh"), 0, "the local refusal needs no head read");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+    }
+
+    /// A plan saved by the previous code records the PR head but not the
+    /// checkout state. It is unknown and refused, in the same words as a
+    /// plan without the analyzed head: re-analyze, nothing changed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_legacy_plan_without_the_checkout_provenance_is_refused() {
+        // Same: the fake is held for its PATH presence and its answer is
+        // never read, because the unknown-provenance check runs first.
+        let _gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut task, stored) = analyzed_plan_with_items();
+        let mut legacy = stored.clone();
+        legacy.analyzed_worktree_oid = None;
+        legacy.analyzed_worktree_fingerprint = None;
+        task.pr_review_plan = Some(legacy.clone());
+
+        let err = preflight(&task, &legacy, &dir)
+            .await
+            .expect_err("a plan without checkout provenance is refused");
+        assert!(err.contains("does not record the checkout state"), "{err}");
+    }
+
+    /// The capture hashes content, not the status listing: a second edit the
+    /// listing does not report, a mode change, a link-only change, a new
+    /// untracked file and a deletion each make the second capture differ, so
+    /// neither an analysis nor an Apply can be fooled by a stable listing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_state_facts_hash_the_content_the_listing_hides() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        std::fs::write(dir.path().join("committed.txt"), b"first").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"untracked").unwrap();
+        let facts = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+
+        // The same status letter, different bytes: the reported gap.
+        std::fs::write(dir.path().join("committed.txt"), b"second").unwrap();
+        let second = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+        assert_ne!(second.fingerprint, facts.fingerprint, "a content edit shows");
+
+        // Same bytes, a mode flip: still a different state.
+        let mut perms =
+            std::fs::metadata(dir.path().join("committed.txt")).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.path().join("committed.txt"), perms.clone()).unwrap();
+        let exec = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+        assert_ne!(exec.fingerprint, second.fingerprint, "a mode change shows");
+        perms.set_mode(0o644);
+        std::fs::set_permissions(dir.path().join("committed.txt"), perms).unwrap();
+
+        // An untracked file hashes its content, not just its name.
+        std::fs::write(dir.path().join("notes.txt"), b"edited").unwrap();
+        let untracked_changed = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+        assert_ne!(
+            untracked_changed.fingerprint, facts.fingerprint,
+            "an untracked edit shows"
+        );
+
+        // A symlink's target is content.
+        std::fs::remove_file(dir.path().join("notes.txt")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("committed.txt"),
+            dir.path().join("notes.txt"),
+        )
+        .unwrap();
+        let linked = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+        assert_ne!(linked.fingerprint, untracked_changed.fingerprint, "a symlink shows");
+
+        // A deletion removes content, not just the status letter.
+        std::fs::remove_file(dir.path().join("committed.txt")).unwrap();
+        let deleted = worktree_state_facts(dir.path().to_str().unwrap(), FIXTURE_BRANCH)
+            .await
+            .expect("readable");
+        assert_ne!(deleted.fingerprint, linked.fingerprint, "a deletion shows");
+    }
+
+    /// An analysis on a moved checkout is refused, and the refusal is named
+    /// in this exact wording.
+    #[test]
+    fn an_analysis_that_ran_on_a_moved_checkout_is_refused() {
+        let recording = CheckoutFacts {
+            tip: ANALYZED.to_string(),
+            fingerprint: "one".to_string(),
+        };
+        let moved = CheckoutFacts {
+            tip: ANALYZED.to_string(),
+            fingerprint: "two".to_string(),
+        };
+        let err = analysis_not_stable(&recording, &moved);
+        assert!(err.contains("during the analysis"), "{err}");
+        assert!(err.contains("was not recorded"), "{err}");
     }
 
     fn unapproved_fix(comment_id: Option<u64>) -> PrReviewItem {
@@ -24777,9 +25295,19 @@ mod review_plan_provenance {
         );
         let mut sent = stored.clone();
         sent.items[0].approved = true;
-        let err = check_apply_preflight(Some(&stored), &sent, PR_URL)
-            .await
-            .expect_err("an unidentified approval is refused");
+        // The refusal happens in the sent-vs-stored identity check, before
+        // the checkout is read at all: no git fake is needed here, and adding
+        // one would double-acquire PATH_LOCK this test already holds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = check_apply_preflight(
+            Some(&stored),
+            &sent,
+            PR_URL,
+            dir.path().to_str().unwrap(),
+            Some("test-branch"),
+        )
+        .await
+        .expect_err("an unidentified approval is refused");
         assert!(err.contains("Nothing was changed"), "{err}");
         assert_eq!(gh.launches("gh"), 0, "no head read, no reply, no push");
         assert_eq!(gh.launches("claude"), 0, "no fix agent runs");

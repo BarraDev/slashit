@@ -545,6 +545,8 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
 
     let plan = PrReviewPlan {
         analyzed_head_oid: None,
+        analyzed_worktree_oid: None,
+        analyzed_worktree_fingerprint: None,
         analyzed_at: None,
         generated_at: chrono::Utc::now(),
         pr_url: task.pr_url.clone().unwrap(),
@@ -787,6 +789,8 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
 
     let plan = PrReviewPlan {
         analyzed_head_oid: None,
+        analyzed_worktree_oid: None,
+        analyzed_worktree_fingerprint: None,
         analyzed_at: None,
         generated_at: chrono::Utc::now(),
         pr_url: task.pr_url.clone().unwrap(),
@@ -1235,6 +1239,8 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
     // Dry-run results are intentionally ignored.
     let mut dry_plan = PrReviewPlan {
         analyzed_head_oid: None,
+        analyzed_worktree_oid: None,
+        analyzed_worktree_fingerprint: None,
         analyzed_at: None,
         generated_at: chrono::Utc::now(),
         pr_url: "x".to_string(),
