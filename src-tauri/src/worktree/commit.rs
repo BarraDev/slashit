@@ -65,6 +65,19 @@ pub async fn commit_checkout_even_if_empty(
         .ok_or_else(|| "git made no commit".to_string())
 }
 
+/// The commit the checkout's branch tip is at. For a run that was just told
+/// there was nothing to commit, the work it has to record is exactly this
+/// tip: the agent committed its own work, or changed nothing. The checkout
+/// must be the top level of its own Git working tree with a commit reachable
+/// through `HEAD` — which [`commit_checkout`]'s refusals have just
+/// established for a caller that reads the tip right after a commit attempt
+/// — and the call writes nothing.
+pub async fn checkout_head_commit(working_dir: &str) -> Result<String, String> {
+    git(working_dir, &["rev-parse", "--verify", "HEAD^{commit}"])
+        .await
+        .map_err(|e| format!("could not read the commit the checkout is at: {e}"))
+}
+
 /// Whether the checkout holds work that is not in its base yet: an edit that is
 /// not committed, or a commit past `base`. A checkout that is unchanged, or
 /// whose only commits are already in `base`, holds no work. Nothing is staged
@@ -284,6 +297,29 @@ mod tests {
         );
     }
 
+    /// The tip of the branch, read back after an agent-style commit of its
+    /// own, is what one run with nothing left to commit records as its head.
+    #[tokio::test]
+    async fn checkout_head_commit_names_the_tip_the_commit_left_in_place() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        std::fs::write(checkout.join("own work.txt"), "committed by the agent\n").unwrap();
+        git_ok(&checkout, &["add", "-A"]);
+        git_ok(&checkout, &["commit", "-q", "-m", "agent: my own work"]);
+        let head = git_ok(&checkout, &["rev-parse", "HEAD"]);
+
+        let tip = checkout_head_commit(checkout.to_str().unwrap())
+            .await
+            .expect("tip");
+
+        assert_eq!(tip, head);
+    }
+
+    /// The empty-commit variant still does what its contract says when a
+    /// caller asks for it directly. The run-completion commit no longer does:
+    /// the executor's `commit_changes` now uses `commit_checkout` and, when
+    /// it answers `CheckoutCommit::NothingToCommit`, records the branch tip
+    /// that `checkout_head_commit` returns, so a finished run adds a commit
+    /// only when the checkout held uncommitted work.
     #[tokio::test]
     async fn a_clean_checkout_has_nothing_to_commit_unless_an_empty_commit_is_asked_for() {
         let (_tmp, _repo, checkout) = repo_with_task_checkout();

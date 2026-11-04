@@ -8296,13 +8296,18 @@ impl TaskExecutor {
         Ok(repo.local_path.clone())
     }
 
-    /// Commit the agent's work in its task checkout, on the task branch.
+    /// Commit the agent's work in its task checkout, on the task branch, when
+    /// it left work uncommitted.
     ///
-    /// Always a Git commit, even when the agent changed nothing, so a
-    /// finished task ends with its own commit on its branch (see
-    /// [`crate::worktree::commit_checkout`] for why jj is not used and what
-    /// is refused). The error says why nothing was committed; the caller
-    /// fails the run with it.
+    /// A checkout with uncommitted edits gets exactly one commit,
+    /// `task: {title}` (see [`crate::worktree::commit_checkout`] for why jj is
+    /// not used and what is refused). A checkout without any holds its work
+    /// already: either the agent committed its own work, so the branch tip is
+    /// that work, or the agent changed nothing, so the tip is where it was.
+    /// No empty commit is made and the run does not fail for having nothing
+    /// to commit: the recorded head is the tip as it stands, which is what
+    /// the handoff records and every exact-tip proof after the run checks.
+    /// The error says why committing failed; the caller fails the run with it.
     async fn commit_changes(
         tasks: &Tasks,
         task_id: Uuid,
@@ -8318,26 +8323,46 @@ impl TaskExecutor {
         };
         let committed = match &branch {
             Some(branch) => {
-                crate::worktree::commit_checkout_even_if_empty(
-                    working_dir,
-                    branch,
-                    &format!("task: {title}"),
-                )
-                .await
+                crate::worktree::commit_checkout(working_dir, branch, &format!("task: {title}"))
+                    .await
             }
             None => Err(NO_TASK_BRANCH.to_string()),
         };
-        let commit = committed.map_err(|e| {
-            format!(
-                "The agent's work could not be committed: {e}. It remains as uncommitted edits \
-                 in the task checkout."
-            )
-        })?;
-        events.agent_event(AgentEvent::Log {
-            task_id: task_id.to_string(),
-            level: LogLevel::Info,
-            message: format!("Committed the agent's work as {commit}"),
-        });
+        let commit = match committed {
+            Ok(CheckoutCommit::Committed { commit }) => {
+                events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Info,
+                    message: format!("Committed the agent's work as {commit}"),
+                });
+                commit
+            }
+            Ok(CheckoutCommit::NothingToCommit) => {
+                // `commit_checkout` proved this checkout is the top of its
+                // own working tree, on the task branch and out of any
+                // in-progress operation before it staged anything, so the
+                // tip it left in place is well defined.
+                let head =
+                    crate::worktree::checkout_head_commit(working_dir).map_err(|e| {
+                        format!(
+                            "The agent's work could not be committed: {e}. It remains as \
+                             uncommitted edits in the task checkout."
+                        )
+                    })?;
+                events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Info,
+                    message: format!("Nothing to commit; the task branch tip is {head}"),
+                });
+                head
+            }
+            Err(e) => {
+                return Err(format!(
+                    "The agent's work could not be committed: {e}. It remains as uncommitted \
+                     edits in the task checkout."
+                ))
+            }
+        };
         Ok(commit)
     }
 
@@ -17332,6 +17357,182 @@ mod tests {
             "the AI reviewer must still see the task's committed change, got an empty diff"
         );
         assert!(diff.patch.contains("agent_change.txt"));
+    }
+
+    /// A repository whose `task` branch is the Task's, prepared for
+    /// `commit_changes`: with `committed`, the agent's own work is already a
+    /// commit on the branch; with `uncommitted`, the agent also left edits in
+    /// its checkout. Returns the tempdir that keeps the checkout alive, the
+    /// Task's id, its store, and the agent's own commit when one was made.
+    /// The identity is repository-local, so committing works where none is
+    /// set globally.
+    fn commit_changes_fixture(
+        committed: bool,
+        uncommitted: bool,
+    ) -> (tempfile::TempDir, Uuid, Tasks, Option<String>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "task"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(path.join("seed.txt"), "seed\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "seed"]);
+
+        let mut agent_commit = None;
+        if committed {
+            std::fs::write(path.join("agent_change.txt"), "the agent's work\n").unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", "agent: my own work"]);
+            agent_commit = Some(git(&["rev-parse", "HEAD"]));
+        }
+        if uncommitted {
+            std::fs::write(path.join("left_uncommitted.txt"), "left behind\n").unwrap();
+        }
+
+        let mut task = create_test_task_full("sweep", Uuid::new_v4(), TaskStatus::InProgress, 0);
+        task.branch_name = Some("task".to_string());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        (dir, task_id, tasks, agent_commit)
+    }
+
+    /// The Worker committed its own work and left its checkout clean: the run
+    /// records that commit and adds nothing. The branch tip after the run is
+    /// exactly the work the Worker made, not an extra commit of the app's on
+    /// top of it.
+    #[tokio::test]
+    async fn a_worker_that_committed_its_own_work_is_recorded_without_a_second_commit() {
+        let (dir, task_id, tasks, agent_commit) = commit_changes_fixture(true, false);
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let tip_before = git(&["rev-parse", "HEAD"]);
+
+        let recorded = TaskExecutor::commit_changes(
+            &tasks,
+            task_id,
+            dir.path().to_str().unwrap(),
+            &crate::events::null_sink(),
+        )
+        .await
+        .expect("the run is not failed for having nothing to commit");
+
+        assert_eq!(Some(tip_before.clone()), agent_commit);
+        assert_eq!(
+            recorded, tip_before,
+            "the recorded head is the agent's own commit"
+        );
+        assert_eq!(
+            git(&["rev-parse", "HEAD"]),
+            tip_before,
+            "no second commit was created on top of the agent's"
+        );
+        assert_eq!(git(&["log", "-1", "--format=%s"]), "agent: my own work");
+        assert_eq!(git(&["status", "--porcelain"]), "");
+    }
+
+    /// The Worker changed nothing and left its checkout clean: no empty
+    /// commit is made and the run does not fail. The recorded head is the
+    /// branch tip as it already stood.
+    #[tokio::test]
+    async fn a_worker_that_changed_nothing_commits_nothing_and_does_not_fail() {
+        let (dir, task_id, tasks, agent_commit) = commit_changes_fixture(false, false);
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let tip_before = git(&["rev-parse", "HEAD"]);
+
+        let recorded = TaskExecutor::commit_changes(
+            &tasks,
+            task_id,
+            dir.path().to_str().unwrap(),
+            &crate::events::null_sink(),
+        )
+        .await
+        .expect("the run does not fail when nothing was changed");
+
+        assert!(agent_commit.is_none());
+        assert_eq!(
+            recorded, tip_before,
+            "the recorded head is where the branch already was"
+        );
+        assert_eq!(
+            git(&["rev-parse", "HEAD"]),
+            tip_before,
+            "no empty commit was created"
+        );
+        assert_eq!(git(&["log", "-1", "--format=%s"]), "seed");
+        assert_eq!(git(&["status", "--porcelain"]), "");
+    }
+
+    /// Edits left uncommitted still become the one `task: {title}` commit:
+    /// the branch gains exactly one commit of the app's.
+    #[tokio::test]
+    async fn uncommitted_work_still_becomes_exactly_one_commit() {
+        let (dir, task_id, tasks, _agent_commit) = commit_changes_fixture(false, true);
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let tip_before = git(&["rev-parse", "HEAD"]);
+
+        let recorded = TaskExecutor::commit_changes(
+            &tasks,
+            task_id,
+            dir.path().to_str().unwrap(),
+            &crate::events::null_sink(),
+        )
+        .await
+        .expect("committed");
+
+        assert_ne!(recorded, tip_before);
+        assert_eq!(git(&["rev-parse", "HEAD"]), recorded);
+        assert_eq!(git(&["log", "-1", "--format=%s"]), "task: sweep");
+        assert_eq!(git(&["rev-list", "--count", &format!("{tip_before}..HEAD")]), "1");
+        assert_eq!(git(&["status", "--porcelain"]), "");
     }
 
     // ---- Unit 5C2: review/fix lifecycle ownership and shared capacity ----
