@@ -600,10 +600,10 @@ async fn handle_set_task_review_mode(
         Ok(id) => id,
         Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
     };
-    let mode = match review_mode.as_deref() {
-        None | Some("automatic") => crate::domain::task::ReviewMode::Automatic,
-        Some("manual") => crate::domain::task::ReviewMode::Manual,
-        Some(other) => {
+    let mode = match review_mode.as_str() {
+        "automatic" => crate::domain::task::ReviewMode::Automatic,
+        "manual" => crate::domain::task::ReviewMode::Manual,
+        other => {
             return IpcResponse::error(format!(
                 "Invalid review mode: {other}. Use manual or automatic."
             ))
