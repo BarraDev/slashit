@@ -8342,8 +8342,9 @@ impl TaskExecutor {
                 // own working tree, on the task branch and out of any
                 // in-progress operation before it staged anything, so the
                 // tip it left in place is well defined.
-                let head =
-                    crate::worktree::checkout_head_commit(working_dir).map_err(|e| {
+                let head = crate::worktree::checkout_head_commit(working_dir)
+                    .await
+                    .map_err(|e| {
                         format!(
                             "The agent's work could not be committed: {e}. It remains as \
                              uncommitted edits in the task checkout."

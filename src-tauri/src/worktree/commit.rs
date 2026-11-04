@@ -55,6 +55,13 @@ pub async fn commit_checkout(
 
 /// [`commit_checkout`], except that a checkout without changes still gets a
 /// new, empty commit. Returns the new commit.
+///
+/// Run completion no longer asks for empty commits — a finished task branch
+/// ends at the work itself ([`commit_checkout`], reading the tip it leaves
+/// with [`checkout_head_commit`]) — so this variant has no production
+/// caller and is compiled only for the tests that pin how [`commit`]
+/// distinguishes an empty checkout when a caller does ask directly.
+#[cfg(test)]
 pub async fn commit_checkout_even_if_empty(
     working_dir: &str,
     branch: &str,
