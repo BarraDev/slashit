@@ -1,0 +1,19 @@
+#!/bin/sh
+# Reads its prompt to EOF first, as `claude -p` does.
+cat > /dev/null
+sleep 0.2
+# One genuine initialization: this is the only session start the run has.
+printf '{"type":"system","subtype":"init","session_id":"s-sub","model":"fixture-model"}\n'
+sleep 0.1
+# Non-init system subtypes a real session emits between turns, none with a
+# `model` field. None of these is a session start.
+printf '{"type":"system","subtype":"api_retry","session_id":"s-sub"}\n'
+printf '{"type":"system","subtype":"notification","session_id":"s-sub"}\n'
+printf '{"type":"system","subtype":"informational","session_id":"s-sub"}\n'
+printf '{"type":"system","subtype":"compact_boundary","session_id":"s-sub"}\n'
+sleep 0.1
+# Then the run carries on in the same session: a tool call and its turn.
+printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.rs"}}]}}\n'
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"read the file"}]}}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-sub","result":"done"}\n'
+exit 0

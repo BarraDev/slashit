@@ -25,6 +25,13 @@ pub enum CodingRunEvent {
     /// Session initialized
     #[serde(rename = "system_init")]
     SystemInit { session_id: String, model: Option<String>, message: Option<String> },
+    /// A provider system event that is not a session start (a status report, a
+    /// notice between turns): it stays observable on the stream, but it is not
+    /// an initialization and it claims no model — there is no model field to
+    /// read one from. `summary` is a bounded one-line description the runner
+    /// derives from `subtype` alone, never a provider payload.
+    #[serde(rename = "system_notice")]
+    SystemNotice { subtype: String, summary: String },
     /// Partial text output (streaming)
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
@@ -138,6 +145,17 @@ mod tests {
                 },
                 serde_json::json!({
                     "type": "system_init", "session_id": "s", "model": "m", "message": null
+                }),
+            ),
+            (
+                CodingRunEvent::SystemNotice {
+                    subtype: "api_retry".into(),
+                    summary: "the provider is retrying an API call".into(),
+                },
+                serde_json::json!({
+                    "type": "system_notice",
+                    "subtype": "api_retry",
+                    "summary": "the provider is retrying an API call"
                 }),
             ),
             (
