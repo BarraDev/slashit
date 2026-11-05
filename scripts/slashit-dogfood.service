@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MPL-2.0
 # Optional systemd user unit for the isolated SlashIt dogfood instance.
 #
-# scripts/supervise-dogfood.sh works on any system and is the primary
-# mechanism; this unit only adds automatic restarts and journal logging where
-# a systemd user session is available. The unit runs the script's `run` verb:
+# scripts/supervise-dogfood.sh is the primary mechanism and is Linux only: it
+# needs /proc, flock(1) and setsid(1), and exits 1 on any other platform. This
+# unit only adds automatic restarts and journal logging where a systemd user
+# session is available. The unit runs the script's `run` verb:
 # the binary and CLI locations are resolved from the checkout the script
 # belongs to (its own target/debug), so the layout is declared in exactly ONE
 # place — the script. Adjust the ExecStart path to the workspace checkout that

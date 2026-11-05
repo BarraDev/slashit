@@ -79,6 +79,10 @@ jobs:
         with:
           persist-credentials: false
 
+      # Both scripts are executed directly; a missing execute bit fails with exit 126.
+      - name: Check the supervisor scripts are executable
+        run: test -x scripts/supervise-dogfood.sh && test -x scripts/test-supervise-dogfood.sh
+
       - name: Run the supervisor harness
         env:
           TMPDIR: ${{ runner.temp }}
