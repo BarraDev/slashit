@@ -27,7 +27,7 @@
 #       declaration. The child's identity is recorded as soon as its PID is
 #       known (a provisional launch record). A start that fails after the
 #       spawn ends that child by its verified identity. If the child survives,
-#       or its identity cannot be read, nothing is signaled and the record is
+#       or its identity cannot be read, no further signal is sent and the record is
 #       kept for manual recovery: `stop --force` ends a record only when its
 #       identity is verified, and refuses otherwise. A failed record write is
 #       a failed start.

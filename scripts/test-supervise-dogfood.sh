@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=121
+EXPECTED_TOTAL=122
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -1044,6 +1044,53 @@ cleanup_instances
 rm -f "$record_file"
 signal_owned KILL "$record_id" || true
 wait "$record_pid" 2>/dev/null || true
+
+echo "== the identity re-read after the environment check refuses a changed process"
+# Deterministic, without pid reuse: PATH shims stand in for two commands. `tr` is
+# the only command verify_env runs, so once it has run, the `cat` shim reports
+# the endpoint pid's start time one tick later. The re-read must see that and
+# refuse before any quit. Without the re-read, the stop would send quit.
+cleanup_instances
+out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+reread_pid=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$reread_pid" ]; then
+  reread_shim=$work/reread-shim
+  reread_flag=$work/reread-flag
+  mkdir -p "$reread_shim"
+  real_tr=$(command -v tr)
+  real_cat=$(command -v cat)
+  cat >"$reread_shim/tr" <<SHIM
+#!/usr/bin/env bash
+: >"$reread_flag"
+exec "$real_tr" "\$@"
+SHIM
+  cat >"$reread_shim/cat" <<SHIM
+#!/usr/bin/env bash
+if [ -e "$reread_flag" ] && [ "\$1" = "/proc/$reread_pid/stat" ]; then
+  stat=\$("$real_cat" -- "\$1") || exit 1
+  pre=\${stat%) *}
+  rest=\${stat##*) }
+  read -r -a fields <<<"\$rest"
+  fields[19]=\$((fields[19] + 1))
+  printf '%s) %s\n' "\$pre" "\${fields[*]}"
+  exit 0
+fi
+exec "$real_cat" "\$@"
+SHIM
+  chmod +x "$reread_shim/tr" "$reread_shim/cat"
+  rm -f "$reread_flag"
+  : >"$stub_dir/calls"
+  out=$(sv PATH="$reread_shim:$PATH" SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"changed while it was being verified"* ]] && [ -e "$reread_flag" ] &&
+    is_alive "$reread_pid" && ! grep -qx quit "$stub_dir/calls" 2>/dev/null; then
+    ok "a forced stop refuses when the endpoint pid's start time changes during verification, with no quit (refused: changed while it was being verified)"
+  else
+    bad "the re-read did not refuse a changed endpoint pid before any quit (exit $st, verified-env reached: $([ -e "$reread_flag" ] && echo yes || echo no))"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "re-read fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
 
 echo "== process identity: a verified instance still stops and restarts"
 out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?

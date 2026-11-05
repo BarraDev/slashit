@@ -1129,12 +1129,13 @@ responsibilities:
   each signal, but the instant between that read and `kill(2)` is not closed.
   Bash has no pidfd, so a pid reused within that window is not excluded in
   theory; the window is about a millisecond, and Linux allocates pids
-  sequentially. The re-read that follows the environment check is not forced
-  by any test: reproducing a pid reuse at a chosen moment is not possible
-  without intrusive test hooks, so removing that re-read is not detected by the
-  suite. It is covered by review only. The suite also cannot force a crash
-  between a spawn and its provisional record (see "Failed starts keep
-  ownership"). None of these is a crash-safety guarantee.
+  sequentially. The re-read that follows the environment check is covered by a
+  deterministic case, which needs no pid reuse: PATH shims report a changed
+  start time once the environment has been read. That case shows the re-read
+  refuses before any quit. The window between the re-read and `kill(2)` is not
+  covered, because only a real pid reuse could exercise it. The suite also
+  cannot force a crash between a spawn and its provisional record (see "Failed
+  starts keep ownership"). None of these is a crash-safety guarantee.
 - **Failed starts keep ownership.** `start` writes a provisional launch record
   (`state provisional`, with the child's identity) as soon as the child's pid is
   known, before it waits for readiness. A start that then fails (no answer
@@ -1235,7 +1236,7 @@ recover this automatically.
 ### Validating changes to the mechanism
 
 `scripts/test-supervise-dogfood.sh` exercises the script against stub
-binaries and a stub CLI inside a throwaway directory (121 checks in one clean
+binaries and a stub CLI inside a throwaway directory (122 checks in one clean
 run). It is Linux only, and it runs through `TMPDIR` like any test, so a
 scratch location can be chosen. Its cases cover: start, refusal of a second
 start and of a concurrent lifecycle
@@ -1263,8 +1264,11 @@ signal, with both processes alive.
 
 Every supervisor call in the suite is bounded by a timeout. The suite signals
 only processes it started itself, or the supervisor and stub instance that its
-own fixture carries, and each signal is sent only after the target's start time
-(and, for fixture processes, its fixture marker) is verified. It never matches
+own fixture carries. A disposable process is signaled only while its start time
+still matches the one captured when the harness started it. A stub instance is
+signaled only while its environment carries this run's fixture marker, a unique
+temporary path that only this run's processes carry; for stub instances the
+marker is the ownership check, and no start time is compared. It never matches
 command lines to choose a target: a look-alike process with the supervisor's
 command line survives the crash fixture, and a stale stub pid file that names an
 unrelated process is not signaled. Outside that, the suite writes only to its
@@ -1273,5 +1277,5 @@ own temporary directory.
 Fault injection: each protection removed in a scratch copy was detected by the
 suite (the harness pattern-kill, the endpoint and record disagreement check,
 the `.`/`..` gate, HOME normalization, the Linux guard, and the cleanup
-ownership check). Removing the identity re-read after the environment check
-was not detected; see the limits above.
+ownership check). The identity re-read after the environment check is covered
+by the shim case described above; removing it is detected by that case.
