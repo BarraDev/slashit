@@ -613,7 +613,7 @@ cmd_start() {
   record_state
   case $REC_STATE in
     match) refuse "the process of the last supervised launch (pid $REC_PID) is still alive but does not answer on $ENDPOINT; run \`$SELF status\`, then \`$SELF stop --force\`" ;;
-    unverifiable) refuse "the launch record names pid $REC_PID, but its identity $REC_WHY; a launch will not start beside a process it cannot identify (see \`$SELF status\`)" ;;
+    unverifiable) refuse "the launch record names pid $REC_PID, which $REC_WHY; a launch will not start beside a process it cannot identify (see \`$SELF status\`)" ;;
   esac
 
   # Provenance gates: the CLI first (it verifies the instance), then the binary.
@@ -738,7 +738,7 @@ EOF
   record_state
   case $REC_STATE in
     match) refuse "the process of the last supervised launch (pid $REC_PID) is still alive but does not answer on $ENDPOINT; resolve it (see \`$SELF status\`) before the unit may start" ;;
-    unverifiable) refuse "the launch record names pid $REC_PID, but its identity $REC_WHY; the unit may not start beside a process it cannot identify (see \`$SELF status\`)" ;;
+    unverifiable) refuse "the launch record names pid $REC_PID, which $REC_WHY; the unit may not start beside a process it cannot identify (see \`$SELF status\`)" ;;
   esac
 
   launch_gates
@@ -878,7 +878,7 @@ select_target() {
       return 0
       ;;
     unverifiable)
-      refuse "the launch record names pid $REC_PID, but its identity $REC_WHY, so that pid is not signaled. Check what it is (for example \`ps -o pid,lstart,args -p $REC_PID\`); if it is not the instance, remove the record $RECORD by hand; if it is the instance, end it by hand"
+      refuse "the launch record names pid $REC_PID, which $REC_WHY, so that pid is not signaled. Check what it is (for example \`ps -o pid,lstart,args -p $REC_PID\`); if it is not the instance, remove the record $RECORD by hand; if it is the instance, end it by hand"
       ;;
   esac
   return 1
@@ -982,7 +982,7 @@ _status_record_lines() {
         echo "record:         pid $REC_PID from the last supervised start is STILL ALIVE but does not answer; run \"$SELF stop --force\" if it should be gone"
       fi
       ;;
-    *) echo "record:         pid $REC_PID $REC_WHY; its identity is unverifiable, so the pid is never signaled (see the stop refusal for the recovery steps)" ;;
+    *) echo "record:         pid $REC_PID $REC_WHY, so its identity is unverifiable and the pid is never signaled (see the stop refusal for the recovery steps)" ;;
   esac
 }
 

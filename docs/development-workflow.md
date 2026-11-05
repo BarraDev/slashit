@@ -1090,7 +1090,9 @@ responsibilities:
 - **Process identity before any signal.** A pid written in the launch record
   is never signaled on its own. `start` and `run` record the instance's boot
   id and start time (`/proc/<pid>/stat`, field 22), and a stop or restart
-  signals a process only while both still match. `stop --force` escalates to
+  signals a process only while both still match; when no record names a pid
+  and the endpoint answers, the answering pid is taken and identified at stop
+  time instead. `stop --force` escalates to
   SIGTERM and then SIGKILL, and only to that verified process. A record that
   names a pid whose identity is missing, malformed or unreadable is refused,
   never signaled; a record that names a pid now held by a different process
@@ -1102,7 +1104,7 @@ responsibilities:
   by hand; if it is the instance, end it by hand. Limitation: the identity is
   re-read immediately before each signal, but the instant between that read and
   `kill(2)` is not closed. Bash has no pidfd, so a pid reused within that window
-  is not excluded in theory; the window is microseconds, and Linux allocates
+  is not excluded in theory; the window is about a millisecond, and Linux allocates
   pids sequentially.
 - **Backup before any restart.** `restart` stops the instance over the
   control channel (so it can end its terminals cleanly; `stop --force`
