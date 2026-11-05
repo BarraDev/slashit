@@ -11,16 +11,17 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=62
+EXPECTED_TOTAL=80
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sup="$root/scripts/supervise-dogfood.sh"
 [ -f "$sup" ] || { echo "FAIL $sup is missing" >&2; exit 1; }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/supervise-dogfood-test.XXXXXX")
-trap 'cleanup_instances; rm -rf "$work"' EXIT
+trap 'cleanup_instances; for p in ${foreign_pids[@]+"${foreign_pids[@]}"}; do kill -9 "$p" 2>/dev/null || true; done; rm -rf "$work"' EXIT
 
 passed=0
+foreign_pids=()
 failed=0
 
 ok() {
@@ -82,7 +83,7 @@ if [ "${SLASHIT_TEST_STUB_ROLE:-quit}" = quit ]; then
   done
   rm -f "$stub_dir/quit" "$stub_dir/pid" "$SLASHIT_TEST_SOCKET"
 else
-  sleep 300
+  exec sleep 300
 fi
 exit 0
 STUB
@@ -767,6 +768,173 @@ if [ "$st" -eq 0 ] && [ -n "$running_pid" ]; then
   fi
 else
   bad "restart fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== process identity: a launch record alone never authorizes a signal"
+# Foreign processes are disposable `sleep` children of this test. The EXIT trap
+# kills any that remain; no case signals a pid this test did not start itself.
+is_alive() { # pid: exists and has not exited (a zombie has exited)
+  local stat rest
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  rest=${stat##*) }
+  case $rest in Z | "Z "*) return 1 ;; esac
+  return 0
+}
+proc_start() { # pid -> starttime (field 22 of /proc/<pid>/stat)
+  local stat rest
+  stat=$(cat "/proc/$1/stat") || return 1
+  rest=${stat##*) }
+  set -- $rest
+  printf '%s\n' "${20}"
+}
+boot_id_now=$(cat /proc/sys/kernel/random/boot_id)
+record_file="$state/supervisor/instance"
+expect_refused_alive() { # label output status reason pid
+  local label=$1 out=$2 st=$3 reason=$4 pid=$5
+  if [ "$st" -eq 1 ] && [[ "$out" == *"$reason"* ]] && is_alive "$pid"; then
+    ok "$label (refused: $reason; pid $pid still alive)"
+  else
+    bad "$label: expected exit 1 with '$reason' and pid $pid alive, exited $st alive=$(is_alive "$pid" && echo yes || echo no)"
+    printf '%s\n' "$out" >&2
+  fi
+}
+
+sleep 300 &
+foreign_pid=$!
+foreign_pids+=("$foreign_pid")
+foreign_start=$(proc_start "$foreign_pid")
+
+# A stale record that names the unrelated live pid, with the identity of an
+# instance that no longer exists (a different start time).
+printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$foreign_pid" "$boot_id_now" 1 >"$record_file"
+out=$(sv stop 2>&1); st=$?
+expect_refused_alive "a stop refuses a stale record that names an unrelated live pid" "$out" "$st" "now belongs to a different process" "$foreign_pid"
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+expect_refused_alive "a forced stop refuses that foreign pid and signals nothing" "$out" "$st" "now belongs to a different process" "$foreign_pid"
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 restart --force 2>&1); st=$?
+expect_refused_alive "a forced restart refuses that foreign pid and stops nothing" "$out" "$st" "now belongs to a different process" "$foreign_pid"
+
+# The pid is alive and in this boot, but the start time differs by one tick.
+printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$foreign_pid" "$boot_id_now" $((foreign_start + 1)) >"$record_file"
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+expect_refused_alive "a live pid with a mismatched start time is not signaled" "$out" "$st" "now belongs to a different process" "$foreign_pid"
+
+# The same pid recorded under a previous boot: its process cannot still exist.
+printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$foreign_pid" "00000000-0000-0000-0000-000000000000" "$foreign_start" >"$record_file"
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+expect_refused_alive "a record from a previous boot is not signaled" "$out" "$st" "now belongs to a different process" "$foreign_pid"
+
+# Missing identity: the record names a live pid but proves nothing about it.
+printf 'pid\t%s\n' "$foreign_pid" >"$record_file"
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+expect_refused_alive "a record without process identity is refused under --force" "$out" "$st" "has no recorded process identity" "$foreign_pid"
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 restart --force 2>&1); st=$?
+expect_refused_alive "a forced restart refuses a record without process identity" "$out" "$st" "has no recorded process identity" "$foreign_pid"
+
+# Malformed identity: a start time that is not a number.
+printf 'pid\t%s\nboot_id\t%s\nstart_ticks\tabc\n' "$foreign_pid" "$boot_id_now" >"$record_file"
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+expect_refused_alive "a record with a malformed start time is refused under --force" "$out" "$st" "has a malformed process identity" "$foreign_pid"
+
+# Malformed pid: not a number at all.
+printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "12x" "$boot_id_now" "$foreign_start" >"$record_file"
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+expect_refused_alive "a record with a non-numeric pid is refused under --force" "$out" "$st" "is not a valid pid" "$foreign_pid"
+
+# A status over the same stale record must not call the foreign pid the instance.
+printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$foreign_pid" "$boot_id_now" 1 >"$record_file"
+out=$(sv status 2>&1); st=$?
+if [[ "$out" == *"stale (it names pid $foreign_pid, which now belongs to a different process)"* ]] && [[ "$out" != *"STILL ALIVE"* ]] && is_alive "$foreign_pid"; then
+  ok "status reports a reused pid as stale, not as the still-running instance"
+else
+  bad "status misreported a reused pid (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+# Positive control: the same process, with its verified identity, IS signaled.
+# This proves the refusals above come from the identity check, not from a
+# supervisor that never signals a recorded pid.
+sleep 300 &
+control_pid=$!
+control_start=$(proc_start "$control_pid")
+printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$control_pid" "$boot_id_now" "$control_start" >"$record_file"
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+wait "$control_pid" 2>/dev/null
+if [ "$st" -eq 0 ] && [[ "$out" == *"ended after signal escalation"* ]] && ! is_alive "$control_pid"; then
+  ok "a forced stop of a pid whose recorded identity matches is signaled and ends it"
+else
+  bad "the identity-verified control was not stopped (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+echo "== process identity: an endpoint that disagrees with the launch record"
+cleanup_instances
+out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+live_instance=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$live_instance" ]; then
+  printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$foreign_pid" "$boot_id_now" "$foreign_start" >"$record_file"
+  out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"the endpoint is served by pid $live_instance"* ]] && is_alive "$foreign_pid" && is_alive "$live_instance"; then
+    ok "a forced stop refuses when the endpoint and the record disagree; both processes survive"
+  else
+    bad "a disagreeing endpoint was not refused with both processes alive (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "disagreement fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+rm -f "$record_file"
+
+echo "== process identity: a verified instance still stops and restarts"
+out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+first_pid=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$first_pid" ] && grep -q "^boot_id	$boot_id_now\$" "$record_file" && grep -q "^start_ticks	" "$record_file"; then
+  ok "start records the verified identity (boot id and start time) of the launched instance"
+else
+  bad "start did not record the process identity (exit $st)"; printf '%s\n' "$out" >&2
+fi
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 restart --force 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"ended after signal escalation"* ]] && ! is_alive "$first_pid" &&
+  [[ "$out" == *"the endpoint path"*"nothing could be verified"* ]]; then
+  ok "a forced restart ends only the verified instance, then refuses to start over the socket its forced stop left"
+else
+  bad "forced restart of the verified instance did not end it and refuse the stale endpoint (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== process identity: recovery after the recorded instance has exited"
+out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+dead_instance=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$dead_instance" ]; then
+  kill -9 "$dead_instance" 2>/dev/null
+  for _ in $(seq 1 50); do is_alive "$dead_instance" || break; sleep 0.1; done
+  out=$(sv status 2>&1); st=$?
+  if [ "$st" -eq 3 ] && [[ "$out" == *"stale (it names pid $dead_instance"* ]]; then
+    ok "status after an unexpected exit reports the record as stale and the endpoint as unverifiable"
+  else
+    bad "status after an unexpected exit (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+  out=$(sv stop 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"nothing found to operate on"* ]] && [[ "$out" == *"so it is not signaled"* ]]; then
+    ok "stop after an unexpected exit has nothing to signal and refuses"
+  else
+    bad "stop after an unexpected exit did not refuse with nothing to signal (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+  out=$(sv start 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"the endpoint path"* ]] && [[ "$out" == *"nothing could be verified"* ]]; then
+    ok "start refuses while the stale endpoint path is unverified (the documented manual step)"
+  else
+    bad "start did not refuse the unverified endpoint path (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+  rm -f "$socket"
+  out=$(sv start 2>&1); st=$?
+  new_instance=$(stub_pid)
+  if [ "$st" -eq 0 ] && [ -n "$new_instance" ] && [ "$new_instance" != "$dead_instance" ]; then
+    ok "after the stale endpoint is removed by hand, start launches a new identified instance"
+  else
+    bad "start did not recover after the manual endpoint removal (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "recovery fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
 fi
 cleanup_instances
 

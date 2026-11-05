@@ -1047,7 +1047,7 @@ defaults derived from `HOME`:
 | `XDG_DATA_HOME` | `~/.local/state/slashit-dogfood/data` | isolated project data; the dogfood development checkout and its task worktrees live under here |
 | `XDG_CACHE_HOME` | `~/.local/state/slashit-dogfood/cache` | regenerable caches |
 | `XDG_STATE_HOME` | `~/.local/state/slashit-dogfood` | isolated state home |
-| `XDG_RUNTIME_DIR` | `/run/user/<uid>/slashit-dogfood` | isolated socket and PID file: `/run/user/<uid>/slashit-app/slashit.sock` is this instance's control endpoint |
+| `XDG_RUNTIME_DIR` | `/run/user/<uid>/slashit-dogfood` | isolated socket and PID file: `/run/user/<uid>/slashit-dogfood/slashit-app/slashit.sock` is this instance's control endpoint |
 | `GH_CONFIG_DIR` | `~/.config/gh` | real GitHub credentials, deliberately shared |
 | `HOME` | the real home | the desktop session's display and PATH flow through unchanged |
 
@@ -1087,6 +1087,23 @@ responsibilities:
 - **Endpoint verification.** `start` and `verify` confirm the instance
   through `slashit --endpoint ... ping`, including that the answering PID and
   endpoint are the declared ones.
+- **Process identity before any signal.** A pid written in the launch record
+  is never signaled on its own. `start` and `run` record the instance's boot
+  id and start time (`/proc/<pid>/stat`, field 22), and a stop or restart
+  signals a process only while both still match. `stop --force` escalates to
+  SIGTERM and then SIGKILL, and only to that verified process. A record that
+  names a pid whose identity is missing, malformed or unreadable is refused,
+  never signaled; a record that names a pid now held by a different process
+  (or left over from a previous boot) is reported as stale and is not
+  signaled. When the endpoint answers with a pid that differs from the record,
+  nothing is signaled. Operator recovery for a refused record: inspect the pid
+  (for example `ps -o pid,lstart,args -p <pid>`); if it is not the instance,
+  remove the record file `~/.local/state/slashit-dogfood/supervisor/instance`
+  by hand; if it is the instance, end it by hand. Limitation: the identity is
+  re-read immediately before each signal, but the instant between that read and
+  `kill(2)` is not closed. Bash has no pidfd, so a pid reused within that window
+  is not excluded in theory; the window is microseconds, and Linux allocates
+  pids sequentially.
 - **Backup before any restart.** `restart` stops the instance over the
   control channel (so it can end its terminals cleanly; `stop --force`
   escalates to SIGTERM and SIGKILL and does not run that shutdown), then it
@@ -1132,12 +1149,16 @@ unchanged.
 ### Validating changes to the mechanism
 
 `scripts/test-supervise-dogfood.sh` exercises the script against stub
-binaries and a stub CLI inside a throwaway directory (33 checks in one clean
+binaries and a stub CLI inside a throwaway directory (80 checks in one clean
 run): start, refusal of a second start and of a concurrent lifecycle
 operation, the `run` entry point's duplicate and ambient-environment
 refusals, truthful cannot-verify reporting when the CLI is absent, refusing
 default XDG values, the process-environment check, the binary and CLI
 provenance gates, `status` and `stop`, the `--force` escalation, the
 controlled restart with a checksum-verified backup over exactly the compared
-snapshot set, and a caught state divergence. It touches nothing outside its
+snapshot set, and a caught state divergence. The process-identity cases use
+disposable `sleep` processes as unrelated live pids: stale, mismatched,
+previous-boot, missing, malformed and endpoint-disagreeing records must refuse
+with their stated reason and leave the unrelated pid alive, and one
+identity-matched control must still be stopped. It touches nothing outside its
 own temporary directory.

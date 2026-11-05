@@ -46,7 +46,10 @@
 #   scripts/supervise-dogfood.sh stop [--force]
 #       Ask the instance to shut down over the control channel (graceful, and
 #       the only path that lets it end its terminals cleanly), then wait. If
-#       it is still running, --force escalates: SIGTERM, then SIGKILL.
+#       it is still running, --force escalates: SIGTERM, then SIGKILL. A signal
+#       is sent only to a process whose identity (boot id and start time) is
+#       the one verified for the target; a pid named by the launch record alone
+#       is never signaled, and neither is one the endpoint disagrees with.
 #
 #   scripts/supervise-dogfood.sh restart [--force]
 #       The controlled restart: stop, take a state backup under
@@ -112,8 +115,9 @@
 #      different endpoint, or a live process that does not answer).
 #   2  usage error.
 #   3  unverifiable: the CLI is missing or does not answer, the control channel
-#      did not answer within SLASHIT_DOGFOOD_CLI_TIMEOUT, or the live process
-#      environment cannot be read. Nothing is claimed about the instance.
+#      did not answer within SLASHIT_DOGFOOD_CLI_TIMEOUT, the live process
+#      environment cannot be read, or a live launch-record pid has no verifiable
+#      identity. Nothing is claimed about the instance.
 #   4  environment mismatch: a live instance whose process environment differs
 #      from the declared XDG_* and GH_CONFIG_DIR values. Do not trust its writes.
 
@@ -341,6 +345,104 @@ record_field() {
   awk -F '\t' -v key="$1" '$1 == key { print $2 }' "$RECORD" | head -n 1
 }
 
+# Process identity. A pid is a number the kernel reuses, so a pid written in the
+# launch record proves nothing by itself: the process holding it may have exited
+# and been replaced. A process is the recorded one only when both its boot id
+# and its start time (field 22 of /proc/<pid>/stat, in clock ticks since boot)
+# still match what was captured at launch. Same boot and same start time is the
+# same process; any other process at that pid is not the instance.
+proc_identity() { # pid -> "BOOT_ID START_TICKS"; fails when unreadable
+  local stat rest boot
+  local -a fields=()
+  [ -r "/proc/$1/stat" ] || return 1
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  rest=${stat##*) } # past the comm field, which may itself hold spaces
+  read -r -a fields <<<"$rest"
+  # rest begins at field 3 (state), so starttime (field 22) is element 19.
+  [ -n "${fields[19]:-}" ] || return 1
+  boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) && [ -n "$boot" ] || return 1
+  printf '%s %s\n' "$boot" "${fields[19]}"
+}
+
+# True when the process has exited but not yet been reaped: it is no longer a
+# live instance, whatever its pid entry still says.
+proc_zombie() { # pid
+  local stat rest
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  rest=${stat##*) }
+  case $rest in Z | "Z "*) return 0 ;; esac
+  return 1
+}
+
+# The launch record's pid, classified without signaling anything. REC_STATE is:
+#   none          no record, or no pid in it
+#   gone          provably not the recorded process: no such pid, a previous
+#                 boot, or the pid now held by a different process
+#   match         the recorded process is alive and its identity matches
+#   unverifiable  a live pid whose identity cannot be proven (missing, malformed
+#                 or unreadable); fails closed, so it is never signaled
+# REC_WHY completes the sentence "pid N ... " in messages about the record.
+REC_STATE= REC_PID= REC_ID= REC_WHY=
+record_state() {
+  REC_STATE=none REC_PID= REC_ID= REC_WHY=
+  REC_PID=$(record_field pid || true)
+  [ -n "$REC_PID" ] || return 0
+  case $REC_PID in
+    *[!0-9]*) REC_STATE=unverifiable REC_WHY="is not a valid pid"; return 0 ;;
+  esac
+  if [ ! -d "/proc/$REC_PID" ]; then
+    REC_STATE=gone REC_WHY="is gone"
+    return 0
+  fi
+  if proc_zombie "$REC_PID"; then
+    REC_STATE=gone REC_WHY="has exited"
+    return 0
+  fi
+  local boot start now
+  boot=$(record_field boot_id || true)
+  start=$(record_field start_ticks || true)
+  if [ -z "$boot" ] || [ -z "$start" ]; then
+    REC_STATE=unverifiable REC_WHY="has no recorded process identity"
+    return 0
+  fi
+  case $boot$start in
+    *[!0-9a-f-]*) REC_STATE=unverifiable REC_WHY="has a malformed process identity"; return 0 ;;
+  esac
+  case $start in
+    *[!0-9]*) REC_STATE=unverifiable REC_WHY="has a malformed process identity"; return 0 ;;
+  esac
+  REC_ID="$boot $start"
+  now=$(proc_identity "$REC_PID") ||
+    { REC_STATE=unverifiable REC_WHY="cannot be read from /proc"; return 0; }
+  if [ "$now" = "$REC_ID" ]; then
+    REC_STATE=match
+  else
+    REC_STATE=gone REC_WHY="now belongs to a different process"
+  fi
+}
+
+# The one process a stop or restart may signal, fixed by select_target before
+# any signal exists. target_state re-reads its identity: same | other | absent |
+# unknown. A signal is sent only in state same.
+TARGET_PID= TARGET_ID= ENDPOINT_UP=0
+target_state() {
+  if [ -z "$TARGET_PID" ] || [ ! -d "/proc/$TARGET_PID" ] || proc_zombie "$TARGET_PID"; then
+    echo absent
+    return 0
+  fi
+  local now
+  now=$(proc_identity "$TARGET_PID") || { echo unknown; return 0; }
+  if [ "$now" = "$TARGET_ID" ]; then echo same; else echo other; fi
+}
+
+# The only direct signal this script sends to a process. It re-verifies the
+# identity immediately before delivery. The residual window between that check
+# and kill(2) is documented in docs/development-workflow.md (section 19).
+signal_target() { # SIGNAL
+  [ "$(target_state)" = same ] || return 1
+  kill -"$1" "$TARGET_PID" 2>/dev/null
+}
+
 # Provenance: the commit of the checkout the binary was built in, resolved
 # through that checkout's own .git. The value is recorded at launch time.
 binary_commit() {
@@ -506,11 +608,11 @@ cmd_start() {
   elif [ "$PING_TIMED_OUT" = 1 ] || [ -e "$SOCKET" ]; then
     refuse "the endpoint path $SOCKET exists but nothing could be verified on it ($(verification_state_text)); the socket file may be stale or the endpoint may be alive without a verified CLI — run \`$SELF status\` and resolve that before starting anything"
   fi
-  local rec
-  rec=$(record_field pid || true)
-  if _process_alive "$rec"; then
-    refuse "the process of the last supervised launch (pid $rec) is still alive but does not answer on $ENDPOINT; run \`$SELF status\`, then \`$SELF stop --force\`"
-  fi
+  record_state
+  case $REC_STATE in
+    match) refuse "the process of the last supervised launch (pid $REC_PID) is still alive but does not answer on $ENDPOINT; run \`$SELF status\`, then \`$SELF stop --force\`" ;;
+    unverifiable) refuse "the launch record names pid $REC_PID, but its identity $REC_WHY; a launch will not start beside a process it cannot identify (see \`$SELF status\`)" ;;
+  esac
 
   # Provenance gates: the CLI first (it verifies the instance), then the binary.
   launch_gates
@@ -578,6 +680,11 @@ cmd_start() {
   local commit=unknown
   commit=$(binary_commit "$(dirname "$BINARY")" 2>/dev/null) || commit=unknown
 
+  # The identity is captured while the verified child is alive. If it cannot be
+  # read, the record is still written, and it fails closed for any later signal.
+  local ident
+  ident=$(proc_identity "$child") || { ident=; note "warning: the identity of pid $child cannot be read; the record cannot authorize a signal later"; }
+
   {
     printf 'pid\t%s\n' "$child"
     printf 'binary\t%s\n' "$BINARY"
@@ -585,6 +692,7 @@ cmd_start() {
     printf 'version\t%s\n' "$version_line"
     printf 'endpoint\t%s\n' "$ENDPOINT"
     printf 'started_at\t%s\n' "$(date -u +%FT%TZ)"
+    [ -z "$ident" ] || printf 'boot_id\t%s\nstart_ticks\t%s\n' "${ident% *}" "${ident#* }"
   } >"$RECORD"
 
   note "started pid $child ($version_line, commit ${commit:0:12}) on $ENDPOINT"
@@ -625,11 +733,11 @@ EOF
   elif [ "$PING_TIMED_OUT" = 1 ] || [ -e "$SOCKET" ]; then
     refuse "the endpoint path $SOCKET exists but nothing could be verified on it ($(verification_state_text)); resolve that (see \`$SELF status\`) before the unit may start"
   fi
-  local rec
-  rec=$(record_field pid || true)
-  if _process_alive "$rec"; then
-    refuse "the process of the last supervised launch (pid $rec) is still alive but does not answer on $ENDPOINT; resolve it (see \`$SELF status\`) before the unit may start"
-  fi
+  record_state
+  case $REC_STATE in
+    match) refuse "the process of the last supervised launch (pid $REC_PID) is still alive but does not answer on $ENDPOINT; resolve it (see \`$SELF status\`) before the unit may start" ;;
+    unverifiable) refuse "the launch record names pid $REC_PID, but its identity $REC_WHY; the unit may not start beside a process it cannot identify (see \`$SELF status\`)" ;;
+  esac
 
   launch_gates
 
@@ -649,7 +757,10 @@ EOF
     printf 'GH_CONFIG_DIR=%s\n' "$GH_CONFIG"
   } >>"$INSTANCE_LOG" 2>/dev/null
 
-  # Same PID serves the socket after exec, so the record stays meaningful.
+  # Same PID serves the socket after exec, and exec keeps the start time, so the
+  # identity captured here is still the instance's once the binary runs.
+  local ident
+  ident=$(proc_identity "$$") || { ident=; note "warning: the identity of pid $$ cannot be read; the record cannot authorize a signal later"; }
   {
     printf 'pid\t%s\n' "$$"
     printf 'binary\t%s\n' "$BINARY"
@@ -657,6 +768,7 @@ EOF
     printf 'version\t%s\n' "$version_line"
     printf 'endpoint\t%s\n' "$ENDPOINT"
     printf 'started_at\t%s\n' "$(date -u +%FT%TZ)"
+    [ -z "$ident" ] || printf 'boot_id\t%s\nstart_ticks\t%s\n' "${ident% *}" "${ident#* }"
   } >"$RECORD"
 
   note "exec $BINARY ($version_line, commit ${commit:0:12}) in the foreground as pid $$; the service manager owns this process"
@@ -673,14 +785,10 @@ EOF
 }
 
 cmd_stop() {
-  local pid=""
-  _live_pid && pid=$LIVE_PID
-  if [ -z "$pid" ]; then
-    fail "$(nothing_reachable_text) — nothing to stop"
-  fi
-  local graceful=1
-  if ping_fields; then
-    if [ -z "$(record_field pid || true)" ]; then
+  select_target || fail "$(nothing_reachable_text) — nothing to stop"
+  local pid=$TARGET_PID graceful=1
+  if [ "$ENDPOINT_UP" = 1 ]; then
+    if [ -z "$REC_PID" ]; then
       note "note: pid $pid was not started by this supervisor; stopping it anyway"
     fi
     if ! timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" quit >/dev/null 2>&1; then
@@ -704,28 +812,34 @@ cmd_stop() {
   local wait_s=$STOP_TIMEOUT
   [ "$graceful" -eq 1 ] || wait_s=0
   local deadline=$((SECONDS + wait_s))
-  while _process_alive "$pid" && [ "$SECONDS" -lt "$deadline" ]; do
+  while [ "$(target_state)" = same ] && [ "$SECONDS" -lt "$deadline" ]; do
     sleep 0.25
   done
 
-  if _process_alive "$pid" && [ "$force" -eq 0 ]; then
+  if [ "$(target_state)" = same ] && [ "$force" -eq 0 ]; then
     refuse "pid $pid did not stop within ${STOP_TIMEOUT}s of \`slashit quit\`; it may be waiting on a shutdown confirmation (agents or terminals still running). Rerun with --force to SIGTERM/SIGKILL it"
   fi
 
-  if _process_alive "$pid"; then
-    kill -TERM "$pid" 2>/dev/null || true
+  if [ "$(target_state)" = same ]; then
+    signal_target TERM
     deadline=$((SECONDS + FORCE_TIMEOUT))
-    while _process_alive "$pid" && [ "$SECONDS" -lt "$deadline" ]; do
+    while [ "$(target_state)" = same ] && [ "$SECONDS" -lt "$deadline" ]; do
       sleep 0.25
     done
-    if _process_alive "$pid"; then
-      kill -KILL "$pid" 2>/dev/null || true
+    if [ "$(target_state)" = same ]; then
+      signal_target KILL
       sleep 0.5
-      _process_alive "$pid" && fail "pid $pid survived SIGKILL; investigate manually"
+      [ "$(target_state)" = same ] && fail "pid $pid survived SIGKILL; investigate manually"
     fi
+    [ "$(target_state)" = unknown ] &&
+      fail "pid $pid cannot be verified after SIGTERM; no further signal was sent"
     note "pid $pid ended after signal escalation; a raw SIGTERM/SIGKILL does not run the application's shutdown (terminals may outlive it)"
   else
-    note "pid $pid stopped gracefully"
+    case $(target_state) in
+      absent) note "pid $pid stopped gracefully" ;;
+      other) note "pid $pid has exited, and its pid now belongs to a different process, which was not signaled" ;;
+      *) fail "pid $pid cannot be verified as stopped; no signal was sent" ;;
+    esac
   fi
   # The path may have been replaced after the recorded process exited. There
   # is no race-free way here to prove which process owns it, so never unlink it.
@@ -735,24 +849,44 @@ cmd_stop() {
   rm -f "$RECORD"
 }
 
-# Sets LIVE_PID to the pid answering on the endpoint, or else the live pid of
-# the last supervised launch, and returns 0 when there is one. It runs in the
-# caller's shell (no command substitution), so PING_TIMED_OUT from its ping
-# reaches the caller's refusal text.
-_live_pid() {
-  LIVE_PID=
+# Chooses the process a stop or restart may act on, before any signal exists.
+# A control-channel answer is the instance's own claim of its pid and is
+# accepted only when the launch record, if it names a pid, names the same one.
+# Otherwise the record is the claim, and it is accepted only when its identity
+# matches. Sets TARGET_PID and TARGET_ID and returns 0; returns 1 when there is
+# nothing to act on; refuses (exit 1) when the evidence disagrees or cannot be
+# verified. It runs in the caller's shell, so ENDPOINT_UP and PING_TIMED_OUT
+# reach the caller.
+select_target() {
+  TARGET_PID= TARGET_ID= ENDPOINT_UP=0
+  record_state
   if ping_fields; then
-    LIVE_PID=$PING_PID
+    ENDPOINT_UP=1
+    if [ -n "$REC_PID" ] && [ "$REC_PID" != "$PING_PID" ]; then
+      refuse "the endpoint is served by pid $PING_PID, but the launch record names pid $REC_PID; nothing is signaled while the two disagree (see \`$SELF status\`)"
+    fi
+    TARGET_PID=$PING_PID
+    TARGET_ID=$(proc_identity "$PING_PID") ||
+      refuse "pid $PING_PID answers on $ENDPOINT, but its process identity cannot be read; nothing is signaled"
     return 0
   fi
-  local rec
-  rec=$(record_field pid) || return 1
-  _process_alive "$rec" && LIVE_PID=$rec
-  [ -n "$LIVE_PID" ]
+  case $REC_STATE in
+    match)
+      TARGET_PID=$REC_PID TARGET_ID=$REC_ID
+      return 0
+      ;;
+    unverifiable)
+      refuse "the launch record names pid $REC_PID, but its identity $REC_WHY, so that pid is not signaled. Check what it is (for example \`ps -o pid,lstart,args -p $REC_PID\`); if it is not the instance, remove the record $RECORD by hand; if it is the instance, end it by hand"
+      ;;
+  esac
+  return 1
 }
 
 nothing_reachable_text() {
   local msg="nothing found to operate on: no instance answers on $ENDPOINT and the last supervised launch is not alive"
+  if [ "$REC_STATE" = gone ]; then
+    msg="$msg (the launch record's pid $REC_PID $REC_WHY, so it is not signaled)"
+  fi
   [ -e "$SOCKET" ] && msg="$msg (the endpoint path $SOCKET exists but is unverified: investigate it first)"
   if [ "$PING_TIMED_OUT" = 1 ]; then
     msg="cannot verify: the control channel did not answer within ${CLI_TIMEOUT}s on $ENDPOINT, so the instance is not known to be absent"
@@ -799,12 +933,9 @@ write_backup() {
 }
 
 cmd_restart() {
-  local pid=""
-  _live_pid && pid=$LIVE_PID
-  if [ -z "$pid" ]; then
-    fail "$(nothing_reachable_text) — nothing to restart"
-  fi
-  if ! ping_fields; then
+  select_target || fail "$(nothing_reachable_text) — nothing to restart"
+  local pid=$TARGET_PID
+  if [ "$ENDPOINT_UP" != 1 ]; then
     note "warning: pid $pid does not answer on $ENDPOINT; the backup and the restart proceed from state on disk"
   fi
   # Refuse before anything is stopped when the protected state cannot be proven
@@ -835,23 +966,22 @@ cmd_restart() {
   note "verified: state files are checksum-identical before and after the restart"
 }
 
-# The record part of the non-running status branch. mode: stopped or
-# cannot-verify — the text stays truthful about what we could check.
+# The record part of the non-running status branch, from record_state. mode:
+# stopped or cannot-verify — the text stays truthful about what we could check.
 _status_record_lines() {
-  local rec=$2 mode=$1
-  if [ -n "$rec" ]; then
-    if _process_alive "$rec"; then
+  local mode=$1
+  case $REC_STATE in
+    none) echo "record:         none" ;;
+    gone) echo "record:         stale (it names pid $REC_PID, which $REC_WHY)" ;;
+    match)
       if [ "$mode" = cannot-verify ]; then
-        echo "record:         pid $rec from the last supervised start is STILL ALIVE; whether it answers on the endpoint is not verifiable (no CLI)"
+        echo "record:         pid $REC_PID from the last supervised start is STILL ALIVE; whether it answers on the endpoint is not verifiable (no CLI)"
       else
-        echo "record:         pid $rec from the last supervised start is STILL ALIVE but does not answer; run \"$SELF stop --force\" if it should be gone"
+        echo "record:         pid $REC_PID from the last supervised start is STILL ALIVE but does not answer; run \"$SELF stop --force\" if it should be gone"
       fi
-    else
-      echo "record:         stale (it names pid $rec, which is gone)"
-    fi
-  else
-    echo "record:         none"
-  fi
+      ;;
+    *) echo "record:         pid $REC_PID $REC_WHY; its identity is unverifiable, so the pid is never signaled (see the stop refusal for the recovery steps)" ;;
+  esac
 }
 
 # Exit with a documented code (see "Exit status" at the top) and say why.
@@ -864,7 +994,8 @@ exit_with() { # code, message...
 
 cmd_status() {
   local rec code=0 unverifiable
-  rec=$(record_field pid || true)
+  record_state
+  rec=$REC_PID
 
   if ping_fields; then
     echo "instance:       running (pid $PING_PID, mode $PING_MODE, version $PING_VERSION)"
@@ -909,17 +1040,19 @@ cmd_status() {
         unverifiable="cannot verify (the endpoint path $SOCKET exists, but nothing verified answers on it)"
       fi
       echo "instance:       $unverifiable — the endpoint was not checked, so nothing is claimed about it either way"
-      _status_record_lines cannot-verify "$rec"
+      _status_record_lines cannot-verify
       echo "control channel: $unverifiable"
       code=3
     else
       echo "instance:       stopped"
-      _status_record_lines stopped "$rec"
+      _status_record_lines stopped
       echo "control channel: idle"
-      # A live process that does not answer is not "stopped".
-      if [ -n "$rec" ] && _process_alive "$rec"; then
-        code=1
-      fi
+      # A live process that does not answer is not "stopped", and a live pid
+      # whose identity is unverifiable is not claimed either way.
+      case $REC_STATE in
+        match) code=1 ;;
+        unverifiable) code=3 ;;
+      esac
     fi
     echo "endpoint:       $ENDPOINT"
     echo "binary:         ${BINARY:-"unresolved (set SLASHIT_DOGFOOD_BINARY)"}"
