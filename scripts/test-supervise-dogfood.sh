@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=58
+EXPECTED_TOTAL=62
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sup="$root/scripts/supervise-dogfood.sh"
@@ -658,23 +658,42 @@ else
 fi
 cleanup_instances
 
-echo "== a forced stop leaves no stale socket, so the next start succeeds"
+echo "== a forced stop leaves ambiguous endpoint cleanup to the owner"
 out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
 forced_pid=$(stub_pid)
 if [ "$st" -eq 0 ] && [ -n "$forced_pid" ]; then
   out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
-  if [ "$st" -eq 0 ] && ! kill -0 "$forced_pid" 2>/dev/null && [ ! -e "$socket" ]; then
+  if [ "$st" -eq 0 ] && ! kill -0 "$forced_pid" 2>/dev/null && [ -e "$socket" ] &&
+    [[ "$out" == *"left endpoint path $socket in place"* ]]; then
     out=$(sv start 2>&1); st=$?
-    if [ "$st" -eq 0 ]; then
-      ok "after a forced stop the socket is gone and the next start succeeds"
+    if [ "$st" -eq 1 ] && [[ "$out" == *"endpoint path $socket exists"* ]] && [ -e "$socket" ]; then
+      ok "after forced stop, the ambiguous endpoint is preserved and start refuses with cleanup guidance"
     else
-      bad "the start after a forced stop was refused (exit $st)"; printf '%s\n' "$out" >&2
+      bad "start did not fail closed on the preserved endpoint (exit $st)"; printf '%s\n' "$out" >&2
     fi
   else
-    bad "stop --force did not end the instance cleanly, or left its socket (exit $st)"; printf '%s\n' "$out" >&2
+    bad "stop --force did not end the instance and preserve the endpoint with guidance (exit $st)"; printf '%s\n' "$out" >&2
   fi
 else
   bad "forced-stop fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== a replacement endpoint is never unlinked after the recorded process exits"
+out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+foreign_pid=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$foreign_pid" ]; then
+  printf 'foreign listener replacement\n' >"$socket"
+  out=$(sv SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+  if [ "$st" -eq 0 ] && ! kill -0 "$foreign_pid" 2>/dev/null &&
+    [ "$(cat "$socket" 2>/dev/null)" = 'foreign listener replacement' ] &&
+    [[ "$out" == *"left endpoint path $socket in place"* ]]; then
+    ok "a foreign replacement at the endpoint survives stop and is reported for manual inspection"
+  else
+    bad "stop removed or failed to diagnose the replacement endpoint (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "replacement-endpoint fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
 fi
 cleanup_instances
 
@@ -701,6 +720,30 @@ if [ "$st" -eq 1 ] && [[ "$out" == *"does not answer --version"* ]] && [[ "$out"
   ok "run refuses a binary whose --version exits nonzero, even when it printed a line"
 else
   bad "run accepted a binary whose --version exits nonzero (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+echo "== run requires a present CLI with a successful, nonempty version"
+out=$(sv SLASHIT_DOGFOOD_CLI= run 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *'no `slashit` CLI is available'* ]] && [[ "$out" != *"exec "* ]]; then
+  ok "run refuses when the provenance CLI is missing"
+else
+  bad "run did not refuse the missing provenance CLI (exit $st)"; printf '%s\n' "$out" >&2
+fi
+printf '#!/usr/bin/env bash\nexit 0\n' >"$work/empty-version-cli"
+chmod +x "$work/empty-version-cli"
+out=$(sv SLASHIT_DOGFOOD_CLI="$work/empty-version-cli" run 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not answer --version"* ]] && [[ "$out" != *"exec "* ]]; then
+  ok "run refuses a CLI whose --version succeeds without version output"
+else
+  bad "run accepted an empty CLI version (exit $st)"; printf '%s\n' "$out" >&2
+fi
+printf '#!/usr/bin/env bash\necho "slashit cli 9.9.9-broken"\nexit 3\n' >"$work/failing-version-cli"
+chmod +x "$work/failing-version-cli"
+out=$(sv SLASHIT_DOGFOOD_CLI="$work/failing-version-cli" run 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not answer --version"* ]] && [[ "$out" != *"exec "* ]]; then
+  ok "run refuses a CLI whose --version prints a line and exits nonzero"
+else
+  bad "run accepted a failing CLI version check (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
 echo "== with no launch record, a control channel that does not answer is still unverifiable, not absent"

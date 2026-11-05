@@ -260,11 +260,12 @@ resolve_cli() {
 cli_state() {
   CLI_STATE=no
   [ -n "$CLI_BIN" ] || return 0
-  if timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --version >/dev/null 2>&1; then
-    CLI_STATE=ready
-  else
+  local version
+  version=$(timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --version 2>/dev/null) || {
     CLI_STATE=broken
-  fi
+    return 0
+  }
+  [ -n "$version" ] && CLI_STATE=ready || CLI_STATE=broken
 }
 
 cannot_verify_text() {
@@ -489,7 +490,6 @@ launch_gates() {
     refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
   version_line=$(printf '%s\n' "$out" | head -n 1)
   [ -n "$version_line" ] || refuse "the binary answers --version with nothing; refusing it: $BINARY"
-  command -v setsid >/dev/null 2>&1 || refuse "setsid is required to detach the instance"
 }
 
 cmd_start() {
@@ -514,6 +514,7 @@ cmd_start() {
 
   # Provenance gates: the CLI first (it verifies the instance), then the binary.
   launch_gates
+  command -v setsid >/dev/null 2>&1 || refuse "setsid is required to detach the instance"
 
   mkdir -p "$STATE_BASE/config" "$STATE_BASE/data" "$STATE_BASE/cache" "$SUP_DIR" 2>/dev/null
   mkdir -p "$RUNTIME_BASE" 2>/dev/null
@@ -630,17 +631,7 @@ EOF
     refuse "the process of the last supervised launch (pid $rec) is still alive but does not answer on $ENDPOINT; resolve it (see \`$SELF status\`) before the unit may start"
   fi
 
-  [ -n "$BINARY" ] ||
-    refuse "the binary location is unresolved: no workspace checkout was found next to this script (set SLASHIT_DOGFOOD_BINARY in the ExecStart environment)"
-  [ -f "$BINARY" ] || refuse "the binary is missing: $BINARY"
-  [ -x "$BINARY" ] || refuse "the binary is not executable: $BINARY"
-  # The call's own status is the gate: a pipeline would report head's status, and
-  # a binary that prints a line and then fails would pass.
-  local version_out
-  version_out=$(timeout -k 2 "$CLI_TIMEOUT" "$BINARY" --version 2>/dev/null) ||
-    refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
-  version_line=$(printf '%s\n' "$version_out" | head -n 1)
-  [ -n "$version_line" ] || refuse "the binary answers --version with nothing; refusing it: $BINARY"
+  launch_gates
 
   mkdir -p "$STATE_BASE/config" "$STATE_BASE/data" "$STATE_BASE/cache" "$SUP_DIR" "$RUNTIME_BASE" 2>/dev/null
   chmod 700 "$STATE_BASE" "$RUNTIME_BASE" 2>/dev/null
@@ -736,12 +727,10 @@ cmd_stop() {
   else
     note "pid $pid stopped gracefully"
   fi
-  # The launch this supervisor recorded has ended, so a socket it left behind
-  # can no longer be held by anyone. Only that socket is removed; a socket the
-  # record does not name stays, and stays unverifiable.
-  if [ -e "$SOCKET" ] && [ "$(record_field pid || true)" = "$pid" ] && ! _process_alive "$pid"; then
-    rm -f "$SOCKET"
-    note "removed the socket left by the launch this supervisor ended"
+  # The path may have been replaced after the recorded process exited. There
+  # is no race-free way here to prove which process owns it, so never unlink it.
+  if [ -e "$SOCKET" ]; then
+    note "left endpoint path $SOCKET in place; verify no process owns it before manually removing it, then retry the requested operation"
   fi
   rm -f "$RECORD"
 }
