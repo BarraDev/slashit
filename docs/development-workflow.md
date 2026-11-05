@@ -1028,3 +1028,84 @@ disable CI or all automatic reviews to save capacity.
 
 SlashIt creates pull requests without a draft option. Until that changes, open
 a PR that needs time in draft form with `gh pr create --draft`.
+
+## 19. The isolated dogfood instance
+
+The dogfood instance is the desktop development build that a maintainer runs
+for SlashIt's own dogfooding. It is deliberately isolated: the owner's real
+application state, and the instance's state, stay apart even though both run
+under the same login.
+
+### The declared environment
+
+The instance always launches with exactly these values, never with XDG
+defaults derived from `HOME`:
+
+| Variable | Value | Why |
+|---|---|---|
+| `XDG_CONFIG_HOME` | `~/.local/state/slashit-dogfood/config` | isolated configuration and secrets |
+| `XDG_DATA_HOME` | `~/.local/state/slashit-dogfood/data` | isolated project data; the dogfood development checkout and its task worktrees live under here |
+| `XDG_CACHE_HOME` | `~/.local/state/slashit-dogfood/cache` | regenerable caches |
+| `XDG_STATE_HOME` | `~/.local/state/slashit-dogfood` | isolated state home |
+| `XDG_RUNTIME_DIR` | `/run/user/<uid>/slashit-dogfood` | isolated socket and PID file: `/run/user/<uid>/slashit-app/slashit.sock` is this instance's control endpoint |
+| `GH_CONFIG_DIR` | `~/.config/gh` | real GitHub credentials, deliberately shared |
+| `HOME` | the real home | the desktop session's display and PATH flow through unchanged |
+
+### Launch and supervision
+
+`scripts/supervise-dogfood.sh` is the mechanism. Run it with `start`, `stop`,
+`restart`, `status`, `verify` or `env` (see the script header). Its
+responsibilities:
+
+- **Explicit environment.** A start spawns the binary with only the declared
+  `XDG_*` and `GH_CONFIG_DIR` values set, then reads the new PID's
+  `/proc/<pid>/environ` and refuses, loudly, if the running process does not
+  carry the declaration. A declared value that would equal the default
+  directory derived from `HOME` (`~/.config`, `~/.local/share`, `~/.cache`,
+  `~/.local/state`, `/run/user/<uid>`) also refuses.
+- **Known binary.** A start refuses a binary that does not answer
+  `--version`; `status` reports the recorded binary path, the launch-time
+  commit of the checkout the binary was built in, the PID and the endpoint.
+- **One instance.** A start refuses while the control socket answers, and
+  while the PID of a previous launch is alive without answering.
+- **Endpoint verification.** `start` and `verify` confirm the instance
+  through `slashit --endpoint ... ping`, including that the answering PID and
+  endpoint are the declared ones.
+- **Backup before any restart.** `restart` stops the instance over the
+  control channel (so it can end its terminals cleanly; `stop --force`
+  escalates to SIGTERM and SIGKILL and does not run that shutdown), then
+  copies the isolated config and data trees into
+  `~/.local/state/slashit-dogfood/supervisor/backup/<stamp>/` and verifies the
+  copy against a `sha256sum` manifest before starting anything new. After the
+  start it compares checksums again and exits 1 with a file list when the
+  state changed. The comparison excludes the supervisor's own directory, the
+  cache, the instance's logs, and the terminal session records file, which the
+  application rewrites at every startup by design.
+- **No healthy-instance churn.** A restart of a healthy instance is itself a
+  state-changing operation: run it only under this procedure, never to
+  "refresh" a working instance.
+
+A healthy instance is verified from outside its window:
+
+```bash
+scripts/supervise-dogfood.sh status
+scripts/supervise-dogfood.sh verify
+```
+
+### Optional systemd user unit
+
+`scripts/slashit-dogfood.service` carries the same `Environment=` entries for
+`systemctl --user`, adding automatic restarts and journal logging. When the
+unit owns the instance, lifecycle actions go through systemd; the script's
+`status` and `verify` keep working because they check the control socket, and
+a scripted `start` still refuses a second instance. Keep the unit's
+`Environment=` entries in step with the script's declared environment.
+
+### Validating changes to the mechanism
+
+`scripts/test-supervise-dogfood.sh` exercises the script against stub
+binaries and a stub CLI inside a throwaway directory: start, refusal of a
+second start and of default XDG values, the process-environment check,
+`status` and `stop`, the controlled restart with a checksum-verified backup,
+a caught state divergence, and the `--force` escalation. It touches nothing
+outside its own temporary directory.

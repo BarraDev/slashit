@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: MPL-2.0
+# Optional systemd user unit for the isolated SlashIt dogfood instance.
+#
+# scripts/supervise-dogfood.sh works on any system and is the primary
+# mechanism; this unit only adds automatic restarts and journal logging where
+# a systemd user session is available. The Environment= entries are explicit
+# on purpose: a user service inherits little from the desktop session, and the
+# instance must never fall back to the default XDG directories derived from
+# HOME. The values are the declaration from scripts/supervise-dogfood.sh; keep
+# the two in step when the layout ever changes.
+#
+# Install and use:
+#
+#   install -Dm644 scripts/slashit-dogfood.service \
+#     ~/.config/systemd/user/slashit-dogfood.service
+#   systemctl --user daemon-reload
+#   systemctl --user start slashit-dogfood
+#
+# Once the unit owns the instance, lifecycle actions belong to systemctl
+# (`status`, `stop`, `restart`). scripts/supervise-dogfood.sh status and verify
+# still work, because they check the control socket, not the unit; a scripted
+# start correctly refuses while the unit's instance answers on the socket.
+# Backups before a unit-driven restart can be taken with
+# `scripts/supervise-dogfood.sh restart` on a stopped instance, or by stopping
+# the unit first and running the script's controlled restart.
+
+[Unit]
+Description=SlashIt isolated dogfood instance
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment="XDG_CONFIG_HOME=%h/.local/state/slashit-dogfood/config"
+Environment="XDG_DATA_HOME=%h/.local/state/slashit-dogfood/data"
+Environment="XDG_CACHE_HOME=%h/.local/state/slashit-dogfood/cache"
+Environment="XDG_STATE_HOME=%h/.local/state/slashit-dogfood"
+Environment="XDG_RUNTIME_DIR=/run/user/%U/slashit-dogfood"
+Environment="GH_CONFIG_DIR=%h/.config/gh"
+ExecStartPre=/usr/bin/install -d -m 0700 \
+  %h/.local/state/slashit-dogfood /run/user/%U/slashit-dogfood
+ExecStart=%h/.local/state/slashit-dogfood/data/workspaces/slashit-dogfood-git/target/debug/slashit-ui
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+
+[Install]
+WantedBy=graphical-session.target
