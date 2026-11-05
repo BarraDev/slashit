@@ -634,8 +634,13 @@ EOF
     refuse "the binary location is unresolved: no workspace checkout was found next to this script (set SLASHIT_DOGFOOD_BINARY in the ExecStart environment)"
   [ -f "$BINARY" ] || refuse "the binary is missing: $BINARY"
   [ -x "$BINARY" ] || refuse "the binary is not executable: $BINARY"
-  version_line=$(timeout -k 2 "$CLI_TIMEOUT" "$BINARY" --version 2>/dev/null | head -n 1)
-  [ -n "$version_line" ] || refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
+  # The call's own status is the gate: a pipeline would report head's status, and
+  # a binary that prints a line and then fails would pass.
+  local version_out
+  version_out=$(timeout -k 2 "$CLI_TIMEOUT" "$BINARY" --version 2>/dev/null) ||
+    refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
+  version_line=$(printf '%s\n' "$version_out" | head -n 1)
+  [ -n "$version_line" ] || refuse "the binary answers --version with nothing; refusing it: $BINARY"
 
   mkdir -p "$STATE_BASE/config" "$STATE_BASE/data" "$STATE_BASE/cache" "$SUP_DIR" "$RUNTIME_BASE" 2>/dev/null
   chmod 700 "$STATE_BASE" "$RUNTIME_BASE" 2>/dev/null

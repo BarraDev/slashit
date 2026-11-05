@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=57
+EXPECTED_TOTAL=58
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sup="$root/scripts/supervise-dogfood.sh"
@@ -692,6 +692,16 @@ else
   bad "hung-channel fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
 fi
 cleanup_instances
+
+echo "== run refuses a binary that prints a version line and then fails, as start does"
+printf '#!/usr/bin/env bash\necho "slashit-ui 9.9.9-broken"\nexit 3\n' >"$work/broken-version"
+chmod +x "$work/broken-version"
+out=$(sv SLASHIT_DOGFOOD_BINARY="$work/broken-version" run 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not answer --version"* ]] && [[ "$out" != *"exec "* ]]; then
+  ok "run refuses a binary whose --version exits nonzero, even when it printed a line"
+else
+  bad "run accepted a binary whose --version exits nonzero (exit $st)"; printf '%s\n' "$out" >&2
+fi
 
 echo "== with no launch record, a control channel that does not answer is still unverifiable, not absent"
 cleanup_instances
