@@ -1053,34 +1053,54 @@ defaults derived from `HOME`:
 
 ### Launch and supervision
 
-`scripts/supervise-dogfood.sh` is the mechanism. Run it with `start`, `stop`,
-`restart`, `status`, `verify` or `env` (see the script header). Its
+`scripts/supervise-dogfood.sh` is the mechanism. Run it with `start`, `run`,
+`stop`, `restart`, `status`, `verify` or `env` (see the script header). Its
 responsibilities:
 
+- **One declared layout.** The binary, the verified CLI and the script live in
+  the same workspace checkout, and the script resolves that checkout from its
+  own location, so the layout is declared in exactly one place. The systemd
+  user unit shares it by running the script's `run` verb rather than naming
+  the binary.
 - **Explicit environment.** A start spawns the binary with only the declared
   `XDG_*` and `GH_CONFIG_DIR` values set, then reads the new PID's
   `/proc/<pid>/environ` and refuses, loudly, if the running process does not
   carry the declaration. A declared value that would equal the default
   directory derived from `HOME` (`~/.config`, `~/.local/share`, `~/.cache`,
   `~/.local/state`, `/run/user/<uid>`) also refuses.
-- **Known binary.** A start refuses a binary that does not answer
-  `--version`; `status` reports the recorded binary path, the launch-time
-  commit of the checkout the binary was built in, the PID and the endpoint.
-- **One instance.** A start refuses while the control socket answers, and
-  while the PID of a previous launch is alive without answering.
+- **One instance, serially supervised.** `start`, `run`, `stop` and `restart`
+  take an advisory `flock` on the supervisor directory first, so concurrent
+  lifecycle operations refuse instead of interleaving. The FIRST check of a
+  `start` (and of `run`) is the control socket: a begin refuses while an
+  instance already answers, and refuses an ambiguous socket path (present
+  without a verified answer) before any binary handling.
+- **Verified binary and CLI.** A start refuses a binary that does not answer
+  `--version` (unknown provenance) and, equally, the CLI used for endpoint
+  verification: `status` and `verify` never trust `slashit` found on PATH,
+  only the CLI beside the binary or the one named in `SLASHIT_DOGFOOD_CLI`,
+  and a CLI that does not answer `--version` is refused. `status` reports the
+  recorded binary path, the launch-time commit of the checkout the binary was
+  built in, the PID and the endpoint; where the endpoint cannot be checked
+  because no verified CLI is available, it says "cannot verify (no CLI)"
+  instead of claiming `stopped`, and `verify` says the same instead of "no
+  instance answers".
 - **Endpoint verification.** `start` and `verify` confirm the instance
   through `slashit --endpoint ... ping`, including that the answering PID and
   endpoint are the declared ones.
 - **Backup before any restart.** `restart` stops the instance over the
   control channel (so it can end its terminals cleanly; `stop --force`
-  escalates to SIGTERM and SIGKILL and does not run that shutdown), then
-  copies the isolated config and data trees into
+  escalates to SIGTERM and SIGKILL and does not run that shutdown), then it
+  copies exactly the compared snapshot set into
   `~/.local/state/slashit-dogfood/supervisor/backup/<stamp>/` and verifies the
   copy against a `sha256sum` manifest before starting anything new. After the
   start it compares checksums again and exits 1 with a file list when the
-  state changed. The comparison excludes the supervisor's own directory, the
-  cache, the instance's logs, and the terminal session records file, which the
-  application rewrites at every startup by design.
+  state changed. The comparison and the backup exclude the supervisor's own
+  directory, the cache, the instance's logs, the terminal session records
+  file (which the application rewrites at every startup by design), and the
+  workspace and Task Checkouts under `data/slashit-app/worktrees/`.
+  Uncommitted checkout content is not a restart invariant; the checkouts
+  survive a restart untouched, and comparing or backing them up would
+  checksum whole `target/` build trees.
 - **No healthy-instance churn.** A restart of a healthy instance is itself a
   state-changing operation: run it only under this procedure, never to
   "refresh" a working instance.
@@ -1094,18 +1114,30 @@ scripts/supervise-dogfood.sh verify
 
 ### Optional systemd user unit
 
-`scripts/slashit-dogfood.service` carries the same `Environment=` entries for
-`systemctl --user`, adding automatic restarts and journal logging. When the
-unit owns the instance, lifecycle actions go through systemd; the script's
-`status` and `verify` keep working because they check the control socket, and
-a scripted `start` still refuses a second instance. Keep the unit's
-`Environment=` entries in step with the script's declared environment.
+`scripts/slashit-dogfood.service` runs `scripts/supervise-dogfood.sh run`,
+which validates like `start` (ambient environment must agree with the
+declaration, live-socket refusal, binary provenance) and then execs the
+binary in the foreground with the declared environment, so `systemctl --user`
+adds automatic restarts and journal logging. The unit carries explicit
+`Environment=` entries mirroring the declaration; the binary and CLI
+locations are not duplicated in the unit, because `run` resolves them from
+the checkout the script belongs to. When the unit owns the instance,
+lifecycle actions go through systemd; the script's `status` and `verify`
+keep working because they check the control socket, and a scripted `start`
+or a unit start still refuses a second instance. A unit-driven restart should
+still take a verified backup: stop the unit, then run the script's controlled
+`restart`, which stops, backs up, starts and proves the state file set
+unchanged.
 
 ### Validating changes to the mechanism
 
 `scripts/test-supervise-dogfood.sh` exercises the script against stub
-binaries and a stub CLI inside a throwaway directory: start, refusal of a
-second start and of default XDG values, the process-environment check,
-`status` and `stop`, the controlled restart with a checksum-verified backup,
-a caught state divergence, and the `--force` escalation. It touches nothing
-outside its own temporary directory.
+binaries and a stub CLI inside a throwaway directory (33 checks in one clean
+run): start, refusal of a second start and of a concurrent lifecycle
+operation, the `run` entry point's duplicate and ambient-environment
+refusals, truthful cannot-verify reporting when the CLI is absent, refusing
+default XDG values, the process-environment check, the binary and CLI
+provenance gates, `status` and `stop`, the `--force` escalation, the
+controlled restart with a checksum-verified backup over exactly the compared
+snapshot set, and a caught state divergence. It touches nothing outside its
+own temporary directory.

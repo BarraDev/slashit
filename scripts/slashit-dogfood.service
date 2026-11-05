@@ -3,26 +3,37 @@
 #
 # scripts/supervise-dogfood.sh works on any system and is the primary
 # mechanism; this unit only adds automatic restarts and journal logging where
-# a systemd user session is available. The Environment= entries are explicit
-# on purpose: a user service inherits little from the desktop session, and the
+# a systemd user session is available. The unit runs the script's `run` verb:
+# the binary and CLI locations are resolved from the checkout the script
+# belongs to (its own target/debug), so the layout is declared in exactly ONE
+# place — the script. Adjust the ExecStart path to the workspace checkout that
+# builds the dogfood binary. The Environment= entries are explicit on
+# purpose: a user service inherits little from the desktop session, and the
 # instance must never fall back to the default XDG directories derived from
-# HOME. The values are the declaration from scripts/supervise-dogfood.sh; keep
-# the two in step when the layout ever changes.
+# HOME. They mirror the script's declaration; `run` re-checks the ambient
+# values against it and refuses when they disagree, and it refuses while an
+# instance already answers on the control socket — the unit fails visibly
+# instead of doubling an instance the service manager does not know about.
 #
-# Install and use:
+# Lifecycle: while the unit owns the instance, start/stop/restart belong to
+# systemctl (`daemon-reload` after edits; `status` shows the service).
+# scripts/supervise-dogfood.sh status and verify keep working, because they
+# check the control socket, not the unit; a scripted start correctly refuses
+# while the unit's instance answers on the socket. systemctl stop signals the
+# process directly, which does not run the application's own shutdown; prefer
+# `slashit --endpoint ... quit` against this instance, or stop the unit and
+# accept that integrated terminals may outlive it.
+#
+# Install and use (adjust ExecStart first):
 #
 #   install -Dm644 scripts/slashit-dogfood.service \
 #     ~/.config/systemd/user/slashit-dogfood.service
 #   systemctl --user daemon-reload
 #   systemctl --user start slashit-dogfood
 #
-# Once the unit owns the instance, lifecycle actions belong to systemctl
-# (`status`, `stop`, `restart`). scripts/supervise-dogfood.sh status and verify
-# still work, because they check the control socket, not the unit; a scripted
-# start correctly refuses while the unit's instance answers on the socket.
-# Backups before a unit-driven restart can be taken with
-# `scripts/supervise-dogfood.sh restart` on a stopped instance, or by stopping
-# the unit first and running the script's controlled restart.
+# Backups before a unit-driven restart: stop the unit, then take the verified
+# backup with a controlled restart step from the script, or let the script's
+# own `restart` do the stop, backup, start and checksum comparison.
 
 [Unit]
 Description=SlashIt isolated dogfood instance
@@ -39,7 +50,7 @@ Environment="XDG_RUNTIME_DIR=/run/user/%U/slashit-dogfood"
 Environment="GH_CONFIG_DIR=%h/.config/gh"
 ExecStartPre=/usr/bin/install -d -m 0700 \
   %h/.local/state/slashit-dogfood /run/user/%U/slashit-dogfood
-ExecStart=%h/.local/state/slashit-dogfood/data/workspaces/slashit-dogfood-git/target/debug/slashit-ui
+ExecStart=%h/Repo/Tauri/slashit/workspaces/slashit-dogfood-git/scripts/supervise-dogfood.sh run
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=120
