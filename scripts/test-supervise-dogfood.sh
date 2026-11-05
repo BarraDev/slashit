@@ -66,7 +66,7 @@ if [ "${1:-}" = "--version" ]; then
   echo "slashit-ui 9.9.9-stub"
   exit 0
 fi
-tr '\0' '\n' </proc/self/environ >"$stub_dir/environ"
+env >"$stub_dir/environ"
 if [ -n "${SLASHIT_TEST_STARTUP_TOUCH:-}" ]; then
   printf 'boot write\n' >"$SLASHIT_TEST_STARTUP_TOUCH"
 fi
@@ -429,7 +429,8 @@ fi
 
 echo "== a state change across the restart is caught"
 printf 'settings v1\n' >"$state/config/slashit-app/settings.toml"
-sv start >/dev/null 2>&1 || bad "tamper fixture: start failed"
+# The instance the previous restart left running is the fixture.
+sv verify >/dev/null 2>&1 || bad "tamper fixture: no verified running instance"
 # The restart spawns a fresh instance that (told by the stub variable) writes
 # into a compared state file at boot, after the backup was taken. The stub
 # writes the file before its pid file, so the write is always visible to the

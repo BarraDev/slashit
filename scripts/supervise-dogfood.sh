@@ -286,14 +286,17 @@ ping_json_field() { # key, JSON on stdin
 
 # On success sets PING_MODE, PING_PID, PING_VERSION, PING_ENDPOINT.
 ping_fields() {
+  # A CLI that failed its provenance gate must not become trusted merely
+  # because a later invocation happens to print a plausible reply.
+  [ "$CLI_STATE" = ready ] || return 1
   [ -n "$CLI_BIN" ] || return 1
   local out
   out=$("$CLI_BIN" --endpoint "$ENDPOINT" --json ping 2>/dev/null) || return 1
-  PING_MODE=$(printf '%s\n' "$out" | ping_json_field mode)
-  PING_PID=$(printf '%s\n' "$out" | ping_json_field pid)
-  PING_VERSION=$(printf '%s\n' "$out" | ping_json_field version)
-  PING_ENDPOINT=$(printf '%s\n' "$out" | ping_json_field endpoint)
-  [ -n "$PING_PID" ] || return 1
+  PING_MODE=$(printf '%s\n' "$out" | ping_json_field mode) || return 1
+  PING_PID=$(printf '%s\n' "$out" | ping_json_field pid) || return 1
+  PING_VERSION=$(printf '%s\n' "$out" | ping_json_field version) || return 1
+  PING_ENDPOINT=$(printf '%s\n' "$out" | ping_json_field endpoint) || return 1
+  case $PING_PID in '' | *[!0-9]*) return 1 ;; esac
 }
 
 _process_alive() {
@@ -380,8 +383,13 @@ state_file_list() {
   )
 }
 
+# Paths are relative to the snapshotted base, so a state tree and its backup
+# copy produce comparable lines; the checksums must run from inside the base.
 state_snapshot() {
-  state_file_list "$1" | LC_ALL=C sort -z | xargs -0 -r sha256sum 2>/dev/null
+  (
+    cd "$1" 2>/dev/null || exit 0
+    state_file_list "$1" | LC_ALL=C sort -z | xargs -0 -r sha256sum 2>/dev/null
+  )
 }
 
 # Advisory lock on the supervisor's own directory: start, run, stop and
@@ -392,7 +400,7 @@ lifecycle_lock() {
   command -v flock >/dev/null 2>&1 ||
     fail "flock (util-linux) is required to keep lifecycle operations from running concurrently"
   mkdir -p "$SUP_DIR" 2>/dev/null
-  exec 9>"$LOCK" 2>/dev/null || fail "cannot open the lifecycle lock $LOCK"
+  { exec 9>"$LOCK"; } 2>/dev/null || fail "cannot open the lifecycle lock $LOCK"
   flock -n 9 || refuse "another lifecycle operation (start, run, stop or restart) is already running on $SUP_DIR"
 }
 
@@ -612,7 +620,7 @@ EOF
     XDG_STATE_HOME="$declare_state" \
     XDG_RUNTIME_DIR="$declare_runtime" \
     GH_CONFIG_DIR="$GH_CONFIG"
-  exec 9>&- 2>/dev/null # release the lifecycle lock before the exec
+  exec 9>&- # release the lifecycle lock before the exec
   exec "$BINARY"
 }
 
