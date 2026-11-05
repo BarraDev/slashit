@@ -11,16 +11,21 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=107
+EXPECTED_TOTAL=121
+
+# Linux only: the supervisor and this harness read /proc and use flock and setsid.
+[ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sup="$root/scripts/supervise-dogfood.sh"
 [ -f "$sup" ] || { echo "FAIL $sup is missing" >&2; exit 1; }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/supervise-dogfood-test.XXXXXX")
-trap 'cleanup_instances; for p in ${foreign_pids[@]+"${foreign_pids[@]}"}; do kill -9 "$p" 2>/dev/null || true; done; rm -rf "$work"' EXIT
+trap 'cleanup_all' EXIT
 
 passed=0
+# Disposable processes this harness started, as "pid starttime". Each one is
+# signaled only while its start time still matches (see signal_owned).
 foreign_pids=()
 failed=0
 
@@ -32,6 +37,83 @@ ok() {
 bad() {
   echo "FAIL $*"
   failed=$((failed + 1))
+}
+
+# Process identity -------------------------------------------------------------
+# A pid number is reused by the kernel, so every signal this harness sends goes
+# through one of these checks: the target must still have the start time that
+# was captured when this harness (or its fixture) created it.
+
+proc_start() { # pid -> start time (field 22 of /proc/<pid>/stat), or fails
+  local stat rest
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  rest=${stat##*) }
+  set -- $rest
+  printf '%s\n' "${20}"
+}
+
+# Records a disposable process this harness started, with its identity.
+own() { # pid
+  foreign_pids+=("$1 $(proc_start "$1")")
+}
+
+# Signals "pid starttime" only while the process still has that start time.
+signal_owned() { # SIGNAL "pid starttime"
+  local sig=$1 pid=${2%% *} start=${2#* } now
+  now=$(proc_start "$pid" 2>/dev/null) || return 1
+  [ -n "$start" ] && [ "$now" = "$start" ] || return 1
+  kill -"$sig" "$pid" 2>/dev/null
+}
+
+# A process this run's fixture started carries the run's unique stub directory
+# in its environment, and only such a process is ever a supervisor or instance
+# target. A recycled pid, or an operator's own process, does not carry it.
+owned_by_fixture() { # pid
+  local envs
+  envs=$({ tr '\0' '\n' <"/proc/$1/environ"; } 2>/dev/null) || return 1
+  case $'\n'"$envs"$'\n' in
+    *$'\n'"SLASHIT_TEST_STUB_DIR=$stub_dir"$'\n'*) return 0 ;;
+  esac
+  return 1
+}
+
+# Every live descendant of a pid, found from the parent pid in /proc.
+descendants_of() { # pid
+  local parent=$1 c stat rest ppid
+  for c in /proc/[0-9]*; do
+    c=${c#/proc/}
+    stat=$(cat "/proc/$c/stat" 2>/dev/null) || continue
+    rest=${stat##*) }
+    set -- $rest
+    ppid=$2
+    [ "$ppid" = "$parent" ] || continue
+    echo "$c"
+    descendants_of "$c"
+  done
+}
+
+# The supervisor a background `sv start` job became: a descendant of that job
+# whose command line is exactly this checkout's supervisor run as `start`, and
+# which carries this run's fixture environment. Prints "pid starttime".
+fixture_supervisor() { # job
+  local pid cmd
+  for pid in $(descendants_of "$1"); do
+    cmd=$({ tr '\0' ' ' <"/proc/$pid/cmdline"; } 2>/dev/null) || continue
+    [ "$cmd" = "bash $sup start " ] || continue
+    owned_by_fixture "$pid" || continue
+    printf '%s %s\n' "$pid" "$(proc_start "$pid")"
+    return 0
+  done
+  return 1
+}
+
+cleanup_all() {
+  cleanup_instances
+  local rec
+  for rec in "${foreign_pids[@]+"${foreign_pids[@]}"}"; do
+    signal_owned KILL "$rec" || true
+  done
+  rm -rf "$work"
 }
 
 state="$work/state"
@@ -47,7 +129,9 @@ mkdir -p "$bin_dir" \
   "$state/data/slashit-app/worktrees" \
   "$stub_dir" "$runtime" "$runtime/slashit-app"
 
-export SLASHIT_TEST_STUB_DIR="$stub_dir"
+# SLASHIT_TEST_STUB_DIR is deliberately NOT exported: it is the fixture marker
+# that owned_by_fixture looks for, so only the supervisor (through BASEENV) and
+# its stub children carry it, never the harness's own disposable processes.
 export SLASHIT_TEST_SOCKET="$socket"
 
 # --- stubs -------------------------------------------------------------------
@@ -166,6 +250,7 @@ printf 'ended\n' >"$state/data/slashit-app/terminal_sessions.toml"
 printf 'uncommitted checkout content\n' >"$state/data/slashit-app/worktrees/task.txt"
 
 BASEENV=(
+  SLASHIT_TEST_STUB_DIR="$stub_dir"
   SLASHIT_DOGFOOD_STATE="$state"
   SLASHIT_DOGFOOD_RUNTIME="$runtime"
   SLASHIT_DOGFOOD_BINARY="$bin_dir/slashit-ui"
@@ -215,8 +300,13 @@ sv() {
 }
 
 cleanup_instances() {
-  if [ -f "$stub_dir/pid" ]; then
-    kill -9 "$(cat "$stub_dir/pid")" 2>/dev/null || true
+  # The pid file can outlive its instance, and its pid can then be reused by an
+  # unrelated process. Only a process that carries this run's fixture marker is
+  # the stub instance and may be signaled.
+  local pid
+  pid=$(cat "$stub_dir/pid" 2>/dev/null) || pid=
+  if [ -n "$pid" ] && owned_by_fixture "$pid"; then
+    kill -9 "$pid" 2>/dev/null || true
   fi
   rm -f "$stub_dir/pid" "$stub_dir/quit" "$stub_dir/environ" "$socket"
 }
@@ -265,6 +355,20 @@ out=$(sv 2>&1); expect input "no arguments is a usage error" "$out" $?
 out=$(sv bogus 2>&1); expect input "an unknown verb is a usage error" "$out" $?
 out=$(sv env extra 2>&1); expect input "unexpected arguments are a usage error" "$out" $?
 out=$(sv start --force 2>&1); expect input "start takes no --force" "$out" $?
+
+echo "== platform guard"
+# A shim `uname` that reports another platform, put first on PATH for the
+# supervisor only: the guard must refuse before any Linux-specific step runs.
+shim=$work/shim-other-platform
+mkdir -p "$shim"
+printf '#!/usr/bin/env bash\necho Darwin\n' >"$shim/uname"
+chmod +x "$shim/uname"
+out=$(sv PATH="$shim:$PATH" status 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"unsupported platform (Darwin)"* ]] && [[ "$out" == *"Linux only"* ]]; then
+  ok "a non-Linux platform is refused at once, before any Linux-specific operation"
+else
+  bad "a non-Linux platform was not refused by the platform guard (exit $st)"; printf '%s\n' "$out" >&2
+fi
 
 echo "== env"
 out=$(sv env 2>&1)
@@ -806,13 +910,6 @@ is_alive() { # pid: exists and has not exited (a zombie has exited)
   case $rest in Z | "Z "*) return 1 ;; esac
   return 0
 }
-proc_start() { # pid -> starttime (field 22 of /proc/<pid>/stat)
-  local stat rest
-  stat=$(cat "/proc/$1/stat") || return 1
-  rest=${stat##*) }
-  set -- $rest
-  printf '%s\n' "${20}"
-}
 boot_id_now=$(cat /proc/sys/kernel/random/boot_id)
 record_file="$state/supervisor/instance"
 expect_refused_alive() { # label output status reason pid
@@ -827,7 +924,7 @@ expect_refused_alive() { # label output status reason pid
 
 sleep 300 &
 foreign_pid=$!
-foreign_pids+=("$foreign_pid")
+own "$foreign_pid"
 foreign_start=$(proc_start "$foreign_pid")
 
 # A stale record that names the unrelated live pid, with the identity of an
@@ -881,6 +978,7 @@ fi
 # supervisor that never signals a recorded pid.
 env "${declared_env[@]}" sleep 300 &
 control_pid=$!
+own "$control_pid"
 control_start=$(proc_start "$control_pid")
 printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$control_pid" "$boot_id_now" "$control_start" >"$record_file"
 out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
@@ -909,6 +1007,44 @@ fi
 cleanup_instances
 rm -f "$record_file"
 
+echo "== endpoint and launch record name different processes: nothing is quit or signaled"
+# The endpoint answers for one live instance (A). The launch record names a second
+# live process (B) with a matching identity and the declared environment. Each
+# process passes its own checks, so only the disagreement can refuse.
+cleanup_instances
+out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+endpoint_pid=$(stub_pid)
+env "${declared_env[@]}" sleep 300 &
+record_pid=$!
+own "$record_pid"
+record_id="$record_pid $(proc_start "$record_pid")"
+if [ "$st" -eq 0 ] && [ -n "$endpoint_pid" ] && is_alive "$record_pid"; then
+  printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$record_pid" "$boot_id_now" "$(proc_start "$record_pid")" >"$record_file"
+  # Refused before any quit, TERM or KILL: both processes survive, and the
+  # refusal names the disagreement so the operator can act on it.
+  disagree_case() { # label, verb arguments...
+    local label=$1
+    shift
+    : >"$stub_dir/calls"
+    out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 "$@" 2>&1); st=$?
+    if [ "$st" -eq 1 ] && [[ "$out" == *"the launch record names pid $record_pid"* ]] &&
+      is_alive "$endpoint_pid" && is_alive "$record_pid" && ! grep -qx quit "$stub_dir/calls" 2>/dev/null; then
+      ok "$label (refused: the endpoint is served by pid $endpoint_pid, the record names pid $record_pid; both alive, no quit)"
+    else
+      bad "$label: expected a refusal naming pid $record_pid, both processes alive and no quit (exit $st)"; printf '%s\n' "$out" >&2
+    fi
+  }
+  disagree_case "a forced stop refuses an endpoint and a record that name different processes" stop --force
+  disagree_case "a forced restart refuses the same disagreement" restart --force
+  disagree_case "a graceful stop refuses the same disagreement" stop
+else
+  bad "disagreement fixture: start failed or a process was missing (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+rm -f "$record_file"
+signal_owned KILL "$record_id" || true
+wait "$record_pid" 2>/dev/null || true
+
 echo "== process identity: a verified instance still stops and restarts"
 out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
 first_pid=$(stub_pid)
@@ -930,7 +1066,7 @@ echo "== process identity: recovery after the recorded instance has exited"
 out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
 dead_instance=$(stub_pid)
 if [ "$st" -eq 0 ] && [ -n "$dead_instance" ]; then
-  kill -9 "$dead_instance" 2>/dev/null
+  owned_by_fixture "$dead_instance" && kill -9 "$dead_instance" 2>/dev/null
   for _ in $(seq 1 50); do is_alive "$dead_instance" || break; sleep 0.1; done
   out=$(sv status 2>&1); st=$?
   if [ "$st" -eq 3 ] && [[ "$out" == *"stale (it names pid $dead_instance"* ]]; then
@@ -972,10 +1108,10 @@ cleanup_instances
 rm -f "$record_file"
 sleep 300 &
 bare_pid=$!
-foreign_pids+=("$bare_pid")
+own "$bare_pid"
 env "${declared_env[@]}" sleep 300 &
 declared_pid=$!
-foreign_pids+=("$declared_pid")
+own "$declared_pid"
 reply_file=$work/endpoint-reply.json
 reply() { # mode endpoint pid
   printf '{\n  "mode": "%s",\n  "version": "9.9.9-stub",\n  "protocol_version": 1,\n  "pid": %s,\n  "endpoint": "%s"\n}\n' "$1" "$3" "$2" >"$reply_file"
@@ -1019,7 +1155,7 @@ no_quit "endpoint mismatch"
 cleanup_instances
 sleep 300 &
 rec_bare=$!
-foreign_pids+=("$rec_bare")
+own "$rec_bare"
 printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$rec_bare" "$boot_id_now" "$(proc_start "$rec_bare")" >"$record_file"
 out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
 expect_refused_alive "a record whose identity matches a process without the declared environment is refused" "$out" "$st" "does not carry the declared" "$rec_bare"
@@ -1096,24 +1232,47 @@ fi
 cleanup_instances
 
 # A supervisor killed while it waits for readiness leaves the provisional record
-# over a live child. Sets crash_child and crash_marker for the case.
+# over a live child. Sets crash_child and crash_marker for the case. Only the
+# supervisor that this fixture's background start became is killed: it is found
+# from that job's process tree and signaled by pid and start time. No pattern is
+# matched against command lines, so an unrelated process cannot be selected.
 crash_mid_start() {
   cleanup_instances
   rm -f "$record_file"
   crash_marker=crash-$RANDOM-$$
   sv SLASHIT_TEST_MARK=$crash_marker SLASHIT_TEST_CLI_NEVER_ANSWERS=1 SLASHIT_TEST_STUB_ROLE=noquit SLASHIT_DOGFOOD_START_TIMEOUT=120 start >/dev/null 2>&1 &
-  local svjob=$! i
+  local svjob=$! i sup_info
   for i in $(seq 150); do
     if grep -q "^state[[:space:]]provisional" "$record_file" 2>/dev/null && [ -s "$stub_dir/pid" ]; then break; fi
     sleep 0.1
   done
-  pkill -9 -f "$sup start" 2>/dev/null
+  sup_info=$(fixture_supervisor "$svjob") || {
+    bad "crash fixture: the supervisor of the background start could not be identified; nothing was killed"
+    crash_child=
+    return 1
+  }
+  signal_owned KILL "$sup_info"
   wait "$svjob" 2>/dev/null
   # The interrupted child has not bound its endpoint yet, so the path is absent.
   rm -f "$socket"
   wait_lock_free
   crash_child=$(awk -F '\t' '$1 == "pid" { print $2 }' "$record_file" 2>/dev/null | head -n 1)
 }
+
+# A look-alike process: its command line contains the supervisor path and
+# `start`, which a broad pattern match would select, but it is not this
+# fixture's supervisor. It must survive the crash fixture. The harness started
+# it, so it is ended below by pid and start time.
+bash -c 'exec -a "$0" sleep 300' "bash $sup start" &
+decoy_pid=$!
+own "$decoy_pid"
+decoy_id="$decoy_pid $(proc_start "$decoy_pid")"
+decoy_cmd=$(tr '\0' ' ' <"/proc/$decoy_pid/cmdline" 2>/dev/null)
+if [[ "$decoy_cmd" == *"$sup start"* ]]; then
+  ok "fixture: a look-alike process matches the old broad pattern (pid $decoy_pid)"
+else
+  bad "fixture: the look-alike process does not carry the supervisor pattern ('$decoy_cmd')"
+fi
 
 crash_mid_start
 if [ -n "$crash_child" ] && is_alive "$crash_child" && [ -n "$(marked "$crash_marker")" ]; then
@@ -1133,7 +1292,7 @@ cleanup_instances
 
 crash_mid_start
 if [ -n "$crash_child" ] && is_alive "$crash_child"; then
-  kill -9 "$crash_child" 2>/dev/null
+  owned_by_fixture "$crash_child" && kill -9 "$crash_child" 2>/dev/null
   for i in $(seq 50); do is_alive "$crash_child" || break; sleep 0.1; done
   wait_lock_free
   out=$(sv start 2>&1); st=$?
@@ -1147,6 +1306,24 @@ else
   bad "recovery fixture: no live child to exit"
 fi
 cleanup_instances
+
+# The look-alike survived both interrupted supervisors. A stale pid file that
+# names it (its pid reused by an unrelated process) must not make cleanup signal
+# it either: cleanup signals only a process that carries the fixture marker.
+if is_alive "$decoy_pid"; then
+  ok "the look-alike process survived both interrupted supervisors (only the fixture's own supervisor was ended)"
+else
+  bad "the look-alike process was killed by a fixture (pattern-based or unverified signal)"
+fi
+printf '%s\n' "$decoy_pid" >"$stub_dir/pid"
+cleanup_instances
+if is_alive "$decoy_pid" && [ ! -e "$stub_dir/pid" ]; then
+  ok "cleanup does not signal a stale pid file that names an unrelated live process"
+else
+  bad "cleanup signaled a process that is not the fixture's instance"
+fi
+signal_owned KILL "$decoy_id" || true
+wait "$decoy_pid" 2>/dev/null || true
 
 cleanup_instances
 rm -f "$record_file"
@@ -1186,6 +1363,34 @@ if [ "$st" -eq 0 ] && grep -qxF "XDG_RUNTIME_DIR  $runtime" <<<"$out"; then
   ok "a legitimate isolated runtime with a trailing slash is kept, in normalized form"
 else
   bad "a legitimate runtime with a trailing slash was not kept in normalized form (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+echo "== XDG paths: '.' and '..' components cannot name a default directory"
+# Each of these names a default location without spelling it: the old gate
+# compared spellings, so each was accepted and the instance used the real state.
+expect fail "a state base spelled with a trailing /. is refused, not accepted as the default" \
+  "$(sv SLASHIT_DOGFOOD_STATE="$HOME/.local/state/." env 2>&1)" $? "may not contain '.' or '..'"
+expect fail "a state base with a '..' component is refused" \
+  "$(sv SLASHIT_DOGFOOD_STATE="$state/../state" env 2>&1)" $? "may not contain '.' or '..'"
+expect fail "a runtime directory with a /. component is refused" \
+  "$(sv SLASHIT_DOGFOOD_RUNTIME="/run/user/$(id -u)/." env 2>&1)" $? "may not contain '.' or '..'"
+expect fail "a HOME with a '.' component cannot shift the defaults it derives" \
+  "$(sv HOME="$HOME/." SLASHIT_DOGFOOD_STATE="$HOME/.local/state" env 2>&1)" $? "may not contain '.' or '..'"
+
+echo "== XDG paths: HOME and state trailing slashes are compared in normalized form"
+expect fail "a HOME with a trailing slash still derives the defaults, so the default state is refused" \
+  "$(sv HOME="$HOME/" SLASHIT_DOGFOOD_STATE="$HOME/.local/state" env 2>&1)" $? "default directory derived from HOME"
+out=$(sv HOME="$HOME/" env 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qxF "STATE_BASE       $state" <<<"$out"; then
+  ok "an isolated state base is still accepted when HOME has a trailing slash"
+else
+  bad "an isolated state base was refused under a trailing-slash HOME (exit $st)"; printf '%s\n' "$out" >&2
+fi
+out=$(sv SLASHIT_DOGFOOD_STATE="$state/" env 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qxF "STATE_BASE       $state" <<<"$out"; then
+  ok "a trailing slash on the isolated state base is kept, in normalized form"
+else
+  bad "a trailing slash on the isolated state base was not normalized (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
 echo

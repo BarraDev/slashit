@@ -1068,12 +1068,20 @@ responsibilities:
   carry the declaration. A declared value that would equal the default
   directory derived from `HOME` (`~/.config`, `~/.local/share`, `~/.cache`,
   `~/.local/state`, `/run/user/<uid>`) also refuses. Repeated and trailing
-  slashes are normalized before that comparison; symbolic links are not
-  resolved, so the directory a path names is never changed.
+  slashes are normalized before that comparison, and the same normalized form
+  is used for HOME. A declared path, or HOME, that contains a `.` or `..`
+  component is refused outright, because `$HOME/.local/state/.` names the
+  default directory without spelling it. The comparison is lexical: symbolic
+  links are not resolved, so a link that points at a default directory is not
+  detected, and the directory a path names is never changed by the check.
+- **Linux only.** The supervisor and its test suite need `/proc`, `flock(1)`,
+  `setsid(1)` and the systemd user unit. On any other platform the script
+  exits 1 with `unsupported platform` before it uses them. macOS and Windows
+  support is not implemented.
 - **One instance, serially supervised.** `start`, `run`, `stop` and `restart`
   take an advisory `flock` on the supervisor directory first, so concurrent
   lifecycle operations refuse instead of interleaving. The FIRST check of a
-  `start` (and of `run`) is the control socket: a begin refuses while an
+  `start` (and of `run`) is the control socket: a start refuses while an
   instance already answers, and refuses an ambiguous socket path (present
   without a verified answer) before any binary handling.
 - **Verified binary and CLI.** A start refuses a binary that does not answer
@@ -1121,23 +1129,48 @@ responsibilities:
   each signal, but the instant between that read and `kill(2)` is not closed.
   Bash has no pidfd, so a pid reused within that window is not excluded in
   theory; the window is about a millisecond, and Linux allocates pids
-  sequentially.
+  sequentially. The re-read that follows the environment check is not forced
+  by any test: reproducing a pid reuse at a chosen moment is not possible
+  without intrusive test hooks, so removing that re-read is not detected by the
+  suite. It is covered by review only. The suite also cannot force a crash
+  between a spawn and its provisional record (see "Failed starts keep
+  ownership"). None of these is a crash-safety guarantee.
 - **Failed starts keep ownership.** `start` writes a provisional launch record
   (`state provisional`, with the child's identity) as soon as the child's pid is
   known, before it waits for readiness. A start that then fails (no answer
   within `SLASHIT_DOGFOOD_START_TIMEOUT`, a mode, endpoint or environment
   mismatch, the child exiting during startup, or a failed record write) ends
   that child by its verified identity, with TERM and then KILL, and exits 1.
-  If the child survives, or its identity could not be read, the provisional
-  record is kept: the next `start` refuses while that pid lives, and
-  `stop --force` ends it. A verified record replaces the provisional one by an
-  atomic rename. A write that fails for either record is a failed start and is
-  never reported as success. The rename claims no durability, because no fsync
-  is issued. Known gap: if the spawn wrapper does not report the child's pid
-  within 5 seconds, the start fails without a record; check with `pgrep` before
-  starting again. A supervisor killed while it waits leaves the same
-  provisional record, recovered by `stop --force`, or by `start` once the child
-  has exited. A child ended this way can leave its endpoint path behind, since
+  Four cases of a provisional record, and what each one allows:
+  - **A live child with a verified identity.** `stop --force` ends it, by that
+    identity. The next `start` refuses while it lives.
+  - **A live child whose identity cannot be read.** Nothing is signaled. The
+    record is kept, the next `start` refuses, and `stop --force` refuses with
+    the reason. It is not a way around identity verification. Recovery is by
+    hand: inspect the pid (for example `ps -o pid,lstart,args -p <pid>`), and
+    end it yourself only if it is the instance.
+  - **A child that has already exited.** The record is stale, and `stop` reports
+    nothing to signal. `start` proceeds once the endpoint path is absent. If
+    the exited child left its path behind, an operator removes it by hand first,
+    as described in the stale-endpoint limitation below.
+  - **Operator-required manual recovery.** Any record whose pid is live but
+    unverifiable, and any endpoint path that exists without a verified answer,
+    is resolved by an operator, never by `--force`.
+  A verified record replaces the provisional one by an atomic rename. A write
+  that fails for either record is a failed start and is never reported as
+  success. The rename claims no durability, because no fsync is issued.
+  Known gap: if the spawn wrapper does not report the child's pid within 5
+  seconds, the start fails without a record; check with `pgrep` before starting
+  again. A supervisor killed while it waits leaves the same provisional record
+  over a live child; `stop --force` ends that child when its identity is
+  verified, and `start` proceeds once the child has exited. A short window
+  remains between the spawn and the provisional record: the spawn wrapper's
+  startup and one identity read. The provenance lookup now runs before the
+  spawn, which shortens that window but does not close it. A supervisor killed
+  inside it leaves a live child with no record. While that child has not yet
+  bound its endpoint, a later `start` sees no answer and can launch a second
+  instance. After a supervisor was killed mid-start, run `pgrep -a slashit-ui`
+  before `start`. A child ended this way can leave its endpoint path behind, since
   the supervisor never unlinks a path after its recorded process ends. The next
   `start` then refuses that path as unverifiable until an operator has checked
   that no process owns it and removed it by hand (the stale-endpoint limitation
@@ -1202,8 +1235,10 @@ recover this automatically.
 ### Validating changes to the mechanism
 
 `scripts/test-supervise-dogfood.sh` exercises the script against stub
-binaries and a stub CLI inside a throwaway directory (107 checks in one clean
-run): start, refusal of a second start and of a concurrent lifecycle
+binaries and a stub CLI inside a throwaway directory (121 checks in one clean
+run). It is Linux only, and it runs through `TMPDIR` like any test, so a
+scratch location can be chosen. Its cases cover: start, refusal of a second
+start and of a concurrent lifecycle
 operation, the `run` entry point's duplicate and ambient-environment
 refusals, truthful cannot-verify reporting when the CLI is absent, refusing
 default XDG values, the process-environment check, the binary and CLI
@@ -1218,8 +1253,25 @@ endpoint answer must declare mode `gui`, the declared endpoint and the declared
 environment before anything is quit or signaled: a foreign pid that fails any of
 these is refused by stop, graceful or forced, and by restart, and it survives
 with no `quit` sent. Failed starts must end their own child or keep an explicit
-provisional record; a CLI that never answers, an interrupted supervisor, and a
 provisional or verified record write that fails are each covered. XDG values
-with trailing or repeated slashes must still refuse the default directories.
-Every supervisor call in the suite is bounded by a timeout. It touches nothing
-outside its own temporary directory.
+with trailing or repeated slashes must still refuse the default directories,
+and so must `.` and `..` components in the declared values and in HOME. HOME
+with a trailing slash, and a state base with one, are compared in normalized
+form. An endpoint that names one process while the launch record names another
+is refused by stop (forced and graceful) and by restart, before any quit or
+signal, with both processes alive.
+
+Every supervisor call in the suite is bounded by a timeout. The suite signals
+only processes it started itself, or the supervisor and stub instance that its
+own fixture carries, and each signal is sent only after the target's start time
+(and, for fixture processes, its fixture marker) is verified. It never matches
+command lines to choose a target: a look-alike process with the supervisor's
+command line survives the crash fixture, and a stale stub pid file that names an
+unrelated process is not signaled. Outside that, the suite writes only to its
+own temporary directory.
+
+Fault injection: each protection removed in a scratch copy was detected by the
+suite (the harness pattern-kill, the endpoint and record disagreement check,
+the `.`/`..` gate, HOME normalization, the Linux guard, and the cleanup
+ownership check). Removing the identity re-read after the environment check
+was not detected; see the limits above.

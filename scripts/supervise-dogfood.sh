@@ -26,8 +26,11 @@
 #       and cross-checks the new PID's /proc environment against the
 #       declaration. The child's identity is recorded as soon as its PID is
 #       known (a provisional launch record). A start that fails after the
-#       spawn ends that child by its identity, or leaves the record for
-#       `stop --force`; a failed record write is a failed start.
+#       spawn ends that child by its verified identity. If the child survives,
+#       or its identity cannot be read, nothing is signaled and the record is
+#       kept for manual recovery: `stop --force` ends a record only when its
+#       identity is verified, and refuses otherwise. A failed record write is
+#       a failed start.
 #
 #   scripts/supervise-dogfood.sh run
 #       Foreground: validate like start (environment gates, live-socket
@@ -78,7 +81,13 @@
 # through unchanged. A start refuses when any declared value would equal the
 # default XDG location derived from HOME (~/.config, ~/.local/share, ~/.cache,
 # ~/.local/state, /run/user/<uid>), so the instance can never silently fall
-# back to the owner's real state.
+# back to the owner's real state. Repeated and trailing slashes are removed
+# before every comparison. A path (or HOME) with a `.` or `..` component is
+# refused outright, because it can name a default directory without spelling
+# it. Comparison is lexical: no symbolic link is resolved.
+#
+# Platform: Linux only. The supervisor needs /proc, flock(1), setsid(1) and the
+# systemd user unit. Any other platform exits 1 before using them.
 #
 # The supervisor keeps its own files under $STATE_BASE/supervisor: the launch
 # record (a key<TAB>value file), the instance log, the lifecycle lock, and the
@@ -128,6 +137,13 @@ set -uo pipefail
 export LC_ALL=C
 
 SELF=${0##*/}
+
+# Linux only: /proc, flock(1), setsid(1) and the systemd user unit are required.
+# Checked before anything Linux-specific runs, so another platform fails here.
+if [ "$(uname -s 2>/dev/null)" != Linux ]; then
+  echo "$SELF: unsupported platform ($(uname -s 2>/dev/null || echo unknown)): this supervisor is Linux only" >&2
+  exit 1
+fi
 
 usage() {
   echo "usage: $SELF {start|run|stop|restart|status|verify|env} [--force]" >&2
@@ -239,8 +255,17 @@ env_gates() {
   # meaningful for the isolated state and the runtime socket.
   case $STATE_BASE in /*) ;; *) refuse "SLASHIT_DOGFOOD_STATE must be an absolute path ('$STATE_BASE')" ;; esac
   case $RUNTIME_BASE in /*) ;; *) refuse "SLASHIT_DOGFOOD_RUNTIME must be an absolute path ('$RUNTIME_BASE')" ;; esac
-  local home
+  local home component
   home=$(norm_path "$HOME")
+  # A `.` or `..` component can name a default directory without spelling it
+  # (`$HOME/.local/state/.`), so such a path is refused, never normalized. This
+  # is lexical only: a symbolic link that points at a default directory is not
+  # detected (see docs/development-workflow.md, section 19).
+  for component in "$STATE_BASE" "$RUNTIME_BASE" "$GH_CONFIG" "$home"; do
+    case "/$component/" in
+      */./* | */../*) refuse "a declared path or HOME may not contain '.' or '..' components ('$component')" ;;
+    esac
+  done
   case $STATE_BASE in
     "" | "$home") refuse "the state base ('$STATE_BASE') isolates nothing" ;;
   esac
@@ -703,6 +728,10 @@ cmd_start() {
   mkdir -p "$RUNTIME_BASE" 2>/dev/null
   chmod 700 "$STATE_BASE" "$RUNTIME_BASE" 2>/dev/null
   rm -f "$CHILD_PID"
+  # The provenance lookup runs before the spawn, so no git call sits between the
+  # child's start and its provisional record.
+  local commit=unknown
+  commit=$(binary_commit "$(dirname "$BINARY")" 2>/dev/null) || commit=unknown
 
   {
     echo "=== $(date -u +%FT%TZ) start by $SELF (user $uid)"
@@ -741,8 +770,9 @@ cmd_start() {
 
   # The provisional record comes before any waiting. From here the child is a
   # recorded process, so a start that fails below cannot leave it untracked.
-  local ident commit=unknown
-  commit=$(binary_commit "$(dirname "$BINARY")" 2>/dev/null) || commit=unknown
+  # Between the spawn and this write there is still a short window (the child's
+  # PID handoff and the identity read); it is documented, not closed.
+  local ident
   ident=$(proc_identity "$child") || ident=
   TARGET_PID=$child TARGET_ID=$ident
   write_record provisional "$child" "$ident" "$commit" ||
@@ -939,7 +969,7 @@ select_target() {
   if ping_fields; then
     ENDPOINT_UP=1
     [ -z "$REC_PID" ] || [ "$REC_PID" = "$PING_PID" ] ||
-      refuse "the endpoint is served by pid $PING_PID, but the launch record names pid $REC_PID; nothing is signaled while the two disagree (see \`$SELF status\`)"
+      refuse "the endpoint is served by pid $PING_PID, but the launch record names pid $REC_PID; nothing is signaled or quit while the two disagree. Run \`$SELF status\`; if the record is stale (pid $REC_PID is not the process on the endpoint), remove $RECORD by hand and retry"
     [ -z "$REC_PID" ] || [ "$REC_STATE" = match ] ||
       refuse "the endpoint is served by pid $PING_PID, and the launch record's pid $REC_PID $REC_WHY, so the record cannot confirm that pid; nothing is signaled or quit (see \`$SELF status\`)"
     [ "$PING_MODE" = gui ] ||
