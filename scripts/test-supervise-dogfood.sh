@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=50
+EXPECTED_TOTAL=53
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sup="$root/scripts/supervise-dogfood.sh"
@@ -620,6 +620,39 @@ if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]]; then
   ok "verify exits 4 for the same environment mismatch"
 else
   bad "verify did not exit 4 for an environment mismatch (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== an endpoint path with no verified answer is unverifiable, never stopped"
+cleanup_instances
+mkdir -p "$runtime/slashit-app"
+: >"$socket"
+out=$(sv status 2>&1); st=$?
+if [ "$st" -eq 3 ] && [[ "$out" == *"cannot verify"* ]] && [[ "$out" != *"instance:       stopped"* ]]; then
+  ok "status exits 3 for an endpoint path whose answer cannot be verified (never reports stopped)"
+else
+  bad "status reported a socket with no verified answer as stopped or as success (exit $st)"; printf '%s\n' "$out" >&2
+fi
+out=$(sv verify 2>&1); st=$?
+if [ "$st" -eq 3 ] && [[ "$out" == *"cannot verify"* ]]; then
+  ok "verify exits 3 for the same endpoint path"
+else
+  bad "verify did not exit 3 for an endpoint path with no verified answer (exit $st)"; printf '%s\n' "$out" >&2
+fi
+rm -f "$socket"
+
+echo "== stop --force escalates to signals when there is no CLI"
+out=$(sv start 2>&1); st=$?
+forced_pid=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$forced_pid" ]; then
+  out=$(sv SLASHIT_DOGFOOD_CLI= SLASHIT_DOGFOOD_STOP_TIMEOUT=2 stop --force 2>&1); st=$?
+  if [ "$st" -eq 0 ] && ! kill -0 "$forced_pid" 2>/dev/null; then
+    ok "stop --force without a CLI escalates to signals and ends the instance"
+  else
+    bad "stop --force without a CLI did not end the instance (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "stop --force fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
 fi
 cleanup_instances
 

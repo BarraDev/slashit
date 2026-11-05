@@ -685,7 +685,9 @@ cmd_stop() {
       note "warning: \`slashit quit\` failed; waiting for the process to exit, then escalating"
     fi
   elif [ "$CLI_STATE" != ready ]; then
-    refuse "cannot stop gracefully (no CLI): quitting over the control channel is the only stop that lets the instance end its terminals cleanly — resolve the CLI (beside the binary or through SLASHIT_DOGFOOD_CLI) and rerun, or rerun with --force to escalate to signals right away"
+    [ "$force" -eq 1 ] ||
+      refuse "cannot stop gracefully (no CLI): quitting over the control channel is the only stop that lets the instance end its terminals cleanly — resolve the CLI (beside the binary or through SLASHIT_DOGFOOD_CLI) and rerun, or rerun with --force to escalate to signals right away"
+    note "warning: no CLI; --force escalates straight to signals, without a graceful quit"
   else
     note "warning: pid $pid is alive but does not answer on $ENDPOINT (a process-side hang is possible)"
   fi
@@ -730,6 +732,9 @@ _live_pid() {
 nothing_reachable_text() {
   local msg="nothing found to operate on: no instance answers on $ENDPOINT and the last supervised launch is not alive"
   [ -e "$SOCKET" ] && msg="$msg (the endpoint path $SOCKET exists but is unverified: investigate it first)"
+  if [ "$PING_TIMED_OUT" = 1 ]; then
+    msg="cannot verify: the control channel did not answer within ${CLI_TIMEOUT}s on $ENDPOINT, so the instance is not known to be absent"
+  fi
   printf '%s\n' "$msg"
 }
 
@@ -868,11 +873,16 @@ cmd_status() {
       *) [ "$code" -eq 0 ] && code=3 ;;
     esac
   else
-    if [ "$CLI_STATE" != ready ] || [ "$PING_TIMED_OUT" = 1 ]; then
+    # An endpoint path that exists but has no verified answer is not a stopped
+    # instance: a live process may be behind it (a stale file cannot be told
+    # apart from one without a verified answer), so it is unverifiable.
+    if [ "$CLI_STATE" != ready ] || [ "$PING_TIMED_OUT" = 1 ] || [ -e "$SOCKET" ]; then
       if [ "$PING_TIMED_OUT" = 1 ]; then
         unverifiable="cannot verify (the control channel did not answer within ${CLI_TIMEOUT}s)"
-      else
+      elif [ "$CLI_STATE" != ready ]; then
         unverifiable=$(cannot_verify_text)
+      else
+        unverifiable="cannot verify (the endpoint path $SOCKET exists, but nothing verified answers on it)"
       fi
       echo "instance:       $unverifiable — the endpoint was not checked, so nothing is claimed about it either way"
       _status_record_lines cannot-verify "$rec"
@@ -881,11 +891,7 @@ cmd_status() {
     else
       echo "instance:       stopped"
       _status_record_lines stopped "$rec"
-      if [ -e "$SOCKET" ]; then
-        echo "control channel: the endpoint path $SOCKET exists but nothing answered on it — possibly a stale socket file"
-      else
-        echo "control channel: idle"
-      fi
+      echo "control channel: idle"
       # A live process that does not answer is not "stopped".
       if [ -n "$rec" ] && _process_alive "$rec"; then
         code=1
@@ -906,6 +912,8 @@ cmd_verify() {
   if ! ping_fields; then
     [ "$PING_TIMED_OUT" = 1 ] &&
       exit_with 3 "cannot verify — the control channel did not answer within ${CLI_TIMEOUT}s on $ENDPOINT"
+    [ -e "$SOCKET" ] &&
+      exit_with 3 "cannot verify — the endpoint path $SOCKET exists, but nothing verified answers on it"
     fail "no instance answers on $ENDPOINT"
   fi
   [ "$PING_MODE" = "gui" ] || fail "the endpoint answers with mode '$PING_MODE', expected 'gui'"
