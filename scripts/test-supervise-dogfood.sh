@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=33
+EXPECTED_TOTAL=50
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sup="$root/scripts/supervise-dogfood.sh"
@@ -70,6 +70,9 @@ env >"$stub_dir/environ"
 if [ -n "${SLASHIT_TEST_STARTUP_TOUCH:-}" ]; then
   printf 'boot write\n' >"$SLASHIT_TEST_STARTUP_TOUCH"
 fi
+if [ -n "${SLASHIT_TEST_STARTUP_REMOVE:-}" ]; then
+  rm -f "$SLASHIT_TEST_STARTUP_REMOVE"
+fi
 echo "$$" >"$stub_dir/pid"
 rm -f "$stub_dir/quit"
 touch "$SLASHIT_TEST_SOCKET"
@@ -101,6 +104,9 @@ case $last in
     exit 0
     ;;
   ping)
+    if [ -n "${SLASHIT_TEST_CLI_HANG:-}" ]; then
+      exec sleep 300
+    fi
     if [ -f "$stub_dir/pid" ]; then
       printf '{\n  "mode": "gui",\n  "version": "9.9.9-stub",\n  "protocol_version": 1,\n  "pid": %s,\n  "endpoint": "unix:%s"\n}\n' \
         "$(cat "$stub_dir/pid")" "$SLASHIT_TEST_SOCKET"
@@ -175,7 +181,9 @@ sv() {
       argv+=("$a")
     fi
   done
-  env "${BASEENV[@]}" "${assignments[@]}" bash "$sup" "${argv[@]}"
+  # Every supervisor invocation is bounded: a step that never returns fails
+  # its case with status 124 instead of hanging the whole suite.
+  timeout -k 5 "${SV_TIMEOUT:-120}" env "${BASEENV[@]}" "${assignments[@]}" bash "$sup" "${argv[@]}"
 }
 
 cleanup_instances() {
@@ -189,8 +197,8 @@ stub_pid() {
   cat "$stub_dir/pid" 2>/dev/null || true
 }
 
-expect() { # want <pass|fail|input> <label> <supervisor-output> <status>
-  local want=$1 label=$2 output=$3 status=$4
+expect() { # want <pass|fail|input> <label> <supervisor-output> <status> [reason]
+  local want=$1 label=$2 output=$3 status=$4 reason=${5:-}
   local first=${output%%$'\n'*}
   local self=supervise-dogfood.sh
   case $want in
@@ -200,14 +208,14 @@ expect() { # want <pass|fail|input> <label> <supervisor-output> <status>
       fi
       ;;
     fail)
-      if [ "$status" -eq 1 ]; then
-        case $first in
-          "$self: refusing:"*) ok "$label (refused: ${first#"$self: refusing: "})";;
-          "$self:"*) ok "$label (failed: ${first#"$self: "})";;
-          *) bad "$label: expected a refusal, got: $first"; printf '%s\n' "$output" >&2 ;;
-        esac
+      # A refusal counts only with the reason this case must carry. Any other
+      # exit 1 is a failure, so an unrelated refusal cannot satisfy the case.
+      if [ -z "$reason" ]; then
+        bad "$label: harness error, no expected refusal reason given"
+      elif [ "$status" -eq 1 ] && [[ "$output" == *"$reason"* ]]; then
+        ok "$label (refused: $reason)"
       else
-        bad "$label: expected refusal (exit 1), exited $status"; printf '%s\n' "$output" >&2
+        bad "$label: expected exit 1 with '$reason', exited $status"; printf '%s\n' "$output" >&2
       fi
       ;;
     input)
@@ -278,14 +286,14 @@ else
 fi
 
 echo "== what is said when no CLI is available (instance is live)"
-out=$(sv SLASHIT_DOGFOOD_CLI= status 2>&1)
-if [[ "$out" == *"cannot verify (no CLI)"* ]] && [[ "$out" != *"instance:       stopped"* ]]; then
+out=$(sv SLASHIT_DOGFOOD_CLI= status 2>&1); st=$?
+if [ "$st" -eq 3 ] && [[ "$out" == *"cannot verify (no CLI)"* ]] && [[ "$out" != *"instance:       stopped"* ]]; then
   ok "status without a CLI reports cannot-verify, and never claims the live instance is stopped"
 else
   bad "status without a CLI misreported a live instance: $out"
 fi
 out=$(sv SLASHIT_DOGFOOD_CLI= verify 2>&1); st=$?
-if [ "$st" -eq 1 ] && [[ "$out" == *"cannot verify (no CLI)"* ]]; then
+if [ "$st" -eq 3 ] && [[ "$out" == *"cannot verify (no CLI)"* ]]; then
   ok "verify without a CLI reports cannot-verify instead of no-instance-answers"
 else
   bad "verify without a CLI did not report cannot-verify (exit $st)"; printf '%s\n' "$out" >&2
@@ -375,15 +383,15 @@ out=$(sv stop 2>&1); expect pass "the concurrency winner stops gracefully" "$out
 
 echo "== provenance gates (no instance, so each refusal is its own gate)"
 out=$(sv SLASHIT_DOGFOOD_BINARY="$work/absent/slashit-ui" start 2>&1)
-expect fail "a missing binary is refused" "$out" $?
+expect fail "a missing binary is refused" "$out" $? "the binary is missing"
 printf '#!/usr/bin/env bash\nexit 3\n' >"$work/no-version"
 chmod +x "$work/no-version"
 out=$(sv SLASHIT_DOGFOOD_BINARY="$work/no-version" start 2>&1)
-expect fail "a binary without --version is refused" "$out" $?
+expect fail "a binary without --version is refused" "$out" $? "does not answer --version"
 printf '#!/usr/bin/env bash\nexit 3\n' >"$work/no-version-cli"
 chmod +x "$work/no-version-cli"
 out=$(sv SLASHIT_DOGFOOD_CLI="$work/no-version-cli" start 2>&1)
-expect fail "a CLI without --version is refused (an unverified slashit is not trusted)" "$out" $?
+expect fail "a CLI without --version is refused (an unverified slashit is not trusted)" "$out" $? "does not answer --version"
 
 echo "== a graceful stop that needs --force"
 export SLASHIT_TEST_STUB_ROLE=noquit
@@ -404,7 +412,7 @@ fi
 cleanup_instances
 
 echo "== restart"
-out=$(sv restart 2>&1); expect fail "a restart of a stopped instance is refused" "$out" $?
+out=$(sv restart 2>&1); expect fail "a restart of a stopped instance is refused" "$out" $? "nothing found to operate on"
 
 sv start >/dev/null 2>&1 || { bad "restart fixture: start failed"; }
 before=$(settings_digest)
@@ -444,6 +452,176 @@ else
 fi
 cleanup_instances
 printf 'settings v1\n' >"$state/config/slashit-app/settings.toml"
+
+# A small protected-state fixture: two compared files and two excluded ones.
+make_state() {
+  mkdir -p "$1/config/slashit-app" "$1/data/slashit-app/logs" "$1/data/slashit-app/worktrees"
+  printf 'settings v1\n' >"$1/config/slashit-app/settings.toml"
+  printf 'session 7\n' >"$1/data/slashit-app/board.toml"
+  printf 'transcript\n' >"$1/data/slashit-app/logs/agent.txt"
+  printf 'uncommitted\n' >"$1/data/slashit-app/worktrees/task.txt"
+}
+
+echo "== default discovery: no explicit binary or CLI, inside a git checkout"
+disc=$work/disc
+mkdir -p "$disc/main/target/debug" "$disc/main/scripts"
+cp "$bin_dir/slashit-ui" "$disc/main/target/debug/slashit-ui"
+cp "$stub_dir/slashit" "$disc/main/target/debug/slashit"
+cp "$sup" "$disc/main/scripts/supervise-dogfood.sh"
+git -C "$disc/main" init -q
+git -C "$disc/main" config user.name "Supervise Test"
+git -C "$disc/main" config user.email supervise-test@example.invalid
+git -C "$disc/main" add scripts/supervise-dogfood.sh
+git -C "$disc/main" commit -q -m layout
+d_env=(SLASHIT_DOGFOOD_STATE="$state" SLASHIT_DOGFOOD_RUNTIME="$runtime"
+  XDG_CONFIG_HOME= XDG_DATA_HOME= XDG_CACHE_HOME= XDG_STATE_HOME= XDG_RUNTIME_DIR= GH_CONFIG_DIR=)
+out=$(cd / && env "${d_env[@]}" timeout 60 bash "$disc/main/scripts/supervise-dogfood.sh" env 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qxE "BINARY +$disc/main/target/debug/slashit-ui" <<<"$out" &&
+  grep -qxE "CLI +$disc/main/target/debug/slashit" <<<"$out"; then
+  ok "default discovery finds the binary and the CLI beside it, with no overrides"
+else
+  bad "default discovery did not resolve the checkout layout (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+git -C "$disc/main" worktree add -q "$disc/task" -b task-probe >/dev/null 2>&1
+out=$(cd / && env "${d_env[@]}" timeout 60 bash "$disc/task/scripts/supervise-dogfood.sh" env 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qxE "BINARY +$disc/main/target/debug/slashit-ui" <<<"$out"; then
+  ok "discovery from a linked worktree (the Task Checkout geometry) resolves the main checkout's build"
+else
+  bad "discovery from a linked worktree did not resolve the main checkout (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+rm -f "$disc/main/target/debug/slashit"
+out=$(cd / && env "${d_env[@]}" timeout 60 bash "$disc/main/scripts/supervise-dogfood.sh" status 2>&1); st=$?
+if [ "$st" -eq 3 ] && [[ "$out" == *"cannot verify (no CLI)"* ]]; then
+  ok "without a CLI beside the binary, status exits 3 and says it cannot verify"
+else
+  bad "status without a discovered CLI did not exit 3 (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+echo "== protected state: missing or unprovable evidence refuses before anything is stopped"
+cleanup_instances
+empty=$work/empty-state
+mkdir -p "$empty/config" "$empty/data/slashit-app/logs" "$empty/data/slashit-app/worktrees"
+printf 'log\n' >"$empty/data/slashit-app/logs/agent.txt"
+printf 'wt\n' >"$empty/data/slashit-app/worktrees/task.txt"
+out=$(sv SLASHIT_DOGFOOD_STATE="$empty" start 2>&1); st=$?
+[ "$st" -eq 0 ] || { bad "empty-set fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2; }
+out=$(sv SLASHIT_DOGFOOD_STATE="$empty" restart 2>&1); st=$?
+still=$(stub_pid)
+if [ "$st" -eq 1 ] && [[ "$out" == *"cannot be verified"* ]] && [ -n "$still" ] && kill -0 "$still" 2>/dev/null; then
+  ok "a restart with no compared files is refused, and the running instance is left untouched"
+else
+  bad "a restart with no compared files was not refused before stopping (exit $st, pid '$still')"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+unread=$work/unread-state
+make_state "$unread"
+if [ "$(id -u)" -eq 0 ]; then
+  bad "the unreadable-file case needs a non-root runner (root reads every file)"
+else
+  out=$(sv SLASHIT_DOGFOOD_STATE="$unread" start 2>&1); st=$?
+  [ "$st" -eq 0 ] || { bad "unreadable fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2; }
+  chmod 000 "$unread/config/slashit-app/settings.toml"
+  out=$(sv SLASHIT_DOGFOOD_STATE="$unread" restart 2>&1); st=$?
+  chmod 600 "$unread/config/slashit-app/settings.toml"
+  still=$(stub_pid)
+  if [ "$st" -eq 1 ] && [[ "$out" == *"cannot be verified"* ]] && [[ "$out" == *"Permission denied"* ]] &&
+    [ -n "$still" ] && kill -0 "$still" 2>/dev/null; then
+    ok "an unreadable compared file is refused with its cause, before the instance is stopped"
+  else
+    bad "an unreadable compared file was not refused before stopping (exit $st, pid '$still')"; printf '%s\n' "$out" >&2
+  fi
+fi
+cleanup_instances
+
+rmst=$work/rm-state
+make_state "$rmst"
+out=$(sv SLASHIT_DOGFOOD_STATE="$rmst" start 2>&1); st=$?
+[ "$st" -eq 0 ] || { bad "removal fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2; }
+out=$(sv SLASHIT_DOGFOOD_STATE="$rmst" SLASHIT_TEST_STARTUP_REMOVE="$rmst/config/slashit-app/settings.toml" restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"state files changed during the restart"* ]] && [[ "$out" == *"settings.toml"* ]]; then
+  ok "a protected file removed at boot is refused as a restart divergence, and named"
+else
+  bad "a protected file removed at boot was not refused (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+expect fail "a relative state base is refused, not resolved against the caller's directory" \
+  "$(sv SLASHIT_DOGFOOD_STATE=relative/state start 2>&1)" $? "must be an absolute path"
+
+gone=$work/gone-state
+make_state "$gone"
+out=$(sv SLASHIT_DOGFOOD_STATE="$gone" start 2>&1); st=$?
+[ "$st" -eq 0 ] || { bad "missing-directory fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2; }
+rm -rf "$gone/config"
+out=$(sv SLASHIT_DOGFOOD_STATE="$gone" restart 2>&1); st=$?
+still=$(stub_pid)
+if [ "$st" -eq 1 ] && [[ "$out" == *"cannot be verified"* ]] && [ -n "$still" ] && kill -0 "$still" 2>/dev/null; then
+  ok "a protected directory missing before a restart is refused, and the running instance is left untouched"
+else
+  bad "a missing protected directory was not refused before stopping (exit $st, pid '$still')"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== status and verify follow the documented exit contract"
+out=$(sv status 2>&1); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"instance:       stopped"* ]]; then
+  ok "status exits 0 and reports stopped when nothing runs"
+else
+  bad "status did not report a clean stop (exit $st)"; printf '%s\n' "$out" >&2
+fi
+out=$(sv verify 2>&1); expect fail "verify exits 1 when no instance answers" "$out" $? "no instance answers"
+out=$(sv start 2>&1); st=$?
+[ "$st" -eq 0 ] || { bad "exit-contract fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2; }
+out=$(sv status 2>&1); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"running (pid"* ]]; then
+  ok "status exits 0 for a running and verified instance"
+else
+  bad "status did not exit 0 for a running instance (exit $st)"; printf '%s\n' "$out" >&2
+fi
+out=$(sv verify 2>&1); expect pass "verify exits 0 for a running and verified instance" "$out" $?
+out=$(sv SLASHIT_DOGFOOD_CLI= status 2>&1); st=$?
+if [ "$st" -eq 3 ] && [[ "$out" == *"cannot verify (no CLI)"* ]]; then
+  ok "status exits 3 when the endpoint is unverifiable (no CLI)"
+else
+  bad "status without a CLI did not exit 3 (exit $st)"; printf '%s\n' "$out" >&2
+fi
+out=$(sv SLASHIT_DOGFOOD_CLI= verify 2>&1); st=$?
+if [ "$st" -eq 3 ] && [[ "$out" == *"cannot verify (no CLI)"* ]]; then
+  ok "verify exits 3 when the endpoint is unverifiable (no CLI)"
+else
+  bad "verify without a CLI did not exit 3 (exit $st)"; printf '%s\n' "$out" >&2
+fi
+t0=$SECONDS
+out=$(sv SLASHIT_TEST_CLI_HANG=1 SLASHIT_DOGFOOD_CLI_TIMEOUT=2 status 2>&1); st=$?
+elapsed=$((SECONDS - t0))
+if [ "$st" -eq 3 ] && [[ "$out" == *"did not answer within 2s"* ]] && [ "$elapsed" -lt 30 ]; then
+  ok "a hung control channel is bounded (${elapsed}s) and reported as unverifiable, exit 3"
+else
+  bad "a hung control channel was not bounded and reported (exit $st, ${elapsed}s)"; printf '%s\n' "$out" >&2
+fi
+out=$(sv stop 2>&1); st=$?
+[ "$st" -eq 0 ] || { bad "exit-contract fixture: graceful stop failed (exit $st)"; printf '%s\n' "$out" >&2; }
+env XDG_CONFIG_HOME="$work/not-declared/config" XDG_DATA_HOME="$state/data" XDG_CACHE_HOME="$state/cache" \
+  XDG_STATE_HOME="$state" XDG_RUNTIME_DIR="$runtime" GH_CONFIG_DIR="$HOME/.config/gh" \
+  SLASHIT_TEST_STUB_DIR="$stub_dir" SLASHIT_TEST_SOCKET="$socket" \
+  "$bin_dir/slashit-ui" >"$work/mismatch.log" 2>&1 &
+for _ in $(seq 100); do [ -s "$stub_dir/pid" ] && break; sleep 0.05; done
+out=$(sv status 2>&1); st=$?
+if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]]; then
+  ok "status exits 4 for a live instance whose environment differs from the declaration"
+else
+  bad "status did not exit 4 for an environment mismatch (exit $st)"; printf '%s\n' "$out" >&2
+fi
+out=$(sv verify 2>&1); st=$?
+if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]]; then
+  ok "verify exits 4 for the same environment mismatch"
+else
+  bad "verify did not exit 4 for an environment mismatch (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
 
 echo
 if [ "$((passed + failed))" -ne "$EXPECTED_TOTAL" ]; then

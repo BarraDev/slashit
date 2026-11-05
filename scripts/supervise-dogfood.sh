@@ -34,16 +34,14 @@
 #
 #   scripts/supervise-dogfood.sh status
 #       Report PID, binary path, binary-provenance commit and endpoint, and
-#       whether the control channel and the environment verify. Exits 0 both
-#       when the instance is running and when it is stopped. If the endpoint
-#       cannot be verified because the CLI is missing or unverified, it says
-#       so truthfully and makes no claim either way.
+#       whether the control channel and the environment verify. Exit codes are
+#       listed under "Exit status" below. It says "cannot verify" when the CLI
+#       is missing or unverified, and never claims a state it could not check.
 #
 #   scripts/supervise-dogfood.sh verify
 #       Endpoint verification only: ping the control socket, compare the
 #       answering PID and endpoint with the declaration, and verify the live
-#       environment. Exits 0 only when everything checks out; reports
-#       "cannot verify (no CLI)" when no verified CLI is available.
+#       environment. Exits 0 only when everything checks out.
 #
 #   scripts/supervise-dogfood.sh stop [--force]
 #       Ask the instance to shut down over the control channel (graceful, and
@@ -102,8 +100,22 @@
 #   SLASHIT_DOGFOOD_START_TIMEOUT  seconds to wait for the control socket
 #   SLASHIT_DOGFOOD_STOP_TIMEOUT   seconds to wait for a graceful quit
 #   SLASHIT_DOGFOOD_FORCE_TIMEOUT  seconds between SIGTERM and SIGKILL
+#   SLASHIT_DOGFOOD_CLI_TIMEOUT    seconds before a CLI call (--version, ping,
+#                                   quit) is abandoned
 #
-# Exit status: 0 success, 1 refusal or failure, 2 usage error.
+# Exit status. This is the contract for every verb; no other codes are used.
+#   0  success. status: running and verified, or stopped. verify: running and
+#      verified. start, run, stop and restart: the action completed.
+#   1  refusal or failure. verify: no instance answers, the mode or endpoint
+#      differs from the declaration, or the launch record names another pid.
+#      status: a running instance that is not as declared (a stale record, a
+#      different endpoint, or a live process that does not answer).
+#   2  usage error.
+#   3  unverifiable: the CLI is missing or does not answer, the control channel
+#      did not answer within SLASHIT_DOGFOOD_CLI_TIMEOUT, or the live process
+#      environment cannot be read. Nothing is claimed about the instance.
+#   4  environment mismatch: a live instance whose process environment differs
+#      from the declared XDG_* and GH_CONFIG_DIR values. Do not trust its writes.
 
 set -uo pipefail
 export LC_ALL=C
@@ -135,6 +147,10 @@ GH_CONFIG=${SLASHIT_DOGFOOD_GH_CONFIG:-"$HOME/.config/gh"}
 START_TIMEOUT=${SLASHIT_DOGFOOD_START_TIMEOUT:-90}
 STOP_TIMEOUT=${SLASHIT_DOGFOOD_STOP_TIMEOUT:-180}
 FORCE_TIMEOUT=${SLASHIT_DOGFOOD_FORCE_TIMEOUT:-15}
+CLI_TIMEOUT=${SLASHIT_DOGFOOD_CLI_TIMEOUT:-15}
+# Set by ping_fields: a ping abandoned at CLI_TIMEOUT is an unverifiable
+# endpoint, not an absent instance.
+PING_TIMED_OUT=0
 
 # One declared location ------------------------------------------------------
 # The workspace checkout this script belongs to holds the dogfood binary and
@@ -145,14 +161,14 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 repo_checkout() {
   local common top
-  common=$(git -C "$script_dir" --path-format=absolute rev-parse --git-common-dir 2>/dev/null) || common=
+  common=$(git -C "$script_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=
   if [ -n "$common" ] && [ "$(basename "$common")" = .git ]; then
     dirname "$common"
     return 0
   fi
   # Not a linked worktree and not a plain clone layout: the checkout is
   # whatever toplevel the script's directory belongs to, if any.
-  top=$(git -C "$script_dir" --path-format=absolute rev-parse --show-toplevel 2>/dev/null) || return 1
+  top=$(git -C "$script_dir" rev-parse --path-format=absolute --show-toplevel 2>/dev/null) || return 1
   printf '%s\n' "$top"
 }
 
@@ -200,6 +216,11 @@ refuse() {
 # derived from the real HOME here, exactly the way the application and the
 # shell would derive them, and any match is a refusal.
 env_gates() {
+  # Relative paths resolve against whatever directory the caller is in, and a
+  # detached child resolves them after its own cd. Only absolute paths are
+  # meaningful for the isolated state and the runtime socket.
+  case $STATE_BASE in /*) ;; *) refuse "SLASHIT_DOGFOOD_STATE must be an absolute path ('$STATE_BASE')" ;; esac
+  case $RUNTIME_BASE in /*) ;; *) refuse "SLASHIT_DOGFOOD_RUNTIME must be an absolute path ('$RUNTIME_BASE')" ;; esac
   case $STATE_BASE in
     "" | "$HOME") refuse "the state base ('$STATE_BASE') isolates nothing" ;;
   esac
@@ -239,7 +260,7 @@ resolve_cli() {
 cli_state() {
   CLI_STATE=no
   [ -n "$CLI_BIN" ] || return 0
-  if "$CLI_BIN" --version >/dev/null 2>&1; then
+  if timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --version >/dev/null 2>&1; then
     CLI_STATE=ready
   else
     CLI_STATE=broken
@@ -256,7 +277,9 @@ cannot_verify_text() {
 # What the endpoint check can honestly say right now, for messages about a
 # socket path whose answer is unverified.
 verification_state_text() {
-  if [ "$CLI_STATE" = ready ]; then
+  if [ "$PING_TIMED_OUT" = 1 ]; then
+    echo "the control channel did not answer within ${CLI_TIMEOUT}s"
+  elif [ "$CLI_STATE" = ready ]; then
     echo "the CLI is verified but no instance answered on it"
   else
     cannot_verify_text
@@ -284,14 +307,23 @@ ping_json_field() { # key, JSON on stdin
   return 1
 }
 
-# On success sets PING_MODE, PING_PID, PING_VERSION, PING_ENDPOINT.
+# On success sets PING_MODE, PING_PID, PING_VERSION, PING_ENDPOINT. A ping
+# abandoned at CLI_TIMEOUT sets PING_TIMED_OUT, so the caller can report
+# "unverifiable" rather than "no instance".
 ping_fields() {
+  PING_TIMED_OUT=0
   # A CLI that failed its provenance gate must not become trusted merely
   # because a later invocation happens to print a plausible reply.
   [ "$CLI_STATE" = ready ] || return 1
   [ -n "$CLI_BIN" ] || return 1
-  local out
-  out=$("$CLI_BIN" --endpoint "$ENDPOINT" --json ping 2>/dev/null) || return 1
+  local out rc
+  out=$(timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" --json ping 2>/dev/null)
+  rc=$?
+  case $rc in
+    0) ;;
+    124 | 137) PING_TIMED_OUT=1; return 1 ;;
+    *) return 1 ;;
+  esac
   PING_MODE=$(printf '%s\n' "$out" | ping_json_field mode) || return 1
   PING_PID=$(printf '%s\n' "$out" | ping_json_field pid) || return 1
   PING_VERSION=$(printf '%s\n' "$out" | ping_json_field version) || return 1
@@ -369,27 +401,42 @@ env_verdict() {
 #                                           regenerable; they are not compared
 #                                           and not backed up
 # The backup copies exactly this set, so a restore means copying the files the
-# manifest lists. A missing base degrades to an empty comparison, which the
-# restart check reports as a divergence instead of silently passing.
+# manifest lists. The evidence is fail-closed: a base that is missing or cannot
+# be traversed, an unreadable or unchecksummable file, or an empty compared set
+# is an error. Nothing here treats missing evidence as an empty, matching set.
+PROTECTED_EXCLUDES=(
+  ! -path 'data/slashit-app/logs/*'
+  ! -path 'data/slashit-app/pr-helper-logs/*'
+  ! -path 'data/slashit-app/terminal_sessions.toml'
+  ! -path 'data/slashit-app/worktrees/*'
+)
+
+# NUL-terminated paths of the compared set, relative to BASE. Fails when BASE
+# is not a directory or any part of the traversal fails.
 state_file_list() {
+  [ -d "$1" ] || { echo "protected state: $1 is not a directory" >&2; return 1; }
   (
-    cd "$1" 2>/dev/null || exit 0
-    find config data -type f \
-      ! -path 'data/slashit-app/logs/*' \
-      ! -path 'data/slashit-app/pr-helper-logs/*' \
-      ! -path 'data/slashit-app/terminal_sessions.toml' \
-      ! -path 'data/slashit-app/worktrees/*' \
-      -print0 2>/dev/null
+    cd "$1" || exit 1
+    find config data -type f "${PROTECTED_EXCLUDES[@]}" -print0
   )
 }
 
-# Paths are relative to the snapshotted base, so a state tree and its backup
-# copy produce comparable lines; the checksums must run from inside the base.
+# The sha256 manifest of the compared set under BASE, one line per file, sorted
+# with the C locale so that a state tree and its backup copy compare equal. The
+# checksums run from inside BASE, so the caller's working directory is
+# irrelevant. Every failure is reported on stderr and returns 1; an empty set
+# is a failure too, because it proves nothing about the state.
 state_snapshot() {
-  (
-    cd "$1" 2>/dev/null || exit 0
-    state_file_list "$1" | LC_ALL=C sort -z | xargs -0 -r sha256sum 2>/dev/null
-  )
+  local base=$1 out sorted
+  [ -d "$base" ] || { echo "protected state: $base is not a directory" >&2; return 1; }
+  out=$(
+    cd "$base" || exit 1
+    find config data -type f "${PROTECTED_EXCLUDES[@]}" -exec sha256sum -- {} +
+  ) || { echo "protected state: cannot read or checksum the compared files under $base (see the error above)" >&2; return 1; }
+  [ -n "$out" ] || { echo "protected state: no compared files under $base, so there is no evidence to verify" >&2; return 1; }
+  sorted=$(printf '%s\n' "$out" | LC_ALL=C sort) ||
+    { echo "protected state: cannot sort the manifest for $base" >&2; return 1; }
+  printf '%s\n' "$sorted"
 }
 
 # Advisory lock on the supervisor's own directory: start, run, stop and
@@ -433,7 +480,7 @@ cmd_start() {
   # and is refused, not raced against.
   if ping_fields; then
     refuse "an instance already answers on $ENDPOINT (pid $PING_PID, mode $PING_MODE); a second instance is not permitted"
-  elif [ -e "$SOCKET" ]; then
+  elif [ "$PING_TIMED_OUT" = 1 ] || [ -e "$SOCKET" ]; then
     refuse "the endpoint path $SOCKET exists but nothing could be verified on it ($(verification_state_text)); the socket file may be stale or the endpoint may be alive without a verified CLI — run \`$SELF status\` and resolve that before starting anything"
   fi
   local rec
@@ -567,7 +614,7 @@ EOF
   # instance the service manager does not know about.
   if ping_fields; then
     refuse "an instance already answers on $ENDPOINT (pid $PING_PID, mode $PING_MODE); a second instance is not permitted"
-  elif [ -e "$SOCKET" ]; then
+  elif [ "$PING_TIMED_OUT" = 1 ] || [ -e "$SOCKET" ]; then
     refuse "the endpoint path $SOCKET exists but nothing could be verified on it ($(verification_state_text)); resolve that (see \`$SELF status\`) before the unit may start"
   fi
   local rec
@@ -634,7 +681,7 @@ cmd_stop() {
     if [ -z "$(record_field pid || true)" ]; then
       note "note: pid $pid was not started by this supervisor; stopping it anyway"
     fi
-    if ! "$CLI_BIN" --endpoint "$ENDPOINT" quit >/dev/null 2>&1; then
+    if ! timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" quit >/dev/null 2>&1; then
       note "warning: \`slashit quit\` failed; waiting for the process to exit, then escalating"
     fi
   elif [ "$CLI_STATE" != ready ]; then
@@ -693,21 +740,31 @@ nothing_reachable_text() {
 write_backup() {
   local stamp=$(date +%Y%m%d-%H%M%S)-$$
   local dir=$SUP_DIR/backup/$stamp
-  [ -d "$STATE_BASE/config" ] || [ -d "$STATE_BASE/data" ] ||
-    fail "no state directories to back up under $STATE_BASE; not backing up an empty tree"
-  mkdir -p "$dir"
-  (
-    cd "$STATE_BASE" 2>/dev/null || exit 0
-    state_file_list "$STATE_BASE" | while IFS= read -r -d '' rel; do
-      mkdir -p "$dir/$(dirname "$rel")"
-      cp -p -- "$STATE_BASE/$rel" "$dir/$rel"
-    done
-  )
-  local snap=$dir/manifest.sha256
-  state_snapshot "$STATE_BASE" >"$snap"
-  if ! diff -q "$snap" <(state_snapshot "$dir") >/dev/null 2>&1; then
-    fail "the state backup at $dir does not verify against its manifest; restart abandoned and no new instance was started"
+  local list=$SUP_DIR/backup-list.$$
+  local rel snap=$dir/manifest.sha256 copy=$dir/copy.sha256
+  # The evidence comes first: nothing is copied unless the compared set can be
+  # read and checksummed in full. A failure here is a refusal, not an empty
+  # backup that later verifies against an empty manifest.
+  state_snapshot "$STATE_BASE" >/dev/null ||
+    fail "the protected state under $STATE_BASE cannot be verified, so no backup was taken; the instance is stopped, start it deliberately after fixing the state"
+  mkdir -p "$dir" || fail "cannot create the backup directory $dir"
+  state_file_list "$STATE_BASE" >"$list" ||
+    { rm -rf "$dir" "$list"; fail "cannot list the protected state under $STATE_BASE; no backup was taken"; }
+  while IFS= read -r -d '' rel; do
+    mkdir -p "$dir/$(dirname "$rel")" ||
+      { rm -rf "$dir" "$list"; fail "cannot create $dir/$(dirname "$rel") for the backup"; }
+    cp -p -- "$STATE_BASE/$rel" "$dir/$rel" ||
+      { rm -rf "$dir" "$list"; fail "cannot copy $rel into the backup; no backup was kept"; }
+  done <"$list"
+  rm -f "$list"
+  state_snapshot "$STATE_BASE" >"$snap" ||
+    { rm -rf "$dir"; fail "cannot take the protected-state manifest; no backup was kept"; }
+  state_snapshot "$dir" >"$copy" ||
+    fail "the backup copy under $dir cannot be verified against its manifest; it is kept for inspection"
+  if ! cmp -s "$snap" "$copy"; then
+    fail "the backup copy under $dir does not match its manifest; it is kept for inspection"
   fi
+  rm -f "$copy"
   ls -1d "$SUP_DIR"/backup/[0-9]* 2>/dev/null | head -n -5 | while read -r old; do
     rm -rf "$old"
   done
@@ -723,6 +780,10 @@ cmd_restart() {
   if ! ping_fields; then
     note "warning: pid $pid does not answer on $ENDPOINT; the backup and the restart proceed from state on disk"
   fi
+  # Refuse before anything is stopped when the protected state cannot be proven
+  # now. A restart that cannot verify its own state does not start.
+  state_snapshot "$STATE_BASE" >/dev/null ||
+    refuse "the protected state cannot be verified now, so the instance was not stopped (see the reason above)"
   note "controlled restart of pid $pid on $ENDPOINT"
   cmd_stop
 
@@ -734,7 +795,8 @@ cmd_restart() {
   cmd_start
 
   local after=$backup/after.sha256
-  state_snapshot "$STATE_BASE" >"$after"
+  state_snapshot "$STATE_BASE" >"$after" ||
+    fail "the instance was restarted, but the protected state cannot be verified afterwards; the backup is $backup"
   if ! cmp -s "$after" "$backup/manifest.sha256"; then
     diff <(sort "$backup/manifest.sha256") <(sort "$after") |
       grep '^[<>]' | head -n 20 | sed 's/^/    /' >&2 || true
@@ -763,8 +825,16 @@ _status_record_lines() {
   fi
 }
 
+# Exit with a documented code (see "Exit status" at the top) and say why.
+exit_with() { # code, message...
+  local code=$1
+  shift
+  echo "$SELF: $*" >&2
+  exit "$code"
+}
+
 cmd_status() {
-  local rec
+  local rec code=0 unverifiable
   rec=$(record_field pid || true)
 
   if ping_fields; then
@@ -776,6 +846,7 @@ cmd_status() {
       echo "record:         started $(record_field started_at), pid $rec"
       if [ "$rec" != "$PING_PID" ]; then
         echo "record:         STALE — it names pid $rec, the endpoint is served by pid $PING_PID"
+        code=1
       fi
     else
       echo "binary:         unknown (the running instance was not started by this supervisor)"
@@ -789,11 +860,24 @@ cmd_status() {
     fi
     verify_env "$PING_PID"
     env_verdict
+    # Precedence: a record or endpoint that is not as declared (1) before a
+    # mismatched environment (4) before an unreadable one (3).
+    case $ENV_CHECK in
+      0) ;;
+      1) [ "$code" -eq 0 ] && code=4 ;;
+      *) [ "$code" -eq 0 ] && code=3 ;;
+    esac
   else
-    if [ "$CLI_STATE" != ready ]; then
-      echo "instance:       $(cannot_verify_text) — the endpoint was not checked, so nothing is claimed about it either way"
+    if [ "$CLI_STATE" != ready ] || [ "$PING_TIMED_OUT" = 1 ]; then
+      if [ "$PING_TIMED_OUT" = 1 ]; then
+        unverifiable="cannot verify (the control channel did not answer within ${CLI_TIMEOUT}s)"
+      else
+        unverifiable=$(cannot_verify_text)
+      fi
+      echo "instance:       $unverifiable — the endpoint was not checked, so nothing is claimed about it either way"
       _status_record_lines cannot-verify "$rec"
-      echo "control channel: $(cannot_verify_text)"
+      echo "control channel: $unverifiable"
+      code=3
     else
       echo "instance:       stopped"
       _status_record_lines stopped "$rec"
@@ -802,19 +886,28 @@ cmd_status() {
       else
         echo "control channel: idle"
       fi
+      # A live process that does not answer is not "stopped".
+      if [ -n "$rec" ] && _process_alive "$rec"; then
+        code=1
+      fi
     fi
     echo "endpoint:       $ENDPOINT"
     echo "binary:         ${BINARY:-"unresolved (set SLASHIT_DOGFOOD_BINARY)"}"
     echo "commit:         unknown"
   fi
+  exit "$code"
 }
 
 cmd_verify() {
   case $CLI_STATE in
-    no) fail "cannot verify (no CLI) — set SLASHIT_DOGFOOD_CLI (or keep the CLI beside the binary) to check the endpoint; without it nothing is claimed here" ;;
-    broken) fail "cannot verify — the CLI does not answer --version ($CLI_BIN); an unverified slashit is not trusted for the endpoint" ;;
+    no) exit_with 3 "cannot verify (no CLI) — set SLASHIT_DOGFOOD_CLI (or keep the CLI beside the binary) to check the endpoint; without it nothing is claimed here" ;;
+    broken) exit_with 3 "cannot verify — the CLI does not answer --version ($CLI_BIN); an unverified slashit is not trusted for the endpoint" ;;
   esac
-  ping_fields || fail "no instance answers on $ENDPOINT"
+  if ! ping_fields; then
+    [ "$PING_TIMED_OUT" = 1 ] &&
+      exit_with 3 "cannot verify — the control channel did not answer within ${CLI_TIMEOUT}s on $ENDPOINT"
+    fail "no instance answers on $ENDPOINT"
+  fi
   [ "$PING_MODE" = "gui" ] || fail "the endpoint answers with mode '$PING_MODE', expected 'gui'"
   printf 'ping:           mode %s, pid %s, version %s, endpoint %s\n' "$PING_MODE" "$PING_PID" "$PING_VERSION" "$PING_ENDPOINT"
   [ "${PING_ENDPOINT#unix:}" = "$SOCKET" ] ||
@@ -827,7 +920,11 @@ cmd_verify() {
   fi
   verify_env "$PING_PID"
   env_verdict
-  [ "$ENV_CHECK" -eq 0 ]
+  case $ENV_CHECK in
+    0) exit 0 ;;
+    1) exit 4 ;; # environment mismatch
+    *) exit 3 ;; # the process environment cannot be read
+  esac
 }
 
 env_gates
