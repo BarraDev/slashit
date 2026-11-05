@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=56
+EXPECTED_TOTAL=57
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sup="$root/scripts/supervise-dogfood.sh"
@@ -692,6 +692,15 @@ else
   bad "hung-channel fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
 fi
 cleanup_instances
+
+echo "== with no launch record, a control channel that does not answer is still unverifiable, not absent"
+cleanup_instances
+out=$(sv SLASHIT_TEST_CLI_HANG=1 SLASHIT_DOGFOOD_CLI_TIMEOUT=2 stop 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"did not answer within 2s"* ]] && [[ "$out" != *"nothing found"* ]]; then
+  ok "stop with no record and a hung channel says it cannot verify, not that nothing is running"
+else
+  bad "stop with no record and a hung channel did not report an unverifiable channel (exit $st)"; printf '%s\n' "$out" >&2
+fi
 
 echo "== a restart that could not start again is refused before the instance is stopped"
 out=$(sv start 2>&1); st=$?
