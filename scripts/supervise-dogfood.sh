@@ -469,6 +469,29 @@ ENDPOINT         $ENDPOINT
 EOF
 }
 
+# The provenance gates a launch must pass before anything is stopped or started:
+# a verified CLI beside the binary and a binary that answers --version. Sets
+# version_line. start runs them; restart runs them before it stops the instance,
+# so a restart that could not start again is refused while the instance is up.
+launch_gates() {
+  [ -n "$CLI_BIN" ] ||
+    refuse "cannot verify the endpoint: no \`slashit\` CLI is available (it normally sits beside the binary; set SLASHIT_DOGFOOD_CLI) — a launch refuses an unverified control channel"
+  if [ "$CLI_STATE" != ready ]; then
+    refuse "$(cannot_verify_text) — a launch refuses an unverified CLI; resolve it beside the binary or through SLASHIT_DOGFOOD_CLI"
+  fi
+  [ -n "$BINARY" ] ||
+    refuse "the binary location is unresolved: no workspace checkout was found next to this script (set SLASHIT_DOGFOOD_BINARY to point at slashit-ui)"
+  [ -f "$BINARY" ] || refuse "the binary is missing: $BINARY"
+  [ -x "$BINARY" ] || refuse "the binary is not executable: $BINARY"
+  # One bounded call: its status is the gate, its output the version.
+  local out
+  out=$(timeout -k 2 "$CLI_TIMEOUT" "$BINARY" --version 2>/dev/null) ||
+    refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
+  version_line=$(printf '%s\n' "$out" | head -n 1)
+  [ -n "$version_line" ] || refuse "the binary answers --version with nothing; refusing it: $BINARY"
+  command -v setsid >/dev/null 2>&1 || refuse "setsid is required to detach the instance"
+}
+
 cmd_start() {
   env_gates
   [ -n "$HOME" ] || fail "HOME is not set"
@@ -489,24 +512,8 @@ cmd_start() {
     refuse "the process of the last supervised launch (pid $rec) is still alive but does not answer on $ENDPOINT; run \`$SELF status\`, then \`$SELF stop --force\`"
   fi
 
-  # Provenance gates. The CLI first: it is what will verify the instance, so
-  # an unverified slashit is never trusted for the ping. Then the binary.
-  [ -n "$CLI_BIN" ] ||
-    refuse "cannot verify the endpoint: no \`slashit\` CLI is available (it normally sits beside the binary; set SLASHIT_DOGFOOD_CLI) — a start refuses an unverified control channel"
-  if [ "$CLI_STATE" != ready ]; then
-    refuse "$(cannot_verify_text) — a start refuses an unverified CLI; resolve it beside the binary or through SLASHIT_DOGFOOD_CLI"
-  fi
-  [ -n "$BINARY" ] ||
-    refuse "the binary location is unresolved: no workspace checkout was found next to this script (set SLASHIT_DOGFOOD_BINARY to point at slashit-ui)"
-  [ -f "$BINARY" ] || refuse "the binary is missing: $BINARY"
-  [ -x "$BINARY" ] || refuse "the binary is not executable: $BINARY"
-  # The gate itself, separate from the capture: a pipe would turn the
-  # binary's own exit status into the tail's status.
-  "$BINARY" --version >/dev/null 2>&1 ||
-    refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
-  version_line=$("$BINARY" --version 2>/dev/null | head -n 1)
-  [ -n "$version_line" ] || refuse "the binary answers --version with nothing; refusing it: $BINARY"
-  command -v setsid >/dev/null 2>&1 || refuse "setsid is required to detach the instance"
+  # Provenance gates: the CLI first (it verifies the instance), then the binary.
+  launch_gates
 
   mkdir -p "$STATE_BASE/config" "$STATE_BASE/data" "$STATE_BASE/cache" "$SUP_DIR" 2>/dev/null
   mkdir -p "$RUNTIME_BASE" 2>/dev/null
@@ -627,10 +634,8 @@ EOF
     refuse "the binary location is unresolved: no workspace checkout was found next to this script (set SLASHIT_DOGFOOD_BINARY in the ExecStart environment)"
   [ -f "$BINARY" ] || refuse "the binary is missing: $BINARY"
   [ -x "$BINARY" ] || refuse "the binary is not executable: $BINARY"
-  "$BINARY" --version >/dev/null 2>&1 ||
-    refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
-  version_line=$("$BINARY" --version 2>/dev/null | head -n 1)
-  [ -n "$version_line" ] || refuse "the binary answers --version with nothing; refusing it: $BINARY"
+  version_line=$(timeout -k 2 "$CLI_TIMEOUT" "$BINARY" --version 2>/dev/null | head -n 1)
+  [ -n "$version_line" ] || refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
 
   mkdir -p "$STATE_BASE/config" "$STATE_BASE/data" "$STATE_BASE/cache" "$SUP_DIR" "$RUNTIME_BASE" 2>/dev/null
   chmod 700 "$STATE_BASE" "$RUNTIME_BASE" 2>/dev/null
@@ -672,11 +677,12 @@ EOF
 }
 
 cmd_stop() {
-  local pid
-  pid=$(_live_pid)
+  local pid=""
+  _live_pid && pid=$LIVE_PID
   if [ -z "$pid" ]; then
     fail "$(nothing_reachable_text) — nothing to stop"
   fi
+  local graceful=1
   if ping_fields; then
     if [ -z "$(record_field pid || true)" ]; then
       note "note: pid $pid was not started by this supervisor; stopping it anyway"
@@ -684,15 +690,24 @@ cmd_stop() {
     if ! timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" quit >/dev/null 2>&1; then
       note "warning: \`slashit quit\` failed; waiting for the process to exit, then escalating"
     fi
-  elif [ "$CLI_STATE" != ready ]; then
-    [ "$force" -eq 1 ] ||
+  elif [ "$CLI_STATE" != ready ] || [ "$PING_TIMED_OUT" = 1 ]; then
+    # No graceful quit can be attempted: no verified CLI, or a control channel
+    # that did not answer in time. Only --force may end the process then.
+    graceful=0
+    if [ "$force" -eq 0 ]; then
+      if [ "$PING_TIMED_OUT" = 1 ]; then
+        refuse "cannot verify — the control channel did not answer within ${CLI_TIMEOUT}s, so a graceful quit cannot be attempted; rerun with --force to escalate to signals"
+      fi
       refuse "cannot stop gracefully (no CLI): quitting over the control channel is the only stop that lets the instance end its terminals cleanly — resolve the CLI (beside the binary or through SLASHIT_DOGFOOD_CLI) and rerun, or rerun with --force to escalate to signals right away"
-    note "warning: no CLI; --force escalates straight to signals, without a graceful quit"
+    fi
+    note "warning: no graceful quit is possible; --force escalates straight to signals"
   else
     note "warning: pid $pid is alive but does not answer on $ENDPOINT (a process-side hang is possible)"
   fi
 
-  local deadline=$((SECONDS + STOP_TIMEOUT))
+  local wait_s=$STOP_TIMEOUT
+  [ "$graceful" -eq 1 ] || wait_s=0
+  local deadline=$((SECONDS + wait_s))
   while _process_alive "$pid" && [ "$SECONDS" -lt "$deadline" ]; do
     sleep 0.25
   done
@@ -716,17 +731,30 @@ cmd_stop() {
   else
     note "pid $pid stopped gracefully"
   fi
+  # The launch this supervisor recorded has ended, so a socket it left behind
+  # can no longer be held by anyone. Only that socket is removed; a socket the
+  # record does not name stays, and stays unverifiable.
+  if [ -e "$SOCKET" ] && [ "$(record_field pid || true)" = "$pid" ] && ! _process_alive "$pid"; then
+    rm -f "$SOCKET"
+    note "removed the socket left by the launch this supervisor ended"
+  fi
   rm -f "$RECORD"
 }
 
+# Sets LIVE_PID to the pid answering on the endpoint, or else the live pid of
+# the last supervised launch, and returns 0 when there is one. It runs in the
+# caller's shell (no command substitution), so PING_TIMED_OUT from its ping
+# reaches the caller's refusal text.
 _live_pid() {
+  LIVE_PID=
   if ping_fields; then
-    printf '%s\n' "$PING_PID"
+    LIVE_PID=$PING_PID
     return 0
   fi
   local rec
   rec=$(record_field pid) || return 1
-  _process_alive "$rec" && printf '%s\n' "$rec"
+  _process_alive "$rec" && LIVE_PID=$rec
+  [ -n "$LIVE_PID" ]
 }
 
 nothing_reachable_text() {
@@ -777,8 +805,8 @@ write_backup() {
 }
 
 cmd_restart() {
-  local pid
-  pid=$(_live_pid)
+  local pid=""
+  _live_pid && pid=$LIVE_PID
   if [ -z "$pid" ]; then
     fail "$(nothing_reachable_text) — nothing to restart"
   fi
@@ -789,6 +817,8 @@ cmd_restart() {
   # now. A restart that cannot verify its own state does not start.
   state_snapshot "$STATE_BASE" >/dev/null ||
     refuse "the protected state cannot be verified now, so the instance was not stopped (see the reason above)"
+  # A restart whose start could not succeed must not stop the instance first.
+  launch_gates
   note "controlled restart of pid $pid on $ENDPOINT"
   cmd_stop
 

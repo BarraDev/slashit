@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=53
+EXPECTED_TOTAL=56
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sup="$root/scripts/supervise-dogfood.sh"
@@ -107,7 +107,9 @@ case $last in
     if [ -n "${SLASHIT_TEST_CLI_HANG:-}" ]; then
       exec sleep 300
     fi
-    if [ -f "$stub_dir/pid" ]; then
+    # Answers only while the instance process is alive, as a real one would: a
+    # forced kill leaves the pid file behind, and that is not an answer.
+    if [ -f "$stub_dir/pid" ] && kill -0 "$(cat "$stub_dir/pid")" 2>/dev/null; then
       printf '{\n  "mode": "gui",\n  "version": "9.9.9-stub",\n  "protocol_version": 1,\n  "pid": %s,\n  "endpoint": "unix:%s"\n}\n' \
         "$(cat "$stub_dir/pid")" "$SLASHIT_TEST_SOCKET"
       exit 0
@@ -653,6 +655,56 @@ if [ "$st" -eq 0 ] && [ -n "$forced_pid" ]; then
   fi
 else
   bad "stop --force fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== a forced stop leaves no stale socket, so the next start succeeds"
+out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+forced_pid=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$forced_pid" ]; then
+  out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+  if [ "$st" -eq 0 ] && ! kill -0 "$forced_pid" 2>/dev/null && [ ! -e "$socket" ]; then
+    out=$(sv start 2>&1); st=$?
+    if [ "$st" -eq 0 ]; then
+      ok "after a forced stop the socket is gone and the next start succeeds"
+    else
+      bad "the start after a forced stop was refused (exit $st)"; printf '%s\n' "$out" >&2
+    fi
+  else
+    bad "stop --force did not end the instance cleanly, or left its socket (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "forced-stop fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== a stop over a control channel that does not answer in time is refused as unverifiable"
+out=$(sv start 2>&1); st=$?
+hung_pid=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$hung_pid" ]; then
+  out=$(sv SLASHIT_TEST_CLI_HANG=1 SLASHIT_DOGFOOD_CLI_TIMEOUT=2 stop 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"did not answer within 2s"* ]] && kill -0 "$hung_pid" 2>/dev/null; then
+    ok "stop refuses with the cannot-verify reason when the ping times out, and the instance keeps running"
+  else
+    bad "stop over a hung control channel was not refused as unverifiable (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "hung-channel fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== a restart that could not start again is refused before the instance is stopped"
+out=$(sv start 2>&1); st=$?
+running_pid=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$running_pid" ]; then
+  out=$(sv SLASHIT_DOGFOOD_CLI= restart --force 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"CLI is available"* ]] && kill -0 "$running_pid" 2>/dev/null; then
+    ok "restart --force with no CLI is refused before the stop; the instance keeps running"
+  else
+    bad "restart --force with no CLI stopped the instance or did not refuse (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "restart fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
 fi
 cleanup_instances
 
