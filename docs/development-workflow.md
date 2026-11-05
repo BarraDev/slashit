@@ -1160,6 +1160,12 @@ responsibilities:
   A verified record replaces the provisional one by an atomic rename. A write
   that fails for either record is a failed start and is never reported as
   success. The rename claims no durability, because no fsync is issued.
+  If the provisional write itself fails, no record exists, and the start says
+  so: a child whose identity was captured is ended by that identity, and a child
+  that survives, or whose identity cannot be read, is reported with no record
+  claim. Check it with `pgrep -a slashit-ui` and end it by hand if it is the
+  instance. No fixture survives SIGKILL, so the branch where such a child
+  survives it is checked by reading the code only.
   Known gap: if the spawn wrapper does not report the child's pid within 5
   seconds, the start fails without a record; check with `pgrep` before starting
   again. A supervisor killed while it waits leaves the same provisional record
@@ -1236,9 +1242,10 @@ recover this automatically.
 ### Validating changes to the mechanism
 
 `scripts/test-supervise-dogfood.sh` exercises the script against stub
-binaries and a stub CLI inside a throwaway directory (122 checks in one clean
+binaries and a stub CLI inside a throwaway directory (125 checks in one clean
 run). It is Linux only, and it runs through `TMPDIR` like any test, so a
-scratch location can be chosen. Its cases cover: start, refusal of a second
+scratch location can be chosen. CI runs it in the `supervisor-harness` job of
+`.github/workflows/ci.yml`. Its cases cover: start, refusal of a second
 start and of a concurrent lifecycle
 operation, the `run` entry point's duplicate and ambient-environment
 refusals, truthful cannot-verify reporting when the CLI is absent, refusing
@@ -1253,8 +1260,10 @@ identity-matched control must still be stopped. With no launch record, an
 endpoint answer must declare mode `gui`, the declared endpoint and the declared
 environment before anything is quit or signaled: a foreign pid that fails any of
 these is refused by stop, graceful or forced, and by restart, and it survives
-with no `quit` sent. Failed starts must end their own child or keep an explicit
-provisional or verified record write that fails are each covered. XDG values
+with no `quit` sent. Failed starts must end their own child, and a failed
+provisional or verified record write is covered: a failed provisional write is
+reported without any record claim, with a readable identity and with an
+unreadable one. XDG values
 with trailing or repeated slashes must still refuse the default directories,
 and so must `.` and `..` components in the declared values and in HOME. HOME
 with a trailing slash, and a state base with one, are compared in normalized

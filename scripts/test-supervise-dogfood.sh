@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=122
+EXPECTED_TOTAL=125
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -1382,6 +1382,76 @@ if [ "$st" -eq 1 ] && [[ "$out" == *"cannot write the provisional launch record"
   ok "a provisional record that cannot be written refuses the start and ends its child"
 else
   bad "a failed provisional record write was not a refused start with its child ended (exit $st)"; printf '%s\n' "$out" >&2
+fi
+if [[ "$out" == *"no launch record was written for it"* ]] && [[ "$out" != *"kept"* ]]; then
+  ok "a provisional record that cannot be written is not reported as kept"
+else
+  bad "a failed provisional record write was reported as a kept record (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+# A start whose provisional record cannot be written (its record path is a
+# directory) and whose child's /proc identity is unreadable. The child is left
+# running on purpose: the case checks that nothing signals it, and it is ended
+# below by the fixture's own ownership check. $1 is a PATH directory whose `cat`
+# shim makes the read fail; $2 is the child's marker.
+unrecorded_start() {
+  cleanup_instances
+  rm -f "$record_file"
+  mkdir "$record_file"
+  out=$(sv PATH="$1:$PATH" SLASHIT_TEST_MARK=$2 SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+  rmdir "$record_file"
+  # The child writes its pid file on startup. Wait for it, then give a wrong
+  # signal time to land before the child is judged.
+  local i
+  for i in $(seq 100); do [ -s "$stub_dir/pid" ] && break; sleep 0.05; done
+  sleep 0.5
+}
+blind_cat=$(command -v cat)
+blind_shim=$work/blind-shim
+mkdir -p "$blind_shim"
+cat >"$blind_shim/cat" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case \$a in /proc/[0-9]*/stat) exit 1 ;; esac
+done
+exec "$blind_cat" "\$@"
+SHIM
+chmod +x "$blind_shim/cat"
+m_blind=blind-$$
+unrecorded_start "$blind_shim" "$m_blind"
+if [ "$st" -eq 1 ] && [[ "$out" == *"has no captured identity, so nothing was signaled; no launch record was written for it"* ]] && [[ "$out" != *"kept"* ]] && [[ "$out" != *"started pid"* ]] && [ -n "$(marked "$m_blind")" ]; then
+  ok "a failed provisional write with an unreadable identity claims no record, and signals nothing (refused: no captured identity)"
+else
+  bad "a failed provisional write with an unreadable identity was misreported or its child was signaled (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+# The same, but the identity is readable at the spawn and unreadable at the
+# abort, which reaches the unknown branch with no signal sent. The shim fails
+# every /proc stat read after the first one (the spawn's identity capture).
+once_flag=$work/once-flag
+once_shim=$work/once-shim
+mkdir -p "$once_shim"
+rm -f "$once_flag"
+cat >"$once_shim/cat" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case \$a in
+    /proc/[0-9]*/stat)
+      if [ -e "$once_flag" ]; then exit 1; fi
+      : >"$once_flag" ;;
+  esac
+done
+exec "$blind_cat" "\$@"
+SHIM
+chmod +x "$once_shim/cat"
+m_once=once-$$
+unrecorded_start "$once_shim" "$m_once"
+if [ "$st" -eq 1 ] && [[ "$out" == *"cannot be verified, so no further signal was sent; no launch record was written for it"* ]] && [[ "$out" != *"kept"* ]] && [ -n "$(marked "$m_once")" ]; then
+  ok "a failed provisional write with an unverifiable child claims no record, and sends no signal (refused: cannot be verified)"
+else
+  bad "a failed provisional write with an unverifiable child was misreported or its child was signaled (exit $st)"; printf '%s\n' "$out" >&2
 fi
 cleanup_instances
 

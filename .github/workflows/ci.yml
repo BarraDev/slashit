@@ -63,6 +63,27 @@ jobs:
       - name: Self-test the publication read-back guard
         run: scripts/test-verify-published-commit.sh
 
+  # The dogfood supervisor's regression harness. It runs against stub binaries in
+  # a throwaway directory under the runner's temp root, starts no SlashIt
+  # instance, reads no credentials and uses no network. It signals only processes
+  # it started itself, or the stub instance that carries its own run-scoped
+  # fixture marker; it never matches command lines. It needs /proc, flock and
+  # setsid, which this Ubuntu image provides. The job timeout bounds it, and every
+  # supervisor call inside it is bounded too.
+  supervisor-harness:
+    runs-on: ubuntu-22.04
+    name: Dogfood supervisor harness
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the supervisor harness
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: scripts/test-supervise-dogfood.sh
+
   # The Linux validation is three independent jobs rather than one serial one,
   # so the wall-clock is the slowest of them, not their sum. Each installs and
   # caches only what its own steps need; none consumes anything another job

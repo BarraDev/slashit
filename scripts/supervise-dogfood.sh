@@ -27,10 +27,12 @@
 #       declaration. The child's identity is recorded as soon as its PID is
 #       known (a provisional launch record). A start that fails after the
 #       spawn ends that child by its verified identity. If the child survives,
-#       or its identity cannot be read, no further signal is sent and the record is
-#       kept for manual recovery: `stop --force` ends a record only when its
-#       identity is verified, and refuses otherwise. A failed record write is
-#       a failed start.
+#       or its identity cannot be read, no further signal is sent. A written
+#       record is kept for manual recovery: `stop --force` ends a record only
+#       when its identity is verified, and refuses otherwise. If the provisional
+#       record itself cannot be written, no record exists, and the message says
+#       so; the child is then checked by hand. A failed record write is a
+#       failed start.
 #
 #   scripts/supervise-dogfood.sh run
 #       Foreground: validate like start (environment gates, live-socket
@@ -487,8 +489,9 @@ record_state() {
 
 # The one process a stop or restart may signal, fixed by select_target before
 # any signal exists. target_state re-reads its identity: same | other | absent |
-# unknown. A signal is sent only in state same.
-TARGET_PID= TARGET_ID= ENDPOINT_UP=0
+# unknown. A signal is sent only in state same. RECORD_WRITTEN becomes 1 only
+# after the start's provisional record write has succeeded (see abort_start).
+TARGET_PID= TARGET_ID= ENDPOINT_UP=0 RECORD_WRITTEN=0
 target_state() {
   if [ -z "$TARGET_PID" ] || [ ! -d "/proc/$TARGET_PID" ] || proc_zombie "$TARGET_PID"; then
     echo absent
@@ -671,13 +674,18 @@ launch_gates() {
 
 # A start that fails after its spawn must not leave the child running untracked.
 # The child is ended only while its identity still matches the one captured at
-# the spawn (the check stop uses), with TERM and then KILL. When it survives, or
-# when no identity was captured, the provisional record is kept: the next start
-# refuses while the process lives, and `stop --force` can end it.
-abort_start() { # message; uses TARGET_PID and TARGET_ID
+# the spawn (the check stop uses), with TERM and then KILL. What is reported
+# depends on RECORD_WRITTEN. A written provisional record is kept: the next
+# start refuses while the process lives, and `stop --force` can end it. A
+# provisional record that could not be written does not exist, so no message
+# may say it is kept; the operator checks the process by hand instead.
+abort_start() { # message; uses TARGET_PID, TARGET_ID and RECORD_WRITTEN
   local msg=$1 st deadline
   if [ -z "$TARGET_ID" ]; then
-    fail "$msg; pid $TARGET_PID has no captured identity, so nothing was signaled; the record $RECORD is kept for inspection"
+    if [ "$RECORD_WRITTEN" = 1 ]; then
+      fail "$msg; pid $TARGET_PID has no captured identity, so nothing was signaled; the record $RECORD is kept for inspection"
+    fi
+    fail "$msg; pid $TARGET_PID has no captured identity, so nothing was signaled; no launch record was written for it: check with \`pgrep -a slashit-ui\` and end it by hand if it is the instance"
   fi
   st=$(target_state)
   if [ "$st" = same ]; then
@@ -693,9 +701,16 @@ abort_start() { # message; uses TARGET_PID and TARGET_ID
       st=$(target_state)
     fi
   fi
+  if [ "$RECORD_WRITTEN" != 1 ]; then
+    case $st in
+      same) fail "$msg; pid $TARGET_PID could not be ended and still runs; no launch record was written for it: check with \`pgrep -a slashit-ui\` and end it by hand" ;;
+      unknown) fail "$msg; pid $TARGET_PID cannot be verified, so no further signal was sent; no launch record was written for it: check with \`pgrep -a slashit-ui\` and end it by hand if it is the instance" ;;
+      *) fail "$msg; the started process has ended; no launch record was written for it" ;;
+    esac
+  fi
   case $st in
     same) fail "$msg; pid $TARGET_PID could not be ended and still runs. Its provisional record is kept in $RECORD; run \`$SELF stop --force\` to end it" ;;
-    unknown) fail "$msg; pid $TARGET_PID cannot be verified after the signal, so no further signal was sent. Its record is kept in $RECORD" ;;
+    unknown) fail "$msg; pid $TARGET_PID cannot be verified, so no further signal was sent. Its record is kept in $RECORD" ;;
     *) fail "$msg; the started process has ended. Its record is kept in $RECORD, where it names a process that is gone" ;;
   esac
 }
@@ -777,6 +792,7 @@ cmd_start() {
   TARGET_PID=$child TARGET_ID=$ident
   write_record provisional "$child" "$ident" "$commit" ||
     abort_start "cannot write the provisional launch record $RECORD"
+  RECORD_WRITTEN=1
   [ -n "$ident" ] ||
     abort_start "the identity of pid $child cannot be read, so it can be neither verified nor signaled"
 
