@@ -458,16 +458,18 @@ binary_commit() {
 ENV_CHECK=9 # 0 verified, 1 mismatch, 9 unreadable
 
 verify_env() {
-  local pid=$1 rc=0
-  if [ ! -r "/proc/$pid/environ" ]; then
-    ENV_CHECK=9
-    return
-  fi
+  local pid=$1 rc=0 envs
+  # Read the environment once and match in shell. A pipeline into `grep -q`
+  # would let an early match close the pipe under `pipefail` while `tr` is still
+  # writing, which reads as a mismatch for a value that is present.
+  envs=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null) || { ENV_CHECK=9; return; }
+  envs=$'\n'$envs$'\n'
   while IFS=' ' read -r name want; do
     [ -n "$name" ] || continue
-    if ! tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -Fxq "$name=$want"; then
-      rc=1
-    fi
+    case $envs in
+      *$'\n'"$name=$want"$'\n'*) ;;
+      *) rc=1 ;;
+    esac
   done <<EOF
 XDG_CONFIG_HOME $declare_config
 XDG_DATA_HOME $declare_data
