@@ -1067,7 +1067,9 @@ responsibilities:
   `/proc/<pid>/environ` and refuses, loudly, if the running process does not
   carry the declaration. A declared value that would equal the default
   directory derived from `HOME` (`~/.config`, `~/.local/share`, `~/.cache`,
-  `~/.local/state`, `/run/user/<uid>`) also refuses.
+  `~/.local/state`, `/run/user/<uid>`) also refuses. Repeated and trailing
+  slashes are normalized before that comparison; symbolic links are not
+  resolved, so the directory a path names is never changed.
 - **One instance, serially supervised.** `start`, `run`, `stop` and `restart`
   take an advisory `flock` on the supervisor directory first, so concurrent
   lifecycle operations refuse instead of interleaving. The FIRST check of a
@@ -1087,26 +1089,67 @@ responsibilities:
 - **Endpoint verification.** `start` and `verify` confirm the instance
   through `slashit --endpoint ... ping`, including that the answering PID and
   endpoint are the declared ones.
-- **Process identity before any signal.** A pid written in the launch record
-  is never signaled on its own. `start` and `run` record the instance's boot
-  id and start time (`/proc/<pid>/stat`, field 22), and a stop or restart
-  signals a process only while both still match; when no record names a pid
-  and the endpoint answers, the answering pid is taken and identified at stop
-  time instead. `stop --force` escalates to
-  SIGTERM and then SIGKILL, and only to that verified process. A record that
-  names a pid whose identity is missing, malformed or unreadable is refused,
-  never signaled; a record that names a pid now held by a different process
-  (or left over from a previous boot) is reported as stale and is not
-  signaled. When the endpoint answers with a pid that differs from the record,
-  nothing is signaled. Operator recovery for a refused record: inspect the pid
-  (for example `ps -o pid,lstart,args -p <pid>`); if it is not the instance,
-  remove the record file `~/.local/state/slashit-dogfood/supervisor/instance`
-  by hand; if it is the instance, end it by hand. Limitation: the identity is
-  re-read immediately before each signal, but the instant between that read and
-  `kill(2)` is not closed. Bash has no pidfd, so a pid reused within that window
-  is not excluded in theory; the window is about a millisecond, and Linux allocates
-  pids sequentially.
-- **Backup before any restart.** `restart` stops the instance over the
+- **Identity and endpoint evidence before any signal or quit.** A pid written
+  in the launch record is never signaled on its own. `start` and `run` record
+  the instance's boot id and start time (`/proc/<pid>/stat`, field 22), and a
+  stop or restart acts on a process only while both still match. When the
+  endpoint answers, a stop or restart acts on the answering pid only when all
+  of these hold, and otherwise refuses before any `quit`, TERM or KILL: the
+  launch record, if it names a pid, names that same pid with a matching
+  identity; the answer declares mode `gui` and the declared endpoint; the pid's
+  identity can be read and its process environment carries the declared
+  `XDG_*` and `GH_CONFIG_DIR` values; and the identity is read again after the
+  environment, so both reads describe the same process. With no answer, a
+  matching launch record is signaled only when its process carries the declared
+  environment. A record that names a pid whose identity is missing, malformed
+  or unreadable is refused, never signaled; a record that names a pid now held
+  by a different process (or left over from a previous boot) is reported as
+  stale and is not signaled. `stop --force` escalates to SIGTERM and then
+  SIGKILL, and only to the verified process. Operator recovery for a refused
+  record: inspect the pid (for example `ps -o pid,lstart,args -p <pid>`); if it
+  is not the instance, remove the record file
+  `~/.local/state/slashit-dogfood/supervisor/instance` by hand; if it is the
+  instance, end it by hand.
+- **Limits of that evidence.** The environment is not an authentication. The
+  declared values are set by the launcher, and any process of the same user can
+  read and copy them, so a same-user process that carries the declared values
+  and answers on the socket passes these checks. The checks guard against stale
+  records, reused pids, manual launches with another environment, and unrelated
+  processes that did not declare this environment. They do not defend against a
+  deliberate same-user process. The answering pid is not bound to the socket
+  path by the kernel in these checks. The identity is re-read immediately before
+  each signal, but the instant between that read and `kill(2)` is not closed.
+  Bash has no pidfd, so a pid reused within that window is not excluded in
+  theory; the window is about a millisecond, and Linux allocates pids
+  sequentially.
+- **Failed starts keep ownership.** `start` writes a provisional launch record
+  (`state provisional`, with the child's identity) as soon as the child's pid is
+  known, before it waits for readiness. A start that then fails (no answer
+  within `SLASHIT_DOGFOOD_START_TIMEOUT`, a mode, endpoint or environment
+  mismatch, the child exiting during startup, or a failed record write) ends
+  that child by its verified identity, with TERM and then KILL, and exits 1.
+  If the child survives, or its identity could not be read, the provisional
+  record is kept: the next `start` refuses while that pid lives, and
+  `stop --force` ends it. A verified record replaces the provisional one by an
+  atomic rename. A write that fails for either record is a failed start and is
+  never reported as success. The rename claims no durability, because no fsync
+  is issued. Known gap: if the spawn wrapper does not report the child's pid
+  within 5 seconds, the start fails without a record; check with `pgrep` before
+  starting again. A supervisor killed while it waits leaves the same
+  provisional record, recovered by `stop --force`, or by `start` once the child
+  has exited. A child ended this way can leave its endpoint path behind, since
+  the supervisor never unlinks a path after its recorded process ends. The next
+  `start` then refuses that path as unverifiable until an operator has checked
+  that no process owns it and removed it by hand (the stale-endpoint limitation
+  below). Separately, a helper that inherited the lifecycle lock, such as a
+  readiness-loop sleep or a CLI call bounded by `SLASHIT_DOGFOOD_CLI_TIMEOUT`,
+  may hold that lock for a moment after its supervisor is killed; a lifecycle
+  command then refuses with "another lifecycle operation" until it exits. That
+  refusal signals nothing.
+- **Backup before any restart.** `restart` needs a running instance. With
+  nothing running or recorded it refuses before it stops or backs up anything,
+  so a stopped instance comes back with `start`, which takes no backup.
+  `restart` stops the instance over the
   control channel (so it can end its terminals cleanly; `stop --force`
   escalates to SIGTERM and SIGKILL and does not run that shutdown), then it
   copies exactly the compared snapshot set into
@@ -1143,15 +1186,23 @@ locations are not duplicated in the unit, because `run` resolves them from
 the checkout the script belongs to. When the unit owns the instance,
 lifecycle actions go through systemd; the script's `status` and `verify`
 keep working because they check the control socket, and a scripted `start`
-or a unit start still refuses a second instance. A unit-driven restart should
-still take a verified backup: stop the unit, then run the script's controlled
-`restart`, which stops, backs up, starts and proves the state file set
-unchanged.
+or a unit start still refuses a second instance. A verified backup comes only
+from the script's `restart`, which needs a running instance. After
+`systemctl --user stop`, `restart` refuses with `nothing found to operate on`
+and backs up nothing. A stopped instance comes back with
+`systemctl --user start` (no backup) or `scripts/supervise-dogfood.sh start`.
+
+**Deployment blocker: a stale endpoint after a crash.** Do not install or enable
+the unit yet. The application removes its control socket only on a clean drop,
+and a forced stop leaves it too. The next `run` or `start` then refuses that
+path as unverifiable, so `Restart=on-failure` loops until an operator verifies
+that no process owns the path and removes it by hand. The script does not
+recover this automatically.
 
 ### Validating changes to the mechanism
 
 `scripts/test-supervise-dogfood.sh` exercises the script against stub
-binaries and a stub CLI inside a throwaway directory (80 checks in one clean
+binaries and a stub CLI inside a throwaway directory (107 checks in one clean
 run): start, refusal of a second start and of a concurrent lifecycle
 operation, the `run` entry point's duplicate and ambient-environment
 refusals, truthful cannot-verify reporting when the CLI is absent, refusing
@@ -1162,5 +1213,13 @@ snapshot set, and a caught state divergence. The process-identity cases use
 disposable `sleep` processes as unrelated live pids: stale, mismatched,
 previous-boot, missing, malformed and endpoint-disagreeing records must refuse
 with their stated reason and leave the unrelated pid alive, and one
-identity-matched control must still be stopped. It touches nothing outside its
-own temporary directory.
+identity-matched control must still be stopped. With no launch record, an
+endpoint answer must declare mode `gui`, the declared endpoint and the declared
+environment before anything is quit or signaled: a foreign pid that fails any of
+these is refused by stop, graceful or forced, and by restart, and it survives
+with no `quit` sent. Failed starts must end their own child or keep an explicit
+provisional record; a CLI that never answers, an interrupted supervisor, and a
+provisional or verified record write that fails are each covered. XDG values
+with trailing or repeated slashes must still refuse the default directories.
+Every supervisor call in the suite is bounded by a timeout. It touches nothing
+outside its own temporary directory.

@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=80
+EXPECTED_TOTAL=107
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sup="$root/scripts/supervise-dogfood.sh"
@@ -99,6 +99,7 @@ last=
 for a in "$@"; do
   case $a in --endpoint | --json) ;; *) last=$a ;; esac
 done
+echo "$last" >>"$stub_dir/calls"
 case $last in
   --version)
     echo "slashit 9.9.9-stub"
@@ -108,9 +109,22 @@ case $last in
     if [ -n "${SLASHIT_TEST_CLI_HANG:-}" ]; then
       exec sleep 300
     fi
+    if [ -n "${SLASHIT_TEST_CLI_NEVER_ANSWERS:-}" ]; then
+      exit 1
+    fi
+    if [ -n "${SLASHIT_TEST_CLI_FAKE_PING:-}" ]; then
+      cat "$SLASHIT_TEST_CLI_FAKE_PING"
+      exit 0
+    fi
     # Answers only while the instance process is alive, as a real one would: a
     # forced kill leaves the pid file behind, and that is not an answer.
     if [ -f "$stub_dir/pid" ] && kill -0 "$(cat "$stub_dir/pid")" 2>/dev/null; then
+      if [ -n "${SLASHIT_TEST_CLI_REPLACE_RECORD:-}" ]; then
+        # Replaces the launch record after the provisional write, so the
+        # verified write is the one that fails.
+        rm -f "$SLASHIT_TEST_CLI_REPLACE_RECORD"
+        mkdir "$SLASHIT_TEST_CLI_REPLACE_RECORD"
+      fi
       printf '{\n  "mode": "gui",\n  "version": "9.9.9-stub",\n  "protocol_version": 1,\n  "pid": %s,\n  "endpoint": "unix:%s"\n}\n' \
         "$(cat "$stub_dir/pid")" "$SLASHIT_TEST_SOCKET"
       exit 0
@@ -167,6 +181,17 @@ BASEENV=(
   XDG_STATE_HOME=
   XDG_RUNTIME_DIR=
   GH_CONFIG_DIR=
+)
+
+# The declared environment, for disposable foreign processes that must look
+# declared (only their mode or endpoint can then refuse them).
+declared_env=(
+  XDG_CONFIG_HOME="$state/config"
+  XDG_DATA_HOME="$state/data"
+  XDG_CACHE_HOME="$state/cache"
+  XDG_STATE_HOME="$state"
+  XDG_RUNTIME_DIR="$runtime"
+  GH_CONFIG_DIR="$HOME/.config/gh"
 )
 
 # sv [ASSIGNMENTS...] [VERB/ARG...]: '='-assignments go to env, everything
@@ -854,7 +879,7 @@ fi
 # Positive control: the same process, with its verified identity, IS signaled.
 # This proves the refusals above come from the identity check, not from a
 # supervisor that never signals a recorded pid.
-sleep 300 &
+env "${declared_env[@]}" sleep 300 &
 control_pid=$!
 control_start=$(proc_start "$control_pid")
 printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$control_pid" "$boot_id_now" "$control_start" >"$record_file"
@@ -937,6 +962,231 @@ else
   bad "recovery fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
 fi
 cleanup_instances
+
+echo "== no launch record: an endpoint's own answer never authorizes a quit or a signal"
+# The stub CLI prints a reply file for ping, so each case declares its own
+# endpoint. The foreign processes are disposable: one carries no declared
+# environment, the other carries all of it, so only mode or endpoint can refuse
+# it.
+cleanup_instances
+rm -f "$record_file"
+sleep 300 &
+bare_pid=$!
+foreign_pids+=("$bare_pid")
+env "${declared_env[@]}" sleep 300 &
+declared_pid=$!
+foreign_pids+=("$declared_pid")
+reply_file=$work/endpoint-reply.json
+reply() { # mode endpoint pid
+  printf '{\n  "mode": "%s",\n  "version": "9.9.9-stub",\n  "protocol_version": 1,\n  "pid": %s,\n  "endpoint": "%s"\n}\n' "$1" "$3" "$2" >"$reply_file"
+}
+no_quit() { # label: the refused endpoint must not have received a quit
+  if grep -qx quit "$stub_dir/calls" 2>/dev/null; then
+    bad "$1: a quit reached the refused endpoint"
+  else
+    ok "$1: no quit reached the refused endpoint"
+  fi
+}
+
+reply gui "unix:$socket" "$bare_pid"
+: >"$stub_dir/calls"
+out=$(sv SLASHIT_TEST_CLI_FAKE_PING="$reply_file" SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+expect_refused_alive "a forced stop refuses an endpoint pid with no declared environment" "$out" "$st" "does not carry the declared" "$bare_pid"
+no_quit "forced stop"
+
+: >"$stub_dir/calls"
+out=$(sv SLASHIT_TEST_CLI_FAKE_PING="$reply_file" SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 restart --force 2>&1); st=$?
+expect_refused_alive "a forced restart refuses the same endpoint pid" "$out" "$st" "does not carry the declared" "$bare_pid"
+no_quit "forced restart"
+
+: >"$stub_dir/calls"
+out=$(sv SLASHIT_TEST_CLI_FAKE_PING="$reply_file" SLASHIT_DOGFOOD_STOP_TIMEOUT=2 stop 2>&1); st=$?
+expect_refused_alive "a graceful stop refuses the same endpoint pid" "$out" "$st" "does not carry the declared" "$bare_pid"
+no_quit "graceful stop"
+
+reply cli "unix:$socket" "$declared_pid"
+: >"$stub_dir/calls"
+out=$(sv SLASHIT_TEST_CLI_FAKE_PING="$reply_file" SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+expect_refused_alive "a forced stop refuses an endpoint that declares mode cli" "$out" "$st" "as mode 'cli', not 'gui'" "$declared_pid"
+no_quit "mode mismatch"
+
+reply gui "unix:/elsewhere/other.sock" "$declared_pid"
+: >"$stub_dir/calls"
+out=$(sv SLASHIT_TEST_CLI_FAKE_PING="$reply_file" SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 restart --force 2>&1); st=$?
+expect_refused_alive "a forced restart refuses an endpoint on another path" "$out" "$st" "not on the declared endpoint" "$declared_pid"
+no_quit "endpoint mismatch"
+
+cleanup_instances
+sleep 300 &
+rec_bare=$!
+foreign_pids+=("$rec_bare")
+printf 'pid\t%s\nboot_id\t%s\nstart_ticks\t%s\n' "$rec_bare" "$boot_id_now" "$(proc_start "$rec_bare")" >"$record_file"
+out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+expect_refused_alive "a record whose identity matches a process without the declared environment is refused" "$out" "$st" "does not carry the declared" "$rec_bare"
+rm -f "$record_file"
+
+out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+unrecorded=$(stub_pid)
+rm -f "$record_file"
+: >"$stub_dir/calls"
+if [ "$st" -eq 0 ] && [ -n "$unrecorded" ]; then
+  out=$(sv SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+  if [ "$st" -eq 0 ] && ! is_alive "$unrecorded" && grep -qx quit "$stub_dir/calls"; then
+    ok "a forced stop of an instance with no launch record proceeds on its endpoint, mode and environment"
+  else
+    bad "a forced stop of an unrecorded instance did not end it on verified evidence (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "unrecorded-instance fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== a failed start leaves no untracked child and no second launch"
+# Each case marks its supervisor and that supervisor's children with a unique
+# environment variable, so the children are found even when no pid is known.
+marked() { # marker: the pids of live processes whose environment carries it
+  local f
+  for f in /proc/[0-9]*/environ; do
+    case $'\n'"$({ tr '\0' '\n' <"$f"; } 2>/dev/null)"$'\n' in
+      *$'\n'"SLASHIT_TEST_MARK=$1"$'\n'*) echo "${f#/proc/}" ;;
+    esac
+  done
+}
+
+# A killed supervisor can leave a helper that inherited its lifecycle lock for a
+# moment (a readiness-loop sleep, at most a fraction of a second). The lock is
+# then busy for a start, which refuses it: fail-closed. The cases wait for it.
+wait_lock_free() {
+  local i
+  for i in $(seq 100); do
+    flock -n "$state/supervisor/lifecycle.lock" true 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+cleanup_instances
+rm -f "$record_file"
+m_never=never-$$
+out=$(sv SLASHIT_TEST_MARK=$m_never SLASHIT_TEST_CLI_NEVER_ANSWERS=1 SLASHIT_TEST_STUB_ROLE=noquit SLASHIT_DOGFOOD_START_TIMEOUT=2 start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"no answer on"* ]] && [[ "$out" == *"the started process has ended"* ]] && [ -z "$(marked "$m_never")" ]; then
+  ok "a start whose CLI never answers ends the child it spawned (refused: no answer on the endpoint)"
+else
+  bad "a start whose CLI never answers did not end its child (exit $st)"; printf '%s\n' "$out" >&2
+fi
+if grep -q "^state[[:space:]]provisional" "$record_file" 2>/dev/null; then
+  ok "the failed start keeps its provisional record"
+else
+  bad "the failed start kept no provisional record"
+fi
+out=$(sv start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"exists but nothing could be verified"* ]] && [[ "$out" == *"$socket"* ]]; then
+  ok "the next start refuses the endpoint path the ended child left, until an operator removes it"
+else
+  bad "the next start did not refuse the leftover endpoint path (exit $st)"; printf '%s\n' "$out" >&2
+fi
+rm -f "$socket"
+out=$(sv start 2>&1); st=$?
+second=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$second" ] && is_alive "$second" && grep -q "^state[[:space:]]verified" "$record_file"; then
+  ok "after the path is removed by hand, one instance starts with a verified record"
+else
+  bad "the start after the failed one did not launch cleanly (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+# A supervisor killed while it waits for readiness leaves the provisional record
+# over a live child. Sets crash_child and crash_marker for the case.
+crash_mid_start() {
+  cleanup_instances
+  rm -f "$record_file"
+  crash_marker=crash-$RANDOM-$$
+  sv SLASHIT_TEST_MARK=$crash_marker SLASHIT_TEST_CLI_NEVER_ANSWERS=1 SLASHIT_TEST_STUB_ROLE=noquit SLASHIT_DOGFOOD_START_TIMEOUT=120 start >/dev/null 2>&1 &
+  local svjob=$! i
+  for i in $(seq 150); do
+    if grep -q "^state[[:space:]]provisional" "$record_file" 2>/dev/null && [ -s "$stub_dir/pid" ]; then break; fi
+    sleep 0.1
+  done
+  pkill -9 -f "$sup start" 2>/dev/null
+  wait "$svjob" 2>/dev/null
+  # The interrupted child has not bound its endpoint yet, so the path is absent.
+  rm -f "$socket"
+  wait_lock_free
+  crash_child=$(awk -F '\t' '$1 == "pid" { print $2 }' "$record_file" 2>/dev/null | head -n 1)
+}
+
+crash_mid_start
+if [ -n "$crash_child" ] && is_alive "$crash_child" && [ -n "$(marked "$crash_marker")" ]; then
+  ok "fixture: the interrupted start left a provisional record over a live child"
+  out=$(sv SLASHIT_TEST_CLI_NEVER_ANSWERS=1 start 2>&1); st=$?
+  expect_refused_alive "a repeated start is refused while the provisional child is alive" "$out" "$st" "still alive but does not answer" "$crash_child"
+  out=$(sv SLASHIT_TEST_CLI_NEVER_ANSWERS=1 SLASHIT_DOGFOOD_STOP_TIMEOUT=2 SLASHIT_DOGFOOD_FORCE_TIMEOUT=2 stop --force 2>&1); st=$?
+  if [ "$st" -eq 0 ] && ! is_alive "$crash_child"; then
+    ok "stop --force ends the child of the interrupted start"
+  else
+    bad "stop --force did not end the interrupted child (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "crash fixture: no provisional record over a live child (child '$crash_child')"; cat "$work/crash.out" >&2 2>/dev/null
+fi
+cleanup_instances
+
+crash_mid_start
+if [ -n "$crash_child" ] && is_alive "$crash_child"; then
+  kill -9 "$crash_child" 2>/dev/null
+  for i in $(seq 50); do is_alive "$crash_child" || break; sleep 0.1; done
+  wait_lock_free
+  out=$(sv start 2>&1); st=$?
+  new_child=$(stub_pid)
+  if [ "$st" -eq 0 ] && [ -n "$new_child" ] && [ "$new_child" != "$crash_child" ] && is_alive "$new_child"; then
+    ok "once the interrupted child has exited, its provisional record no longer blocks a start"
+  else
+    bad "start after the interrupted child exited did not recover (exit $st)"; printf '%s\n' "$out" >&2
+  fi
+else
+  bad "recovery fixture: no live child to exit"
+fi
+cleanup_instances
+
+cleanup_instances
+rm -f "$record_file"
+mkdir "$record_file"
+m_persist=persist-$$
+out=$(sv SLASHIT_TEST_MARK=$m_persist SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+rmdir "$record_file"
+if [ "$st" -eq 1 ] && [[ "$out" == *"cannot write the provisional launch record"* ]] && [[ "$out" != *"started pid"* ]] && [ -z "$(marked "$m_persist")" ]; then
+  ok "a provisional record that cannot be written refuses the start and ends its child"
+else
+  bad "a failed provisional record write was not a refused start with its child ended (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+rm -f "$record_file"
+m_verified=verified-$$
+out=$(sv SLASHIT_TEST_MARK=$m_verified SLASHIT_TEST_STUB_ROLE=noquit SLASHIT_TEST_CLI_REPLACE_RECORD="$record_file" start 2>&1); st=$?
+rm -rf "$record_file"
+if [ "$st" -eq 1 ] && [[ "$out" == *"cannot write the verified launch record"* ]] && [[ "$out" != *"started pid"* ]] && [ -z "$(marked "$m_verified")" ]; then
+  ok "a verified record that cannot be written is not reported as a successful start, and its child ends"
+else
+  bad "a failed verified record write was reported as success or left its child (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== XDG paths: trailing and repeated slashes cannot bypass the default-directory gate"
+expect fail "a default runtime directory with a trailing slash is refused" \
+  "$(sv SLASHIT_DOGFOOD_RUNTIME="/run/user/$(id -u)/" env 2>&1)" $? "default directory derived from HOME"
+expect fail "a default runtime directory with repeated slashes is refused" \
+  "$(sv SLASHIT_DOGFOOD_RUNTIME="/run/user/$(id -u)//" env 2>&1)" $? "default directory derived from HOME"
+expect fail "a default state home with a trailing slash is refused" \
+  "$(sv SLASHIT_DOGFOOD_STATE="$HOME/.local/state/" env 2>&1)" $? "default directory derived from HOME"
+expect fail "HOME with a trailing slash as the state base is refused" \
+  "$(sv SLASHIT_DOGFOOD_STATE="$HOME/" env 2>&1)" $? "isolates nothing"
+out=$(sv SLASHIT_DOGFOOD_RUNTIME="$runtime/" env 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qxF "XDG_RUNTIME_DIR  $runtime" <<<"$out"; then
+  ok "a legitimate isolated runtime with a trailing slash is kept, in normalized form"
+else
+  bad "a legitimate runtime with a trailing slash was not kept in normalized form (exit $st)"; printf '%s\n' "$out" >&2
+fi
 
 echo
 if [ "$((passed + failed))" -ne "$EXPECTED_TOTAL" ]; then

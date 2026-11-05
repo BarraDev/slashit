@@ -31,9 +31,14 @@
 #   systemctl --user daemon-reload
 #   systemctl --user start slashit-dogfood
 #
-# Backups before a unit-driven restart: stop the unit, then take the verified
-# backup with a controlled restart step from the script, or let the script's
-# own `restart` do the stop, backup, start and checksum comparison.
+# Backups: only the script's `restart` takes a verified backup, and it needs a
+# running instance. After `systemctl --user stop` it refuses (nothing to
+# restart) and backs up nothing, so take the backup by running `restart` while
+# the instance is up.
+#
+# Deployment blocker: do not enable this unit until the stale-endpoint recovery
+# is resolved. After a crash or a forced stop the control socket remains, `run`
+# refuses it as unverifiable, and Restart=on-failure loops on that refusal.
 
 [Unit]
 Description=SlashIt isolated dogfood instance

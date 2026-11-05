@@ -24,7 +24,10 @@
 #       answer, so nothing of unknown provenance is trusted). After the spawn
 #       it verifies the control channel with `slashit --endpoint ... ping`
 #       and cross-checks the new PID's /proc environment against the
-#       declaration.
+#       declaration. The child's identity is recorded as soon as its PID is
+#       known (a provisional launch record). A start that fails after the
+#       spawn ends that child by its identity, or leaves the record for
+#       `stop --force`; a failed record write is a failed start.
 #
 #   scripts/supervise-dogfood.sh run
 #       Foreground: validate like start (environment gates, live-socket
@@ -144,10 +147,21 @@ case $verb in stop | restart) : ;; *) [ "${2:-}" != "--force" ] || usage ;; esac
 force=0
 [ "${2:-}" = "--force" ] && force=1
 
+# Path normalization for the declaration and for every comparison with the
+# default XDG locations: runs of slashes collapse and a trailing slash goes.
+# Nothing is resolved through the filesystem, so no symlink is followed and the
+# directory a path names is never changed by this.
+norm_path() {
+  local p=$1
+  while [[ $p == *//* ]]; do p=${p//\/\//\/}; done
+  while [ -n "$p" ] && [ "${p%/}" != "$p" ]; do p=${p%/}; done
+  printf '%s' "$p"
+}
+
 uid=$(id -u)
-STATE_BASE=${SLASHIT_DOGFOOD_STATE:-"$HOME/.local/state/slashit-dogfood"}
-RUNTIME_BASE=${SLASHIT_DOGFOOD_RUNTIME:-/run/user/$uid/slashit-dogfood}
-GH_CONFIG=${SLASHIT_DOGFOOD_GH_CONFIG:-"$HOME/.config/gh"}
+STATE_BASE=$(norm_path "${SLASHIT_DOGFOOD_STATE:-"$HOME/.local/state/slashit-dogfood"}")
+RUNTIME_BASE=$(norm_path "${SLASHIT_DOGFOOD_RUNTIME:-/run/user/$uid/slashit-dogfood}")
+GH_CONFIG=$(norm_path "${SLASHIT_DOGFOOD_GH_CONFIG:-"$HOME/.config/gh"}")
 START_TIMEOUT=${SLASHIT_DOGFOOD_START_TIMEOUT:-90}
 STOP_TIMEOUT=${SLASHIT_DOGFOOD_STOP_TIMEOUT:-180}
 FORCE_TIMEOUT=${SLASHIT_DOGFOOD_FORCE_TIMEOUT:-15}
@@ -225,17 +239,19 @@ env_gates() {
   # meaningful for the isolated state and the runtime socket.
   case $STATE_BASE in /*) ;; *) refuse "SLASHIT_DOGFOOD_STATE must be an absolute path ('$STATE_BASE')" ;; esac
   case $RUNTIME_BASE in /*) ;; *) refuse "SLASHIT_DOGFOOD_RUNTIME must be an absolute path ('$RUNTIME_BASE')" ;; esac
+  local home
+  home=$(norm_path "$HOME")
   case $STATE_BASE in
-    "" | "$HOME") refuse "the state base ('$STATE_BASE') isolates nothing" ;;
+    "" | "$home") refuse "the state base ('$STATE_BASE') isolates nothing" ;;
   esac
-  case $HOME in
+  case $home in
     "$STATE_BASE" | "$STATE_BASE"/*) refuse "HOME ($HOME) sits inside the isolated state base" ;;
   esac
   local bad=0
-  [ "$declare_config" = "$HOME/.config" ] && bad=1
-  [ "$declare_data" = "$HOME/.local/share" ] && bad=1
-  [ "$declare_cache" = "$HOME/.cache" ] && bad=1
-  [ "$declare_state" = "$HOME/.local/state" ] && bad=1
+  [ "$declare_config" = "$home/.config" ] && bad=1
+  [ "$declare_data" = "$home/.local/share" ] && bad=1
+  [ "$declare_cache" = "$home/.cache" ] && bad=1
+  [ "$declare_state" = "$home/.local/state" ] && bad=1
   [ "$declare_runtime" = "/run/user/$uid" ] && bad=1
   if [ "$bad" -eq 1 ]; then
     refuse "a declared XDG value equals the default directory derived from HOME ('$HOME'); the instance must never fall back to the real user state"
@@ -343,6 +359,29 @@ _process_alive() {
 record_field() {
   [ -f "$RECORD" ] || return 1
   awk -F '\t' -v key="$1" '$1 == key { print $2 }' "$RECORD" | head -n 1
+}
+
+# Writes the launch record in one step: the complete content goes to a temporary
+# file, which then replaces the record by rename. A failure is returned, never
+# ignored, so a caller cannot report success over it. The rename is atomic
+# within the directory; no fsync is issued, so this claims no crash durability.
+# $1 state (provisional, verified or run), $2 pid, $3 "BOOT_ID START_TICKS" or
+# empty when the identity is not known, $4 the binary's commit.
+write_record() {
+  local tmp=$RECORD.tmp.$$ boot= start=
+  if [ -n "$3" ]; then boot=${3% *}; start=${3#* }; fi
+  {
+    printf 'state\t%s\n' "$1"
+    printf 'pid\t%s\n' "$2"
+    printf 'binary\t%s\n' "$BINARY"
+    printf 'commit\t%s\n' "$4"
+    printf 'version\t%s\n' "$version_line"
+    printf 'endpoint\t%s\n' "$ENDPOINT"
+    printf 'started_at\t%s\n' "$(date -u +%FT%TZ)"
+    [ -z "$3" ] || printf 'boot_id\t%s\nstart_ticks\t%s\n' "$boot" "$start"
+  } >"$tmp" 2>/dev/null && mv -f -T "$tmp" "$RECORD" 2>/dev/null && return 0
+  rm -f "$tmp"
+  return 1
 }
 
 # Process identity. A pid is a number the kernel reuses, so a pid written in the
@@ -481,6 +520,15 @@ EOF
   ENV_CHECK=$rc
 }
 
+# Why the declared environment does not verify a process, for a refusal message.
+env_refusal() {
+  if [ "$ENV_CHECK" = 9 ]; then
+    echo "its process environment cannot be read"
+  else
+    echo "it does not carry the declared XDG_* and GH_CONFIG_DIR values"
+  fi
+}
+
 env_verdict() {
   case $ENV_CHECK in
     0) echo "environment:    verified (the live process carries the declared XDG_* and GH_CONFIG_DIR values)" ;;
@@ -596,6 +644,37 @@ launch_gates() {
   [ -n "$version_line" ] || refuse "the binary answers --version with nothing; refusing it: $BINARY"
 }
 
+# A start that fails after its spawn must not leave the child running untracked.
+# The child is ended only while its identity still matches the one captured at
+# the spawn (the check stop uses), with TERM and then KILL. When it survives, or
+# when no identity was captured, the provisional record is kept: the next start
+# refuses while the process lives, and `stop --force` can end it.
+abort_start() { # message; uses TARGET_PID and TARGET_ID
+  local msg=$1 st deadline
+  if [ -z "$TARGET_ID" ]; then
+    fail "$msg; pid $TARGET_PID has no captured identity, so nothing was signaled; the record $RECORD is kept for inspection"
+  fi
+  st=$(target_state)
+  if [ "$st" = same ]; then
+    signal_target TERM
+    deadline=$((SECONDS + FORCE_TIMEOUT))
+    while [ "$(target_state)" = same ] && [ "$SECONDS" -lt "$deadline" ]; do
+      sleep 0.25
+    done
+    st=$(target_state)
+    if [ "$st" = same ]; then
+      signal_target KILL
+      sleep 0.5
+      st=$(target_state)
+    fi
+  fi
+  case $st in
+    same) fail "$msg; pid $TARGET_PID could not be ended and still runs. Its provisional record is kept in $RECORD; run \`$SELF stop --force\` to end it" ;;
+    unknown) fail "$msg; pid $TARGET_PID cannot be verified after the signal, so no further signal was sent. Its record is kept in $RECORD" ;;
+    *) fail "$msg; the started process has ended. Its record is kept in $RECORD, where it names a process that is gone" ;;
+  esac
+}
+
 cmd_start() {
   env_gates
   [ -n "$HOME" ] || fail "HOME is not set"
@@ -657,45 +736,41 @@ cmd_start() {
   done
   child=$(cat "$CHILD_PID" 2>/dev/null || true)
   rm -f "$CHILD_PID"
-  [ -n "$child" ] || fail "no PID was recorded for the spawn; see $INSTANCE_LOG"
+  [ -n "$child" ] ||
+    fail "no PID was recorded for the spawn; see $INSTANCE_LOG. A process may have started without a record: check with pgrep before starting again"
+
+  # The provisional record comes before any waiting. From here the child is a
+  # recorded process, so a start that fails below cannot leave it untracked.
+  local ident commit=unknown
+  commit=$(binary_commit "$(dirname "$BINARY")" 2>/dev/null) || commit=unknown
+  ident=$(proc_identity "$child") || ident=
+  TARGET_PID=$child TARGET_ID=$ident
+  write_record provisional "$child" "$ident" "$commit" ||
+    abort_start "cannot write the provisional launch record $RECORD"
+  [ -n "$ident" ] ||
+    abort_start "the identity of pid $child cannot be read, so it can be neither verified nor signaled"
 
   local deadline=$((SECONDS + START_TIMEOUT))
   until ping_fields; do
-    if ! _process_alive "$child"; then
-      fail "the instance (pid $child) exited during startup; see $INSTANCE_LOG"
-    fi
-    [ "$SECONDS" -lt "$deadline" ] ||
-      fail "no answer on $ENDPOINT within ${START_TIMEOUT}s; the instance (pid $child) is still alive; see $INSTANCE_LOG"
+    _process_alive "$child" || abort_start "the instance (pid $child) exited during startup; see $INSTANCE_LOG"
+    [ "$SECONDS" -lt "$deadline" ] || abort_start "no answer on $ENDPOINT within ${START_TIMEOUT}s; see $INSTANCE_LOG"
     sleep 0.25
   done
 
-  [ "$PING_MODE" = "gui" ] || fail "the endpoint answers with mode '$PING_MODE', expected 'gui'"
+  [ "$PING_MODE" = "gui" ] || abort_start "the endpoint answers with mode '$PING_MODE', expected 'gui'"
   [ "${PING_ENDPOINT#unix:}" = "$SOCKET" ] ||
-    fail "the instance answers on '$PING_ENDPOINT', not on '$ENDPOINT'"
+    abort_start "the instance answers on '$PING_ENDPOINT', not on '$ENDPOINT'"
   [ "$PING_PID" = "$child" ] ||
-    fail "the endpoint reports pid $PING_PID, but pid $child was launched"
+    abort_start "the endpoint reports pid $PING_PID, but pid $child was launched"
 
   verify_env "$child"
   [ "$ENV_CHECK" -eq 0 ] ||
-    refuse "the spawned instance does not carry the declared environment (verdict: $(env_verdict | sed 's/^environment:    //; s/^environment: //'))"
+    abort_start "the spawned instance does not carry the declared environment (verdict: $(env_verdict | sed 's/^environment:    //; s/^environment: //'))"
 
-  local commit=unknown
-  commit=$(binary_commit "$(dirname "$BINARY")" 2>/dev/null) || commit=unknown
-
-  # The identity is captured while the verified child is alive. If it cannot be
-  # read, the record is still written, and it fails closed for any later signal.
-  local ident
-  ident=$(proc_identity "$child") || { ident=; note "warning: the identity of pid $child cannot be read; the record cannot authorize a signal later"; }
-
-  {
-    printf 'pid\t%s\n' "$child"
-    printf 'binary\t%s\n' "$BINARY"
-    printf 'commit\t%s\n' "$commit"
-    printf 'version\t%s\n' "$version_line"
-    printf 'endpoint\t%s\n' "$ENDPOINT"
-    printf 'started_at\t%s\n' "$(date -u +%FT%TZ)"
-    [ -z "$ident" ] || printf 'boot_id\t%s\nstart_ticks\t%s\n' "${ident% *}" "${ident#* }"
-  } >"$RECORD"
+  # The verified record replaces the provisional one by rename. A write that
+  # fails is never reported as a successful start.
+  write_record verified "$child" "$ident" "$commit" ||
+    abort_start "cannot write the verified launch record $RECORD, so the start is not reported as successful"
 
   note "started pid $child ($version_line, commit ${commit:0:12}) on $ENDPOINT"
   env_verdict
@@ -762,16 +837,10 @@ EOF
   # Same PID serves the socket after exec, and exec keeps the start time, so the
   # identity captured here is still the instance's once the binary runs.
   local ident
-  ident=$(proc_identity "$$") || { ident=; note "warning: the identity of pid $$ cannot be read; the record cannot authorize a signal later"; }
-  {
-    printf 'pid\t%s\n' "$$"
-    printf 'binary\t%s\n' "$BINARY"
-    printf 'commit\t%s\n' "$commit"
-    printf 'version\t%s\n' "$version_line"
-    printf 'endpoint\t%s\n' "$ENDPOINT"
-    printf 'started_at\t%s\n' "$(date -u +%FT%TZ)"
-    [ -z "$ident" ] || printf 'boot_id\t%s\nstart_ticks\t%s\n' "${ident% *}" "${ident#* }"
-  } >"$RECORD"
+  ident=$(proc_identity "$$") ||
+    fail "the identity of pid $$ cannot be read, so the launch record could not authorize a signal; nothing was started"
+  write_record run "$$" "$ident" "$commit" ||
+    fail "cannot write the launch record $RECORD; nothing was started"
 
   note "exec $BINARY ($version_line, commit ${commit:0:12}) in the foreground as pid $$; the service manager owns this process"
   cd "$HOME" 2>/dev/null
@@ -790,9 +859,8 @@ cmd_stop() {
   select_target || fail "$(nothing_reachable_text) — nothing to stop"
   local pid=$TARGET_PID graceful=1
   if [ "$ENDPOINT_UP" = 1 ]; then
-    if [ -z "$REC_PID" ]; then
-      note "note: pid $pid was not started by this supervisor; stopping it anyway"
-    fi
+    [ -n "$REC_PID" ] ||
+      note "note: no launch record names pid $pid; its endpoint, mode and environment match the declaration"
     if ! timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" quit >/dev/null 2>&1; then
       note "warning: \`slashit quit\` failed; waiting for the process to exit, then escalating"
     fi
@@ -851,29 +919,50 @@ cmd_stop() {
   rm -f "$RECORD"
 }
 
-# Chooses the process a stop or restart may act on, before any signal exists.
-# A control-channel answer is the instance's own claim of its pid and is
-# accepted only when the launch record, if it names a pid, names the same one.
-# Otherwise the record is the claim, and it is accepted only when its identity
-# matches. Sets TARGET_PID and TARGET_ID and returns 0; returns 1 when there is
-# nothing to act on; refuses (exit 1) when the evidence disagrees or cannot be
-# verified. It runs in the caller's shell, so ENDPOINT_UP and PING_TIMED_OUT
-# reach the caller.
+# Chooses the process a stop or restart may act on, before any signal or quit is
+# sent. Both routes establish their evidence first:
+#   endpoint answers: a launch record that names a pid must name this pid with
+#     a matching identity; the answer must declare mode gui and the declared
+#     endpoint; the pid's identity is captured, its process environment must
+#     carry the declared values, and the identity is read again to show that
+#     the environment was read from that same process.
+#   no answer, launch record matches: the recorded identity matches, and the
+#     process carries the declared environment.
+# Sets TARGET_PID and TARGET_ID and returns 0. Returns 1 when there is nothing to
+# act on, and refuses (exit 1) when the evidence disagrees or cannot be read.
+# It runs in the caller's shell, so ENDPOINT_UP and PING_TIMED_OUT reach the
+# caller. The environment is not an authentication: a same-user process that
+# carries the declared values passes these checks (docs section 19).
 select_target() {
   TARGET_PID= TARGET_ID= ENDPOINT_UP=0
   record_state
   if ping_fields; then
     ENDPOINT_UP=1
-    if [ -n "$REC_PID" ] && [ "$REC_PID" != "$PING_PID" ]; then
+    [ -z "$REC_PID" ] || [ "$REC_PID" = "$PING_PID" ] ||
       refuse "the endpoint is served by pid $PING_PID, but the launch record names pid $REC_PID; nothing is signaled while the two disagree (see \`$SELF status\`)"
-    fi
-    TARGET_PID=$PING_PID
+    [ -z "$REC_PID" ] || [ "$REC_STATE" = match ] ||
+      refuse "the endpoint is served by pid $PING_PID, and the launch record's pid $REC_PID $REC_WHY, so the record cannot confirm that pid; nothing is signaled or quit (see \`$SELF status\`)"
+    [ "$PING_MODE" = gui ] ||
+      refuse "pid $PING_PID answers on $ENDPOINT as mode '$PING_MODE', not 'gui'; nothing is signaled or quit"
+    [ "${PING_ENDPOINT#unix:}" = "$SOCKET" ] ||
+      refuse "pid $PING_PID answers as '$PING_ENDPOINT', not on the declared endpoint '$ENDPOINT'; nothing is signaled or quit"
     TARGET_ID=$(proc_identity "$PING_PID") ||
-      refuse "pid $PING_PID answers on $ENDPOINT, but its process identity cannot be read; nothing is signaled"
+      refuse "pid $PING_PID answers on $ENDPOINT, but its process identity cannot be read; nothing is signaled or quit"
+    verify_env "$PING_PID"
+    [ "$ENV_CHECK" -eq 0 ] ||
+      refuse "pid $PING_PID answers on $ENDPOINT, but $(env_refusal); nothing is signaled or quit"
+    [ "$(proc_identity "$PING_PID")" = "$TARGET_ID" ] ||
+      refuse "pid $PING_PID changed while it was being verified; nothing is signaled or quit"
+    TARGET_PID=$PING_PID
     return 0
   fi
   case $REC_STATE in
     match)
+      # Nothing answers to check, so the record's identity and the declared
+      # environment are the evidence.
+      verify_env "$REC_PID"
+      [ "$ENV_CHECK" -eq 0 ] ||
+        refuse "the launch record's pid $REC_PID is alive, but $(env_refusal); nothing is signaled"
       TARGET_PID=$REC_PID TARGET_ID=$REC_ID
       return 0
       ;;
