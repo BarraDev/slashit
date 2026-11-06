@@ -781,7 +781,7 @@ local checks too, and do not merge with a known blocker open.
 
 ## 14. Merge gates and security checks
 
-Four kinds of control apply to a merge. Only the first is enforced by GitHub.
+Several kinds of control apply to a merge. Only the first is enforced as a merge gate by GitHub.
 
 **GitHub-enforced: ruleset `Main Protect` (ID 24351287, active).** Verified
 against the ruleset on 2026-11-06:
@@ -801,13 +801,15 @@ owner's decision (`AGENTS.md`, Authorization).
 **Hosted CI (procedural).** Wait for green before merging. Every functional check in `ci.yml`:
 
 - Agent docs
+- Dogfood supervisor harness
 - Lint and structural checks
 - Backend and harness tests
 - Frontend tests and build
-- Compile check (windows-latest)
-- Compile check (macos-latest)
-- Durable write tests (ubuntu-22.04, macos-latest, windows-latest)
 - Desktop acceptance / product shard 1, 2 and 3 (shard 2 also runs the harness suite)
+- Compile check (windows-latest and macos-latest)
+- IPC tests (windows-latest)
+- Updater transport tests (windows-latest and macos-latest)
+- Durable write tests (ubuntu-22.04, macos-latest, windows-latest)
 
 **Advisory; may finish after the merge.**
 
