@@ -407,18 +407,19 @@ pub(crate) async fn set_task_dependencies_via(
             }
         }
     };
-    let written = crate::lifecycle::record_typed_if_changed(tasks, storage, task_id, &revise).await;
+    // Classified at the write: a delete landing after a failed write must not
+    // turn the failure into an absent Task.
+    let written =
+        crate::lifecycle::record_classified_if_changed(tasks, storage, task_id, &revise).await;
+    #[cfg(test)]
+    crate::lifecycle::after_write_seam();
     if let Some(error) = refusal.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
         return Err(error);
     }
     match written {
         Ok(_) => {}
-        Err(crate::lifecycle::RecordWriteError::NotPublished(_))
-            if !tasks.read().await.contains_key(&task_id) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error.to_string()),
+        Err(crate::lifecycle::RecordFailure::TaskAbsent(_)) => return Ok(None),
+        Err(crate::lifecycle::RecordFailure::Write(error)) => return Err(error.to_string()),
     }
     Ok(tasks.read().await.get(&task_id).cloned())
 }
@@ -627,14 +628,17 @@ pub(crate) async fn attach_github_issue_serialized(
             }
         }
     };
-    let changed = crate::lifecycle::record_if_changed(tasks, storage, task_id, &revise).await;
+    let changed =
+        crate::lifecycle::record_classified_if_changed(tasks, storage, task_id, &revise).await;
+    #[cfg(test)]
+    crate::lifecycle::after_write_seam();
     if let Some(refusal) = refusal.into_inner().unwrap_or_else(|e| e.into_inner()) {
         return Err(refusal);
     }
     match changed {
         Ok(_) => Ok(tasks.read().await.get(&task_id).cloned()),
-        Err(_) if !tasks.read().await.contains_key(&task_id) => Ok(None),
-        Err(e) => Err(e),
+        Err(crate::lifecycle::RecordFailure::TaskAbsent(_)) => Ok(None),
+        Err(crate::lifecycle::RecordFailure::Write(error)) => Err(error.to_string()),
     }
 }
 
@@ -1081,12 +1085,45 @@ pub async fn add_external_ref(
     external_ref: ExternalRef,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let amend = move |staged: &mut HashMap<Uuid, Task>| {
-        if let Some(task) = staged.get_mut(&task_id) {
-            task.external_refs.push(external_ref.clone());
+    add_external_ref_serialized(&state.task.tasks, &state.storage, task_id, external_ref).await
+}
+
+/// The write behind [`add_external_ref`].
+pub(crate) async fn add_external_ref_serialized(
+    tasks: &crate::lifecycle::Tasks,
+    storage: &crate::config::Storage,
+    task_id: Uuid,
+    external_ref: ExternalRef,
+) -> Result<Option<Task>, String> {
+    // The duplicate check runs under the write, so two references to one Issue
+    // cannot both be added. The refusals are checked here, not in the caller:
+    // a refused reference persists nothing.
+    let refusal = std::sync::Mutex::new(None::<String>);
+    let revise = |staged: &mut HashMap<Uuid, Task>| {
+        let Some(task) = staged.get_mut(&task_id) else {
+            return false;
+        };
+        let duplicate =
+            crate::domain::github_issue_link::duplicate_issue_refusal(task, &external_ref);
+        if let Some(recovery) = task.worker_recovery_refusal().or(duplicate) {
+            *refusal.lock().unwrap_or_else(|e| e.into_inner()) = Some(recovery);
+            return false;
         }
+        task.external_refs.push(external_ref.clone());
+        true
     };
-    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
+    let changed =
+        crate::lifecycle::record_classified_if_changed(tasks, storage, task_id, &revise).await;
+    #[cfg(test)]
+    crate::lifecycle::after_write_seam();
+    if let Some(refusal) = refusal.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        return Err(refusal);
+    }
+    match changed {
+        Ok(_) => Ok(tasks.read().await.get(&task_id).cloned()),
+        Err(crate::lifecycle::RecordFailure::TaskAbsent(_)) => Ok(None),
+        Err(crate::lifecycle::RecordFailure::Write(error)) => Err(error.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -1170,14 +1207,18 @@ pub(crate) async fn remove_external_ref_chosen_serialized(
             true
         }
     };
-    match crate::lifecycle::record_if_changed(tasks, storage, task_id, &revise).await {
+    let written =
+        crate::lifecycle::record_classified_if_changed(tasks, storage, task_id, &revise).await;
+    #[cfg(test)]
+    crate::lifecycle::after_write_seam();
+    match written {
         Ok(_) if moved.load(std::sync::atomic::Ordering::SeqCst) => Err(
             "the task's references changed while this was waiting; nothing was removed, so this can be asked for again"
                 .to_string(),
         ),
         Ok(_) => Ok(tasks.read().await.get(&task_id).cloned()),
-        Err(_) if !tasks.read().await.contains_key(&task_id) => Ok(None),
-        Err(e) => Err(e),
+        Err(crate::lifecycle::RecordFailure::TaskAbsent(_)) => Ok(None),
+        Err(crate::lifecycle::RecordFailure::Write(error)) => Err(error.to_string()),
     }
 }
 
@@ -2115,22 +2156,6 @@ mod tests {
         assert!(matches!(&updated.external_refs[0], ExternalRef::GithubIssue { number: 1, .. }));
         assert!(matches!(&updated.external_refs[1], ExternalRef::JiraTicket { .. }));
         assert!(matches!(&updated.external_refs[2], ExternalRef::GithubIssue { number: 3, .. }));
-    }
-
-    #[test]
-    fn test_add_duplicate_external_ref_both_present() {
-        let project_id = Uuid::new_v4();
-        let task = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
-        let task_id = task.id;
-        let mut tasks = create_test_tasks_map(vec![task]);
-
-        add_external_ref_logic(&mut tasks, task_id, make_github_issue_ref(42));
-        let result = add_external_ref_logic(&mut tasks, task_id, make_github_issue_ref(42));
-
-        assert!(result.is_some());
-        let updated = result.unwrap();
-        // No dedup: both present
-        assert_eq!(updated.external_refs.len(), 2);
     }
 
     #[test]
@@ -3797,6 +3822,326 @@ mod issue_reference_write_tests {
         .unwrap();
         assert_eq!(updated.external_refs, vec![issue_ref("o/r", 1), issue_ref("o/r", 3)]);
         assert_eq!(board.reloaded().external_refs, updated.external_refs);
+    }
+
+    /// Deletes the Task right after the next conditional write releases its
+    /// lock, the gap in which the caller used to look the Task up again.
+    /// Returns a flag the hook sets when it has run, so a test can prove the
+    /// delete landed in the gap rather than passing on the injected failure alone.
+    fn delete_task_after_the_next_write(
+        tasks: &crate::lifecycle::Tasks,
+        task_id: Uuid,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let tasks = tasks.clone();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        crate::lifecycle::AFTER_WRITE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                tasks
+                    .try_write()
+                    .expect("the write has released the lock")
+                    .remove(&task_id);
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+        });
+        ran
+    }
+
+    /// Whether the seam's delete ran, as the test must assert before it trusts
+    /// the outcome it observed.
+    fn assert_the_delete_landed(ran: &std::sync::atomic::AtomicBool) {
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the delete must land in the gap before the outcome is read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_that_fails_to_persist_is_reported_even_if_the_task_is_deleted_at_once() {
+        let issue = parse_issue_url("https://github.com/o/r/issues/7").unwrap();
+        let board = Board::new(create_test_task("linked then deleted")).await;
+        let _fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+        let ran = delete_task_after_the_next_write(&board.tasks, board.task_id);
+
+        let result = attach_github_issue_serialized(
+            &board.tasks,
+            &board.storage,
+            board.task_id,
+            &issue,
+            "OPEN",
+        )
+        .await;
+
+        assert_the_delete_landed(&ran);
+        assert!(
+            result.is_err(),
+            "a failed write must be reported, got {result:?}"
+        );
+        assert!(
+            board.reloaded().external_refs.is_empty(),
+            "the failed write left the record alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_published_but_not_durable_is_reported_even_if_the_task_is_deleted_at_once() {
+        let issue = parse_issue_url("https://github.com/o/r/issues/7").unwrap();
+        let board = Board::new(create_test_task("linked then deleted")).await;
+        let _fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        let ran = delete_task_after_the_next_write(&board.tasks, board.task_id);
+
+        let result = attach_github_issue_serialized(
+            &board.tasks,
+            &board.storage,
+            board.task_id,
+            &issue,
+            "OPEN",
+        )
+        .await;
+
+        assert_the_delete_landed(&ran);
+        assert!(
+            result.is_err(),
+            "an unconfirmed write must be reported, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unlink_that_fails_to_persist_is_reported_even_if_the_task_is_deleted_at_once() {
+        let mut task = create_test_task("unlinked then deleted");
+        task.external_refs = vec![issue_ref("o/r", 7)];
+        let board = Board::new(task).await;
+        let _fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+        let ran = delete_task_after_the_next_write(&board.tasks, board.task_id);
+
+        let result = remove_external_ref_chosen_serialized(
+            &board.tasks,
+            &board.storage,
+            &board.locks,
+            board.task_id,
+            0,
+            &issue_ref("o/r", 7),
+        )
+        .await;
+
+        assert_the_delete_landed(&ran);
+        assert!(
+            result.is_err(),
+            "a failed write must be reported, got {result:?}"
+        );
+        assert_eq!(board.reloaded().external_refs, vec![issue_ref("o/r", 7)]);
+    }
+
+    /// A dependency write that the disk refuses is reported, even when a delete
+    /// lands in the gap before the outcome is read. The lease already keeps a
+    /// delete out of this gap in production; the test does not rely on it.
+    #[tokio::test]
+    async fn a_dependency_write_that_fails_is_reported_even_if_the_task_is_deleted_at_once() {
+        let board = Board::new(create_test_task("dependent")).await;
+        // A dependency absent from the Project is refused before any write, so
+        // the named Task must be on the board for the write to be attempted.
+        let mut dependency = create_test_task("dependency");
+        dependency.project_id = board.project_id;
+        let dependency_id = dependency.id;
+        {
+            let mut tasks = board.tasks.write().await;
+            tasks.insert(dependency_id, dependency);
+            let all: Vec<Task> = tasks.values().cloned().collect();
+            board
+                .storage
+                .save_project_tasks(board.project_id, &all)
+                .unwrap();
+        }
+        let _fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+        let ran = delete_task_after_the_next_write(&board.tasks, board.task_id);
+
+        let result = set_task_dependencies_via(
+            &board.tasks,
+            &board.storage,
+            &board.locks,
+            board.task_id,
+            vec![dependency_id.to_string()],
+        )
+        .await;
+
+        assert_the_delete_landed(&ran);
+        assert!(
+            result.is_err(),
+            "a failed write must be reported, got {result:?}"
+        );
+        assert!(board.reloaded().dependencies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_task_absent_before_the_link_begins_is_still_answered_as_absent() {
+        let issue = parse_issue_url("https://github.com/o/r/issues/7").unwrap();
+        let board = Board::new(create_test_task("gone")).await;
+        board.tasks.write().await.remove(&board.task_id);
+
+        let result = attach_github_issue_serialized(
+            &board.tasks,
+            &board.storage,
+            board.task_id,
+            &issue,
+            "OPEN",
+        )
+        .await;
+
+        assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_task_absent_before_the_unlink_begins_is_still_answered_as_absent() {
+        let mut task = create_test_task("gone");
+        task.external_refs = vec![issue_ref("o/r", 7)];
+        let board = Board::new(task).await;
+        board.tasks.write().await.remove(&board.task_id);
+
+        let result = remove_external_ref_chosen_serialized(
+            &board.tasks,
+            &board.storage,
+            &board.locks,
+            board.task_id,
+            0,
+            &issue_ref("o/r", 7),
+        )
+        .await;
+
+        assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    /// The generic command is registered with the webview, and it must not
+    /// store a second row for an Issue the Task already holds.
+    #[tokio::test]
+    async fn the_generic_reference_command_refuses_a_second_row_for_a_held_issue() {
+        let board = Board::new(create_test_task("generic")).await;
+        let held = issue_ref("o/r", 7);
+        add_external_ref_serialized(&board.tasks, &board.storage, board.task_id, held.clone())
+            .await
+            .unwrap();
+
+        let before = serde_json::to_value(board.reloaded()).unwrap();
+
+        let second =
+            add_external_ref_serialized(&board.tasks, &board.storage, board.task_id, held.clone())
+                .await;
+
+        assert!(
+            second
+                .as_ref()
+                .is_err_and(|m| m.contains("already links issue #7")),
+            "{second:?}"
+        );
+        assert_eq!(board.reloaded().external_refs, vec![held]);
+        assert_eq!(
+            serde_json::to_value(board.reloaded()).unwrap(),
+            before,
+            "a refused reference rewrites nothing, not even updated_at"
+        );
+    }
+
+    /// A reference the disk refuses is reported, even when a delete lands in
+    /// the gap before the outcome is read.
+    #[tokio::test]
+    async fn a_reference_that_fails_to_persist_is_reported_even_if_the_task_is_deleted_at_once() {
+        let board = Board::new(create_test_task("generic")).await;
+        let _fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+        let ran = delete_task_after_the_next_write(&board.tasks, board.task_id);
+
+        let result = add_external_ref_serialized(
+            &board.tasks,
+            &board.storage,
+            board.task_id,
+            issue_ref("o/r", 7),
+        )
+        .await;
+
+        assert_the_delete_landed(&ran);
+        assert!(
+            result.is_err(),
+            "a failed write must be reported, got {result:?}"
+        );
+        assert!(board.reloaded().external_refs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reference_for_a_task_absent_before_the_add_is_still_answered_as_absent() {
+        let board = Board::new(create_test_task("gone")).await;
+        board.tasks.write().await.remove(&board.task_id);
+
+        let result = add_external_ref_serialized(
+            &board.tasks,
+            &board.storage,
+            board.task_id,
+            issue_ref("o/r", 7),
+        )
+        .await;
+
+        assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn the_generic_reference_command_refuses_the_same_issue_in_another_case() {
+        let board = Board::new(create_test_task("generic")).await;
+        add_external_ref_serialized(
+            &board.tasks,
+            &board.storage,
+            board.task_id,
+            issue_ref("o/r", 7),
+        )
+        .await
+        .unwrap();
+        let upper = ExternalRef::GithubIssue {
+            url: "https://github.com/O/R/issues/7".to_string(),
+            number: 7,
+            repo: "O/R".to_string(),
+            state: Some("OPEN".to_string()),
+        };
+
+        let result =
+            add_external_ref_serialized(&board.tasks, &board.storage, board.task_id, upper).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(board.reloaded().external_refs, vec![issue_ref("o/r", 7)]);
+    }
+
+    /// Genuinely distinct Issues, including the same number in another
+    /// repository, are still stored.
+    #[tokio::test]
+    async fn the_generic_reference_command_keeps_distinct_issues() {
+        let board = Board::new(create_test_task("generic")).await;
+        let refs = vec![
+            issue_ref("o/r", 7),
+            issue_ref("o/r", 8),
+            issue_ref("other/r", 7),
+        ];
+        for reference in &refs {
+            add_external_ref_serialized(
+                &board.tasks,
+                &board.storage,
+                board.task_id,
+                reference.clone(),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(board.reloaded().external_refs, refs);
     }
 
     /// Finding 2: unlinking the Issue also clears the legacy field that names
