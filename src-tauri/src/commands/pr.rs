@@ -5093,9 +5093,11 @@ async fn create_pr_reserved(
     } else {
         None
     };
-    if let Err(refused) = refuse_before_pr_create(state, task_uuid, approved_delivery, bound)
-        .and_then(|()| refuse_if_pr_operation_cancelled(&reservation, "opening the pull request"))
-    {
+    let refuse_now = || {
+        refuse_before_pr_create(state, task_uuid, approved_delivery, bound)
+            .and_then(|()| refuse_if_pr_operation_cancelled(&reservation, "opening the pull request"))
+    };
+    if let Err(refused) = refuse_now() {
         return Err(retract_pr_create_attempt(state, task_uuid, &attempt, refused).await);
     }
     // Named only here, after every refusal above, so that a refused request
@@ -5106,6 +5108,14 @@ async fn create_pr_reserved(
         eprintln!("[pr] pull request repository unknown, so no Issue is closed: {e}");
         String::new()
     });
+    #[cfg(test)]
+    after_slug_hook::run(&working_dir);
+    // The lookup is a `gh` call, so an approval can be withdrawn or a
+    // cancellation can land while it is outstanding. Both are read again here,
+    // with no await between this read and the spawn of `gh pr create`.
+    if let Err(refused) = refuse_now() {
+        return Err(retract_pr_create_attempt(state, task_uuid, &attempt, refused).await);
+    }
     let pr_body = build_pr_body(&pr_source, &pr_repo);
     let mut create_args = vec![
         "pr", "create",
@@ -7912,6 +7922,32 @@ async fn push_branch_pinned(working_dir: &str, branch: &str, pinned: Option<&str
 /// window deterministically.
 #[cfg(test)]
 mod after_record_hook {
+    use std::sync::Mutex;
+
+    static HOOK: Mutex<Option<(String, Box<dyn FnOnce() + Send>)>> = Mutex::new(None);
+
+    pub(super) fn arm(working_dir: &str, hook: impl FnOnce() + Send + 'static) {
+        *HOOK.lock().unwrap() = Some((working_dir.to_string(), Box::new(hook)));
+    }
+
+    pub(super) fn run(working_dir: &str) {
+        let due = {
+            let mut slot = HOOK.lock().unwrap();
+            match slot.as_ref() {
+                Some((dir, _)) if dir == working_dir => slot.take().map(|(_, hook)| hook),
+                _ => None,
+            }
+        };
+        if let Some(hook) = due {
+            hook();
+        }
+    }
+}
+
+/// The same hook as `after_record_hook`, run once the repository lookup has
+/// returned, so a test can change the task while that `gh` call is outstanding.
+#[cfg(test)]
+mod after_slug_hook {
     use std::sync::Mutex;
 
     static HOOK: Mutex<Option<(String, Box<dyn FnOnce() + Send>)>> = Mutex::new(None);
@@ -22094,6 +22130,70 @@ esac"#
                     let executor = executor.clone();
                     let mut cancelled = cancelled.clone();
                     crate::commands::pr::after_record_hook::arm(&working_dir, move || {
+                        // The transition that ends the operation runs on another
+                        // worker; the hook returns once it has cancelled it.
+                        *ender.lock().unwrap() = Some(tokio::spawn(async move {
+                            let running: Option<&dyn crate::lifecycle::ExecutionOwnership> =
+                                Some(executor.as_ref());
+                            crate::lifecycle::end_active_ownership(running, task_id).await
+                        }));
+                        tokio::task::block_in_place(|| {
+                            for _ in 0..400 {
+                                if *cancelled.borrow_and_update() {
+                                    return;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                            }
+                        });
+                    });
+                }
+
+                let error = create_pr_reserved(&state, task_id, reservation, None)
+                    .await
+                    .expect_err("a cancelled operation does not open the pull request");
+                let joined = ender.lock().unwrap().take().expect("the hook ran");
+                joined
+                    .await
+                    .expect("join")
+                    .expect("the transition ends the operation");
+
+                assert!(
+                    error.contains("stopped before opening the pull request"),
+                    "{error}"
+                );
+                assert_eq!(gh.creates(), 0, "{}", gh.fake.invocations());
+                assert_eq!(
+                    repo.remote_has_branch(BRANCH).as_deref(),
+                    Some(sha.as_str())
+                );
+                assert_nothing_recorded(&state, task_id).await;
+
+                assert_eq!(create(&state, task_id, None).await.as_deref(), Ok(PR_URL));
+                assert_eq!(gh.creates(), 1, "{}", gh.fake.invocations());
+                assert_delivered(&state, task_id).await;
+            }
+
+            /// A cancellation that lands while the repository is looked up, after
+            /// the request is recorded, stops the delivery before `gh pr create`.
+            /// The lookup is a `gh` call, so the refusals are read again after it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_cancellation_during_the_repository_lookup_stops_before_gh_pr_create() {
+                let (repo, sha, gh, state, _tmp, task_id, _bin) = setup().await;
+                let executor = crate::test_helpers::attach_test_executor(&state);
+                let reservation = reserve_task_for_pr_side_effect(&state, task_id)
+                    .await
+                    .expect("the task is reserved for the operation");
+                let cancelled = reservation
+                    .as_ref()
+                    .expect("an executor is wired, so a reservation is held")
+                    .cancel_receiver();
+                let working_dir = repo.checkout.to_str().unwrap().to_string();
+                let ender = std::sync::Arc::new(std::sync::Mutex::new(None));
+                {
+                    let ender = ender.clone();
+                    let executor = executor.clone();
+                    let mut cancelled = cancelled.clone();
+                    crate::commands::pr::after_slug_hook::arm(&working_dir, move || {
                         // The transition that ends the operation runs on another
                         // worker; the hook returns once it has cancelled it.
                         *ender.lock().unwrap() = Some(tokio::spawn(async move {
