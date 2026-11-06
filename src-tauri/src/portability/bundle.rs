@@ -418,15 +418,31 @@ fn validate(payload: &Payload) -> Result<(), BundleError> {
 
 /// A repository remote is one plain token, and carries no user information:
 /// that is where a credential would sit, so its presence is `Unsafe`.
-/// Shortcut: a scp-style remote (`user:secret@host:path`) and a local path are
-/// accepted as written; a credential in those forms is not detected.
+///
+/// An scp-style remote (`user@host:path`) keeps its user part, as SSH needs it.
+/// A colon inside that user part (`user:secret@host:path`) is a password, so it
+/// is refused the same way. A local path is not an scp-style remote.
 fn check_remote_identity(url: &str) -> Result<(), BundleError> {
     if url.is_empty() || url.len() > 2048 || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(BundleError::Malformed("the repository remote is not one plain token".into()));
     }
+    // A colon before the first `@` is inside the user part; one after it is in the host or path.
+    let carries_user_information = |head: &str| match (head.find(':'), head.find('@')) {
+        (Some(colon), Some(at)) => colon < at,
+        _ => false,
+    };
     if let Some((_, rest)) = url.split_once("://") {
         let authority = rest.split('/').next().unwrap_or_default();
         if authority.contains('@') {
+            return Err(BundleError::Unsafe(
+                "the repository remote carries user information, which may hold a credential".into(),
+            ));
+        }
+        if url.contains(['?', '#']) {
+            return Err(BundleError::Malformed("the repository remote has a query or fragment".into()));
+        }
+    } else {
+        if carries_user_information(url.split('/').next().unwrap_or_default()) {
             return Err(BundleError::Unsafe(
                 "the repository remote carries user information, which may hold a credential".into(),
             ));

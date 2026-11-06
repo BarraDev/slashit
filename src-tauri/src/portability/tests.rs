@@ -1061,6 +1061,59 @@ async fn an_export_refuses_a_remote_that_decode_would_refuse() {
     assert!(!path.exists());
 }
 
+/// An scp-style remote can carry a credential in its user part, which is not
+/// stripped the way a `://` URL's is. Export refuses it, and an ordinary
+/// `git@host:path` remote, which has no credential, still exports.
+#[tokio::test]
+async fn an_export_refuses_an_scp_remote_that_carries_a_credential() {
+    let (tmp, ctx) = test_ctx().await;
+    let mut repo = repository(Path::new("/tmp/unused-checkout"));
+    repo.remote_url = Some("deploy:SCP_SECRET@github.com:acme/app.git".into());
+    seed(&ctx, Some(&repo), &fixture_tasks()).await;
+    let path = tmp.path().join("scp.json");
+    let answer = export_to(&ctx, &path).await;
+    assert!(
+        !answer.ok,
+        "a credential-bearing remote must be refused: {answer:?}"
+    );
+    assert!(!format!("{answer:?}").contains("SCP_SECRET"));
+    assert!(!path.exists());
+
+    repo.remote_url = Some("git@github.com:acme/app.git".into());
+    seed(&ctx, Some(&repo), &fixture_tasks()).await;
+    let ssh = tmp.path().join("ssh.json");
+    let answer = export_to(&ctx, &ssh).await;
+    assert!(
+        answer.ok,
+        "an ordinary SSH remote must still export: {answer:?}"
+    );
+
+    // Export drops a query from any remote before the check, so the secret never reaches the file.
+    repo.remote_url = Some("git@github.com:acme/app.git?access_token=QUERY_SECRET".into());
+    seed(&ctx, Some(&repo), &fixture_tasks()).await;
+    let query = tmp.path().join("query.json");
+    let answer = export_to(&ctx, &query).await;
+    assert!(answer.ok, "{answer:?}");
+    let written = fs::read_to_string(&query).unwrap();
+    assert!(!written.contains("QUERY_SECRET"), "the query must not be exported");
+
+    let sealed = seal(&payload_json(|v| {
+        v["repository"]["remote_url"] = Value::from("deploy:SCP_SECRET@github.com:acme/app.git");
+    }));
+    assert!(
+        matches!(bundle::decode(&sealed), Err(BundleError::Unsafe(_))),
+        "decode refuses the same remote"
+    );
+    // A hand-written bundle may still carry a query: decode refuses it.
+    let queried = seal(&payload_json(|v| {
+        v["repository"]["remote_url"] = Value::from("git@github.com:acme/app.git?token=x");
+    }));
+    assert!(
+        matches!(bundle::decode(&queried), Err(BundleError::Malformed(_))),
+        "decode refuses a query in an scp remote"
+    );
+}
+
 /// B2, decode side: identity and Git evidence are checked by shape, and an
 /// absent but well-formed commit is still accepted.
 #[test]
