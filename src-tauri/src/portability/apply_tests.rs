@@ -384,6 +384,35 @@ async fn an_invalid_reviewer_model_refuses_the_bundle_before_any_write() {
     assert_target_empty(&target).await;
 }
 
+/// The stored reviewer model is the parser's output, not the raw bundle text:
+/// an empty or whitespace-only model stores no reviewer, and a padded model is
+/// stored trimmed. Raw storage would start a reviewer run with `--model ""`.
+#[tokio::test]
+async fn an_imported_reviewer_model_is_stored_as_the_parser_reads_it() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let task_id = bundle::decode(&bytes).unwrap().payload.tasks[0].id;
+
+    for (raw, stored) in [
+        (Some("  sonnet  "), Some("sonnet")),
+        (Some(""), None),
+        (Some("   "), None),
+        (None, None),
+    ] {
+        let mut payload = bundle::decode(&bytes).unwrap().payload;
+        payload.tasks[0].reviewer_model = raw.map(str::to_string);
+        let tampered = bundle::encode(&payload, chrono::Utc::now(), "test").unwrap();
+
+        let (_dst, target) = test_ctx().await;
+        apply::apply(live(&target), &tampered, &checksum_of(&tampered))
+            .await
+            .unwrap_or_else(|e| panic!("reviewer {raw:?} must import: {e}"));
+        let imported = target.tasks.read().await[&task_id].reviewer_model.clone();
+        assert_eq!(imported.as_deref(), stored, "reviewer {raw:?}");
+    }
+}
+
 #[tokio::test]
 async fn apply_waits_for_the_project_lifecycle_gate() {
     let (src, source) = test_ctx().await;
@@ -660,6 +689,153 @@ async fn a_configuration_the_filesystem_cannot_synchronize_is_not_reported_durab
     assert!(response.ok, "the change is in place: {:?}", response.error);
     assert_eq!(response.data["durable"], false);
     assert_eq!(target.tasks.read().await.len(), 2);
+}
+
+/// A failed revert leaves the Project's configuration entry on disk while memory
+/// no longer holds the Project. A later save of any Project must keep that
+/// entry, or a restart would find the Task board without its configuration.
+#[tokio::test]
+async fn a_later_save_after_a_failed_revert_keeps_the_held_back_entry() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+
+    // The same faults as `a_failed_revert_is_reported_as_an_incomplete_import`.
+    let faults = fault::fail_in_order(&[
+        (Stage::Replace, ErrorKind::Other, 2),
+        (Stage::Replace, ErrorKind::Other, 0),
+    ]);
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    drop(faults);
+    assert!(!response.ok);
+    assert!(!target.projects.read().await.contains_key(&project_id()));
+
+    let memory = target.projects.read().await.clone();
+    crate::commands::project::try_persist_projects(&target.storage, &memory)
+        .expect("a later save succeeds");
+    assert!(
+        target
+            .storage
+            .load_config()
+            .unwrap()
+            .projects
+            .contains_key(&project_id().to_string()),
+        "a later save dropped the held-back entry"
+    );
+}
+
+/// A Task or Conversation cleanup still owed for a Project id refuses an import
+/// of that id. Otherwise the cleanup could delete the Tasks or Conversations the
+/// import created. The refusal writes nothing, and the cleanup record stays until
+/// its own cleanup completes.
+#[tokio::test]
+async fn an_import_waits_for_a_pending_cleanup_of_the_same_identity() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+
+    for task_cleanup in [true, false] {
+        let (dst, target) = test_ctx().await;
+        let path = write_bundle(&dst, &bytes);
+        if task_cleanup {
+            target
+                .storage
+                .mark_project_tasks_deletion_pending(project_id(), &[])
+                .unwrap();
+        } else {
+            target
+                .storage
+                .mark_project_conversation_deletion_pending(project_id())
+                .unwrap();
+        }
+
+        let refused = apply_with(&target, &path, &checksum_of(&bytes)).await;
+        assert!(!refused.ok, "task cleanup: {task_cleanup}: {refused:?}");
+        assert!(target.storage.pending_project_imports().unwrap().is_empty());
+        assert!(!target.projects.read().await.contains_key(&project_id()));
+        assert!(target.tasks.read().await.is_empty());
+        if task_cleanup {
+            assert!(target.storage.has_pending_tasks_deletion_record(project_id()).unwrap());
+        } else {
+            assert!(target
+                .storage
+                .pending_project_conversation_deletions()
+                .unwrap()
+                .contains(&project_id()));
+        }
+
+        if task_cleanup {
+            target.storage.clear_project_tasks_deletion_pending(project_id()).unwrap();
+        } else {
+            target
+                .storage
+                .clear_project_conversation_deletion_pending(project_id())
+                .unwrap();
+        }
+        let imported = apply_with(&target, &path, &checksum_of(&bytes)).await;
+        assert!(imported.ok, "task cleanup: {task_cleanup}: {:?}", imported.error);
+    }
+}
+
+/// On a filesystem that cannot synchronize a directory, startup's reconfirmation
+/// of the configuration can never succeed. That used to count as proof that the
+/// configuration was not authoritative, so the completed import was quarantined
+/// on every start. The Project now loads on each start, and its record stays
+/// until a start can confirm the configuration.
+#[tokio::test]
+async fn a_completed_import_loads_on_every_start_of_a_filesystem_that_cannot_synchronize_directories() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    let paths = std::sync::Arc::new(target.storage.paths().clone());
+
+    // Every directory sync reports Unsupported, for the import and the restarts.
+    let unsupported = fault::fail_every(Stage::SyncDirectory, ErrorKind::Unsupported);
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(response.data["durable"], false);
+    drop(target);
+
+    for start in 1..=2 {
+        let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+            .await
+            .unwrap();
+        assert!(
+            state.project.projects.read().await.contains_key(&project_id()),
+            "start {start}: the completed import must load: {:?}",
+            report.project_import_recovery_failures
+        );
+        let loaded = state
+            .task
+            .tasks
+            .read()
+            .await
+            .values()
+            .filter(|t| t.project_id == project_id())
+            .count();
+        assert_eq!(loaded, 2, "start {start}: the Tasks must load with their Project");
+        assert!(
+            paths.pending_project_import_file(project_id()).exists(),
+            "start {start}: the record stays until the configuration is confirmed durable"
+        );
+    }
+    drop(unsupported);
+
+    // A filesystem that confirms the configuration settles the import.
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(state.project.projects.read().await.contains_key(&project_id()));
+    assert!(
+        !paths.pending_project_import_file(project_id()).exists(),
+        "the record goes once the configuration is confirmed: {:?}",
+        report.project_import_recovery_failures
+    );
+    assert!(report.project_import_recovery_failures.is_empty());
 }
 
 /// Make `config.toml` fail strict parsing, so startup reads it through the

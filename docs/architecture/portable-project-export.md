@@ -49,7 +49,9 @@ They show what the exporting instance recorded. They confer no authority,
 because approvals are withdrawn and the apply creates no checkout.
 
 Refused on read, in preview and apply alike: a Task whose reviewer model would
-be rejected when it is created. An export of such a Task still succeeds.
+be rejected when it is created. An export of such a Task still succeeds. An
+accepted reviewer model is stored as the parser returns it: an empty or
+whitespace-only value stores no reviewer, and surrounding whitespace is removed.
 
 Not created: a Repository, a checkout, a branch, a pull request, a worker run,
 an integration, or any Git object. Historical Git identifiers are not checked
@@ -87,10 +89,11 @@ Results:
   also gives `durable: false`.
 - A repeated apply of the same bundle is refused by the identity rule, so an
   import cannot be committed twice.
-- An apply is refused, and changes nothing, while any import record, Task board
-  or configuration entry for the same Project id is still on disk. This covers
-  a Project held back by an earlier import: the preview sees only memory, so the
-  disk is checked as well.
+- An apply is refused, and changes nothing, while any import record, Task board,
+  configuration entry, or pending Task or Conversation cleanup for the same
+  Project id is still on disk. This covers a Project held back by an earlier
+  import: the preview sees only memory, so the disk is checked as well. A
+  cleanup that is still owed would otherwise delete what the import created.
 - Two concurrent applies of one bundle serialize on the Project's lifecycle
   gate. Exactly one commits.
 
@@ -101,8 +104,12 @@ any Project is used, and only with a configuration read without salvage:
 
 - No Project and no board under the record: the import never committed. The
   record is removed.
-- A Project with its board: the import completed. Only the record remained, so
-  it is removed and the Project is kept.
+- A Project with its board: the import completed. The Project is kept. The
+  record is removed once the configuration is confirmed durable. On a
+  filesystem that cannot synchronize a directory that never happens, so the
+  record stays and the Project loads on every start until a start can confirm
+  the configuration. The record is what holds back a Project whose entry or
+  board a power loss could drop, so it is not removed on an unconfirmed start.
 - A Project without its board: the import was interrupted. Only this Project is
   removed from `config.toml`, so the bundle can be imported again. No other
   record or board is touched.
@@ -217,12 +224,23 @@ Export is refused, and writes nothing, while any Task of the Project:
 Every blocked Task is named in one refusal. `human_review` with a checkout is
 allowed: a decision wait is not an active run.
 
+## Lock order
+
+Apply, Preview, Export, Task creation and Project deletion take the in-memory
+locks in one order: the Project lifecycle gate, then Tasks, then Projects, then
+Repositories. Project creation and Repository commands take one of these locks
+at a time. A handler that took Projects before Tasks could hold Projects
+while it waited for Tasks, and an Apply holding Tasks while it waited for
+Projects would then deadlock with it. `ipc::handlers::import_lock_order` parks
+Export and Preview at the Repositories lock and checks that they already hold
+Tasks.
+
 ## Snapshot consistency
 
 Export takes the Project's lifecycle gate in shared mode and every Task
-lifecycle lease of the Project, then reads the Project, its Repository and its
-Tasks from the in-memory maps under their read locks, and releases everything
-before writing the file. A deletion of the Project, a run start or a lifecycle
+lifecycle lease of the Project, then reads the Tasks, the Project and its
+Repository from the in-memory maps under their read locks, in the lock order
+above, and releases everything before writing the file. A deletion of the Project, a run start or a lifecycle
 transition therefore cannot interleave with the read. Export does not read the
 board files or the config file.
 

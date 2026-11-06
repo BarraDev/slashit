@@ -833,10 +833,11 @@ impl Storage {
         held.iter().copied().collect()
     }
 
-    /// Whether anything on disk still names this Project as an import: its
-    /// import record, a Task board, or a configuration entry. An unreadable
-    /// file counts as present. An import of the same id must not replace or
-    /// clear any of them while they remain.
+    /// Whether anything on disk still names this Project id: its import record,
+    /// a Task board, a configuration entry, or a Task or Conversation cleanup
+    /// that is still owed. An unreadable file counts as present. An import of the
+    /// same id must not replace or clear any of them while they remain, and a
+    /// pending cleanup must not later delete what the import created.
     pub fn project_import_residue(&self, project_id: Uuid) -> Result<bool> {
         let record = self.paths.pending_project_import_file(project_id);
         if record.try_exists().unwrap_or(true) {
@@ -846,6 +847,17 @@ impl Storage {
             .tasks_board_files(project_id)
             .iter()
             .any(|file| file.try_exists().unwrap_or(true))
+        {
+            return Ok(true);
+        }
+        if self.has_pending_tasks_deletion_record(project_id)? {
+            return Ok(true);
+        }
+        if self
+            .paths
+            .pending_project_conversation_deletion_file(project_id)
+            .try_exists()
+            .unwrap_or(true)
         {
             return Ok(true);
         }

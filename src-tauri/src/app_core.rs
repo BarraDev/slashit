@@ -235,6 +235,10 @@ pub async fn build_state_with_paths(
     // configuration is rewritten through the full durable protocol; if that
     // fails the records are kept and the cleanup waits for a later start.
     let mut projects_are_authoritative = projects_are_authoritative;
+    // Import recovery has its own two answers: whether the configuration proves
+    // a Project's absence, and whether its own state is confirmed durable.
+    let mut import_authoritative = projects_are_authoritative;
+    let mut import_confirmed = true;
     if projects_are_authoritative {
         let owed = app_state
             .storage
@@ -264,6 +268,17 @@ pub async fn build_state_with_paths(
                     "pending cleanup deferred: configuration not confirmed durable: {error}"
                 ));
                 projects_are_authoritative = false;
+                // A filesystem that cannot synchronize a directory never confirms
+                // a write, so this reconfirmation can never succeed there. The
+                // configuration was read in full, which is enough to settle an
+                // import; the record stays until the configuration is confirmed.
+                // Any other failure keeps the imports held back as well.
+                if matches!(error, crate::config::ConfigWriteError::Unconfirmable(_)) {
+                    import_confirmed = false;
+                } else {
+                    import_authoritative = false;
+                    import_confirmed = false;
+                }
             }
         }
     }
@@ -277,7 +292,8 @@ pub async fn build_state_with_paths(
         let recovery = crate::portability::apply::recover_interrupted_imports(
             &app_state.storage,
             &mut projects,
-            projects_are_authoritative,
+            import_authoritative,
+            import_confirmed,
         );
         report.project_import_recovery_failures = recovery.failures;
         recovery.quarantined

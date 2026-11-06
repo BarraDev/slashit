@@ -141,14 +141,15 @@ pub async fn apply(
     let project_name = project.name.clone();
     let task_count = tasks.len() as u32;
 
-    // A Project held back by an earlier import keeps its record, board or
-    // configuration entry. The preview sees only memory, so the disk is checked
+    // A Project held back by an earlier import, or a cleanup still owed for its id,
+    // keeps its record, board, configuration entry or cleanup record. The preview
+    // sees only memory, so the disk is checked
     // here: a new import must not replace, clear, or adopt any of them.
     match live.storage.project_import_residue(project_id) {
         Ok(false) => {}
         Ok(true) => {
             return Err(ApplyError::Failed(format!(
-                "Project {project_id} is held back by an earlier import: its import record, Task board or configuration entry is still present. Repair or settle it before importing this bundle again."
+                "Project {project_id} still has state from an earlier import or a pending cleanup on this instance: an import record, Task board, configuration entry, or cleanup record remains. Settle it before importing this bundle again."
             )))
         }
         Err(e) => {
@@ -221,6 +222,9 @@ pub async fn apply(
                 // The revert is in place. The record stays until a start confirms
                 // the Project is gone.
                 Err(revert) if revert.is_published() => {
+                    // The Project is out of memory, but its entry may still be on
+                    // disk after a power loss: later saves must keep it.
+                    live.storage.hold_back_project(project_id);
                     *projects_w = original;
                     Err(ApplyError::Failed(format!(
                         "{board_error}; the revert is in place but not confirmed durable: {}",
@@ -230,6 +234,9 @@ pub async fn apply(
                 // The Project leaves memory, so nothing in this process can use it.
                 // The record stays, and the next start settles it.
                 Err(revert) => {
+                    // The revert did not publish, so the Project's entry is still
+                    // on disk while memory has no Project. Later saves keep it.
+                    live.storage.hold_back_project(project_id);
                     *projects_w = original;
                     Err(ApplyError::Incomplete(format!(
                         "{board_error}, and the revert also failed, so Project {project_id} is recorded without its Tasks. Restart SlashIt: the interrupted import is then undone, and the bundle can be imported again. {}",
@@ -293,14 +300,22 @@ pub struct ImportRecovery {
 ///   reader recovers no Projects today, so what this holds back is the Task
 ///   board, which would otherwise load with no Project to own it.
 /// - No Project under the record: the import never committed. The record goes.
-/// - A Project with a board: the import completed. Only the record remained.
+/// - A Project with a board: the import completed. The Project is loaded. Its
+///   record goes once the configuration is `confirmed` durable; until then the
+///   record stays, because it is what holds back a Project whose entry or board
+///   a power loss could drop.
 /// - A Project without a board: the import was interrupted. The Project is
 ///   removed from the configuration, which is the only change made. Its
 ///   record goes once that removal is confirmed.
+///
+/// `confirmed` is false on a filesystem that cannot synchronize a directory: a
+/// write there never confirms, so the record cannot go, but the configuration
+/// that was read in full still settles the import.
 pub fn recover_interrupted_imports(
     storage: &Storage,
     projects: &mut HashMap<Uuid, Project>,
     authoritative: bool,
+    confirmed: bool,
 ) -> ImportRecovery {
     let mut recovery = ImportRecovery::default();
     let records = match storage.import_records() {
@@ -348,7 +363,7 @@ pub fn recover_interrupted_imports(
             ));
             continue;
         }
-        settle_record(storage, projects, project_id, &mut recovery);
+        settle_record(storage, projects, project_id, confirmed, &mut recovery);
     }
     recovery
 }
@@ -371,6 +386,7 @@ fn settle_record(
     storage: &Storage,
     projects: &mut HashMap<Uuid, Project>,
     project_id: Uuid,
+    confirmed: bool,
     recovery: &mut ImportRecovery,
 ) {
     // A board that cannot be stat'ed may still exist, so it counts as present.
@@ -405,6 +421,15 @@ fn settle_record(
                 return;
             }
         }
+    }
+    // A completed import is loaded now. Its record goes only once the configuration
+    // is confirmed durable, so a later power loss cannot leave the board without
+    // the entry it belongs to while the record is gone.
+    if !confirmed && projects.contains_key(&project_id) {
+        recovery.failures.push(format!(
+            "{project_id}: the import is loaded from the configuration, and its import record is kept until the configuration can be confirmed durable on this filesystem"
+        ));
+        return;
     }
     if let Err(error) = storage.clear_project_import_pending(project_id) {
         recovery.failures.push(format!("{project_id}: {error:#}"));
@@ -492,6 +517,17 @@ fn materialize_task(
         other => other,
     };
 
+    // Store what the parser accepts, as the Task editor does: an empty model is
+    // no reviewer, and surrounding whitespace is removed. Storing the raw text
+    // would start a reviewer run with `--model ""` or a padded identifier.
+    let reviewer_model =
+        crate::domain::task::parse_reviewer_model(t.reviewer_model.as_deref().unwrap_or_default())
+            .map_err(|why| {
+                BundleError::Malformed(format!(
+                    "task {task_id} has a reviewer model that cannot be used: {why}"
+                ))
+            })?;
+
     let mut task = Task::new_backlog(
         &HashMap::new(),
         NewTask {
@@ -500,7 +536,7 @@ fn materialize_task(
             title: t.title,
             description: t.description,
             model: t.model,
-            reviewer_model: t.reviewer_model,
+            reviewer_model,
             planning_mode: t.planning_mode,
             dependencies: t.dependencies,
             category: t.category,
