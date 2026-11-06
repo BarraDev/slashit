@@ -152,12 +152,18 @@ pub async fn link_github_issue(task_id: String, issue_url: String) -> Result<Opt
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
-/// Remove the external reference at `ref_index` of a Task. The backend checks
-/// that the reference at that index is still the one the caller chose.
-pub async fn remove_external_ref(task_id: String, ref_index: usize) -> Result<Option<Task>, String> {
+/// Remove the external reference at `ref_index` of a Task. The backend removes
+/// it only if the reference at that index is still `expected`, the one the
+/// caller chose.
+pub async fn remove_external_ref(
+    task_id: String,
+    ref_index: usize,
+    expected: ExternalRef,
+) -> Result<Option<Task>, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "taskId": task_id,
         "refIndex": ref_index,
+        "expected": expected,
     })).unwrap();
 
     let response = invoke_reporting("remove_external_ref", args).await?;

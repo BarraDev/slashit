@@ -97,6 +97,14 @@ pub fn holds_issue(task: &Task, issue: &IssueAddress) -> bool {
     })
 }
 
+/// The refusal for a repeated link, shared by every check that makes it.
+pub fn already_linked_message(issue: &IssueAddress) -> String {
+    format!(
+        "This Task already links issue #{} in {}.",
+        issue.number, issue.repo
+    )
+}
+
 /// Add the Issue to `task` as a GitHub Issue reference, recording the state
 /// GitHub reported. Refuses a repeated link and changes nothing then. Existing
 /// references, including legacy ones, are left as they are.
@@ -106,10 +114,7 @@ pub fn attach_github_issue(
     state: &str,
 ) -> Result<(), String> {
     if holds_issue(task, issue) {
-        return Err(format!(
-            "This Task already links issue #{} in {}.",
-            issue.number, issue.repo
-        ));
+        return Err(already_linked_message(issue));
     }
     task.external_refs.push(ExternalRef::GithubIssue {
         url: issue.url(),

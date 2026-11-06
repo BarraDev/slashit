@@ -50,6 +50,15 @@ pub fn state_label(state: Option<&str>) -> &'static str {
     }
 }
 
+/// The GitHub Issue reference at `url`, with its position, for the removal
+/// the drawer sends.
+pub fn unlink_target(refs: &[ExternalRef], url: &str) -> Option<(usize, ExternalRef)> {
+    refs.iter().enumerate().find_map(|(index, r)| match r {
+        ExternalRef::GithubIssue { url: u, .. } if u == url => Some((index, r.clone())),
+        _ => None,
+    })
+}
+
 /// The GitHub Issues section of the task drawer.
 #[component]
 pub fn TaskIssueLinks(
@@ -96,22 +105,18 @@ pub fn TaskIssueLinks(
         if busy.get_untracked() {
             return;
         }
-        // The index is read from the record as it is now: the backend removes
-        // by position, and an earlier removal moves the references after it.
-        let index = task.with_untracked(|t| {
-            t.as_ref().and_then(|t| {
-                t.external_refs
-                    .iter()
-                    .position(|r| matches!(r, ExternalRef::GithubIssue { url: u, .. } if *u == url))
-            })
-        });
-        let Some(index) = index else {
+        // The position and the reference are read from the record as it is
+        // now. The backend removes the reference only if that position still
+        // holds this one, since an earlier removal moves the references after it.
+        let Some((index, expected)) =
+            task.with_untracked(|t| t.as_ref().and_then(|t| unlink_target(&t.external_refs, &url)))
+        else {
             return;
         };
         busy.set(true);
         error.set(None);
         spawn_local(async move {
-            let result = remove_external_ref(task_id.to_string(), index).await;
+            let result = remove_external_ref(task_id.to_string(), index, expected).await;
             busy.try_set(false);
             match result {
                 Ok(Some(updated)) => {
@@ -247,6 +252,28 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn unlinking_names_the_reference_and_its_position_at_the_time() {
+        let refs = vec![
+            ExternalRef::GithubIssue {
+                url: "https://github.com/o/r/issues/2".into(),
+                number: 2,
+                repo: "o/r".into(),
+                state: Some("OPEN".into()),
+            },
+            ExternalRef::GithubIssue {
+                url: "https://github.com/o/r/issues/3".into(),
+                number: 3,
+                repo: "o/r".into(),
+                state: Some("OPEN".into()),
+            },
+        ];
+        let (index, expected) = unlink_target(&refs, "https://github.com/o/r/issues/3").unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(expected, refs[1]);
+        assert_eq!(unlink_target(&refs, "https://github.com/o/r/issues/9"), None);
     }
 
     #[test]

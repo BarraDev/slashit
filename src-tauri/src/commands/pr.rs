@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
 use crate::domain::{BranchOrigin, Task, TaskStatus};
+use crate::domain::github_issue_link::{parse_issue_url, IssueAddress};
 use crate::domain::task::{
     ExternalRef, PrCommentKind, PrReviewApplyResult, PrReviewComment, PrReviewDecision,
     PrReviewItem, PrReviewPlan,
@@ -678,10 +679,13 @@ pub async fn find_pr_candidates(
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
 
-    let repo = repo_slug_for_task(&task, &working_dir).await?;
+    let repo = repo_slug_for_task(&working_dir).await?;
     let branch = task.branch_name.clone().unwrap_or_default();
-    let issue_numbers: Vec<u32> = task.external_refs.iter().filter_map(|r| match r {
-        ExternalRef::GithubIssue { number, .. } => Some(*number),
+    let task_issues: Vec<IssueAddress> = task.external_refs.iter().filter_map(|r| match r {
+        ExternalRef::GithubIssue { repo, number, .. } => Some(IssueAddress {
+            repo: repo.clone(),
+            number: *number,
+        }),
         _ => None,
     }).collect();
     let task_title_tokens = title_tokens(&task.title);
@@ -725,14 +729,9 @@ pub async fn find_pr_candidates(
             reasons.push(format!("branch {}", branch));
         }
 
-        if let Some(refs) = pr.get("closingIssuesReferences").and_then(|v| v.as_array()) {
-            let linked: Vec<u32> = refs.iter()
-                .filter_map(|r| r.get("number").and_then(|n| n.as_u64()).map(|n| n as u32))
-                .filter(|n| issue_numbers.contains(n))
-                .collect();
-            if !linked.is_empty() {
-                reasons.push(format!("linked issue {}", linked.iter().map(|n| format!("#{}", n)).collect::<Vec<_>>().join(", ")));
-            }
+        let linked = closed_task_issues(&pr, &task_issues);
+        if !linked.is_empty() {
+            reasons.push(format!("linked issue {}", linked.iter().map(|n| format!("#{}", n)).collect::<Vec<_>>().join(", ")));
         }
 
         let pr_tokens = title_tokens(&title);
@@ -4889,12 +4888,12 @@ async fn create_pr_reserved(
     // it must be the repository the branch is pushed to.
     refuse_if_pushes_and_pull_requests_use_different_repositories(&working_dir).await?;
 
-    let (pr_title, pr_body, task_branch_name, branch_origin, base_commit, has_dependencies) = {
+    let (pr_title, pr_source, task_branch_name, branch_origin, base_commit, has_dependencies) = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_uuid).ok_or("Task not found")?;
         (
             task.title.clone(),
-            build_pr_body(task),
+            task.clone(),
             task.branch_name.clone(),
             task.branch_origin.clone(),
             task.base_commit.clone(),
@@ -5099,6 +5098,15 @@ async fn create_pr_reserved(
     {
         return Err(retract_pr_create_attempt(state, task_uuid, &attempt, refused).await);
     }
+    // Named only here, after every refusal above, so that a refused request
+    // never runs `gh`. A closing keyword is written only for an Issue of the
+    // repository the pull request is opened in. When that repository cannot be
+    // named, no Issue is closed.
+    let pr_repo = repo_slug_for_task(&working_dir).await.unwrap_or_else(|e| {
+        eprintln!("[pr] pull request repository unknown, so no Issue is closed: {e}");
+        String::new()
+    });
+    let pr_body = build_pr_body(&pr_source, &pr_repo);
     let mut create_args = vec![
         "pr", "create",
         "--title", &pr_title,
@@ -7724,15 +7732,12 @@ pub async fn refresh_task_pr_state(
     Ok(Some(updated))
 }
 
-async fn repo_slug_for_task(task: &Task, working_dir: &str) -> Result<String, String> {
-    if let Some(repo) = task.external_refs.iter().find_map(|r| match r {
-        ExternalRef::GithubIssue { repo, .. } | ExternalRef::GithubPr { repo, .. } => Some(repo.clone()),
-        _ => None,
-    }) {
-        return Ok(repo);
-    }
-
-    let output = tokio::process::Command::new("gh")
+/// The repository a Task's pull request is searched for and opened in: the one
+/// `gh` names in its working directory. A linked Issue or pull request may be
+/// in another repository, so it says nothing about where this Task's pull
+/// request belongs.
+async fn repo_slug_for_task(working_dir: &str) -> Result<String, String> {
+    let output = crate::host_process::tokio_command(program("gh"))
         .args(["repo", "view", "--json", "nameWithOwner"])
         .current_dir(working_dir)
         .output()
@@ -7762,24 +7767,63 @@ fn title_tokens(title: &str) -> Vec<String> {
         .collect()
 }
 
-fn build_pr_body(task: &Task) -> String {
+/// The Issues of `task_issues` that a pull request closes, by GitHub's own
+/// closing references. A reference counts only when it names the same
+/// repository and number, not merely the same number.
+fn closed_task_issues(pr: &serde_json::Value, task_issues: &[IssueAddress]) -> Vec<u32> {
+    pr.get("closingIssuesReferences")
+        .and_then(|v| v.as_array())
+        .map(|refs| {
+            refs.iter()
+                .filter_map(|r| {
+                    let closed = parse_issue_url(r.get("url")?.as_str()?).ok()?;
+                    task_issues
+                        .iter()
+                        .any(|i| i.number == closed.number && i.repo.eq_ignore_ascii_case(&closed.repo))
+                        .then_some(closed.number)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The reference lines for this Task's Issues. An Issue of `pr_repo` gets a
+/// closing keyword; an Issue of any other repository gets a plain reference,
+/// which links it without closing it.
+fn build_pr_body(task: &Task, pr_repo: &str) -> String {
     let mut body = task.description.clone().unwrap_or_default();
 
-    let fixes: Vec<String> = task.external_refs.iter()
+    let mut issues: Vec<(String, u32)> = task.external_refs.iter()
         .filter_map(|r| match r {
-            ExternalRef::GithubIssue { number, .. } => Some(format!("Fixes #{}", number)),
+            ExternalRef::GithubIssue { repo, number, .. } => Some((repo.clone(), *number)),
             _ => None,
         })
         .collect();
-
-    if !fixes.is_empty() {
-        if !body.is_empty() { body.push_str("\n\n"); }
-        body.push_str(&fixes.join("\n"));
-    } else if let Some(ref issue_url) = task.github_issue_url {
-        if let Some(number) = issue_url.rsplit('/').next().and_then(|n| n.parse::<u32>().ok()) {
-            if !body.is_empty() { body.push_str("\n\n"); }
-            body.push_str(&format!("Fixes #{}", number));
+    // The legacy field counts only when no reference names an Issue.
+    if issues.is_empty() {
+        if let Some(ExternalRef::GithubIssue { repo, number, .. }) = task
+            .github_issue_url
+            .as_deref()
+            .and_then(|url| crate::config::parse_github_url(url, false))
+        {
+            issues.push((repo, number));
         }
+    }
+
+    let lines: Vec<String> = issues
+        .iter()
+        .map(|(repo, number)| {
+            if repo.eq_ignore_ascii_case(pr_repo) {
+                format!("Fixes #{}", number)
+            } else {
+                format!("Related to {}#{}", repo, number)
+            }
+        })
+        .collect();
+
+    if !lines.is_empty() {
+        if !body.is_empty() { body.push_str("\n\n"); }
+        body.push_str(&lines.join("\n"));
     }
 
     body
@@ -8476,7 +8520,7 @@ mod tests {
             },
         ];
 
-        let body = build_pr_body(&task);
+        let body = build_pr_body(&task, "org/repo");
         assert!(body.contains("Fixes #123"));
         assert!(body.contains("Login fails on Safari"));
     }
@@ -8506,7 +8550,7 @@ mod tests {
             },
         ];
 
-        let body = build_pr_body(&task);
+        let body = build_pr_body(&task, "org/repo");
         assert!(body.contains("Fixes #10"));
         assert!(body.contains("Fixes #20"));
         assert!(body.contains("Fixes #30"));
@@ -8526,7 +8570,7 @@ mod tests {
             },
         ];
 
-        let body = build_pr_body(&task);
+        let body = build_pr_body(&task, "org/repo");
         assert!(!body.contains("Fixes"));
     }
 
@@ -8535,7 +8579,7 @@ mod tests {
         let mut task = create_test_task("New feature");
         task.description = Some("Brand new feature".to_string());
 
-        let body = build_pr_body(&task);
+        let body = build_pr_body(&task, "org/repo");
         assert!(!body.contains("Fixes"));
         assert_eq!(body, "Brand new feature");
     }
@@ -8570,7 +8614,7 @@ mod tests {
             },
         ];
 
-        let body = build_pr_body(&task);
+        let body = build_pr_body(&task, "org/repo");
         assert!(body.contains("Fixes #7"));
         // Only GithubIssue produces Fixes lines
         assert!(!body.contains("Fixes #8")); // PR, not issue
@@ -8585,8 +8629,96 @@ mod tests {
         // No external_refs, so falls back to github_issue_url
         task.github_issue_url = Some("https://github.com/org/repo/issues/55".to_string());
 
-        let body = build_pr_body(&task);
+        let body = build_pr_body(&task, "org/repo");
         assert!(body.contains("Fixes #55"));
+    }
+
+    /// An Issue in another repository is never closed by this pull request:
+    /// an unqualified `Fixes #7` would name `org/app#7` instead.
+    #[test]
+    fn pr_body_does_not_close_an_issue_of_another_repository() {
+        let mut task = create_test_task("Cross repository");
+        task.external_refs = vec![ExternalRef::GithubIssue {
+            url: "https://github.com/other/repo/issues/7".to_string(),
+            number: 7,
+            repo: "other/repo".to_string(),
+            state: Some("OPEN".to_string()),
+        }];
+
+        let body = build_pr_body(&task, "org/app");
+        assert!(!body.contains("Fixes"), "{body}");
+        assert!(body.contains("other/repo#7"), "{body}");
+    }
+
+    #[test]
+    fn pr_body_does_not_close_a_legacy_issue_url_of_another_repository() {
+        let mut task = create_test_task("Legacy cross repository");
+        task.external_refs = vec![ExternalRef::JiraTicket {
+            key: "PLAT-1".to_string(),
+            project: "PLAT".to_string(),
+        }];
+        task.github_issue_url = Some("https://github.com/other/repo/issues/7".to_string());
+
+        let body = build_pr_body(&task, "org/app");
+        assert!(!body.contains("Fixes"), "{body}");
+    }
+
+    #[test]
+    fn pr_body_closes_an_issue_of_the_same_repository_whatever_the_case() {
+        let mut task = create_test_task("Same repository");
+        task.external_refs = vec![ExternalRef::GithubIssue {
+            url: "https://github.com/Org/App/issues/7".to_string(),
+            number: 7,
+            repo: "Org/App".to_string(),
+            state: Some("OPEN".to_string()),
+        }];
+
+        assert_eq!(build_pr_body(&task, "org/app"), "Fixes #7");
+    }
+
+    /// A closing reference counts only when it names the Task's own Issue in
+    /// the same repository, not any Issue with the same number.
+    #[test]
+    fn a_closing_reference_to_another_repositorys_issue_does_not_link_the_task() {
+        let task_issues = [IssueAddress {
+            repo: "org/app".to_string(),
+            number: 7,
+        }];
+        let other = serde_json::json!({
+            "closingIssuesReferences": [
+                {"number": 7, "url": "https://github.com/other/repo/issues/7"}
+            ]
+        });
+        assert!(closed_task_issues(&other, &task_issues).is_empty());
+
+        let same = serde_json::json!({
+            "closingIssuesReferences": [
+                {"number": 7, "url": "https://github.com/ORG/app/issues/7"}
+            ]
+        });
+        assert_eq!(closed_task_issues(&same, &task_issues), vec![7]);
+    }
+
+    /// The search repository is the one `gh` names in the working directory.
+    /// Before, the first external reference chose it, so a linked Issue in
+    /// another repository sent the search there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_search_repository_is_the_one_gh_names_in_the_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\necho '{\"nameWithOwner\":\"org/app\"}'\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let slug = test_programs::scope(
+            [("gh", gh)],
+            repo_slug_for_task(dir.path().to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(slug, "org/app");
     }
 
     #[test]
@@ -8601,7 +8733,7 @@ mod tests {
             },
         ];
 
-        let body = build_pr_body(&task);
+        let body = build_pr_body(&task, "org/repo");
         // No description, so body should start directly with Fixes
         assert_eq!(body, "Fixes #1");
     }
@@ -8619,7 +8751,7 @@ mod tests {
             },
         ];
 
-        let body = build_pr_body(&task);
+        let body = build_pr_body(&task, "org/repo");
         assert!(body.contains("Some description\n\nFixes #5"));
     }
 
