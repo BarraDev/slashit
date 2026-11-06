@@ -816,6 +816,20 @@ once per development round:
 - New CodeQL alerts on `main`, from post-merge and weekly runs. They stay
   actionable even though CodeQL does not gate the pull request.
 
+**Review dispositions.** Before a pull request merges, every review thread and
+every review-body finding has a recorded disposition, stated in the pull request:
+
+- FIXED: the code change, with the commit and the test that proves it.
+- INVALID: why the finding does not apply.
+- ACCEPTED: the limitation, and that the owner accepted it.
+- DEFERRED: the Issue or pull request that tracks it.
+- NOT REVIEWED: a reviewer that was skipped or rate-limited. A merge on a head
+  that reviewer did not review says so in the pull request.
+
+A thread that is resolved without one of these dispositions does not count.
+An unresolved finding that would change behavior, persistence or authorization
+blocks the merge.
+
 ## 15. Failure gates
 
 Stop and report instead of guessing when:
