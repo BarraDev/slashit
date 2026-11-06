@@ -264,15 +264,21 @@ pub async fn build_state_with_paths(
             }
         }
     }
-    // An import that did not settle leaves a Project without its board. It is
-    // removed before anything uses the Project list. The same proof of absence
-    // as the cleanup records above is needed, so the check runs only with an
-    // authoritative configuration.
-    if projects_are_authoritative {
+    // Import records are settled before anything uses the Project list. An
+    // import that did not settle leaves a Project without its board, and that
+    // Project is removed only under an authoritative configuration. Without one,
+    // or when a record cannot be trusted, the Project is quarantined: kept out
+    // of this process, with its record and board left for repair.
+    let quarantined_imports = {
         let mut projects = app_state.project.projects.write().await;
-        report.project_import_recovery_failures =
-            crate::portability::apply::recover_interrupted_imports(&app_state.storage, &mut projects);
-    }
+        let recovery = crate::portability::apply::recover_interrupted_imports(
+            &app_state.storage,
+            &mut projects,
+            projects_are_authoritative,
+        );
+        report.project_import_recovery_failures = recovery.failures;
+        recovery.quarantined
+    };
     if projects_are_authoritative {
         match app_state.storage.pending_project_conversation_deletions() {
             Ok(pending) => {
@@ -377,10 +383,12 @@ pub async fn build_state_with_paths(
         }
     }
 
-    let loaded_tasks = app_state.storage.load_all_tasks().unwrap_or_else(|e| {
+    let mut loaded_tasks = app_state.storage.load_all_tasks().unwrap_or_else(|e| {
         eprintln!("Warning: Failed to load tasks from disk: {e}");
         Vec::new()
     });
+    // A quarantined Project's Tasks are not loaded either, so none can run without it.
+    loaded_tasks.retain(|task| !quarantined_imports.contains(&task.project_id));
 
     // Built before the task write lock is taken rather than inside it. The
     // original code held the tasks write guard while acquiring read guards on

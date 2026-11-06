@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::commands::project::{get_default_agent_config, try_persist_projects};
 use crate::config::paths::StateLocation;
-use crate::config::{adopt_published, Storage};
+use crate::config::{adopt_published, ImportRecord, Storage};
 use crate::domain::{
     AgentConfig, HumanReviewRecord, NewTask, Project, ProjectScope, Repository, Task, TaskStatus,
 };
@@ -244,60 +244,128 @@ fn clear_import_record(storage: &Storage, project_id: Uuid) {
     }
 }
 
+/// What startup did about the import records it found.
+#[derive(Debug, Default)]
+pub struct ImportRecovery {
+    /// One message per record that still needs attention. Such a record stays
+    /// on disk, so the next start checks it again.
+    pub failures: Vec<String>,
+    /// Projects kept out of this process, and so their Tasks as well. Nothing
+    /// is deleted for them: the Project and its record stay for repair.
+    pub quarantined: Vec<Uuid>,
+}
+
 /// Settle the import records a previous process left behind. Runs at startup,
-/// only when the configuration was read without salvage, and before any
-/// Project is used.
+/// before any Project is used.
 ///
+/// - A record whose content does not confirm its file name, or a record that
+///   cannot be listed: its Project is quarantined. Nothing is inferred from the
+///   record, and nothing on disk is changed.
+/// - Without an authoritative configuration (`authoritative` is false, which
+///   means the configuration was read with salvage), every record's Project is
+///   quarantined. Settling needs proof that a Project is absent. The salvage
+///   reader recovers no Projects today, so what this holds back is the Task
+///   board, which would otherwise load with no Project to own it.
 /// - No Project under the record: the import never committed. The record goes.
 /// - A Project with a board: the import completed. Only the record remained.
 /// - A Project without a board: the import was interrupted. The Project is
 ///   removed from the configuration, which is the only change made. Its
 ///   record goes once that removal is confirmed.
-///
-/// Returns one message per record that could not be settled. Such a record
-/// stays for the next start.
 pub fn recover_interrupted_imports(
     storage: &Storage,
     projects: &mut HashMap<Uuid, Project>,
-) -> Vec<String> {
-    let pending = match storage.pending_project_imports() {
-        Ok(pending) => pending,
-        Err(error) => return vec![format!("the import records could not be read: {error:#}")],
+    authoritative: bool,
+) -> ImportRecovery {
+    let mut recovery = ImportRecovery::default();
+    let records = match storage.import_records() {
+        Ok(records) => records,
+        Err(error) => {
+            // Without the records, nothing shows that an import is settled.
+            recovery.quarantined = projects.keys().copied().collect();
+            projects.clear();
+            recovery.failures.push(format!(
+                "the import records could not be read, so no Project is loaded: {error:#}"
+            ));
+            return recovery;
+        }
     };
-    let mut failures = Vec::new();
-    for project_id in pending {
-        // A board that cannot be stat'ed may still exist, so it counts as present.
-        let board_present = storage
-            .tasks_board_files(project_id)
-            .iter()
-            .any(|file| file.try_exists().unwrap_or(true));
-        if projects.contains_key(&project_id) && !board_present {
-            let mut proposed = projects.clone();
-            proposed.remove(&project_id);
-            match try_persist_projects(storage, &proposed) {
-                Ok(()) => *projects = proposed,
-                Err(error) => {
-                    // The interrupted Project is not usable in this process, even
-                    // when its removal is not in place. The record stays, so a
-                    // later start removes it again.
-                    if error.is_published() {
-                        *projects = proposed;
-                    } else {
-                        projects.remove(&project_id);
-                    }
-                    failures.push(format!(
-                        "{project_id}: {}",
-                        error.describe("remove the interrupted import")
-                    ));
-                    continue;
-                }
+    for ImportRecord {
+        project_id,
+        path,
+        problem,
+    } in records
+    {
+        let Some(project_id) = project_id else {
+            recovery.failures.push(format!(
+                "{}: {}; nothing was changed",
+                path.display(),
+                problem.unwrap_or_default()
+            ));
+            continue;
+        };
+        if let Some(problem) = problem {
+            quarantine(projects, project_id, &mut recovery);
+            recovery.failures.push(format!(
+                "{project_id}: the import record {} cannot be trusted ({problem}); the Project is held back and the record is kept",
+                path.display()
+            ));
+            continue;
+        }
+        if !authoritative {
+            quarantine(projects, project_id, &mut recovery);
+            recovery.failures.push(format!(
+                "{project_id}: held back until the configuration loads completely; its import record is kept"
+            ));
+            continue;
+        }
+        settle_record(storage, projects, project_id, &mut recovery);
+    }
+    recovery
+}
+
+/// Keep a Project out of this process. Its Tasks are filtered out too.
+fn quarantine(
+    projects: &mut HashMap<Uuid, Project>,
+    project_id: Uuid,
+    recovery: &mut ImportRecovery,
+) {
+    projects.remove(&project_id);
+    recovery.quarantined.push(project_id);
+}
+
+/// Settle one trusted record under an authoritative configuration.
+fn settle_record(
+    storage: &Storage,
+    projects: &mut HashMap<Uuid, Project>,
+    project_id: Uuid,
+    recovery: &mut ImportRecovery,
+) {
+    // A board that cannot be stat'ed may still exist, so it counts as present.
+    let board_present = storage
+        .tasks_board_files(project_id)
+        .iter()
+        .any(|file| file.try_exists().unwrap_or(true));
+    if projects.contains_key(&project_id) && !board_present {
+        let mut proposed = projects.clone();
+        proposed.remove(&project_id);
+        match try_persist_projects(storage, &proposed) {
+            Ok(()) => *projects = proposed,
+            Err(error) => {
+                // The interrupted Project is not usable in this process, even
+                // when its removal is not in place. The record stays, so a
+                // later start removes it again.
+                projects.remove(&project_id);
+                recovery.failures.push(format!(
+                    "{project_id}: {}",
+                    error.describe("remove the interrupted import")
+                ));
+                return;
             }
         }
-        if let Err(error) = storage.clear_project_import_pending(project_id) {
-            failures.push(format!("{project_id}: {error:#}"));
-        }
     }
-    failures
+    if let Err(error) = storage.clear_project_import_pending(project_id) {
+        recovery.failures.push(format!("{project_id}: {error:#}"));
+    }
 }
 
 /// The records an import creates, the normalizations applied, and the remote the bundle named.

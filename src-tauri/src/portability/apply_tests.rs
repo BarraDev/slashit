@@ -661,3 +661,155 @@ async fn a_configuration_the_filesystem_cannot_synchronize_is_not_reported_durab
     assert_eq!(response.data["durable"], false);
     assert_eq!(target.tasks.read().await.len(), 2);
 }
+
+/// Make `config.toml` fail strict parsing while its Projects section still
+/// salvages, the case where startup cannot prove a Project is absent.
+fn corrupt_config_keeping_projects(config_file: &Path) {
+    let mut value: toml::Value =
+        toml::from_str(&fs::read_to_string(config_file).unwrap()).unwrap();
+    value["ui_preferences"]["theme"] = toml::Value::Integer(5);
+    fs::write(config_file, toml::to_string(&value).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn a_record_that_cannot_be_trusted_holds_its_project_back_and_keeps_everything() {
+    // A completed import whose record was then damaged or names another Project.
+    let untrusted: [Vec<u8>; 3] = [
+        b"not a project id".to_vec(),
+        Uuid::from_u128(999).to_string().into_bytes(),
+        Vec::new(),
+    ];
+    for content in untrusted {
+        let (src, source) = test_ctx().await;
+        seed(&source, None, &fixture_tasks()).await;
+        let bytes = exported_bytes(&source, &src).await;
+        let (dst, target) = test_ctx().await;
+        let path = write_bundle(&dst, &bytes);
+        assert!(apply_with(&target, &path, &checksum_of(&bytes)).await.ok);
+        let record = target.storage.paths().pending_project_import_file(project_id());
+        fs::write(&record, &content).unwrap();
+        let paths = std::sync::Arc::new(target.storage.paths().clone());
+        drop(target);
+
+        let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+            .await
+            .unwrap();
+        assert!(!state.project.projects.read().await.contains_key(&project_id()));
+        assert!(state
+            .task
+            .tasks
+            .read()
+            .await
+            .values()
+            .all(|task| task.project_id != project_id()));
+        assert_eq!(
+            report.project_import_recovery_failures.len(),
+            1,
+            "{:?}",
+            report.project_import_recovery_failures
+        );
+        assert_eq!(fs::read(&record).unwrap(), content, "the record is kept as evidence");
+        let storage = crate::config::Storage::with_paths((*paths).clone());
+        assert!(storage
+            .load_config()
+            .unwrap()
+            .projects
+            .contains_key(&project_id().to_string()));
+        assert!(storage
+            .tasks_board_files(project_id())
+            .iter()
+            .any(|file| file.exists()));
+    }
+}
+
+#[tokio::test]
+async fn a_completed_import_under_a_salvaged_configuration_loads_none_of_its_tasks() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    assert!(apply_with(&target, &path, &checksum_of(&bytes)).await.ok);
+    // A record left beside a completed board, as a confirmed-not-durable link would.
+    target.storage.mark_project_import_pending(project_id()).unwrap();
+    let paths = std::sync::Arc::new(target.storage.paths().clone());
+    drop(target);
+
+    let config_file = paths.config_file();
+    let valid_config = fs::read(&config_file).unwrap();
+    let record = paths.pending_project_import_file(project_id());
+    corrupt_config_keeping_projects(&config_file);
+    let corrupt_config = fs::read(&config_file).unwrap();
+    let storage = crate::config::Storage::with_paths((*paths).clone());
+    assert!(storage.load_config_strict().is_err());
+
+    // The salvaged configuration carries no Project, so its board must not load alone.
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(!state.project.projects.read().await.contains_key(&project_id()));
+    assert!(state
+        .task
+        .tasks
+        .read()
+        .await
+        .values()
+        .all(|task| task.project_id != project_id()));
+    assert_eq!(report.project_import_recovery_failures.len(), 1);
+    assert!(record.exists(), "the record is kept");
+    assert_eq!(
+        fs::read(&config_file).unwrap(),
+        corrupt_config,
+        "a salvaged configuration is not rewritten"
+    );
+
+    // Once the configuration loads completely, the next start restores the import.
+    fs::write(&config_file, &valid_config).unwrap();
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(report.project_import_recovery_failures.is_empty());
+    assert!(state.project.projects.read().await.contains_key(&project_id()));
+    assert_eq!(
+        state
+            .task
+            .tasks
+            .read()
+            .await
+            .values()
+            .filter(|task| task.project_id == project_id())
+            .count(),
+        2
+    );
+    assert!(!record.exists());
+}
+
+#[tokio::test]
+async fn an_unreadable_record_holds_back_an_interrupted_import_until_it_is_repaired() {
+    let (_src, _dst, _bytes, paths, _path) = interrupted_import().await;
+    let record = paths.pending_project_import_file(project_id());
+    let valid_record = fs::read(&record).unwrap();
+    fs::write(&record, b"garbage").unwrap();
+    let config_before = fs::read(paths.config_file()).unwrap();
+
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(!state.project.projects.read().await.contains_key(&project_id()));
+    assert_eq!(report.project_import_recovery_failures.len(), 1);
+    assert_eq!(fs::read(&record).unwrap(), b"garbage", "the record is kept");
+    assert_eq!(
+        fs::read(paths.config_file()).unwrap(),
+        config_before,
+        "the configuration is not changed for an untrusted record"
+    );
+
+    // Repaired, the record settles the interrupted import as usual.
+    fs::write(&record, &valid_record).unwrap();
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(report.project_import_recovery_failures.is_empty());
+    assert!(!state.project.projects.read().await.contains_key(&project_id()));
+    assert!(!record.exists());
+}

@@ -389,6 +389,17 @@ pub struct ProjectTaskCleanupRecord {
     pub board_files: Vec<PathBuf>,
 }
 
+/// One Project import record found in the configuration directory.
+///
+/// `project_id` comes from the file name. `problem` is set when the content
+/// does not confirm that name, so the record cannot prove the import's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRecord {
+    pub project_id: Option<Uuid>,
+    pub path: PathBuf,
+    pub problem: Option<String>,
+}
+
 impl Storage {
     /// Load a Project's primary Conversation, if one has been created.
     pub fn load_primary_conversation(&self, project_id: Uuid) -> Result<Option<Conversation>> {
@@ -735,37 +746,65 @@ impl Storage {
         }
     }
 
-    /// List the import records. A malformed record is an error, not skipped:
-    /// recovery must not guess at what it names.
-    pub fn pending_project_imports(&self) -> Result<Vec<Uuid>> {
+    /// List every import record. Only a failure to list the directory is an
+    /// error. A malformed record is returned with its `problem`, so recovery
+    /// can still act on the Project its file name identifies.
+    pub fn import_records(&self) -> Result<Vec<ImportRecord>> {
         let entries = match fs::read_dir(self.paths.config_dir()) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error).context("Failed to list import records"),
         };
-        let mut pending = Vec::new();
+        let mut records = Vec::new();
         for entry in entries {
             let entry = entry.context("Failed to read import record directory entry")?;
+            let path = entry.path();
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
             let Some(id) = name.strip_suffix(".import-pending") else {
                 continue;
             };
-            let project_id = id
-                .parse::<Uuid>()
-                .with_context(|| format!("Invalid Project id in import record {:?}", entry.path()))?;
-            let recorded: Uuid = fs::read_to_string(entry.path())
-                .with_context(|| format!("Failed to read import record {:?}", entry.path()))?
-                .trim()
-                .parse()
-                .with_context(|| format!("Invalid Project id in import record {:?}", entry.path()))?;
-            if recorded != project_id {
-                anyhow::bail!("Project id does not match import record {:?}", entry.path());
-            }
-            pending.push(project_id);
+            // The file name is the identity recovery relies on; the content is
+            // checked against it and never trusted on its own.
+            let project_id = id.parse::<Uuid>().ok();
+            let problem = match project_id {
+                None => Some("the file name does not name a Project".to_string()),
+                Some(expected) => match fs::read_to_string(&path) {
+                    Err(error) => Some(format!("the record cannot be read: {error}")),
+                    Ok(text) => match text.trim().parse::<Uuid>() {
+                        Err(_) => Some("the record does not contain a Project id".to_string()),
+                        Ok(recorded) if recorded != expected => {
+                            Some("the record names a different Project".to_string())
+                        }
+                        Ok(_) => None,
+                    },
+                },
+            };
+            records.push(ImportRecord {
+                project_id,
+                path,
+                problem,
+            });
         }
-        Ok(pending)
+        Ok(records)
+    }
+
+    /// The Projects with an import record. A malformed record is an error, not
+    /// skipped; recovery uses [`Self::import_records`] to act on the valid
+    /// records and quarantine the rest.
+    pub fn pending_project_imports(&self) -> Result<Vec<Uuid>> {
+        self.import_records()?
+            .into_iter()
+            .map(|record| match (record.project_id, record.problem) {
+                (Some(id), None) => Ok(id),
+                (_, problem) => anyhow::bail!(
+                    "Invalid import record {:?}: {}",
+                    record.path,
+                    problem.unwrap_or_default()
+                ),
+            })
+            .collect()
     }
 
     pub fn new() -> Result<Self> {
