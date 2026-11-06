@@ -104,11 +104,37 @@ A configuration without a `projects` section is not authoritative, so a record
 written before the first Project was saved waits until a configuration exists.
 It is harmless: a retry overwrites it, and a later start settles it.
 
+Records that cannot be trusted quarantine their Project instead:
+
+- A record whose content does not name the Project in its file name (malformed,
+  empty, or naming another Project), or whose file name is not a Project id, is
+  not used to infer anything. The Project is kept out of this process together
+  with its Tasks, and the record and board stay on disk for repair.
+- When the configuration is not authoritative (it does not parse strictly, or
+  has no `projects` section), every record's Project is quarantined the same way.
+  Nothing is rewritten. The salvage reader recovers no Projects today, so what
+  is held back is the Task board, which would otherwise load with no Project to
+  own it.
+- When the record directory cannot be listed, no Project is loaded.
+
+Once the record is repaired or the configuration loads completely, the next
+start applies the rules above. Nothing is deleted for a quarantined Project.
+
+Not covered: a board that survives a power loss after a non-durable configuration
+commit has no record that owns it, so it can block a later import with "a Task
+board already exists". The import refuses and nothing is overwritten, but the
+board is not adopted or removed automatically. Removing it needs a deliberate
+owner decision; no automatic repair exists.
+
 Covered by tests: the record write refusal, an unconfirmed record, a failed
 revert followed by a restart through the production startup path, a record with
-no Project, a record beside a completed board, and an unrelated Project that
-survives recovery. The restart tests are not a real process kill: a crash that
-loses unflushed page-cache data is not simulated.
+no Project, a record beside a completed board, an unrelated Project that
+survives recovery, the three untrusted-record contents (each leaving the record
+and board in place, the configuration unchanged, and the Tasks unloaded), a
+completed import under a salvaged configuration (its Tasks not loaded, and
+restored once the configuration loads), and a negative control showing the Task
+filter is required. The restart tests are not a real process kill: a crash
+that loses unflushed page-cache data is not simulated.
 
 ## The file
 
@@ -215,6 +241,11 @@ envelope, checksum, payload parse, manifest, then structural rules:
 - The repository remote is one plain token. A remote with user information is
   refused as unsafe, since a credential would sit there. The project base is a
   branch name (a leading dash is refused, so it can never read as an option).
+- A Task's issue or pull request address with a `://` scheme must not carry user
+  information (refused as unsafe), and its host part must be a host with an
+  optional numeric port (otherwise refused as malformed). Export strips user
+  information from these addresses before the check, so an export never writes
+  the credential form. Addresses without a scheme are not checked.
 - Historical Git evidence (base commit, approved tip, pull request merge commit)
   is a 40- or 64-character hexadecimal identifier. The shape is checked, and
   nothing requires the commit to exist in the importing repository.
@@ -267,6 +298,19 @@ longer unspaced fragment can survive.
 - A repository remote in the scp form with a colon in its user part
   (`user:secret@host:path`) is refused on export and on decode. An ordinary
   `user@host:path` remote, such as `git@host:owner/repo.git`, is accepted.
+- Forms that are not refused, and why. Each was reviewed and judged not to be a
+  credential under Git's own parsing, so refusing them would also refuse valid
+  remotes or addresses. They are documented, not sanitized:
+  - A `://` remote whose text before the first `/` has a colon but no `@`
+    (`https://user:s/ecret@host/path`). Git reads that text as host and port and
+    rejects it because `s/ecret` is not a port (checked with `git ls-remote`), so
+    it is not a usable credential. The export keeps the text as written. A colon
+    in an authority is also how a valid port is written, so remotes are refused
+    only when the authority has an `@`.
+  - An scp-form remote with a percent-encoded colon (`deploy%3ASECRET@host:path`).
+    Git does not percent-decode it before handing it to `ssh` (not checked beyond
+    the hostname lookup). An scp-form remote with a `/` before its
+    colon (`us/er:secret@host:path`) is read by Git as a local path.
 - The Preview-to-Apply check is the checksum of the payload. It detects a file
   that changed, and it does not authenticate the file.
 - Export refuses to replace any existing path, including one created after

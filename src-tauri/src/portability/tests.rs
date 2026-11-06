@@ -1061,6 +1061,33 @@ async fn an_export_refuses_a_remote_that_decode_would_refuse() {
     assert!(!path.exists());
 }
 
+/// A hand-written bundle may put user information in a Task's web address. A
+/// credential is refused, a malformed authority is refused, and a plain address
+/// still imports. Export strips user information before it writes an address, so
+/// it never writes the credential form.
+#[test]
+fn an_import_refuses_a_task_web_address_that_carries_user_information() {
+    let credential = seal(&payload_json(|v| {
+        v["tasks"][0]["pr_url"] = Value::from("https://user:PR_SECRET@github.com/acme/app/pull/1");
+    }));
+    assert!(
+        matches!(bundle::decode(&credential), Err(BundleError::Unsafe(_))),
+        "a credential in a web address is refused"
+    );
+    let malformed = seal(&payload_json(|v| {
+        v["tasks"][0]["github_issue_url"] =
+            Value::from("https://user:ISSUE_SECRET/x@github.com/acme/app/issues/1");
+    }));
+    assert!(
+        matches!(bundle::decode(&malformed), Err(BundleError::Malformed(_))),
+        "an authority that is not a host and port is refused"
+    );
+    let plain = seal(&payload_json(|v| {
+        v["tasks"][0]["pr_url"] = Value::from("https://github.com:443/acme/app/pull/1");
+    }));
+    assert!(bundle::decode(&plain).is_ok(), "a plain address with a port still imports");
+}
+
 /// An scp-style remote can carry a credential in its user part, which is not
 /// stripped the way a `://` URL's is. Export refuses it, and an ordinary
 /// `git@host:path` remote, which has no credential, still exports.

@@ -386,6 +386,22 @@ fn validate(payload: &Payload) -> Result<(), BundleError> {
                 )));
             }
         }
+        let web_addresses = [
+            task.github_issue_url.as_deref(),
+            task.gitlab_issue_url.as_deref(),
+            task.pr_url.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(task.external_refs.iter().filter_map(|r| match r {
+            ExternalRef::GithubIssue { url, .. }
+            | ExternalRef::GithubPr { url, .. }
+            | ExternalRef::GitlabIssue { url } => Some(url.as_str()),
+            _ => None,
+        }));
+        for url in web_addresses {
+            check_web_address(task.id, url)?;
+        }
         // Historical evidence: checked as an identifier, never required to exist.
         let commits = task
             .base_commit
@@ -412,6 +428,36 @@ fn validate(payload: &Payload) -> Result<(), BundleError> {
     }
     if let Err(cycle) = check_acyclic(&payload.tasks) {
         return malformed(cycle);
+    }
+    Ok(())
+}
+
+/// A Task's web address (an issue or pull request link) that uses a `://` scheme
+/// must not carry user information, which is where a credential would sit, and
+/// its host part must be a host with an optional numeric port. Export strips user
+/// information before this check, so only an edited bundle or an unusual stored
+/// address reaches the refusal. Addresses without a scheme are not checked here.
+///
+/// shortcut: an address without a scheme, or a bracketed IPv6 host, is not
+/// checked; a web address for a Task does not use either form.
+fn check_web_address(task_id: Uuid, url: &str) -> Result<(), BundleError> {
+    let Some((_, rest)) = url.split_once("://") else {
+        return Ok(());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return Err(BundleError::Unsafe(format!(
+            "task {task_id} has a web address with user information, which may hold a credential"
+        )));
+    }
+    if !authority.starts_with('[') {
+        if let Some((_, port)) = authority.rsplit_once(':') {
+            if !port.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(BundleError::Malformed(format!(
+                    "task {task_id} has a web address whose host part is not a host and port"
+                )));
+            }
+        }
     }
     Ok(())
 }
