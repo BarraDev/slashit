@@ -57,6 +57,8 @@ mod conversations;
 mod conversation_history;
 #[path = "product_acceptance/developer_tools.rs"]
 mod developer_tools;
+#[path = "product_acceptance/github_issue_link.rs"]
+mod github_issue_link;
 #[path = "product_acceptance/human_review.rs"]
 mod human_review;
 #[path = "product_acceptance/local_first.rs"]
