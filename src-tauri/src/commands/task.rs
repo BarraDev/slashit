@@ -5,10 +5,15 @@ use crate::domain::{
     TaskImpact, SecuritySeverity, TaskPhase, Subtask,
 };
 use crate::domain::task::{CodingProvider, ExternalRef};
+use crate::domain::github_issue_link::{
+    already_linked_message, attach_github_issue, holds_issue, parse_issue_url,
+};
+use crate::commands::github::read_issue_state;
 use crate::lifecycle::{classify_status_transition, StatusTransitionEffect};
 use crate::queue::{PromotionChoice, PromotionOutcome};
 use uuid::Uuid;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -562,6 +567,10 @@ pub async fn toggle_subtask(
     crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
+/// Link a GitHub Issue to a Task. The address is parsed, and GitHub is asked
+/// about the Issue, before anything is written: a refused address, a repeated
+/// link or an Issue GitHub does not confirm changes nothing. The legacy
+/// `github_issue_url` field and existing references are left as they are.
 #[tauri::command]
 pub async fn link_github_issue(
     _gui: GuiMutation,
@@ -570,32 +579,63 @@ pub async fn link_github_issue(
     issue_url: String,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let amend = move |staged: &mut HashMap<Uuid, Task>| {
-        if let Some(task) = staged.get_mut(&task_id) {
-            task.github_issue_url = Some(issue_url.clone());
-            // Also add to external_refs if not already there
-            if !task.external_refs.iter().any(|r| matches!(r, ExternalRef::GithubIssue { url, .. } if url == &issue_url)) {
-                // Parse: https://github.com/{owner}/{repo}/issues/{number}
-                let parts: Vec<&str> = issue_url.trim_end_matches('/').split('/').collect();
-                if let Some(issues_idx) = parts.iter().position(|&p| p == "issues") {
-                    if let Some(gh_idx) = parts.iter().position(|&p| p == "github.com") {
-                        if let (Some(number_str), true) = (parts.get(issues_idx + 1), gh_idx + 2 < issues_idx) {
-                            if let Ok(number) = number_str.parse::<u32>() {
-                                let repo = format!("{}/{}", parts[gh_idx + 1], parts[gh_idx + 2]);
-                                task.external_refs.push(ExternalRef::GithubIssue {
-                                    url: issue_url.clone(),
-                                    number,
-                                    repo,
-                                    state: Some("OPEN".to_string()),
-                                });
-                            }
-                        }
-                    }
-                }
+    let issue = parse_issue_url(&issue_url)?;
+    if state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .is_some_and(|task| holds_issue(task, &issue))
+    {
+        return Err(already_linked_message(&issue));
+    }
+    let issue_state = read_issue_state(OsStr::new("gh"), &issue.repo, issue.number).await?;
+    attach_github_issue_serialized(&state.task.tasks, &state.storage, task_id, &issue, &issue_state)
+        .await
+}
+
+/// The write behind [`link_github_issue`]. The repeated-link check runs again
+/// under the write, so two requests that both passed the check before the
+/// network read cannot both add the Issue. A refusal under the write persists
+/// nothing: the Task keeps its bytes and its `updated_at`.
+pub(crate) async fn attach_github_issue_serialized(
+    tasks: &crate::lifecycle::Tasks,
+    storage: &crate::config::Storage,
+    task_id: Uuid,
+    issue: &crate::domain::github_issue_link::IssueAddress,
+    issue_state: &str,
+) -> Result<Option<Task>, String> {
+    if !tasks.read().await.contains_key(&task_id) {
+        return Ok(None);
+    }
+    let refusal = std::sync::Mutex::new(None::<String>);
+    let revise = |staged: &mut HashMap<Uuid, Task>| {
+        let Some(task) = staged.get_mut(&task_id) else {
+            return false;
+        };
+        // The same refusal `commit_task` gave before this write was conditional.
+        if let Some(recovery) = task.worker_recovery_refusal() {
+            *refusal.lock().unwrap_or_else(|e| e.into_inner()) = Some(recovery);
+            return false;
+        }
+        match attach_github_issue(task, issue, issue_state) {
+            Ok(()) => true,
+            Err(e) => {
+                *refusal.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                false
             }
         }
     };
-    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
+    let changed = crate::lifecycle::record_if_changed(tasks, storage, task_id, &revise).await;
+    if let Some(refusal) = refusal.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        return Err(refusal);
+    }
+    match changed {
+        Ok(_) => Ok(tasks.read().await.get(&task_id).cloned()),
+        Err(_) if !tasks.read().await.contains_key(&task_id) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[tauri::command]
@@ -1055,16 +1095,101 @@ pub async fn remove_external_ref(
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     ref_index: usize,
+    expected: ExternalRef,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    remove_external_ref_serialized(
+    remove_external_ref_chosen_serialized(
         &state.task.tasks,
         &state.storage,
         &state.task_lifecycle_locks,
         task_id,
         ref_index,
+        &expected,
     )
     .await
+}
+
+/// [`remove_external_ref_serialized`] for a caller that names the reference it
+/// chose. The reference at `ref_index` must still be `expected` under the
+/// write, so the caller removes what it saw and nothing that moved into that
+/// position since. Otherwise nothing is removed and the caller is told to ask
+/// again. Two references to one Issue or pull request are the same link when
+/// their URLs are; their recorded state is not identity.
+pub(crate) async fn remove_external_ref_chosen_serialized(
+    tasks: &crate::lifecycle::Tasks,
+    storage: &crate::config::Storage,
+    locks: &crate::lifecycle::TaskLifecycleLocks,
+    task_id: Uuid,
+    ref_index: usize,
+    expected: &ExternalRef,
+) -> Result<Option<Task>, String> {
+    let same_link = |a: &ExternalRef, b: &ExternalRef| match (a, b) {
+        (ExternalRef::GithubPr { url: a, .. }, ExternalRef::GithubPr { url: b, .. })
+        | (ExternalRef::GithubIssue { url: a, .. }, ExternalRef::GithubIssue { url: b, .. }) => {
+            a == b
+        }
+        _ => a == b,
+    };
+    let guards_lifecycle = matches!(expected, ExternalRef::GithubPr { .. });
+    let _lease = if guards_lifecycle { Some(locks.acquire(task_id).await?) } else { None };
+
+    let moved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let revise = {
+        let moved = moved.clone();
+        let expected = expected.clone();
+        move |staged: &mut HashMap<Uuid, Task>| {
+            let Some(task) = staged.get_mut(&task_id) else {
+                return false;
+            };
+            if !task.external_refs.get(ref_index).is_some_and(|now| same_link(&expected, now)) {
+                moved.store(true, std::sync::atomic::Ordering::SeqCst);
+                return false;
+            }
+            let removed = task.external_refs.remove(ref_index);
+            // Unlinking the pull request unlinks the delivery that names it,
+            // in the same write: a `pr_url` left behind would keep naming a
+            // pull request the task no longer links, and a refresh would go
+            // on acting on it. A different `pr_url` is another link and
+            // stays.
+            if let ExternalRef::GithubPr { url, .. } = &removed {
+                if task.pr_url.as_deref() == Some(url.as_str()) {
+                    task.pr_url = None;
+                }
+            }
+            // The same goes for the legacy `github_issue_url`: left behind, the
+            // next load migrates it back into the reference just removed.
+            if let ExternalRef::GithubIssue { repo, number, .. } = &removed {
+                if task
+                    .github_issue_url
+                    .as_deref()
+                    .is_some_and(|legacy| legacy_names_issue(legacy, repo, *number))
+                {
+                    task.github_issue_url = None;
+                }
+            }
+            true
+        }
+    };
+    match crate::lifecycle::record_if_changed(tasks, storage, task_id, &revise).await {
+        Ok(_) if moved.load(std::sync::atomic::Ordering::SeqCst) => Err(
+            "the task's references changed while this was waiting; nothing was removed, so this can be asked for again"
+                .to_string(),
+        ),
+        Ok(_) => Ok(tasks.read().await.get(&task_id).cloned()),
+        Err(_) if !tasks.read().await.contains_key(&task_id) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a legacy `github_issue_url` names this Issue, read the way the
+/// load-time migration reads it: that reading is what would recreate the
+/// reference.
+fn legacy_names_issue(legacy: &str, repo: &str, number: u32) -> bool {
+    matches!(
+        crate::config::parse_github_url(legacy, false),
+        Some(ExternalRef::GithubIssue { repo: r, number: n, .. })
+            if n == number && r.eq_ignore_ascii_case(repo)
+    )
 }
 
 /// Remove the external reference at `ref_index`, serialized against the
@@ -1093,6 +1218,9 @@ pub async fn remove_external_ref(
 /// removing, or clearing the `pr_url` of, a reference nobody chose. Two pull
 /// request references are the same link when their URLs are; their recorded
 /// state changes under a poll and is not identity.
+/// Test-only: production removals name the reference they chose (see
+/// [`remove_external_ref_chosen_serialized`]).
+#[cfg(test)]
 pub(crate) async fn remove_external_ref_serialized(
     tasks: &crate::lifecycle::Tasks,
     storage: &crate::config::Storage,
@@ -1100,10 +1228,6 @@ pub(crate) async fn remove_external_ref_serialized(
     task_id: Uuid,
     ref_index: usize,
 ) -> Result<Option<Task>, String> {
-    let same_link = |a: &ExternalRef, b: &ExternalRef| match (a, b) {
-        (ExternalRef::GithubPr { url: a, .. }, ExternalRef::GithubPr { url: b, .. }) => a == b,
-        _ => a == b,
-    };
     let chosen = {
         let tasks = tasks.read().await;
         let Some(task) = tasks.get(&task_id) else {
@@ -1111,46 +1235,13 @@ pub(crate) async fn remove_external_ref_serialized(
         };
         task.external_refs.get(ref_index).cloned()
     };
-    let guards_lifecycle = matches!(chosen, Some(ExternalRef::GithubPr { .. }));
-    let _lease = if guards_lifecycle { Some(locks.acquire(task_id).await?) } else { None };
-
-    let moved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let revise = {
-        let moved = moved.clone();
-        move |staged: &mut HashMap<Uuid, Task>| {
-            let Some(task) = staged.get_mut(&task_id) else {
-                return false;
-            };
-            // Nothing was there to choose.
-            let Some(chosen) = chosen.as_ref() else {
-                return false;
-            };
-            if !task.external_refs.get(ref_index).is_some_and(|now| same_link(chosen, now)) {
-                moved.store(true, std::sync::atomic::Ordering::SeqCst);
-                return false;
-            }
-            let removed = task.external_refs.remove(ref_index);
-            // Unlinking the pull request unlinks the delivery that names it,
-            // in the same write: a `pr_url` left behind would keep naming a
-            // pull request the task no longer links, and a refresh would go
-            // on acting on it. A different `pr_url` is another link and
-            // stays.
-            if let ExternalRef::GithubPr { url, .. } = &removed {
-                if task.pr_url.as_deref() == Some(url.as_str()) {
-                    task.pr_url = None;
-                }
-            }
-            true
+    match chosen {
+        Some(chosen) => {
+            remove_external_ref_chosen_serialized(tasks, storage, locks, task_id, ref_index, &chosen)
+                .await
         }
-    };
-    match crate::lifecycle::record_if_changed(tasks, storage, task_id, &revise).await {
-        Ok(_) if moved.load(std::sync::atomic::Ordering::SeqCst) => Err(
-            "the task's references changed while this was waiting; nothing was removed, so this can be asked for again"
-                .to_string(),
-        ),
-        Ok(_) => Ok(tasks.read().await.get(&task_id).cloned()),
-        Err(_) if !tasks.read().await.contains_key(&task_id) => Ok(None),
-        Err(e) => Err(e),
+        // Nothing is at that index, so there is nothing to remove.
+        None => Ok(tasks.read().await.get(&task_id).cloned()),
     }
 }
 
@@ -3561,5 +3652,201 @@ mod task_dependency_contract {
             .find(|t| t.id == child.id)
             .expect("the task must be on disk");
         assert_eq!(on_disk.dependencies, vec![parent.id]);
+    }
+}
+
+#[cfg(test)]
+mod issue_reference_write_tests {
+    use super::*;
+    use crate::config::paths::AppPaths;
+    use crate::domain::github_issue_link::{attach_github_issue, parse_issue_url};
+    use crate::test_helpers::create_test_task;
+
+    fn issue_ref(repo: &str, number: u32) -> ExternalRef {
+        ExternalRef::GithubIssue {
+            url: format!("https://github.com/{repo}/issues/{number}"),
+            number,
+            repo: repo.to_string(),
+            state: Some("OPEN".to_string()),
+        }
+    }
+
+    /// One Task on a real board in a temporary directory: held in memory the
+    /// way the application holds it, and saved so a start reads it back.
+    struct Board {
+        _dir: tempfile::TempDir,
+        tasks: crate::lifecycle::Tasks,
+        storage: crate::config::Storage,
+        locks: crate::lifecycle::TaskLifecycleLocks,
+        project_id: Uuid,
+        task_id: Uuid,
+    }
+
+    impl Board {
+        async fn new(task: Task) -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let root = dir.path();
+            for name in ["config", "data"] {
+                std::fs::create_dir_all(root.join(name)).unwrap();
+            }
+            let storage = crate::config::Storage::with_paths(AppPaths::with_roots(
+                root.join("config"),
+                root.join("data"),
+                root.join("cache"),
+                root.join("runtime"),
+            ));
+            let (project_id, task_id) = (task.project_id, task.id);
+            storage
+                .save_project_tasks(project_id, std::slice::from_ref(&task))
+                .unwrap();
+            Self {
+                _dir: dir,
+                tasks: Arc::new(RwLock::new(HashMap::from([(task_id, task)]))),
+                storage,
+                locks: crate::lifecycle::TaskLifecycleLocks::new(),
+                project_id,
+                task_id,
+            }
+        }
+
+        /// The Task as the next start reads it from disk, legacy migration included.
+        fn reloaded(&self) -> Task {
+            self.storage
+                .load_project_tasks(self.project_id)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.id == self.task_id)
+                .unwrap()
+        }
+    }
+
+    /// Finding 6: a link refused inside the write must not rewrite the Task.
+    #[tokio::test]
+    async fn a_link_refused_inside_the_write_leaves_the_record_and_its_timestamp_alone() {
+        let issue = parse_issue_url("https://github.com/o/r/issues/7").unwrap();
+        let mut task = create_test_task("linked");
+        attach_github_issue(&mut task, &issue, "OPEN").unwrap();
+        let board = Board::new(task).await;
+        let before = board.reloaded();
+
+        // The repeated-link check ran before the GitHub read; a link that landed
+        // in between is refused here, under the write.
+        let refusal = attach_github_issue_serialized(
+            &board.tasks,
+            &board.storage,
+            board.task_id,
+            &issue,
+            "CLOSED",
+        )
+        .await
+        .unwrap_err();
+        assert!(refusal.contains("already links issue #7"), "{refusal}");
+
+        let after = board.reloaded();
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(
+            serde_json::to_string(&after).unwrap(),
+            serde_json::to_string(&before).unwrap()
+        );
+        let in_memory = board.tasks.read().await[&board.task_id].clone();
+        assert_eq!(in_memory.updated_at, before.updated_at);
+    }
+
+    /// Finding 4: the reference removed is the one the caller chose, never
+    /// whatever now sits at its index.
+    #[tokio::test]
+    async fn a_removal_refuses_when_the_reference_at_the_index_is_not_the_chosen_one() {
+        let mut task = create_test_task("refs");
+        // The caller chose `o/r#3` while it sat at index 1. Another reference
+        // then took index 1, so index 1 is now `o/r#2`.
+        task.external_refs = vec![issue_ref("o/r", 1), issue_ref("o/r", 2), issue_ref("o/r", 3)];
+        let board = Board::new(task).await;
+
+        let refusal = remove_external_ref_chosen_serialized(
+            &board.tasks,
+            &board.storage,
+            &board.locks,
+            board.task_id,
+            1,
+            &issue_ref("o/r", 3),
+        )
+        .await;
+        assert!(refusal.is_err(), "{refusal:?}");
+        assert_eq!(
+            board.reloaded().external_refs,
+            vec![issue_ref("o/r", 1), issue_ref("o/r", 2), issue_ref("o/r", 3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removal_takes_the_reference_the_caller_chose() {
+        let mut task = create_test_task("refs");
+        task.external_refs = vec![issue_ref("o/r", 1), issue_ref("o/r", 2), issue_ref("o/r", 3)];
+        let board = Board::new(task).await;
+
+        let updated = remove_external_ref_chosen_serialized(
+            &board.tasks,
+            &board.storage,
+            &board.locks,
+            board.task_id,
+            1,
+            &issue_ref("o/r", 2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.external_refs, vec![issue_ref("o/r", 1), issue_ref("o/r", 3)]);
+        assert_eq!(board.reloaded().external_refs, updated.external_refs);
+    }
+
+    /// Finding 2: unlinking the Issue also clears the legacy field that names
+    /// it, so the next start does not migrate it back.
+    #[tokio::test]
+    async fn unlinking_the_last_issue_does_not_bring_it_back_from_the_legacy_field() {
+        let mut task = create_test_task("legacy");
+        task.github_issue_url = Some("https://github.com/o/r/issues/7".to_string());
+        task.external_refs = vec![issue_ref("o/r", 7)];
+        let board = Board::new(task).await;
+
+        let updated = remove_external_ref_serialized(
+            &board.tasks,
+            &board.storage,
+            &board.locks,
+            board.task_id,
+            0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(updated.external_refs.is_empty());
+        assert_eq!(updated.github_issue_url, None);
+
+        let reloaded = board.reloaded();
+        assert!(reloaded.external_refs.is_empty(), "{:?}", reloaded.external_refs);
+        assert_eq!(reloaded.github_issue_url, None);
+    }
+
+    /// The legacy field that names a different Issue is another link and stays.
+    #[tokio::test]
+    async fn unlinking_an_issue_keeps_a_legacy_field_that_names_another_issue() {
+        let mut task = create_test_task("legacy other");
+        task.github_issue_url = Some("https://github.com/o/r/issues/8".to_string());
+        task.external_refs = vec![issue_ref("o/r", 7)];
+        let board = Board::new(task).await;
+
+        let updated = remove_external_ref_serialized(
+            &board.tasks,
+            &board.storage,
+            &board.locks,
+            board.task_id,
+            0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            updated.github_issue_url.as_deref(),
+            Some("https://github.com/o/r/issues/8")
+        );
     }
 }

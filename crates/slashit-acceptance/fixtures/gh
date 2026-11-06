@@ -102,6 +102,16 @@ case "$1 $2" in
             printf '{"state":"OPEN","number":1,"mergeable":"MERGEABLE","reviewDecision":"","statusCheckRollup":[],"baseRefName":"main","isCrossRepository":false}'
         fi
         ;;
+    "issue view")
+        # `issue-view-<number>.json` is what `issue view <number>` prints; by
+        # default the Issue is open at the fixture repository's own address.
+        number="$3"
+        if [ -f "$dir/issue-view-$number.json" ]; then
+            cat "$dir/issue-view-$number.json"
+        else
+            printf '{"number":%s,"state":"OPEN","url":"%s/issues/%s"}' "$number" "$repository" "$number"
+        fi
+        ;;
     "api --paginate")
         number=$(printf '%s' "$3" | sed -n 's#.*/pulls/\([0-9][0-9]*\)/commits$#\1#p')
         if [ -z "$number" ] || [ ! -f "$dir/pr-commits/$number" ]; then

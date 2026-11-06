@@ -292,7 +292,9 @@ impl Default for AppConfig {
     }
 }
 
-fn parse_github_url(url: &str, is_pr: bool) -> Option<ExternalRef> {
+/// The reference a legacy `github_issue_url` or `pr_url` becomes at load. It is
+/// `pub(crate)` so that unlinking can ask the same question the migration asks.
+pub(crate) fn parse_github_url(url: &str, is_pr: bool) -> Option<ExternalRef> {
     // Expected format: https://github.com/owner/repo/issues/123 or .../pull/123
     let segment = if is_pr { "/pull/" } else { "/issues/" };
     let number_str = url.split(segment).last()?;

@@ -1,13 +1,21 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
 use crate::domain::github::{Assignee, GithubIssue, Label, PullRequest, Review};
+use crate::domain::github_issue_link::parse_issue_url;
 use crate::domain::task::ExternalRef;
 use crate::domain::{
     SecuritySeverity, Task, TaskCategory, TaskComplexity, TaskImpact, TaskPhase, TaskPriority,
     TaskStatus,
 };
+use std::ffi::OsStr;
+use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
 use uuid::Uuid;
+
+/// How long one read of a linked Issue may take. The read happens once, when
+/// the Issue is linked, so a slow answer only delays that request.
+const ISSUE_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct GithubState;
@@ -191,6 +199,95 @@ pub async fn get_issue(repo: String, number: i32) -> Result<GithubIssue, String>
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     })
+}
+
+/// Read one Issue from GitHub through `program` (the `gh` on `PATH` in
+/// production) and return its state, `OPEN` or `CLOSED`. `gh issue view`
+/// changes nothing on GitHub. An answer for another number or address, such
+/// as a pull request, is refused.
+pub(crate) async fn read_issue_state(
+    program: &OsStr,
+    repo: &str,
+    number: u32,
+) -> Result<String, String> {
+    read_issue_state_within(program, repo, number, ISSUE_READ_TIMEOUT).await
+}
+
+/// [`read_issue_state`] with the bound injected, so the timeout path can be
+/// exercised without waiting for the production limit.
+async fn read_issue_state_within(
+    program: &OsStr,
+    repo: &str,
+    number: u32,
+    limit: Duration,
+) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command
+        .args([
+            "issue",
+            "view",
+            &number.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "number,state,url",
+        ])
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(limit, command.output())
+        .await
+        .map_err(|_| {
+            format!(
+                "GitHub did not answer within {} seconds",
+                limit.as_secs()
+            )
+        })?
+        .map_err(|e| {
+            format!("Could not run gh ({e}). Install the GitHub CLI and run gh auth login.")
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "GitHub could not return issue #{number} in {repo}: {}",
+            stderr.trim()
+        ));
+    }
+    parse_issue_state(&output.stdout, repo, number)
+}
+
+fn parse_issue_state(stdout: &[u8], repo: &str, number: u32) -> Result<String, String> {
+    let json: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|e| format!("GitHub's answer could not be read: {e}"))?;
+    let answered_number = json.get("number").and_then(serde_json::Value::as_u64);
+    let url = json
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let Ok(home) = parse_issue_url(url) else {
+        return Err(format!(
+            "GitHub did not answer with issue #{number} in {repo}"
+        ));
+    };
+    if answered_number != Some(u64::from(number)) {
+        return Err(format!(
+            "GitHub did not answer with issue #{number} in {repo}"
+        ));
+    }
+    // An Issue transferred to another repository is answered at its new
+    // address. Storing the typed address would name the wrong repository, so
+    // the caller is told the address GitHub reports instead.
+    if home.number != number || !home.repo.eq_ignore_ascii_case(repo) {
+        return Err(format!(
+            "GitHub reports issue #{number} in {repo} at {}. Link that address instead.",
+            home.url()
+        ));
+    }
+    match json.get("state").and_then(serde_json::Value::as_str) {
+        Some(state @ ("OPEN" | "CLOSED")) => Ok(state.to_string()),
+        _ => Err(format!(
+            "GitHub did not report the state of issue #{number} in {repo}"
+        )),
+    }
 }
 
 #[tauri::command]
@@ -586,4 +683,91 @@ fn map_labels_to_priority(labels: &[Label]) -> TaskPriority {
         }
     }
     TaskPriority::Medium
+}
+
+#[cfg(test)]
+mod issue_read_tests {
+    use super::*;
+
+    #[test]
+    fn an_answer_for_this_issue_gives_its_state() {
+        let open = br#"{"number":7,"state":"OPEN","url":"https://github.com/o/r/issues/7"}"#;
+        assert_eq!(parse_issue_state(open, "o/r", 7).unwrap(), "OPEN");
+        let closed = br#"{"number":7,"state":"CLOSED","url":"https://github.com/o/r/issues/7"}"#;
+        assert_eq!(parse_issue_state(closed, "o/r", 7).unwrap(), "CLOSED");
+    }
+
+    #[test]
+    fn an_answer_for_another_number_or_a_pull_request_is_refused() {
+        let other = br#"{"number":8,"state":"OPEN","url":"https://github.com/o/r/issues/8"}"#;
+        assert!(parse_issue_state(other, "o/r", 7).is_err());
+        let pull = br#"{"number":7,"state":"OPEN","url":"https://github.com/o/r/pull/7"}"#;
+        assert!(parse_issue_state(pull, "o/r", 7).is_err());
+    }
+
+    /// An Issue transferred to another repository must not be stored under the
+    /// address that was typed: the answer names the repository that holds it.
+    #[test]
+    fn an_answer_naming_the_issue_in_another_repository_is_refused() {
+        let moved = br#"{"number":7,"state":"OPEN","url":"https://github.com/new/repo/issues/7"}"#;
+        let refusal = parse_issue_state(moved, "old/repo", 7).unwrap_err();
+        assert!(
+            refusal.contains("https://github.com/new/repo/issues/7"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_differs_only_in_the_case_of_the_repository_is_accepted() {
+        let answer = br#"{"number":7,"state":"OPEN","url":"https://github.com/Old/Repo/issues/7"}"#;
+        assert_eq!(parse_issue_state(answer, "old/repo", 7).unwrap(), "OPEN");
+    }
+
+    #[test]
+    fn an_answer_without_a_known_state_or_readable_json_is_refused() {
+        let merged = br#"{"number":7,"state":"MERGED","url":"https://github.com/o/r/issues/7"}"#;
+        let refusal = parse_issue_state(merged, "o/r", 7).unwrap_err();
+        assert!(refusal.contains("did not report the state"), "{refusal}");
+        let unreadable = parse_issue_state(b"not json", "o/r", 7).unwrap_err();
+        assert!(unreadable.contains("could not be read"), "{unreadable}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_gh_is_reported_with_its_refusal() {
+        // `false` exits 1 whatever it is given, so no network is involved.
+        let error = read_issue_state(OsStr::new("false"), "o/r", 7)
+            .await
+            .unwrap_err();
+        assert!(error.contains("could not return issue #7 in o/r"), "{error}");
+    }
+
+    /// A `gh` that never answers is abandoned at the bound, and its process is
+    /// killed rather than left running. `exec` makes the script itself the
+    /// sleeping process, so killing it is enough.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gh_that_never_answers_is_abandoned_at_the_bound() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = read_issue_state_within(gh.as_os_str(), "o/r", 7, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(error.contains("did not answer within"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_missing_gh_is_reported_as_missing() {
+        let error = read_issue_state(OsStr::new("/nonexistent/slashit-gh-for-test"), "o/r", 7)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Could not run gh"), "{error}");
+    }
 }

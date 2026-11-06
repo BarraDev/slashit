@@ -18,6 +18,7 @@ pub mod restack_published;
 pub mod task_activity;
 pub mod task_dependency;
 pub mod task_drawer;
+pub mod task_issue_links;
 pub mod task_live;
 pub mod task_review;
 pub mod worker_recovery;

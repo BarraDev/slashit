@@ -7,6 +7,7 @@ Domain models shared across backend modules. These types define the core data st
 - **agent.rs** - Agent types and status
 - **integration.rs** - The durable record of integrating a Task's approved commit into a local branch, including the checkout a person confirmed moving it in
 - **project.rs** - Project definition and metadata, including where its tasks start and whether a person chose the local branch over a remote default
+- **github_issue_link.rs** - Linking a GitHub Issue to a Task: the one accepted Issue address form (parsing refuses other hosts, pull requests, queries, fragments and non-positive numbers), and the repeated-link check. The read that confirms the Issue lives in `commands/github.rs`
 - **repository.rs** - Repository configuration
 - **session.rs** - Chat session with agents
 - **storage_usage.rs** - Disk usage summary, what each total means, and the disk pressure policy
