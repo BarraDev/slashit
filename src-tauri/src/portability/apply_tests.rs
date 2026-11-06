@@ -662,8 +662,8 @@ async fn a_configuration_the_filesystem_cannot_synchronize_is_not_reported_durab
     assert_eq!(target.tasks.read().await.len(), 2);
 }
 
-/// Make `config.toml` fail strict parsing while its Projects section still
-/// salvages, the case where startup cannot prove a Project is absent.
+/// Make `config.toml` fail strict parsing, so startup reads it through the
+/// salvage path and cannot prove a Project is absent.
 fn corrupt_config_keeping_projects(config_file: &Path) {
     let mut value: toml::Value =
         toml::from_str(&fs::read_to_string(config_file).unwrap()).unwrap();
@@ -688,6 +688,12 @@ async fn a_record_that_cannot_be_trusted_holds_its_project_back_and_keeps_everyt
         assert!(apply_with(&target, &path, &checksum_of(&bytes)).await.ok);
         let record = target.storage.paths().pending_project_import_file(project_id());
         fs::write(&record, &content).unwrap();
+        assert!(target
+            .storage
+            .load_config()
+            .unwrap()
+            .projects
+            .contains_key(&project_id().to_string()));
         let paths = std::sync::Arc::new(target.storage.paths().clone());
         drop(target);
 
@@ -812,4 +818,194 @@ async fn an_unreadable_record_holds_back_an_interrupted_import_until_it_is_repai
     assert!(report.project_import_recovery_failures.is_empty());
     assert!(!state.project.projects.read().await.contains_key(&project_id()));
     assert!(!record.exists());
+}
+
+#[tokio::test]
+async fn a_held_back_project_cannot_be_imported_again_over_its_record() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    assert!(apply_with(&target, &path, &checksum_of(&bytes)).await.ok);
+    let record = target.storage.paths().pending_project_import_file(project_id());
+    fs::write(&record, b"garbage").unwrap();
+    let paths = std::sync::Arc::new(target.storage.paths().clone());
+    drop(target);
+
+    let (_state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert_eq!(report.project_import_recovery_failures.len(), 1);
+    let config_before = fs::read(paths.config_file()).unwrap();
+
+    // A fresh instance: nothing in memory names the Project, only the disk does.
+    let retry = crate::test_helpers::ipc_test_context(paths.clone());
+    let response = apply_with(&retry, &path, &checksum_of(&bytes)).await;
+    assert!(!response.ok, "a held-back Project is not imported over its record");
+    assert_eq!(fs::read(&record).unwrap(), b"garbage", "the record is kept");
+    assert_eq!(fs::read(paths.config_file()).unwrap(), config_before);
+    assert!(retry.tasks.read().await.is_empty());
+
+    let (state, _report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(state
+        .task
+        .tasks
+        .read()
+        .await
+        .values()
+        .all(|task| task.project_id != project_id()));
+}
+
+#[tokio::test]
+async fn a_held_back_project_keeps_its_pending_conversation_deletion() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    assert!(apply_with(&target, &path, &checksum_of(&bytes)).await.ok);
+    let conversation = target.storage.create_primary_conversation(project_id()).unwrap();
+    target
+        .storage
+        .mark_project_conversation_deletion_pending(project_id())
+        .unwrap();
+    let paths = std::sync::Arc::new(target.storage.paths().clone());
+    let pointer = paths.primary_conversation_file(project_id());
+    let document = paths.conversation_file(conversation.id);
+    let record = paths.pending_project_import_file(project_id());
+    drop(target);
+    fs::write(&record, b"garbage").unwrap();
+
+    let (_state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert_eq!(report.project_import_recovery_failures.len(), 1);
+    assert!(
+        pointer.exists() && document.exists(),
+        "absence from memory is not deletion: the Conversation stays"
+    );
+    assert!(paths
+        .pending_project_conversation_deletion_file(project_id())
+        .exists());
+}
+
+#[tokio::test]
+async fn a_record_without_its_project_holds_back_the_board_it_cannot_own() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    assert!(apply_with(&target, &path, &checksum_of(&bytes)).await.ok);
+    // The configuration lost the Project's entry while its board and record remain.
+    crate::commands::project::try_persist_projects(&target.storage, &HashMap::new()).unwrap();
+    target.storage.mark_project_import_pending(project_id()).unwrap();
+    let paths = std::sync::Arc::new(target.storage.paths().clone());
+    let record = paths.pending_project_import_file(project_id());
+    drop(target);
+
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert_eq!(report.project_import_recovery_failures.len(), 1);
+    assert!(state
+        .task
+        .tasks
+        .read()
+        .await
+        .values()
+        .all(|task| task.project_id != project_id()));
+    assert!(record.exists(), "the record is kept: the import cannot be shown complete");
+    let storage = crate::config::Storage::with_paths((*paths).clone());
+    assert!(storage.tasks_board_files(project_id()).iter().any(|file| file.exists()));
+}
+
+#[tokio::test]
+async fn a_record_whose_name_is_not_the_canonical_id_is_kept_and_reported() {
+    let (tmp, ctx) = test_ctx().await;
+    crate::commands::project::try_persist_projects(&ctx.storage, &HashMap::new()).unwrap();
+    let paths = std::sync::Arc::new(ctx.storage.paths().clone());
+    let id = Uuid::parse_str("8f3c2a1e-9b7d-4c6e-a5f0-1d2e3f4a5b6c").unwrap();
+    let lower = id.to_string();
+    let upper = lower.to_uppercase();
+    assert_ne!(lower, upper);
+    let record = paths.config_dir().join(format!("{upper}.import-pending"));
+    fs::write(&record, &lower).unwrap();
+    drop(ctx);
+
+    let (_state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert_eq!(report.project_import_recovery_failures.len(), 1);
+    assert!(record.exists(), "a record that cannot be cleared by its canonical path is kept");
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn a_held_back_entry_survives_a_settlement_and_a_later_save() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    assert!(apply_with(&target, &path, &checksum_of(&bytes)).await.ok);
+    // Held back: a completed import whose record was damaged.
+    let held_record = target.storage.paths().pending_project_import_file(project_id());
+    fs::write(&held_record, b"garbage").unwrap();
+    // Settled in the same startup: an interrupted import of another Project.
+    let other_id = Uuid::from_u128(77);
+    let mut other = super::tests::project(None);
+    other.id = other_id;
+    other.name = "Interrupted".into();
+    let mut projects = HashMap::from([(other_id, other)]);
+    projects.insert(project_id(), super::tests::project(None));
+    crate::commands::project::try_persist_projects(&target.storage, &projects).unwrap();
+    target.storage.mark_project_import_pending(other_id).unwrap();
+    let paths = std::sync::Arc::new(target.storage.paths().clone());
+    drop(target);
+
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert_eq!(report.project_import_recovery_failures.len(), 1);
+    assert!(!state.project.projects.read().await.contains_key(&other_id));
+    let storage = crate::config::Storage::with_paths((*paths).clone());
+    assert!(storage.load_config().unwrap().projects.contains_key(&project_id().to_string()));
+    assert!(!storage.load_config().unwrap().projects.contains_key(&other_id.to_string()));
+
+    // A later save by this running instance must not drop the held-back entry.
+    let memory = state.project.projects.read().await.clone();
+    crate::commands::project::try_persist_projects(&state.storage, &memory).unwrap();
+    assert!(
+        storage
+            .load_config()
+            .unwrap()
+            .projects
+            .contains_key(&project_id().to_string()),
+        "a save does not drop a held-back Project"
+    );
+}
+
+#[tokio::test]
+async fn an_import_whose_configuration_is_not_confirmed_keeps_its_record() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+
+    let _fault = fault::fail_at_file(Stage::SyncDirectory, ErrorKind::Unsupported, "config.toml");
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    drop(_fault);
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(response.data["durable"], false);
+    // The board is durable, but the Project's entry is not. The record stays, so
+    // the next start can hold the import back if the entry was lost.
+    assert_eq!(
+        target.storage.pending_project_imports().unwrap(),
+        vec![project_id()]
+    );
 }

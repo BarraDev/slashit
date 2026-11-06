@@ -1076,7 +1076,7 @@ fn an_import_refuses_a_task_web_address_that_carries_user_information() {
     );
     let malformed = seal(&payload_json(|v| {
         v["tasks"][0]["github_issue_url"] =
-            Value::from("https://user:ISSUE_SECRET/x@github.com/acme/app/issues/1");
+            Value::from("https://user:ISSUE_SECRET/acme/app/issues/1");
     }));
     assert!(
         matches!(bundle::decode(&malformed), Err(BundleError::Malformed(_))),
@@ -1086,6 +1086,46 @@ fn an_import_refuses_a_task_web_address_that_carries_user_information() {
         v["tasks"][0]["pr_url"] = Value::from("https://github.com:443/acme/app/pull/1");
     }));
     assert!(bundle::decode(&plain).is_ok(), "a plain address with a port still imports");
+    // Spellings the `://` sanitizer does not reach must be refused too.
+    for address in [
+        "https:///user:pw@github.com/acme/app/pull/1",
+        "https:user:tok@github.com/acme/app/pull/1",
+        "https://a/https://user:tok@github.com/acme/app/pull/1",
+        "https://github.com\\@evil.example/acme/app/pull/1",
+    ] {
+        let sealed = seal(&payload_json(|v| {
+            v["tasks"][0]["pr_url"] = Value::from(address);
+        }));
+        assert!(
+            matches!(bundle::decode(&sealed), Err(BundleError::Unsafe(_))),
+            "{address} must be refused"
+        );
+    }
+}
+
+/// Export writes a Task's address only after the same check. The `://` form
+/// with user information is stripped and exported; a spelling the stripping
+/// cannot reach is refused, and the credential is in neither the answer nor the file.
+#[tokio::test]
+async fn an_export_never_writes_a_credential_in_a_task_web_address() {
+    let (tmp, ctx) = test_ctx().await;
+    let mut tasks = fixture_tasks();
+    tasks[0].pr_url = Some("https://user:PR_TOKEN@github.com/acme/app/pull/1".into());
+    seed(&ctx, None, &tasks).await;
+    let stripped = tmp.path().join("stripped.json");
+    let answer = export_to(&ctx, &stripped).await;
+    assert!(answer.ok, "{answer:?}");
+    let written = fs::read_to_string(&stripped).unwrap();
+    assert!(!written.contains("PR_TOKEN"), "the user information must not be exported");
+    assert!(written.contains("https://github.com/acme/app/pull/1"));
+
+    tasks[0].pr_url = Some("https:///user:PR_TOKEN@github.com/acme/app/pull/1".into());
+    seed(&ctx, None, &tasks).await;
+    let refused = tmp.path().join("refused.json");
+    let answer = export_to(&ctx, &refused).await;
+    assert!(!answer.ok, "a spelling the sanitizer cannot strip is refused: {answer:?}");
+    assert!(!format!("{answer:?}").contains("PR_TOKEN"));
+    assert!(!refused.exists());
 }
 
 /// An scp-style remote can carry a credential in its user part, which is not

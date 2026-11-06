@@ -4,7 +4,7 @@ use crate::domain::task::ExternalRef;
 use crate::domain::{AgentConfig, Conversation, Project, Repository, Task};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -334,6 +334,9 @@ fn migrate_task_refs(task: &mut Task) {
 pub struct Storage {
     paths: Arc<AppPaths>,
     config_file: PathBuf,
+    /// Projects an import held back. They are not in memory, but their entries
+    /// in `config.toml` must survive every rewrite of the Projects section.
+    held_back: Arc<Mutex<HashSet<Uuid>>>,
     /// Project id to the directory holding that project's shareable state.
     ///
     /// Routing depends only on config content — a project's repository path
@@ -766,10 +769,12 @@ impl Storage {
                 continue;
             };
             // The file name is the identity recovery relies on; the content is
-            // checked against it and never trusted on its own.
-            let project_id = id.parse::<Uuid>().ok();
+            // checked against it and never trusted on its own. Only the canonical
+            // spelling is accepted, because clearing a record rebuilds its path
+            // from the id, so another spelling could never be removed.
+            let project_id = id.parse::<Uuid>().ok().filter(|uuid| uuid.to_string() == id);
             let problem = match project_id {
-                None => Some("the file name does not name a Project".to_string()),
+                None => Some("the file name is not a canonical Project id".to_string()),
                 Some(expected) => match fs::read_to_string(&path) {
                     Err(error) => Some(format!("the record cannot be read: {error}")),
                     Ok(text) => match text.trim().parse::<Uuid>() {
@@ -807,6 +812,49 @@ impl Storage {
             .collect()
     }
 
+    /// Keep a Project out of this process because an import could not settle it.
+    /// Its configuration entry is preserved by later rewrites until a start
+    /// settles it.
+    pub fn hold_back_project(&self, project_id: Uuid) {
+        let mut held = match self.held_back.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        held.insert(project_id);
+    }
+
+    /// The Projects held back in this process, copied out so no lock is held
+    /// while the configuration transaction runs.
+    pub fn held_back_projects(&self) -> Vec<Uuid> {
+        let held = match self.held_back.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        held.iter().copied().collect()
+    }
+
+    /// Whether anything on disk still names this Project as an import: its
+    /// import record, a Task board, or a configuration entry. An unreadable
+    /// file counts as present. An import of the same id must not replace or
+    /// clear any of them while they remain.
+    pub fn project_import_residue(&self, project_id: Uuid) -> Result<bool> {
+        let record = self.paths.pending_project_import_file(project_id);
+        if record.try_exists().unwrap_or(true) {
+            return Ok(true);
+        }
+        if self
+            .tasks_board_files(project_id)
+            .iter()
+            .any(|file| file.try_exists().unwrap_or(true))
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .read_config_strict()?
+            .projects
+            .contains_key(&project_id.to_string()))
+    }
+
     pub fn new() -> Result<Self> {
         let paths = AppPaths::new().context("Failed to resolve application directories")?;
         Ok(Self::with_paths(paths))
@@ -823,6 +871,7 @@ impl Storage {
             load_diagnostics: Arc::new(Mutex::new(Vec::new())),
             config_tx: Arc::new(Mutex::new(())),
             config_unconfirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            held_back: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 

@@ -141,9 +141,29 @@ pub async fn apply(
     let project_name = project.name.clone();
     let task_count = tasks.len() as u32;
 
+    // A Project held back by an earlier import keeps its record, board or
+    // configuration entry. The preview sees only memory, so the disk is checked
+    // here: a new import must not replace, clear, or adopt any of them.
+    match live.storage.project_import_residue(project_id) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(ApplyError::Failed(format!(
+                "Project {project_id} is held back by an earlier import: its import record, Task board or configuration entry is still present. Repair or settle it before importing this bundle again."
+            )))
+        }
+        Err(e) => {
+            return Err(ApplyError::Failed(format!(
+                "the state of Project {project_id} could not be read, so nothing was imported: {e:#}"
+            )))
+        }
+    }
+
     // Step 1: the record that makes an interrupted import recognizable. Nothing
     // is committed yet, so a refusal here leaves nothing to undo. Written in
     // place but not confirmed durable, the import proceeds and reports it.
+    // Whether the Project's configuration entry is confirmed durable. Only that and
+    // the board decide when the record may go; the record's own write does not.
+    let mut config_durable = true;
     let mut durable = match live.storage.mark_project_import_pending(project_id) {
         Ok(committed) => committed.is_fully_durable(),
         Err(e) if e.is_published() => false,
@@ -170,7 +190,10 @@ pub async fn apply(
     let outcome = try_persist_projects(live.storage, &proposed);
     match adopt_published(&mut *projects_w, proposed, outcome) {
         Ok(()) => {}
-        Err(e) if e.is_published() => durable = false,
+        Err(e) if e.is_published() => {
+            durable = false;
+            config_durable = false;
+        }
         Err(e) => {
             clear_import_record(live.storage, project_id);
             return Err(ApplyError::Failed(
@@ -180,7 +203,8 @@ pub async fn apply(
     }
     // A save can succeed while the directory cannot be synchronized; only the
     // storage flag says so.
-    durable &= !live.storage.config_is_unconfirmed();
+    config_durable &= !live.storage.config_is_unconfirmed();
+    durable &= config_durable;
 
     // Step 4: the board becomes visible, or the Project is reverted.
     let board_durable = match staged_board.publish_new() {
@@ -217,9 +241,11 @@ pub async fn apply(
     };
 
     // Step 5: the board is in place, so the import is settled. The Tasks are
-    // visible only now. A board whose directory entry is not confirmed durable
-    // keeps its record, so a power loss cannot leave a Project with neither.
-    if board_durable {
+    // visible only now. The record goes only when the configuration and the
+    // board are both confirmed durable. Otherwise a power loss could leave the
+    // Project's entry or its board without the other, and the record is what
+    // lets the next start hold that state back.
+    if board_durable && config_durable {
         clear_import_record(live.storage, project_id);
     }
     durable &= board_durable;
@@ -280,8 +306,12 @@ pub fn recover_interrupted_imports(
     let records = match storage.import_records() {
         Ok(records) => records,
         Err(error) => {
-            // Without the records, nothing shows that an import is settled.
+            // Without the records, nothing shows that an import is settled. Every
+            // Project is held back, so no later configuration save drops one.
             recovery.quarantined = projects.keys().copied().collect();
+            for id in &recovery.quarantined {
+                storage.hold_back_project(*id);
+            }
             projects.clear();
             recovery.failures.push(format!(
                 "the import records could not be read, so no Project is loaded: {error:#}"
@@ -304,7 +334,7 @@ pub fn recover_interrupted_imports(
             continue;
         };
         if let Some(problem) = problem {
-            quarantine(projects, project_id, &mut recovery);
+            quarantine(storage, projects, project_id, &mut recovery);
             recovery.failures.push(format!(
                 "{project_id}: the import record {} cannot be trusted ({problem}); the Project is held back and the record is kept",
                 path.display()
@@ -312,7 +342,7 @@ pub fn recover_interrupted_imports(
             continue;
         }
         if !authoritative {
-            quarantine(projects, project_id, &mut recovery);
+            quarantine(storage, projects, project_id, &mut recovery);
             recovery.failures.push(format!(
                 "{project_id}: held back until the configuration loads completely; its import record is kept"
             ));
@@ -323,12 +353,15 @@ pub fn recover_interrupted_imports(
     recovery
 }
 
-/// Keep a Project out of this process. Its Tasks are filtered out too.
+/// Keep a Project out of this process. Its Tasks are filtered out too, and its
+/// configuration entry is held in place by [`Storage::hold_back_project`].
 fn quarantine(
+    storage: &Storage,
     projects: &mut HashMap<Uuid, Project>,
     project_id: Uuid,
     recovery: &mut ImportRecovery,
 ) {
+    storage.hold_back_project(project_id);
     projects.remove(&project_id);
     recovery.quarantined.push(project_id);
 }
@@ -345,6 +378,16 @@ fn settle_record(
         .tasks_board_files(project_id)
         .iter()
         .any(|file| file.try_exists().unwrap_or(true));
+    // Under an authoritative configuration, a Project absent from memory is absent
+    // from the file. With its board still present, the import's completion cannot
+    // be shown, so the board is held back rather than adopted or cleared.
+    if !projects.contains_key(&project_id) && board_present {
+        quarantine(storage, projects, project_id, recovery);
+        recovery.failures.push(format!(
+            "{project_id}: the import record remains, its Project is not in the configuration, and its Task board is present; the board is held back and nothing was changed"
+        ));
+        return;
+    }
     if projects.contains_key(&project_id) && !board_present {
         let mut proposed = projects.clone();
         proposed.remove(&project_id);
@@ -352,9 +395,9 @@ fn settle_record(
             Ok(()) => *projects = proposed,
             Err(error) => {
                 // The interrupted Project is not usable in this process, even
-                // when its removal is not in place. The record stays, so a
-                // later start removes it again.
-                projects.remove(&project_id);
+                // when its removal is not in place. The record stays, and the
+                // entry is held so a later save does not drop it.
+                quarantine(storage, projects, project_id, recovery);
                 recovery.failures.push(format!(
                     "{project_id}: {}",
                     error.describe("remove the interrupted import")

@@ -432,24 +432,28 @@ fn validate(payload: &Payload) -> Result<(), BundleError> {
     Ok(())
 }
 
-/// A Task's web address (an issue or pull request link) that uses a `://` scheme
-/// must not carry user information, which is where a credential would sit, and
-/// its host part must be a host with an optional numeric port. Export strips user
-/// information before this check, so only an edited bundle or an unusual stored
-/// address reaches the refusal. Addresses without a scheme are not checked here.
+/// A Task's web address (an issue or pull request link) must not contain `@`:
+/// that is where user information, and so a credential, would sit. The export
+/// sanitizer strips user information only from the authority of a `://` address,
+/// so every other spelling that carries an `@` is refused, on export as well as
+/// on decode (`encode` validates the payload before it writes it).
 ///
-/// shortcut: an address without a scheme, or a bracketed IPv6 host, is not
-/// checked; a web address for a Task does not use either form.
+/// A `://` address's host part must then be a host with an optional numeric
+/// port.
+///
+/// shortcut: an address with a bracketed IPv6 host is not port-checked; a Task
+/// web address does not use that form in practice. An address whose path
+/// legitimately contains `@` is refused; no issue or pull request link does.
 fn check_web_address(task_id: Uuid, url: &str) -> Result<(), BundleError> {
-    let Some((_, rest)) = url.split_once("://") else {
-        return Ok(());
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.contains('@') {
+    if url.contains('@') {
         return Err(BundleError::Unsafe(format!(
             "task {task_id} has a web address with user information, which may hold a credential"
         )));
     }
+    let Some((_, rest)) = url.split_once("://") else {
+        return Ok(());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if !authority.starts_with('[') {
         if let Some((_, port)) = authority.rsplit_once(':') {
             if !port.bytes().all(|b| b.is_ascii_digit()) {

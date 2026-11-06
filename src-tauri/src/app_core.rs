@@ -246,10 +246,13 @@ pub async fn build_state_with_paths(
                 .pending_project_tasks_deletions()
                 .map(|p| !p.is_empty())
                 .unwrap_or(true)
+            // Only a trusted record can settle anything, and only that one needs
+            // the configuration proved absent of a Project. A record that cannot
+            // be trusted is held back without rewriting the configuration.
             || app_state
                 .storage
-                .pending_project_imports()
-                .map(|p| !p.is_empty())
+                .import_records()
+                .map(|records| records.iter().any(|record| record.problem.is_none()))
                 .unwrap_or(true);
         if owed {
             if let Err(error) = app_state.storage.reconfirm_config_durable() {
@@ -284,6 +287,10 @@ pub async fn build_state_with_paths(
             Ok(pending) => {
                 let projects = app_state.project.projects.read().await;
                 for project_id in pending {
+                    // Held back, not deleted: its absence from memory proves nothing.
+                    if quarantined_imports.contains(&project_id) {
+                        continue;
+                    }
                     if projects.contains_key(&project_id) {
                         if let Err(error) = app_state
                             .storage
@@ -342,6 +349,9 @@ pub async fn build_state_with_paths(
                 let projects = app_state.project.projects.read().await;
                 for record in pending {
                     let project_id = record.project_id;
+                    if quarantined_imports.contains(&project_id) {
+                        continue;
+                    }
                     if projects.contains_key(&project_id) {
                         if let Err(error) = app_state
                             .storage

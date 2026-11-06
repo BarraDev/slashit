@@ -66,7 +66,9 @@ single atomic write cannot cover both, so the commit runs in this order:
 2. Stage the board beside its destination. Nothing is visible yet.
 3. Commit the Project to `config.toml`. This is the commit point.
 4. Publish the board with a no-clobber publication.
-5. Remove the import record and insert the Tasks into memory.
+5. Remove the import record and insert the Tasks into memory. The record is
+   removed only when the configuration entry and the board are both confirmed
+   durable; otherwise it stays for the next start.
 
 Results:
 
@@ -85,6 +87,10 @@ Results:
   also gives `durable: false`.
 - A repeated apply of the same bundle is refused by the identity rule, so an
   import cannot be committed twice.
+- An apply is refused, and changes nothing, while any import record, Task board
+  or configuration entry for the same Project id is still on disk. This covers
+  a Project held back by an earlier import: the preview sees only memory, so the
+  disk is checked as well.
 - Two concurrent applies of one bundle serialize on the Project's lifecycle
   gate. Exactly one commits.
 
@@ -93,12 +99,17 @@ Results:
 A record left behind marks an import that did not finish. At startup, before
 any Project is used, and only with a configuration read without salvage:
 
-- No Project under the record: the import never committed. The record is removed.
+- No Project and no board under the record: the import never committed. The
+  record is removed.
 - A Project with its board: the import completed. Only the record remained, so
   it is removed and the Project is kept.
 - A Project without its board: the import was interrupted. Only this Project is
   removed from `config.toml`, so the bundle can be imported again. No other
   record or board is touched.
+- A board with no Project in `config.toml` but with the record: the Project
+  entry may have been lost after a non-durable commit. The board is held back
+  (its Tasks are not loaded), and the record and board are kept. Nothing is
+  adopted or deleted.
 
 A configuration without a `projects` section is not authoritative, so a record
 written before the first Project was saved waits until a configuration exists.
@@ -115,16 +126,20 @@ Records that cannot be trusted quarantine their Project instead:
   Nothing is rewritten. The salvage reader recovers no Projects today, so what
   is held back is the Task board, which would otherwise load with no Project to
   own it.
-- When the record directory cannot be listed, no Project is loaded.
+- When the record directory cannot be listed, every Project is held back.
+- A held-back Project keeps its `config.toml` entry through any later save in
+  the same process, so a settlement or a Project save cannot drop it. Its
+  Conversation and Task deletion records are not acted on while it is held back.
 
 Once the record is repaired or the configuration loads completely, the next
 start applies the rules above. Nothing is deleted for a quarantined Project.
 
-Not covered: a board that survives a power loss after a non-durable configuration
-commit has no record that owns it, so it can block a later import with "a Task
-board already exists". The import refuses and nothing is overwritten, but the
-board is not adopted or removed automatically. Removing it needs a deliberate
-owner decision; no automatic repair exists.
+Not covered: a Task board with neither a Project entry nor a record is still
+loaded by startup with its Tasks, as before this change. Nothing in the import
+path owns such a board, and it can block a later import with "a Task board
+already exists". The import refuses and nothing is overwritten, but the board is
+not adopted or removed automatically. Removing it needs a deliberate owner
+decision; no automatic repair exists.
 
 Covered by tests: the record write refusal, an unconfirmed record, a failed
 revert followed by a restart through the production startup path, a record with
@@ -132,8 +147,12 @@ no Project, a record beside a completed board, an unrelated Project that
 survives recovery, the three untrusted-record contents (each leaving the record
 and board in place, the configuration unchanged, and the Tasks unloaded), a
 completed import under a salvaged configuration (its Tasks not loaded, and
-restored once the configuration loads), and a negative control showing the Task
-filter is required. The restart tests are not a real process kill: a crash
+restored once the configuration loads), a board whose Project entry is missing,
+a re-import refused over a held-back record, a Conversation deletion that is not
+run for a held-back Project, a non-canonical record name, a held-back entry that
+survives a sibling settlement and a later save, and an unconfirmed configuration
+that keeps its record. Negative controls showed that the Task filter and the
+held-back preservation are each required. The restart tests are not a real process kill: a crash
 that loses unflushed page-cache data is not simulated.
 
 ## The file
@@ -241,11 +260,12 @@ envelope, checksum, payload parse, manifest, then structural rules:
 - The repository remote is one plain token. A remote with user information is
   refused as unsafe, since a credential would sit there. The project base is a
   branch name (a leading dash is refused, so it can never read as an option).
-- A Task's issue or pull request address with a `://` scheme must not carry user
-  information (refused as unsafe), and its host part must be a host with an
-  optional numeric port (otherwise refused as malformed). Export strips user
-  information from these addresses before the check, so an export never writes
-  the credential form. Addresses without a scheme are not checked.
+- A Task's issue or pull request address must not contain `@` (refused as
+  unsafe, on decode and on export). Export strips user information from the
+  authority of a `://` address before the check, so that form is exported with
+  the credential removed. Any other spelling that carries an `@` is refused, and
+  nothing is written. A `://` address's host part must be a host with an optional
+  numeric port (otherwise refused as malformed).
 - Historical Git evidence (base commit, approved tip, pull request merge commit)
   is a 40- or 64-character hexadecimal identifier. The shape is checked, and
   nothing requires the commit to exist in the importing repository.
