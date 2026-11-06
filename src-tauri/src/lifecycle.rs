@@ -487,9 +487,37 @@ pub async fn record_typed_if_changed(
     task_id: Uuid,
     revise: Revise<'_>,
 ) -> Result<bool, RecordWriteError> {
+    record_classified_if_changed(tasks, storage, task_id, revise)
+        .await
+        .map_err(|failure| match failure {
+            RecordFailure::TaskAbsent(message) => RecordWriteError::NotPublished(message),
+            RecordFailure::Write(error) => error,
+        })
+}
+
+/// Why a conditional record write did not commit. A caller that must answer an
+/// absent Task differently from a failed write matches this, instead of looking
+/// the Task up again after the write has released its lock: a delete can land
+/// in that gap and turn a persistence failure into an apparent absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordFailure {
+    /// No Task with this id was on the board when the write began.
+    TaskAbsent(String),
+    /// The Task was on the board and the write did not publish, or did not
+    /// persist.
+    Write(RecordWriteError),
+}
+
+/// [`record_typed_if_changed`] with an absent Task reported as its own variant.
+pub async fn record_classified_if_changed(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    revise: Revise<'_>,
+) -> Result<bool, RecordFailure> {
     let mut tasks_w = tasks.write().await;
     let Some(project_id) = tasks_w.get(&task_id).map(|t| t.project_id) else {
-        return Err(RecordWriteError::NotPublished(format!(
+        return Err(RecordFailure::TaskAbsent(format!(
             "task {task_id} is no longer on the board"
         )));
     };
@@ -502,7 +530,9 @@ pub async fn record_typed_if_changed(
         task.updated_at = chrono::Utc::now();
     }
 
-    publish_typed(&mut tasks_w, storage, project_id, staged).map(|()| true)
+    publish_typed(&mut tasks_w, storage, project_id, staged)
+        .map(|()| true)
+        .map_err(RecordFailure::Write)
 }
 
 /// Amend a task's own fields durably, or say there is no such task.

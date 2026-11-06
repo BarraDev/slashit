@@ -97,6 +97,26 @@ pub fn holds_issue(task: &Task, issue: &IssueAddress) -> bool {
     })
 }
 
+/// The refusal for a generic reference that would store a second row for an
+/// Issue the Task already holds: the same Issue, or the same URL. Another Issue
+/// of the same number in another repository is a distinct reference.
+pub fn duplicate_issue_refusal(task: &Task, reference: &ExternalRef) -> Option<String> {
+    let ExternalRef::GithubIssue {
+        url, number, repo, ..
+    } = reference
+    else {
+        return None;
+    };
+    let issue = IssueAddress {
+        repo: repo.clone(),
+        number: *number,
+    };
+    let same_url = task.external_refs.iter().any(
+        |held| matches!(held, ExternalRef::GithubIssue { url: held_url, .. } if held_url == url),
+    );
+    (same_url || holds_issue(task, &issue)).then(|| already_linked_message(&issue))
+}
+
 /// The refusal for a repeated link, shared by every check that makes it.
 pub fn already_linked_message(issue: &IssueAddress) -> String {
     format!(
