@@ -139,6 +139,31 @@ pub async fn set_task_dependencies(task_id: String, dependencies: Vec<String>) -
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
+/// Link a GitHub Issue to a Task by its web address. The backend reads the
+/// Issue from GitHub first; a refusal (a pull request address, an Issue GitHub
+/// does not confirm, a repeated link) comes back as the error.
+pub async fn link_github_issue(task_id: String, issue_url: String) -> Result<Option<Task>, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "taskId": task_id,
+        "issueUrl": issue_url,
+    })).unwrap();
+
+    let response = invoke_reporting("link_github_issue", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// Remove the external reference at `ref_index` of a Task. The backend checks
+/// that the reference at that index is still the one the caller chose.
+pub async fn remove_external_ref(task_id: String, ref_index: usize) -> Result<Option<Task>, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "taskId": task_id,
+        "refIndex": ref_index,
+    })).unwrap();
+
+    let response = invoke_reporting("remove_external_ref", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
 pub async fn delete_task(task_id: String) -> Result<bool, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "taskId": task_id,

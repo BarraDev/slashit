@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::components::diff_viewer::DiffViewer;
 use crate::components::task_dependency::DependencyList;
+use crate::components::task_issue_links::TaskIssueLinks;
 use crate::components::new_work_pause::NewWorkPauseNotice;
 use crate::components::pr_status::PullRequestSection;
 use crate::components::task_activity::TaskActivity;
@@ -535,6 +536,11 @@ pub fn TaskDrawer(
                     {move || task.get().filter(|t| !t.dependencies.is_empty()).map(|t| view! {
                         <DependencyList task=t tasks=tasks on_open=on_open />
                     })}
+
+                    // The GitHub Issues this task links. Kept mounted while the task exists, so a typed address survives a poll.
+                    <Show when=move || task.with(|t| t.is_some())>
+                        <TaskIssueLinks task_id=task_id task=task apply_task=apply_task />
+                    </Show>
 
                     // The decision on these changes, and what became of it.
                     <Show when=move || {

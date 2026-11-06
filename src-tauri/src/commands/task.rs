@@ -5,10 +5,13 @@ use crate::domain::{
     TaskImpact, SecuritySeverity, TaskPhase, Subtask,
 };
 use crate::domain::task::{CodingProvider, ExternalRef};
+use crate::domain::github_issue_link::{attach_github_issue, holds_issue, parse_issue_url};
+use crate::commands::github::read_issue_state;
 use crate::lifecycle::{classify_status_transition, StatusTransitionEffect};
 use crate::queue::{PromotionChoice, PromotionOutcome};
 use uuid::Uuid;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -562,6 +565,10 @@ pub async fn toggle_subtask(
     crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
+/// Link a GitHub Issue to a Task. The address is parsed, and GitHub is asked
+/// about the Issue, before anything is written: a refused address, a repeated
+/// link or an Issue GitHub does not confirm changes nothing. The legacy
+/// `github_issue_url` field and existing references are left as they are.
 #[tauri::command]
 pub async fn link_github_issue(
     _gui: GuiMutation,
@@ -570,32 +577,37 @@ pub async fn link_github_issue(
     issue_url: String,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+    let issue = parse_issue_url(&issue_url)?;
+    if state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .is_some_and(|task| holds_issue(task, &issue))
+    {
+        return Err(format!(
+            "This Task already links issue #{} in {}.",
+            issue.number, issue.repo
+        ));
+    }
+    let issue_state = read_issue_state(OsStr::new("gh"), &issue.repo, issue.number).await?;
+    // The repeated-link check runs again under the write, so two requests
+    // that both passed the check above cannot both add the Issue.
+    let refusal = std::sync::Mutex::new(None::<String>);
+    let amend = |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
-            task.github_issue_url = Some(issue_url.clone());
-            // Also add to external_refs if not already there
-            if !task.external_refs.iter().any(|r| matches!(r, ExternalRef::GithubIssue { url, .. } if url == &issue_url)) {
-                // Parse: https://github.com/{owner}/{repo}/issues/{number}
-                let parts: Vec<&str> = issue_url.trim_end_matches('/').split('/').collect();
-                if let Some(issues_idx) = parts.iter().position(|&p| p == "issues") {
-                    if let Some(gh_idx) = parts.iter().position(|&p| p == "github.com") {
-                        if let (Some(number_str), true) = (parts.get(issues_idx + 1), gh_idx + 2 < issues_idx) {
-                            if let Ok(number) = number_str.parse::<u32>() {
-                                let repo = format!("{}/{}", parts[gh_idx + 1], parts[gh_idx + 2]);
-                                task.external_refs.push(ExternalRef::GithubIssue {
-                                    url: issue_url.clone(),
-                                    number,
-                                    repo,
-                                    state: Some("OPEN".to_string()),
-                                });
-                            }
-                        }
-                    }
-                }
+            if let Err(e) = attach_github_issue(task, &issue, &issue_state) {
+                *refusal.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
             }
         }
     };
-    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
+    let task =
+        crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await?;
+    match refusal.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        Some(refusal) => Err(refusal),
+        None => Ok(task),
+    }
 }
 
 #[tauri::command]
