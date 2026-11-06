@@ -352,6 +352,34 @@ fn a_golden_bundle_decodes_back_to_the_same_bytes() {
     assert_eq!(again, GOLDEN, "decode and encode agree on every byte");
 }
 
+#[test]
+fn activity_key_insertion_order_never_changes_the_bytes() {
+    // serde_json keeps insertion order for objects only with its preserve_order
+    // feature, which a feature-unified build can enable. The same Activity
+    // content with its keys inserted in reverse must still give the golden bytes.
+    let mut reversed = fixture_payload();
+    for task in &mut reversed.tasks {
+        for value in &mut task.activity {
+            *value = reverse_keys(value);
+        }
+    }
+    assert_eq!(bundle::encode(&reversed, at(), "golden").unwrap(), GOLDEN);
+}
+
+fn reverse_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let mut out = serde_json::Map::new();
+            for (key, field) in fields.iter().rev() {
+                out.insert(key.clone(), reverse_keys(field));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(reverse_keys).collect()),
+        other => other.clone(),
+    }
+}
+
 // --------------------------------------------------------- what must be absent
 
 #[test]

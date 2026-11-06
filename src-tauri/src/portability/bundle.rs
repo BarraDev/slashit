@@ -241,7 +241,13 @@ pub fn encode(
 ) -> Result<Vec<u8>, String> {
     // The same rules decode applies, so a written bundle always previews.
     validate(payload).map_err(|e| format!("this Project cannot be exported: {e}"))?;
-    let raw = serde_json::value::to_raw_value(payload).map_err(|e| e.to_string())?;
+    // Activity values are free-form JSON, whose key order serde_json decides by
+    // feature (preserve_order), so their keys are sorted before the bytes are fixed.
+    let mut canonical = payload.clone();
+    for task in &mut canonical.tasks {
+        task.activity.iter_mut().for_each(sort_object_keys);
+    }
+    let raw = serde_json::value::to_raw_value(&canonical).map_err(|e| e.to_string())?;
     let envelope = Envelope {
         format: FORMAT.to_string(),
         format_version: FORMAT_VERSION,
@@ -508,6 +514,24 @@ fn check_acyclic(tasks: &[PortableTask]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Sort the keys of every object in `value`, at every depth. A `BTreeMap`-backed
+/// `Value` is already sorted, so this changes nothing there.
+fn sort_object_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let mut sorted: Vec<(String, serde_json::Value)> =
+                std::mem::take(fields).into_iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, field) in &mut sorted {
+                sort_object_keys(field);
+            }
+            *fields = sorted.into_iter().collect();
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sort_object_keys),
+        _ => {}
+    }
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
