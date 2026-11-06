@@ -239,6 +239,8 @@ pub fn encode(
     created_at: DateTime<Utc>,
     build: &str,
 ) -> Result<Vec<u8>, String> {
+    // The same rules decode applies, so a written bundle always previews.
+    validate(payload).map_err(|e| format!("this Project cannot be exported: {e}"))?;
     let raw = serde_json::value::to_raw_value(payload).map_err(|e| e.to_string())?;
     let envelope = Envelope {
         format: FORMAT.to_string(),
@@ -302,6 +304,17 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, BundleError> {
 /// breaks one was edited or produced by something else.
 fn validate(payload: &Payload) -> Result<(), BundleError> {
     let malformed = |why: String| Err(BundleError::Malformed(why));
+    // Repository identity, and the branch new Tasks start from, which the
+    // importing side will name to Git: each is checked by shape, never looked
+    // up in the importing repository.
+    if let Some(url) = payload.repository.as_ref().and_then(|r| r.remote_url.as_deref()) {
+        check_remote_identity(url)?;
+    }
+    if let Some(base) = &payload.project.base {
+        if !is_branch_name(base.branch()) {
+            return malformed(format!("the project base {:?} is not a branch name", base.branch()));
+        }
+    }
     let mut ids: HashSet<Uuid> = HashSet::new();
     for task in &payload.tasks {
         if !ids.insert(task.id) {
@@ -346,6 +359,21 @@ fn validate(payload: &Payload) -> Result<(), BundleError> {
                 )));
             }
         }
+        // Historical evidence: checked as an identifier, never required to exist.
+        let commits = task
+            .base_commit
+            .iter()
+            .map(|c| ("base_commit", c))
+            .chain(task.human_review.entries.iter().filter_map(|e| e.approved_tip.as_ref().map(|c| ("approved_tip", c))))
+            .chain(task.external_refs.iter().filter_map(|r| match r {
+                ExternalRef::GithubPr { merge_commit: Some(c), .. } => Some(("merge_commit", c)),
+                _ => None,
+            }));
+        for (field, commit) in commits {
+            if !is_commit_id(commit) {
+                return malformed(format!("task {} has a {field} that is not a commit identifier", task.id));
+            }
+        }
         let review = &task.human_review;
         let mut previous = 0;
         for entry in &review.entries {
@@ -359,6 +387,88 @@ fn validate(payload: &Payload) -> Result<(), BundleError> {
         return malformed(cycle);
     }
     Ok(())
+}
+
+/// A repository remote is one plain token, and carries no user information:
+/// that is where a credential would sit, so its presence is `Unsafe`.
+/// Shortcut: a scp-style remote (`user:secret@host:path`) and a local path are
+/// accepted as written; a credential in those forms is not detected.
+fn check_remote_identity(url: &str) -> Result<(), BundleError> {
+    if url.is_empty() || url.len() > 2048 || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(BundleError::Malformed("the repository remote is not one plain token".into()));
+    }
+    if let Some((_, rest)) = url.split_once("://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        if authority.contains('@') {
+            return Err(BundleError::Unsafe(
+                "the repository remote carries user information, which may hold a credential".into(),
+            ));
+        }
+        if url.contains(['?', '#']) {
+            return Err(BundleError::Malformed("the repository remote has a query or fragment".into()));
+        }
+    }
+    Ok(())
+}
+
+/// Git's branch-name rules for the cases that matter here, including a leading
+/// dash, so the name can never be read as an option.
+fn is_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "@"
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && !name.chars().any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
+}
+
+/// A SHA-1 or SHA-256 object identifier, by shape only.
+fn is_commit_id(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The bytes of a bundle file for Preview: a regular file, read to at most the
+/// bound plus one byte. The file is opened without blocking, so a named pipe or
+/// device is refused by its type rather than waited on, and a file that grows
+/// is cut off at the bound.
+pub fn read_bundle_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Without this, opening a named pipe waits for a writer.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let regular = file
+        .metadata()
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?
+        .is_file();
+    if !regular {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    read_bounded(file)
+}
+
+/// Read `source` to at most [`MAX_BUNDLE_BYTES`] plus one byte. One byte past the
+/// bound is enough to refuse, so nothing beyond it is ever held in memory.
+pub fn read_bounded(source: impl std::io::Read) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    source
+        .take(MAX_BUNDLE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("could not read the export: {e}"))?;
+    if bytes.len() as u64 > MAX_BUNDLE_BYTES {
+        return Err(BundleError::TooLarge.to_string());
+    }
+    Ok(bytes)
 }
 
 fn has_duplicate(values: &[Uuid]) -> bool {

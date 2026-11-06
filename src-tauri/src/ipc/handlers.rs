@@ -178,15 +178,9 @@ async fn handle_preview_import(ctx: &IpcContext, path: String) -> IpcResponse {
     if !source.is_absolute() {
         return IpcResponse::error("the export path must be absolute".to_string());
     }
-    let too_large = std::fs::metadata(&source)
-        .map(|m| m.len() > crate::portability::bundle::MAX_BUNDLE_BYTES)
-        .unwrap_or(false);
-    if too_large {
-        return IpcResponse::error(crate::portability::bundle::BundleError::TooLarge.to_string());
-    }
-    let bytes = match std::fs::read(&source) {
+    let bytes = match crate::portability::bundle::read_bundle_file(&source) {
         Ok(bytes) => bytes,
-        Err(e) => return IpcResponse::error(format!("could not read {path}: {e}")),
+        Err(e) => return IpcResponse::error(e),
     };
     let projects = ctx.projects.read().await;
     let repositories = ctx.repositories.read().await;

@@ -1004,3 +1004,110 @@ async fn a_bundle_in_place_but_unconfirmed_is_reported_as_written_not_failed() {
         "the complete bundle is readable"
     );
 }
+
+/// B1: an export must never write a bundle that its own preview refuses.
+#[tokio::test]
+async fn an_export_refuses_a_dependency_missing_from_the_export() {
+    let (tmp, ctx) = test_ctx().await;
+    let mut tasks = fixture_tasks();
+    tasks[1].dependencies = vec![Uuid::from_u128(0xdead)];
+    seed(&ctx, None, &tasks).await;
+    let path = tmp.path().join("dangling.json");
+
+    let answer = export_to(&ctx, &path).await;
+    assert!(!answer.ok, "a dangling dependency must be refused: {answer:?}");
+    assert!(!path.exists(), "nothing is written for a refused export");
+}
+
+/// B2, exporter side: the export applies the same shape rules as decode.
+#[tokio::test]
+async fn an_export_refuses_a_remote_that_decode_would_refuse() {
+    let (tmp, ctx) = test_ctx().await;
+    let mut repo = repository(Path::new("/tmp/unused-checkout"));
+    repo.remote_url = Some("https://github.com/acme/ap p.git".into());
+    seed(&ctx, Some(&repo), &fixture_tasks()).await;
+    let path = tmp.path().join("spaced.json");
+
+    let answer = export_to(&ctx, &path).await;
+    assert!(!answer.ok, "a remote with a space must be refused: {answer:?}");
+    assert!(!path.exists());
+}
+
+/// B2, decode side: identity and Git evidence are checked by shape, and an
+/// absent but well-formed commit is still accepted.
+#[test]
+fn repository_identity_and_git_fields_are_checked_on_decode() {
+    let credentialed = seal(&payload_json(|v| {
+        v["repository"]["remote_url"] =
+            Value::from("https://user:ghp_SECRETTOKEN@github.com/acme/app.git");
+    }));
+    assert!(
+        matches!(bundle::decode(&credentialed), Err(BundleError::Unsafe(_))),
+        "credentials in a remote are refused"
+    );
+
+    let option_shaped = seal(&payload_json(|v| {
+        v["tasks"][1]["base_commit"] = Value::from("--upload-pack=touch /tmp/x");
+    }));
+    assert!(
+        matches!(bundle::decode(&option_shaped), Err(BundleError::Malformed(m)) if m.contains("base_commit")),
+        "a base commit must be a commit identifier"
+    );
+
+    let option_branch = seal(&payload_json(|v| {
+        v["project"]["base"] = serde_json::json!({"kind": "local_branch", "branch": "-delete"});
+    }));
+    assert!(
+        matches!(bundle::decode(&option_branch), Err(BundleError::Malformed(m)) if m.contains("branch")),
+        "a project base must be a branch name"
+    );
+
+    let absent_commit = seal(&payload_json(|v| {
+        v["tasks"][1]["base_commit"] = Value::from("3".repeat(40));
+    }));
+    assert!(
+        bundle::decode(&absent_commit).is_ok(),
+        "historical commits are not required to exist in this repository"
+    );
+}
+
+/// B3: Preview must answer for a named pipe rather than wait for a writer.
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_is_refused_without_blocking_the_preview() {
+    let tmp = TempDir::new().unwrap();
+    let pipe = tmp.path().join("pipe.json");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .unwrap()
+        .success());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let answer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (_dir, ctx) = test_ctx().await;
+                preview_of(&ctx, &pipe).await
+            });
+        let _ = sender.send(answer);
+    });
+
+    let answer = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the preview must answer for a named pipe, not wait for a writer");
+    assert!(!answer.ok, "a named pipe is not a bundle: {answer:?}");
+}
+
+/// B3: an endless or growing source is refused after one byte past the bound,
+/// so the read never holds more than that.
+#[test]
+fn a_bounded_read_stops_at_the_limit_whatever_the_source() {
+    assert_eq!(
+        bundle::read_bounded(std::io::repeat(b'x')).unwrap_err(),
+        BundleError::TooLarge.to_string()
+    );
+    assert_eq!(bundle::read_bounded(&b"{}"[..]).unwrap(), b"{}".to_vec());
+}

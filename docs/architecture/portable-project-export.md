@@ -121,6 +121,16 @@ envelope, checksum, payload parse, manifest, then structural rules:
   refused.
 - Review entries are in order and do not name an arrival beyond the record's
   count.
+- The repository remote is one plain token. A remote with user information is
+  refused as unsafe, since a credential would sit there. The project base is a
+  branch name (a leading dash is refused, so it can never read as an option).
+- Historical Git evidence (base commit, approved tip, pull request merge commit)
+  is a 40- or 64-character hexadecimal identifier. The shape is checked, and
+  nothing requires the commit to exist in the importing repository.
+
+Export runs the same structural rules before it writes, so an export is refused
+exactly when its own Preview would refuse it (for example, a Task depending on a
+Task that is not in the Project).
 
 A bundle that fails any rule is refused. A valid bundle is reported with:
 
@@ -133,7 +143,9 @@ A bundle that fails any rule is refused. A valid bundle is reported with:
 - `excluded`: the omitted list;
 - `importable`: true only when no conflict was found.
 
-Preview reads only the file and the instance's in-memory maps. It never calls
+Preview reads only the file and the instance's in-memory maps. The file must be
+a regular file: it is opened without blocking, so a named pipe is refused rather
+than waited on, and it is read to at most 64 MiB plus one byte. It never calls
 `Storage::load_config`, which can copy or rename a damaged `config.toml`
 (verified by test), and it never loads a board. A test compares the config and
 data trees byte for byte around a preview.
