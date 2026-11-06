@@ -726,6 +726,38 @@ async fn a_later_save_after_a_failed_revert_keeps_the_held_back_entry() {
     );
 }
 
+/// The revert is published but its directory sync fails: the configuration on
+/// disk no longer has the Project, yet nothing confirms it. The Project is out
+/// of memory and held back, and the record stays for the next start.
+#[tokio::test]
+async fn a_published_but_unconfirmed_revert_is_reported_and_held_back() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+
+    // Replace writes: the record, the Project commit, then the board (fails).
+    // The first directory sync fails. The message below names the revert's
+    // published-but-unconfirmed arm, which is the arm this test covers.
+    let faults = fault::fail_in_order(&[
+        (Stage::Replace, ErrorKind::Other, 2),
+        (Stage::SyncDirectory, ErrorKind::Other, 0),
+    ]);
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    drop(faults);
+    assert!(!response.ok);
+    let message = response.error.unwrap();
+    assert!(message.contains("revert is in place"), "{message}");
+    assert!(!target.projects.read().await.contains_key(&project_id()));
+    assert!(target.tasks.read().await.is_empty());
+    assert_eq!(
+        target.storage.pending_project_imports().unwrap(),
+        vec![project_id()],
+        "the record is kept for the next start"
+    );
+}
+
 /// A Task or Conversation cleanup still owed for a Project id refuses an import
 /// of that id. Otherwise the cleanup could delete the Tasks or Conversations the
 /// import created. The refusal writes nothing, and the cleanup record stays until
@@ -836,6 +868,82 @@ async fn a_completed_import_loads_on_every_start_of_a_filesystem_that_cannot_syn
         report.project_import_recovery_failures
     );
     assert!(report.project_import_recovery_failures.is_empty());
+}
+
+/// An interrupted import whose Project entry is in `config.toml` but whose board
+/// is missing, on a filesystem that cannot synchronize a directory. Startup
+/// removes the entry, but that removal is not confirmed, so the record must stay:
+/// it is what repeats the removal if a power loss brings the entry back.
+#[tokio::test]
+async fn an_unconfirmed_removal_of_an_interrupted_import_keeps_its_record() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    assert!(apply_with(&target, &path, &checksum_of(&bytes)).await.ok);
+    let paths = std::sync::Arc::new(target.storage.paths().clone());
+    for board in target.storage.tasks_board_files(project_id()) {
+        fs::remove_file(board).unwrap();
+    }
+    fs::write(
+        paths.pending_project_import_file(project_id()),
+        project_id().to_string().as_bytes(),
+    )
+    .unwrap();
+    drop(target);
+
+    let unsupported = fault::fail_every(Stage::SyncDirectory, ErrorKind::Unsupported);
+    for start in 1..=2 {
+        let (_state, _report) = crate::app_core::build_state_with_paths(paths.clone())
+            .await
+            .unwrap();
+        assert!(
+            paths.pending_project_import_file(project_id()).exists(),
+            "start {start}: the record must stay while the removal is unconfirmed"
+        );
+    }
+    drop(unsupported);
+
+    // A filesystem that confirms the configuration completes the removal.
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(!state.project.projects.read().await.contains_key(&project_id()));
+    assert!(
+        !paths.pending_project_import_file(project_id()).exists(),
+        "{:?}",
+        report.project_import_recovery_failures
+    );
+}
+
+/// Apply holds Tasks while it waits for Projects, so it must take Tasks first. The
+/// test holds the Projects write lock, which parks Apply where it needs Projects;
+/// a correct Apply is then parked holding Tasks.
+#[tokio::test]
+async fn apply_takes_tasks_before_projects() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (_dst, target) = test_ctx().await;
+    let sum = checksum_of(&bytes);
+
+    let projects = target.projects.write().await;
+    let import = apply::apply(live(&target), &bytes, &sum);
+    let probe = async {
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        let tasks_held = target.tasks.try_write().is_err();
+        drop(projects);
+        tasks_held
+    };
+    let (result, tasks_held) = tokio::join!(import, probe);
+    assert!(
+        tasks_held,
+        "Apply waits for Projects without holding Tasks, which closes a deadlock cycle"
+    );
+    result.expect("the import completes once Projects is free");
 }
 
 /// Make `config.toml` fail strict parsing, so startup reads it through the

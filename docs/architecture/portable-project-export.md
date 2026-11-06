@@ -110,6 +110,12 @@ any Project is used, and only with a configuration read without salvage:
   record stays and the Project loads on every start until a start can confirm
   the configuration. The record is what holds back a Project whose entry or
   board a power loss could drop, so it is not removed on an unconfirmed start.
+- An interrupted import whose Project entry is removed, or whose record has no
+  Project, is settled the same way: the record stays while the configuration
+  is unconfirmed, because a removal written there may return after a power
+  loss, and the record is what repeats it. An import whose id has a record
+  stays refused until a start can confirm the configuration, which needs a
+  filesystem that synchronizes directories.
 - A Project without its board: the import was interrupted. Only this Project is
   removed from `config.toml`, so the bundle can be imported again. No other
   record or board is touched.
@@ -227,8 +233,9 @@ allowed: a decision wait is not an active run.
 ## Lock order
 
 Apply, Preview, Export, Task creation and Project deletion take the in-memory
-locks in one order: the Project lifecycle gate, then Tasks, then Projects, then
-Repositories. Project creation and Repository commands take one of these locks
+locks in one order: the Project lifecycle gate, then Conversation and per-Task
+lifecycle leases where the operation needs them, then Tasks, then Projects, then
+Repositories. Leases are timed, so a wait for one ends in a refusal, not a hang. Project creation and Repository commands take one of these locks
 at a time. A handler that took Projects before Tasks could hold Projects
 while it waited for Tasks, and an Apply holding Tasks while it waited for
 Projects would then deadlock with it. `ipc::handlers::import_lock_order` parks

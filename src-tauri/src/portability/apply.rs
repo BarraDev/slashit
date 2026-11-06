@@ -149,7 +149,7 @@ pub async fn apply(
         Ok(false) => {}
         Ok(true) => {
             return Err(ApplyError::Failed(format!(
-                "Project {project_id} still has state from an earlier import or a pending cleanup on this instance: an import record, Task board, configuration entry, or cleanup record remains. Settle it before importing this bundle again."
+                "Project {project_id} still has state from an earlier import or a pending cleanup on this instance: an import record, Task board, configuration entry, or cleanup record remains. The import record clears once a start can confirm the configuration durable, and a cleanup clears when it completes; import again after both."
             )))
         }
         Err(e) => {
@@ -422,12 +422,12 @@ fn settle_record(
             }
         }
     }
-    // A completed import is loaded now. Its record goes only once the configuration
-    // is confirmed durable, so a later power loss cannot leave the board without
-    // the entry it belongs to while the record is gone.
-    if !confirmed && projects.contains_key(&project_id) {
+    // The record goes only once the configuration is confirmed durable. Until then
+    // it stays whatever this start settled: a removal written here may return
+    // after a power loss, and the record is what repeats it.
+    if !confirmed {
         recovery.failures.push(format!(
-            "{project_id}: the import is loaded from the configuration, and its import record is kept until the configuration can be confirmed durable on this filesystem"
+            "{project_id}: settled from the configuration, and its import record is kept until the configuration can be confirmed durable on this filesystem"
         ));
         return;
     }

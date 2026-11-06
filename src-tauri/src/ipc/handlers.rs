@@ -2799,15 +2799,13 @@ mod task_configuration_writes {
 }
 
 /// The lock order of the Project portability handlers: Tasks, then Projects,
-/// then Repositories, the order Apply, Project creation and Task creation use.
+/// then Repositories, the order Apply and Task creation use.
 ///
 /// A handler that takes Projects before Tasks can hold Projects while it waits
 /// for Tasks. An Apply that holds Tasks and waits for Projects then closes the
-/// cycle. The test is deterministic: the runtime is single-threaded and the
-/// test holds the Repositories write lock, which parks each handler at its
-/// last acquisition in either order. Once the handler has reached Projects, a
-/// handler that honors the order must already hold Tasks, so a Tasks writer
-/// cannot get in.
+/// cycle. The test is deterministic: the runtime is single-threaded and the test
+/// holds the Projects write lock, which parks each handler where it first needs
+/// Projects. A handler that honors the order is parked holding Tasks.
 #[cfg(test)]
 mod import_lock_order {
     use super::*;
@@ -2849,34 +2847,29 @@ mod import_lock_order {
         }
     }
 
-    /// Runs `handler` with the Repositories write lock held by the test. The
-    /// probe waits until the handler holds Projects, then asserts that it also
-    /// holds Tasks. The handler must not finish while the lock is held, and it
-    /// must finish once the lock is released.
+    /// Runs `handler` with the Projects write lock held by the test, so the
+    /// handler parks at the first point where it needs Projects. Three yields
+    /// let the single-threaded runtime poll the handler until it is parked; a
+    /// parked handler stays parked, so the probe then reads a fixed state. The
+    /// handler must already hold Tasks there, so a Tasks writer cannot get in.
     async fn assert_tasks_held_before_projects<F>(ctx: &IpcContext, handler: F)
     where
         F: std::future::Future<Output = IpcResponse>,
     {
-        let repositories = ctx.repositories.write().await;
+        let projects = ctx.projects.write().await;
         let probe = async {
-            let mut reached_projects = false;
-            for _ in 0..1000 {
-                if ctx.projects.try_write().is_err() {
-                    reached_projects = true;
-                    break;
-                }
+            for _ in 0..3 {
                 tokio::task::yield_now().await;
             }
-            assert!(reached_projects, "the handler never reached the Projects lock");
             let tasks_held = ctx.tasks.try_write().is_err();
-            drop(repositories);
+            drop(projects);
             tasks_held
         };
         let (response, tasks_held) = tokio::join!(handler, probe);
         assert!(
             tasks_held,
-            "the handler holds Projects while it waits for Repositories, but not Tasks: \
-             an Apply holding Tasks and waiting for Projects deadlocks against it"
+            "the handler waits for Projects without holding Tasks: an Apply holding Tasks and \
+             waiting for Projects deadlocks against it"
         );
         assert!(response.ok, "the handler must finish once the lock is free: {response:?}");
     }
