@@ -132,10 +132,11 @@ async fn handle_export_project(ctx: &IpcContext, project_id: String, path: Strin
         Ok(leases) => leases,
         Err(e) => return IpcResponse::error(e),
     };
+    // Lock order: Tasks, Projects, Repositories (see `portability::apply`).
     let built = {
+        let tasks = ctx.tasks.read().await;
         let projects = ctx.projects.read().await;
         let repositories = ctx.repositories.read().await;
-        let tasks = ctx.tasks.read().await;
         match projects.get(&project_uuid) {
             None => Err(format!("Project {project_id} not found")),
             Some(project) => {
@@ -185,9 +186,10 @@ async fn handle_preview_import(ctx: &IpcContext, path: String) -> IpcResponse {
         Ok(bytes) => bytes,
         Err(e) => return IpcResponse::error(e),
     };
+    // Lock order: Tasks, Projects, Repositories, as in Apply and Project creation.
+    let tasks = ctx.tasks.read().await;
     let projects = ctx.projects.read().await;
     let repositories = ctx.repositories.read().await;
-    let tasks = ctx.tasks.read().await;
     let target = crate::portability::preview::Target {
         projects: &projects,
         repositories: &repositories,
@@ -2793,5 +2795,120 @@ mod task_configuration_writes {
                 "{answer:?}"
             );
         }
+    }
+}
+
+/// The lock order of the Project portability handlers: Tasks, then Projects,
+/// then Repositories, the order Apply, Project creation and Task creation use.
+///
+/// A handler that takes Projects before Tasks can hold Projects while it waits
+/// for Tasks. An Apply that holds Tasks and waits for Projects then closes the
+/// cycle. The test is deterministic: the runtime is single-threaded and the
+/// test holds the Repositories write lock, which parks each handler at its
+/// last acquisition in either order. Once the handler has reached Projects, a
+/// handler that honors the order must already hold Tasks, so a Tasks writer
+/// cannot get in.
+#[cfg(test)]
+mod import_lock_order {
+    use super::*;
+    use crate::config::paths::{AppPaths, StateLocation};
+    use crate::domain::{AgentConfig, AgentType, Project, ProjectScope};
+    use crate::test_helpers::ipc_test_context;
+    use std::sync::Arc;
+
+    fn test_ctx() -> (tempfile::TempDir, IpcContext) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        (tmp, ipc_test_context(paths))
+    }
+
+    fn project_for(id: Uuid) -> Project {
+        Project {
+            id,
+            name: "Lock Order Project".to_string(),
+            repository_id: None,
+            scope: ProjectScope::Standalone,
+            state_location: StateLocation::External,
+            base: None,
+            agent_type: AgentType::ClaudeCode,
+            agent_config: AgentConfig {
+                agent_type: AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Runs `handler` with the Repositories write lock held by the test. The
+    /// probe waits until the handler holds Projects, then asserts that it also
+    /// holds Tasks. The handler must not finish while the lock is held, and it
+    /// must finish once the lock is released.
+    async fn assert_tasks_held_before_projects<F>(ctx: &IpcContext, handler: F)
+    where
+        F: std::future::Future<Output = IpcResponse>,
+    {
+        let repositories = ctx.repositories.write().await;
+        let probe = async {
+            let mut reached_projects = false;
+            for _ in 0..1000 {
+                if ctx.projects.try_write().is_err() {
+                    reached_projects = true;
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(reached_projects, "the handler never reached the Projects lock");
+            let tasks_held = ctx.tasks.try_write().is_err();
+            drop(repositories);
+            tasks_held
+        };
+        let (response, tasks_held) = tokio::join!(handler, probe);
+        assert!(
+            tasks_held,
+            "the handler holds Projects while it waits for Repositories, but not Tasks: \
+             an Apply holding Tasks and waiting for Projects deadlocks against it"
+        );
+        assert!(response.ok, "the handler must finish once the lock is free: {response:?}");
+    }
+
+    #[tokio::test]
+    async fn export_takes_tasks_before_projects() {
+        let (tmp, ctx) = test_ctx();
+        let project_id = Uuid::new_v4();
+        ctx.projects.write().await.insert(project_id, project_for(project_id));
+        let destination = tmp.path().join("export.slashit-project");
+        let handler = handle_export_project(
+            &ctx,
+            project_id.to_string(),
+            destination.to_string_lossy().into_owned(),
+        );
+        assert_tasks_held_before_projects(&ctx, handler).await;
+    }
+
+    #[tokio::test]
+    async fn preview_takes_tasks_before_projects() {
+        let (tmp, ctx) = test_ctx();
+        let project_id = Uuid::new_v4();
+        ctx.projects.write().await.insert(project_id, project_for(project_id));
+        let destination = tmp.path().join("export.slashit-project");
+        let exported = handle_export_project(
+            &ctx,
+            project_id.to_string(),
+            destination.to_string_lossy().into_owned(),
+        )
+        .await;
+        assert!(exported.ok, "{exported:?}");
+        let handler = handle_preview_import(&ctx, destination.to_string_lossy().into_owned());
+        assert_tasks_held_before_projects(&ctx, handler).await;
     }
 }
