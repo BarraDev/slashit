@@ -356,8 +356,23 @@ pub fn stage(path: &Path, bytes: &[u8], permissions: Permissions) -> Result<Stag
 
 impl StagedFile {
     /// Atomically replace the destination, then synchronize its directory.
-    pub fn publish(mut self) -> Result<Committed, WriteError> {
-        step(Stage::Replace, &self.dest, || platform::replace(&self.tmp, &self.dest)).map_err(not_published(Stage::Replace))?;
+    pub fn publish(self) -> Result<Committed, WriteError> {
+        self.publish_with(platform::replace)
+    }
+
+    /// Publish only if the destination does not exist. Unlike [`StagedFile::publish`],
+    /// a file created after staging is never replaced: the publication fails with
+    /// `ErrorKind::AlreadyExists` and changes nothing.
+    ///
+    /// Shortcut: relies on hard links, so a filesystem without them fails the
+    /// write closed; upgrade to `renameat2(RENAME_NOREPLACE)` if such
+    /// filesystems must be supported.
+    pub fn publish_new(self) -> Result<Committed, WriteError> {
+        self.publish_with(platform::publish_new)
+    }
+
+    fn publish_with(mut self, link: fn(&Path, &Path) -> io::Result<()>) -> Result<Committed, WriteError> {
+        step(Stage::Replace, &self.dest, || link(&self.tmp, &self.dest)).map_err(not_published(Stage::Replace))?;
         self.published = true;
         let parent = self.dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         match step(Stage::SyncDirectory, &self.dest, || platform::sync_directory(parent)).or_else(tolerate_unsupported) {

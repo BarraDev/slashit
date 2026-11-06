@@ -37,6 +37,7 @@ pub mod instance;
 // a Windows named pipe alongside the Unix socket, so the module compiles and
 // works on every supported platform.
 pub mod ipc;
+pub mod portability;
 
 /// Set by the updater when the application should come back up after the
 /// ownership-preserving shutdown instead of staying down.

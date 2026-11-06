@@ -95,6 +95,105 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
         IpcRequest::Quit => handle_quit(),
         IpcRequest::Features => Dispatch::reply(handle_features(ctx).await),
         IpcRequest::Ping => Dispatch::reply(handle_ping(ctx, peer)),
+        IpcRequest::ExportProject { project_id, path } => {
+            Dispatch::reply(handle_export_project(ctx, project_id, path).await)
+        }
+        IpcRequest::PreviewImport { path } => {
+            Dispatch::reply(handle_preview_import(ctx, path).await)
+        }
+    }
+}
+
+/// Write one Project's portable export to a new file.
+///
+/// The Project's lifecycle gate and every Task lease are held only while the
+/// records are read, so no Task transition runs mid-snapshot. They are released
+/// before the file is written.
+async fn handle_export_project(ctx: &IpcContext, project_id: String, path: String) -> IpcResponse {
+    let project_uuid = match Uuid::parse_str(&project_id) {
+        Ok(id) => id,
+        Err(_) => return IpcResponse::error(format!("Invalid project_id: {project_id}")),
+    };
+    let destination = std::path::PathBuf::from(&path);
+    if !destination.is_absolute() {
+        return IpcResponse::error("the export path must be absolute".to_string());
+    }
+    let gate = ctx.project_gate.read(project_uuid).await;
+    let leases = match crate::lifecycle::hold_project_task_leases(
+        &ctx.task_lifecycle_locks,
+        &ctx.tasks,
+        project_uuid,
+    )
+    .await
+    {
+        Ok(leases) => leases,
+        Err(e) => return IpcResponse::error(e),
+    };
+    let built = {
+        let projects = ctx.projects.read().await;
+        let repositories = ctx.repositories.read().await;
+        let tasks = ctx.tasks.read().await;
+        match projects.get(&project_uuid) {
+            None => Err(format!("Project {project_id} not found")),
+            Some(project) => {
+                let repository = project.repository_id.and_then(|id| repositories.get(&id));
+                let mine: Vec<&crate::domain::Task> = tasks
+                    .values()
+                    .filter(|t| t.project_id == project_uuid)
+                    .collect();
+                crate::portability::export::build_payload(project, repository, &mine)
+            }
+        }
+    };
+    drop(leases);
+    drop(gate);
+    let payload = match built {
+        Ok(payload) => payload,
+        Err(e) => return IpcResponse::error(e),
+    };
+    let bytes = match crate::portability::bundle::encode(
+        &payload,
+        chrono::Utc::now(),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => return IpcResponse::error(e),
+    };
+    match crate::portability::export::write_bundle(&destination, &bytes) {
+        Ok(durable) => IpcResponse::success(serde_json::json!({
+            "path": path,
+            "project_id": project_id,
+            "tasks": payload.tasks.len(),
+            "bytes": bytes.len(),
+            "durable": durable,
+        })),
+        Err(e) => IpcResponse::error(e),
+    }
+}
+
+/// Validate an export file and describe what importing it would do. Reads the
+/// file and the instance's memory; nothing is written.
+async fn handle_preview_import(ctx: &IpcContext, path: String) -> IpcResponse {
+    let source = std::path::PathBuf::from(&path);
+    if !source.is_absolute() {
+        return IpcResponse::error("the export path must be absolute".to_string());
+    }
+    let bytes = match crate::portability::bundle::read_bundle_file(&source) {
+        Ok(bytes) => bytes,
+        Err(e) => return IpcResponse::error(e),
+    };
+    let projects = ctx.projects.read().await;
+    let repositories = ctx.repositories.read().await;
+    let tasks = ctx.tasks.read().await;
+    let target = crate::portability::preview::Target {
+        projects: &projects,
+        repositories: &repositories,
+        tasks: &tasks,
+        unreadable_boards: ctx.storage.task_board_diagnostics().len(),
+    };
+    match crate::portability::preview::preview(&bytes, &target) {
+        Ok(report) => IpcResponse::success(serde_json::to_value(report).unwrap_or_default()),
+        Err(e) => IpcResponse::error(e.to_string()),
     }
 }
 
