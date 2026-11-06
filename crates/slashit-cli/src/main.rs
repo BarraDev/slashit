@@ -171,16 +171,23 @@ enum Commands {
         /// New file to write; relative paths are resolved from this shell
         path: PathBuf,
     },
-    /// Validate an export file and describe what importing it would do
+    /// Validate an export file, and describe or apply its import
     ///
-    /// Read-only: nothing in the running instance changes. Applying an import
-    /// is not available yet, so `--preview` is required.
+    /// `--preview` changes nothing. `--apply` creates the Project and its Tasks
+    /// as inert records, and needs the `--checksum` that a preview of the same
+    /// file reported. The Project is created without a Repository.
     Import {
         /// Export file to read
         path: PathBuf,
-        /// Describe the import without applying it (required)
-        #[arg(long)]
+        /// Describe the import without applying it
+        #[arg(long, conflicts_with = "apply")]
         preview: bool,
+        /// Create the Project in the running instance
+        #[arg(long, conflicts_with = "preview")]
+        apply: bool,
+        /// Payload checksum reported by `--preview` for this file
+        #[arg(long, value_name = "SHA256", requires = "apply")]
+        checksum: Option<String>,
     },
     /// Inspect the headless daemon
     Daemon {
@@ -199,9 +206,15 @@ enum DaemonCommands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let options = client::options(cli.endpoint.as_deref(), cli.wait, cli.timeout)?;
-    if let Commands::Import { preview: false, .. } = &cli.command {
-        eprintln!("Error: applying an import is not available yet; pass --preview to describe it");
-        std::process::exit(2);
+    if let Commands::Import { preview, apply, checksum, .. } = &cli.command {
+        if preview == apply {
+            eprintln!("Error: pass exactly one of --preview or --apply");
+            std::process::exit(2);
+        }
+        if *apply && checksum.is_none() {
+            eprintln!("Error: --apply needs --checksum, the payload checksum that --preview reports for this file");
+            std::process::exit(2);
+        }
     }
 
     let request = match &cli.command {
@@ -268,6 +281,10 @@ async fn main() -> Result<()> {
         Commands::Export { project, path } => IpcRequest::ExportProject {
             project_id: project.clone(),
             path: absolute_path(path)?,
+        },
+        Commands::Import { path, apply: true, checksum, .. } => IpcRequest::ApplyImport {
+            path: absolute_path(path)?,
+            checksum: checksum.clone().unwrap_or_default(),
         },
         Commands::Import { path, .. } => IpcRequest::PreviewImport {
             path: absolute_path(path)?,

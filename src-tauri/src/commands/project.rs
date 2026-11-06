@@ -66,7 +66,7 @@ impl Default for ProjectState {
     }
 }
 
-fn get_default_agent_config(agent_type: &AgentType) -> AgentConfig {
+pub(crate) fn get_default_agent_config(agent_type: &AgentType) -> AgentConfig {
     let (command, args) = match agent_type {
         AgentType::ClaudeCode => ("claude", vec!["--stdio"]),
         AgentType::Cursor => ("cursor-agent", vec!["--stdio"]),

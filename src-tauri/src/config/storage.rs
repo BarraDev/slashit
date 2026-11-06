@@ -1697,6 +1697,31 @@ impl Storage {
         Ok(())
     }
 
+    /// Stage the board of a Project that has none yet, without making it visible.
+    ///
+    /// The caller publishes the file with `publish_new`, which refuses a board
+    /// that appeared after this check, so an import never replaces a board.
+    /// Nothing is visible until that publication.
+    pub fn stage_new_project_board(
+        &self,
+        project_id: Uuid,
+        tasks: &[Task],
+    ) -> Result<slashit_durable_fs::StagedFile> {
+        let path = self.tasks_path(project_id);
+        let legacy = self.legacy_tasks_path(project_id);
+        self.ensure_board_replaceable(project_id, &path, &legacy)?;
+        if self.tasks_board_files(project_id).iter().any(|file| file.exists()) {
+            anyhow::bail!("a Task board already exists for this Project");
+        }
+        let tasks_file = ProjectTasksFile {
+            version: TASKS_FILE_VERSION,
+            tasks: tasks.to_vec(),
+        };
+        let contents = toml::to_string_pretty(&tasks_file).context("Failed to serialize tasks")?;
+        slashit_durable_fs::stage(&path, contents.as_bytes(), slashit_durable_fs::Permissions::Preserve)
+            .map_err(|e| write_failure(e, "stage tasks file"))
+    }
+
     pub fn delete_task_files(&self, board_files: &[PathBuf]) -> Result<()> {
         for path in board_files {
             if path.exists() {

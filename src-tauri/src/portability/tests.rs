@@ -35,13 +35,13 @@ use super::{export, preview};
 
 const GOLDEN: &[u8] = include_bytes!("testdata/export-v1.golden.json");
 
-fn at() -> DateTime<Utc> {
+pub(super) fn at() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z")
         .unwrap()
         .with_timezone(&Utc)
 }
 
-fn peer() -> PeerContext {
+pub(super) fn peer() -> PeerContext {
     PeerContext {
         endpoint: Endpoint::Unix {
             path: PathBuf::from("/nonexistent-for-tests"),
@@ -50,7 +50,7 @@ fn peer() -> PeerContext {
     }
 }
 
-async fn test_ctx() -> (TempDir, IpcContext) {
+pub(super) async fn test_ctx() -> (TempDir, IpcContext) {
     let tmp = TempDir::new().expect("tempdir");
     let paths = Arc::new(AppPaths::with_roots(
         tmp.path().join("config"),
@@ -64,7 +64,7 @@ async fn test_ctx() -> (TempDir, IpcContext) {
     (tmp, ctx)
 }
 
-fn project_id() -> Uuid {
+pub(super) fn project_id() -> Uuid {
     Uuid::from_u128(1)
 }
 
@@ -72,7 +72,7 @@ fn repository_id() -> Uuid {
     Uuid::from_u128(2)
 }
 
-fn project(repository: Option<Uuid>) -> Project {
+pub(super) fn project(repository: Option<Uuid>) -> Project {
     Project {
         id: project_id(),
         name: "Fixture".into(),
@@ -94,7 +94,7 @@ fn project(repository: Option<Uuid>) -> Project {
     }
 }
 
-fn repository(path: &Path) -> Repository {
+pub(super) fn repository(path: &Path) -> Repository {
     Repository {
         id: repository_id(),
         local_path: path.to_string_lossy().into_owned(),
@@ -114,7 +114,7 @@ fn entry(seq: u32, kind: ActivityKind) -> ActivityEntry {
 
 /// Two Tasks: `Alpha` in Backlog with a timeline, and `Beta` in Human Review,
 /// depending on Alpha, with a current approval and run output in its timeline.
-fn fixture_tasks() -> Vec<Task> {
+pub(super) fn fixture_tasks() -> Vec<Task> {
     let mut alpha = create_test_task_full("Alpha", project_id(), TaskStatus::Backlog, 0);
     alpha.id = Uuid::from_u128(10);
     alpha.sequence_number = 1;
@@ -221,7 +221,7 @@ fn fixture_payload() -> Payload {
     .expect("the fixture is exportable")
 }
 
-async fn seed(ctx: &IpcContext, repo: Option<&Repository>, tasks: &[Task]) {
+pub(super) async fn seed(ctx: &IpcContext, repo: Option<&Repository>, tasks: &[Task]) {
     ctx.projects
         .write()
         .await
@@ -235,7 +235,7 @@ async fn seed(ctx: &IpcContext, repo: Option<&Repository>, tasks: &[Task]) {
     }
 }
 
-async fn export_to(ctx: &IpcContext, path: &Path) -> IpcResponse {
+pub(super) async fn export_to(ctx: &IpcContext, path: &Path) -> IpcResponse {
     dispatch(
         IpcRequest::ExportProject {
             project_id: project_id().to_string(),

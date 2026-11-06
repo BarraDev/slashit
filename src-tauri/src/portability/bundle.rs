@@ -229,6 +229,9 @@ impl Payload {
 pub struct Decoded {
     pub build: String,
     pub created_at: DateTime<Utc>,
+    /// The verified checksum of the payload bytes. An apply names it back, so
+    /// it applies exactly the payload that was previewed.
+    pub checksum: String,
     pub payload: Payload,
 }
 
@@ -300,6 +303,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, BundleError> {
     }
     validate(&payload)?;
     Ok(Decoded {
+        checksum: envelope.checksum,
         build: envelope.build,
         created_at: envelope.created_at,
         payload,

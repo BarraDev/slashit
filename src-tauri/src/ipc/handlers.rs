@@ -101,6 +101,9 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
         IpcRequest::PreviewImport { path } => {
             Dispatch::reply(handle_preview_import(ctx, path).await)
         }
+        IpcRequest::ApplyImport { path, checksum } => {
+            Dispatch::reply(handle_apply_import(ctx, path, checksum).await)
+        }
     }
 }
 
@@ -192,6 +195,30 @@ async fn handle_preview_import(ctx: &IpcContext, path: String) -> IpcResponse {
         unreadable_boards: ctx.storage.task_board_diagnostics().len(),
     };
     match crate::portability::preview::preview(&bytes, &target) {
+        Ok(report) => IpcResponse::success(serde_json::to_value(report).unwrap_or_default()),
+        Err(e) => IpcResponse::error(e.to_string()),
+    }
+}
+
+/// Create the Project of an export file, when the confirmed checksum matches
+/// its payload. The apply validates again under the locks it commits with.
+async fn handle_apply_import(ctx: &IpcContext, path: String, checksum: String) -> IpcResponse {
+    let source = std::path::PathBuf::from(&path);
+    if !source.is_absolute() {
+        return IpcResponse::error("the export path must be absolute".to_string());
+    }
+    let bytes = match crate::portability::bundle::read_bundle_file(&source) {
+        Ok(bytes) => bytes,
+        Err(e) => return IpcResponse::error(e),
+    };
+    let live = crate::portability::apply::Live {
+        gate: &ctx.project_gate,
+        tasks: &ctx.tasks,
+        projects: &ctx.projects,
+        repositories: &ctx.repositories,
+        storage: &ctx.storage,
+    };
+    match crate::portability::apply::apply(live, &bytes, &checksum).await {
         Ok(report) => IpcResponse::success(serde_json::to_value(report).unwrap_or_default()),
         Err(e) => IpcResponse::error(e.to_string()),
     }

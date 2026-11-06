@@ -37,6 +37,8 @@ pub struct Report {
     pub project: ProjectSummary,
     pub repository: Option<RepositorySummary>,
     pub counts: Counts,
+    /// The payload checksum the apply must name back to import this exact file.
+    pub checksum: String,
     /// Identity collisions. Any entry here means the import would be refused.
     pub conflicts: Vec<Conflict>,
     /// Historical state the import must neutralize before anything can act on it.
@@ -182,6 +184,7 @@ pub fn preview(bytes: &[u8], target: &Target<'_>) -> Result<Report, BundleError>
         format_version: bundle::FORMAT_VERSION,
         build: decoded.build,
         created_at: decoded.created_at,
+        checksum: decoded.checksum,
         project: ProjectSummary {
             id: payload.project.id,
             name: payload.project.name.clone(),

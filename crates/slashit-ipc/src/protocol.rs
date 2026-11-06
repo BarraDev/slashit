@@ -106,6 +106,10 @@ pub enum IpcRequest {
     /// Validate an export file and describe what importing it would do. Reads
     /// the file and the instance's memory, and writes nothing.
     PreviewImport { path: String },
+    /// Create the Project described by an export file, as an inert Project.
+    /// `checksum` is the payload checksum a preview reported for this file; the
+    /// apply refuses any other payload. Writes the Project and its Tasks.
+    ApplyImport { path: String, checksum: String },
 }
 
 impl IpcRequest {
@@ -173,6 +177,7 @@ impl IpcRequest {
             Self::Ping => "ping",
             Self::ExportProject { .. } => "export_project",
             Self::PreviewImport { .. } => "preview_import",
+            Self::ApplyImport { .. } => "apply_import",
         }
     }
 }

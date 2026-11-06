@@ -1,23 +1,82 @@
 # Portable Project export and import preview (format v1)
 
-Status: export and read-only import preview are implemented behind the IPC
-protocol and the `slashit` CLI. Import apply is not implemented. Nothing in
-this version creates, changes or activates a Project or Task on import.
+Status: export, read-only import preview, and import apply are implemented
+behind the IPC protocol and the `slashit` CLI. Apply creates one Project and
+its Tasks as inert records. It creates no Repository and no runtime authority.
+The desktop interface for import is not implemented.
 
 Code: `src-tauri/src/portability/` (`bundle.rs` format, `export.rs` projection
-and write, `preview.rs` validation against the target).
+and write, `preview.rs` validation against the target, `apply.rs` the import
+commit).
 
 ## Invocation
 
 ```text
 slashit export <project-id> <new-file>
 slashit import --preview <file>
+slashit import --apply <file> --checksum <sha256>
 ```
 
-Both are one IPC request each (`ExportProject`, `PreviewImport`). The CLI
-turns a relative path into an absolute one first, because the instance writes
-relative to its own working directory. `slashit import` without `--preview` is
-refused.
+Each is one IPC request (`ExportProject`, `PreviewImport`, `ApplyImport`). The
+CLI turns a relative path into an absolute one first, because the instance
+writes relative to its own working directory. `--checksum` is the payload
+checksum that `--preview` reports for the same file. An apply refuses any other
+payload, so the user confirms exactly what was previewed.
+
+## Apply
+
+Apply validates the file again under the locks it commits with. It does not
+trust an earlier preview. The identity rules are the preview's, so an apply
+refuses whenever a preview would report a conflict.
+
+Created, and kept as the bundle states them:
+
+- The Project under its exported id. Its `repository_id` is empty, and its
+  agent configuration is the default for its agent type. The exported model is
+  kept. No command or credential is read from the bundle.
+- Each Task under its exported id, with its dependencies, review history,
+  timeline and Git identifiers as text. Runtime fields start at their defaults.
+
+Changed, and reported in `normalization`:
+
+- A current approval is withdrawn by closing its review arrival. The decision
+  stays in the history and nothing is current.
+- A Task in Human Review returns to Backlog, because a review wait needs the
+  checkout the bundle does not carry.
+
+Not created: a Repository, a checkout, a branch, a pull request, a worker run,
+an integration, or any Git object. Historical Git identifiers are not checked
+against the importing repository.
+
+### Commit order and failure results
+
+Projects and Repositories are stored in `config.toml`. Each Project's Tasks are
+stored in their own board file, and startup loads every board file present. A
+single atomic write cannot cover both, so the commit runs in this order:
+
+1. Stage the board beside its destination. Nothing is visible yet.
+2. Commit the Project to `config.toml`. This is the commit point.
+3. Publish the board with a no-clobber publication.
+4. Insert the Tasks into memory.
+
+Results:
+
+- A failure before step 2 leaves nothing: the staged file is removed.
+- A failure of step 3 before the board is visible reverts step 2. The apply
+  reports `reverted`, and the target is unchanged.
+- A failure of that revert leaves the Project recorded without its Tasks. The
+  apply reports it as incomplete. This is the one state this version cannot
+  undo. Delete that Project before importing again, and keep the bundle file.
+- A board that is published but not confirmed durable is reported as an
+  applied import with `durable: false`. The change is in place, so it is not
+  reported as a failure.
+- A repeated apply of the same bundle is refused by the identity rule, so an
+  import cannot be committed twice.
+- Two concurrent applies of one bundle serialize on the Project's lifecycle
+  gate. Exactly one commits.
+
+A crash between step 2 and step 3 is not covered by a test. Its result is the
+same incomplete state as the revert failure above, and recovery is the same.
 
 ## The file
 
@@ -165,8 +224,14 @@ longer unspaced fragment can survive.
 
 ## Limits and what is not done
 
-- No import apply, no status normalization, no arrival bump, no Git
-  reconciliation. Those are the next unit and need their own review.
+- No Repository is recreated, so an imported Project cannot run work until a
+  local checkout is linked to it. No Git reconciliation, restack, branch
+  creation, worker resume, approval replay or pull request publication.
+- No desktop interface. The CLI and IPC are the only import entry points.
+- A crash between the Project commit and the board publication is not covered
+  by a test (see Commit order above).
+- The Preview-to-Apply check is the checksum of the payload. It detects a file
+  that changed, and it does not authenticate the file.
 - Export refuses to replace any existing path, including one created after
   its check, but it is owner-only, not authenticated: another local process
   that runs as the same user can still read or change the file.
