@@ -99,6 +99,13 @@ pub enum IpcRequest {
     Features,
     /// Report what kind of instance is answering, and on which endpoint.
     Ping,
+    /// Write one Project's portable export to a new file. `path` must be
+    /// absolute. Refused while a Task of the Project is queued, running or in
+    /// automatic AI Review, or has an unsettled lifecycle record.
+    ExportProject { project_id: String, path: String },
+    /// Validate an export file and describe what importing it would do. Reads
+    /// the file and the instance's memory, and writes nothing.
+    PreviewImport { path: String },
 }
 
 impl IpcRequest {
@@ -119,6 +126,7 @@ impl IpcRequest {
                 | Self::ListTerminals
                 | Self::Features
                 | Self::Ping
+                | Self::PreviewImport { .. }
         )
     }
 
@@ -163,6 +171,8 @@ impl IpcRequest {
             Self::Quit => "quit",
             Self::Features => "features",
             Self::Ping => "ping",
+            Self::ExportProject { .. } => "export_project",
+            Self::PreviewImport { .. } => "preview_import",
         }
     }
 }

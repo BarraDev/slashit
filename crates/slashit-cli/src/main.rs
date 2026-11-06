@@ -8,6 +8,8 @@
 mod client;
 mod output;
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use slashit_ipc::client::{ClientError, ClientOptions};
@@ -155,6 +157,31 @@ enum Commands {
     Ping,
     /// Show every feature flag with the value in force and where it came from
     Features,
+    /// Write one Project's portable export to a new file
+    ///
+    /// The bundle holds the Project, its Repository identity (never its local
+    /// path) and its Tasks. Credentials, runtime state and worktree paths are
+    /// left out. The file is created owner-only and never replaces an
+    /// existing path. A Project with a Task that is queued, running or in
+    /// automatic AI Review cannot be exported yet; a Task waiting for a
+    /// Human Review decision can.
+    Export {
+        /// Project ID
+        project: String,
+        /// New file to write; relative paths are resolved from this shell
+        path: PathBuf,
+    },
+    /// Validate an export file and describe what importing it would do
+    ///
+    /// Read-only: nothing in the running instance changes. Applying an import
+    /// is not available yet, so `--preview` is required.
+    Import {
+        /// Export file to read
+        path: PathBuf,
+        /// Describe the import without applying it (required)
+        #[arg(long)]
+        preview: bool,
+    },
     /// Inspect the headless daemon
     Daemon {
         #[command(subcommand)]
@@ -172,6 +199,10 @@ enum DaemonCommands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let options = client::options(cli.endpoint.as_deref(), cli.wait, cli.timeout)?;
+    if let Commands::Import { preview: false, .. } = &cli.command {
+        eprintln!("Error: applying an import is not available yet; pass --preview to describe it");
+        std::process::exit(2);
+    }
 
     let request = match &cli.command {
         Commands::Status => IpcRequest::Status,
@@ -234,6 +265,13 @@ async fn main() -> Result<()> {
         Commands::Quit => IpcRequest::Quit,
         Commands::Ping => IpcRequest::Ping,
         Commands::Features => IpcRequest::Features,
+        Commands::Export { project, path } => IpcRequest::ExportProject {
+            project_id: project.clone(),
+            path: absolute_path(path)?,
+        },
+        Commands::Import { path, .. } => IpcRequest::PreviewImport {
+            path: absolute_path(path)?,
+        },
         // Not a plain request/response: "no daemon is running" is an answer
         // rather than a failure, and it has to set the exit status.
         Commands::Daemon { command } => match command {
@@ -278,6 +316,13 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The path as an absolute one, resolved from this shell's directory. The
+/// instance writes relative to its own directory, so a relative path must be
+/// made absolute here.
+fn absolute_path(path: &std::path::Path) -> Result<String> {
+    Ok(std::path::absolute(path)?.to_string_lossy().into_owned())
 }
 
 /// Answer "is a daemon running?" with an exit status a script can branch on.

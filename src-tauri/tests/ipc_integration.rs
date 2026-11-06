@@ -765,3 +765,62 @@ async fn a_stale_socket_left_by_a_crash_does_not_lock_the_app_out() {
         .await
         .expect("stale artifacts must not permanently lock the app out");
 }
+
+// --- Portable Project export and import preview -----------------------------
+
+#[tokio::test]
+async fn portable_export_and_preview_are_reachable_over_the_local_endpoint() {
+    let h = Harness::start().await;
+    let nil_project = uuid::Uuid::nil().to_string();
+
+    // Export is a write: the classification says so, and preview is not.
+    let export = IpcRequest::ExportProject {
+        project_id: nil_project.clone(),
+        path: "/x.json".into(),
+    };
+    assert!(export.is_mutating());
+    let preview = IpcRequest::PreviewImport {
+        path: "/x.json".into(),
+    };
+    assert!(!preview.is_mutating());
+
+    let nowhere = h._tmp.path().join("nowhere.json");
+    let missing = send(
+        &IpcRequest::ExportProject {
+            project_id: nil_project.clone(),
+            path: nowhere.to_string_lossy().into_owned(),
+        },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("the local endpoint should answer");
+    assert!(error_of(&missing).contains("not found"), "{missing:?}");
+    assert!(!nowhere.exists());
+
+    let relative = send(
+        &IpcRequest::ExportProject {
+            project_id: nil_project,
+            path: "relative.json".into(),
+        },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("the local endpoint should answer");
+    assert!(error_of(&relative).contains("absolute"), "{relative:?}");
+
+    // The committed golden bundle, previewed through the real transport.
+    let bundle = h._tmp.path().join("bundle.json");
+    let golden: &[u8] = include_bytes!("../src/portability/testdata/export-v1.golden.json");
+    std::fs::write(&bundle, golden).unwrap();
+    let previewed = send(
+        &IpcRequest::PreviewImport {
+            path: bundle.to_string_lossy().into_owned(),
+        },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("the local endpoint should answer");
+    assert!(previewed.ok, "{previewed:?}");
+    assert_eq!(previewed.data["importable"], true);
+    assert_eq!(previewed.data["counts"]["tasks"], 2);
+}
