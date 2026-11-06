@@ -80,6 +80,9 @@ pub struct StartupReport {
     /// Durable Project Task cleanup records that could not be completed
     /// during startup. Each record remains on disk for a later retry.
     pub project_tasks_cleanup_failures: Vec<String>,
+    /// Import records of Projects that could not be settled during startup.
+    /// Each record remains on disk for a later retry.
+    pub project_import_recovery_failures: Vec<String>,
 }
 
 /// Resolve the OS directories and build state from what is on disk.
@@ -242,6 +245,11 @@ pub async fn build_state_with_paths(
                 .storage
                 .pending_project_tasks_deletions()
                 .map(|p| !p.is_empty())
+                .unwrap_or(true)
+            || app_state
+                .storage
+                .pending_project_imports()
+                .map(|p| !p.is_empty())
                 .unwrap_or(true);
         if owed {
             if let Err(error) = app_state.storage.reconfirm_config_durable() {
@@ -255,6 +263,15 @@ pub async fn build_state_with_paths(
                 projects_are_authoritative = false;
             }
         }
+    }
+    // An import that did not settle leaves a Project without its board. It is
+    // removed before anything uses the Project list. The same proof of absence
+    // as the cleanup records above is needed, so the check runs only with an
+    // authoritative configuration.
+    if projects_are_authoritative {
+        let mut projects = app_state.project.projects.write().await;
+        report.project_import_recovery_failures =
+            crate::portability::apply::recover_interrupted_imports(&app_state.storage, &mut projects);
     }
     if projects_are_authoritative {
         match app_state.storage.pending_project_conversation_deletions() {

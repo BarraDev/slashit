@@ -61,29 +61,54 @@ Projects and Repositories are stored in `config.toml`. Each Project's Tasks are
 stored in their own board file, and startup loads every board file present. A
 single atomic write cannot cover both, so the commit runs in this order:
 
-1. Stage the board beside its destination. Nothing is visible yet.
-2. Commit the Project to `config.toml`. This is the commit point.
-3. Publish the board with a no-clobber publication.
-4. Insert the Tasks into memory.
+1. Write the import record, `<id>.import-pending` beside `config.toml`. It
+   tells a restart that an import of this Project is unfinished.
+2. Stage the board beside its destination. Nothing is visible yet.
+3. Commit the Project to `config.toml`. This is the commit point.
+4. Publish the board with a no-clobber publication.
+5. Remove the import record and insert the Tasks into memory.
 
 Results:
 
-- A failure before step 2 leaves nothing: the staged file is removed.
-- A failure of step 3 before the board is visible reverts step 2. The apply
-  reports `reverted`, and the target is unchanged.
-- A failure of that revert leaves the Project recorded without its Tasks. The
-  apply reports it as incomplete. This is the one state this version cannot
-  undo. Delete that Project before importing again, and keep the bundle file.
+- A refusal before step 1 changes nothing. A record that cannot be written
+  refuses the import, and nothing is committed.
+- A failure before step 3 removes the record and leaves nothing behind.
+- A failure of step 4 before the board is visible reverts step 3, removes the
+  record, and the target is unchanged (`reverted`).
+- A failure of that revert keeps the record and reports the import as
+  incomplete. The next start settles it (see Recovery below). Until then the
+  Project exists without Tasks, and no repository is linked, so it cannot run
+  work.
 - A board that is published but not confirmed durable is reported as an
   applied import with `durable: false`. The change is in place, so it is not
-  reported as a failure.
+  reported as a failure. A record that is in place but not confirmed durable
+  also gives `durable: false`.
 - A repeated apply of the same bundle is refused by the identity rule, so an
   import cannot be committed twice.
 - Two concurrent applies of one bundle serialize on the Project's lifecycle
   gate. Exactly one commits.
 
-A crash between step 2 and step 3 is not covered by a test. Its result is the
-same incomplete state as the revert failure above, and recovery is the same.
+### Recovery at startup
+
+A record left behind marks an import that did not finish. At startup, before
+any Project is used, and only with a configuration read without salvage:
+
+- No Project under the record: the import never committed. The record is removed.
+- A Project with its board: the import completed. Only the record remained, so
+  it is removed and the Project is kept.
+- A Project without its board: the import was interrupted. Only this Project is
+  removed from `config.toml`, so the bundle can be imported again. No other
+  record or board is touched.
+
+A configuration without a `projects` section is not authoritative, so a record
+written before the first Project was saved waits until a configuration exists.
+It is harmless: a retry overwrites it, and a later start settles it.
+
+Covered by tests: the record write refusal, an unconfirmed record, a failed
+revert followed by a restart through the production startup path, a record with
+no Project, a record beside a completed board, and an unrelated Project that
+survives recovery. The restart tests are not a real process kill: a crash that
+loses unflushed page-cache data is not simulated.
 
 ## The file
 
@@ -236,14 +261,12 @@ longer unspaced fragment can survive.
   creation, worker resume, approval replay or pull request publication.
 - No desktop interface. The CLI and IPC are the only import entry points.
 - Apply is refused to a peer the operating system has not identified, like the
-  verbs that create agent work. The denial is one line in the server, and no
-  test drives it through the server: the protocol test checks the predicate
-  only. The same gap applies to the existing agent verbs.
-- A repository remote written in the scp form (`user:secret@host:path`) is not
-  detected as carrying a credential. It is echoed in the preview and apply
-  reports as written in the bundle.
-- A crash between the Project commit and the board publication is not covered
-  by a test (see Commit order above).
+  verbs that create agent work. An integration test drives this through the
+  assembled server over TCP with a valid token, and checks that nothing changed.
+  The existing agent verbs are tested the same way.
+- A repository remote in the scp form with a colon in its user part
+  (`user:secret@host:path`) is refused on export and on decode. An ordinary
+  `user@host:path` remote, such as `git@host:owner/repo.git`, is accepted.
 - The Preview-to-Apply check is the checksum of the payload. It detects a file
   that changed, and it does not authenticate the file.
 - Export refuses to replace any existing path, including one created after

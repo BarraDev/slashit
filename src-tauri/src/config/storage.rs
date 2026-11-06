@@ -710,6 +710,64 @@ impl Storage {
         Ok(pending)
     }
 
+    /// Persist the import record before the imported Project is committed.
+    ///
+    /// The result is the write's own: `Err` with a published write means the
+    /// record is in place but not confirmed durable, which the caller reports.
+    /// Recovery reads the record; see `portability::apply::recover_interrupted_imports`.
+    pub fn mark_project_import_pending(
+        &self,
+        project_id: Uuid,
+    ) -> std::result::Result<slashit_durable_fs::Committed, slashit_durable_fs::WriteError> {
+        write_private_atomic(
+            &self.paths.pending_project_import_file(project_id),
+            project_id.to_string().as_bytes(),
+        )
+    }
+
+    /// Remove the import record. Clearing an absent record is a no-op.
+    pub fn clear_project_import_pending(&self, project_id: Uuid) -> Result<()> {
+        let path = self.paths.pending_project_import_file(project_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("Failed to clear import record {path:?}")),
+        }
+    }
+
+    /// List the import records. A malformed record is an error, not skipped:
+    /// recovery must not guess at what it names.
+    pub fn pending_project_imports(&self) -> Result<Vec<Uuid>> {
+        let entries = match fs::read_dir(self.paths.config_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("Failed to list import records"),
+        };
+        let mut pending = Vec::new();
+        for entry in entries {
+            let entry = entry.context("Failed to read import record directory entry")?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".import-pending") else {
+                continue;
+            };
+            let project_id = id
+                .parse::<Uuid>()
+                .with_context(|| format!("Invalid Project id in import record {:?}", entry.path()))?;
+            let recorded: Uuid = fs::read_to_string(entry.path())
+                .with_context(|| format!("Failed to read import record {:?}", entry.path()))?
+                .trim()
+                .parse()
+                .with_context(|| format!("Invalid Project id in import record {:?}", entry.path()))?;
+            if recorded != project_id {
+                anyhow::bail!("Project id does not match import record {:?}", entry.path());
+            }
+            pending.push(project_id);
+        }
+        Ok(pending)
+    }
+
     pub fn new() -> Result<Self> {
         let paths = AppPaths::new().context("Failed to resolve application directories")?;
         Ok(Self::with_paths(paths))

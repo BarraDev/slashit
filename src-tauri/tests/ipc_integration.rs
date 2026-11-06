@@ -36,7 +36,7 @@ use slashit_ipc::{
     PROTOCOL_VERSION,
 };
 use slashit_ui_lib::config::paths::AppPaths;
-use slashit_ui_lib::ipc::IpcServer;
+use slashit_ui_lib::ipc::{IpcContext, IpcServer};
 use slashit_ui_lib::test_helpers::ipc_test_context;
 
 /// The local, OS-authenticated endpoint for one test.
@@ -96,6 +96,8 @@ struct Harness {
     local: Endpoint,
     tcp: Endpoint,
     token: AuthToken,
+    /// The state the server writes into, to check what a request changed.
+    ctx: Arc<IpcContext>,
 }
 
 impl Harness {
@@ -121,7 +123,7 @@ impl Harness {
             },
         ];
 
-        let server = IpcServer::bind_endpoints(ctx, &requested, &BindOptions::default())
+        let server = IpcServer::bind_endpoints(ctx.clone(), &requested, &BindOptions::default())
             .await
             .expect("both endpoints should bind inside a tempdir");
 
@@ -148,6 +150,7 @@ impl Harness {
             local,
             tcp,
             token,
+            ctx,
         }
     }
 
@@ -767,6 +770,58 @@ async fn a_stale_socket_left_by_a_crash_does_not_lock_the_app_out() {
 }
 
 // --- Portable Project export and import preview -----------------------------
+
+/// An import creates Tasks that run as the user, so it is refused to a peer the
+/// operating system has not identified, as the agent verbs are. A refused
+/// import changes nothing; the same request from the local endpoint is admitted.
+#[tokio::test]
+async fn an_import_is_refused_to_an_unidentified_peer_and_admitted_locally() {
+    let h = Harness::start().await;
+    let bundle = h._tmp.path().join("bundle.json");
+    let golden: &[u8] = include_bytes!("../src/portability/testdata/export-v1.golden.json");
+    std::fs::write(&bundle, golden).unwrap();
+    let path = bundle.to_string_lossy().into_owned();
+
+    let preview = send(
+        &IpcRequest::PreviewImport { path: path.clone() },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("the local endpoint should answer");
+    assert!(preview.ok, "{preview:?}");
+    let checksum = preview.data["checksum"]
+        .as_str()
+        .expect("a preview names the checksum an apply needs")
+        .to_string();
+    let apply = IpcRequest::ApplyImport { path, checksum };
+
+    // A valid token proves a secret, not the user. The refusal must be the
+    // authorization rule, not the handler failing on the file.
+    let refused = send(&apply, &h.options(&h.tcp, Some(&h.token)))
+        .await
+        .expect("the request should be answered, not dropped");
+    let error = error_of(&refused);
+    assert!(error.contains("not available to clients"), "{error}");
+    assert!(!error.contains("not found"), "reached the handler: {error}");
+    assert!(
+        h.ctx.projects.read().await.is_empty(),
+        "a refused import added a Project"
+    );
+    assert!(
+        h.ctx.tasks.read().await.is_empty(),
+        "a refused import added Tasks"
+    );
+    assert!(h.ctx.storage.load_config().unwrap().projects.is_empty());
+    assert!(h.ctx.storage.pending_project_imports().unwrap().is_empty());
+
+    let admitted = send(&apply, &h.options(&h.local, None))
+        .await
+        .expect("the local endpoint should answer");
+    assert!(admitted.ok, "{admitted:?}");
+    assert_eq!(admitted.data["tasks"], 2);
+    assert_eq!(h.ctx.projects.read().await.len(), 1);
+    assert_eq!(h.ctx.tasks.read().await.len(), 2);
+}
 
 #[tokio::test]
 async fn portable_export_and_preview_are_reachable_over_the_local_endpoint() {

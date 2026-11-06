@@ -395,6 +395,13 @@ impl AppPaths {
         self.config_dir.join(format!("{project_id}.tasks-delete-pending"))
     }
 
+    /// Recovery record for an import of a Project from a bundle. It is written
+    /// before the Project is committed and removed once the import is settled.
+    /// Beside `config.toml` for the same reason as the deletion records.
+    pub fn pending_project_import_file(&self, project_id: Uuid) -> PathBuf {
+        self.config_dir.join(format!("{project_id}.import-pending"))
+    }
+
     pub fn conversation_file(&self, conversation_id: Uuid) -> PathBuf {
         self.conversations_dir().join(format!("{conversation_id}.json"))
     }

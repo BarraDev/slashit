@@ -10,15 +10,18 @@
 //! Project's Tasks live in their own board file. One atomic write cannot cover
 //! both, so the order is:
 //!
-//! 1. stage the board beside its destination (not visible to anything);
-//! 2. commit the Project to `config.toml` (the commit point);
-//! 3. publish the board, refusing to replace one;
-//! 4. insert the Tasks into memory.
+//! 1. write the import record (`<id>.import-pending`, beside `config.toml`);
+//! 2. stage the board beside its destination (not visible to anything);
+//! 3. commit the Project to `config.toml` (the commit point);
+//! 4. publish the board, refusing to replace one;
+//! 5. remove the import record and insert the Tasks into memory.
 //!
-//! If step 3 fails before the board is visible, step 2 is reverted. If that
-//! revert also fails, the Project stays recorded without its Tasks, and the
-//! error says so. That is the one state this version cannot undo; the bundle
-//! file is the record needed to re-import it after the Project is deleted.
+//! The record is what separates an interrupted import from a Project that is
+//! legitimately empty. If step 4 fails before the board is visible, step 3 is
+//! reverted and the record removed. If the revert fails, or the process ends
+//! first, the record stays. The next start settles it with
+//! [`recover_interrupted_imports`]: a Project with no board is removed, so the
+//! import can be retried, and nothing else is touched.
 
 use std::collections::HashMap;
 
@@ -138,42 +141,61 @@ pub async fn apply(
     let project_name = project.name.clone();
     let task_count = tasks.len() as u32;
 
-    // Step 1: invisible until step 3.
-    let staged_board = live
-        .storage
-        .stage_new_project_board(project_id, &tasks)
-        .map_err(|e| ApplyError::Failed(format!("{e:#}")))?;
+    // Step 1: the record that makes an interrupted import recognizable. Nothing
+    // is committed yet, so a refusal here leaves nothing to undo. Written in
+    // place but not confirmed durable, the import proceeds and reports it.
+    let mut durable = match live.storage.mark_project_import_pending(project_id) {
+        Ok(committed) => committed.is_fully_durable(),
+        Err(e) if e.is_published() => false,
+        Err(e) => {
+            return Err(ApplyError::Failed(format!(
+                "the import record could not be written, so nothing was imported: {e}"
+            )))
+        }
+    };
 
-    // Step 2: the commit point. The Project's previous set is kept for a revert.
+    // Step 2: invisible until step 4.
+    let staged_board = match live.storage.stage_new_project_board(project_id, &tasks) {
+        Ok(staged) => staged,
+        Err(e) => {
+            clear_import_record(live.storage, project_id);
+            return Err(ApplyError::Failed(format!("{e:#}")));
+        }
+    };
+
+    // Step 3: the commit point. The Project's previous set is kept for a revert.
     let original = projects_w.clone();
     let mut proposed = projects_w.clone();
     proposed.insert(project.id, project);
     let outcome = try_persist_projects(live.storage, &proposed);
-    let mut durable = true;
     match adopt_published(&mut *projects_w, proposed, outcome) {
         Ok(()) => {}
         Err(e) if e.is_published() => durable = false,
         Err(e) => {
+            clear_import_record(live.storage, project_id);
             return Err(ApplyError::Failed(
                 e.describe("record the imported Project"),
-            ))
+            ));
         }
     }
     // A save can succeed while the directory cannot be synchronized; only the
     // storage flag says so.
     durable &= !live.storage.config_is_unconfirmed();
 
-    // Step 3: the board becomes visible, or the Project is reverted.
-    match staged_board.publish_new() {
-        Ok(committed) => durable &= committed.is_fully_durable(),
-        Err(e) if e.is_published() => durable = false,
+    // Step 4: the board becomes visible, or the Project is reverted.
+    let board_durable = match staged_board.publish_new() {
+        Ok(committed) => committed.is_fully_durable(),
+        Err(e) if e.is_published() => false,
         Err(e) => {
             let board_error = format!("the Task board could not be published ({e})");
             return match try_persist_projects(live.storage, &original) {
                 Ok(()) => {
                     *projects_w = original;
+                    clear_import_record(live.storage, project_id);
                     Err(ApplyError::Failed(format!("{board_error}, so the import was reverted")))
                 }
+                // The revert is in place. The record stays until a start confirms
+                // the Project is gone.
                 Err(revert) if revert.is_published() => {
                     *projects_w = original;
                     Err(ApplyError::Failed(format!(
@@ -181,15 +203,26 @@ pub async fn apply(
                         revert.describe("revert the imported Project")
                     )))
                 }
-                Err(revert) => Err(ApplyError::Incomplete(format!(
-                    "{board_error}, and the revert also failed, so Project {project_id} is recorded without its Tasks. Delete that Project before importing again: {}",
-                    revert.describe("revert the imported Project")
-                ))),
+                // The Project leaves memory, so nothing in this process can use it.
+                // The record stays, and the next start settles it.
+                Err(revert) => {
+                    *projects_w = original;
+                    Err(ApplyError::Incomplete(format!(
+                        "{board_error}, and the revert also failed, so Project {project_id} is recorded without its Tasks. Restart SlashIt: the interrupted import is then undone, and the bundle can be imported again. {}",
+                        revert.describe("revert the imported Project")
+                    )))
+                }
             };
         }
-    }
+    };
 
-    // Step 4: the Tasks are visible only now, after the board is in place.
+    // Step 5: the board is in place, so the import is settled. The Tasks are
+    // visible only now. A board whose directory entry is not confirmed durable
+    // keeps its record, so a power loss cannot leave a Project with neither.
+    if board_durable {
+        clear_import_record(live.storage, project_id);
+    }
+    durable &= board_durable;
     for task in tasks {
         tasks_w.insert(task.id, task);
     }
@@ -201,6 +234,70 @@ pub async fn apply(
         repository_remote,
         durable,
     })
+}
+
+/// Remove the import record once the state it guards is settled. A failed
+/// removal is harmless: the next start finds the record and settles it again.
+fn clear_import_record(storage: &Storage, project_id: Uuid) {
+    if let Err(error) = storage.clear_project_import_pending(project_id) {
+        eprintln!("Warning: {error:#}; the next start removes it");
+    }
+}
+
+/// Settle the import records a previous process left behind. Runs at startup,
+/// only when the configuration was read without salvage, and before any
+/// Project is used.
+///
+/// - No Project under the record: the import never committed. The record goes.
+/// - A Project with a board: the import completed. Only the record remained.
+/// - A Project without a board: the import was interrupted. The Project is
+///   removed from the configuration, which is the only change made. Its
+///   record goes once that removal is confirmed.
+///
+/// Returns one message per record that could not be settled. Such a record
+/// stays for the next start.
+pub fn recover_interrupted_imports(
+    storage: &Storage,
+    projects: &mut HashMap<Uuid, Project>,
+) -> Vec<String> {
+    let pending = match storage.pending_project_imports() {
+        Ok(pending) => pending,
+        Err(error) => return vec![format!("the import records could not be read: {error:#}")],
+    };
+    let mut failures = Vec::new();
+    for project_id in pending {
+        // A board that cannot be stat'ed may still exist, so it counts as present.
+        let board_present = storage
+            .tasks_board_files(project_id)
+            .iter()
+            .any(|file| file.try_exists().unwrap_or(true));
+        if projects.contains_key(&project_id) && !board_present {
+            let mut proposed = projects.clone();
+            proposed.remove(&project_id);
+            match try_persist_projects(storage, &proposed) {
+                Ok(()) => *projects = proposed,
+                Err(error) => {
+                    // The interrupted Project is not usable in this process, even
+                    // when its removal is not in place. The record stays, so a
+                    // later start removes it again.
+                    if error.is_published() {
+                        *projects = proposed;
+                    } else {
+                        projects.remove(&project_id);
+                    }
+                    failures.push(format!(
+                        "{project_id}: {}",
+                        error.describe("remove the interrupted import")
+                    ));
+                    continue;
+                }
+            }
+        }
+        if let Err(error) = storage.clear_project_import_pending(project_id) {
+            failures.push(format!("{project_id}: {error:#}"));
+        }
+    }
+    failures
 }
 
 /// The records an import creates, the normalizations applied, and the remote the bundle named.

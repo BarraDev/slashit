@@ -3,6 +3,7 @@
 //! failure points of the commit order, and a concurrent double apply. Driven
 //! through the IPC dispatcher, so the production handlers are what is tested.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -414,10 +415,11 @@ async fn a_failed_revert_is_reported_as_an_incomplete_import() {
     let (dst, target) = test_ctx().await;
     let path = write_bundle(&dst, &bytes);
 
-    // Replace writes, in order: the Project commit (let through), the board
-    // publication (fails), then the revert of the Project commit (fails).
+    // Replace writes, in order: the import record and the Project commit (let
+    // through), the board publication (fails), then the revert of the Project
+    // commit (fails).
     let _faults = fault::fail_in_order(&[
-        (Stage::Replace, ErrorKind::Other, 1),
+        (Stage::Replace, ErrorKind::Other, 2),
         (Stage::Replace, ErrorKind::Other, 0),
     ]);
     let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
@@ -425,7 +427,11 @@ async fn a_failed_revert_is_reported_as_an_incomplete_import() {
     assert!(!response.ok);
     let message = response.error.unwrap();
     assert!(message.contains("without its Tasks"), "{message}");
-    assert!(target.projects.read().await.contains_key(&project_id()));
+    assert!(message.contains("Restart SlashIt"), "{message}");
+    assert!(
+        !target.projects.read().await.contains_key(&project_id()),
+        "an unrecovered import is not usable in this process"
+    );
     assert!(target.tasks.read().await.is_empty());
     assert!(target
         .storage
@@ -433,6 +439,211 @@ async fn a_failed_revert_is_reported_as_an_incomplete_import() {
         .unwrap()
         .projects
         .contains_key(&project_id().to_string()));
+    assert_eq!(
+        target.storage.pending_project_imports().unwrap(),
+        vec![project_id()],
+        "the record is kept for the next start"
+    );
+}
+
+/// The import record's file name, for targeting a fault at it.
+fn record_name() -> String {
+    format!("{}.import-pending", project_id())
+}
+
+#[tokio::test]
+async fn an_import_record_that_cannot_be_written_refuses_before_any_commit() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+
+    let _fault = fault::fail_at_file(Stage::Replace, ErrorKind::Other, &record_name());
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    drop(_fault);
+    assert!(!response.ok);
+    assert!(response.error.unwrap().contains("nothing was imported"));
+    assert_target_empty(&target).await;
+}
+
+#[tokio::test]
+async fn a_board_not_confirmed_durable_keeps_the_record_for_the_next_start() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+
+    // Directory syncs in order: the record, the Project commit, then the board's
+    // publication. The third one fails: the board is in place but not confirmed.
+    let _fault = fault::fail_after(Stage::SyncDirectory, ErrorKind::Other, 2);
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    drop(_fault);
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(response.data["durable"], false);
+    assert_eq!(
+        target.storage.pending_project_imports().unwrap(),
+        vec![project_id()],
+        "the record stays until the board is confirmed"
+    );
+}
+
+#[tokio::test]
+async fn a_record_in_place_but_not_confirmed_lets_the_import_proceed_as_not_durable() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+
+    // The first directory sync is the record's; it is published but unconfirmed.
+    let _fault = fault::fail_at(Stage::SyncDirectory, ErrorKind::Other);
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    drop(_fault);
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(response.data["durable"], false);
+    assert_eq!(target.tasks.read().await.len(), 2);
+    assert!(target.storage.pending_project_imports().unwrap().is_empty());
+}
+
+/// An import whose process ended after the Project was committed and before its
+/// board was published, with the revert never run: the state root, the bundle
+/// bytes, the paths, and the bundle file for the retry.
+type InterruptedImport = (
+    TempDir,
+    TempDir,
+    Vec<u8>,
+    std::sync::Arc<crate::config::paths::AppPaths>,
+    PathBuf,
+);
+
+async fn interrupted_import() -> InterruptedImport {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    let paths = std::sync::Arc::new(target.storage.paths().clone());
+
+    // Replace writes, in order: the import record and the Project commit (let
+    // through), the board publication (fails), then the revert (fails).
+    let _faults = fault::fail_in_order(&[
+        (Stage::Replace, ErrorKind::Other, 2),
+        (Stage::Replace, ErrorKind::Other, 0),
+    ]);
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    drop(_faults);
+    assert!(!response.ok);
+    drop(target);
+    (src, dst, bytes, paths, path)
+}
+
+#[tokio::test]
+async fn an_import_interrupted_after_its_commit_is_undone_at_the_next_start() {
+    let (_src, _dst, bytes, paths, path) = interrupted_import().await;
+
+    // The next start, through the production startup path, before any Project is used.
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(
+        report.project_import_recovery_failures.is_empty(),
+        "{:?}",
+        report.project_import_recovery_failures
+    );
+    assert!(!state
+        .project
+        .projects
+        .read()
+        .await
+        .contains_key(&project_id()));
+    let storage = crate::config::Storage::with_paths((*paths).clone());
+    let config = storage.load_config().unwrap();
+    assert!(!config.projects.contains_key(&project_id().to_string()));
+    assert!(storage.pending_project_imports().unwrap().is_empty());
+    assert!(storage
+        .tasks_board_files(project_id())
+        .iter()
+        .all(|p| !p.exists()));
+
+    // The import can now be retried, and it creates the Project once.
+    let retry = crate::test_helpers::ipc_test_context(paths.clone());
+    let response = apply_with(&retry, &path, &checksum_of(&bytes)).await;
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(retry.tasks.read().await.len(), 2);
+    assert_eq!(storage.load_project_tasks(project_id()).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn startup_undoes_an_interrupted_import_and_leaves_other_projects_alone() {
+    let (_src, _dst, _bytes, paths, _path) = interrupted_import().await;
+    let other_id = Uuid::from_u128(77);
+    let storage = crate::config::Storage::with_paths((*paths).clone());
+    let mut other = super::tests::project(None);
+    other.id = other_id;
+    other.name = "Unrelated".into();
+    let mut projects = HashMap::from([(other_id, other.clone())]);
+    projects.insert(project_id(), super::tests::project(None));
+    crate::commands::project::try_persist_projects(&storage, &projects).unwrap();
+
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(report.project_import_recovery_failures.is_empty());
+    let loaded = state.project.projects.read().await;
+    assert_eq!(
+        loaded.get(&other_id).map(|p| p.name.as_str()),
+        Some("Unrelated")
+    );
+    assert!(!loaded.contains_key(&project_id()));
+}
+
+#[tokio::test]
+async fn a_record_without_a_project_is_cleared_at_the_next_start() {
+    let (tmp, ctx) = test_ctx().await;
+    // An installed app always has a configuration with a projects section; only
+    // such a file makes the absence of a Project authoritative.
+    crate::commands::project::try_persist_projects(&ctx.storage, &HashMap::new()).unwrap();
+    let paths = std::sync::Arc::new(ctx.storage.paths().clone());
+    ctx.storage
+        .mark_project_import_pending(project_id())
+        .unwrap();
+    drop(ctx);
+
+    let (_state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(report.project_import_recovery_failures.is_empty());
+    let storage = crate::config::Storage::with_paths((*paths).clone());
+    assert!(storage.pending_project_imports().unwrap().is_empty());
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn a_record_beside_a_completed_board_keeps_the_project_and_its_tasks() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    assert!(apply_with(&target, &path, &checksum_of(&bytes)).await.ok);
+    // A removal that never ran would leave exactly this record.
+    target
+        .storage
+        .mark_project_import_pending(project_id())
+        .unwrap();
+    let paths = std::sync::Arc::new(target.storage.paths().clone());
+    drop(target);
+
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(report.project_import_recovery_failures.is_empty());
+    assert!(state.project.projects.read().await.contains_key(&project_id()));
+    let storage = crate::config::Storage::with_paths((*paths).clone());
+    assert!(storage.pending_project_imports().unwrap().is_empty());
+    assert_eq!(storage.load_project_tasks(project_id()).unwrap().len(), 2);
 }
 
 #[tokio::test]
