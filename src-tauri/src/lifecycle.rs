@@ -535,6 +535,23 @@ pub async fn record_classified_if_changed(
         .map_err(RecordFailure::Write)
 }
 
+// Test-only seam: runs once a conditional Task write has released its lock and
+// before the caller reads the outcome. A test deletes the Task here to
+// reproduce a delete landing in that gap.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AFTER_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn after_write_seam() {
+    let hook = AFTER_WRITE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Amend a task's own fields durably, or say there is no such task.
 ///
 /// [`record`] cannot make the distinction an ordinary command needs: every
@@ -984,13 +1001,16 @@ pub async fn enqueue_leased(
         changed
     };
     // Typed, so a write the file holds but could not confirm durable is an
-    // error that says the change is in place, as every board writer's is.
-    match record_typed_if_changed(tasks, storage, task_id, &revise).await {
+    // error that says the change is in place, as every board writer's is. The
+    // absence is decided by the write itself: looking the Task up again after
+    // it would let a delete in that gap turn a failed write into `Missing`.
+    let written = record_classified_if_changed(tasks, storage, task_id, &revise).await;
+    #[cfg(test)]
+    after_write_seam();
+    match written {
         Ok(_) => Ok(verdict.into_inner().unwrap()),
-        Err(RecordWriteError::NotPublished(_)) if !tasks.read().await.contains_key(&task_id) => {
-            Ok(EnqueueVerdict::Missing)
-        }
-        Err(error) => Err(error.to_string()),
+        Err(RecordFailure::TaskAbsent(_)) => Ok(EnqueueVerdict::Missing),
+        Err(RecordFailure::Write(error)) => Err(error.to_string()),
     }
 }
 
@@ -4207,6 +4227,85 @@ mod tests {
         queue.sort_by_key(|t| t.position);
         let order: Vec<(Uuid, i32)> = queue.iter().map(|t| (t.id, t.position)).collect();
         assert_eq!(order, vec![(entering, 0), (first, 1), (second, 2)]);
+    }
+
+    /// Deletes the Task right after the next conditional write releases its
+    /// lock, and returns a flag the hook sets once it has run. The seam removes
+    /// the Task from memory only, so it reaches a state production does not.
+    fn delete_after_the_next_write(
+        tasks: &Tasks,
+        task_id: Uuid,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let tasks = tasks.clone();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        AFTER_WRITE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                tasks
+                    .try_write()
+                    .expect("the write has released the lock")
+                    .remove(&task_id);
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+        });
+        ran
+    }
+
+    /// A queue write that the disk refuses is reported, even when a delete
+    /// lands in the gap before the outcome is read. `enqueue_leased` requires
+    /// the caller to hold the Task's lease; every production caller does, and
+    /// the test forces the gap directly to exercise the classification.
+    #[tokio::test]
+    async fn a_queue_write_that_fails_is_reported_even_if_the_task_is_deleted_at_once() {
+        let world = world(true);
+        let id = add_task(&world, "backlog", TaskStatus::Backlog, 0, |_| {}).await;
+        let _fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+        let ran = delete_after_the_next_write(&world.tasks, id);
+
+        let result = enqueue_leased(
+            &world.tasks,
+            &world.storage,
+            world.project_id,
+            id,
+            &TaskStatus::Backlog,
+            None,
+        )
+        .await;
+
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the delete must land in the gap before the outcome is read"
+        );
+        assert!(
+            result.is_err(),
+            "a failed write must be reported, got {result:?}"
+        );
+        assert_eq!(world.persisted(id).status, TaskStatus::Backlog);
+    }
+
+    #[tokio::test]
+    async fn a_queue_request_for_a_task_absent_before_the_write_is_still_missing() {
+        let world = world(true);
+        let id = add_task(&world, "gone", TaskStatus::Backlog, 0, |_| {}).await;
+        world.tasks.write().await.remove(&id);
+
+        let verdict = enqueue_leased(
+            &world.tasks,
+            &world.storage,
+            world.project_id,
+            id,
+            &TaskStatus::Backlog,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(verdict, Ok(EnqueueVerdict::Missing)),
+            "{verdict:?}"
+        );
     }
 
     #[tokio::test]
