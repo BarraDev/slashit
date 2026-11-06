@@ -87,13 +87,27 @@ Export takes the Project's lifecycle gate in shared mode and every Task
 lifecycle lease of the Project, then reads the Project, its Repository and its
 Tasks from the in-memory maps under their read locks, and releases everything
 before writing the file. A deletion of the Project, a run start or a lifecycle
-transition therefore cannot interleave with the read. A Task text or
-dependency edit that does not take a lease is not excluded by the leases; the
-single read of the Task map is the only guarantee against it. Export does not
-read the board files or the config file.
+transition therefore cannot interleave with the read. Export does not read the
+board files or the config file.
+
+The guarantee is narrower than one atomic snapshot of the whole Project:
+
+- The three map read locks are acquired one after another. A write that
+  changes the Repository or the Project record without the Project gate can
+  land between those acquisitions, so the Project and its Repository may come
+  from different instants.
+- A Task text or dependency edit that takes no lease is excluded only by the
+  read lock on the Task map. The Tasks are read at one instant, which may differ
+  from the instant of the Project and Repository records.
+- The concurrent-write behavior has not been stress-tested. The claims above
+  rest on lock-order analysis and barrier tests, not on a torn-read stress run.
 
 Lock order: project gate, then Task leases, then the shared maps. This matches
 the existing Project deletion path.
+
+Publication never replaces a file: the bytes are staged beside the destination
+and linked into place, and that link fails if the destination exists, including
+a file created after the existence check.
 
 ## Preview
 
@@ -141,9 +155,11 @@ longer unspaced fragment can survive.
 
 - No import apply, no status normalization, no arrival bump, no Git
   reconciliation. Those are the next unit and need their own review.
-- A file another process creates between the final existence check and the
-  rename is replaced. A file written by a process that does not check first
-  is not protected.
+- Export refuses to replace any existing path, including one created after
+  its check, but it is owner-only, not authenticated: another local process
+  that runs as the same user can still read or change the file.
+- The export needs a filesystem with hard links; on one without them the
+  write fails closed and nothing is published.
 - Conversations are not exported in v1.
 - Export reads the live instance. A CLI or desktop session must be running.
 - A Task whose id, repository or remote matches the target is a conflict. The

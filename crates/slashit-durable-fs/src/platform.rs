@@ -45,6 +45,16 @@ pub(crate) fn replace(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+/// Make `to` a second name for `from` only if `to` does not exist. Creating a
+/// link fails with `AlreadyExists` atomically (`link(2)`, `CreateHardLinkW`),
+/// so unlike a rename this never replaces a file created after the check.
+pub(crate) fn publish_new(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    // The destination is complete; a leftover staging name is only clutter.
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
 /// Synchronize one regular file's contents to stable storage. On Windows this
 /// needs write access, so a read-only file fails closed instead of being
 /// reported as synchronized.

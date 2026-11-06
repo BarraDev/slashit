@@ -284,11 +284,22 @@ pub fn portable_url(url: &str) -> String {
 /// Write a bundle to a new file, owner-readable only.
 ///
 /// Refuses an existing path of any kind and a missing parent directory. The
-/// bytes are staged beside the destination and renamed into place, so readers
-/// see either nothing or the complete file. The last existence check runs
-/// right before the rename; a file another process creates in the gap between
-/// that check and the rename is replaced. Nothing else in the store is touched.
+/// bytes are staged beside the destination and then linked into place, so
+/// readers see either nothing or the complete file. The link refuses an
+/// existing path atomically, so a file another process creates after staging
+/// is never replaced. Nothing else in the store is touched.
 pub fn write_bundle(path: &Path, bytes: &[u8]) -> Result<bool, String> {
+    write_bundle_with(path, bytes, || {})
+}
+
+/// [`write_bundle`] with a hook that runs after the bytes are staged and right
+/// before they are published: the window in which a competing file would be
+/// replaced. Tests use the hook to create that file deterministically.
+pub(super) fn write_bundle_with(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce(),
+) -> Result<bool, String> {
     if !path.is_absolute() {
         return Err("the export path must be absolute".into());
     }
@@ -297,28 +308,26 @@ pub fn write_bundle(path: &Path, bytes: &[u8]) -> Result<bool, String> {
         return Err(format!("the directory {} does not exist", parent.display()));
     }
     if exists(path) {
-        return Err(format!(
-            "{} already exists; choose another path",
-            path.display()
-        ));
+        return Err(already_exists(path));
     }
     let staged =
         slashit_durable_fs::stage(path, bytes, Permissions::OwnerOnly).map_err(describe)?;
-    if exists(path) {
-        drop(staged);
-        return Err(format!(
-            "{} appeared while the export was being written; nothing was replaced",
-            path.display()
-        ));
-    }
-    match staged.publish() {
+    before_publish();
+    match staged.publish_new() {
         Ok(committed) => Ok(committed.is_fully_durable()),
         // The file is in place and readable; only its directory entry is
         // unconfirmed. Reporting that as a failure would invite a retry that
         // the existing file then refuses.
         Err(error) if error.is_published() => Ok(false),
+        Err(error) if error.io_error().kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(already_exists(path))
+        }
         Err(error) => Err(describe(error)),
     }
+}
+
+fn already_exists(path: &Path) -> String {
+    format!("{} already exists; choose another path", path.display())
 }
 
 fn exists(path: &Path) -> bool {

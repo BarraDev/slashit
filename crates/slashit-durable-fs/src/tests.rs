@@ -167,6 +167,28 @@ fn a_staged_file_publishes_what_it_staged() {
 }
 
 #[test]
+fn publish_new_never_replaces_a_file_created_after_staging() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("export.json");
+    let staged = stage(&path, b"new", Permissions::OwnerOnly).unwrap();
+    fs::write(&path, b"competitor").unwrap();
+    let error = staged.publish_new().unwrap_err();
+    assert_eq!(error.io_error().kind(), io::ErrorKind::AlreadyExists);
+    assert!(!error.is_published());
+    assert_eq!(read(&path), b"competitor");
+    assert!(leftovers(dir.path()).is_empty());
+}
+
+#[test]
+fn publish_new_publishes_when_the_destination_is_absent() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("export.json");
+    stage(&path, b"new", Permissions::OwnerOnly).unwrap().publish_new().unwrap();
+    assert_eq!(read(&path), b"new");
+    assert!(leftovers(dir.path()).is_empty());
+}
+
+#[test]
 fn a_colliding_temporary_name_is_skipped_not_overwritten() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("board.toml");

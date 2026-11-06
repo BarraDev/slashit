@@ -761,6 +761,24 @@ async fn export_writes_a_new_owner_only_file_and_never_replaces_one() {
     );
 }
 
+#[test]
+fn a_file_created_after_the_export_check_is_never_replaced() {
+    let tmp = TempDir::new().unwrap();
+    let destination = tmp.path().join("export.json");
+    let result = super::export::write_bundle_with(&destination, b"bundle", || {
+        // The race window: the existence check has passed, the publication has not run.
+        fs::write(&destination, b"someone else's file").unwrap();
+    });
+    assert!(result.is_err(), "the export must refuse, not publish: {result:?}");
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        b"someone else's file",
+        "the competing file is unchanged"
+    );
+    let entries: Vec<_> = fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(entries.len(), 1, "no staging file is left behind: {entries:?}");
+}
+
 #[tokio::test]
 async fn export_refuses_relative_paths_and_missing_directories() {
     let (tmp, ctx) = test_ctx().await;
