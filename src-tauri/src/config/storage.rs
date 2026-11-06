@@ -962,6 +962,12 @@ impl Storage {
         self.require_config_confirmed()
     }
 
+    /// Whether the last configuration write could not be confirmed durable.
+    /// Read-only: unlike [`Self::confirm_config_durable`], it writes nothing.
+    pub fn config_is_unconfirmed(&self) -> bool {
+        self.config_unconfirmed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn require_config_confirmed(&self) -> std::result::Result<(), ConfigWriteError> {
         if self.config_unconfirmed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ConfigWriteError::Unconfirmable(anyhow::anyhow!(

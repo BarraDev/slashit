@@ -302,12 +302,29 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, BundleError> {
         ));
     }
     validate(&payload)?;
+    check_import_fields(&payload)?;
     Ok(Decoded {
         checksum: envelope.checksum,
         build: envelope.build,
         created_at: envelope.created_at,
         payload,
     })
+}
+
+/// Field rules that a Task created through SlashIt always meets, but that an
+/// older Task may not. Checked on read only, so an export of such a Task still
+/// succeeds and its import is refused with the reason.
+fn check_import_fields(payload: &Payload) -> Result<(), BundleError> {
+    for task in &payload.tasks {
+        let reviewer = task.reviewer_model.as_deref().unwrap_or_default();
+        if let Err(why) = crate::domain::task::parse_reviewer_model(reviewer) {
+            return Err(BundleError::Malformed(format!(
+                "task {} has a reviewer model that cannot be used: {why}",
+                task.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Structural rules a valid export satisfies by construction. A bundle that

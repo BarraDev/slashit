@@ -159,6 +159,9 @@ pub async fn apply(
             ))
         }
     }
+    // A save can succeed while the directory cannot be synchronized; only the
+    // storage flag says so.
+    durable &= !live.storage.config_is_unconfirmed();
 
     // Step 3: the board becomes visible, or the Project is reverted.
     match staged_board.publish_new() {

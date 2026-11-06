@@ -44,6 +44,13 @@ Changed, and reported in `normalization`:
 - A Task in Human Review returns to Backlog, because a review wait needs the
   checkout the bundle does not carry.
 
+Kept as records, not verified: QA sign-off, review decisions and the timeline.
+They show what the exporting instance recorded. They confer no authority,
+because approvals are withdrawn and the apply creates no checkout.
+
+Refused on read, in preview and apply alike: a Task whose reviewer model would
+be rejected when it is created. An export of such a Task still succeeds.
+
 Not created: a Repository, a checkout, a branch, a pull request, a worker run,
 an integration, or any Git object. Historical Git identifiers are not checked
 against the importing repository.
@@ -228,6 +235,13 @@ longer unspaced fragment can survive.
   local checkout is linked to it. No Git reconciliation, restack, branch
   creation, worker resume, approval replay or pull request publication.
 - No desktop interface. The CLI and IPC are the only import entry points.
+- Apply is refused to a peer the operating system has not identified, like the
+  verbs that create agent work. The denial is one line in the server, and no
+  test drives it through the server: the protocol test checks the predicate
+  only. The same gap applies to the existing agent verbs.
+- A repository remote written in the scp form (`user:secret@host:path`) is not
+  detected as carrying a credential. It is echoed in the preview and apply
+  reports as written in the bundle.
 - A crash between the Project commit and the board publication is not covered
   by a test (see Commit order above).
 - The Preview-to-Apply check is the checksum of the payload. It detects a file

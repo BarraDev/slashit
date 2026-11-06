@@ -7,6 +7,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use futures::FutureExt;
 use slashit_durable_fs::{fault, Stage};
 use slashit_ipc::{IpcRequest, IpcResponse};
 use tempfile::TempDir;
@@ -83,7 +84,10 @@ fn board_name(ctx: &IpcContext) -> String {
 /// Every file whose name names the imported Project, anywhere in the state tree.
 fn leftovers(ctx: &IpcContext) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let mut pending = vec![ctx.storage.paths().data_dir().to_path_buf()];
+    let mut pending = vec![
+        ctx.storage.paths().data_dir().to_path_buf(),
+        ctx.storage.paths().config_dir().to_path_buf(),
+    ];
     while let Some(dir) = pending.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
@@ -359,4 +363,90 @@ async fn the_preview_reports_the_checksum_an_apply_needs() {
     assert!(preview.ok);
     let reported = preview.data["checksum"].as_str().unwrap().to_string();
     assert_eq!(reported, checksum_of(&bytes));
+}
+
+#[tokio::test]
+async fn an_invalid_reviewer_model_refuses_the_bundle_before_any_write() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let mut payload = bundle::decode(&bytes).unwrap().payload;
+    payload.tasks[0].reviewer_model = Some("-x".into());
+    let tampered = bundle::encode(&payload, chrono::Utc::now(), "test").unwrap();
+
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &tampered);
+    // Decode refuses the tampered payload before any checksum is compared.
+    let response = apply_with(&target, &path, &"0".repeat(64)).await;
+    assert!(!response.ok);
+    assert!(response.error.unwrap().contains("reviewer model"));
+    assert_target_empty(&target).await;
+}
+
+#[tokio::test]
+async fn apply_waits_for_the_project_lifecycle_gate() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (_dst, target) = test_ctx().await;
+    let sum = checksum_of(&bytes);
+
+    let gate = target.project_gate.write(project_id()).await;
+    // Polled once, without a sleep: an apply that did not wait for the gate would
+    // complete on this first poll.
+    let while_held = apply::apply(live(&target), &bytes, &sum).now_or_never();
+    assert!(
+        while_held.is_none(),
+        "apply must wait while the gate is held"
+    );
+    assert!(target.tasks.read().await.is_empty());
+    drop(gate);
+
+    assert!(apply::apply(live(&target), &bytes, &sum).await.is_ok());
+    assert_eq!(target.tasks.read().await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_revert_is_reported_as_an_incomplete_import() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+
+    // Replace writes, in order: the Project commit (let through), the board
+    // publication (fails), then the revert of the Project commit (fails).
+    let _faults = fault::fail_in_order(&[
+        (Stage::Replace, ErrorKind::Other, 1),
+        (Stage::Replace, ErrorKind::Other, 0),
+    ]);
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    drop(_faults);
+    assert!(!response.ok);
+    let message = response.error.unwrap();
+    assert!(message.contains("without its Tasks"), "{message}");
+    assert!(target.projects.read().await.contains_key(&project_id()));
+    assert!(target.tasks.read().await.is_empty());
+    assert!(target
+        .storage
+        .load_config()
+        .unwrap()
+        .projects
+        .contains_key(&project_id().to_string()));
+}
+
+#[tokio::test]
+async fn a_configuration_the_filesystem_cannot_synchronize_is_not_reported_durable() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+
+    let _fault = fault::fail_at_file(Stage::SyncDirectory, ErrorKind::Unsupported, "config.toml");
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    drop(_fault);
+    assert!(response.ok, "the change is in place: {:?}", response.error);
+    assert_eq!(response.data["durable"], false);
+    assert_eq!(target.tasks.read().await.len(), 2);
 }

@@ -144,6 +144,13 @@ impl IpcRequest {
     /// in progress, so it reaches the same primitive one step later and must
     /// be denied to any non-local peer exactly like the verbs that start it.
     /// These verbs are the code-execution surface.
+    /// Verbs that create work a person can run: the agent verbs above, and an
+    /// import, whose Tasks can be queued the same way. Denied to any peer the
+    /// operating system has not identified.
+    pub fn needs_verified_peer(&self) -> bool {
+        self.spawns_agent() || matches!(self, Self::ApplyImport { .. })
+    }
+
     pub fn spawns_agent(&self) -> bool {
         matches!(
             self,
@@ -398,6 +405,20 @@ mod tests {
         .spawns_agent());
         assert!(!IpcRequest::Show.spawns_agent());
         assert!(!IpcRequest::Quit.spawns_agent());
+    }
+
+    #[test]
+    fn an_import_creates_work_so_it_needs_a_verified_peer() {
+        assert!(IpcRequest::ApplyImport {
+            path: String::new(),
+            checksum: String::new(),
+        }
+        .needs_verified_peer());
+        assert!(!IpcRequest::PreviewImport {
+            path: String::new(),
+        }
+        .needs_verified_peer());
+        assert!(!IpcRequest::Status.needs_verified_peer());
     }
 
     #[test]
