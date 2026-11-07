@@ -394,20 +394,54 @@ async fn an_imported_reviewer_model_is_stored_as_the_parser_reads_it() {
     let bytes = exported_bytes(&source, &src).await;
     let task_id = bundle::decode(&bytes).unwrap().payload.tasks[0].id;
 
-    for (raw, stored) in [
-        (Some("  sonnet  "), Some("sonnet")),
-        (Some(""), None),
-        (Some("   "), None),
-        (None, None),
+    for (raw, stored, reason) in [
+        (
+            Some("  sonnet  "),
+            Some("sonnet"),
+            Some("reviewer_model_trimmed"),
+        ),
+        (Some(""), None, Some("reviewer_model_cleared")),
+        (Some("   "), None, Some("reviewer_model_cleared")),
+        (None, None, None),
     ] {
         let mut payload = bundle::decode(&bytes).unwrap().payload;
         payload.tasks[0].reviewer_model = raw.map(str::to_string);
         let tampered = bundle::encode(&payload, chrono::Utc::now(), "test").unwrap();
+        let reviewer_reasons = |notes: &[super::preview::Normalization]| -> Vec<&'static str> {
+            notes
+                .iter()
+                .map(|n| n.reason)
+                .filter(|r| r.starts_with("reviewer_model_"))
+                .collect()
+        };
+        let expected: Vec<&str> = reason.into_iter().collect();
+
+        // Preview describes the change that Apply then makes.
+        let previewed = super::preview::preview(
+            &tampered,
+            &super::preview::Target {
+                projects: &HashMap::new(),
+                repositories: &HashMap::new(),
+                tasks: &HashMap::new(),
+                unreadable_boards: 0,
+            },
+        )
+        .unwrap_or_else(|e| panic!("reviewer {raw:?} must preview: {e}"));
+        assert_eq!(
+            reviewer_reasons(&previewed.normalization),
+            expected,
+            "preview {raw:?}"
+        );
 
         let (_dst, target) = test_ctx().await;
-        apply::apply(live(&target), &tampered, &checksum_of(&tampered))
+        let applied = apply::apply(live(&target), &tampered, &checksum_of(&tampered))
             .await
             .unwrap_or_else(|e| panic!("reviewer {raw:?} must import: {e}"));
+        assert_eq!(
+            reviewer_reasons(&applied.normalization),
+            expected,
+            "apply {raw:?}"
+        );
         let imported = target.tasks.read().await[&task_id].reviewer_model.clone();
         assert_eq!(imported.as_deref(), stored, "reviewer {raw:?}");
     }
@@ -1175,8 +1209,17 @@ async fn a_completed_import_keeps_its_record_until_the_board_directory_is_synced
     let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
         .await
         .unwrap();
-    assert!(report.project_import_recovery_failures.is_empty(), "{:?}", report.project_import_recovery_failures);
-    assert!(state.project.projects.read().await.contains_key(&project_id()));
+    assert!(
+        report.project_import_recovery_failures.is_empty(),
+        "{:?}",
+        report.project_import_recovery_failures
+    );
+    assert!(state
+        .project
+        .projects
+        .read()
+        .await
+        .contains_key(&project_id()));
     assert!(!record.exists(), "the record goes once every component is durable");
 }
 

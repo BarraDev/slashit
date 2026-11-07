@@ -547,16 +547,12 @@ fn materialize_task(
         other => other,
     };
 
-    // Store what the parser accepts, as the Task editor does: an empty model is
-    // no reviewer, and surrounding whitespace is removed. Storing the raw text
-    // would start a reviewer run with `--model ""` or a padded identifier.
-    let reviewer_model =
-        crate::domain::task::parse_reviewer_model(t.reviewer_model.as_deref().unwrap_or_default())
-            .map_err(|why| {
-                BundleError::Malformed(format!(
-                    "task {task_id} has a reviewer model that cannot be used: {why}"
-                ))
-            })?;
+    // Store what the parser accepts, and report what changed (see
+    // `preview::reviewer_model_for_import`). Storing the raw text would start a
+    // reviewer run with `--model ""` or a padded identifier.
+    let (reviewer_model, reviewer_note) =
+        super::preview::reviewer_model_for_import(task_id, t.reviewer_model.as_deref())?;
+    normalization.extend(reviewer_note);
 
     let mut task = Task::new_backlog(
         &HashMap::new(),
