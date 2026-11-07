@@ -16749,6 +16749,18 @@ mod tests {
                     .await
                     .expect("linking must succeed once the live owner is safely ended");
 
+                // Without this, a failed `gh` read (`fetch_pr_state` = None) would
+                // still reach `PrCreated` and pass the assertions below.
+                let recorded = state
+                    .pr_statuses
+                    .get(&crate::pr_status::PrKey::new("testorg/testrepo", 9))
+                    .and_then(|entry| entry.status);
+                assert_eq!(
+                    recorded.map(|status| status.state),
+                    Some(crate::pr_status::PrState::Open),
+                    "the remote state must be read from the mock, not inferred",
+                );
+
                 assert!(cleaned_up.load(std::sync::atomic::Ordering::SeqCst));
                 let tasks = state.task.tasks.read().await;
                 assert_eq!(tasks.get(&task_id).unwrap().status, TaskStatus::PrCreated);
