@@ -1804,6 +1804,31 @@ impl Storage {
         slashit_durable_fs::sync_directory(dir).context("Failed to synchronize the tasks directory")
     }
 
+    /// Synchronize the directory of each Task board file this Project has, so the
+    /// entries that make an existing board reachable are durable. Startup uses
+    /// this, because a configuration sync covers only the configuration's own
+    /// directory. `Unsupported` if any of those directories cannot be asked.
+    pub fn sync_board_directories(
+        &self,
+        project_id: Uuid,
+    ) -> Result<slashit_durable_fs::DirectorySync> {
+        let mut total = slashit_durable_fs::DirectorySync::Synced;
+        for file in self.tasks_board_files(project_id) {
+            if !file.try_exists().unwrap_or(true) {
+                continue;
+            }
+            let dir = file
+                .parent()
+                .context("the Task board has no containing directory")?;
+            let sync = slashit_durable_fs::sync_directory(dir)
+                .with_context(|| format!("Failed to synchronize {}", dir.display()))?;
+            if sync == slashit_durable_fs::DirectorySync::Unsupported {
+                total = sync;
+            }
+        }
+        Ok(total)
+    }
+
     /// Save tasks for a specific project.
     ///
     /// Writes to the project's current state directory and then retires the

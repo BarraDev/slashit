@@ -110,6 +110,17 @@ any Project is used, and only with a configuration read without salvage:
   record stays and the Project loads on every start until a start can confirm
   the configuration. The record is what holds back a Project whose entry or
   board a power loss could drop, so it is not removed on an unconfirmed start.
+  The configuration's confirmation covers only the configuration's own
+  directory. The record is also removed only after the directory of the Task
+  board is synchronized at the same start. A board directory that cannot be
+  synchronized keeps the record, and the Project loads on every start with a
+  diagnostic until a start can synchronize it. A directory that cannot be
+  synchronized at all keeps the record indefinitely; that is the visible,
+  deferred cleanup the import prefers over deleting a board that might not be
+  durable. What a clearing start proves: the configuration entry and the board's
+  directory entry were each reported synchronized, and the board's bytes were
+  synchronized when they were written. The tests simulate the directory answers
+  with the durable-filesystem fault seam; they do not cut power.
 - An interrupted import whose Project entry is removed, or whose record has no
   Project, is settled the same way: the record stays while the configuration
   is unconfirmed, because a removal written there may return after a power
