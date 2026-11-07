@@ -4,7 +4,7 @@ use leptos::task::spawn_local;
 use leptos::callback::Callback;
 use crate::models::Project;
 use crate::services::list_projects;
-use crate::components::CreateProjectModal;
+use crate::components::{CreateProjectModal, ExportPhase, ExportProjectModal, ImportProjectModal, start_export};
 
 /// A tab representing an open project in the top bar
 #[derive(Clone, PartialEq)]
@@ -12,6 +12,23 @@ struct ProjectTab {
     id: String,
     name: String,
     path: Option<String>,
+}
+
+fn tab_is_open(tabs: &[ProjectTab], project_id: &str) -> bool {
+    tabs.iter().any(|t| t.id == project_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_project_already_in_a_tab_is_not_added_again() {
+        let tabs = vec![ProjectTab { id: "a".into(), name: "A".into(), path: None }];
+        assert!(tab_is_open(&tabs, "a"));
+        assert!(!tab_is_open(&tabs, "b"));
+        assert!(!tab_is_open(&[], "a"));
+    }
 }
 
 /// Persist open tabs to localStorage
@@ -49,6 +66,8 @@ pub fn ProjectTabs(
     let (loading, set_loading) = signal(true);
     let (show_create_modal, set_show_create_modal) = signal(false);
     let (refresh_trigger, set_refresh_trigger) = signal(0u32);
+    let (show_import_modal, set_show_import_modal) = signal(false);
+    let export_phase = RwSignal::new(None::<ExportPhase>);
 
     // Load projects and restore tabs on mount (also reload when refresh_trigger changes)
     Effect::new(move |prev_trigger: Option<u32>| {
@@ -162,21 +181,23 @@ pub fn ProjectTabs(
         let project_id = project.id.to_string();
         let project_name = project.name.clone();
         
-        // Add to tabs
-        let new_tab = ProjectTab {
-            id: project_id.clone(),
-            name: project_name,
-            path: project.repository_id.map(|r| r.to_string()),
-        };
-        set_tabs.update(|t| t.push(new_tab));
-        
+        // Add to tabs, unless a repeated callback (a second "Show the Project" click) already opened it
+        if !tab_is_open(&tabs.get_untracked(), &project_id) {
+            let new_tab = ProjectTab {
+                id: project_id.clone(),
+                name: project_name,
+                path: project.repository_id.map(|r| r.to_string()),
+            };
+            set_tabs.update(|t| t.push(new_tab));
+        }
+
         // Select the new project
         set_selected_project.set(project_id.clone());
-        
+
         // Persist tabs
         let tab_ids: Vec<String> = tabs.get().iter().map(|t| t.id.clone()).collect();
         persist_tabs(&tab_ids);
-        
+
         // Refresh project list
         set_refresh_trigger.update(|t| *t += 1);
     });
@@ -275,6 +296,38 @@ pub fn ProjectTabs(
 
             // Right side - add project and refresh buttons
             <div class="flex items-center gap-1 ml-auto">
+                // Import a portable Project file
+                <button
+                    data-testid="import-project-button"
+                    aria-label="Import project"
+                    on:click=move |_| set_show_import_modal.set(true)
+                    class="p-2 rounded-lg text-white/40 hover:text-white/60 hover:bg-white/5 transition-colors"
+                    title="Import project from a file"
+                >
+                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V3" />
+                    </svg>
+                </button>
+
+                // Export the selected Project to a new file
+                <button
+                    data-testid="export-project-button"
+                    aria-label="Export selected project"
+                    disabled=move || selected_project.get().is_empty()
+                    on:click=move |_| {
+                        let id = selected_project.get_untracked();
+                        if let Some(tab) = tabs.get_untracked().into_iter().find(|t| t.id == id) {
+                            start_export(tab.id, tab.name, export_phase);
+                        }
+                    }
+                    class="p-2 rounded-lg text-white/40 hover:text-white/60 hover:bg-white/5 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
+                    title="Export the selected project to a file"
+                >
+                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M16 8l-4-4m0 0L8 8m4-4v12" />
+                    </svg>
+                </button>
+
                 // Add project button
                 <button
                     data-testid="add-project-button"
@@ -304,6 +357,14 @@ pub fn ProjectTabs(
                 </button>
             </div>
             
+            <ImportProjectModal
+                show=show_import_modal
+                set_show=set_show_import_modal
+                on_project_created=on_project_created
+                on_list_changed=Callback::new(move |_| set_refresh_trigger.update(|t| *t += 1))
+            />
+            <ExportProjectModal phase=export_phase />
+
             // Create project modal
             <CreateProjectModal
                 show=show_create_modal
