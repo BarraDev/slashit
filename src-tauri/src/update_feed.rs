@@ -775,9 +775,17 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for reply in responses {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 8192];
-                let _ = stream.read(&mut request);
+                // Read the whole request and let the client close first: closing
+                // with unread request bytes resets the connection, and Windows
+                // then discards the response the client had not read yet.
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+                    request.push(byte[0]);
+                }
                 stream.write_all(reply.as_bytes()).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+                let _ = stream.read_to_end(&mut request);
             }
         });
         (listing, handle)

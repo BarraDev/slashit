@@ -20,8 +20,6 @@
 #[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
 use std::sync::LazyLock;
@@ -290,10 +288,7 @@ fn assert_read_only_invocation(claude_log: &str, what: &str) {
 
 #[cfg(unix)]
 fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("write script");
-    let mut perms = fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).expect("chmod");
+    slashit_ui_lib::test_helpers::write_executable(path, body);
 }
 
 #[cfg(unix)]

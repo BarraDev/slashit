@@ -8741,12 +8741,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_search_repository_is_the_one_gh_names_in_the_working_directory() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::TempDir::new().unwrap();
         let gh = dir.path().join("gh");
-        std::fs::write(&gh, "#!/bin/sh\necho '{\"nameWithOwner\":\"org/app\"}'\n").unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_helpers::write_executable(&gh, "#!/bin/sh\necho '{\"nameWithOwner\":\"org/app\"}'\n");
 
         let slug = test_programs::scope(
             [("gh", gh)],
@@ -9878,8 +9875,6 @@ mod tests {
     // ──────────────────────────────────────────────
     mod repo_level_pr_creation {
         use super::*;
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
         use std::process::Command as StdCommand;
 
@@ -10942,10 +10937,7 @@ mod tests {
 
         #[cfg(unix)]
         fn write_executable(path: &Path, body: &str) {
-            std::fs::write(path, body).expect("write script");
-            let mut perms = std::fs::metadata(path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(path, perms).expect("chmod");
+            crate::test_helpers::write_executable(path, body);
         }
 
         #[cfg(unix)]
@@ -16744,6 +16736,10 @@ mod tests {
             /// publish that status over a live owner.
             #[tokio::test(flavor = "multi_thread")]
             async fn link_pr_to_task_ends_a_live_owner_before_writing_pr_created() {
+                // The remote state comes from `gh` on PATH; without the lock a
+                // sibling test's MERGED mock could make this a merged link.
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
                 let (state, _tmp) = build_test_state().await;
                 let executor = attach_test_executor(&state);
                 let task_id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::InProgress).await;
@@ -16752,6 +16748,18 @@ mod tests {
                 link_pr_to_task(&state, task_id, "https://github.com/testorg/testrepo/pull/9")
                     .await
                     .expect("linking must succeed once the live owner is safely ended");
+
+                // Without this, a failed `gh` read (`fetch_pr_state` = None) would
+                // still reach `PrCreated` and pass the assertions below.
+                let recorded = state
+                    .pr_statuses
+                    .get(&crate::pr_status::PrKey::new("testorg/testrepo", 9))
+                    .and_then(|entry| entry.status);
+                assert_eq!(
+                    recorded.map(|status| status.state),
+                    Some(crate::pr_status::PrState::Open),
+                    "the remote state must be read from the mock, not inferred",
+                );
 
                 assert!(cleaned_up.load(std::sync::atomic::Ordering::SeqCst));
                 let tasks = state.task.tasks.read().await;
