@@ -130,6 +130,18 @@ enum ImportPhase {
     Applied(ImportOutcome),
 }
 
+/// The imported Project to add to navigation, or its id when the lookup did not
+/// return it. The import itself has already succeeded in both cases.
+fn navigation_after_import(
+    project_id: String,
+    lookup: Result<Option<Project>, String>,
+) -> Result<Project, String> {
+    match lookup {
+        Ok(Some(project)) => Ok(project),
+        Ok(None) | Err(_) => Err(project_id),
+    }
+}
+
 fn tone_class(tone: Tone) -> &'static str {
     match tone {
         Tone::Success => "text-emerald-300",
@@ -150,9 +162,26 @@ pub fn ImportProjectModal(
     let session = StoredValue::new(0u64);
     // One file dialog at a time.
     let choosing = StoredValue::new(false);
+    // The id of an imported Project that navigation could not show yet.
+    let unlisted = RwSignal::new(None::<String>);
+
+    // Look the imported Project up and hand it to navigation. If that fails the
+    // import still stands, so the dialog offers to try again.
+    let show_imported = move |project_id: String| async move {
+        match navigation_after_import(project_id.clone(), get_project(project_id).await) {
+            Ok(project) => {
+                let _ = unlisted.try_set(None);
+                on_project_created.run(project);
+            }
+            Err(id) => {
+                let _ = unlisted.try_set(Some(id));
+            }
+        }
+    };
 
     let close = move |_| {
         session.update_value(|s| *s += 1);
+        unlisted.set(None);
         phase.set(ImportPhase::Idle);
         set_show.set(false);
     };
@@ -199,6 +228,7 @@ pub fn ImportProjectModal(
             return;
         }
         phase.set(ImportPhase::Applying);
+        unlisted.set(None);
         let mine = session.get_value();
         spawn_local(async move {
             let outcome = match apply_import(path, report.checksum.clone()).await {
@@ -209,9 +239,7 @@ pub fn ImportProjectModal(
             // list is refreshed in every case: the caller adds a tab, selects the
             // Project and reloads the list.
             if let ImportOutcome::Applied { project_id, .. } = &outcome {
-                if let Ok(Some(project)) = get_project(project_id.clone()).await {
-                    on_project_created.run(project);
-                }
+                show_imported(project_id.clone()).await;
             }
             if session.get_value() == mine {
                 let _ = phase.try_set(ImportPhase::Applied(outcome));
@@ -219,8 +247,15 @@ pub fn ImportProjectModal(
         });
     };
 
+    let retry_show = move |_| {
+        if let Some(id) = unlisted.get_untracked() {
+            spawn_local(show_imported(id));
+        }
+    };
+
     let reset_choice = move |_| {
         session.update_value(|s| *s += 1);
+        unlisted.set(None);
         phase.set(ImportPhase::Idle);
     };
 
@@ -353,6 +388,19 @@ pub fn ImportProjectModal(
                                             "Link a local repository to this Project before its Tasks can run. The import did not create one."
                                         </p>
                                     })}
+                                    {move || unlisted.get().map(|_| view! {
+                                        <div data-testid="import-unlisted" class="space-y-2 text-amber-300">
+                                            <p>"The Project was imported, but it could not be shown in the Project list yet."</p>
+                                            <button
+                                                data-testid="import-show-project"
+                                                type="button"
+                                                on:click=retry_show
+                                                class="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-white"
+                                            >
+                                                "Show the Project"
+                                            </button>
+                                        </div>
+                                    })}
                                 </div>
                             }.into_any()
                         }
@@ -366,5 +414,32 @@ pub fn ImportProjectModal(
                 </div>
             </div>
         </Show>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project(id: &str) -> Project {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": "p", "repository_id": null, "agent_type": "claude_code",
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    const ID: &str = "00000000-0000-0000-0000-000000000001";
+
+    #[test]
+    fn a_found_project_goes_to_navigation() {
+        let shown = navigation_after_import(ID.into(), Ok(Some(project(ID)))).unwrap();
+        assert_eq!(shown.id.to_string(), ID);
+    }
+
+    #[test]
+    fn a_missing_or_failed_lookup_keeps_the_id_for_a_retry() {
+        assert_eq!(navigation_after_import(ID.into(), Ok(None)).unwrap_err(), ID);
+        assert_eq!(navigation_after_import(ID.into(), Err("ipc".into())).unwrap_err(), ID);
     }
 }
