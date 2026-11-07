@@ -256,8 +256,9 @@ impl StartTrace {
     }
 
     /// Quit the WebDriver session, then terminate the provider tree. The quit
-    /// is bounded, so a driver that never answers cannot keep the provider
-    /// alive. Both are attempted even when the first fails.
+    /// future is wrapped in a timeout, but dropping it still runs thirtyfour's
+    /// session-handle drop, so this does not bound the whole release. Both
+    /// steps are attempted even when the first fails.
     async fn release(&mut self) -> Result<()> {
         let quit = match self.driver.take() {
             Some(driver) => diagnostics::bounded(driver.quit())
@@ -310,15 +311,10 @@ impl StartTrace {
             .and_then(|raw| raw.as_ref().ok())
             .and_then(|raw| native_ready(raw));
 
-        let (url, captured) = match self.driver.as_ref() {
-            Some(driver) => (
-                Some(match diagnostics::bounded(driver.current_url()).await {
-                    Ok(url) => url.to_string(),
-                    Err(e) => format!("unavailable ({e})"),
-                }),
-                Some(diagnostics::capture(driver, dir, &prefix).await),
-            ),
-            None => (None, None),
+        // `capture` reads the URL itself, so it is not asked for twice.
+        let captured = match self.driver.as_ref() {
+            Some(driver) => Some(diagnostics::capture(driver, dir, &prefix).await),
+            None => None,
         };
         let log_tail = std::fs::read(log_path)
             .map(|bytes| String::from_utf8_lossy(tail(&bytes, START_LOG_TAIL)).into_owned())
@@ -327,7 +323,6 @@ impl StartTrace {
         let report = format_start_failure(&StartFailure {
             error,
             milestones: &self.milestones,
-            url: url.as_deref(),
             native_status: native_status.as_deref(),
             provider_exit: provider_exit.as_deref(),
             captured: captured.as_deref(),
@@ -408,7 +403,6 @@ fn tail(bytes: &[u8], limit: usize) -> &[u8] {
 struct StartFailure<'a> {
     error: &'a str,
     milestones: &'a [&'static str],
-    url: Option<&'a str>,
     native_status: Option<&'a str>,
     provider_exit: Option<&'a str>,
     captured: Option<&'a str>,
@@ -423,11 +417,10 @@ fn format_start_failure(f: &StartFailure) -> String {
         f.milestones.join(" -> ")
     };
     format!(
-        "error: {}\nmilestones reached: {milestones}\nurl: {}\ntauri-driver exit: {}\n\
-         native driver GET /status:\n{}\n\nsession capture:\n  {}\n\n\
+        "error: {}\nmilestones reached: {milestones}\ntauri-driver exit: {}\n\
+         native driver GET /status:\n{}\n\nsession capture (includes the URL):\n  {}\n\n\
          provider log (last {START_LOG_TAIL} bytes):\n{}\n",
         f.error,
-        f.url.unwrap_or(absent),
         f.provider_exit.unwrap_or(absent),
         f.native_status.unwrap_or(absent),
         f.captured.unwrap_or("no session existed"),
@@ -586,7 +579,6 @@ mod tests {
         let report = format_start_failure(&StartFailure {
             error: "the provider refused to create a session: HTTP 500",
             milestones: &["provider and native driver ready"],
-            url: None,
             native_status: Some("HTTP/1.1 200 OK\r\n\r\n{\"value\":{\"ready\":true}}"),
             provider_exit: Some("still running"),
             captured: None,
@@ -594,7 +586,6 @@ mod tests {
         });
         assert!(report.contains("error: the provider refused to create a session: HTTP 500"));
         assert!(report.contains("milestones reached: provider and native driver ready\n"));
-        assert!(report.contains("url: not reached"));
         assert!(report.contains("tauri-driver exit: still running"));
         assert!(report.contains("\"ready\":true"));
         assert!(report.contains("no session existed"));

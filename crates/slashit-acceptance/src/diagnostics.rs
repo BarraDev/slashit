@@ -17,9 +17,10 @@ use thirtyfour::prelude::*;
 /// which is where a mount failure or an error page shows itself.
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 
-/// How long one diagnostic WebDriver call may take. Diagnostics are best
-/// effort and are never retried, but a driver that stops answering must not
-/// turn a failed journey into a hung job.
+/// How long one diagnostic WebDriver call may take before it is abandoned.
+/// The timeout drops the call's future; it does not bound thirtyfour's
+/// session-handle drop, which runs its own synchronous DELETE. Calls are
+/// never retried.
 const DIAGNOSTIC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run one diagnostic call under [`DIAGNOSTIC_CALL_TIMEOUT`], once.

@@ -114,8 +114,11 @@ Publication policy: the CI failure artifact is an allowlist of
 `journey-timings*.jsonl`, `*/journey-result.json` and `*/*-start-summary.json`
 only. Page source, screenshots, native driver status, URLs, window titles and
 provider logs stay on the runner and are not uploaded. Each diagnostic
-WebDriver call is bounded (10 seconds, never retried) so a hung driver cannot
-hang a failed job.
+WebDriver call (URL, title, screenshot, page source) and the bounded
+WebDriver quit on a failed start is wrapped in a 10-second timeout and is
+never retried. The timeout drops the call's future; it does not bound the
+session handle's own drop, which thirtyfour runs as a synchronous DELETE with
+its own 120-second default. No total time is promised for a failure.
 
 ### Configuration
 

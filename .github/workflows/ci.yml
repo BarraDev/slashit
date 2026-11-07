@@ -7,7 +7,8 @@ name: CI
 # Every checkout also sets `persist-credentials: false`. `actions/checkout`
 # otherwise leaves the token in `.git/config`, and these jobs build and run
 # code from the pull request's own revision -- including a desktop acceptance
-# job that uploads `target/acceptance` as an artifact when it fails. A token
+# job that uploads an allowlist of sanitized records from `target/acceptance`
+# as an artifact when it fails (see "Preserve failure evidence"). A token
 # that is never written to the workspace cannot be read out of it.
 permissions:
   contents: read
