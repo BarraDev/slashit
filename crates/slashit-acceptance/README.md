@@ -100,11 +100,22 @@ Failed journeys also retain `journey-result.json` beside their existing
 screenshots, page source and `*-provider.log`. The provider log records
 `tauri-driver` output and any output its native driver/application descendants
 inherit; the harness does not configure a separate product application log.
+A start that fails writes `*-start-failure.txt` (raw: native driver status,
+URL, provider log tail) and `*-start-summary.json` (milestones, error and
+provider log classes, provider state and exit code, `native_ready`, elapsed
+time, artifact basenames) beside the provider log.
 Failure classes are diagnostic hints based on concrete error markers. The
 original libtest failure and captured page evidence remain authoritative.
 CI artifact names include the workflow attempt so a failed rerun cannot collide
 with an artifact from an earlier attempt. Failures before the test runner
 creates `target/acceptance` remain available in their GitHub Actions step logs.
+
+Publication policy: the CI failure artifact is an allowlist of
+`journey-timings*.jsonl`, `*/journey-result.json` and `*/*-start-summary.json`
+only. Page source, screenshots, native driver status, URLs, window titles and
+provider logs stay on the runner and are not uploaded. Each diagnostic
+WebDriver call is bounded (10 seconds, never retried) so a hung driver cannot
+hang a failed job.
 
 ### Configuration
 
@@ -188,8 +199,9 @@ do not compare them byte for byte.
   fixed sleep.
 - **Evidence on failure.** URL, title, screenshot, page source and the
   provider log are captured while the application is still alive, into
-  `target/acceptance/`. Successful runs delete everything; failed runs are
-  retained, oldest first, up to a bounded count.
+  `target/acceptance/`, and stay local (see the publication policy above).
+  Successful runs delete everything; failed runs are retained, oldest first,
+  up to a bounded count.
 - **A click that opens nothing says why.** `open_drawer` clicks a card once.
   If its drawer does not appear, the failure message carries what the page
   saw: each pointer, mouse, drag and scroll event with where the card was,

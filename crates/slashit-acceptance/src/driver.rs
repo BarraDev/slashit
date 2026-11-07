@@ -33,6 +33,7 @@ use thirtyfour::prelude::*;
 
 use crate::context::Environment;
 use crate::developer_tools;
+use crate::diagnostics;
 use crate::ports::{self, ReservedPort};
 use crate::process::OwnedProcess;
 use crate::state::StateRoot;
@@ -73,27 +74,20 @@ pub struct Session {
 impl Session {
     /// Start the provider, launch the application against `state`, and return
     /// only once the frontend has mounted.
+    ///
+    /// A failed start is diagnosed while the provider and driver it got
+    /// through are still alive; see [`fail_start`].
     pub async fn start(
         env: &Environment,
         state: &StateRoot,
         log_path: PathBuf,
         child_env: &[(OsString, OsString)],
     ) -> Result<Self> {
-        let mut trace = StartTrace::default();
-        let mut started = Self::start_traced(env, state, &log_path, child_env, &mut trace).await;
-        if let Err(error) = &started {
-            // The provider log is the only place the native driver's own
-            // complaint appears, so name it in the failure.
-            let note = trace.record(&log_path, &format!("{error:#}")).await;
-            started = started.map_err(|e| {
-                e.context(format!(
-                    "provider log: {} (application: {}); startup diagnostics: {note}",
-                    log_path.display(),
-                    env.app_binary().display()
-                ))
-            });
+        let mut trace = StartTrace::new();
+        match Self::start_traced(env, state, &log_path, child_env, &mut trace).await {
+            Ok(()) => Ok(trace.into_session(log_path)),
+            Err(error) => Err(fail_start(trace, &log_path, env.app_binary(), error).await),
         }
-        started
     }
 
     async fn start_traced(
@@ -102,7 +96,7 @@ impl Session {
         log_path: &Path,
         child_env: &[(OsString, OsString)],
         trace: &mut StartTrace,
-    ) -> Result<Self> {
+    ) -> Result<()> {
         // One deadline for the whole "get a session" step, shared across the
         // three waits inside it. See the constants above for why: without a
         // shared deadline, a retry or an extra wait multiplies the total
@@ -145,17 +139,13 @@ impl Session {
             )
             .await?;
         trace.milestones.push("session created");
-        let session = Self {
-            driver: trace.driver.insert(driver).clone(),
-            provider: trace.provider.take().expect("the provider was stored above"),
-            log_path: log_path.to_path_buf(),
-        };
+        let driver = trace.driver.insert(driver);
 
-        session.assert_custom_protocol_build().await?;
+        Self::assert_custom_protocol_build(driver).await?;
         trace.milestones.push("embedded frontend loaded");
-        session.wait_until_mounted().await?;
-        trace.driver = None;
-        Ok(session)
+        Self::wait_until_mounted(driver).await?;
+        trace.milestones.push("frontend mounted");
+        Ok(())
     }
 
     /// Fail immediately if the binary under test is a development build.
@@ -168,9 +158,8 @@ impl Session {
     /// The usual cause is mundane: `cargo build`, `cargo test` or `cargo
     /// clippy` for `slashit-ui` rebuilds `target/debug/slashit-ui` without
     /// `custom-protocol` and silently replaces the acceptance binary.
-    async fn assert_custom_protocol_build(&self) -> Result<()> {
-        let url = self
-            .driver
+    async fn assert_custom_protocol_build(driver: &WebDriver) -> Result<()> {
+        let url = driver
             .current_url()
             .await
             .context("could not read the application's URL")?
@@ -191,8 +180,8 @@ impl Session {
     ///
     /// A Tauri window appears long before WASM has mounted anything, so
     /// "the process is alive" is not readiness. This is.
-    async fn wait_until_mounted(&self) -> Result<()> {
-        self.driver
+    async fn wait_until_mounted(driver: &WebDriver) -> Result<()> {
+        driver
             .query(By::Css(ROOT_ELEMENT))
             .wait(MOUNT_TIMEOUT, POLL)
             .exists()
@@ -236,44 +225,98 @@ impl Session {
     }
 }
 
-/// What a failed [`Session::start`] got through, kept so the failure can be
-/// explained. Holds the provider until a session owns it, and a driver while
-/// a session exists, so both can still be asked about the failure.
-#[derive(Default)]
+/// What a start got through. Holds the provider and the driver until a
+/// [`Session`] takes them over, so a failed start can still ask them about the
+/// failure before releasing them. Nothing here is dropped on the way out.
 struct StartTrace {
+    started: Instant,
     milestones: Vec<&'static str>,
     provider: Option<Provider>,
     driver: Option<WebDriver>,
 }
 
 impl StartTrace {
-    /// Write `<session>-start-failure.txt` next to the provider log, plus a
-    /// screenshot and page source when a session exists, and say where.
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            milestones: Vec::new(),
+            provider: None,
+            driver: None,
+        }
+    }
+
+    fn into_session(self, log_path: PathBuf) -> Session {
+        Session {
+            driver: self.driver.expect("a started session stores its driver"),
+            provider: self
+                .provider
+                .expect("a started session stores its provider"),
+            log_path,
+        }
+    }
+
+    /// Quit the WebDriver session, then terminate the provider tree. The quit
+    /// is bounded, so a driver that never answers cannot keep the provider
+    /// alive. Both are attempted even when the first fails.
+    async fn release(&mut self) -> Result<()> {
+        let quit = match self.driver.take() {
+            Some(driver) => diagnostics::bounded(driver.quit())
+                .await
+                .map_err(|e| anyhow!("closing the WebDriver session failed: {e}")),
+            None => Ok(()),
+        };
+        let stop = match self.provider.take() {
+            Some(provider) => provider.shutdown(),
+            None => Ok(()),
+        };
+        quit.and(stop)
+    }
+
+    /// Write `<session>-start-failure.txt` (raw, local only) and
+    /// `<session>-start-summary.json` (the publishable subset) beside the
+    /// provider log, plus a screenshot and page source when a session exists.
+    /// Must run before [`StartTrace::release`]. Returns where they went.
     async fn record(&mut self, log_path: &Path, error: &str) -> String {
         let dir = log_path.parent().unwrap_or(Path::new("."));
         let stem = log_path.file_name().unwrap_or_default().to_string_lossy();
-        let prefix = stem.strip_suffix("-provider.log").unwrap_or(&stem).to_string();
+        let prefix = stem
+            .strip_suffix("-provider.log")
+            .unwrap_or(&stem)
+            .to_string();
 
-        let (status, exit) = match self.provider.as_mut() {
-            Some(provider) => (
-                Some(match ports::http_get_raw(provider.native_port, "/status").await {
-                    Ok(raw) => raw,
-                    Err(e) => format!("unavailable ({e:#})"),
-                }),
-                Some(match provider.process.exit_status() {
-                    Some(status) => status.to_string(),
-                    None => "still running".to_string(),
-                }),
-            ),
-            None => (None, None),
+        let (provider_state, exit_status, status) = match self.provider.as_mut() {
+            Some(provider) => {
+                let exit_status = provider.process.exit_status();
+                let status = ports::http_get_raw(provider.native_port, "/status").await;
+                let state = if exit_status.is_some() {
+                    "exited"
+                } else {
+                    "running"
+                };
+                (state, Some(exit_status), Some(status))
+            }
+            None => ("not started", None, None),
         };
+        let provider_exit = exit_status.map(|exit| match exit {
+            Some(status) => status.to_string(),
+            None => "still running".to_string(),
+        });
+        let native_status = status.as_ref().map(|raw| match raw {
+            Ok(raw) => raw.clone(),
+            Err(e) => format!("unavailable ({e:#})"),
+        });
+        let native_ready = status
+            .as_ref()
+            .and_then(|raw| raw.as_ref().ok())
+            .and_then(|raw| native_ready(raw));
+
         let (url, captured) = match self.driver.as_ref() {
             Some(driver) => (
-                Some(match driver.current_url().await {
+                Some(match diagnostics::bounded(driver.current_url()).await {
                     Ok(url) => url.to_string(),
                     Err(e) => format!("unavailable ({e})"),
                 }),
-                Some(crate::diagnostics::capture(driver, dir, &prefix).await),
+                Some(diagnostics::capture(driver, dir, &prefix).await),
             ),
             None => (None, None),
         };
@@ -285,17 +328,74 @@ impl StartTrace {
             error,
             milestones: &self.milestones,
             url: url.as_deref(),
-            native_status: status.as_deref(),
-            provider_exit: exit.as_deref(),
+            native_status: native_status.as_deref(),
+            provider_exit: provider_exit.as_deref(),
             captured: captured.as_deref(),
             log_tail: &log_tail,
         });
-        let path = dir.join(format!("{prefix}-start-failure.txt"));
-        match std::fs::write(&path, report) {
+        let summary = json!({
+            "schema_version": 1,
+            "last_milestone": self.milestones.last(),
+            "milestones": self.milestones,
+            "elapsed_ms": u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "error_class": diagnostics::classify_failure(error).as_str(),
+            "provider_log_class": diagnostics::classify_failure(&log_tail).as_str(),
+            "provider_state": provider_state,
+            "provider_exit_code": exit_status.flatten().and_then(|status| status.code()),
+            "native_ready": native_ready,
+            "artifacts": {
+                "provider_log": format!("{prefix}-provider.log"),
+                "start_failure_report": format!("{prefix}-start-failure.txt"),
+            },
+        });
+
+        let report_path = dir.join(format!("{prefix}-start-failure.txt"));
+        let summary_path = dir.join(format!("{prefix}-start-summary.json"));
+        let written = |path: &Path, result: std::io::Result<()>| match result {
             Ok(()) => path.display().to_string(),
             Err(e) => format!("could not write {} ({e})", path.display()),
-        }
+        };
+        let report_note = written(&report_path, std::fs::write(&report_path, report));
+        let summary_note = written(
+            &summary_path,
+            std::fs::write(&summary_path, summary.to_string()),
+        );
+        format!("{report_note}, {summary_note}")
     }
+}
+
+/// Diagnose a start that failed, release what it owns, and return the original
+/// error with the evidence location added. Diagnostics run first, while the
+/// provider and driver are alive, and they never replace the error.
+async fn fail_start(
+    mut trace: StartTrace,
+    log_path: &Path,
+    app_binary: &Path,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    // The provider log is the only place the native driver's own complaint
+    // appears, so name it in the failure.
+    let note = trace.record(log_path, &format!("{error:#}")).await;
+    let released = trace.release().await;
+    let error = error.context(format!(
+        "provider log: {} (application: {}); startup diagnostics: {note}",
+        log_path.display(),
+        app_binary.display()
+    ));
+    match released {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!(
+            "cleaning up the failed start also failed: {cleanup:#}"
+        )),
+    }
+}
+
+/// Whether a raw `GET /status` response reports `value.ready == true`.
+/// `None` when the response is not a WebDriver status report.
+fn native_ready(raw: &str) -> Option<bool> {
+    let body = raw.split_once("\r\n\r\n")?.1;
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value["value"]["ready"].as_bool()
 }
 
 /// How much of the provider log a start-failure report repeats.
@@ -343,7 +443,10 @@ fn application_capabilities(app_binary: &Path) -> Result<Capabilities> {
     // (`webkitgtk:browserOptions` here). thirtyfour already serialises
     // exactly that envelope, so no protocol glue is needed.
     capabilities
-        .set("tauri:options", json!({ "application": app_binary, "args": [] }))
+        .set(
+            "tauri:options",
+            json!({ "application": app_binary, "args": [] }),
+        )
         .map_err(|e| anyhow!("could not set tauri:options: {e}"))?;
     Ok(capabilities)
 }
@@ -389,7 +492,9 @@ impl Provider {
         }
         configure(&mut command)?;
         command
-            .stdout(Stdio::from(log.try_clone().context("clone the log handle")?))
+            .stdout(Stdio::from(
+                log.try_clone().context("clone the log handle")?,
+            ))
             .stderr(Stdio::from(log));
 
         // Hand both ports over only now, and refuse to start if anything
@@ -464,7 +569,10 @@ impl Provider {
     /// Terminate the provider tree and verify both ports were let go.
     pub fn shutdown(mut self) -> Result<()> {
         self.process.terminate()?;
-        ports::assert_free(self.client_port, "the provider's client port after shutdown")?;
+        ports::assert_free(
+            self.client_port,
+            "the provider's client port after shutdown",
+        )?;
         ports::assert_free(self.native_port, "the native driver's port after shutdown")
     }
 }
@@ -497,5 +605,109 @@ mod tests {
     fn the_report_repeats_only_the_end_of_the_provider_log() {
         assert_eq!(tail(b"abcdef", 4), b"cdef");
         assert_eq!(tail(b"ab", 4), b"ab");
+    }
+
+    /// A failed start must still own its provider while diagnostics read it.
+    /// Before the fix the provider went away with a dropped session, so the
+    /// report had no native status and no provider state.
+    #[tokio::test]
+    async fn a_failed_start_reads_the_live_provider_before_releasing_it() {
+        let dir =
+            std::env::temp_dir().join(format!("slashit-start-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let log_path = dir.join("0-test-provider.log");
+        std::fs::write(&log_path, "tauri-driver output\n").expect("provider log");
+
+        // A stand-in native driver: it answers one /status request, and drops
+        // its listener before replying so the port is free at release time.
+        // It gives up after a few seconds rather than blocking forever, so a
+        // regression that never asks it anything fails the test instead of
+        // hanging it.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("native port");
+        let native_port = listener.local_addr().expect("address").port();
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let native = std::thread::spawn(move || {
+            use std::io::{ErrorKind, Read, Write};
+            let give_up = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < give_up => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return false,
+                }
+            };
+            stream.set_nonblocking(false).expect("blocking stream");
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request);
+            drop(listener);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"value\":{\"ready\":true}}")
+                .is_ok()
+        });
+        let client_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("client port")
+            .local_addr()
+            .expect("address")
+            .port();
+
+        let mut command = Command::new("sleep");
+        command.arg("60");
+        let process =
+            OwnedProcess::spawn("test provider", &mut command).expect("stand-in provider");
+        let mut trace = StartTrace::new();
+        trace.milestones.push("provider and native driver ready");
+        trace.provider = Some(Provider {
+            process,
+            client_port,
+            native_port,
+        });
+
+        let error = fail_start(
+            trace,
+            &log_path,
+            Path::new("/unused/slashit-ui"),
+            anyhow!("the provider refused to create a session: HTTP 500"),
+        )
+        .await;
+        assert!(
+            native.join().expect("stand-in native driver"),
+            "the native driver was never asked for /status"
+        );
+
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("the provider refused to create a session: HTTP 500"),
+            "{chain}"
+        );
+        assert!(
+            !chain.contains("cleaning up the failed start also failed"),
+            "{chain}"
+        );
+
+        let report = std::fs::read_to_string(dir.join("0-test-start-failure.txt")).expect("report");
+        assert!(report.contains("\"ready\":true"), "{report}");
+        assert!(
+            report.contains("tauri-driver exit: still running"),
+            "{report}"
+        );
+
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("0-test-start-summary.json")).expect("summary"),
+        )
+        .expect("summary is JSON");
+        assert_eq!(summary["provider_state"], "running");
+        assert_eq!(summary["native_ready"], true);
+        assert_eq!(
+            summary["last_milestone"],
+            "provider and native driver ready"
+        );
+        assert_eq!(summary["error_class"], "assertion_or_product");
+
+        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 }
