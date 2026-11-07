@@ -16744,6 +16744,10 @@ mod tests {
             /// publish that status over a live owner.
             #[tokio::test(flavor = "multi_thread")]
             async fn link_pr_to_task_ends_a_live_owner_before_writing_pr_created() {
+                // The remote state comes from `gh` on PATH; without the lock a
+                // sibling test's MERGED mock could make this a merged link.
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
                 let (state, _tmp) = build_test_state().await;
                 let executor = attach_test_executor(&state);
                 let task_id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::InProgress).await;
