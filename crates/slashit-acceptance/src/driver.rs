@@ -79,34 +79,30 @@ impl Session {
         log_path: PathBuf,
         child_env: &[(OsString, OsString)],
     ) -> Result<Self> {
-        let started = Self::create(env, state, &log_path, child_env).await;
-        let (driver, provider) = started.map_err(|e| {
+        let mut trace = StartTrace::default();
+        let mut started = Self::start_traced(env, state, &log_path, child_env, &mut trace).await;
+        if let Err(error) = &started {
             // The provider log is the only place the native driver's own
             // complaint appears, so name it in the failure.
-            e.context(format!(
-                "provider log: {} (application: {})",
-                log_path.display(),
-                env.app_binary().display()
-            ))
-        })?;
-
-        let session = Self {
-            driver,
-            provider,
-            log_path,
-        };
-
-        session.assert_custom_protocol_build().await?;
-        session.wait_until_mounted().await?;
-        Ok(session)
+            let note = trace.record(&log_path, &format!("{error:#}")).await;
+            started = started.map_err(|e| {
+                e.context(format!(
+                    "provider log: {} (application: {}); startup diagnostics: {note}",
+                    log_path.display(),
+                    env.app_binary().display()
+                ))
+            });
+        }
+        started
     }
 
-    async fn create(
+    async fn start_traced(
         env: &Environment,
         state: &StateRoot,
         log_path: &Path,
         child_env: &[(OsString, OsString)],
-    ) -> Result<(WebDriver, Provider)> {
+        trace: &mut StartTrace,
+    ) -> Result<Self> {
         // One deadline for the whole "get a session" step, shared across the
         // three waits inside it. See the constants above for why: without a
         // shared deadline, a retry or an extra wait multiplies the total
@@ -118,7 +114,7 @@ impl Session {
         // being inherited. See `fake_agent::publish_controls`.
         crate::fake_agent::publish_controls(child_env)?;
 
-        let mut provider = Provider::spawn(env.native_driver(), log_path, deadline, |command| {
+        let provider = Provider::spawn(env.native_driver(), log_path, deadline, |command| {
             // The journey's own variables go on first so the state root's go
             // on last and win. Isolation is not something a test should be
             // able to switch off by asking for one more variable.
@@ -140,13 +136,26 @@ impl Session {
             Ok(())
         })
         .await?;
+        trace.milestones.push("provider and native driver ready");
+        let provider = trace.provider.insert(provider);
         let driver = provider
             .create_session(
                 application_capabilities(env.app_binary())?,
                 deadline.saturating_duration_since(Instant::now()),
             )
             .await?;
-        Ok((driver, provider))
+        trace.milestones.push("session created");
+        let session = Self {
+            driver: trace.driver.insert(driver).clone(),
+            provider: trace.provider.take().expect("the provider was stored above"),
+            log_path: log_path.to_path_buf(),
+        };
+
+        session.assert_custom_protocol_build().await?;
+        trace.milestones.push("embedded frontend loaded");
+        session.wait_until_mounted().await?;
+        trace.driver = None;
+        Ok(session)
     }
 
     /// Fail immediately if the binary under test is a development build.
@@ -225,6 +234,105 @@ impl Session {
 
         quit.map_err(|e| anyhow!("closing the WebDriver session failed: {e}"))
     }
+}
+
+/// What a failed [`Session::start`] got through, kept so the failure can be
+/// explained. Holds the provider until a session owns it, and a driver while
+/// a session exists, so both can still be asked about the failure.
+#[derive(Default)]
+struct StartTrace {
+    milestones: Vec<&'static str>,
+    provider: Option<Provider>,
+    driver: Option<WebDriver>,
+}
+
+impl StartTrace {
+    /// Write `<session>-start-failure.txt` next to the provider log, plus a
+    /// screenshot and page source when a session exists, and say where.
+    async fn record(&mut self, log_path: &Path, error: &str) -> String {
+        let dir = log_path.parent().unwrap_or(Path::new("."));
+        let stem = log_path.file_name().unwrap_or_default().to_string_lossy();
+        let prefix = stem.strip_suffix("-provider.log").unwrap_or(&stem).to_string();
+
+        let (status, exit) = match self.provider.as_mut() {
+            Some(provider) => (
+                Some(match ports::http_get_raw(provider.native_port, "/status").await {
+                    Ok(raw) => raw,
+                    Err(e) => format!("unavailable ({e:#})"),
+                }),
+                Some(match provider.process.exit_status() {
+                    Some(status) => status.to_string(),
+                    None => "still running".to_string(),
+                }),
+            ),
+            None => (None, None),
+        };
+        let (url, captured) = match self.driver.as_ref() {
+            Some(driver) => (
+                Some(match driver.current_url().await {
+                    Ok(url) => url.to_string(),
+                    Err(e) => format!("unavailable ({e})"),
+                }),
+                Some(crate::diagnostics::capture(driver, dir, &prefix).await),
+            ),
+            None => (None, None),
+        };
+        let log_tail = std::fs::read(log_path)
+            .map(|bytes| String::from_utf8_lossy(tail(&bytes, START_LOG_TAIL)).into_owned())
+            .unwrap_or_else(|e| format!("unreadable ({e})"));
+
+        let report = format_start_failure(&StartFailure {
+            error,
+            milestones: &self.milestones,
+            url: url.as_deref(),
+            native_status: status.as_deref(),
+            provider_exit: exit.as_deref(),
+            captured: captured.as_deref(),
+            log_tail: &log_tail,
+        });
+        let path = dir.join(format!("{prefix}-start-failure.txt"));
+        match std::fs::write(&path, report) {
+            Ok(()) => path.display().to_string(),
+            Err(e) => format!("could not write {} ({e})", path.display()),
+        }
+    }
+}
+
+/// How much of the provider log a start-failure report repeats.
+const START_LOG_TAIL: usize = 16 * 1024;
+
+fn tail(bytes: &[u8], limit: usize) -> &[u8] {
+    &bytes[bytes.len().saturating_sub(limit)..]
+}
+
+struct StartFailure<'a> {
+    error: &'a str,
+    milestones: &'a [&'static str],
+    url: Option<&'a str>,
+    native_status: Option<&'a str>,
+    provider_exit: Option<&'a str>,
+    captured: Option<&'a str>,
+    log_tail: &'a str,
+}
+
+fn format_start_failure(f: &StartFailure) -> String {
+    let absent = "not reached";
+    let milestones = if f.milestones.is_empty() {
+        "none".to_string()
+    } else {
+        f.milestones.join(" -> ")
+    };
+    format!(
+        "error: {}\nmilestones reached: {milestones}\nurl: {}\ntauri-driver exit: {}\n\
+         native driver GET /status:\n{}\n\nsession capture:\n  {}\n\n\
+         provider log (last {START_LOG_TAIL} bytes):\n{}\n",
+        f.error,
+        f.url.unwrap_or(absent),
+        f.provider_exit.unwrap_or(absent),
+        f.native_status.unwrap_or(absent),
+        f.captured.unwrap_or("no session existed"),
+        f.log_tail,
+    )
 }
 
 /// The capabilities that ask the provider to launch `app_binary`.
@@ -358,5 +466,36 @@ impl Provider {
         self.process.terminate()?;
         ports::assert_free(self.client_port, "the provider's client port after shutdown")?;
         ports::assert_free(self.native_port, "the native driver's port after shutdown")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_start_failure_report_names_what_was_and_was_not_reached() {
+        let report = format_start_failure(&StartFailure {
+            error: "the provider refused to create a session: HTTP 500",
+            milestones: &["provider and native driver ready"],
+            url: None,
+            native_status: Some("HTTP/1.1 200 OK\r\n\r\n{\"value\":{\"ready\":true}}"),
+            provider_exit: Some("still running"),
+            captured: None,
+            log_tail: "invalid session id",
+        });
+        assert!(report.contains("error: the provider refused to create a session: HTTP 500"));
+        assert!(report.contains("milestones reached: provider and native driver ready\n"));
+        assert!(report.contains("url: not reached"));
+        assert!(report.contains("tauri-driver exit: still running"));
+        assert!(report.contains("\"ready\":true"));
+        assert!(report.contains("no session existed"));
+        assert!(report.ends_with("invalid session id\n"));
+    }
+
+    #[test]
+    fn the_report_repeats_only_the_end_of_the_provider_log() {
+        assert_eq!(tail(b"abcdef", 4), b"cdef");
+        assert_eq!(tail(b"ab", 4), b"ab");
     }
 }

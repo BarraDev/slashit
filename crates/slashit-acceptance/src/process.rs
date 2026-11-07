@@ -58,6 +58,14 @@ impl OwnedProcess {
         })
     }
 
+    /// The leader's exit status if it has already exited, reaping it; `None`
+    /// while it runs. For startup diagnostics.
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        let status = self.child.try_wait().ok().flatten();
+        self.reaped |= status.is_some();
+        status
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }

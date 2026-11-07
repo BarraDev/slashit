@@ -144,6 +144,28 @@ pub async fn wait_until_webdriver_ready(
     )
 }
 
+/// One bounded GET whose raw response (status line, headers and at most
+/// 16 KiB in all) is returned as text, for diagnostics only.
+pub async fn http_get_raw(port: u16, path: &str) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let exchange = async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .context("connect")?;
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes())
+            .await
+            .context("write request")?;
+        let mut raw = Vec::new();
+        stream.take(16 * 1024).read_to_end(&mut raw).await.context("read response")?;
+        Ok(String::from_utf8_lossy(&raw).into_owned())
+    };
+    tokio::time::timeout(Duration::from_secs(3), exchange)
+        .await
+        .context("no response within 3s")?
+}
+
 /// One GET, no retry, no connection reuse: whether the response was a
 /// well-formed WebDriver status report with `value.ready == true`, or the
 /// error that stopped it (most commonly "connection refused" while the
