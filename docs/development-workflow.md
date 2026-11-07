@@ -791,6 +791,9 @@ against the ruleset on 2026-11-06:
 - Squash is the only allowed merge method, and history must be linear.
 - Non-fast-forward updates and deletion of `main` are refused.
 - No bypass actors.
+- `require_extra_approval_for_unattributed_changes` is `true`. The ruleset
+  read-back shows the setting, but this document does not verify its effect on
+  a merge.
 - No required status checks. GitHub does not block a merge on a red or pending
   CI run, so the CI requirement below is procedural.
 
