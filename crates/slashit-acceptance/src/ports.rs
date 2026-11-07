@@ -144,6 +144,35 @@ pub async fn wait_until_webdriver_ready(
     )
 }
 
+/// One bounded GET whose raw response (status line, headers and at most
+/// 16 KiB in all) is returned as text, for diagnostics only.
+pub async fn http_get_raw(port: u16, path: &str) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let exchange = async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .context("connect")?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .context("write request")?;
+        let mut raw = Vec::new();
+        stream
+            .take(16 * 1024)
+            .read_to_end(&mut raw)
+            .await
+            .context("read response")?;
+        Ok(String::from_utf8_lossy(&raw).into_owned())
+    };
+    tokio::time::timeout(Duration::from_secs(3), exchange)
+        .await
+        .context("no response within 3s")?
+}
+
 /// One GET, no retry, no connection reuse: whether the response was a
 /// well-formed WebDriver status report with `value.ready == true`, or the
 /// error that stopped it (most commonly "connection refused" while the
@@ -156,7 +185,10 @@ async fn http_get_webdriver_ready(port: u16, path: &str) -> Result<bool> {
         .await
         .context("connect")?;
     stream
-        .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .await
         .context("write request")?;
 
@@ -317,9 +349,14 @@ mod tests {
         tokio::spawn(respond_forever(listener, webdriver_status_response(false)));
 
         let started = Instant::now();
-        let err = wait_until_webdriver_ready(port, "/status", Duration::from_millis(300), "a native driver")
-            .await
-            .expect_err("ready:false must never be reported as ready");
+        let err = wait_until_webdriver_ready(
+            port,
+            "/status",
+            Duration::from_millis(300),
+            "a native driver",
+        )
+        .await
+        .expect_err("ready:false must never be reported as ready");
         assert!(
             started.elapsed() >= Duration::from_millis(300),
             "a permanent ready:false must be retried until the deadline, not accepted early: {:?}",
@@ -347,9 +384,14 @@ mod tests {
         );
         tokio::spawn(respond_forever(listener, response));
 
-        wait_until_webdriver_ready(port, "/status", Duration::from_millis(300), "a native driver")
-            .await
-            .expect_err("a malformed status body must never be treated as ready");
+        wait_until_webdriver_ready(
+            port,
+            "/status",
+            Duration::from_millis(300),
+            "a native driver",
+        )
+        .await
+        .expect_err("a malformed status body must never be treated as ready");
     }
 
     /// A corrupt or hostile `Content-Length` must not be trusted for the size
@@ -363,9 +405,14 @@ mod tests {
         let response = "HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999\r\n\r\n".to_string();
         tokio::spawn(respond_forever(listener, response));
 
-        wait_until_webdriver_ready(port, "/status", Duration::from_millis(300), "a native driver")
-            .await
-            .expect_err("an implausible Content-Length must fail gracefully, not abort the process");
+        wait_until_webdriver_ready(
+            port,
+            "/status",
+            Duration::from_millis(300),
+            "a native driver",
+        )
+        .await
+        .expect_err("an implausible Content-Length must fail gracefully, not abort the process");
     }
 
     /// The regression this fix exists for: a peer that accepts the TCP
@@ -400,7 +447,8 @@ mod tests {
             "a stalled attempt must not outlive the shared deadline: {elapsed:?}"
         );
         assert!(
-            err.to_string().contains("did not complete before the startup deadline"),
+            err.to_string()
+                .contains("did not complete before the startup deadline"),
             "the failure should name the stalled attempt, not a generic timeout: {err}"
         );
     }
@@ -412,7 +460,8 @@ mod tests {
         listener
             .set_nonblocking(true)
             .expect("mark the listener non-blocking before handing it to tokio");
-        let listener = tokio::net::TcpListener::from_std(listener).expect("adopt std listener into tokio");
+        let listener =
+            tokio::net::TcpListener::from_std(listener).expect("adopt std listener into tokio");
         // Accepted connections are kept here, alive for as long as this task
         // runs, rather than dropped -- dropping would close the socket and
         // turn "accepted but silent" into "connection reset", a different
@@ -442,8 +491,9 @@ mod tests {
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let listener =
-                tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("bind late");
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("bind late");
             respond_once_tokio(listener, webdriver_status_response(true)).await;
         });
 
@@ -487,11 +537,15 @@ mod tests {
     /// Answer every connection this listener ever accepts with the same
     /// `response`, for as long as the test keeps polling. Used where the wait
     /// under test must retry more than once before its deadline.
-    async fn respond_forever(listener: TcpListener, response: impl Into<String> + Clone + Send + 'static) {
+    async fn respond_forever(
+        listener: TcpListener,
+        response: impl Into<String> + Clone + Send + 'static,
+    ) {
         listener
             .set_nonblocking(true)
             .expect("mark the listener non-blocking before handing it to tokio");
-        let listener = tokio::net::TcpListener::from_std(listener).expect("adopt std listener into tokio");
+        let listener =
+            tokio::net::TcpListener::from_std(listener).expect("adopt std listener into tokio");
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;

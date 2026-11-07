@@ -8,12 +8,38 @@
 //! error it was supposed to explain.
 
 use anyhow::Result;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thirtyfour::prelude::*;
 
 /// Page source is captured whole up to this size; beyond it the head is kept,
 /// which is where a mount failure or an error page shows itself.
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
+
+/// How long one diagnostic WebDriver call may take before it is abandoned.
+/// The timeout drops the call's future; it does not bound thirtyfour's
+/// session-handle drop, which runs its own synchronous DELETE. Calls are
+/// never retried.
+const DIAGNOSTIC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run one diagnostic call under [`DIAGNOSTIC_CALL_TIMEOUT`], once.
+pub async fn bounded<T, E: std::fmt::Display>(
+    call: impl Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, String> {
+    bounded_within(DIAGNOSTIC_CALL_TIMEOUT, call).await
+}
+
+async fn bounded_within<T, E: std::fmt::Display>(
+    limit: Duration,
+    call: impl Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, String> {
+    match tokio::time::timeout(limit, call).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!("no answer within {limit:?}")),
+    }
+}
 
 /// How many failed runs' artifact directories to keep before pruning the
 /// oldest. Enough to compare a flake against its neighbours, few enough that
@@ -91,7 +117,7 @@ pub struct JourneyResult<'a> {
 }
 
 impl FailureClass {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::AssertionOrProduct => "assertion_or_product",
             Self::ApplicationCrash => "application_crash",
@@ -160,23 +186,23 @@ pub fn write_journey_result(
 pub async fn capture(driver: &WebDriver, dir: &Path, label: &str) -> String {
     let mut notes = Vec::new();
 
-    match driver.current_url().await {
+    match bounded(driver.current_url()).await {
         Ok(url) => notes.push(format!("url: {url}")),
         Err(e) => notes.push(format!("url: unavailable ({e})")),
     }
-    match driver.title().await {
+    match bounded(driver.title()).await {
         Ok(title) => notes.push(format!("title: {title:?}")),
         Err(e) => notes.push(format!("title: unavailable ({e})")),
     }
 
     let screenshot = dir.join(format!("{label}-screenshot.png"));
-    match driver.screenshot(&screenshot).await {
+    match bounded(driver.screenshot(&screenshot)).await {
         Ok(()) => notes.push(format!("screenshot: {}", screenshot.display())),
         Err(e) => notes.push(format!("screenshot: unavailable ({e})")),
     }
 
     let source_path = dir.join(format!("{label}-source.html"));
-    match driver.source().await {
+    match bounded(driver.source()).await {
         Ok(source) => {
             let truncated = head_within(&source, MAX_SOURCE_BYTES);
             match std::fs::write(&source_path, truncated) {
@@ -369,6 +395,21 @@ mod tests {
                 "limit {limit} discarded more than one character's worth"
             );
         }
+    }
+
+    /// A call that never answers must come back as a note, not hang the
+    /// failure path. The limit is injected so the test does not wait 10s.
+    #[tokio::test]
+    async fn a_diagnostic_call_that_never_answers_is_bounded() {
+        let stuck = std::future::pending::<std::result::Result<(), String>>();
+        let outcome = bounded_within(Duration::from_millis(20), stuck).await;
+        assert!(outcome
+            .expect_err("must time out")
+            .contains("no answer within"));
+
+        let answered =
+            bounded_within(Duration::from_millis(20), async { Ok::<_, String>(7) }).await;
+        assert_eq!(answered, Ok(7));
     }
 
     #[test]

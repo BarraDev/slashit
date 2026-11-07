@@ -7,7 +7,8 @@ name: CI
 # Every checkout also sets `persist-credentials: false`. `actions/checkout`
 # otherwise leaves the token in `.git/config`, and these jobs build and run
 # code from the pull request's own revision -- including a desktop acceptance
-# job that uploads `target/acceptance` as an artifact when it fails. A token
+# job that uploads an allowlist of sanitized records from `target/acceptance`
+# as an artifact when it fails (see "Preserve failure evidence"). A token
 # that is never written to the workspace cannot be read out of it.
 permissions:
   contents: read
@@ -326,12 +327,19 @@ jobs:
 
       # Artifact names carry the shard ID so three concurrent jobs cannot
       # overwrite each other's evidence. Shard 2 may contain harness evidence.
+      # Only sanitized records are published: the timing index, each failed
+      # journey's result, and the start-failure summary. Page source,
+      # screenshots, native driver status, URLs and provider logs stay on the
+      # runner. Keep this an allowlist; see crates/slashit-acceptance/README.md.
       - name: Preserve failure evidence
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: acceptance-failure-artifacts-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
-          path: target/acceptance
+          path: |
+            target/acceptance/journey-timings*.jsonl
+            target/acceptance/*/journey-result.json
+            target/acceptance/*/*-start-summary.json
           if-no-files-found: warn
           retention-days: 7
 
