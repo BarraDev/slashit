@@ -9878,8 +9878,6 @@ mod tests {
     // ──────────────────────────────────────────────
     mod repo_level_pr_creation {
         use super::*;
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
         use std::process::Command as StdCommand;
 
@@ -10942,10 +10940,7 @@ mod tests {
 
         #[cfg(unix)]
         fn write_executable(path: &Path, body: &str) {
-            std::fs::write(path, body).expect("write script");
-            let mut perms = std::fs::metadata(path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(path, perms).expect("chmod");
+            crate::test_helpers::write_executable(path, body);
         }
 
         #[cfg(unix)]
