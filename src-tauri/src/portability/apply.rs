@@ -75,6 +75,8 @@ pub enum ApplyError {
     Failed(String),
     /// The Project is recorded but its Tasks are not, and the revert failed.
     Incomplete(String),
+    /// The file could not be used: it is not absolute or cannot be read.
+    File(String),
 }
 
 impl std::fmt::Display for ApplyError {
@@ -89,7 +91,9 @@ impl std::fmt::Display for ApplyError {
                 let kinds: Vec<&str> = conflicts.iter().map(|c| c.kind).collect();
                 write!(f, "the import is refused, nothing was changed: {}", kinds.join(", "))
             }
-            Self::Failed(message) | Self::Incomplete(message) => f.write_str(message),
+            Self::Failed(message) | Self::Incomplete(message) | Self::File(message) => {
+                f.write_str(message)
+            }
         }
     }
 }

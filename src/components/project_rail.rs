@@ -12,7 +12,7 @@ use crate::services::list_projects;
 use crate::services::human_review_service::get_attention_summary;
 use crate::components::attention::BoardAttention;
 use crate::components::task_live::ResponseOrder;
-use crate::components::CreateProjectModal;
+use crate::components::{CreateProjectModal, ExportPhase, ExportProjectModal, ImportProjectModal, start_export};
 
 /// How often the rail reads "Needs you" for the projects not on screen.
 const ATTENTION_POLL_MS: i32 = 5_000;
@@ -28,6 +28,8 @@ pub fn ProjectRail(
     let (hovered, set_hovered) = signal(false);
     let (show_create_modal, set_show_create_modal) = signal(false);
     let (refresh_trigger, set_refresh_trigger) = signal(0u32);
+    let (show_import_modal, set_show_import_modal) = signal(false);
+    let export_phase = RwSignal::new(None::<ExportPhase>);
 
     // Load projects on mount and when refresh_trigger changes
     Effect::new(move |prev: Option<u32>| {
@@ -172,6 +174,44 @@ pub fn ProjectRail(
             // Add project button
             <div class="py-2 border-t border-white/5">
                 <button
+                    data-testid="rail-import-project"
+                    aria-label="Import project"
+                    on:click=move |_| set_show_import_modal.set(true)
+                    class="rail-item"
+                    title="Import project from a file"
+                >
+                    <div class="rail-badge add">
+                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V3" />
+                        </svg>
+                    </div>
+                    {move || hovered.get().then(|| view! {
+                        <span class="rail-label">"Import project"</span>
+                    })}
+                </button>
+                <button
+                    data-testid="rail-export-project"
+                    aria-label="Export selected project"
+                    disabled=move || selected_project.get().is_empty()
+                    on:click=move |_| {
+                        let id = selected_project.get_untracked();
+                        if let Some(project) = projects.get_untracked().into_iter().find(|p| p.id.to_string() == id) {
+                            start_export(id, project.name, export_phase);
+                        }
+                    }
+                    class="rail-item disabled:opacity-30"
+                    title="Export the selected project to a file"
+                >
+                    <div class="rail-badge add">
+                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M16 8l-4-4m0 0L8 8m4-4v12" />
+                        </svg>
+                    </div>
+                    {move || hovered.get().then(|| view! {
+                        <span class="rail-label">"Export project"</span>
+                    })}
+                </button>
+                <button
                     data-testid="rail-add-project"
                     aria-label="Add project"
                     on:click=move |_| set_show_create_modal.set(true)
@@ -188,6 +228,13 @@ pub fn ProjectRail(
                     })}
                 </button>
             </div>
+
+            <ImportProjectModal
+                show=show_import_modal
+                set_show=set_show_import_modal
+                on_project_created=on_project_created
+            />
+            <ExportProjectModal phase=export_phase />
 
             <CreateProjectModal
                 show=show_create_modal
