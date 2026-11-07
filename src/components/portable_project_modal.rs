@@ -260,6 +260,9 @@ pub fn ImportProjectModal(
             // Project and reloads the list.
             if let ImportOutcome::Applied { project_id, .. } = &outcome {
                 show_imported(project_id.clone()).await;
+            } else {
+                // Failed or incomplete may still have left the Project in place.
+                on_list_changed.run(());
             }
             if session.get_value() == mine {
                 let _ = phase.try_set(ImportPhase::Applied(outcome));
@@ -275,7 +278,8 @@ pub fn ImportProjectModal(
             retrying.set_value(true);
             spawn_local(async move {
                 show_imported(id).await;
-                retrying.set_value(false);
+                // The dialog may have closed while the lookup ran.
+                let _ = retrying.try_set_value(false);
             });
         }
     };
