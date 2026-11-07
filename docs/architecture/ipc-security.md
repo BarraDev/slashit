@@ -128,13 +128,15 @@ Two questions, answered in order, for every request:
    every verb that `needs_verified_peer()` reports, regardless of a valid token.
    That is every `spawns_agent()` verb, `ApplyImport` (it creates Tasks), and
    `PreviewImport` (it reads a file at a path the client names, so its refusal
-   happens before the file is opened). A loopback TCP client can read status and
-   the other read-only verbs; it cannot cause code to run, create Tasks, or make
-   the instance read a file it names.
+   happens before the file is opened), and `ExportProject` (it writes a new file
+   at a path the client names, so its refusal happens before the destination is
+   opened or created). A loopback TCP client can read status and the other
+   read-only verbs; it cannot cause code to run, create Tasks, make the instance
+   read a file it names, or make it write one.
 
-   `ExportProject` is not in that set. It writes a new file at a path the client
-   names, with no-clobber and owner-only permissions, and it is open to a
-   token-authenticated TCP peer. Changing that is a separate decision.
+   No remote export contract exists. The CLI and Tauri reach the local endpoint,
+   which is OS-verified, so both keep working. Export over TCP is refused with
+   the same message as the other gated verbs, even with a valid token.
 
 Every mutating request is written to an audit line with the verb, the endpoint
 and whether the peer was OS-verified. Payloads are never logged — task

@@ -863,6 +863,96 @@ async fn a_preview_is_refused_to_an_unidentified_peer_before_it_reads_the_file()
     assert!(valid.data.get("counts").is_none(), "{valid:?}");
 }
 
+/// An export writes a file the client names, so it is refused to a peer the
+/// operating system has not identified, before any destination is opened or
+/// created. The same request from the local endpoint writes the file, and it
+/// never replaces an existing one, from either endpoint.
+#[tokio::test]
+async fn an_export_is_refused_to_an_unidentified_peer_and_never_replaces_a_file() {
+    let h = Harness::start().await;
+    let bundle = h._tmp.path().join("bundle.json");
+    let golden: &[u8] = include_bytes!("../src/portability/testdata/export-v1.golden.json");
+    std::fs::write(&bundle, golden).unwrap();
+    let path = bundle.to_string_lossy().into_owned();
+    let preview = send(
+        &IpcRequest::PreviewImport { path: path.clone() },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("the local endpoint should answer");
+    let checksum = preview.data["checksum"].as_str().unwrap().to_string();
+    let applied = send(
+        &IpcRequest::ApplyImport { path, checksum },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("the local endpoint should answer");
+    assert!(applied.ok, "{applied:?}");
+    let project_id = "00000000-0000-0000-0000-000000000001".to_string();
+
+    // A valid token does not make a TCP peer local. Nothing is created.
+    let fresh = h._tmp.path().join("refused.json");
+    let refused = send(
+        &IpcRequest::ExportProject {
+            project_id: project_id.clone(),
+            path: fresh.to_string_lossy().into_owned(),
+        },
+        &h.options(&h.tcp, Some(&h.token)),
+    )
+    .await
+    .expect("the request should be answered, not dropped");
+    let error = error_of(&refused);
+    assert!(error.contains("not available to clients"), "{error}");
+    assert!(!error.contains("not found"), "reached the handler: {error}");
+    assert!(!fresh.exists(), "a refused export created its destination");
+
+    // An existing file is never replaced, and the refusal does not read it.
+    let existing = h._tmp.path().join("existing.json");
+    std::fs::write(&existing, b"keep me").unwrap();
+    let over_tcp = send(
+        &IpcRequest::ExportProject {
+            project_id: project_id.clone(),
+            path: existing.to_string_lossy().into_owned(),
+        },
+        &h.options(&h.tcp, Some(&h.token)),
+    )
+    .await
+    .expect("the request should be answered, not dropped");
+    assert!(error_of(&over_tcp).contains("not available to clients"));
+    assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
+
+    // The local endpoint writes a new file with the existing response fields.
+    let exported = h._tmp.path().join("exported.json");
+    let local = send(
+        &IpcRequest::ExportProject {
+            project_id: project_id.clone(),
+            path: exported.to_string_lossy().into_owned(),
+        },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("the local endpoint should answer");
+    assert!(local.ok, "{local:?}");
+    assert_eq!(local.data["project_id"], project_id);
+    assert_eq!(local.data["tasks"], 2);
+    assert!(local.data["bytes"].as_u64().unwrap() > 0);
+    assert!(local.data["durable"].is_boolean());
+    assert!(local.data["path"].is_string());
+    assert!(exported.is_file());
+
+    // And the same local request does not replace the file it just wrote.
+    let again = send(
+        &IpcRequest::ExportProject {
+            project_id,
+            path: exported.to_string_lossy().into_owned(),
+        },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("the local endpoint should answer");
+    assert!(error_of(&again).contains("already exists"), "{again:?}");
+}
+
 #[tokio::test]
 async fn portable_export_and_preview_are_reachable_over_the_local_endpoint() {
     let h = Harness::start().await;
