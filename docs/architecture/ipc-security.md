@@ -125,8 +125,16 @@ Two questions, answered in order, for every request:
    through timing.
 
 2. **Is this peer allowed this verb?** A peer that is not OS-verified is denied
-   every `spawns_agent()` verb outright, regardless of a valid token. A loopback
-   TCP client can read status; it cannot cause code to run.
+   every verb that `needs_verified_peer()` reports, regardless of a valid token.
+   That is every `spawns_agent()` verb, `ApplyImport` (it creates Tasks), and
+   `PreviewImport` (it reads a file at a path the client names, so its refusal
+   happens before the file is opened). A loopback TCP client can read status and
+   the other read-only verbs; it cannot cause code to run, create Tasks, or make
+   the instance read a file it names.
+
+   `ExportProject` is not in that set. It writes a new file at a path the client
+   names, with no-clobber and owner-only permissions, and it is open to a
+   token-authenticated TCP peer. Changing that is a separate decision.
 
 Every mutating request is written to an audit line with the verb, the endpoint
 and whether the peer was OS-verified. Payloads are never logged — task

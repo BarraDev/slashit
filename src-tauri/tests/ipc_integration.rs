@@ -823,6 +823,46 @@ async fn an_import_is_refused_to_an_unidentified_peer_and_admitted_locally() {
     assert_eq!(h.ctx.tasks.read().await.len(), 2);
 }
 
+/// A preview reads a file the client names, so it is refused to a peer the
+/// operating system has not identified, before the file is opened. The same
+/// missing path answers "not found" on the local endpoint, which proves the
+/// refusal is the gate rather than the handler, and a valid bundle over TCP
+/// returns no metadata.
+#[tokio::test]
+async fn a_preview_is_refused_to_an_unidentified_peer_before_it_reads_the_file() {
+    let h = Harness::start().await;
+    let missing = h._tmp.path().join("missing.json").to_string_lossy().into_owned();
+    let request = IpcRequest::PreviewImport { path: missing.clone() };
+
+    let local = send(&request, &h.options(&h.local, None))
+        .await
+        .expect("the local endpoint should answer");
+    assert!(error_of(&local).contains("could not read"), "{local:?}");
+
+    let refused = send(&request, &h.options(&h.tcp, Some(&h.token)))
+        .await
+        .expect("the request should be answered, not dropped");
+    let error = error_of(&refused);
+    assert!(error.contains("not available to clients"), "{error}");
+    assert!(!error.contains("could not read"), "reached the handler: {error}");
+    assert!(!error.contains(&missing), "the refusal echoed the path: {error}");
+
+    let bundle = h._tmp.path().join("bundle.json");
+    let golden: &[u8] = include_bytes!("../src/portability/testdata/export-v1.golden.json");
+    std::fs::write(&bundle, golden).unwrap();
+    let valid = send(
+        &IpcRequest::PreviewImport {
+            path: bundle.to_string_lossy().into_owned(),
+        },
+        &h.options(&h.tcp, Some(&h.token)),
+    )
+    .await
+    .expect("the request should be answered, not dropped");
+    assert!(!valid.ok, "{valid:?}");
+    assert!(valid.data.get("importable").is_none(), "{valid:?}");
+    assert!(valid.data.get("counts").is_none(), "{valid:?}");
+}
+
 #[tokio::test]
 async fn portable_export_and_preview_are_reachable_over_the_local_endpoint() {
     let h = Harness::start().await;

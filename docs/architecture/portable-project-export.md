@@ -336,10 +336,13 @@ longer unspaced fragment can survive.
   local checkout is linked to it. No Git reconciliation, restack, branch
   creation, worker resume, approval replay or pull request publication.
 - No desktop interface. The CLI and IPC are the only import entry points.
-- Apply is refused to a peer the operating system has not identified, like the
-  verbs that create agent work. An integration test drives this through the
-  assembled server over TCP with a valid token, and checks that nothing changed.
-  The existing agent verbs are tested the same way.
+- Apply and Preview are refused to a peer the operating system has not
+  identified, like the verbs that create agent work. Preview reads a
+  caller-named file, so the refusal happens before the file is opened. Integration
+  tests drive both through the assembled server over TCP with a valid token. The
+  Apply test checks that nothing changed, and the Preview test checks that the
+  refusal does not depend on the file. Export is not gated this way; see
+  `docs/architecture/ipc-security.md`.
 - A repository remote in the scp form with a colon in its user part
   (`user:secret@host:path`) is refused on export and on decode. An ordinary
   `user@host:path` remote, such as `git@host:owner/repo.git`, is accepted.

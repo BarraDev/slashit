@@ -144,11 +144,13 @@ impl IpcRequest {
     /// in progress, so it reaches the same primitive one step later and must
     /// be denied to any non-local peer exactly like the verbs that start it.
     /// These verbs are the code-execution surface.
-    /// Verbs that create work a person can run: the agent verbs above, and an
-    /// import, whose Tasks can be queued the same way. Denied to any peer the
+    /// Verbs that create work a person can run (the agent verbs above, and an
+    /// import, whose Tasks can be queued the same way), and a preview, which
+    /// reads a file at a path the client chooses. Denied to any peer the
     /// operating system has not identified.
     pub fn needs_verified_peer(&self) -> bool {
-        self.spawns_agent() || matches!(self, Self::ApplyImport { .. })
+        self.spawns_agent()
+            || matches!(self, Self::ApplyImport { .. } | Self::PreviewImport { .. })
     }
 
     pub fn spawns_agent(&self) -> bool {
@@ -414,7 +416,8 @@ mod tests {
             checksum: String::new(),
         }
         .needs_verified_peer());
-        assert!(!IpcRequest::PreviewImport {
+        // A preview reads a caller-chosen path, so it is not a read-only status verb.
+        assert!(IpcRequest::PreviewImport {
             path: String::new(),
         }
         .needs_verified_peer());
