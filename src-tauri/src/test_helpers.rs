@@ -297,6 +297,119 @@ impl FakeProgram {
     }
 }
 
+/// Write `body` to `path` as an executable script that another process can run.
+///
+/// The bytes are copied in by a short-lived `/bin/cp` child, not written by
+/// this process. A descriptor this process holds open for writing is copied
+/// into any child another test thread forks before that child execs, and
+/// `execve` of the file then fails with `ETXTBSY` (errno 26). The copy's
+/// writer lives only in `cp`, which has exited before this returns. The source
+/// file is never executed, so writing it in-process is safe. Tests that need a
+/// fake program call this instead of writing and running one themselves.
+#[cfg(unix)]
+pub fn write_executable(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut source = path.as_os_str().to_owned();
+    source.push(".source");
+    let source = std::path::PathBuf::from(source);
+    std::fs::write(&source, body).expect("write the script source");
+    let copied = std::process::Command::new("/bin/cp")
+        .arg(&source)
+        .arg(path)
+        .status()
+        .expect("run /bin/cp");
+    assert!(copied.success(), "could not create {}: {copied}", path.display());
+    std::fs::remove_file(&source).expect("remove the script source");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod script");
+}
+
+#[cfg(all(test, unix))]
+mod executable_fixture_tests {
+    use super::write_executable;
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+
+    const SCRIPT: &str = "#!/bin/sh\nexit 0\n";
+
+    /// A child forked now and parked in `pre_exec` until released. Until it
+    /// execs it holds a copy of every descriptor this process had open at the
+    /// fork, which is how a write descriptor reaches a forked child.
+    struct PendingFork {
+        release: UnixStream,
+        spawner: std::thread::JoinHandle<std::io::Result<Child>>,
+    }
+
+    impl PendingFork {
+        /// Returns once the child has forked and reached `pre_exec`.
+        fn start() -> Self {
+            let (mut ready_rx, ready_tx) = UnixStream::pair().unwrap();
+            let (release, gate) = UnixStream::pair().unwrap();
+            let mut command = Command::new("/bin/true");
+            command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            // Runs in the forked child, before exec. It only reads and writes
+            // sockets that are already open.
+            unsafe {
+                command.pre_exec(move || {
+                    let _ = (&ready_tx).write(&[1]);
+                    let mut byte = [0u8; 1];
+                    let _ = (&gate).read(&mut byte);
+                    Ok(())
+                });
+            }
+            let spawner = std::thread::spawn(move || command.spawn());
+            ready_rx.read_exact(&mut [0u8; 1]).unwrap();
+            Self { release, spawner }
+        }
+
+        fn finish(mut self) {
+            self.release.write_all(&[1]).unwrap();
+            let mut child = self.spawner.join().unwrap().expect("spawn the pending child");
+            assert!(child.wait().unwrap().success());
+        }
+    }
+
+    /// The in-process write that `write_executable` replaced. The write
+    /// descriptor is still open when the fork happens, so the forked child
+    /// holds it, and executing the file fails with ETXTBSY.
+    #[test]
+    fn a_script_written_in_process_is_busy_while_a_fork_holds_it_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gh");
+        let mut open = File::create(&path).unwrap();
+        open.write_all(SCRIPT.as_bytes()).unwrap();
+        open.set_permissions(std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pending = PendingFork::start();
+        let err = Command::new(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(26), "expected ETXTBSY, got {err}");
+        drop(open);
+        pending.finish();
+    }
+
+    #[test]
+    fn write_executable_publishes_a_script_that_runs_while_a_fork_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gh");
+        let pending = PendingFork::start();
+        write_executable(&path, SCRIPT);
+        let status = Command::new(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .expect("the published script must be executable");
+        assert!(status.success());
+        assert!(!dir.path().join("gh.source").exists(), "the source copy is removed");
+        pending.finish();
+    }
+}
+
 /// The entries of `path` with the programs in `hidden` taken off them: a
 /// directory holding a hidden program is replaced by one under `shadows`
 /// that links every other entry in it, so everything else stays reachable,
