@@ -748,12 +748,9 @@ mod issue_read_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_gh_that_never_answers_is_abandoned_at_the_bound() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::TempDir::new().unwrap();
         let gh = dir.path().join("gh");
-        std::fs::write(&gh, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_helpers::write_executable(&gh, "#!/bin/sh\nexec sleep 30\n");
 
         let started = std::time::Instant::now();
         let error = read_issue_state_within(gh.as_os_str(), "o/r", 7, Duration::from_millis(200))
