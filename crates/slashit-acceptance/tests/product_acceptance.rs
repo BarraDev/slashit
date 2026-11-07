@@ -87,6 +87,8 @@ mod portable_import;
 mod terminal_lifecycle;
 #[path = "product_acceptance/queue_settings.rs"]
 mod queue_settings;
+#[path = "product_acceptance/settings_appearance.rs"]
+mod settings_appearance;
 #[path = "product_acceptance/run_now.rs"]
 mod run_now;
 #[path = "product_acceptance/stacked_tasks.rs"]
