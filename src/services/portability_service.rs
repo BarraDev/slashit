@@ -125,9 +125,10 @@ pub fn import_headline(outcome: &ImportOutcome) -> (Tone, String) {
             Tone::Error,
             "The file could not be used as a SlashIt export. Nothing was changed.".to_string(),
         ),
+        // The backend may have kept part of the import, so the headline does not claim otherwise.
         ImportOutcome::Failed { .. } => (
             Tone::Error,
-            "The import did not complete, and nothing was kept from it.".to_string(),
+            "The import did not complete. It could not be confirmed whether anything was kept, so check the Project list before importing this file again.".to_string(),
         ),
         ImportOutcome::Incomplete { .. } => (
             Tone::Warning,
@@ -136,13 +137,15 @@ pub fn import_headline(outcome: &ImportOutcome) -> (Tone, String) {
     }
 }
 
-/// The detail text for an outcome, when the backend supplied one.
+/// The detail text for an outcome, when it is safe to show. The backend's text for
+/// a failed or incomplete import can name local paths and internal state, so it is
+/// logged by the dialog rather than shown.
 pub fn import_detail(outcome: &ImportOutcome) -> Option<String> {
     match outcome {
-        ImportOutcome::ChecksumMismatch { message }
-        | ImportOutcome::Invalid { message }
-        | ImportOutcome::Failed { message }
-        | ImportOutcome::Incomplete { message } => Some(message.clone()),
+        ImportOutcome::ChecksumMismatch { message } | ImportOutcome::Invalid { message } => {
+            Some(message.clone())
+        }
+        ImportOutcome::Failed { .. } | ImportOutcome::Incomplete { .. } => None,
         ImportOutcome::Refused { conflicts } => Some(
             conflicts
                 .iter()
@@ -299,8 +302,10 @@ mod tests {
         let failed = ImportOutcome::Failed { message: "board failed".into() };
         let (tone, text) = import_headline(&failed);
         assert_eq!(tone, Tone::Error);
-        assert!(text.contains("nothing was kept"), "{text}");
-        assert_eq!(import_detail(&failed).as_deref(), Some("board failed"));
+        assert!(text.contains("could not be confirmed"), "{text}");
+        assert!(!text.contains("nothing was kept"), "{text}");
+        // The backend's own text can name paths and internal state, so it is logged, not shown.
+        assert_eq!(import_detail(&failed), None);
     }
 
     #[test]
@@ -310,7 +315,7 @@ mod tests {
         assert_eq!(tone, Tone::Warning);
         assert!(!text.to_lowercase().contains("reverted"), "{text}");
         assert!(text.contains("Restart SlashIt"), "{text}");
-        assert_eq!(import_detail(&incomplete).as_deref(), Some("revert failed"));
+        assert_eq!(import_detail(&incomplete), None);
     }
 
     #[test]

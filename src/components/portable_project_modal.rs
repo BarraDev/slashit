@@ -142,6 +142,9 @@ fn navigation_after_import(
     }
 }
 
+/// Shown instead of the backend's reason, which can name local paths. The reason is logged.
+const PREVIEW_FAILED: &str = "The file could not be read as a SlashIt export. Nothing was changed.";
+
 fn tone_class(tone: Tone) -> &'static str {
     match tone {
         Tone::Success => "text-emerald-300",
@@ -155,6 +158,8 @@ pub fn ImportProjectModal(
     #[prop(into)] show: Signal<bool>,
     set_show: WriteSignal<bool>,
     on_project_created: Callback<Project>,
+    // Reloads the Project list without opening a tab, for an import whose lookup failed.
+    on_list_changed: Callback<()>,
 ) -> impl IntoView {
     let phase = RwSignal::new(ImportPhase::Idle);
     // Bumped whenever the dialog is closed or reset. A request that finishes
@@ -164,9 +169,11 @@ pub fn ImportProjectModal(
     let choosing = StoredValue::new(false);
     // The id of an imported Project that navigation could not show yet.
     let unlisted = RwSignal::new(None::<String>);
+    // A "Show the Project" lookup is in flight, so a second click does nothing.
+    let retrying = StoredValue::new(false);
 
     // Look the imported Project up and hand it to navigation. If that fails the
-    // import still stands, so the dialog offers to try again.
+    // import still stands, so the dialog offers to try again and the list reloads.
     let show_imported = move |project_id: String| async move {
         match navigation_after_import(project_id.clone(), get_project(project_id).await) {
             Ok(project) => {
@@ -175,6 +182,7 @@ pub fn ImportProjectModal(
             }
             Err(id) => {
                 let _ = unlisted.try_set(Some(id));
+                on_list_changed.run(());
             }
         }
     };
@@ -205,14 +213,21 @@ pub fn ImportProjectModal(
                     let _ = phase.try_set(ImportPhase::Previewing);
                     let next = match preview_import(path.clone()).await {
                         Ok(report) => ImportPhase::Previewed { path: path.clone(), report },
-                        Err(message) => ImportPhase::PreviewFailed { path: Some(path), message },
+                        Err(message) => {
+                            leptos::logging::warn!("Project import preview failed: {message}");
+                            ImportPhase::PreviewFailed { path: Some(path), message: PREVIEW_FAILED.into() }
+                        }
                     };
                     if session.get_value() == mine {
                         let _ = phase.try_set(next);
                     }
                 }
                 Err(message) => {
-                    let _ = phase.try_set(ImportPhase::PreviewFailed { path: None, message });
+                    leptos::logging::warn!("Project import file choice failed: {message}");
+                    let _ = phase.try_set(ImportPhase::PreviewFailed {
+                        path: None,
+                        message: PREVIEW_FAILED.into(),
+                    });
                 }
             }
         });
@@ -233,8 +248,13 @@ pub fn ImportProjectModal(
         spawn_local(async move {
             let outcome = match apply_import(path, report.checksum.clone()).await {
                 Ok(outcome) => outcome,
+                // The backend may have committed before the call failed, so the
+                // headline stays uncertain.
                 Err(message) => ImportOutcome::Failed { message },
             };
+            if let ImportOutcome::Failed { message } | ImportOutcome::Incomplete { message } = &outcome {
+                leptos::logging::error!("Project import did not complete: {message}");
+            }
             // The import may have happened even if the dialog was closed, so the
             // list is refreshed in every case: the caller adds a tab, selects the
             // Project and reloads the list.
@@ -248,8 +268,15 @@ pub fn ImportProjectModal(
     };
 
     let retry_show = move |_| {
+        if retrying.get_value() {
+            return;
+        }
         if let Some(id) = unlisted.get_untracked() {
-            spawn_local(show_imported(id));
+            retrying.set_value(true);
+            spawn_local(async move {
+                show_imported(id).await;
+                retrying.set_value(false);
+            });
         }
     };
 

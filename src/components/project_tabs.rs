@@ -14,6 +14,23 @@ struct ProjectTab {
     path: Option<String>,
 }
 
+fn tab_is_open(tabs: &[ProjectTab], project_id: &str) -> bool {
+    tabs.iter().any(|t| t.id == project_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_project_already_in_a_tab_is_not_added_again() {
+        let tabs = vec![ProjectTab { id: "a".into(), name: "A".into(), path: None }];
+        assert!(tab_is_open(&tabs, "a"));
+        assert!(!tab_is_open(&tabs, "b"));
+        assert!(!tab_is_open(&[], "a"));
+    }
+}
+
 /// Persist open tabs to localStorage
 fn get_persisted_tabs() -> Vec<String> {
     if let Some(window) = web_sys::window() {
@@ -164,21 +181,23 @@ pub fn ProjectTabs(
         let project_id = project.id.to_string();
         let project_name = project.name.clone();
         
-        // Add to tabs
-        let new_tab = ProjectTab {
-            id: project_id.clone(),
-            name: project_name,
-            path: project.repository_id.map(|r| r.to_string()),
-        };
-        set_tabs.update(|t| t.push(new_tab));
-        
+        // Add to tabs, unless a repeated callback (a second "Show the Project" click) already opened it
+        if !tab_is_open(&tabs.get_untracked(), &project_id) {
+            let new_tab = ProjectTab {
+                id: project_id.clone(),
+                name: project_name,
+                path: project.repository_id.map(|r| r.to_string()),
+            };
+            set_tabs.update(|t| t.push(new_tab));
+        }
+
         // Select the new project
         set_selected_project.set(project_id.clone());
-        
+
         // Persist tabs
         let tab_ids: Vec<String> = tabs.get().iter().map(|t| t.id.clone()).collect();
         persist_tabs(&tab_ids);
-        
+
         // Refresh project list
         set_refresh_trigger.update(|t| *t += 1);
     });
@@ -342,6 +361,7 @@ pub fn ProjectTabs(
                 show=show_import_modal
                 set_show=set_show_import_modal
                 on_project_created=on_project_created
+                on_list_changed=Callback::new(move |_| set_refresh_trigger.update(|t| *t += 1))
             />
             <ExportProjectModal phase=export_phase />
 

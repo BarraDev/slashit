@@ -233,6 +233,7 @@ pub fn ProjectRail(
                 show=show_import_modal
                 set_show=set_show_import_modal
                 on_project_created=on_project_created
+                on_list_changed=Callback::new(move |_| set_refresh_trigger.update(|t| *t += 1))
             />
             <ExportProjectModal phase=export_phase />
 
