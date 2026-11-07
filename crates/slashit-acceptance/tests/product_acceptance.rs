@@ -81,6 +81,8 @@ mod pr_status;
 mod pr_recovery;
 #[path = "product_acceptance/project_rail.rs"]
 mod project_rail;
+#[path = "product_acceptance/portable_import.rs"]
+mod portable_import;
 #[path = "product_acceptance/terminal_lifecycle.rs"]
 mod terminal_lifecycle;
 #[path = "product_acceptance/queue_settings.rs"]

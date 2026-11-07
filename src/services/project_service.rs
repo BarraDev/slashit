@@ -28,7 +28,7 @@ fn js_error_to_string(value: JsValue) -> String {
 /// Like `invoke`, but surfaces a command's `Err` instead of trapping on it —
 /// used by commands whose failure the caller must display, such as attach
 /// and detach refusing an ambiguous membership change.
-async fn invoke_checked(cmd: &str, args: JsValue) -> Result<JsValue, String> {
+pub(crate) async fn invoke_checked(cmd: &str, args: JsValue) -> Result<JsValue, String> {
     JsFuture::from(raw_invoke(cmd, args))
         .await
         .map_err(js_error_to_string)
