@@ -781,19 +781,38 @@ local checks too, and do not merge with a known blocker open.
 
 ## 14. Merge gates and security checks
 
-`main` has no branch protection or required status checks. The gates below are
-owner policy, applied by whoever merges.
+Several kinds of control apply to a merge. Only the first is enforced as a merge gate by GitHub.
 
-**Wait for green before merging.** Every functional check in `ci.yml`:
+**GitHub-enforced: ruleset `Main Protect` (ID 24351287, active).** Verified
+against the ruleset on 2026-11-06:
+
+- Changes reach the default branch through a pull request, with zero required
+  approving reviews.
+- Squash is the only allowed merge method, and history must be linear.
+- Non-fast-forward updates and deletion of `main` are refused.
+- No bypass actors.
+- `require_extra_approval_for_unattributed_changes` is `true`. The ruleset
+  read-back shows the setting, but this document does not verify its effect on
+  a merge.
+- No required status checks. GitHub does not block a merge on a red or pending
+  CI run, so the CI requirement below is procedural.
+
+**Repository-owner merge policy (procedural).** Whoever merges applies the
+rules in this section. GitHub does not enforce them, and merging is the
+owner's decision (`AGENTS.md`, Authorization).
+
+**Hosted CI (procedural).** Wait for green before merging. Every functional check in `ci.yml`:
 
 - Agent docs
+- Dogfood supervisor harness
 - Lint and structural checks
 - Backend and harness tests
 - Frontend tests and build
-- Compile check (windows-latest)
-- Compile check (macos-latest)
-- Durable write tests (ubuntu-22.04, macos-latest, windows-latest)
 - Desktop acceptance / product shard 1, 2 and 3 (shard 2 also runs the harness suite)
+- Compile check (windows-latest and macos-latest)
+- IPC tests (windows-latest)
+- Updater transport tests (windows-latest and macos-latest)
+- Durable write tests (ubuntu-22.04, macos-latest, windows-latest)
 
 **Advisory; may finish after the merge.**
 
@@ -804,7 +823,9 @@ owner policy, applied by whoever merges.
   positive is dismissed in the code scanning alert with a factual reason;
   do not rewrite otherwise-correct code, including test code, just to turn
   the check green.
-- CodeRabbit.
+- CodeRabbit. It is advisory and is governed by section 18. A rate-limited or
+  skipped review is NOT REVIEWED, not a passed review, and the pull request
+  must say so.
 
 **Asynchronous and periodic.** Review the repository's Security tab weekly or
 once per development round:

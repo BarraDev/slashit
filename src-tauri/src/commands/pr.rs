@@ -8741,12 +8741,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_search_repository_is_the_one_gh_names_in_the_working_directory() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::TempDir::new().unwrap();
         let gh = dir.path().join("gh");
-        std::fs::write(&gh, "#!/bin/sh\necho '{\"nameWithOwner\":\"org/app\"}'\n").unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_helpers::write_executable(&gh, "#!/bin/sh\necho '{\"nameWithOwner\":\"org/app\"}'\n");
 
         let slug = test_programs::scope(
             [("gh", gh)],
@@ -9878,8 +9875,6 @@ mod tests {
     // ──────────────────────────────────────────────
     mod repo_level_pr_creation {
         use super::*;
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
         use std::process::Command as StdCommand;
 
@@ -10942,10 +10937,7 @@ mod tests {
 
         #[cfg(unix)]
         fn write_executable(path: &Path, body: &str) {
-            std::fs::write(path, body).expect("write script");
-            let mut perms = std::fs::metadata(path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(path, perms).expect("chmod");
+            crate::test_helpers::write_executable(path, body);
         }
 
         #[cfg(unix)]
