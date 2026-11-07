@@ -131,15 +131,14 @@ pub fn Settings(
                                 SettingsTab::Theme,
                                 SettingsTab::Updates,
                             ].into_iter().map(|tab| {
-                                let is_active = active_tab.get() == tab;
                                 let tab_clone = tab;
                                 view! {
                                     <button
                                         data-testid=format!("settings-tab-{}", tab.title().to_lowercase())
                                         on:click=move |_| set_active_tab.set(tab_clone)
-                                        class=format!(
+                                        class=move || format!(
                                             "w-full flex items-center gap-3 px-4 py-3 rounded-lg text-left transition-all {}",
-                                            if is_active {
+                                            if active_tab.get() == tab_clone {
                                                 "bg-blue-500/20 text-blue-300"
                                             } else {
                                                 "text-white/60 hover:text-white/90 hover:bg-white/5"
@@ -272,8 +271,9 @@ pub fn Settings(
                                                             (AppearanceMode::Light, "Light", "Always use light mode"),
                                                             (AppearanceMode::Dark, "Dark", "Always use dark mode"),
                                                         ].into_iter().map(|(mode, label, description)| {
-                                                            let is_selected = appearance_mode.get() == mode;
                                                             let mode_value = mode.clone();
+                                                            let mode_selected = mode.clone();
+                                                            let mode_check = mode.clone();
                                                             view! {
                                                                 <button
                                                                     on:click=move |_| {
@@ -286,9 +286,9 @@ pub fn Settings(
                                                                             }
                                                                         });
                                                                     }
-                                                                    class=format!(
+                                                                    class=move || format!(
                                                                         "relative p-4 rounded-xl border-2 transition-all text-left {}",
-                                                                        if is_selected {
+                                                                        if appearance_mode.get() == mode_selected {
                                                                             "border-yellow-500 bg-yellow-500/10"
                                                                         } else {
                                                                             "border-white/10 hover:border-white/20 bg-white/5"
@@ -299,7 +299,7 @@ pub fn Settings(
                                                                         <p class="font-medium text-white/90">{label}</p>
                                                                         <p class="text-xs text-white/50 mt-1">{description}</p>
                                                                     </div>
-                                                                    {is_selected.then(|| view! {
+                                                                    {move || (appearance_mode.get() == mode_check).then(|| view! {
                                                                         <div class="absolute top-2 right-2 w-4 h-4 rounded-full bg-yellow-500 flex items-center justify-center">
                                                                             <svg class="w-3 h-3 text-black" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                                                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" />
