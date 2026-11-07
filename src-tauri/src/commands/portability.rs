@@ -121,10 +121,20 @@ pub async fn export_project(
     live(&state).export(&project_id, &path).await
 }
 
+/// Debug builds only: the file a journey names instead of the native dialog. The
+/// variable holds the path of a file whose first line is the path the dialog
+/// would return; an empty line is a cancelled dialog. Release builds never read it.
+#[cfg(debug_assertions)]
+pub const IMPORT_CHOICE_VAR: &str = "SLASHIT_DEBUG_IMPORT_CHOICE_FILE";
+
 /// Ask which export file to import. `None` when the user cancels. Nothing is
 /// read or imported here.
 #[tauri::command]
 pub async fn choose_import_file(app: AppHandle) -> Result<Option<String>, String> {
+    #[cfg(debug_assertions)]
+    if let Some(choice) = test_import_choice()? {
+        return Ok(choice);
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
@@ -134,6 +144,19 @@ pub async fn choose_import_file(app: AppHandle) -> Result<Option<String>, String
             let _ = tx.send(path.map(|p| p.to_string()));
         });
     rx.await.map_err(|_| "The open dialog closed unexpectedly".to_string())
+}
+
+/// The journey's choice, when `IMPORT_CHOICE_VAR` names one. The outer `None`
+/// means no choice was configured, so the dialog opens.
+#[cfg(debug_assertions)]
+fn test_import_choice() -> Result<Option<Option<String>>, String> {
+    let Some(file) = std::env::var_os(IMPORT_CHOICE_VAR) else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&file)
+        .map_err(|e| format!("could not read the test import choice: {e}"))?;
+    let line = text.lines().next().unwrap_or_default().trim_end();
+    Ok(Some((!line.is_empty()).then(|| line.to_string())))
 }
 
 /// Describe what importing a file would do. Reads the file; writes nothing.
