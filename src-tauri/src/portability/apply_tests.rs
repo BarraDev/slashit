@@ -436,6 +436,38 @@ async fn apply_waits_for_the_project_lifecycle_gate() {
     assert_eq!(target.tasks.read().await.len(), 2);
 }
 
+/// A revert the filesystem cannot synchronize succeeds in place but may not
+/// survive a power loss. It must not be reported as reverted, and its record
+/// must stay, or a power loss could leave the Project entry with no board.
+#[tokio::test]
+async fn an_unconfirmed_revert_keeps_the_record_and_is_not_reported_as_reverted() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+
+    // Replace writes: record, configuration, then the board publication fails.
+    // The next directory synchronization is the revert's, and it is unsupported.
+    let _faults = fault::fail_in_order(&[
+        (Stage::Replace, ErrorKind::Other, 2),
+        (Stage::SyncDirectory, ErrorKind::Unsupported, 0),
+    ]);
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    drop(_faults);
+    assert!(!response.ok);
+    let message = response.error.unwrap();
+    assert!(!message.contains("reverted"), "{message}");
+    assert!(message.contains("not confirmed durable"), "{message}");
+    assert!(!target.projects.read().await.contains_key(&project_id()));
+    assert!(target.tasks.read().await.is_empty());
+    assert_eq!(
+        target.storage.pending_project_imports().unwrap(),
+        vec![project_id()],
+        "the record is kept until a start confirms the configuration"
+    );
+}
+
 #[tokio::test]
 async fn a_failed_revert_is_reported_as_an_incomplete_import() {
     let (src, source) = test_ctx().await;

@@ -214,6 +214,16 @@ pub async fn apply(
         Err(e) => {
             let board_error = format!("the Task board could not be published ({e})");
             return match try_persist_projects(live.storage, &original) {
+                // A revert the filesystem cannot synchronize is in place but may not
+                // survive a power loss, which could bring back the Project entry from
+                // Step 3. Keep the record, as for an unconfirmed revert below.
+                Ok(()) if live.storage.config_is_unconfirmed() => {
+                    live.storage.hold_back_project(project_id);
+                    *projects_w = original;
+                    Err(ApplyError::Incomplete(format!(
+                        "{board_error}; the revert is in place but not confirmed durable on this filesystem, so the import record is kept until a start confirms the configuration. Restart SlashIt to settle the import."
+                    )))
+                }
                 Ok(()) => {
                     *projects_w = original;
                     clear_import_record(live.storage, project_id);
