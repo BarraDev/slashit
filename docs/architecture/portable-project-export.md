@@ -43,6 +43,9 @@ Changed, and reported in `normalization`:
   stays in the history and nothing is current.
 - A Task in Human Review returns to Backlog, because a review wait needs the
   checkout the bundle does not carry.
+- A reviewer model is trimmed, or cleared when it is empty or whitespace-only.
+  Reported as `reviewer_model_trimmed` or `reviewer_model_cleared`. An absent
+  model is stored as none and is not reported.
 
 Kept as records, not verified: QA sign-off, review decisions and the timeline.
 They show what the exporting instance recorded. They confer no authority,
@@ -110,6 +113,17 @@ any Project is used, and only with a configuration read without salvage:
   record stays and the Project loads on every start until a start can confirm
   the configuration. The record is what holds back a Project whose entry or
   board a power loss could drop, so it is not removed on an unconfirmed start.
+  The configuration's confirmation covers only the configuration's own
+  directory. The record is also removed only after the directory of the Task
+  board is synchronized at the same start. A board directory that cannot be
+  synchronized keeps the record, and the Project loads on every start with a
+  diagnostic until a start can synchronize it. A directory that cannot be
+  synchronized at all keeps the record indefinitely; that is the visible,
+  deferred cleanup the import prefers over deleting a board that might not be
+  durable. What a clearing start proves: the configuration entry and the board's
+  directory entry were each reported synchronized, and the board's bytes were
+  synchronized when they were written. The tests simulate the directory answers
+  with the durable-filesystem fault seam; they do not cut power.
 - An interrupted import whose Project entry is removed, or whose record has no
   Project, is settled the same way: the record stays while the configuration
   is unconfirmed, because a removal written there may return after a power
@@ -304,7 +318,8 @@ A bundle that fails any rule is refused. A valid bundle is reported with:
 - identity conflicts: Project id, Repository id, Repository remote, Task ids,
   and any unreadable target board (which makes a clean verdict impossible);
 - `normalization`: a current approval in the bundle, which import must
-  withdraw before anything can act on it;
+  withdraw before anything can act on it, and the reviewer-model changes listed
+  above; Apply reports the same list in its result;
 - `git_references`: base commits and approved tips, carried as text and never
   recreated or checked;
 - `excluded`: the omitted list;
@@ -336,12 +351,13 @@ longer unspaced fragment can survive.
   local checkout is linked to it. No Git reconciliation, restack, branch
   creation, worker resume, approval replay or pull request publication.
 - No desktop interface. The CLI and IPC are the only import entry points.
-- Apply and Preview are refused to a peer the operating system has not
+- Export, Preview and Apply are refused to a peer the operating system has not
   identified, like the verbs that create agent work. Preview reads a
-  caller-named file, so the refusal happens before the file is opened. Integration
-  tests drive both through the assembled server over TCP with a valid token. The
-  Apply test checks that nothing changed, and the Preview test checks that the
-  refusal does not depend on the file. Export is not gated this way; see
+  caller-named file and Export writes one, so each refusal happens before the
+  file is opened or created. Integration tests drive them through the assembled
+  server over TCP with a valid token. The Apply test checks that nothing changed,
+  the Preview test checks that the refusal does not depend on the file, and the
+  Export test checks that no destination is created or overwritten. See
   `docs/architecture/ipc-security.md`.
 - A repository remote in the scp form with a colon in its user part
   (`user:secret@host:path`) is refused on export and on decode. An ordinary

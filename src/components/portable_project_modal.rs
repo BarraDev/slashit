@@ -12,8 +12,8 @@ use leptos::task::spawn_local;
 use crate::models::Project;
 use crate::services::portability_service::{
     apply_import, can_confirm, choose_export_destination, choose_import_file, export_project,
-    import_detail, import_headline, preview_import, ExportOutcome, ImportOutcome, PreviewReport,
-    Tone,
+    import_detail, import_headline, normalization_summary, preview_import, ExportOutcome,
+    ImportOutcome, PreviewReport, Tone,
 };
 use crate::services::project_service::get_project;
 
@@ -269,7 +269,7 @@ pub fn ImportProjectModal(
                             let confirmable = can_confirm(&report);
                             let conflicts = report.conflicts.clone();
                             let excluded = report.excluded.clone();
-                            let normalization_count = report.normalization.len();
+                            let changes = normalization_summary(&report.normalization);
                             let repo_text = report
                                 .repository
                                 .as_ref()
@@ -299,10 +299,10 @@ pub fn ImportProjectModal(
                                         </div>
                                     })}
 
-                                    {(normalization_count > 0).then(|| view! {
-                                        <p data-testid="import-normalization" class="text-amber-300">
-                                            {format!("{normalization_count} Task(s) will be changed so nothing imported can act: approvals are withdrawn, and Tasks waiting for review return to Backlog.")}
-                                        </p>
+                                    {(!changes.is_empty()).then(|| view! {
+                                        <div data-testid="import-normalization" class="space-y-1 text-amber-300">
+                                            {changes.into_iter().map(|line| view! { <p>{line}</p> }).collect::<Vec<_>>()}
+                                        </div>
                                     })}
 
                                     <div class="rounded-lg border border-white/10 p-3 space-y-1 text-white/60">

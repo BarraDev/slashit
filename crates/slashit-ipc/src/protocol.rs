@@ -145,12 +145,16 @@ impl IpcRequest {
     /// be denied to any non-local peer exactly like the verbs that start it.
     /// These verbs are the code-execution surface.
     /// Verbs that create work a person can run (the agent verbs above, and an
-    /// import, whose Tasks can be queued the same way), and a preview, which
-    /// reads a file at a path the client chooses. Denied to any peer the
-    /// operating system has not identified.
+    /// import, whose Tasks can be queued the same way), a preview, which reads
+    /// a file at a path the client chooses, and an export, which writes a new
+    /// file at a path the client chooses. Denied to any peer the operating
+    /// system has not identified.
     pub fn needs_verified_peer(&self) -> bool {
         self.spawns_agent()
-            || matches!(self, Self::ApplyImport { .. } | Self::PreviewImport { .. })
+            || matches!(
+                self,
+                Self::ApplyImport { .. } | Self::PreviewImport { .. } | Self::ExportProject { .. }
+            )
     }
 
     pub fn spawns_agent(&self) -> bool {
@@ -418,6 +422,12 @@ mod tests {
         .needs_verified_peer());
         // A preview reads a caller-chosen path, so it is not a read-only status verb.
         assert!(IpcRequest::PreviewImport {
+            path: String::new(),
+        }
+        .needs_verified_peer());
+        // An export writes a file at a path the client names.
+        assert!(IpcRequest::ExportProject {
+            project_id: String::new(),
             path: String::new(),
         }
         .needs_verified_peer());

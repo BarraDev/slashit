@@ -315,9 +315,10 @@ pub struct ImportRecovery {
 ///   board, which would otherwise load with no Project to own it.
 /// - No Project under the record: the import never committed. The record goes.
 /// - A Project with a board: the import completed. The Project is loaded. Its
-///   record goes once the configuration is `confirmed` durable; until then the
-///   record stays, because it is what holds back a Project whose entry or board
-///   a power loss could drop.
+///   record goes once the configuration is `confirmed` durable and the board's
+///   directory entry is synchronized at this start; until then the record stays,
+///   because it is what holds back a Project whose entry or board a power loss
+///   could drop.
 /// - A Project without a board: the import was interrupted. The Project is
 ///   removed from the configuration, which is the only change made. Its
 ///   record goes once that removal is confirmed.
@@ -445,6 +446,25 @@ fn settle_record(
         ));
         return;
     }
+    // The configuration's confirmation covers its own directory only. The board's
+    // directory entry is not covered by it, so it is synchronized here too: a
+    // board that was never proven durable would otherwise lose its entry after
+    // the record is gone.
+    match storage.sync_board_directories(project_id) {
+        Ok(slashit_durable_fs::DirectorySync::Synced) => {}
+        Ok(slashit_durable_fs::DirectorySync::Unsupported) => {
+            recovery.failures.push(format!(
+                "{project_id}: the directory of its Task board cannot be synchronized on this filesystem, so the board is not confirmed durable; the import record is kept and the Project loads until a start can confirm it"
+            ));
+            return;
+        }
+        Err(error) => {
+            recovery.failures.push(format!(
+                "{project_id}: the directory of its Task board could not be synchronized ({error:#}); the import record is kept"
+            ));
+            return;
+        }
+    }
     if let Err(error) = storage.clear_project_import_pending(project_id) {
         recovery.failures.push(format!("{project_id}: {error:#}"));
     }
@@ -531,16 +551,12 @@ fn materialize_task(
         other => other,
     };
 
-    // Store what the parser accepts, as the Task editor does: an empty model is
-    // no reviewer, and surrounding whitespace is removed. Storing the raw text
-    // would start a reviewer run with `--model ""` or a padded identifier.
-    let reviewer_model =
-        crate::domain::task::parse_reviewer_model(t.reviewer_model.as_deref().unwrap_or_default())
-            .map_err(|why| {
-                BundleError::Malformed(format!(
-                    "task {task_id} has a reviewer model that cannot be used: {why}"
-                ))
-            })?;
+    // Store what the parser accepts, and report what changed (see
+    // `preview::reviewer_model_for_import`). Storing the raw text would start a
+    // reviewer run with `--model ""` or a padded identifier.
+    let (reviewer_model, reviewer_note) =
+        super::preview::reviewer_model_for_import(task_id, t.reviewer_model.as_deref())?;
+    normalization.extend(reviewer_note);
 
     let mut task = Task::new_backlog(
         &HashMap::new(),

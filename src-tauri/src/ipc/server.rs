@@ -1068,8 +1068,8 @@ async fn process(
         audit(verb, peer, "denied-not-local");
         return Dispatch::reply(IpcResponse::error(format!(
             "`{verb}` is not available to clients the operating system has not identified. It \
-             can create work that runs as the user, or read a file the client names, so only \
-             the local endpoint may use it. See docs/architecture/ipc-security.md."
+             can create work that runs as the user, or read or write a file the client names, \
+             so only the local endpoint may use it. See docs/architecture/ipc-security.md."
         )));
     }
 

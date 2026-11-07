@@ -394,20 +394,54 @@ async fn an_imported_reviewer_model_is_stored_as_the_parser_reads_it() {
     let bytes = exported_bytes(&source, &src).await;
     let task_id = bundle::decode(&bytes).unwrap().payload.tasks[0].id;
 
-    for (raw, stored) in [
-        (Some("  sonnet  "), Some("sonnet")),
-        (Some(""), None),
-        (Some("   "), None),
-        (None, None),
+    for (raw, stored, reason) in [
+        (
+            Some("  sonnet  "),
+            Some("sonnet"),
+            Some("reviewer_model_trimmed"),
+        ),
+        (Some(""), None, Some("reviewer_model_cleared")),
+        (Some("   "), None, Some("reviewer_model_cleared")),
+        (None, None, None),
     ] {
         let mut payload = bundle::decode(&bytes).unwrap().payload;
         payload.tasks[0].reviewer_model = raw.map(str::to_string);
         let tampered = bundle::encode(&payload, chrono::Utc::now(), "test").unwrap();
+        let reviewer_reasons = |notes: &[super::preview::Normalization]| -> Vec<&'static str> {
+            notes
+                .iter()
+                .map(|n| n.reason)
+                .filter(|r| r.starts_with("reviewer_model_"))
+                .collect()
+        };
+        let expected: Vec<&str> = reason.into_iter().collect();
+
+        // Preview describes the change that Apply then makes.
+        let previewed = super::preview::preview(
+            &tampered,
+            &super::preview::Target {
+                projects: &HashMap::new(),
+                repositories: &HashMap::new(),
+                tasks: &HashMap::new(),
+                unreadable_boards: 0,
+            },
+        )
+        .unwrap_or_else(|e| panic!("reviewer {raw:?} must preview: {e}"));
+        assert_eq!(
+            reviewer_reasons(&previewed.normalization),
+            expected,
+            "preview {raw:?}"
+        );
 
         let (_dst, target) = test_ctx().await;
-        apply::apply(live(&target), &tampered, &checksum_of(&tampered))
+        let applied = apply::apply(live(&target), &tampered, &checksum_of(&tampered))
             .await
             .unwrap_or_else(|e| panic!("reviewer {raw:?} must import: {e}"));
+        assert_eq!(
+            reviewer_reasons(&applied.normalization),
+            expected,
+            "apply {raw:?}"
+        );
         let imported = target.tasks.read().await[&task_id].reviewer_model.clone();
         assert_eq!(imported.as_deref(), stored, "reviewer {raw:?}");
     }
@@ -1104,6 +1138,89 @@ async fn a_completed_import_under_a_salvaged_configuration_loads_none_of_its_tas
         2
     );
     assert!(!record.exists());
+}
+
+/// A completed import whose record is still on disk, and whose Task board's
+/// directory is the only one that cannot be synchronized. The configuration's
+/// confirmation covers its own directory, not the board's, so startup must not
+/// clear the record on that strength alone.
+#[tokio::test]
+async fn a_completed_import_keeps_its_record_until_the_board_directory_is_synced() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    assert!(apply_with(&target, &path, &checksum_of(&bytes)).await.ok);
+    let paths = std::sync::Arc::new(target.storage.paths().clone());
+    let record = paths.pending_project_import_file(project_id());
+    fs::write(&record, project_id().to_string().as_bytes()).unwrap();
+    let board_dir = target
+        .storage
+        .tasks_board_files(project_id())
+        .into_iter()
+        .find(|file| file.exists())
+        .expect("the completed import has a board")
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .expect("the board has a directory name")
+        .to_string_lossy()
+        .into_owned();
+    drop(target);
+
+    // The board's directory cannot be synchronized; everything else can.
+    let unsupported = fault::fail_at_file(Stage::SyncDirectory, ErrorKind::Unsupported, &board_dir);
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(
+        state.project.projects.read().await.contains_key(&project_id()),
+        "the completed import still loads"
+    );
+    assert!(record.exists(), "the record stays while the board is unproven");
+    assert!(
+        report
+            .project_import_recovery_failures
+            .iter()
+            .any(|m| m.contains("cannot be synchronized on this filesystem")),
+        "{:?}",
+        report.project_import_recovery_failures
+    );
+    drop(unsupported);
+    drop(state);
+
+    // An I/O error on that directory is a failure to confirm, not an unsupported filesystem.
+    let failed = fault::fail_at_file(Stage::SyncDirectory, ErrorKind::Other, &board_dir);
+    let (_state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(record.exists(), "the record stays after an I/O error");
+    assert!(
+        report
+            .project_import_recovery_failures
+            .iter()
+            .any(|m| m.contains("could not be synchronized")),
+        "{:?}",
+        report.project_import_recovery_failures
+    );
+    drop(failed);
+
+    // A start that can synchronize the board's directory settles the import.
+    let (state, report) = crate::app_core::build_state_with_paths(paths.clone())
+        .await
+        .unwrap();
+    assert!(
+        report.project_import_recovery_failures.is_empty(),
+        "{:?}",
+        report.project_import_recovery_failures
+    );
+    assert!(state
+        .project
+        .projects
+        .read()
+        .await
+        .contains_key(&project_id()));
+    assert!(!record.exists(), "the record goes once every component is durable");
 }
 
 #[tokio::test]

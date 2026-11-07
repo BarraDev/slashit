@@ -160,6 +160,27 @@ pub fn can_confirm(preview: &PreviewReport) -> bool {
     preview.importable
 }
 
+/// One sentence per kind of change the import makes to a Task, in the order the
+/// user should read them. A kind appears once, however many Tasks it touches.
+pub fn normalization_summary(normalization: &[PreviewNormalization]) -> Vec<&'static str> {
+    let has = |reasons: &[&str]| {
+        normalization
+            .iter()
+            .any(|change| reasons.contains(&change.reason.as_str()))
+    };
+    let mut lines = Vec::new();
+    if has(&["approval_current_in_bundle", "approval_withdrawn"]) {
+        lines.push("Approvals are withdrawn, so nothing imported runs on an earlier approval.");
+    }
+    if has(&["human_review_without_checkout"]) {
+        lines.push("Tasks waiting for review return to Backlog, because their checkouts are not in the file.");
+    }
+    if has(&["reviewer_model_trimmed", "reviewer_model_cleared"]) {
+        lines.push("Reviewer models are stored as the Task editor stores them: a blank model means no reviewer, and surrounding spaces are removed.");
+    }
+    lines
+}
+
 pub async fn choose_export_destination(project_name: String) -> Result<Option<String>, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "projectName": project_name }))
         .map_err(|e| e.to_string())?;
@@ -305,5 +326,29 @@ mod tests {
         });
         let parsed: ImportOutcome = serde_json::from_value(json).unwrap();
         assert!(matches!(parsed, ImportOutcome::Applied { durable: false, .. }));
+    }
+
+    fn change(reason: &str) -> PreviewNormalization {
+        PreviewNormalization { task_id: "t".into(), reason: reason.into() }
+    }
+
+    #[test]
+    fn a_normalization_is_described_once_per_kind_and_only_when_present() {
+        assert!(normalization_summary(&[]).is_empty());
+
+        // A reviewer-only change says nothing about approvals or review waits.
+        let reviewer = normalization_summary(&[change("reviewer_model_cleared"), change("reviewer_model_trimmed")]);
+        assert_eq!(reviewer.len(), 1, "{reviewer:?}");
+        assert!(reviewer[0].starts_with("Reviewer models"), "{reviewer:?}");
+
+        // Several Tasks of one kind produce one sentence, in reading order.
+        let mixed = normalization_summary(&[
+            change("approval_current_in_bundle"),
+            change("approval_current_in_bundle"),
+            change("human_review_without_checkout"),
+        ]);
+        assert_eq!(mixed.len(), 2, "{mixed:?}");
+        assert!(mixed[0].starts_with("Approvals"), "{mixed:?}");
+        assert!(mixed[1].starts_with("Tasks waiting"), "{mixed:?}");
     }
 }
