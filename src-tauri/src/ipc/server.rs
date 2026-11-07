@@ -1062,15 +1062,14 @@ async fn process(
     }
 
     // The core security property. A valid token proves the peer knows a secret;
-    // it does not prove the peer is the user, and these verbs run code as the
-    // user.
-    if !peer.os_verified && request.spawns_agent() {
+    // it does not prove the peer is the user. These verbs create work that runs
+    // as the user or read files the client names.
+    if !peer.os_verified && request.needs_verified_peer() {
         audit(verb, peer, "denied-not-local");
         return Dispatch::reply(IpcResponse::error(format!(
             "`{verb}` is not available to clients the operating system has not identified. It \
-             creates a worktree and runs an agent with full tool access, which makes it a \
-             code-execution primitive; only the local endpoint may use it. See \
-             docs/architecture/ipc-security.md."
+             can create work that runs as the user, or read or write a file the client names, \
+             so only the local endpoint may use it. See docs/architecture/ipc-security.md."
         )));
     }
 

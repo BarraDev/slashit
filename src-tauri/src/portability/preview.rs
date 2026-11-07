@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::domain::{Project, Repository, Task};
+use crate::domain::{Project, Repository, Task, TaskStatus};
 
 use super::bundle::{self, BundleError, OMITTED};
 use super::export;
@@ -37,6 +37,8 @@ pub struct Report {
     pub project: ProjectSummary,
     pub repository: Option<RepositorySummary>,
     pub counts: Counts,
+    /// The payload checksum the apply must name back to import this exact file.
+    pub checksum: String,
     /// Identity collisions. Any entry here means the import would be refused.
     pub conflicts: Vec<Conflict>,
     /// Historical state the import must neutralize before anything can act on it.
@@ -91,6 +93,28 @@ pub struct GitReference {
     pub task_id: Uuid,
     pub field: &'static str,
     pub commit: String,
+}
+
+/// The reviewer model an imported Task stores, and the normalization that changed
+/// the bundle's text. The parser is the Task editor's, so Preview and Apply agree.
+/// An absent model stores none and is not a normalization.
+pub(super) fn reviewer_model_for_import(
+    task_id: Uuid,
+    raw: Option<&str>,
+) -> Result<(Option<String>, Option<Normalization>), BundleError> {
+    let stored = crate::domain::task::parse_reviewer_model(raw.unwrap_or_default())
+        .map_err(|why| {
+            BundleError::Malformed(format!(
+                "task {task_id} has a reviewer model that cannot be used: {why}"
+            ))
+        })?;
+    let reason = match raw {
+        None => None,
+        Some(text) if stored.as_deref() == Some(text) => None,
+        Some(_) if stored.is_none() => Some("reviewer_model_cleared"),
+        Some(_) => Some("reviewer_model_trimmed"),
+    };
+    Ok((stored, reason.map(|reason| Normalization { task_id, reason })))
 }
 
 /// Validate `bytes` and describe what importing it would do.
@@ -152,6 +176,15 @@ pub fn preview(bytes: &[u8], target: &Target<'_>) -> Result<Report, BundleError>
     let mut normalization = Vec::new();
     let mut git_references = Vec::new();
     for task in &payload.tasks {
+        let (_, reviewer_note) =
+            reviewer_model_for_import(task.id, task.reviewer_model.as_deref())?;
+        normalization.extend(reviewer_note);
+        if matches!(task.status, TaskStatus::HumanReview) {
+            normalization.push(Normalization {
+                task_id: task.id,
+                reason: "human_review_without_checkout",
+            });
+        }
         if task.human_review.has_current_approval() {
             normalization.push(Normalization {
                 task_id: task.id,
@@ -159,6 +192,10 @@ pub fn preview(bytes: &[u8], target: &Target<'_>) -> Result<Report, BundleError>
             });
         }
         if let Some(commit) = &task.base_commit {
+            normalization.push(Normalization {
+                task_id: task.id,
+                reason: "base_commit_not_kept",
+            });
             git_references.push(GitReference {
                 task_id: task.id,
                 field: "base_commit",
@@ -182,6 +219,7 @@ pub fn preview(bytes: &[u8], target: &Target<'_>) -> Result<Report, BundleError>
         format_version: bundle::FORMAT_VERSION,
         build: decoded.build,
         created_at: decoded.created_at,
+        checksum: decoded.checksum,
         project: ProjectSummary {
             id: payload.project.id,
             name: payload.project.name.clone(),

@@ -108,6 +108,12 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
                 .iter()
                 .map(|failure| format!("Project Task cleanup: {failure}")),
         )
+        .chain(
+            report
+                .project_import_recovery_failures
+                .iter()
+                .map(|failure| format!("Project import recovery: {failure}")),
+        )
         .collect::<Vec<_>>();
     if cleanup_failures.is_empty() {
         println!(

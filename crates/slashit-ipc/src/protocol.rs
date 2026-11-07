@@ -106,6 +106,10 @@ pub enum IpcRequest {
     /// Validate an export file and describe what importing it would do. Reads
     /// the file and the instance's memory, and writes nothing.
     PreviewImport { path: String },
+    /// Create the Project described by an export file, as an inert Project.
+    /// `checksum` is the payload checksum a preview reported for this file; the
+    /// apply refuses any other payload. Writes the Project and its Tasks.
+    ApplyImport { path: String, checksum: String },
 }
 
 impl IpcRequest {
@@ -140,6 +144,19 @@ impl IpcRequest {
     /// in progress, so it reaches the same primitive one step later and must
     /// be denied to any non-local peer exactly like the verbs that start it.
     /// These verbs are the code-execution surface.
+    /// Verbs that create work a person can run (the agent verbs above, and an
+    /// import, whose Tasks can be queued the same way), a preview, which reads
+    /// a file at a path the client chooses, and an export, which writes a new
+    /// file at a path the client chooses. Denied to any peer the operating
+    /// system has not identified.
+    pub fn needs_verified_peer(&self) -> bool {
+        self.spawns_agent()
+            || matches!(
+                self,
+                Self::ApplyImport { .. } | Self::PreviewImport { .. } | Self::ExportProject { .. }
+            )
+    }
+
     pub fn spawns_agent(&self) -> bool {
         matches!(
             self,
@@ -173,6 +190,7 @@ impl IpcRequest {
             Self::Ping => "ping",
             Self::ExportProject { .. } => "export_project",
             Self::PreviewImport { .. } => "preview_import",
+            Self::ApplyImport { .. } => "apply_import",
         }
     }
 }
@@ -393,6 +411,27 @@ mod tests {
         .spawns_agent());
         assert!(!IpcRequest::Show.spawns_agent());
         assert!(!IpcRequest::Quit.spawns_agent());
+    }
+
+    #[test]
+    fn an_import_creates_work_so_it_needs_a_verified_peer() {
+        assert!(IpcRequest::ApplyImport {
+            path: String::new(),
+            checksum: String::new(),
+        }
+        .needs_verified_peer());
+        // A preview reads a caller-chosen path, so it is not a read-only status verb.
+        assert!(IpcRequest::PreviewImport {
+            path: String::new(),
+        }
+        .needs_verified_peer());
+        // An export writes a file at a path the client names.
+        assert!(IpcRequest::ExportProject {
+            project_id: String::new(),
+            path: String::new(),
+        }
+        .needs_verified_peer());
+        assert!(!IpcRequest::Status.needs_verified_peer());
     }
 
     #[test]

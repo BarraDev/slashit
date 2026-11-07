@@ -80,6 +80,9 @@ pub struct StartupReport {
     /// Durable Project Task cleanup records that could not be completed
     /// during startup. Each record remains on disk for a later retry.
     pub project_tasks_cleanup_failures: Vec<String>,
+    /// Import records of Projects that could not be settled during startup.
+    /// Each record remains on disk for a later retry.
+    pub project_import_recovery_failures: Vec<String>,
 }
 
 /// Resolve the OS directories and build state from what is on disk.
@@ -232,6 +235,10 @@ pub async fn build_state_with_paths(
     // configuration is rewritten through the full durable protocol; if that
     // fails the records are kept and the cleanup waits for a later start.
     let mut projects_are_authoritative = projects_are_authoritative;
+    // Import recovery has its own two answers: whether the configuration proves
+    // a Project's absence, and whether its own state is confirmed durable.
+    let mut import_authoritative = projects_are_authoritative;
+    let mut import_confirmed = true;
     if projects_are_authoritative {
         let owed = app_state
             .storage
@@ -242,6 +249,14 @@ pub async fn build_state_with_paths(
                 .storage
                 .pending_project_tasks_deletions()
                 .map(|p| !p.is_empty())
+                .unwrap_or(true)
+            // Only a trusted record can settle anything, and only that one needs
+            // the configuration proved absent of a Project. A record that cannot
+            // be trusted is held back without rewriting the configuration.
+            || app_state
+                .storage
+                .import_records()
+                .map(|records| records.iter().any(|record| record.problem.is_none()))
                 .unwrap_or(true);
         if owed {
             if let Err(error) = app_state.storage.reconfirm_config_durable() {
@@ -253,14 +268,45 @@ pub async fn build_state_with_paths(
                     "pending cleanup deferred: configuration not confirmed durable: {error}"
                 ));
                 projects_are_authoritative = false;
+                // A filesystem that cannot synchronize a directory never confirms
+                // a write, so this reconfirmation can never succeed there. The
+                // configuration was read in full, which is enough to settle an
+                // import; the record stays until the configuration is confirmed.
+                // Any other failure keeps the imports held back as well.
+                if matches!(error, crate::config::ConfigWriteError::Unconfirmable(_)) {
+                    import_confirmed = false;
+                } else {
+                    import_authoritative = false;
+                    import_confirmed = false;
+                }
             }
         }
     }
+    // Import records are settled before anything uses the Project list. An
+    // import that did not settle leaves a Project without its board, and that
+    // Project is removed only under an authoritative configuration. Without one,
+    // or when a record cannot be trusted, the Project is quarantined: kept out
+    // of this process, with its record and board left for repair.
+    let quarantined_imports = {
+        let mut projects = app_state.project.projects.write().await;
+        let recovery = crate::portability::apply::recover_interrupted_imports(
+            &app_state.storage,
+            &mut projects,
+            import_authoritative,
+            import_confirmed,
+        );
+        report.project_import_recovery_failures = recovery.failures;
+        recovery.quarantined
+    };
     if projects_are_authoritative {
         match app_state.storage.pending_project_conversation_deletions() {
             Ok(pending) => {
                 let projects = app_state.project.projects.read().await;
                 for project_id in pending {
+                    // Held back, not deleted: its absence from memory proves nothing.
+                    if quarantined_imports.contains(&project_id) {
+                        continue;
+                    }
                     if projects.contains_key(&project_id) {
                         if let Err(error) = app_state
                             .storage
@@ -319,6 +365,9 @@ pub async fn build_state_with_paths(
                 let projects = app_state.project.projects.read().await;
                 for record in pending {
                     let project_id = record.project_id;
+                    if quarantined_imports.contains(&project_id) {
+                        continue;
+                    }
                     if projects.contains_key(&project_id) {
                         if let Err(error) = app_state
                             .storage
@@ -360,10 +409,12 @@ pub async fn build_state_with_paths(
         }
     }
 
-    let loaded_tasks = app_state.storage.load_all_tasks().unwrap_or_else(|e| {
+    let mut loaded_tasks = app_state.storage.load_all_tasks().unwrap_or_else(|e| {
         eprintln!("Warning: Failed to load tasks from disk: {e}");
         Vec::new()
     });
+    // A quarantined Project's Tasks are not loaded either, so none can run without it.
+    loaded_tasks.retain(|task| !quarantined_imports.contains(&task.project_id));
 
     // Built before the task write lock is taken rather than inside it. The
     // original code held the tasks write guard while acquiring read guards on

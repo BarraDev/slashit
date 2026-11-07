@@ -4,7 +4,7 @@ use crate::domain::task::ExternalRef;
 use crate::domain::{AgentConfig, Conversation, Project, Repository, Task};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -334,6 +334,9 @@ fn migrate_task_refs(task: &mut Task) {
 pub struct Storage {
     paths: Arc<AppPaths>,
     config_file: PathBuf,
+    /// Projects an import held back. They are not in memory, but their entries
+    /// in `config.toml` must survive every rewrite of the Projects section.
+    held_back: Arc<Mutex<HashSet<Uuid>>>,
     /// Project id to the directory holding that project's shareable state.
     ///
     /// Routing depends only on config content — a project's repository path
@@ -387,6 +390,17 @@ pub struct Storage {
 pub struct ProjectTaskCleanupRecord {
     pub project_id: Uuid,
     pub board_files: Vec<PathBuf>,
+}
+
+/// One Project import record found in the configuration directory.
+///
+/// `project_id` comes from the file name. `problem` is set when the content
+/// does not confirm that name, so the record cannot prove the import's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRecord {
+    pub project_id: Option<Uuid>,
+    pub path: PathBuf,
+    pub problem: Option<String>,
 }
 
 impl Storage {
@@ -710,6 +724,149 @@ impl Storage {
         Ok(pending)
     }
 
+    /// Persist the import record before the imported Project is committed.
+    ///
+    /// The result is the write's own: `Err` with a published write means the
+    /// record is in place but not confirmed durable, which the caller reports.
+    /// Recovery reads the record; see `portability::apply::recover_interrupted_imports`.
+    pub fn mark_project_import_pending(
+        &self,
+        project_id: Uuid,
+    ) -> std::result::Result<slashit_durable_fs::Committed, slashit_durable_fs::WriteError> {
+        write_private_atomic(
+            &self.paths.pending_project_import_file(project_id),
+            project_id.to_string().as_bytes(),
+        )
+    }
+
+    /// Remove the import record. Clearing an absent record is a no-op.
+    pub fn clear_project_import_pending(&self, project_id: Uuid) -> Result<()> {
+        let path = self.paths.pending_project_import_file(project_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("Failed to clear import record {path:?}")),
+        }
+    }
+
+    /// List every import record. Only a failure to list the directory is an
+    /// error. A malformed record is returned with its `problem`, so recovery
+    /// can still act on the Project its file name identifies.
+    pub fn import_records(&self) -> Result<Vec<ImportRecord>> {
+        let entries = match fs::read_dir(self.paths.config_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("Failed to list import records"),
+        };
+        let mut records = Vec::new();
+        for entry in entries {
+            let entry = entry.context("Failed to read import record directory entry")?;
+            let path = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".import-pending") else {
+                continue;
+            };
+            // The file name is the identity recovery relies on; the content is
+            // checked against it and never trusted on its own. Only the canonical
+            // spelling is accepted, because clearing a record rebuilds its path
+            // from the id, so another spelling could never be removed.
+            let project_id = id.parse::<Uuid>().ok().filter(|uuid| uuid.to_string() == id);
+            let problem = match project_id {
+                None => Some("the file name is not a canonical Project id".to_string()),
+                Some(expected) => match fs::read_to_string(&path) {
+                    Err(error) => Some(format!("the record cannot be read: {error}")),
+                    Ok(text) => match text.trim().parse::<Uuid>() {
+                        Err(_) => Some("the record does not contain a Project id".to_string()),
+                        Ok(recorded) if recorded != expected => {
+                            Some("the record names a different Project".to_string())
+                        }
+                        Ok(_) => None,
+                    },
+                },
+            };
+            records.push(ImportRecord {
+                project_id,
+                path,
+                problem,
+            });
+        }
+        Ok(records)
+    }
+
+    /// The Projects with an import record. A malformed record is an error, not
+    /// skipped; recovery uses [`Self::import_records`] to act on the valid
+    /// records and quarantine the rest.
+    pub fn pending_project_imports(&self) -> Result<Vec<Uuid>> {
+        self.import_records()?
+            .into_iter()
+            .map(|record| match (record.project_id, record.problem) {
+                (Some(id), None) => Ok(id),
+                (_, problem) => anyhow::bail!(
+                    "Invalid import record {:?}: {}",
+                    record.path,
+                    problem.unwrap_or_default()
+                ),
+            })
+            .collect()
+    }
+
+    /// Keep a Project out of this process because an import could not settle it.
+    /// Its configuration entry is preserved by later rewrites until a start
+    /// settles it.
+    pub fn hold_back_project(&self, project_id: Uuid) {
+        let mut held = match self.held_back.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        held.insert(project_id);
+    }
+
+    /// The Projects held back in this process, copied out so no lock is held
+    /// while the configuration transaction runs.
+    pub fn held_back_projects(&self) -> Vec<Uuid> {
+        let held = match self.held_back.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        held.iter().copied().collect()
+    }
+
+    /// Whether anything on disk still names this Project id: its import record,
+    /// a Task board, a configuration entry, or a Task or Conversation cleanup
+    /// that is still owed. An unreadable file counts as present. An import of the
+    /// same id must not replace or clear any of them while they remain, and a
+    /// pending cleanup must not later delete what the import created.
+    pub fn project_import_residue(&self, project_id: Uuid) -> Result<bool> {
+        let record = self.paths.pending_project_import_file(project_id);
+        if record.try_exists().unwrap_or(true) {
+            return Ok(true);
+        }
+        if self
+            .tasks_board_files(project_id)
+            .iter()
+            .any(|file| file.try_exists().unwrap_or(true))
+        {
+            return Ok(true);
+        }
+        if self.has_pending_tasks_deletion_record(project_id)? {
+            return Ok(true);
+        }
+        if self
+            .paths
+            .pending_project_conversation_deletion_file(project_id)
+            .try_exists()
+            .unwrap_or(true)
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .read_config_strict()?
+            .projects
+            .contains_key(&project_id.to_string()))
+    }
+
     pub fn new() -> Result<Self> {
         let paths = AppPaths::new().context("Failed to resolve application directories")?;
         Ok(Self::with_paths(paths))
@@ -726,6 +883,7 @@ impl Storage {
             load_diagnostics: Arc::new(Mutex::new(Vec::new())),
             config_tx: Arc::new(Mutex::new(())),
             config_unconfirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            held_back: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -960,6 +1118,12 @@ impl Storage {
         }
         self.update_config(|_| {})?;
         self.require_config_confirmed()
+    }
+
+    /// Whether the last configuration write could not be confirmed durable.
+    /// Read-only: unlike [`Self::confirm_config_durable`], it writes nothing.
+    pub fn config_is_unconfirmed(&self) -> bool {
+        self.config_unconfirmed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn require_config_confirmed(&self) -> std::result::Result<(), ConfigWriteError> {
@@ -1640,6 +1804,31 @@ impl Storage {
         slashit_durable_fs::sync_directory(dir).context("Failed to synchronize the tasks directory")
     }
 
+    /// Synchronize the directory of each Task board file this Project has, so the
+    /// entries that make an existing board reachable are durable. Startup uses
+    /// this, because a configuration sync covers only the configuration's own
+    /// directory. `Unsupported` if any of those directories cannot be asked.
+    pub fn sync_board_directories(
+        &self,
+        project_id: Uuid,
+    ) -> Result<slashit_durable_fs::DirectorySync> {
+        let mut total = slashit_durable_fs::DirectorySync::Synced;
+        for file in self.tasks_board_files(project_id) {
+            if !file.try_exists().unwrap_or(true) {
+                continue;
+            }
+            let dir = file
+                .parent()
+                .context("the Task board has no containing directory")?;
+            let sync = slashit_durable_fs::sync_directory(dir)
+                .with_context(|| format!("Failed to synchronize {}", dir.display()))?;
+            if sync == slashit_durable_fs::DirectorySync::Unsupported {
+                total = sync;
+            }
+        }
+        Ok(total)
+    }
+
     /// Save tasks for a specific project.
     ///
     /// Writes to the project's current state directory and then retires the
@@ -1695,6 +1884,31 @@ impl Storage {
         }
 
         Ok(())
+    }
+
+    /// Stage the board of a Project that has none yet, without making it visible.
+    ///
+    /// The caller publishes the file with `publish_new`, which refuses a board
+    /// that appeared after this check, so an import never replaces a board.
+    /// Nothing is visible until that publication.
+    pub fn stage_new_project_board(
+        &self,
+        project_id: Uuid,
+        tasks: &[Task],
+    ) -> Result<slashit_durable_fs::StagedFile> {
+        let path = self.tasks_path(project_id);
+        let legacy = self.legacy_tasks_path(project_id);
+        self.ensure_board_replaceable(project_id, &path, &legacy)?;
+        if self.tasks_board_files(project_id).iter().any(|file| file.exists()) {
+            anyhow::bail!("a Task board already exists for this Project");
+        }
+        let tasks_file = ProjectTasksFile {
+            version: TASKS_FILE_VERSION,
+            tasks: tasks.to_vec(),
+        };
+        let contents = toml::to_string_pretty(&tasks_file).context("Failed to serialize tasks")?;
+        slashit_durable_fs::stage(&path, contents.as_bytes(), slashit_durable_fs::Permissions::Preserve)
+            .map_err(|e| write_failure(e, "stage tasks file"))
     }
 
     pub fn delete_task_files(&self, board_files: &[PathBuf]) -> Result<()> {

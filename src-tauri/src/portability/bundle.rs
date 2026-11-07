@@ -229,6 +229,9 @@ impl Payload {
 pub struct Decoded {
     pub build: String,
     pub created_at: DateTime<Utc>,
+    /// The verified checksum of the payload bytes. An apply names it back, so
+    /// it applies exactly the payload that was previewed.
+    pub checksum: String,
     pub payload: Payload,
 }
 
@@ -299,11 +302,29 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, BundleError> {
         ));
     }
     validate(&payload)?;
+    check_import_fields(&payload)?;
     Ok(Decoded {
+        checksum: envelope.checksum,
         build: envelope.build,
         created_at: envelope.created_at,
         payload,
     })
+}
+
+/// Field rules that a Task created through SlashIt always meets, but that an
+/// older Task may not. Checked on read only, so an export of such a Task still
+/// succeeds and its import is refused with the reason.
+fn check_import_fields(payload: &Payload) -> Result<(), BundleError> {
+    for task in &payload.tasks {
+        let reviewer = task.reviewer_model.as_deref().unwrap_or_default();
+        if let Err(why) = crate::domain::task::parse_reviewer_model(reviewer) {
+            return Err(BundleError::Malformed(format!(
+                "task {} has a reviewer model that cannot be used: {why}",
+                task.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Structural rules a valid export satisfies by construction. A bundle that
@@ -365,6 +386,22 @@ fn validate(payload: &Payload) -> Result<(), BundleError> {
                 )));
             }
         }
+        let web_addresses = [
+            task.github_issue_url.as_deref(),
+            task.gitlab_issue_url.as_deref(),
+            task.pr_url.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(task.external_refs.iter().filter_map(|r| match r {
+            ExternalRef::GithubIssue { url, .. }
+            | ExternalRef::GithubPr { url, .. }
+            | ExternalRef::GitlabIssue { url } => Some(url.as_str()),
+            _ => None,
+        }));
+        for url in web_addresses {
+            check_web_address(task.id, url)?;
+        }
         // Historical evidence: checked as an identifier, never required to exist.
         let commits = task
             .base_commit
@@ -395,17 +432,67 @@ fn validate(payload: &Payload) -> Result<(), BundleError> {
     Ok(())
 }
 
+/// A Task's web address (an issue or pull request link) must not contain `@`:
+/// that is where user information, and so a credential, would sit. The export
+/// sanitizer strips user information only from the authority of a `://` address,
+/// so every other spelling that carries an `@` is refused, on export as well as
+/// on decode (`encode` validates the payload before it writes it).
+///
+/// A `://` address's host part must then be a host with an optional numeric
+/// port.
+///
+/// shortcut: an address with a bracketed IPv6 host is not port-checked; a Task
+/// web address does not use that form in practice. An address whose path
+/// legitimately contains `@` is refused; no issue or pull request link does.
+fn check_web_address(task_id: Uuid, url: &str) -> Result<(), BundleError> {
+    if url.contains('@') {
+        return Err(BundleError::Unsafe(format!(
+            "task {task_id} has a web address with user information, which may hold a credential"
+        )));
+    }
+    let Some((_, rest)) = url.split_once("://") else {
+        return Ok(());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if !authority.starts_with('[') {
+        if let Some((_, port)) = authority.rsplit_once(':') {
+            if !port.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(BundleError::Malformed(format!(
+                    "task {task_id} has a web address whose host part is not a host and port"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A repository remote is one plain token, and carries no user information:
 /// that is where a credential would sit, so its presence is `Unsafe`.
-/// Shortcut: a scp-style remote (`user:secret@host:path`) and a local path are
-/// accepted as written; a credential in those forms is not detected.
+///
+/// An scp-style remote (`user@host:path`) keeps its user part, as SSH needs it.
+/// A colon inside that user part (`user:secret@host:path`) is a password, so it
+/// is refused the same way. A local path is not an scp-style remote.
 fn check_remote_identity(url: &str) -> Result<(), BundleError> {
     if url.is_empty() || url.len() > 2048 || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(BundleError::Malformed("the repository remote is not one plain token".into()));
     }
+    // A colon before the first `@` is inside the user part; one after it is in the host or path.
+    let carries_user_information = |head: &str| match (head.find(':'), head.find('@')) {
+        (Some(colon), Some(at)) => colon < at,
+        _ => false,
+    };
     if let Some((_, rest)) = url.split_once("://") {
         let authority = rest.split('/').next().unwrap_or_default();
         if authority.contains('@') {
+            return Err(BundleError::Unsafe(
+                "the repository remote carries user information, which may hold a credential".into(),
+            ));
+        }
+        if url.contains(['?', '#']) {
+            return Err(BundleError::Malformed("the repository remote has a query or fragment".into()));
+        }
+    } else {
+        if carries_user_information(url.split('/').next().unwrap_or_default()) {
             return Err(BundleError::Unsafe(
                 "the repository remote carries user information, which may hold a credential".into(),
             ));

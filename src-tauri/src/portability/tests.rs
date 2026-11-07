@@ -35,13 +35,13 @@ use super::{export, preview};
 
 const GOLDEN: &[u8] = include_bytes!("testdata/export-v1.golden.json");
 
-fn at() -> DateTime<Utc> {
+pub(super) fn at() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z")
         .unwrap()
         .with_timezone(&Utc)
 }
 
-fn peer() -> PeerContext {
+pub(super) fn peer() -> PeerContext {
     PeerContext {
         endpoint: Endpoint::Unix {
             path: PathBuf::from("/nonexistent-for-tests"),
@@ -50,7 +50,7 @@ fn peer() -> PeerContext {
     }
 }
 
-async fn test_ctx() -> (TempDir, IpcContext) {
+pub(super) async fn test_ctx() -> (TempDir, IpcContext) {
     let tmp = TempDir::new().expect("tempdir");
     let paths = Arc::new(AppPaths::with_roots(
         tmp.path().join("config"),
@@ -64,7 +64,7 @@ async fn test_ctx() -> (TempDir, IpcContext) {
     (tmp, ctx)
 }
 
-fn project_id() -> Uuid {
+pub(super) fn project_id() -> Uuid {
     Uuid::from_u128(1)
 }
 
@@ -72,7 +72,7 @@ fn repository_id() -> Uuid {
     Uuid::from_u128(2)
 }
 
-fn project(repository: Option<Uuid>) -> Project {
+pub(super) fn project(repository: Option<Uuid>) -> Project {
     Project {
         id: project_id(),
         name: "Fixture".into(),
@@ -94,7 +94,7 @@ fn project(repository: Option<Uuid>) -> Project {
     }
 }
 
-fn repository(path: &Path) -> Repository {
+pub(super) fn repository(path: &Path) -> Repository {
     Repository {
         id: repository_id(),
         local_path: path.to_string_lossy().into_owned(),
@@ -114,7 +114,7 @@ fn entry(seq: u32, kind: ActivityKind) -> ActivityEntry {
 
 /// Two Tasks: `Alpha` in Backlog with a timeline, and `Beta` in Human Review,
 /// depending on Alpha, with a current approval and run output in its timeline.
-fn fixture_tasks() -> Vec<Task> {
+pub(super) fn fixture_tasks() -> Vec<Task> {
     let mut alpha = create_test_task_full("Alpha", project_id(), TaskStatus::Backlog, 0);
     alpha.id = Uuid::from_u128(10);
     alpha.sequence_number = 1;
@@ -221,7 +221,7 @@ fn fixture_payload() -> Payload {
     .expect("the fixture is exportable")
 }
 
-async fn seed(ctx: &IpcContext, repo: Option<&Repository>, tasks: &[Task]) {
+pub(super) async fn seed(ctx: &IpcContext, repo: Option<&Repository>, tasks: &[Task]) {
     ctx.projects
         .write()
         .await
@@ -235,7 +235,7 @@ async fn seed(ctx: &IpcContext, repo: Option<&Repository>, tasks: &[Task]) {
     }
 }
 
-async fn export_to(ctx: &IpcContext, path: &Path) -> IpcResponse {
+pub(super) async fn export_to(ctx: &IpcContext, path: &Path) -> IpcResponse {
     dispatch(
         IpcRequest::ExportProject {
             project_id: project_id().to_string(),
@@ -698,10 +698,19 @@ fn preview_describes_the_import_and_neutralizes_nothing_on_its_own() {
         .normalization
         .iter()
         .any(|n| n.reason == "approval_current_in_bundle"));
+    // Apply returns a Human Review Task to Backlog, so Preview must say so too.
+    assert!(report
+        .normalization
+        .iter()
+        .any(|n| n.reason == "human_review_without_checkout"));
     assert!(report
         .git_references
         .iter()
         .any(|g| g.field == "base_commit"));
+    assert!(report
+        .normalization
+        .iter()
+        .any(|n| n.reason == "base_commit_not_kept"));
     assert!(report
         .git_references
         .iter()
@@ -1059,6 +1068,126 @@ async fn an_export_refuses_a_remote_that_decode_would_refuse() {
     let answer = export_to(&ctx, &path).await;
     assert!(!answer.ok, "a remote with a space must be refused: {answer:?}");
     assert!(!path.exists());
+}
+
+/// A hand-written bundle may put user information in a Task's web address. A
+/// credential is refused, a malformed authority is refused, and a plain address
+/// still imports. Export strips user information before it writes an address, so
+/// it never writes the credential form.
+#[test]
+fn an_import_refuses_a_task_web_address_that_carries_user_information() {
+    let credential = seal(&payload_json(|v| {
+        v["tasks"][0]["pr_url"] = Value::from("https://user:PR_SECRET@github.com/acme/app/pull/1");
+    }));
+    assert!(
+        matches!(bundle::decode(&credential), Err(BundleError::Unsafe(_))),
+        "a credential in a web address is refused"
+    );
+    let malformed = seal(&payload_json(|v| {
+        v["tasks"][0]["github_issue_url"] =
+            Value::from("https://user:ISSUE_SECRET/acme/app/issues/1");
+    }));
+    assert!(
+        matches!(bundle::decode(&malformed), Err(BundleError::Malformed(_))),
+        "an authority that is not a host and port is refused"
+    );
+    let plain = seal(&payload_json(|v| {
+        v["tasks"][0]["pr_url"] = Value::from("https://github.com:443/acme/app/pull/1");
+    }));
+    assert!(bundle::decode(&plain).is_ok(), "a plain address with a port still imports");
+    // Spellings the `://` sanitizer does not reach must be refused too.
+    for address in [
+        "https:///user:pw@github.com/acme/app/pull/1",
+        "https:user:tok@github.com/acme/app/pull/1",
+        "https://a/https://user:tok@github.com/acme/app/pull/1",
+        "https://github.com\\@evil.example/acme/app/pull/1",
+    ] {
+        let sealed = seal(&payload_json(|v| {
+            v["tasks"][0]["pr_url"] = Value::from(address);
+        }));
+        assert!(
+            matches!(bundle::decode(&sealed), Err(BundleError::Unsafe(_))),
+            "{address} must be refused"
+        );
+    }
+}
+
+/// Export writes a Task's address only after the same check. The `://` form
+/// with user information is stripped and exported; a spelling the stripping
+/// cannot reach is refused, and the credential is in neither the answer nor the file.
+#[tokio::test]
+async fn an_export_never_writes_a_credential_in_a_task_web_address() {
+    let (tmp, ctx) = test_ctx().await;
+    let mut tasks = fixture_tasks();
+    tasks[0].pr_url = Some("https://user:PR_TOKEN@github.com/acme/app/pull/1".into());
+    seed(&ctx, None, &tasks).await;
+    let stripped = tmp.path().join("stripped.json");
+    let answer = export_to(&ctx, &stripped).await;
+    assert!(answer.ok, "{answer:?}");
+    let written = fs::read_to_string(&stripped).unwrap();
+    assert!(!written.contains("PR_TOKEN"), "the user information must not be exported");
+    assert!(written.contains("https://github.com/acme/app/pull/1"));
+
+    tasks[0].pr_url = Some("https:///user:PR_TOKEN@github.com/acme/app/pull/1".into());
+    seed(&ctx, None, &tasks).await;
+    let refused = tmp.path().join("refused.json");
+    let answer = export_to(&ctx, &refused).await;
+    assert!(!answer.ok, "a spelling the sanitizer cannot strip is refused: {answer:?}");
+    assert!(!format!("{answer:?}").contains("PR_TOKEN"));
+    assert!(!refused.exists());
+}
+
+/// An scp-style remote can carry a credential in its user part, which is not
+/// stripped the way a `://` URL's is. Export refuses it, and an ordinary
+/// `git@host:path` remote, which has no credential, still exports.
+#[tokio::test]
+async fn an_export_refuses_an_scp_remote_that_carries_a_credential() {
+    let (tmp, ctx) = test_ctx().await;
+    let mut repo = repository(Path::new("/tmp/unused-checkout"));
+    repo.remote_url = Some("deploy:SCP_SECRET@github.com:acme/app.git".into());
+    seed(&ctx, Some(&repo), &fixture_tasks()).await;
+    let path = tmp.path().join("scp.json");
+    let answer = export_to(&ctx, &path).await;
+    assert!(
+        !answer.ok,
+        "a credential-bearing remote must be refused: {answer:?}"
+    );
+    assert!(!format!("{answer:?}").contains("SCP_SECRET"));
+    assert!(!path.exists());
+
+    repo.remote_url = Some("git@github.com:acme/app.git".into());
+    seed(&ctx, Some(&repo), &fixture_tasks()).await;
+    let ssh = tmp.path().join("ssh.json");
+    let answer = export_to(&ctx, &ssh).await;
+    assert!(
+        answer.ok,
+        "an ordinary SSH remote must still export: {answer:?}"
+    );
+
+    // Export drops a query from any remote before the check, so the secret never reaches the file.
+    repo.remote_url = Some("git@github.com:acme/app.git?access_token=QUERY_SECRET".into());
+    seed(&ctx, Some(&repo), &fixture_tasks()).await;
+    let query = tmp.path().join("query.json");
+    let answer = export_to(&ctx, &query).await;
+    assert!(answer.ok, "{answer:?}");
+    let written = fs::read_to_string(&query).unwrap();
+    assert!(!written.contains("QUERY_SECRET"), "the query must not be exported");
+
+    let sealed = seal(&payload_json(|v| {
+        v["repository"]["remote_url"] = Value::from("deploy:SCP_SECRET@github.com:acme/app.git");
+    }));
+    assert!(
+        matches!(bundle::decode(&sealed), Err(BundleError::Unsafe(_))),
+        "decode refuses the same remote"
+    );
+    // A hand-written bundle may still carry a query: decode refuses it.
+    let queried = seal(&payload_json(|v| {
+        v["repository"]["remote_url"] = Value::from("git@github.com:acme/app.git?token=x");
+    }));
+    assert!(
+        matches!(bundle::decode(&queried), Err(BundleError::Malformed(_))),
+        "decode refuses a query in an scp remote"
+    );
 }
 
 /// B2, decode side: identity and Git evidence are checked by shape, and an

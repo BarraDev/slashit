@@ -39,11 +39,27 @@ pub(crate) fn try_persist_projects(
     // would replace the stage that actually failed ("Failed to load config
     // before updating it" / "Failed to write config file") with a tautology.
     // The callers already name the operation.
+    // A Project an import held back is absent from `projects`, but its entry is
+    // the only record of it until a start settles it. Keep that entry as the
+    // file has it, so no save can drop a held-back Project.
+    let held: Vec<String> = storage
+        .held_back_projects()
+        .iter()
+        .map(Uuid::to_string)
+        .collect();
     storage.update_config(|config| {
-        config.projects = projects
+        let mut section: HashMap<String, Project> = config
+            .projects
             .iter()
-            .map(|(id, project)| (id.to_string(), project.clone()))
+            .filter(|(id, _)| held.contains(id))
+            .map(|(id, project)| (id.clone(), project.clone()))
             .collect();
+        section.extend(
+            projects
+                .iter()
+                .map(|(id, project)| (id.to_string(), project.clone())),
+        );
+        config.projects = section;
     })
 }
 
@@ -66,7 +82,7 @@ impl Default for ProjectState {
     }
 }
 
-fn get_default_agent_config(agent_type: &AgentType) -> AgentConfig {
+pub(crate) fn get_default_agent_config(agent_type: &AgentType) -> AgentConfig {
     let (command, args) = match agent_type {
         AgentType::ClaudeCode => ("claude", vec!["--stdio"]),
         AgentType::Cursor => ("cursor-agent", vec!["--stdio"]),
