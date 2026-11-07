@@ -547,6 +547,16 @@ fn materialize_task(
         other => other,
     };
 
+    // The bundle's base commit names an object in the exporting repository.
+    // It is historical only, so the Task starts without one and the first run
+    // admits a local base from this repository's own refs.
+    if t.base_commit.is_some() {
+        normalization.push(Normalization {
+            task_id,
+            reason: "base_commit_not_kept",
+        });
+    }
+
     // Store what the parser accepts, and report what changed (see
     // `preview::reviewer_model_for_import`). Storing the raw text would start a
     // reviewer run with `--model ""` or a padded identifier.
@@ -586,7 +596,7 @@ fn materialize_task(
     task.pr_url = t.pr_url;
     task.qa_signoff = t.qa_signoff;
     task.human_review = review;
-    task.base_commit = t.base_commit;
+    task.base_commit = None;
     task.activity = activity;
     task.created_at = t.created_at;
     task.updated_at = t.updated_at;

@@ -708,6 +708,10 @@ fn preview_describes_the_import_and_neutralizes_nothing_on_its_own() {
         .iter()
         .any(|g| g.field == "base_commit"));
     assert!(report
+        .normalization
+        .iter()
+        .any(|n| n.reason == "base_commit_not_kept"));
+    assert!(report
         .git_references
         .iter()
         .any(|g| g.field == "approved_tip"));

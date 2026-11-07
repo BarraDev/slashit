@@ -43,6 +43,8 @@ Changed, and reported in `normalization`:
   stays in the history and nothing is current.
 - A Task in Human Review returns to Backlog, because a review wait needs the
   checkout the bundle does not carry.
+- The bundle's base commit is not kept. The imported Task has no base, and its
+  first explicit run admits a local one. Reported as `base_commit_not_kept`.
 - A reviewer model is trimmed, or cleared when it is empty or whitespace-only.
   Reported as `reviewer_model_trimmed` or `reviewer_model_cleared`. An absent
   model is stored as none and is not reported.
@@ -318,8 +320,9 @@ A bundle that fails any rule is refused. A valid bundle is reported with:
 - identity conflicts: Project id, Repository id, Repository remote, Task ids,
   and any unreadable target board (which makes a clean verdict impossible);
 - `normalization`: a current approval in the bundle, which import must
-  withdraw before anything can act on it, and the reviewer-model changes listed
-  above; Apply reports the same list in its result;
+  withdraw before anything can act on it, the base commit that is not kept, and
+  the reviewer-model changes listed above; Apply reports the same list in its
+  result;
 - `git_references`: base commits and approved tips, carried as text and never
   recreated or checked;
 - `excluded`: the omitted list;

@@ -197,6 +197,50 @@ async fn a_bundle_applies_as_an_inert_project_with_its_tasks() {
         .any(|n| n["reason"] == "human_review_without_checkout"));
 }
 
+/// The bundle's base commit is history. The fixture gives Beta one, and the
+/// imported Task must hold none in memory or after a reload, with no checkout.
+#[tokio::test]
+async fn an_imported_task_does_not_keep_the_bundle_base_commit() {
+    let (src, source) = test_ctx().await;
+    seed(&source, None, &fixture_tasks()).await;
+    let bytes = exported_bytes(&source, &src).await;
+
+    let (dst, target) = test_ctx().await;
+    let path = write_bundle(&dst, &bytes);
+    let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+    assert!(response.ok, "apply failed: {:?}", response.error);
+
+    let beta = target
+        .tasks
+        .read()
+        .await
+        .get(&beta_id())
+        .cloned()
+        .expect("Beta imported");
+    assert_eq!(
+        beta.base_commit, None,
+        "the bundle's base is not operational"
+    );
+    assert!(beta.worktree_path.is_none(), "no checkout was made");
+    assert!(beta.branch_name.is_none(), "no branch was created");
+
+    let stored = target.storage.load_project_tasks(project_id()).unwrap();
+    let reloaded = stored
+        .iter()
+        .find(|t| t.id == beta_id())
+        .expect("Beta persisted");
+    assert_eq!(
+        reloaded.base_commit, None,
+        "the reloaded Task keeps no base"
+    );
+
+    let normalization = response.data["normalization"].as_array().unwrap();
+    assert!(normalization.iter().any(|n| {
+        n["reason"] == "base_commit_not_kept"
+            && n["task_id"].as_str() == Some(&beta_id().to_string())
+    }));
+}
+
 #[tokio::test]
 async fn a_repeated_apply_is_refused_and_changes_nothing() {
     let (src, source) = test_ctx().await;

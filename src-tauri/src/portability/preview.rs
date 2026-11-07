@@ -192,6 +192,10 @@ pub fn preview(bytes: &[u8], target: &Target<'_>) -> Result<Report, BundleError>
             });
         }
         if let Some(commit) = &task.base_commit {
+            normalization.push(Normalization {
+                task_id: task.id,
+                reason: "base_commit_not_kept",
+            });
             git_references.push(GitReference {
                 task_id: task.id,
                 field: "base_commit",
