@@ -698,6 +698,11 @@ fn preview_describes_the_import_and_neutralizes_nothing_on_its_own() {
         .normalization
         .iter()
         .any(|n| n.reason == "approval_current_in_bundle"));
+    // Apply returns a Human Review Task to Backlog, so Preview must say so too.
+    assert!(report
+        .normalization
+        .iter()
+        .any(|n| n.reason == "human_review_without_checkout"));
     assert!(report
         .git_references
         .iter()

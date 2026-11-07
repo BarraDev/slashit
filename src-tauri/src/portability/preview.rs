@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::domain::{Project, Repository, Task};
+use crate::domain::{Project, Repository, Task, TaskStatus};
 
 use super::bundle::{self, BundleError, OMITTED};
 use super::export;
@@ -154,6 +154,12 @@ pub fn preview(bytes: &[u8], target: &Target<'_>) -> Result<Report, BundleError>
     let mut normalization = Vec::new();
     let mut git_references = Vec::new();
     for task in &payload.tasks {
+        if matches!(task.status, TaskStatus::HumanReview) {
+            normalization.push(Normalization {
+                task_id: task.id,
+                reason: "human_review_without_checkout",
+            });
+        }
         if task.human_review.has_current_approval() {
             normalization.push(Normalization {
                 task_id: task.id,
