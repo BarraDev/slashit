@@ -23,6 +23,7 @@ pub mod worktree;
 pub mod pr;
 pub mod roadmap;
 pub mod file;
+pub mod portability;
 pub mod github;
 pub mod changelog;
 pub mod mcp;

@@ -14,6 +14,7 @@
 pub mod apply;
 pub mod bundle;
 pub mod export;
+pub mod live;
 pub mod preview;
 
 #[cfg(test)]
