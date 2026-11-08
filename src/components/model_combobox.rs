@@ -174,9 +174,13 @@ pub fn ModelCombobox(
     /// Receives the chosen ID.
     #[prop(into)]
     on_change: Callback<String>,
-    /// Runs discovery again.
+    /// Runs discovery again. Only offered while `refreshable` is true.
     #[prop(into)]
     on_refresh: Callback<()>,
+    /// Whether the runtime has a discovery to run again. Claude Code's aliases are
+    /// fixed, so its picker has nothing to refresh.
+    #[prop(into)]
+    refreshable: Signal<bool>,
     #[prop(into)]
     loading: Signal<bool>,
     /// The reason the list is not fresh, when it is not.
@@ -194,6 +198,7 @@ pub fn ModelCombobox(
     let (active, set_active) = signal(None::<usize>);
     let refused = StoredValue::new(refused_ids);
     let listbox_id = format!("{id}-listbox");
+    let controls_id = listbox_id.clone();
     let option_prefix = StoredValue::new(id.clone());
 
     // The rows currently offered: the matching options, then a typed entry.
@@ -263,7 +268,7 @@ pub fn ModelCombobox(
                     role="combobox"
                     autocomplete="off"
                     aria-autocomplete="list"
-                    aria-controls=listbox_id.clone()
+                    aria-controls=move || open.get().then(|| controls_id.clone())
                     aria-expanded=move || if open.get() { "true" } else { "false" }
                     aria-activedescendant=move || match active.get() {
                         Some(index) if open.get() => option_dom_id(&option_prefix.get_value(), index),
@@ -294,19 +299,21 @@ pub fn ModelCombobox(
                     on:keydown=on_keydown
                     class="flex-1 min-w-0 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                 />
-                <button
-                    type="button"
-                    class="px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white/80 hover:bg-white/10 disabled:opacity-40"
-                    disabled=move || disabled.get() || loading.get()
-                    on:mousedown=move |ev: web_sys::MouseEvent| ev.prevent_default()
-                    on:click=move |_| {
-                        // A refresh can reorder the rows, so no earlier highlight carries over.
-                        set_active.set(None);
-                        on_refresh.run(());
-                    }
-                >
-                    "Refresh"
-                </button>
+                <Show when=move || refreshable.get()>
+                    <button
+                        type="button"
+                        class="px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white/80 hover:bg-white/10 disabled:opacity-40"
+                        disabled=move || disabled.get() || loading.get()
+                        on:mousedown=move |ev: web_sys::MouseEvent| ev.prevent_default()
+                        on:click=move |_| {
+                            // A refresh can reorder the rows, so no earlier highlight carries over.
+                            set_active.set(None);
+                            on_refresh.run(());
+                        }
+                    >
+                        "Refresh"
+                    </button>
+                </Show>
             </div>
 
             <Show when=move || open.get()>

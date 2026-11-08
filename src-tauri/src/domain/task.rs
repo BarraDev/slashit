@@ -1934,6 +1934,94 @@ pub fn parse_reviewer_model(requested: &str) -> Result<Option<String>, String> {
     Ok(Some(model.to_string()))
 }
 
+/// The model a Task's Worker is saved with, for `provider`. Every write of the
+/// field (the desktop form, `create_task`, `update_task` and the control
+/// channel) applies this one rule, so the same identifier gets the same answer
+/// on each path.
+///
+/// The rule checks syntax only. A Claude Worker takes an alias such as `sonnet`,
+/// the provider default, or a full model ID; an OpenCode Worker takes
+/// `provider/model`. Whether the provider knows the model is decided when a run
+/// starts, and the run then fails with the provider's own message. Nothing is
+/// substituted, and a saved value is never changed to make it valid.
+pub fn parse_worker_model(provider: CodingProvider, requested: &str) -> Result<String, String> {
+    let model = requested.trim();
+    if model.is_empty() {
+        return Err(format!(
+            "No model is chosen for this Task, so it was not saved. Choose a model for {}.",
+            provider.label()
+        ));
+    }
+    let valid = match provider {
+        CodingProvider::OpenCode => is_opencode_model_id(model),
+        CodingProvider::Claude => is_claude_model_id(model),
+    };
+    if valid {
+        return Ok(model.to_string());
+    }
+    Err(match provider {
+        CodingProvider::OpenCode => format!(
+            "OpenCode takes a model as provider/model, for example ollama/llama3.2:3b, and {model} is not one, so it was not saved. Choose an OpenCode model for this Task, or run it with Claude."
+        ),
+        CodingProvider::Claude => format!(
+            "\"{model}\" is not a valid Claude model identifier, so it was not saved. Use an alias such as sonnet, opus or haiku, or a full model ID. A provider/model identifier belongs to an OpenCode Task."
+        ),
+    })
+}
+
+/// Longest Worker model identifier SlashIt stores.
+const MAX_WORKER_MODEL_LEN: usize = 200;
+
+/// Syntax of a Claude Worker model: a letter or digit first, then only letters,
+/// digits and `-._[]`, with each `[` closed by a later `]` and no empty group.
+/// The identifier can never be read as a CLI option, and the `[1m]` context
+/// suffix is allowed.
+fn is_claude_model_id(model: &str) -> bool {
+    model.len() <= MAX_WORKER_MODEL_LEN
+        && model.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '[' | ']'))
+        && brackets_are_paired(model)
+}
+
+/// Whether every `[` is closed by the next `]`, with no nesting and no empty group.
+fn brackets_are_paired(model: &str) -> bool {
+    let mut open = false;
+    let mut opened_at = 0;
+    for (index, c) in model.char_indices() {
+        match c {
+            '[' if open => return false,
+            '[' => {
+                open = true;
+                opened_at = index;
+            }
+            ']' if !open => return false,
+            ']' => {
+                if index == opened_at + 1 {
+                    return false;
+                }
+                open = false;
+            }
+            _ => {}
+        }
+    }
+    !open
+}
+
+/// Whether `model` is an OpenCode model id, `provider/model`: both parts are
+/// present, and the id has no whitespace or control characters. A Claude alias
+/// such as `sonnet` has no provider part, so it is not one.
+pub(crate) fn is_opencode_model_id(model: &str) -> bool {
+    let Some((provider, name)) = model.split_once('/') else {
+        return false;
+    };
+    !provider.is_empty()
+        && !name.is_empty()
+        && model.len() <= MAX_WORKER_MODEL_LEN
+        && model.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
 impl CodingProvider {
     /// True for the default provider, which is omitted from stored Tasks.
     pub fn is_default(&self) -> bool {
@@ -3119,6 +3207,50 @@ mod tests {
         assert_eq!(stored["reviewer_model"], "sonnet");
         let loaded: WorkerHandoff = serde_json::from_value(stored).unwrap();
         assert_eq!(loaded.reviewer_model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn a_worker_model_is_checked_for_its_provider_and_never_substituted() {
+        use crate::domain::task::{parse_worker_model, CodingProvider};
+        // Claude takes its aliases, the provider default, and a full ID that no
+        // catalog has to list. The identifier is kept as given, trimmed.
+        for id in ["sonnet", "opus", "haiku", "default", "sonnet[1m]", "claude-sonnet-4-5-20250929"] {
+            assert_eq!(parse_worker_model(CodingProvider::Claude, id).as_deref(), Ok(id), "{id}");
+        }
+        assert_eq!(parse_worker_model(CodingProvider::Claude, " opus \n").as_deref(), Ok("opus"));
+        assert_eq!(
+            parse_worker_model(CodingProvider::OpenCode, " ollama/dcostenco/prism-coder:4b ").as_deref(),
+            Ok("ollama/dcostenco/prism-coder:4b")
+        );
+        for provider in [CodingProvider::Claude, CodingProvider::OpenCode] {
+            for empty in ["", "   "] {
+                let refusal = parse_worker_model(provider, empty).unwrap_err();
+                assert!(refusal.contains("No model is chosen"), "{refusal}");
+            }
+        }
+        // A Claude Worker takes no provider/model id, and no option-shaped or
+        // malformed identifier.
+        for id in [
+            "ollama/llama3.2:3b",
+            "son net",
+            "--model",
+            "-opus",
+            "sonnet;rm",
+            "sonnet[1m",
+            "sonnet]1m[",
+            "sonnet[[1m]]",
+            "sonnet[]",
+            &"a".repeat(201),
+        ] {
+            let refusal = parse_worker_model(CodingProvider::Claude, id).unwrap_err();
+            assert!(refusal.contains("was not saved"), "{refusal}");
+        }
+        // An OpenCode Worker takes only provider/model, and nothing with whitespace.
+        for id in ["default", "sonnet", "ollama/", "/llama3.2:3b", "ollama/llama 3"] {
+            let refusal = parse_worker_model(CodingProvider::OpenCode, id).unwrap_err();
+            assert!(refusal.contains("provider/model"), "{refusal}");
+            assert!(refusal.contains("was not saved"), "{refusal}");
+        }
     }
 
     #[test]

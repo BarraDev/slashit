@@ -600,10 +600,9 @@ async fn handle_delete_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
 /// The field is written through the desktop's own `update_task` boundary
 /// (`commands::task::set_task_model_and_review_mode`), so the persisted board
 /// ends in the same state as that command's for the same input. The
-/// identifier is checked the way the desktop's own Task form checks it —
-/// through `commands::agent::worker_model_refusal`, from the model picker's
-/// list, or for an OpenCode Task the `provider/model` launch rule — and an
-/// identifier that is refused leaves the Task and its board as they were.
+/// identifier is checked by `domain::task::parse_worker_model`, the same rule
+/// the desktop write applies, and an identifier that is refused leaves the
+/// Task and its board as they were.
 async fn handle_set_task_model(ctx: &IpcContext, task_id: String, model: String) -> IpcResponse {
     let task_uuid = match Uuid::parse_str(&task_id) {
         Ok(id) => id,
@@ -613,9 +612,10 @@ async fn handle_set_task_model(ctx: &IpcContext, task_id: String, model: String)
         Some(task) => task.provider,
         None => return IpcResponse::error(format!("Task {task_id} not found")),
     };
-    if let Some(refusal) = crate::commands::agent::worker_model_refusal(provider, &model).await {
-        return IpcResponse::error(refusal);
-    }
+    let model = match crate::domain::task::parse_worker_model(provider, &model) {
+        Ok(model) => model,
+        Err(refusal) => return IpcResponse::error(refusal),
+    };
     match crate::commands::task::set_task_model_and_review_mode(
         &ctx.tasks,
         &ctx.storage,
@@ -2264,6 +2264,7 @@ mod task_configuration_writes {
             provider: None,
             review_mode,
             planning_mode: None,
+            dependencies: None,
         }
     }
 
@@ -2333,10 +2334,10 @@ mod task_configuration_writes {
         assert_eq!(shown["model"], chosen, "the slice 1 read verb confirms it");
     }
 
-    /// An identifier no model picker offers is refused and nothing is written:
-    /// the record, in memory and on the board file, keeps the value it had.
+    /// A malformed identifier is refused and nothing is written: the record, in
+    /// memory and on the board file, keeps the value it had.
     #[tokio::test]
-    async fn set_model_refuses_an_unknown_identifier_and_changes_nothing() {
+    async fn set_model_refuses_a_malformed_identifier_and_changes_nothing() {
         let (_tmp, ctx) = test_ctx().await;
         let project_id = Uuid::new_v4();
         let mut task = backlog_task(project_id, "under test");
@@ -2348,7 +2349,7 @@ mod task_configuration_writes {
         let answer = dispatch(
             IpcRequest::SetTaskModel {
                 task_id: task_id.to_string(),
-                model: "not-in-the-model-picker".to_string(),
+                model: "son net".to_string(),
             },
             &ctx,
             &peer(),
@@ -2356,9 +2357,10 @@ mod task_configuration_writes {
         .await
         .response;
 
-        assert!(!answer.ok, "an unknown model must be refused: {answer:?}");
+        assert!(!answer.ok, "a malformed model must be refused: {answer:?}");
         let message = answer.error.unwrap_or_default();
-        assert!(message.contains("not-in-the-model-picker"), "{message}");
+        assert!(message.contains("son net"), "{message}");
+        assert!(message.contains("was not saved"), "{message}");
         assert!(message.contains("was not saved"), "{message}");
         assert_eq!(
             serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap(),
@@ -2368,6 +2370,92 @@ mod task_configuration_writes {
         assert_eq!(persisted_json(&ctx, project_id, task_id), disk_before);
         let shown = read_back(&ctx, task_id).await;
         assert_eq!(shown["model"], "default", "the read-back still answers the old value");
+    }
+
+    /// The same identifier gets the same answer from the desktop write and from
+    /// the control channel, for each Worker. An accepted one is stored as given,
+    /// and a refused one changes nothing. No discovery is consulted: a model the
+    /// catalog does not list is accepted when it is well formed.
+    #[tokio::test]
+    async fn a_worker_model_gets_the_same_answer_from_the_form_and_the_control_channel() {
+        use crate::domain::task::CodingProvider;
+        let cases = [
+            (CodingProvider::Claude, "sonnet", true),
+            (CodingProvider::Claude, "claude-sonnet-4-5-20250929", true),
+            (CodingProvider::OpenCode, "ollama/llama3.2:3b", true),
+            (CodingProvider::Claude, "", false),
+            (CodingProvider::OpenCode, "", false),
+            (CodingProvider::Claude, "son net", false),
+            (CodingProvider::Claude, "ollama/llama3.2:3b", false),
+            (CodingProvider::OpenCode, "sonnet", false),
+        ];
+        for (provider, model, accepted) in cases {
+            let project_id = Uuid::new_v4();
+            let mut task = backlog_task(project_id, "parity");
+            task.provider = provider;
+            let task_id = task.id;
+            let (_gui_tmp, gui_app) = gui_app(project_id, vec![task.clone()]).await;
+            let gui = crate::commands::task::update_task(
+                GuiMutation::untracked(),
+                gui_app.state(),
+                new_params(task_id, Some(model.to_string()), None),
+            )
+            .await;
+
+            let (_tmp, ctx) = test_ctx().await;
+            let (ipc_task_id, ipc_project_id) = seed(&ctx, task).await;
+            let answer = dispatch(
+                IpcRequest::SetTaskModel {
+                    task_id: ipc_task_id.to_string(),
+                    model: model.to_string(),
+                },
+                &ctx,
+                &peer(),
+            )
+            .await
+            .response;
+
+            assert_eq!(matches!(gui, Ok(Some(_))), accepted, "desktop write, {model:?}: {gui:?}");
+            assert_eq!(answer.ok, accepted, "control channel, {model:?}: {answer:?}");
+            if accepted {
+                let stored = gui_app.state::<crate::AppState>().task.tasks.read().await[&task_id]
+                    .model
+                    .clone();
+                assert_eq!(stored, model, "desktop stores the identifier as given");
+                assert_eq!(persisted(&ctx, ipc_project_id, ipc_task_id).model, model);
+            } else {
+                let desktop_refusal = gui.err().unwrap_or_default();
+                assert!(desktop_refusal.contains("was not saved") || desktop_refusal.contains("No model"), "{desktop_refusal}");
+                let channel_refusal = answer.error.unwrap_or_default();
+                assert!(channel_refusal.contains("was not saved") || channel_refusal.contains("No model"), "{channel_refusal}");
+            }
+        }
+    }
+
+    /// Changing a Task's provider without naming a model re-checks the stored
+    /// model: a Claude alias cannot become an OpenCode Worker's model, and a
+    /// provider/model id cannot stay on a Claude Worker. Refused, nothing changes.
+    #[tokio::test]
+    async fn a_provider_change_rechecks_the_stored_model() {
+        use crate::domain::task::CodingProvider;
+        let project_id = Uuid::new_v4();
+        let mut task = backlog_task(project_id, "provider change");
+        task.model = "sonnet".to_string();
+        let task_id = task.id;
+        let (_gui_tmp, gui_app) = gui_app(project_id, vec![task]).await;
+        let mut params = new_params(task_id, None, None);
+        params.provider = Some(CodingProvider::OpenCode);
+        let refused = crate::commands::task::update_task(
+            GuiMutation::untracked(),
+            gui_app.state(),
+            params,
+        )
+        .await;
+        let message = refused.expect_err("a Claude alias must not become an OpenCode model");
+        assert!(message.contains("provider/model"), "{message}");
+        let stored = gui_app.state::<crate::AppState>().task.tasks.read().await[&task_id].clone();
+        assert_eq!(stored.provider, CodingProvider::Claude);
+        assert_eq!(stored.model, "sonnet");
     }
 
     /// Same parity, for the review mode the run's finish is handed in.

@@ -117,12 +117,13 @@ pub async fn create_task(
 
     let review_mode = params.review_mode.unwrap_or_default();
     let provider = params.provider.unwrap_or_default();
+    let model = crate::domain::task::parse_worker_model(provider, &params.model)?;
     let new = NewTask {
         id,
         project_id,
         title: params.title,
         description: params.description,
-        model: params.model,
+        model,
         reviewer_model,
         planning_mode: params.planning_mode,
         dependencies: dependencies.clone(),
@@ -783,6 +784,10 @@ pub struct UpdateTaskParams {
     /// the mode it started with.
     pub review_mode: Option<crate::domain::task::ReviewMode>,
     pub planning_mode: Option<bool>,
+    /// The Task's dependencies, as Task ids. Applied only when given, in the
+    /// same write as the other fields, so a refused dependency writes nothing
+    /// else and a refused field writes no dependency.
+    pub dependencies: Option<Vec<String>>,
 }
 
 #[tauri::command]
@@ -798,7 +803,51 @@ pub async fn update_task(
         .as_deref()
         .map(crate::domain::task::parse_reviewer_model)
         .transpose()?;
-    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+    let dependencies = params
+        .dependencies
+        .as_deref()
+        .map(crate::domain::task_dependencies::parse_requested)
+        .transpose()?;
+    // A dependency change takes the lease `set_task_dependencies` takes, so it
+    // serializes with the same lifecycle operations.
+    let _lease = match dependencies {
+        Some(_) => Some(state.task_lifecycle_locks.acquire(task_id).await?),
+        None => None,
+    };
+    if let Some(requested) = &dependencies {
+        // Checked against every Task first, so a Task of another Project is
+        // named as such. The write checks the staged Tasks again.
+        dependency_change(&*state.task.tasks.read().await, task_id, requested)?;
+    }
+    // The model is checked against the provider the Task will have after this
+    // write, so a provider change and its model are judged together.
+    // A provider change without a model re-checks the stored model against the new runtime.
+    let current = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .map(|task| (task.provider, task.model.clone()));
+    let provider = params.provider.or(current.as_ref().map(|(provider, _)| *provider));
+    let requested = params
+        .model
+        .clone()
+        .or_else(|| params.provider.and(current.as_ref().map(|(_, model)| model.clone())));
+    let model = match (provider, requested) {
+        (Some(provider), Some(requested)) => {
+            Some(crate::domain::task::parse_worker_model(provider, &requested)?)
+        }
+        _ => None,
+    };
+    let amend = move |staged: &mut HashMap<Uuid, Task>| -> Result<(), String> {
+        if let Some(requested) = &dependencies {
+            if dependency_change(staged, task_id, requested)? {
+                if let Some(task) = staged.get_mut(&task_id) {
+                    task.dependencies = requested.clone();
+                }
+            }
+        }
         if let Some(task) = staged.get_mut(&task_id) {
             if let Some(reviewer_model) = reviewer_model.clone() {
                 task.reviewer_model = reviewer_model;
@@ -824,7 +873,7 @@ pub async fn update_task(
             if let Some(s) = params.security_severity.clone() {
                 task.security_severity = s;
             }
-            if let Some(m) = params.model.clone() {
+            if let Some(m) = model.clone() {
                 task.model = m;
             }
             if let Some(provider) = params.provider {
@@ -837,8 +886,9 @@ pub async fn update_task(
                 task.planning_mode = p;
             }
         }
+        Ok(())
     };
-    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
+    crate::lifecycle::commit_task_checked(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -3577,6 +3627,7 @@ mod task_dependency_contract {
             provider: None,
             review_mode: None,
             planning_mode: None,
+            dependencies: None,
         };
 
         for refused in ["default", "ollama/llama3.2:3b", "sonnet\nopus"] {
@@ -3608,6 +3659,107 @@ mod task_dependency_contract {
         assert_eq!(disk["worker_handoff"]["reviewer_model"], "sonnet");
     }
 
+    /// An Edit with every field unchanged except the ones a test names.
+    fn edit_of(task_id: Uuid, model: Option<&str>, dependencies: Option<Vec<Uuid>>) -> UpdateTaskParams {
+        UpdateTaskParams {
+            task_id: task_id.to_string(),
+            title: Some("renamed".to_string()),
+            description: None,
+            category: None,
+            priority: None,
+            complexity: None,
+            impact: None,
+            security_severity: None,
+            model: model.map(str::to_string),
+            reviewer_model: None,
+            provider: None,
+            review_mode: None,
+            planning_mode: None,
+            dependencies: dependencies.map(|ids| ids.iter().map(Uuid::to_string).collect()),
+        }
+    }
+
+    /// An Edit is one write: a refused model refuses its dependency and its
+    /// title, and a refused dependency refuses the model. Each refusal leaves
+    /// the Task unchanged in memory and on the board.
+    #[tokio::test]
+    async fn a_refused_part_of_an_edit_refuses_the_whole_edit() {
+        let project_id = Uuid::new_v4();
+        let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
+        let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
+        let (_tmp, _paths, app) = app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
+        let before = both_copies(&app, project_id, child.id).await;
+
+        let bad_model = update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            edit_of(child.id, Some("son net"), Some(vec![parent.id])),
+        )
+        .await
+        .expect_err("a malformed model is refused");
+        assert!(bad_model.contains("was not saved"), "{bad_model}");
+        assert_eq!(both_copies(&app, project_id, child.id).await, before, "no dependency, title or model is written");
+
+        let bad_dependency = update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            edit_of(child.id, Some("opus"), Some(vec![child.id])),
+        )
+        .await
+        .expect_err("a Task cannot depend on itself");
+        assert!(!bad_dependency.is_empty(), "the refusal has a reason");
+        assert_eq!(both_copies(&app, project_id, child.id).await, before, "no model or title is written either");
+    }
+
+    /// A valid Edit writes its dependency, model and title in the one write,
+    /// to memory and to the board file alike.
+    #[tokio::test]
+    async fn a_valid_edit_writes_its_dependency_model_and_title_together() {
+        let project_id = Uuid::new_v4();
+        let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
+        let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
+        let (_tmp, _paths, app) = app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
+
+        let updated = update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            edit_of(child.id, Some("opus"), Some(vec![parent.id])),
+        )
+        .await
+        .expect("the edit is written")
+        .expect("the task exists");
+        assert_eq!(updated.dependencies, vec![parent.id]);
+        assert_eq!(updated.model, "opus");
+
+        let (memory, disk) = both_copies(&app, project_id, child.id).await;
+        assert_eq!(memory["dependencies"], serde_json::json!([parent.id.to_string()]));
+        assert_eq!(disk["dependencies"], serde_json::json!([parent.id.to_string()]));
+        assert_eq!(disk["model"], "opus");
+        assert_eq!(disk["title"], "renamed");
+    }
+
+    /// The checkout rule still refuses a dependency change in an Edit, and the
+    /// model and title in that Edit are not written either.
+    #[tokio::test]
+    async fn an_edit_that_changes_a_checked_out_tasks_dependency_writes_nothing() {
+        let project_id = Uuid::new_v4();
+        let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
+        let mut running = task(project_id, "running", TaskStatus::Backlog, vec![]);
+        running.branch_name = Some("slashit/running".to_string());
+        let (_tmp, _paths, app) = app_with(vec![parent.clone(), running.clone()], &[project_id]).await;
+        let before = both_copies(&app, project_id, running.id).await;
+
+        let error = update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            edit_of(running.id, Some("opus"), Some(vec![parent.id])),
+        )
+        .await
+        .expect_err("a checkout exists");
+        assert!(error.contains("checkout"), "{error}");
+        assert_eq!(both_copies(&app, project_id, running.id).await, before);
+    }
+
     #[tokio::test]
     async fn a_recorded_dependency_survives_edits_that_do_not_name_it() {
         let project_id = Uuid::new_v4();
@@ -3633,6 +3785,7 @@ mod task_dependency_contract {
                 provider: None,
                 review_mode: None,
                 planning_mode: None,
+                dependencies: None,
             },
         )
         .await

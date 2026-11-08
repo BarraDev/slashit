@@ -7,14 +7,11 @@ extern "C" {
     async fn invoke(cmd: &str, args: JsValue) -> JsValue;
 }
 
-/// One model the runtime offers. `source` and `availability` are the backend's
-/// labels: `alias`/`opencode_models` and `catalog`/`unverified`.
+/// One model the runtime offers.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeModel {
     pub id: String,
     pub name: String,
-    pub source: String,
-    pub availability: String,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

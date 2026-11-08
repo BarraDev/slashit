@@ -17,6 +17,8 @@ const WORKER_SELECT: &str = "//label[normalize-space(.)='Coding Worker']/followi
 const SAVED_CLAUDE_LABEL: &str = "Claude Sonnet (latest alias)";
 const HAIKU_LABEL: &str = "Claude Haiku (latest alias)";
 const OPENCODE_MODEL: &str = "ollama/llama3.2:3b";
+/// A full Claude model ID that no catalog lists, typed by hand.
+const MANUAL_CLAUDE_MODEL: &str = "claude-opus-4-1-20250805";
 
 /// The picker's accessibility state, read from the page.
 const PICKER_STATE: &str = r#"
@@ -34,7 +36,8 @@ return {
   rowTexts: rows.map(r => r.textContent.trim()),
   focused: document.activeElement === input,
   label: input.labels && input.labels[0] ? input.labels[0].textContent.trim() : null,
-  value: input.value
+  value: input.value,
+  refresh: [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Refresh')
 };
 "#;
 
@@ -84,6 +87,8 @@ async fn keyboard(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
     let idle = picker_state(driver).await?;
     expect(&idle, "label", &json!("AI Model"), "the field is labelled")?;
     expect(&idle, "value", &json!(SAVED_CLAUDE_LABEL), "the saved model is shown when closed")?;
+    expect(&idle, "controls", &json!(null), "a closed picker names no listbox")?;
+    expect(&idle, "refresh", &json!(false), "a Claude picker offers no Refresh, its aliases are fixed")?;
     focus_field(driver).await?;
     let opened = picker_state(driver).await?;
     expect(&opened, "role", &json!("combobox"), "the field has the combobox role")?;
@@ -101,6 +106,7 @@ async fn keyboard(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
     let closed = picker_state(driver).await?;
     expect(&closed, "open", &json!(false), "Escape closes the list")?;
     expect(&closed, "listbox", &json!(false), "the closed list is removed")?;
+    expect(&closed, "controls", &json!(null), "the closed list is no longer referenced")?;
     expect(&closed, "focused", &json!(true), "Escape keeps focus in the field")?;
     save(driver, &project_id, &task_id, "sonnet").await?;
 
@@ -148,6 +154,7 @@ async fn keyboard(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
     send(driver, Key::Down).await?;
     let typed = picker_state(driver).await?;
     expect(&typed, "active", &json!("task-ai-model-option-0"), "the typed entry is the first row")?;
+    expect(&typed, "refresh", &json!(true), "an OpenCode picker offers Refresh, its list is discovered")?;
     send(driver, Key::Enter).await?;
     save(driver, &project_id, &task_id, OPENCODE_MODEL).await?;
     let saved = listed(driver, &project_id, &task_id).await?;
@@ -156,7 +163,51 @@ async fn keyboard(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
     }
     open_editor(driver, &task_id, &title).await?;
     expect(&picker_state(driver).await?, "value", &json!(OPENCODE_MODEL), "the exact OpenCode identifier survives reopen")?;
+
+    // A typed Claude identifier the catalog does not list is kept when the field
+    // loses focus by keyboard, and it is saved and reopened exactly. Switching
+    // the Worker starts each runtime from its own model, never from the default.
+    select_worker(driver, "claude").await?;
+    expect(&picker_state(driver).await?, "value", &json!(""), "switching to Claude starts empty, without the provider default")?;
+    focus_field(driver).await?;
+    driver
+        .find(By::Id(MODEL_INPUT_ID))
+        .await?
+        .send_keys(MANUAL_CLAUDE_MODEL)
+        .await?;
+    send(driver, Key::Tab).await?;
+    let left = picker_state(driver).await?;
+    expect(&left, "value", &json!(MANUAL_CLAUDE_MODEL), "a typed identifier is kept when the field loses focus")?;
+    // Tab moves focus into the AI Reviewer field, whose list opens over the footer
+    // and would intercept the Save click. Escape closes it and keeps focus there.
+    send(driver, Key::Escape).await?;
+    save(driver, &project_id, &task_id, MANUAL_CLAUDE_MODEL).await?;
+    let blurred_saved = listed(driver, &project_id, &task_id).await?;
+    // The default provider is omitted from a stored Task, so no key means Claude.
+    if blurred_saved.get("provider").and_then(Value::as_str).unwrap_or("claude") != "claude" {
+        bail!("the Task is not a Claude Task after saving the typed identifier: {blurred_saved}");
+    }
+    open_editor(driver, &task_id, &title).await?;
+    expect(&picker_state(driver).await?, "value", &json!(MANUAL_CLAUDE_MODEL), "the exact Claude identifier survives reopen")?;
+    select_worker(driver, "opencode").await?;
+    expect(&picker_state(driver).await?, "value", &json!(""), "switching to OpenCode does not show the Claude model")?;
+    select_worker(driver, "claude").await?;
+    expect(&picker_state(driver).await?, "value", &json!(MANUAL_CLAUDE_MODEL), "switching back restores the Claude model")?;
     Ok(())
+}
+
+/// Chooses the Coding Worker by its select value, `claude` or `opencode`.
+async fn select_worker(driver: &WebDriver, value: &str) -> Result<()> {
+    SelectElement::new(
+        &driver
+            .find(By::XPath(WORKER_SELECT))
+            .await
+            .context("the editor shows no Coding Worker select")?,
+    )
+    .await?
+    .select_by_value(value)
+    .await
+    .with_context(|| format!("could not switch the Coding Worker to {value}"))
 }
 
 async fn open_editor(driver: &WebDriver, task_id: &str, title: &str) -> Result<()> {

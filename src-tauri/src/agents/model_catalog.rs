@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 //! The models a coding runtime can be asked to use, for the model picker.
 //!
-//! An entry is a catalog or alias entry, never a proof of access. `Catalog`
-//! means the runtime's own model list names the model; authentication and
-//! provider access are checked only when a run starts. `Unverified` means
-//! SlashIt knows the name but has no runtime catalog that lists it, which is
-//! the case for Claude Code's aliases and fixed model IDs.
+//! An entry is a name the picker may offer, never a proof of access. OpenCode
+//! entries come from the runtime's own `opencode models` list. Claude Code's
+//! entries are its documented aliases, which no runtime catalog lists. Provider
+//! access is checked only when a run starts.
 //!
 //! A failed refresh never discards the last good list: the caller gets that
 //! list with the error, so a Task's saved model stays selectable.
@@ -15,7 +14,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::domain::task::CodingProvider;
+use crate::domain::task::{is_opencode_model_id, CodingProvider};
 
 /// Bounds one `opencode models` execution.
 const OPENCODE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -24,32 +23,10 @@ const OPENCODE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 /// hundred short lines, so a larger stream is a runaway process, not a catalog.
 const OPENCODE_DISCOVERY_MAX_OUTPUT: u64 = 1024 * 1024;
 
-/// Where an entry came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiscoverySource {
-    /// Claude Code's documented model aliases.
-    Alias,
-    /// `opencode models`, which the runtime prints from its configuration.
-    OpencodeModels,
-}
-
-/// How much SlashIt can say about an entry's availability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Availability {
-    /// The runtime's own catalog lists this model. Access is not verified.
-    Catalog,
-    /// No runtime catalog lists this model, so nothing is claimed about it.
-    Unverified,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeModel {
     pub id: String,
     pub name: String,
-    pub source: DiscoverySource,
-    pub availability: Availability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -62,18 +39,28 @@ pub struct ModelCatalog {
 }
 
 /// The last successful OpenCode discovery, kept for the process lifetime.
-static OPENCODE_CACHE: Mutex<Option<Vec<RuntimeModel>>> = Mutex::new(None);
+static OPENCODE_CACHE: Mutex<OpenCodeCache> = Mutex::new(OpenCodeCache { started: 0, kept: None });
+
+#[derive(Debug, Default)]
+struct OpenCodeCache {
+    /// Discoveries started so far. Each one takes the next number when it starts.
+    started: u64,
+    /// The list kept, with the number of the discovery that produced it.
+    kept: Option<(u64, Vec<RuntimeModel>)>,
+}
+
+fn locked(cache: &Mutex<OpenCodeCache>) -> std::sync::MutexGuard<'_, OpenCodeCache> {
+    cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Claude Code's model aliases. Always listed, whether or not the CLI is
-/// installed, and always `Unverified`: no reliable non-interactive account
-/// listing exists. Pinned model IDs are not listed, because a fixed ID goes
-/// stale; a person who needs one types it, and a saved one stays selected.
+/// installed. No reliable non-interactive account listing exists, so they are
+/// never claimed as verified. Pinned model IDs are not listed, because a fixed ID
+/// goes stale; a person who needs one types it, and a saved one stays selected.
 pub fn claude_models() -> Vec<RuntimeModel> {
     let entry = |id: &str, name: &str| RuntimeModel {
         id: id.to_string(),
         name: name.to_string(),
-        source: DiscoverySource::Alias,
-        availability: Availability::Unverified,
     };
     vec![
         entry("default", "Default (auto)"),
@@ -91,27 +78,13 @@ pub fn parse_opencode_models(stdout: &str) -> Vec<RuntimeModel> {
     stdout
         .lines()
         .map(str::trim)
-        .filter(|line| is_provider_model(line))
+        .filter(|line| is_opencode_model_id(line))
         .filter(|line| seen.insert(line.to_string()))
         .map(|id| RuntimeModel {
             id: id.to_string(),
             name: id.to_string(),
-            source: DiscoverySource::OpencodeModels,
-            availability: Availability::Catalog,
         })
         .collect()
-}
-
-fn is_provider_model(line: &str) -> bool {
-    match line.split_once('/') {
-        Some((provider, name)) => {
-            !provider.is_empty()
-                && !name.is_empty()
-                && line.len() <= 200
-                && !line.chars().any(|c| c.is_whitespace() || c.is_control())
-        }
-        None => false,
-    }
 }
 
 /// Reads at most `limit` bytes from `reader`. A stream longer than that is an
@@ -251,12 +224,12 @@ pub async fn catalog(provider: CodingProvider, refresh: bool) -> ModelCatalog {
 /// The OpenCode catalog. `discover` is started only when there is no cached
 /// list or a refresh was asked for, so a cached read runs no process.
 async fn opencode_catalog(
-    cache: &Mutex<Option<Vec<RuntimeModel>>>,
+    cache: &Mutex<OpenCodeCache>,
     refresh: bool,
     discover: impl std::future::Future<Output = Result<Vec<RuntimeModel>, String>>,
 ) -> ModelCatalog {
     if !refresh {
-        if let Some(cached) = cache.lock().ok().and_then(|c| c.clone()) {
+        if let Some((_, cached)) = locked(cache).kept.clone() {
             return ModelCatalog {
                 provider: CodingProvider::OpenCode,
                 models: cached,
@@ -264,10 +237,18 @@ async fn opencode_catalog(
             };
         }
     }
+    // The number is taken when the discovery starts. Two refreshes can finish in
+    // either order, so a result replaces the kept list only if its discovery started later.
+    let number = {
+        let mut cache = locked(cache);
+        cache.started += 1;
+        cache.started
+    };
     match discover.await {
         Ok(models) => {
-            if let Ok(mut cache) = cache.lock() {
-                *cache = Some(models.clone());
+            let mut cache = locked(cache);
+            if cache.kept.as_ref().is_none_or(|(kept, _)| *kept < number) {
+                cache.kept = Some((number, models.clone()));
             }
             ModelCatalog {
                 provider: CodingProvider::OpenCode,
@@ -278,7 +259,7 @@ async fn opencode_catalog(
         Err(error) => {
             // Keep the last good list: a failed refresh must not empty the
             // picker or drop a saved model.
-            let models = cache.lock().ok().and_then(|c| c.clone()).unwrap_or_default();
+            let models = locked(cache).kept.as_ref().map(|(_, models)| models.clone()).unwrap_or_default();
             ModelCatalog {
                 provider: CodingProvider::OpenCode,
                 models,
@@ -300,18 +281,9 @@ mod tests {
     }
 
     #[test]
-    fn every_opencode_entry_is_catalog_not_access() {
-        let models = parse_opencode_models("ollama/llama3.2:3b\n");
-        assert_eq!(models[0].availability, Availability::Catalog);
-        assert_eq!(models[0].source, DiscoverySource::OpencodeModels);
-    }
-
-    #[test]
-    fn claude_entries_are_aliases_and_never_claim_availability() {
-        let models = claude_models();
-        assert!(models.iter().all(|m| m.source == DiscoverySource::Alias));
-        assert!(models.iter().all(|m| m.availability == Availability::Unverified));
-        assert_eq!(models[0].id, "default");
+    fn claude_entries_are_the_documented_aliases_in_order() {
+        let ids: Vec<String> = claude_models().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["default", "sonnet", "opus", "haiku"]);
     }
 
     #[test]
@@ -419,7 +391,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_refresh_keeps_the_last_good_list_and_reports_why() {
-        let cache = Mutex::new(None);
+        let cache = Mutex::new(OpenCodeCache::default());
         let good = opencode_catalog(
             &cache,
             true,
@@ -469,7 +441,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_cached_list_is_returned_without_running_discovery() {
-        let cache = Mutex::new(Some(parse_opencode_models("ollama/llama3.2:3b\n")));
+        let cache = Mutex::new(OpenCodeCache {
+            started: 1,
+            kept: Some((1, parse_opencode_models("ollama/llama3.2:3b\n"))),
+        });
         let cached = opencode_catalog(
             &cache,
             false,
@@ -478,5 +453,43 @@ mod tests {
         .await;
         assert_eq!(cached.error, None);
         assert_eq!(cached.models[0].id, "ollama/llama3.2:3b");
+    }
+
+    /// Two refreshes overlap and the older one finishes last. Its list must not
+    /// replace the newer list the cache already holds.
+    #[tokio::test]
+    async fn an_older_refresh_that_finishes_last_does_not_replace_a_newer_list() {
+        let cache = Mutex::new(OpenCodeCache::default());
+        let (older_started, started) = tokio::sync::oneshot::channel::<()>();
+        let (release_older, released) = tokio::sync::oneshot::channel::<()>();
+        let (older, newer) = tokio::join!(
+            opencode_catalog(&cache, true, async {
+                older_started.send(()).expect("the newer refresh waits for this");
+                released.await.expect("the older refresh is released");
+                Ok(parse_opencode_models("ollama/older:1b\n"))
+            }),
+            async {
+                // The older refresh has started, so it holds the earlier number.
+                started.await.expect("the older refresh started");
+                let newer = opencode_catalog(
+                    &cache,
+                    true,
+                    std::future::ready(Ok(parse_opencode_models("ollama/newer:1b\n"))),
+                )
+                .await;
+                release_older.send(()).expect("the older refresh is waiting");
+                newer
+            },
+        );
+        assert_eq!(older.models[0].id, "ollama/older:1b");
+        assert_eq!(newer.models[0].id, "ollama/newer:1b");
+
+        let kept = opencode_catalog(
+            &cache,
+            false,
+            std::future::ready(Err("discovery must not run for a cached list".to_string())),
+        )
+        .await;
+        assert_eq!(kept.models[0].id, "ollama/newer:1b", "the newer list is what the cache keeps");
     }
 }

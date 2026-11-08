@@ -102,6 +102,8 @@ pub struct UpdateTaskParams {
     pub provider: Option<crate::models::task::CodingProvider>,
     pub review_mode: Option<crate::models::task::ReviewMode>,
     pub planning_mode: Option<bool>,
+    /// Task ids. `None` leaves the dependencies as they were; an empty list clears them.
+    pub dependencies: Option<Vec<String>>,
 }
 
 pub async fn update_task(params: UpdateTaskParams) -> Result<Option<Task>, String> {
@@ -120,6 +122,7 @@ pub async fn update_task(params: UpdateTaskParams) -> Result<Option<Task>, Strin
             "provider": params.provider,
             "reviewMode": params.review_mode,
             "planningMode": params.planning_mode,
+            "dependencies": params.dependencies,
         }
     })).unwrap();
 
@@ -127,17 +130,6 @@ pub async fn update_task(params: UpdateTaskParams) -> Result<Option<Task>, Strin
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
-/// Replace a Task's dependencies. The backend validates the whole set and
-/// refuses a request it cannot write, so a refusal leaves the Task unchanged.
-pub async fn set_task_dependencies(task_id: String, dependencies: Vec<String>) -> Result<Option<Task>, String> {
-    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
-        "taskId": task_id,
-        "dependencies": dependencies,
-    })).unwrap();
-
-    let response = invoke_reporting("set_task_dependencies", args).await?;
-    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
-}
 
 /// Link a GitHub Issue to a Task by its web address. The backend reads the
 /// Issue from GitHub first; a refusal (a pull request address, an Issue GitHub

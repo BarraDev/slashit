@@ -4,6 +4,7 @@ use crate::agents::opencode_run::OpenCodeRunConfig;
 use crate::agents::runner::{ClaudeRunConfig, LaunchError, ToolAccess};
 use crate::domain::task::ActivityKind;
 use crate::domain::task::CodingProvider;
+use crate::domain::task::is_opencode_model_id;
 use crate::domain::task::ExternalRef;
 use crate::domain::task::NewAttemptDecision;
 use crate::domain::{
@@ -94,19 +95,6 @@ impl Membership {
             .map(|ws| ws.root_path.as_path().to_path_buf());
         Self { project_id: Some(project_id), workspace_id, root }
     }
-}
-
-/// Whether `model` is an OpenCode model id, `provider/model`: both parts are
-/// present, and the id has no whitespace or control characters. A Claude alias
-/// such as `sonnet` has no provider part, so it is not one.
-pub(crate) fn is_opencode_model_id(model: &str) -> bool {
-    let Some((provider, name)) = model.split_once('/') else {
-        return false;
-    };
-    !provider.is_empty()
-        && !name.is_empty()
-        && model.len() <= 200
-        && model.chars().all(|c| !c.is_whitespace() && !c.is_control())
 }
 
 /// What an OpenCode run cannot honor, decided from inputs known before the
