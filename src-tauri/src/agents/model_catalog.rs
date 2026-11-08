@@ -20,11 +20,15 @@ use crate::domain::task::CodingProvider;
 /// Bounds one `opencode models` execution.
 const OPENCODE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The most stdout one `opencode models` execution may write. A listing is a few
+/// hundred short lines, so a larger stream is a runaway process, not a catalog.
+const OPENCODE_DISCOVERY_MAX_OUTPUT: u64 = 1024 * 1024;
+
 /// Where an entry came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoverySource {
-    /// Claude Code's documented aliases and fixed model IDs.
+    /// Claude Code's documented model aliases.
     Alias,
     /// `opencode models`, which the runtime prints from its configuration.
     OpencodeModels,
@@ -60,9 +64,10 @@ pub struct ModelCatalog {
 /// The last successful OpenCode discovery, kept for the process lifetime.
 static OPENCODE_CACHE: Mutex<Option<Vec<RuntimeModel>>> = Mutex::new(None);
 
-/// Claude Code's aliases and fixed IDs. Always listed, whether or not the CLI
-/// is installed, and always `Unverified`: no reliable non-interactive account
-/// listing exists.
+/// Claude Code's model aliases. Always listed, whether or not the CLI is
+/// installed, and always `Unverified`: no reliable non-interactive account
+/// listing exists. Pinned model IDs are not listed, because a fixed ID goes
+/// stale; a person who needs one types it, and a saved one stays selected.
 pub fn claude_models() -> Vec<RuntimeModel> {
     let entry = |id: &str, name: &str| RuntimeModel {
         id: id.to_string(),
@@ -75,9 +80,6 @@ pub fn claude_models() -> Vec<RuntimeModel> {
         entry("sonnet", "Claude Sonnet (latest alias)"),
         entry("opus", "Claude Opus (latest alias)"),
         entry("haiku", "Claude Haiku (latest alias)"),
-        entry("claude-sonnet-4-6", "Claude Sonnet 4.6"),
-        entry("claude-opus-4-6", "Claude Opus 4.6"),
-        entry("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
     ]
 }
 
@@ -112,11 +114,40 @@ fn is_provider_model(line: &str) -> bool {
     }
 }
 
+/// Reads at most `limit` bytes from `reader`. A stream longer than that is an
+/// error, so a runaway process cannot grow the buffer without bound.
+async fn read_capped(reader: impl tokio::io::AsyncRead + Unpin, limit: u64) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    // One byte past the limit tells an exact-size stream from a longer one.
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| format!("OpenCode output could not be read: {e}"))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("OpenCode listed more than {limit} bytes of models"));
+    }
+    Ok(bytes)
+}
+
+/// Kills the process group `pid` leads, so a private server it started does not
+/// outlive the listing. The leader itself is also killed on drop.
+fn kill_group(group: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = group {
+        // Safety: `pid` is the leader of the group made by `process_group(0)`.
+        unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    let _ = group;
+}
+
 /// Runs `opencode models` under the same isolated configuration a Worker gets,
 /// so the picker lists only models a Worker can select. `--standalone` keeps the
 /// listing off the shared background service, which does not read this
-/// environment. The process group is killed when the deadline passes, so the
-/// private server it starts does not outlive the listing.
+/// environment. Stdout is capped and the process group is killed when the
+/// listing fails, overflows or passes its deadline.
 async fn run_opencode_models() -> Result<Vec<RuntimeModel>, String> {
     let config_dir = tempfile::Builder::new()
         .prefix("slashit-opencode-discovery-")
@@ -141,29 +172,37 @@ async fn run_opencode_models() -> Result<Vec<RuntimeModel>, String> {
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|e| format!("OpenCode could not be started: {e}"))?;
-    #[cfg(unix)]
     let group = child.id();
-    let output = match tokio::time::timeout(OPENCODE_DISCOVERY_TIMEOUT, child.wait_with_output()).await {
-        Ok(output) => output.map_err(|e| format!("OpenCode could not be run: {e}"))?,
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "OpenCode output is not piped".to_string())?;
+    let listing = async {
+        let bytes = read_capped(stdout, OPENCODE_DISCOVERY_MAX_OUTPUT).await?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("OpenCode could not be run: {e}"))?;
+        Ok::<_, String>((status, bytes))
+    };
+    let (status, bytes) = match tokio::time::timeout(OPENCODE_DISCOVERY_TIMEOUT, listing).await {
+        Ok(Ok(listed)) => listed,
+        Ok(Err(error)) => {
+            kill_group(group);
+            return Err(error);
+        }
         Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = group {
-                // Safety: `pid` is the leader of the group made by `process_group(0)`.
-                unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
-            }
+            kill_group(group);
             return Err("OpenCode did not list its models in time".to_string());
         }
     };
-    if !output.status.success() {
-        return Err(format!(
-            "OpenCode exited with {} while listing its models",
-            output.status
-        ));
+    if !status.success() {
+        return Err(format!("OpenCode exited with {status} while listing its models"));
     }
-    let models = parse_opencode_models(&String::from_utf8_lossy(&output.stdout));
+    let models = parse_opencode_models(&String::from_utf8_lossy(&bytes));
     if models.is_empty() {
         return Err("OpenCode listed no models".to_string());
     }
@@ -243,5 +282,34 @@ mod tests {
         assert!(models.iter().all(|m| m.source == DiscoverySource::Alias));
         assert!(models.iter().all(|m| m.availability == Availability::Unverified));
         assert_eq!(models[0].id, "default");
+    }
+
+    #[test]
+    fn claude_entries_are_only_aliases_not_pinned_ids() {
+        let ids: Vec<String> = claude_models().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["default", "sonnet", "opus", "haiku"]);
+    }
+
+    #[tokio::test]
+    async fn a_listing_within_the_bound_is_read_whole() {
+        let bytes = read_capped(&b"ollama/llama3.2:3b\n"[..], 64).await.expect("within the bound");
+        assert_eq!(bytes, b"ollama/llama3.2:3b\n");
+    }
+
+    /// A stream that never ends would otherwise grow the buffer until it fails.
+    /// The reader here is endless, so the read must stop at the bound.
+    #[tokio::test]
+    async fn an_endless_listing_stops_at_the_bound() {
+        let error = read_capped(tokio::io::repeat(b'a'), 1024)
+            .await
+            .expect_err("an endless stream is refused");
+        assert!(error.contains("more than 1024 bytes"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_listing_of_exactly_the_bound_is_accepted() {
+        let exact = [b'a'; 16];
+        let bytes = read_capped(&exact[..], 16).await.expect("exactly the bound is allowed");
+        assert_eq!(bytes.len(), 16);
     }
 }

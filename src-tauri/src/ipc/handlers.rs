@@ -2270,11 +2270,10 @@ mod task_configuration_writes {
     /// A Worker model identifier the model picker actually offers, so both
     /// paths take the same, accepted input whatever the environment installs.
     async fn an_offered_model() -> String {
-        let offered = crate::commands::agent::list_available_models().await.expect("models");
-        offered
-            .iter()
-            .find(|m| m.id != "default")
-            .map(|m| m.id.clone())
+        crate::agents::model_catalog::claude_models()
+            .into_iter()
+            .map(|m| m.id)
+            .find(|id| id != "default")
             .unwrap_or_else(|| "default".to_string())
     }
 

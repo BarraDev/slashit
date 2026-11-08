@@ -67,13 +67,6 @@ pub(crate) async fn active_agent_count(
         + executor.map_or(0, crate::queue::TaskExecutor::counted_project_run_count)
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct ModelInfo {
-    pub id: String,
-    pub name: String,
-    pub alias: Option<String>,
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClaudeCliStatus {
     pub installed: bool,
@@ -134,35 +127,6 @@ pub async fn list_runtime_models(
     Ok(crate::agents::model_catalog::catalog(provider, refresh).await)
 }
 
-/// List available Claude models by checking the CLI.
-#[tauri::command]
-pub async fn list_available_models() -> Result<Vec<ModelInfo>, String> {
-    let mut models = vec![
-        ModelInfo { id: "default".to_string(), name: "Default (auto)".to_string(), alias: None },
-    ];
-
-    // Check if Claude CLI is available (fast — no API call)
-    let cli_available = tokio::process::Command::new("which")
-        .arg("claude")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if cli_available {
-        // Aliases (latest in each family)
-        models.push(ModelInfo { id: "sonnet".to_string(), name: "Claude Sonnet (Latest)".to_string(), alias: Some("sonnet".to_string()) });
-        models.push(ModelInfo { id: "opus".to_string(), name: "Claude Opus (Latest)".to_string(), alias: Some("opus".to_string()) });
-        models.push(ModelInfo { id: "haiku".to_string(), name: "Claude Haiku (Latest)".to_string(), alias: Some("haiku".to_string()) });
-        // Specific model IDs
-        models.push(ModelInfo { id: "claude-sonnet-4-6".to_string(), name: "Claude Sonnet 4.6".to_string(), alias: None });
-        models.push(ModelInfo { id: "claude-opus-4-6".to_string(), name: "Claude Opus 4.6".to_string(), alias: None });
-        models.push(ModelInfo { id: "claude-haiku-4-5-20251001".to_string(), name: "Claude Haiku 4.5".to_string(), alias: None });
-    }
-
-    Ok(models)
-}
-
 /// Why `model` may not be saved as a Task's Worker model, or `None` when it may.
 ///
 /// The rule is the one the desktop's own Task form applies to the field, so the
@@ -193,13 +157,7 @@ pub(crate) async fn worker_model_refusal(
             }
         }
         crate::domain::task::CodingProvider::Claude => {
-            let offered = match list_available_models().await {
-                Ok(models) => models,
-                Err(e) => return Some(format!(
-                    "the list of models the Claude Worker can take could not be read, so \
-                     \"{model}\" was not saved: {e}"
-                )),
-            };
+            let offered = crate::agents::model_catalog::claude_models();
             if offered.iter().any(|m| m.id == model) {
                 None
             } else {
@@ -227,8 +185,7 @@ mod worker_model_refusal_tests {
     /// same way the write reads it, so the test tracks the model picker.
     #[tokio::test]
     async fn a_claude_worker_takes_exactly_what_the_model_picker_offers() {
-        let offered = list_available_models().await.expect("the offered models");
-        for id in &offered {
+        for id in crate::agents::model_catalog::claude_models() {
             assert!(
                 worker_model_refusal(crate::domain::task::CodingProvider::Claude, &id.id)
                     .await
