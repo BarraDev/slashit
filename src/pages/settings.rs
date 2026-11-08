@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 use leptos::prelude::*;
-use leptos::task::spawn_local;
 use wasm_bindgen::JsCast;
 use crate::components::markdown::render_release_notes_markdown;
+use crate::components::toast;
 use crate::components::update_banner::{
     abandon_stalled, check_now, request_restart, set_update_channel, start_install,
     UpdaterActivity, UpdaterContext,
 };
-use crate::services::appearance_service::*;
 use crate::services::updater_service::{format_bytes, CHANNEL_PRERELEASE, CHANNEL_STABLE};
 
 /// Helper to get checked state from checkbox event
@@ -15,6 +14,17 @@ fn event_target_checked(ev: &leptos::ev::Event) -> bool {
     ev.target()
         .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
         .map(|i| i.checked())
+        .unwrap_or(false)
+}
+
+/// Persists the diff default. Returns `false` when the browser store refused or is unavailable.
+fn save_diff_collapsed(collapsed: bool) -> bool {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .map(|s| {
+            s.set_item("slashit_diff_default_collapsed", if collapsed { "true" } else { "false" })
+                .is_ok()
+        })
         .unwrap_or(false)
 }
 
@@ -70,37 +80,6 @@ pub fn Settings(
 ) -> impl IntoView {
     let (active_tab, set_active_tab) = signal(SettingsTab::General);
 
-    let (theme_id, set_theme_id) = signal("default".to_string());
-    let (appearance_mode, set_appearance_mode_signal) = signal(AppearanceMode::Dark);
-    let (themes, set_themes) = signal(Vec::<Theme>::new());
-
-    // Load themes and current theme on mount
-    let load_themes = {
-        move || {
-            spawn_local(async move {
-                if let Ok(loaded_themes) = list_themes().await {
-                    set_themes.set(loaded_themes);
-                }
-                if let Ok(current_theme) = get_theme().await {
-                    set_theme_id.set(current_theme.id.clone());
-                    apply_theme_to_dom(&current_theme);
-                }
-                if let Ok(mode) = get_appearance_mode().await {
-                    set_appearance_mode_signal.set(mode);
-                }
-            });
-        }
-    };
-
-    // Load themes once on mount
-    let _ = Effect::new(move |prev: Option<bool>| {
-        if prev.is_some() {
-            return true; // Only run once
-        }
-        load_themes();
-        true
-    });
-
     let show_about = RwSignal::new(false);
 
     let (diff_collapsed, set_diff_collapsed) = signal({
@@ -131,15 +110,15 @@ pub fn Settings(
                                 SettingsTab::Theme,
                                 SettingsTab::Updates,
                             ].into_iter().map(|tab| {
-                                let is_active = active_tab.get() == tab;
                                 let tab_clone = tab;
                                 view! {
                                     <button
                                         data-testid=format!("settings-tab-{}", tab.title().to_lowercase())
                                         on:click=move |_| set_active_tab.set(tab_clone)
-                                        class=format!(
+                                        aria-current=move || (active_tab.get() == tab_clone).then_some("true")
+                                        class=move || format!(
                                             "w-full flex items-center gap-3 px-4 py-3 rounded-lg text-left transition-all {}",
-                                            if is_active {
+                                            if active_tab.get() == tab_clone {
                                                 "bg-blue-500/20 text-blue-300"
                                             } else {
                                                 "text-white/60 hover:text-white/90 hover:bg-white/5"
@@ -165,7 +144,7 @@ pub fn Settings(
                                     <div class="space-y-6">
                                         <div>
                                             <h2 class="text-lg font-semibold text-white/90 mb-4">"General Settings"</h2>
-                                            <p class="text-sm text-white/50 mb-4">"Theme and appearance settings are available in the Theme tab."</p>
+                                            <p class="text-sm text-white/50 mb-4">"SlashIt currently uses only its dark appearance. See the Theme tab for details."</p>
 
                                             <div class="flex items-center justify-between p-4 rounded-xl bg-white/5 border border-white/10">
                                                 <div>
@@ -178,13 +157,13 @@ pub fn Settings(
                                                         prop:checked=diff_collapsed
                                                         on:change=move |ev| {
                                                             let v = event_target_checked(&ev);
-                                                            set_diff_collapsed.set(v);
-                                                            if let Some(window) = web_sys::window() {
-                                                                if let Ok(Some(storage)) = window.local_storage() {
-                                                                    let _ = storage.set_item(
-                                                                        "slashit_diff_default_collapsed",
-                                                                        if v { "true" } else { "false" },
-                                                                    );
+                                                            if save_diff_collapsed(v) {
+                                                                set_diff_collapsed.set(v);
+                                                            } else {
+                                                                toast::error("Could not save the diff setting; it was not changed.".to_string());
+                                                                // Put the checkbox back to the value that is actually stored.
+                                                                if let Some(input) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) {
+                                                                    input.set_checked(diff_collapsed.get_untracked());
                                                                 }
                                                             }
                                                         }
@@ -262,107 +241,13 @@ pub fn Settings(
                                 SettingsTab::Theme => view! {
                                     <div class="space-y-6">
                                         <div>
-                                            <h2 class="text-lg font-semibold text-white/90 mb-4">"Appearance Mode"</h2>
-                                            <div class="space-y-4">
-                                                <div>
-                                                    <label class="block text-sm font-medium text-white/70 mb-3">"Mode"</label>
-                                                    <div class="flex gap-4">
-                                                        {[
-                                                            (AppearanceMode::System, "System", "Follow system preference"),
-                                                            (AppearanceMode::Light, "Light", "Always use light mode"),
-                                                            (AppearanceMode::Dark, "Dark", "Always use dark mode"),
-                                                        ].into_iter().map(|(mode, label, description)| {
-                                                            let is_selected = appearance_mode.get() == mode;
-                                                            let mode_value = mode.clone();
-                                                            view! {
-                                                                <button
-                                                                    on:click=move |_| {
-                                                                        let mode_clone = mode_value.clone();
-                                                                        spawn_local(async move {
-                                                                            if let Err(e) = set_appearance_mode(mode_clone.clone()).await {
-                                                                                eprintln!("Failed to set appearance mode: {}", e);
-                                                                            } else {
-                                                                                set_appearance_mode_signal.set(mode_clone);
-                                                                            }
-                                                                        });
-                                                                    }
-                                                                    class=format!(
-                                                                        "relative p-4 rounded-xl border-2 transition-all text-left {}",
-                                                                        if is_selected {
-                                                                            "border-yellow-500 bg-yellow-500/10"
-                                                                        } else {
-                                                                            "border-white/10 hover:border-white/20 bg-white/5"
-                                                                        }
-                                                                    )
-                                                                >
-                                                                    <div class="text-left">
-                                                                        <p class="font-medium text-white/90">{label}</p>
-                                                                        <p class="text-xs text-white/50 mt-1">{description}</p>
-                                                                    </div>
-                                                                    {is_selected.then(|| view! {
-                                                                        <div class="absolute top-2 right-2 w-4 h-4 rounded-full bg-yellow-500 flex items-center justify-center">
-                                                                            <svg class="w-3 h-3 text-black" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" />
-                                                                            </svg>
-                                                                        </div>
-                                                                    })}
-                                                                </button>
-                                                            }
-                                                        }).collect::<Vec<_>>()}
-                                                    </div>
-                                                </div>
-
-                                                <div>
-                                                    <label class="block text-sm font-medium text-white/70 mb-3">"Color Theme"</label>
-                                                    <div class="grid grid-cols-2 gap-4">
-                                                        {move || {
-                                                            themes.get().into_iter().map(|theme| {
-                                                                let is_selected = theme_id.get() == theme.id;
-                                                                let theme_clone = theme.clone();
-                                                                let id = theme.id.clone();
-                                                                view! {
-                                                                    <button
-                                                                        on:click=move |_| {
-                                                                            let id_clone = id.clone();
-                                                                            spawn_local(async move {
-                                                                                if let Err(e) = set_theme_by_id(id_clone.clone()).await {
-                                                                                    eprintln!("Failed to set theme: {}", e);
-                                                                                } else {
-                                                                                    set_theme_id.set(id_clone.clone());
-                                                                                    if let Ok(theme) = get_theme().await {
-                                                                                        apply_theme_to_dom(&theme);
-                                                                                    }
-                                                                                }
-                                                                            });
-                                                                        }
-                                                                        class=format!(
-                                                                            "relative p-4 rounded-xl border-2 transition-all text-left {}",
-                                                                            if is_selected {
-                                                                                "border-yellow-500 bg-yellow-500/10"
-                                                                            } else {
-                                                                                "border-white/10 hover:border-white/20 bg-white/5"
-                                                                            }
-                                                                        )
-                                                                    >
-                                                                        <div class="flex items-center gap-2 mb-2">
-                                                                            <div class="w-4 h-4 rounded-full" style=format!("background-color: {}", theme_clone.colors.accent)></div>
-                                                                            <p class="font-medium text-white/90">{theme_clone.name.clone()}</p>
-                                                                        </div>
-                                                                        <p class="text-xs text-white/50">{theme_clone.description.clone()}</p>
-                                                                        {is_selected.then(|| view! {
-                                                                            <div class="absolute top-2 right-2 w-4 h-4 rounded-full bg-yellow-500 flex items-center justify-center">
-                                                                                <svg class="w-3 h-3 text-black" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" />
-                                                                                </svg>
-                                                                            </div>
-                                                                        })}
-                                                                    </button>
-                                                                }
-                                                            }).collect::<Vec<_>>()
-                                                        }}
-                                                    </div>
-                                                </div>
-
+                                            <h2 class="text-lg font-semibold text-white/90 mb-4">"Appearance"</h2>
+                                            <p class="text-sm text-white/50 mb-4">
+                                                "SlashIt currently uses only its dark appearance. Light and system modes and color themes are not available yet, so no appearance choice is saved."
+                                            </p>
+                                            <div class="p-4 rounded-xl border border-white/10 bg-white/5 max-w-xs">
+                                                <p class="font-medium text-white/90">"Dark"</p>
+                                                <p class="text-xs text-white/50 mt-1">"Always use dark mode"</p>
                                             </div>
                                         </div>
                                     </div>
