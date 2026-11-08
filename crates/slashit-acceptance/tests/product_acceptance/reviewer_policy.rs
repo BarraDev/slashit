@@ -10,12 +10,11 @@
 use super::human_review::{click, install_fakes, read_task, HR_PANEL};
 use super::task_runs::{register_project, run_to_review};
 use super::*;
-use thirtyfour::components::SelectElement;
 
 const NEW_TASK_BUTTON: &str = "[data-testid=\"new-task-button\"]";
 const TITLE_INPUT: &str = "input[placeholder=\"Task title...\"]";
 const CREATE_BUTTON: &str = "//button[normalize-space(.)='Create Task']";
-const REVIEWER_SELECT: &str = "//select[option[contains(., 'Not chosen: AI Review will not run')]]";
+const REVIEWER_INPUT_ID: &str = "task-ai-reviewer-select";
 const CARD_NO_VERDICT: &str = "[data-testid=\"task-card-no-verdict\"]";
 const DRAWER_NO_AI_REVIEW: &str = "[data-testid=\"task-drawer-no-ai-review\"]";
 const HR_AI_STATUS: &str = "[data-testid=\"human-review-ai-status\"]";
@@ -32,8 +31,8 @@ async fn a_task_created_in_the_editor_keeps_the_reviewer_chosen() {
 
 async fn create_in_editor_journey(context: &TestContext) -> Result<()> {
     let root = context.state().path().to_path_buf();
-    // The reviewer control lists Claude models only when the Claude CLI is on
-    // PATH, and the harness puts its fake agent there.
+    // The reviewer control lists the Claude aliases whether or not the CLI is
+    // installed. The harness still puts its fake agent on PATH for any run.
     let (_agent, _gh) = install_fakes(context, &root)?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
@@ -56,9 +55,9 @@ async fn create_in_editor(driver: &WebDriver, repository: &GitFixture) -> Result
         .context("the Create Task form shows no title field")?
         .send_keys(&title)
         .await?;
-    choose(
+    choose_model(
         driver,
-        REVIEWER_SELECT,
+        REVIEWER_INPUT_ID,
         "Claude Sonnet",
         "the AI Reviewer control",
     )
@@ -316,17 +315,19 @@ async fn assert_reviewer_is_named(driver: &WebDriver) -> Result<()> {
     Ok(())
 }
 
-/// Pick the option whose text starts with `text` in the select `xpath` finds.
-async fn choose(driver: &WebDriver, xpath: &str, text: &str, what: &str) -> Result<()> {
-    let select = driver
-        .find(By::XPath(xpath))
+/// Type `text` into the model combobox with element ID `input_id`, then click
+/// the listed row whose text contains it.
+async fn choose_model(driver: &WebDriver, input_id: &str, text: &str, what: &str) -> Result<()> {
+    let input = ui::visible(driver, &format!("#{input_id}"))
         .await
         .with_context(|| format!("the Create Task form shows no {what}"))?;
-    SelectElement::new(&select)
-        .await?
-        .select_by_partial_text(text)
+    input.click().await?;
+    input.send_keys(text).await?;
+    let row = driver
+        .find(By::XPath(format!("//li[@role='option'][contains(., '{text}')]")))
         .await
         .with_context(|| format!("{what} does not offer {text:?}"))?;
+    row.click().await.with_context(|| format!("could not choose {text:?} for {what}"))?;
     Ok(())
 }
 

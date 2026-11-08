@@ -190,7 +190,8 @@ pub fn ModelCombobox(
 ) -> impl IntoView {
     let (open, set_open) = signal(false);
     let (query, set_query) = signal(String::new());
-    let (active, set_active) = signal(0usize);
+    // The highlighted row, once the person has moved to one with the arrow keys.
+    let (active, set_active) = signal(None::<usize>);
     let refused = StoredValue::new(refused_ids);
     let listbox_id = format!("{id}-listbox");
     let option_prefix = StoredValue::new(id.clone());
@@ -213,7 +214,7 @@ pub fn ModelCombobox(
         on_change.run(chosen);
         set_open.set(false);
         set_query.set(String::new());
-        set_active.set(0);
+        set_active.set(None);
     };
 
     let on_keydown = move |ev: web_sys::KeyboardEvent| {
@@ -224,20 +225,25 @@ pub fn ModelCombobox(
                 set_open.set(true);
                 let count = rows().len();
                 if count > 0 {
+                    let down = key == "ArrowDown";
                     set_active.update(|i| {
-                        *i = if key == "ArrowDown" {
-                            (*i + 1) % count
-                        } else {
-                            (*i + count - 1) % count
-                        };
+                        *i = Some(match *i {
+                            None if down => 0,
+                            None => count - 1,
+                            Some(current) if down => (current + 1) % count,
+                            Some(current) => (current + count - 1) % count,
+                        });
                     });
                 }
             }
             "Enter" if open.get() => {
+                // Only a row the person moved to is chosen. Otherwise Enter
+                // goes to the form, and a focused field never picks a row.
+                let Some(row) = active.get().and_then(|i| rows().get(i).cloned()) else {
+                    return;
+                };
                 ev.prevent_default();
-                if let Some(row) = rows().get(active.get()) {
-                    choose(row.id.clone());
-                }
+                choose(row.id);
             }
             "Escape" if open.get() => {
                 ev.prevent_default();
@@ -259,15 +265,16 @@ pub fn ModelCombobox(
                     aria-autocomplete="list"
                     aria-controls=listbox_id.clone()
                     aria-expanded=move || if open.get() { "true" } else { "false" }
-                    aria-activedescendant=move || {
-                        if open.get() && !rows().is_empty() { option_dom_id(&option_prefix.get_value(), active.get()) } else { String::new() }
+                    aria-activedescendant=move || match active.get() {
+                        Some(index) if open.get() => option_dom_id(&option_prefix.get_value(), index),
+                        _ => String::new(),
                     }
                     placeholder="Search or type a model ID"
                     disabled=move || disabled.get()
                     prop:value=move || if open.get() { query.get() } else { saved_label(&options.get(), &selected.get()) }
                     on:focus=move |_| {
                         set_open.set(true);
-                        set_active.set(0);
+                        set_active.set(None);
                     }
                     on:blur=move |_| {
                         set_open.set(false);
@@ -276,7 +283,7 @@ pub fn ModelCombobox(
                     on:input=move |ev| {
                         set_query.set(event_target_value(&ev));
                         set_open.set(true);
-                        set_active.set(0);
+                        set_active.set(None);
                     }
                     on:keydown=on_keydown
                     class="flex-1 min-w-0 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
@@ -300,7 +307,7 @@ pub fn ModelCombobox(
                 >
                     {move || rows().into_iter().enumerate().map(|(index, row)| {
                         let chosen = row.id.clone();
-                        let is_active = move || active.get() == index;
+                        let is_active = move || active.get() == Some(index);
                         let dom_id = option_dom_id(&option_prefix.get_value(), index);
                         view! {
                             <li

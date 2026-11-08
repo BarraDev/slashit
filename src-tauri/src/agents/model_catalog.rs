@@ -60,8 +60,9 @@ pub struct ModelCatalog {
 /// The last successful OpenCode discovery, kept for the process lifetime.
 static OPENCODE_CACHE: Mutex<Option<Vec<RuntimeModel>>> = Mutex::new(None);
 
-/// Claude Code's aliases and fixed IDs. Listed only when the CLI is present,
-/// and always `Unverified`: no reliable non-interactive account listing exists.
+/// Claude Code's aliases and fixed IDs. Always listed, whether or not the CLI
+/// is installed, and always `Unverified`: no reliable non-interactive account
+/// listing exists.
 pub fn claude_models() -> Vec<RuntimeModel> {
     let entry = |id: &str, name: &str| RuntimeModel {
         id: id.to_string(),
@@ -111,18 +112,51 @@ fn is_provider_model(line: &str) -> bool {
     }
 }
 
-/// Runs `opencode models` under the user's own configuration, bounded in time.
-/// The process group is killed when the deadline passes.
+/// Runs `opencode models` under the same isolated configuration a Worker gets,
+/// so the picker lists only models a Worker can select. `--standalone` keeps the
+/// listing off the shared background service, which does not read this
+/// environment. The process group is killed when the deadline passes, so the
+/// private server it starts does not outlive the listing.
 async fn run_opencode_models() -> Result<Vec<RuntimeModel>, String> {
+    let config_dir = tempfile::Builder::new()
+        .prefix("slashit-opencode-discovery-")
+        .tempdir()
+        .map_err(|e| format!("The OpenCode discovery directory could not be created: {e}"))?;
+    let config_path = config_dir
+        .path()
+        .to_str()
+        .ok_or_else(|| "The OpenCode discovery directory path is not UTF-8".to_string())?
+        .to_string();
     let mut command = tokio::process::Command::new(crate::agents::opencode_run::OPENCODE_PROGRAM);
     command
-        .arg("models")
+        .args(["models", "--standalone"])
+        .env_clear()
+        .envs(crate::agents::opencode_run::opencode_spawn_env(
+            std::env::vars_os(),
+            &config_path,
+        ))
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(OPENCODE_DISCOVERY_TIMEOUT, command.output())
-        .await
-        .map_err(|_| "OpenCode did not list its models in time".to_string())?
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command
+        .spawn()
         .map_err(|e| format!("OpenCode could not be started: {e}"))?;
+    #[cfg(unix)]
+    let group = child.id();
+    let output = match tokio::time::timeout(OPENCODE_DISCOVERY_TIMEOUT, child.wait_with_output()).await {
+        Ok(output) => output.map_err(|e| format!("OpenCode could not be run: {e}"))?,
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = group {
+                // Safety: `pid` is the leader of the group made by `process_group(0)`.
+                unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+            }
+            return Err("OpenCode did not list its models in time".to_string());
+        }
+    };
     if !output.status.success() {
         return Err(format!(
             "OpenCode exited with {} while listing its models",
