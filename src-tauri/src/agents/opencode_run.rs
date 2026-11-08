@@ -86,6 +86,8 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Permission requests are answered at once, so this is only the connection's
 /// upper bound on an answer that never comes.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Bounds the `--version` probe that runs before each Worker starts.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The OpenCode permission policy every Worker runs under, in OpenCode's V2
 /// `permissions` form. Every action not named is denied, and the last matching
@@ -125,6 +127,46 @@ pub fn opencode_spawn_env(
         .collect();
     env.extend(policy_env(config_dir));
     env
+}
+
+/// The major version in a `--version` report such as `opencode v2.2.6`.
+fn major_version(report: &str) -> Option<u64> {
+    report.split_whitespace().find_map(|word| {
+        let (major, _) = word.strip_prefix('v').unwrap_or(word).split_once('.')?;
+        major.parse().ok()
+    })
+}
+
+/// Refuses an installed OpenCode that predates the V2 permission format the
+/// Worker's policy is written in. Only a report that names a major version
+/// below 2 is refused. A probe that fails, times out or prints no version
+/// leaves the launch to report its own error, so an unrelated failure is never
+/// reported as a version problem. The probe runs the same program with the
+/// same environment as the launch.
+async fn check_opencode_version(
+    program: &str,
+    cwd: &std::path::Path,
+    env: &[(String, String)],
+) -> Result<(), String> {
+    let mut command = crate::host_process::tokio_command(program);
+    command
+        .arg("--version")
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(VERSION_PROBE_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => output,
+        _ => return Ok(()),
+    };
+    match major_version(&String::from_utf8_lossy(&output.stdout)) {
+        Some(major) if major < 2 => Err(format!(
+            "The OpenCode executable {program} is OpenCode version {major}. SlashIt's OpenCode Coding Worker requires OpenCode V2, which uses the V2 permission format. Install OpenCode V2 and make sure it is the executable SlashIt starts, then try again."
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// What a run needs to start. The prompt is written to the agent's session
@@ -231,6 +273,7 @@ impl OpenCodeRunner {
             request_timeout: REQUEST_TIMEOUT,
             permission_timeout: PERMISSION_TIMEOUT,
         };
+        check_opencode_version(&spec.program, &spec.cwd, &spec.env).await?;
         let connection = Connection::spawn_holding(&spec, lease, Box::new(config_dir))
             .map_err(|e| e.to_string())?;
         connection.initialize().await.map_err(|e| e.to_string())?;
@@ -722,6 +765,67 @@ mod tests {
             .err()
             .expect("start must fail");
         assert!(error.contains("protocol version"), "{error}");
+    }
+
+    #[test]
+    fn the_version_report_names_its_major_version() {
+        assert_eq!(major_version("opencode v2.2.6\n"), Some(2));
+        assert_eq!(major_version("1.18.33"), Some(1));
+        assert_eq!(major_version("opencode"), None);
+        assert_eq!(major_version(""), None);
+    }
+
+    /// A stand-in `opencode` whose `--version` prints `report`. Every other
+    /// command runs the fixture agent.
+    #[cfg(unix)]
+    fn versioned_program(report: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("opencode");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '{report}'; exit 0; fi\nexec '{}' \"$@\"\n",
+            fixture("ok").program
+        );
+        // Written through the shared helper: a script written in-process races
+        // with other tests' forks and fails with ETXTBSY.
+        crate::test_helpers::write_executable(&path, &script);
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_v1_opencode_is_refused_before_any_session_starts() {
+        let (_dir, program) = versioned_program("opencode v1.18.33");
+        let mut config = fixture("ok");
+        config.program = program;
+        let error = match OpenCodeRunner::start(config, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("a V1 OpenCode must not start"),
+        };
+        assert!(error.contains("version 1"), "{error}");
+        assert!(error.contains("requires OpenCode V2"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_v2_or_unreadable_version_starts_the_run() {
+        for report in ["opencode v2.2.6", "garbage with no version"] {
+            let (_dir, program) = versioned_program(report);
+            let mut config = fixture("ok");
+            config.program = program;
+            let run = OpenCodeRunner::start(config, None).await.expect(report);
+            assert_eq!(run.wait().await, Ok(true), "{report}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_executable_is_not_reported_as_a_version_problem() {
+        let mut config = fixture("ok");
+        config.program = "/nonexistent/slashit-opencode-probe".into();
+        let error = match OpenCodeRunner::start(config, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("a missing executable must not start"),
+        };
+        assert!(!error.contains("OpenCode V2"), "{error}");
     }
 
     #[tokio::test]
