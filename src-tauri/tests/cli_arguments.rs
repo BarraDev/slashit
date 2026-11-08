@@ -4,7 +4,7 @@
 //! Every XDG directory, and HOME, points at a fresh temporary directory, so
 //! the test never reads or writes the developer's real SlashIt state. After
 //! each run the directories must still be empty: no config, data, state,
-//! runtime files, or control socket.
+//! cache, runtime files, control socket, or even an empty directory.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -32,26 +32,23 @@ impl Sandbox {
         path
     }
 
-    /// The four XDG roots and HOME, all inside the sandbox and all empty.
-    fn state_dirs(&self) -> Vec<PathBuf> {
+    /// The environment variable for each XDG root and HOME, paired with its
+    /// directory inside the sandbox. Every directory starts empty.
+    fn state_dirs(&self) -> Vec<(&'static str, PathBuf)> {
         vec![
-            self.dir("config"),
-            self.dir("data"),
-            self.dir("state"),
-            self.dir("runtime"),
-            self.dir("home"),
+            ("XDG_CONFIG_HOME", self.dir("config")),
+            ("XDG_DATA_HOME", self.dir("data")),
+            ("XDG_STATE_HOME", self.dir("state")),
+            ("XDG_CACHE_HOME", self.dir("cache")),
+            ("XDG_RUNTIME_DIR", self.dir("runtime")),
+            ("HOME", self.dir("home")),
         ]
     }
 
     fn run(&self, args: &[&str]) -> (std::process::ExitStatus, String, String) {
-        let dirs = self.state_dirs();
         let mut child = Command::new(env!("CARGO_BIN_EXE_slashit-ui"))
             .args(args)
-            .env("XDG_CONFIG_HOME", &dirs[0])
-            .env("XDG_DATA_HOME", &dirs[1])
-            .env("XDG_STATE_HOME", &dirs[2])
-            .env("XDG_RUNTIME_DIR", &dirs[3])
-            .env("HOME", &dirs[4])
+            .envs(self.state_dirs())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -80,28 +77,43 @@ impl Sandbox {
     }
 
     fn assert_untouched(&self, args: &[&str]) {
-        for dir in self.state_dirs() {
+        for (var, dir) in self.state_dirs() {
+            let entries = tree_entries(&dir);
             assert!(
-                is_empty_tree(&dir),
-                "{args:?} wrote under {}",
+                entries.is_empty(),
+                "{args:?} wrote under {var}={}: {entries:?}",
                 dir.display()
             );
         }
     }
 }
 
-/// True when the directory holds no entries at any depth.
-fn is_empty_tree(path: &Path) -> bool {
-    let entries = std::fs::read_dir(path).expect("read sandbox directory");
-    entries.into_iter().all(|entry| {
+/// Every entry under `path` at any depth: files, symlinks, sockets and
+/// directories, including empty ones. Symlinks are listed, not followed.
+fn tree_entries(path: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(path).expect("read sandbox directory") {
         let entry = entry.expect("read sandbox entry");
         let file_type = entry.file_type().expect("stat sandbox entry");
+        let entry_path = entry.path();
         if file_type.is_dir() {
-            is_empty_tree(&entry.path())
-        } else {
-            false
+            found.extend(tree_entries(&entry_path));
         }
-    })
+        found.push(entry_path);
+    }
+    found
+}
+
+#[test]
+fn tree_entries_reports_empty_directories_at_any_depth() {
+    let root = tempfile::tempdir().expect("create directory");
+    assert!(tree_entries(root.path()).is_empty());
+
+    let nested = root.path().join("a").join("b");
+    std::fs::create_dir_all(&nested).expect("create nested directories");
+    let entries = tree_entries(root.path());
+    assert!(entries.contains(&root.path().join("a")), "{entries:?}");
+    assert!(entries.contains(&nested), "{entries:?}");
 }
 
 #[test]
