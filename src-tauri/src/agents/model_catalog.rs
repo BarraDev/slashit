@@ -158,13 +158,33 @@ async fn run_opencode_models() -> Result<Vec<RuntimeModel>, String> {
         .to_str()
         .ok_or_else(|| "The OpenCode discovery directory path is not UTF-8".to_string())?
         .to_string();
-    let mut command = tokio::process::Command::new(crate::agents::opencode_run::OPENCODE_PROGRAM);
+    run_listing(
+        crate::agents::opencode_run::OPENCODE_PROGRAM,
+        &["models", "--standalone"],
+        &config_path,
+        OPENCODE_DISCOVERY_TIMEOUT,
+        OPENCODE_DISCOVERY_MAX_OUTPUT,
+    )
+    .await
+}
+
+/// Runs `program args` with the Worker's environment under `config_path`, and
+/// parses its stdout. Separated from [`run_opencode_models`] so the timeout,
+/// output bound and process-group cleanup can be tested with a fake program.
+async fn run_listing(
+    program: &str,
+    args: &[&str],
+    config_path: &str,
+    timeout: Duration,
+    max_output: u64,
+) -> Result<Vec<RuntimeModel>, String> {
+    let mut command = tokio::process::Command::new(program);
     command
-        .args(["models", "--standalone"])
+        .args(args)
         .env_clear()
         .envs(crate::agents::opencode_run::opencode_spawn_env(
             std::env::vars_os(),
-            &config_path,
+            config_path,
         ))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -181,15 +201,19 @@ async fn run_opencode_models() -> Result<Vec<RuntimeModel>, String> {
         .take()
         .ok_or_else(|| "OpenCode output is not piped".to_string())?;
     let listing = async {
-        let bytes = read_capped(stdout, OPENCODE_DISCOVERY_MAX_OUTPUT).await?;
+        let bytes = read_capped(stdout, max_output).await?;
         let status = child
             .wait()
             .await
             .map_err(|e| format!("OpenCode could not be run: {e}"))?;
         Ok::<_, String>((status, bytes))
     };
-    let (status, bytes) = match tokio::time::timeout(OPENCODE_DISCOVERY_TIMEOUT, listing).await {
-        Ok(Ok(listed)) => listed,
+    let (status, bytes) = match tokio::time::timeout(timeout, listing).await {
+        Ok(Ok(listed)) => {
+            // A background process that kept its stdout closed would otherwise outlive the listing.
+            kill_group(group);
+            listed
+        }
         Ok(Err(error)) => {
             kill_group(group);
             return Err(error);
@@ -219,40 +243,46 @@ pub async fn catalog(provider: CodingProvider, refresh: bool) -> ModelCatalog {
             error: None,
         },
         CodingProvider::OpenCode => {
-            if !refresh {
-                if let Some(cached) = OPENCODE_CACHE.lock().ok().and_then(|c| c.clone()) {
-                    return ModelCatalog {
-                        provider,
-                        models: cached,
-                        error: None,
-                    };
-                }
+            opencode_catalog(&OPENCODE_CACHE, refresh, run_opencode_models()).await
+        }
+    }
+}
+
+/// The OpenCode catalog. `discover` is started only when there is no cached
+/// list or a refresh was asked for, so a cached read runs no process.
+async fn opencode_catalog(
+    cache: &Mutex<Option<Vec<RuntimeModel>>>,
+    refresh: bool,
+    discover: impl std::future::Future<Output = Result<Vec<RuntimeModel>, String>>,
+) -> ModelCatalog {
+    if !refresh {
+        if let Some(cached) = cache.lock().ok().and_then(|c| c.clone()) {
+            return ModelCatalog {
+                provider: CodingProvider::OpenCode,
+                models: cached,
+                error: None,
+            };
+        }
+    }
+    match discover.await {
+        Ok(models) => {
+            if let Ok(mut cache) = cache.lock() {
+                *cache = Some(models.clone());
             }
-            match run_opencode_models().await {
-                Ok(models) => {
-                    if let Ok(mut cache) = OPENCODE_CACHE.lock() {
-                        *cache = Some(models.clone());
-                    }
-                    ModelCatalog {
-                        provider,
-                        models,
-                        error: None,
-                    }
-                }
-                Err(error) => {
-                    // Keep the last good list: a failed refresh must not empty
-                    // the picker or drop a saved model.
-                    let models = OPENCODE_CACHE
-                        .lock()
-                        .ok()
-                        .and_then(|c| c.clone())
-                        .unwrap_or_default();
-                    ModelCatalog {
-                        provider,
-                        models,
-                        error: Some(error),
-                    }
-                }
+            ModelCatalog {
+                provider: CodingProvider::OpenCode,
+                models,
+                error: None,
+            }
+        }
+        Err(error) => {
+            // Keep the last good list: a failed refresh must not empty the
+            // picker or drop a saved model.
+            let models = cache.lock().ok().and_then(|c| c.clone()).unwrap_or_default();
+            ModelCatalog {
+                provider: CodingProvider::OpenCode,
+                models,
+                error: Some(error),
             }
         }
     }
@@ -311,5 +341,142 @@ mod tests {
         let exact = [b'a'; 16];
         let bytes = read_capped(&exact[..], 16).await.expect("exactly the bound is allowed");
         assert_eq!(bytes.len(), 16);
+    }
+
+    /// Runs a shell script as the discovery program. `/bin/sh` is used directly
+    /// so no executable file is written, which avoids a busy-binary race.
+    #[cfg(unix)]
+    fn shell_listing(script: &str, timeout: Duration, max_output: u64) -> impl std::future::Future<Output = Result<Vec<RuntimeModel>, String>> {
+        let script = script.to_string();
+        async move { run_listing("/bin/sh", &["-c", &script], "/unused", timeout, max_output).await }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listing_that_overflows_its_bound_is_refused_and_stopped() {
+        let started = std::time::Instant::now();
+        let error = shell_listing(
+            "while :; do echo ollama/llama3.2:3b; done",
+            Duration::from_secs(20),
+            4096,
+        )
+        .await
+        .expect_err("an endless listing is refused");
+        assert!(error.contains("more than 4096 bytes"), "{error}");
+        // Overflow ends the run at once, not at the 20-second deadline.
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listing_with_a_nonzero_exit_is_an_error() {
+        let error = shell_listing("exit 3", Duration::from_secs(5), 1024)
+            .await
+            .expect_err("a failed listing is an error");
+        assert!(error.contains("exited"), "{error}");
+    }
+
+    /// The Linux process table reports a zombie as `Z`, so a reaped-or-zombie
+    /// child counts as stopped.
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+            Err(_) => false,
+        }
+    }
+
+    /// A deadline stops the listing and everything it started, not only its
+    /// leader: the background `sleep` below is in the same process group.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_listing_past_its_deadline_stops_its_whole_process_group() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let pid_file = dir.path().join("child.pid");
+        let script = format!(
+            "/bin/sleep 30 & echo $! > '{}'; /bin/sleep 30",
+            pid_file.display()
+        );
+        let error = shell_listing(&script, Duration::from_secs(2), 1024)
+            .await
+            .expect_err("a listing past its deadline fails");
+        assert!(error.contains("in time"), "{error}");
+
+        let child: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the script recorded its background child")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_running(child) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!process_is_running(child), "background child {child} survived the deadline");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_last_good_list_and_reports_why() {
+        let cache = Mutex::new(None);
+        let good = opencode_catalog(
+            &cache,
+            true,
+            shell_listing("echo ollama/llama3.2:3b", Duration::from_secs(5), 1024),
+        )
+        .await;
+        assert_eq!(good.error, None);
+
+        let failed = opencode_catalog(
+            &cache,
+            true,
+            shell_listing("exit 1", Duration::from_secs(5), 1024),
+        )
+        .await;
+        assert!(failed.error.is_some(), "the failed refresh is reported");
+        assert_eq!(failed.models, good.models, "the last good list is kept");
+        assert_eq!(failed.models[0].id, "ollama/llama3.2:3b");
+    }
+
+    /// A successful listing whose background child closed its stdout still
+    /// stops that child: the pipe reaches end-of-file, so only the group kill ends it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_successful_listing_stops_a_background_child_that_closed_its_output() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let pid_file = dir.path().join("child.pid");
+        let script = format!(
+            "/bin/sleep 30 >/dev/null 2>&1 & echo $! > '{}'; echo ollama/llama3.2:3b",
+            pid_file.display()
+        );
+        let models = shell_listing(&script, Duration::from_secs(5), 1024)
+            .await
+            .expect("the listing succeeds");
+        assert_eq!(models[0].id, "ollama/llama3.2:3b");
+
+        let child: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the script recorded its background child")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_running(child) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!process_is_running(child), "background child {child} outlived the listing");
+    }
+
+    #[tokio::test]
+    async fn a_cached_list_is_returned_without_running_discovery() {
+        let cache = Mutex::new(Some(parse_opencode_models("ollama/llama3.2:3b\n")));
+        let cached = opencode_catalog(
+            &cache,
+            false,
+            std::future::ready(Err("discovery must not run for a cached list".to_string())),
+        )
+        .await;
+        assert_eq!(cached.error, None);
+        assert_eq!(cached.models[0].id, "ollama/llama3.2:3b");
     }
 }

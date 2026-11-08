@@ -277,8 +277,14 @@ pub fn ModelCombobox(
                         set_active.set(None);
                     }
                     on:blur=move |_| {
-                        set_open.set(false);
-                        set_query.set(String::new());
+                        // A typed ID the person never chose is kept, not dropped on blur.
+                        let typed = query.get_untracked();
+                        if let Some(manual) = manual_option(&options.get_untracked(), &typed, &refused.get_value()) {
+                            choose(manual.id);
+                        } else {
+                            set_open.set(false);
+                            set_query.set(String::new());
+                        }
                     }
                     on:input=move |ev| {
                         set_query.set(event_target_value(&ev));
@@ -293,7 +299,11 @@ pub fn ModelCombobox(
                     class="px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white/80 hover:bg-white/10 disabled:opacity-40"
                     disabled=move || disabled.get() || loading.get()
                     on:mousedown=move |ev: web_sys::MouseEvent| ev.prevent_default()
-                    on:click=move |_| on_refresh.run(())
+                    on:click=move |_| {
+                        // A refresh can reorder the rows, so no earlier highlight carries over.
+                        set_active.set(None);
+                        on_refresh.run(());
+                    }
                 >
                     "Refresh"
                 </button>
@@ -415,6 +425,14 @@ mod tests {
         let mut gate = LoadGate::default();
         let only = gate.begin();
         assert!(gate.accepts(only));
+    }
+
+    #[test]
+    fn a_saved_model_missing_from_the_list_is_still_shown_as_saved() {
+        // A failed refresh leaves the list without the saved model; its ID is shown.
+        assert_eq!(saved_label(&options(), "ollama/gone:1"), "ollama/gone:1");
+        assert_eq!(saved_label(&options(), "sonnet"), "Claude Sonnet (latest alias)");
+        assert_eq!(saved_label(&options(), ""), "");
     }
 
     #[test]
