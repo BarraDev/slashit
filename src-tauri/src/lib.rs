@@ -482,6 +482,7 @@ pub fn run() {
             delete_task,
             reorder_task,
             list_available_models,
+            list_runtime_models,
             check_claude_cli,
             create_session,
             send_message,

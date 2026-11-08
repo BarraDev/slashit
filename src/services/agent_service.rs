@@ -7,16 +7,29 @@ extern "C" {
     async fn invoke(cmd: &str, args: JsValue) -> JsValue;
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ModelInfo {
+/// One model the runtime offers. `source` and `availability` are the backend's
+/// labels: `alias`/`opencode_models` and `catalog`/`unverified`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeModel {
     pub id: String,
     pub name: String,
-    pub alias: Option<String>,
+    pub source: String,
+    pub availability: String,
 }
 
-pub async fn list_available_models() -> Result<Vec<ModelInfo>, String> {
-    let args = serde_wasm_bindgen::to_value(&serde_json::json!({})).unwrap();
-    let response = invoke("list_available_models", args).await;
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelCatalog {
+    pub provider: String,
+    pub models: Vec<RuntimeModel>,
+    pub error: Option<String>,
+}
+
+/// The models for `provider` (`claude` or `opencode`). `refresh` runs discovery
+/// again; otherwise a cached list is returned.
+pub async fn list_runtime_models(provider: &str, refresh: bool) -> Result<ModelCatalog, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "provider": provider, "refresh": refresh }))
+        .map_err(|e| e.to_string())?;
+    let response = invoke("list_runtime_models", args).await;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 

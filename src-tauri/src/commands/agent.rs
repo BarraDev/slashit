@@ -124,6 +124,16 @@ pub async fn check_claude_cli() -> Result<ClaudeCliStatus, String> {
     })
 }
 
+/// The models a runtime offers the picker, each labelled with where it came
+/// from and how much is known about it. `refresh` runs discovery again.
+#[tauri::command]
+pub async fn list_runtime_models(
+    provider: crate::domain::task::CodingProvider,
+    refresh: bool,
+) -> Result<crate::agents::model_catalog::ModelCatalog, String> {
+    Ok(crate::agents::model_catalog::catalog(provider, refresh).await)
+}
+
 /// List available Claude models by checking the CLI.
 #[tauri::command]
 pub async fn list_available_models() -> Result<Vec<ModelInfo>, String> {

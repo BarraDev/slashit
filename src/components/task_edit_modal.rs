@@ -5,7 +5,16 @@ use leptos::callback::Callback;
 use crate::components::task_dependency::{self, choice_for, requested, DependencyChoice, DependencyField};
 use crate::models::{Task, TaskCategory, TaskPriority};
 use crate::models::task::{CodingProvider, ReviewMode};
-use crate::services::{create_task, update_task, delete_task, set_task_dependencies, agent_service::list_available_models, agent_service::ModelInfo};
+use crate::services::{create_task, update_task, delete_task, set_task_dependencies};
+use crate::components::model_combobox::{ModelCombobox, PickerOption, PickerState};
+
+/// The runtime name the model catalog is requested under.
+fn runtime_name(provider: CodingProvider) -> &'static str {
+    match provider {
+        CodingProvider::Claude => "claude",
+        CodingProvider::OpenCode => "opencode",
+    }
+}
 use uuid::Uuid;
 
 #[derive(Clone, PartialEq)]
@@ -68,18 +77,15 @@ pub fn TaskEditModal(
         TaskEditMode::Edit(task) => choice_for(Some(&*task)),
     });
 
-    let (available_models, set_available_models) = signal(Vec::<ModelInfo>::new());
-
-    // Load available models on mount
-    Effect::new(move |prev: Option<bool>| {
-        if prev.is_some() { return true; }
-        spawn_local(async move {
-            if let Ok(models) = list_available_models().await {
-                set_available_models.set(models);
-            }
-        });
-        true
+    // The Worker's models follow its provider. Switching provider reloads the list only;
+    // the saved model is never replaced by another one.
+    let worker_picker = PickerState::new();
+    let reviewer_picker = PickerState::new();
+    Effect::new(move |_| {
+        worker_picker.load(runtime_name(provider.get()), false);
     });
+    // The AI Reviewer runs on Claude models only.
+    reviewer_picker.load("claude", false);
 
     let (submitting, set_submitting) = signal(false);
     let (deleting, set_deleting) = signal(false);
@@ -383,45 +389,19 @@ pub fn TaskEditModal(
 
                         // AI Model
                         <div>
-                            <label class="block text-sm font-medium text-white/70 mb-1.5">"AI Model"</label>
-                            // OpenCode names its model as provider/model. The run starts
-                            // only on that exact id, and it is part of the approved input.
-                            <input
-                                type="text"
-                                placeholder="provider/model, for example ollama/llama3.2:3b"
-                                prop:value=move || model.get()
-                                on:input=move |ev| set_model.set(event_target_value(&ev))
-                                class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                                hidden=move || provider.get() != CodingProvider::OpenCode
-                                disabled=move || submitting.get()
+                            <label for="task-ai-model" class="block text-sm font-medium text-white/70 mb-1.5">"AI Model"</label>
+                            // The list follows the Worker's provider. A saved model that the list does
+                            // not contain stays selected, and switching provider never picks another one.
+                            <ModelCombobox
+                                id="task-ai-model"
+                                options=Signal::derive(move || worker_picker.options.get())
+                                selected=model
+                                on_change=Callback::new(move |chosen: String| set_model.set(chosen))
+                                on_refresh=Callback::new(move |_: ()| worker_picker.load(runtime_name(provider.get()), true))
+                                loading=Signal::derive(move || worker_picker.loading.get())
+                                error=Signal::derive(move || worker_picker.error.get())
+                                disabled=Signal::derive(move || submitting.get())
                             />
-
-                            <select
-                                on:change=move |ev| set_model.set(event_target_value(&ev))
-                                class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                                disabled=move || submitting.get() || provider.get() == CodingProvider::OpenCode
-                                hidden=move || provider.get() == CodingProvider::OpenCode
-                            >
-                                {move || {
-                                    let models = available_models.get();
-                                    let current = model.get();
-                                    let items: Vec<ModelInfo> = if provider.get() == CodingProvider::OpenCode {
-                                        vec![ModelInfo { id: "default".to_string(), name: "OpenCode default".to_string(), alias: None }]
-                                    } else if models.is_empty() {
-                                        vec![ModelInfo { id: "default".to_string(), name: "Default (auto)".to_string(), alias: None }]
-                                    } else {
-                                        models
-                                    };
-                                    items.iter().map(|m| {
-                                        let id = m.id.clone();
-                                        let name = m.name.clone();
-                                        let selected = id == current;
-                                        view! {
-                                            <option value=id selected=selected>{name}</option>
-                                        }
-                                    }).collect::<Vec<_>>()
-                                }}
-                            </select>
                             {move || match mode.get() {
                                 TaskEditMode::Edit(task) => task.last_observed_model.map(|observed| view! {
                                     <p class="mt-1.5 text-xs text-white/50">
@@ -437,40 +417,22 @@ pub fn TaskEditModal(
                         // chosen by default, so no reviewer starts until a person picks one.
                         <div>
                             <label for="task-ai-reviewer-select" class="block text-sm font-medium text-white/70 mb-1.5">"AI Reviewer (Claude)"</label>
-                            <select
+                            <ModelCombobox
                                 id="task-ai-reviewer-select"
-                                on:change=move |ev| set_reviewer_model.set(event_target_value(&ev))
-                                class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                                disabled=move || submitting.get()
-                            >
-                                {move || {
-                                    let current = reviewer_model.get();
-                                    let mut items = vec![ModelInfo {
-                                        id: String::new(),
-                                        name: "Not chosen: AI Review will not run".to_string(),
-                                        alias: None,
-                                    }];
-                                    // The provider default is not a reviewer choice.
-                                    items.extend(available_models.get().into_iter().filter(|m| m.id != "default"));
-                                    // A configured reviewer stays selectable when the list lacks it, so
-                                    // saving this form cannot clear it by accident.
-                                    if !current.is_empty() && !items.iter().any(|m| m.id == current) {
-                                        items.push(ModelInfo {
-                                            id: current.clone(),
-                                            name: format!("{current} (configured)"),
-                                            alias: None,
-                                        });
-                                    }
-                                    items.iter().map(|m| {
-                                        let id = m.id.clone();
-                                        let name = m.name.clone();
-                                        let selected = id == current;
-                                        view! {
-                                            <option value=id selected=selected>{name}</option>
-                                        }
-                                    }).collect::<Vec<_>>()
-                                }}
-                            </select>
+                                options=Signal::derive(move || {
+                                    // The first row means no reviewer. The provider default is never one.
+                                    let mut rows = vec![PickerOption::new("", "Not chosen: AI Review will not run", "")];
+                                    rows.extend(reviewer_picker.options.get().into_iter().filter(|o| o.id != "default"));
+                                    rows
+                                })
+                                selected=reviewer_model
+                                on_change=Callback::new(move |chosen: String| set_reviewer_model.set(chosen))
+                                on_refresh=Callback::new(move |_: ()| reviewer_picker.load("claude", true))
+                                loading=Signal::derive(move || reviewer_picker.loading.get())
+                                error=Signal::derive(move || reviewer_picker.error.get())
+                                disabled=Signal::derive(move || submitting.get())
+                                refused_ids=vec!["default".to_string()]
+                            />
                             <p class="mt-1 text-xs text-white/50">
                                 {move || match review_mode.get() {
                                     ReviewMode::Automatic => "AI Review runs on this Claude model after each coding run, whichever Worker ran it. Without one, a finished run waits in Human Review and no reviewer starts.",
