@@ -24,8 +24,42 @@
 //! small function is cheaper and clearer than that dependency.
 
 use anyhow::{anyhow, Context, Result};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+/// A name no other publication in this process is using, in the
+/// destination's own directory -- where the finished publication has to be
+/// built, because `std::fs::rename` is atomic only within one filesystem.
+/// The destination's own file name, distinguished by this process's id and a
+/// per-process counter, also keeps two publications to the same directory
+/// from colliding. A process that died before cleaning up leaves its
+/// temporaries behind -- invisible clutter under names only publications
+/// use -- and cannot be mistaken for another's.
+fn scratch(path: &Path, tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "script".into());
+    name.push(format!(
+        ".{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+    ));
+    path.with_file_name(name)
+}
+
+/// A temporary file removed when this value drops, however the guarded
+/// function ends -- error return or panic alike. The removal's own failure
+/// is not reported: the caller learns of the step that failed, and a
+/// leftover is at worst clutter under a name only publications use.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 /// Write `body` to `path` as an executable script another process can run.
 ///
@@ -35,68 +69,47 @@ use std::path::{Path, PathBuf};
 /// child can have inherited one and made that exec fail with `ETXTBSY`. The
 /// source file is never executed, so writing it in-process is safe.
 ///
-/// An existing `path` is replaced, because the copy opens its destination
-/// rather than recreating it. `cp` also writes through what it finds there:
-/// it follows a symbolic link at the destination, and it opens and truncates
-/// a file even when that file has other hard links. Either would rewrite a
-/// file a publication must never touch -- the checked-in fake agent script a
-/// generated entry used to point at, or whatever else shares its entry's
-/// inode -- so an entry that would be written through is removed first and
-/// the copy creates a fresh file in its place. A lone regular file is written
-/// in place, which is also what keeps a failed copy from having destroyed
-/// the previous script.
+/// The publication itself is prepared out of the way and moved into place
+/// atomically: the copy lands in a uniquely named temporary file beside the
+/// destination, receives its final mode, and only the finished copy is
+/// renamed onto `path`. Until that rename, whatever stands at `path` -- a
+/// plain script, a symbolic link to a script elsewhere, or a hard link
+/// sharing an entry's inode -- is untouched, so a failed copy, mode change
+/// or rename cannot truncate, remove or corrupt the previous script, and the
+/// temporaries of the failed attempt are removed. The rename replaces the
+/// entry itself, so the publication follows no destination symlink and
+/// rewrites no file another link shares: both keep saying what they said
+/// before, and the published entry has an inode of its own.
 ///
-/// The copy itself is Linux-only, matching the crate: `/bin/cp` is named by
-/// an absolute path, both because the Linux desktop runtime is the only
+/// The copy is Linux-only, matching the crate: `/bin/cp` is named by an
+/// absolute path, both because the Linux desktop runtime is the only
 /// target and because journeys shadow `PATH`, which must not decide which
-/// `cp` runs. A caller whose publication fails gets the copy's own error, and
-/// finds no temporary `.source` left behind for the next journey step.
+/// `cp` runs. A caller whose publication fails gets the failing step's own
+/// error; cleanup runs either way.
 pub fn write_executable(path: &Path, body: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mut source = path.as_os_str().to_owned();
-    source.push(".source");
-    let source = PathBuf::from(source);
-    std::fs::write(&source, body)
-        .with_context(|| format!("could not write {}", source.display()))?;
-    // `cp` writes through an entry that shares its inode with another file:
-    // it follows a symlink at the destination, and it opens and truncates a
-    // file even when that file has other hard links. Either would rewrite a
-    // file this publication must never touch, so such an entry is removed
-    // first and the copy creates a fresh file in its place. A lone regular
-    // file is written in place, which keeps a failed copy from having
-    // destroyed the previous script.
-    let writes_through = std::fs::symlink_metadata(path)
-        .is_ok_and(|meta| meta.file_type().is_symlink() || meta.nlink() > 1);
-    if writes_through {
-        std::fs::remove_file(path)
-            .with_context(|| format!("could not replace the entry at {}", path.display()))?;
-    }
-    // A failed publication must not leave the temporary source behind for the
-    // next journey step to trip over, and the caller learns of the copy, not
-    // of the cleanup. The source write itself is reported above, and a
-    // failure after the copy has published leaves the script exactly as a
-    // successful publication would, minus its mode bits, which the caller
-    // learns of directly.
+    let source = RemoveOnDrop(scratch(path, "source"));
+    let staged = RemoveOnDrop(scratch(path, "staged"));
+    std::fs::write(&source.0, body)
+        .with_context(|| format!("could not write {}", source.0.display()))?;
     let copied = std::process::Command::new("/bin/cp")
-        .arg(&source)
-        .arg(path)
+        .arg(&source.0)
+        .arg(&staged.0)
         .status();
-    let copied = match copied {
-        Ok(status) if status.success() => Ok(status),
-        Ok(status) => Err(anyhow!("could not create {}: {status}", path.display())),
+    match copied {
+        Ok(status) if status.success() => {}
+        Ok(status) => return Err(anyhow!("could not create {}: {status}", staged.0.display())),
         Err(error) => {
-            Err(anyhow::Error::from(error).context(format!("could not create {}", path.display())))
+            return Err(
+                anyhow::Error::from(error).context(format!("could not create {}", staged.0.display()))
+            )
         }
-    };
-    if copied.is_err() {
-        let _ = std::fs::remove_file(&source);
     }
-    copied?;
-    std::fs::remove_file(&source)
-        .with_context(|| format!("could not remove {}", source.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("could not make {} executable", path.display()))?;
+    std::fs::set_permissions(&staged.0, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("could not make {} executable", staged.0.display()))?;
+    std::fs::rename(&staged.0, path)
+        .with_context(|| format!("could not publish {}", path.display()))?;
     Ok(())
 }
 
@@ -104,6 +117,7 @@ pub fn write_executable(path: &Path, body: &str) -> Result<()> {
 mod tests {
     use super::write_executable;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::Path;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -119,23 +133,46 @@ mod tests {
             .expect("create the scratch directory")
     }
 
-    /// A published script runs, and nothing of the publication is left
-    /// behind for a later journey step to trip over.
+    /// What a directory holds, sorted, for assertions that are about the
+    /// absence or presence of entries rather than their order.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("list the directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn runs_echoing(path: &Path, expected: &str) {
+        let run = Command::new(path)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|error| panic!("{} did not execute: {error}", path.display()));
+        assert!(run.status.success(), "{run:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout).trim(),
+            expected,
+            "{} printed the wrong thing",
+            path.display()
+        );
+    }
+
+    /// A published script runs with the complete content it was given, and
+    /// nothing of the publication is left behind for a later journey step to
+    /// trip over.
     #[test]
-    fn a_published_script_runs_and_leaves_no_source() {
+    fn a_published_script_runs_and_leaves_no_temporaries() {
         let dir = scratch("single");
         let path = dir.path().join("fixture.sh");
         write_executable(&path, "#!/bin/sh\necho published\n").expect("publish");
 
-        let run = std::process::Command::new(&path)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
-        assert!(run.status.success(), "{run:?}");
-        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "published");
-        assert!(
-            !dir.path().join("fixture.sh.source").exists(),
-            "the source copy is removed"
+        runs_echoing(&path, "published");
+        assert_eq!(
+            entries(dir.path()),
+            vec!["fixture.sh"],
+            "no temporary survives the publication"
         );
         assert!(
             std::fs::metadata(&path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0),
@@ -143,45 +180,99 @@ mod tests {
         );
     }
 
-    /// A publication that cannot be copied reports the copy's own failure,
-    /// and leaves no temporary source behind, so the next journey step never
-    /// finds a stale `.source` at the same name.
+    /// A publication over an existing script replaces it with the complete
+    /// new content: the rename moves a fully written file, so `path` never
+    /// shows a partial publication, and the previous content is not
+    /// truncated in place on the way there.
     #[test]
-    fn a_copy_failure_is_reported_and_leaves_no_source() {
+    fn a_replacement_publishes_the_complete_new_content() {
+        let dir = scratch("replacement");
+        let path = dir.path().join("fixture.sh");
+        write_executable(&path, "#!/bin/sh\necho first\n").expect("publish the first");
+
+        write_executable(&path, "#!/bin/sh\necho second\n").expect("publish the replacement");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the published script"),
+            "#!/bin/sh\necho second\n",
+            "the replacement published all of its content"
+        );
+        runs_echoing(&path, "second");
+    }
+
+    /// A publication whose preparation fails leaves the previous script
+    /// exactly as it stood: every step before the rename works on uniquely
+    /// named temporaries, so a directory without write permission defeats
+    /// the publication before anything at `path` is touched.
+    #[test]
+    fn a_failed_publication_leaves_the_previous_script_intact() {
         // Root ignores the write bit this test relies on, so it has no
-        // reproduction for an unwritable destination.
+        // reproduction for a publication defeated by permissions.
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        let dir = scratch("copy-failure");
-        let path = dir.path().join("read-only.sh");
-        std::fs::write(&path, "stale\n").expect("write the stale script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
-            .expect("make the destination unwritable");
+        let dir = scratch("publication-failure");
+        let path = dir.path().join("argued-away.sh");
+        write_executable(&path, "#!/bin/sh\necho previous\n").expect("publish the previous script");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("take the directory's write permission away");
 
         let error = write_executable(&path, "#!/bin/sh\nexit 0\n")
-            .expect_err("an unwritable destination defeats the copy");
+            .expect_err("a directory without write permission defeats the publication");
         assert!(
-            error.to_string().contains("could not create"),
-            "the copy's own error is reported, not the cleanup: {error:#}"
+            error.to_string().contains("could not write"),
+            "the failing step's own error is reported, not the cleanup: {error:#}"
+        );
+        assert_eq!(
+            entries(dir.path()),
+            vec!["argued-away.sh"],
+            "the failed publication leaves no temporary behind"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read what stands at the destination"),
+            "#!/bin/sh\necho previous\n",
+            "the failed publication never touched what stands there"
         );
         assert!(
-            !dir.path().join("read-only.sh.source").exists(),
-            "the failed publication leaves no temporary source"
-        );
-        assert!(
-            std::fs::read_to_string(&path).is_ok_and(|text| text == "stale\n"),
-            "the publication never rewrote what stands there"
+            std::fs::metadata(&path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0),
+            "what stands there is still executable"
         );
 
         // Restore before the scratch directory is removed, so cleanup cannot
         // be blamed for needing its own privileges.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("restore the destination");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("restore the directory");
+    }
+
+    /// A publication can prepare for a destination it cannot replace -- here
+    /// a directory -- and fails at the rename with the temporaries cleaned
+    /// up and what stands at the destination untouched.
+    #[test]
+    fn a_publication_that_cannot_rename_leaves_no_temporaries_behind() {
+        let dir = scratch("rename-failure");
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir(&occupied).expect("occupy the destination with a directory");
+
+        let error = write_executable(&occupied, "#!/bin/sh\nexit 0\n")
+            .expect_err("a directory cannot be replaced by the rename");
+        assert!(
+            error.to_string().contains("could not publish"),
+            "the rename's own error is reported, not the cleanup: {error:#}"
+        );
+        assert_eq!(
+            entries(dir.path()),
+            vec!["occupied"],
+            "no temporary survives the failed publication"
+        );
+        assert!(
+            std::fs::metadata(&occupied).is_ok_and(|meta| meta.is_dir()),
+            "what stands at the destination is untouched"
+        );
     }
 
     /// A published script replaces a symlink at its destination rather than
-    /// rewriting what that symlink points at.
+    /// rewriting what that symlink points at: the rename moves the entry
+    /// itself, so nothing follows the link.
     #[test]
     fn a_published_entry_replaces_a_link_instead_of_following_it() {
         let dir = scratch("publish-over-link");
@@ -201,10 +292,9 @@ mod tests {
         assert_eq!(target_text, "#!/bin/sh\necho original\n");
     }
 
-    /// A published script replaces a hard link at its destination rather than
-    /// writing through it: `cp` opens and truncates the shared inode, so
-    /// without the entry's removal a publication would rewrite the other
-    /// link's file too.
+    /// A published script replaces a hard link at its destination rather
+    /// than writing through it: the rename gives the entry a fresh inode, so
+    /// the file another link shares keeps what it said.
     #[test]
     fn a_published_entry_replaces_a_hard_link_instead_of_writing_through_it() {
         let dir = scratch("publish-over-hard-link");

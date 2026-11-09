@@ -256,11 +256,12 @@ pub fn publish_controls(child_env: &[(OsString, OsString)]) -> Result<()> {
     // The wrapper is published by the shared helper's short-lived child, not
     // written by this process: the product (and the tests here, which exec
     // the entry) cannot meet the file still open for writing in a child a
-    // concurrent fork inherited. The helper replaces the entry itself -- an
-    // entry that shares another file's inode (a fixture symlink or a hard
-    // link) is removed rather than written through, so the checked-in script
-    // behind it is never rewritten -- which is why this call does not remove
-    // `entry` first.
+    // concurrent fork inherited. The helper builds the finished script in a
+    // uniquely named temporary beside the entry and renames it onto the
+    // entry, so an entry that shares another file's inode -- a fixture
+    // symlink or a hard link to the checked-in script -- is replaced, not
+    // followed or written through, and the checked-in script is never
+    // rewritten.
     crate::fixture::write_executable(&entry, &body)
         .with_context(|| format!("could not publish {}", entry.display()))?;
     Ok(())
