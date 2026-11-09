@@ -239,6 +239,7 @@ Module guidance. AGENTS.md is the authoritative source of project instructions. 
 - `src-tauri/src/AGENTS.md` -- Backend (Tauri v2) overview
 - `src-tauri/src/domain/AGENTS.md` -- Domain models conventions
 - `src-tauri/src/agents/AGENTS.md` -- Claude Code agent execution
+- `crates/slashit-acceptance/AGENTS.md` -- Desktop acceptance harness rules and shard manifest
 
 `docs/agent-docs.toml` maps every other module directory to the parent
 `AGENTS.md` that covers it; `scripts/check-agent-docs.sh` enforces both.

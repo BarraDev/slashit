@@ -100,7 +100,7 @@ const READ_ONLY: &[&str] = &[
     "check_acli_available",
     "list_jira_projects",
     "check_claude_cli",
-    "list_available_models",
+    "list_runtime_models",
     "list_mcp_servers",
     "get_mcp_agents",
     "search_memories",

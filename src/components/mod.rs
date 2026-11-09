@@ -49,6 +49,7 @@ pub mod portable_project_modal;
 pub mod task_edit_modal;
 pub mod task_context_menu;
 pub mod custom_select;
+pub mod model_combobox;
 pub mod project_rail;
 pub mod project_conversation;
 pub mod quit_dialog;

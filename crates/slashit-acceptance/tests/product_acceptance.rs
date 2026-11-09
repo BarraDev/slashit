@@ -67,6 +67,8 @@ mod local_first;
 mod manual_review;
 #[path = "product_acceptance/reviewer_policy.rs"]
 mod reviewer_policy;
+#[path = "product_acceptance/model_picker.rs"]
+mod model_picker;
 #[path = "product_acceptance/local_integration.rs"]
 mod local_integration;
 #[path = "product_acceptance/main_window.rs"]

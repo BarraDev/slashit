@@ -5,7 +5,16 @@ use leptos::callback::Callback;
 use crate::components::task_dependency::{self, choice_for, requested, DependencyChoice, DependencyField};
 use crate::models::{Task, TaskCategory, TaskPriority};
 use crate::models::task::{CodingProvider, ReviewMode};
-use crate::services::{create_task, update_task, delete_task, set_task_dependencies, agent_service::list_available_models, agent_service::ModelInfo};
+use crate::services::{create_task, update_task, delete_task};
+use crate::components::model_combobox::{ModelCombobox, PickerOption, PickerState};
+
+/// The runtime name the model catalog is requested under.
+fn runtime_name(provider: CodingProvider) -> &'static str {
+    match provider {
+        CodingProvider::Claude => "claude",
+        CodingProvider::OpenCode => "opencode",
+    }
+}
 use uuid::Uuid;
 
 #[derive(Clone, PartialEq)]
@@ -14,17 +23,38 @@ pub enum TaskEditMode {
     Edit(Box<Task>),
 }
 
-/// Whether `model` is an OpenCode model id, `provider/model`: both parts are
-/// present, and the id has no whitespace or control characters. The backend
-/// applies the same rule before it starts a run.
-fn is_opencode_model_id(model: &str) -> bool {
-    let Some((provider, name)) = model.split_once('/') else {
-        return false;
-    };
-    !provider.is_empty()
-        && !name.is_empty()
-        && model.len() <= 200
-        && model.chars().all(|c| !c.is_whitespace() && !c.is_control())
+/// The model each Worker runtime keeps during one edit. Switching runtimes
+/// keeps the model of the runtime being left and restores the one kept for the
+/// runtime entered. A runtime with nothing kept has no model, so one must be
+/// chosen: the provider default is never substituted.
+#[derive(Clone, Debug, PartialEq)]
+struct KeptModels {
+    claude: String,
+    opencode: String,
+}
+
+impl KeptModels {
+    /// The kept models of a saved Task: its model belongs to its own runtime.
+    fn for_task(provider: CodingProvider, model: &str) -> Self {
+        match provider {
+            CodingProvider::Claude => Self { claude: model.to_string(), opencode: String::new() },
+            CodingProvider::OpenCode => Self { claude: String::new(), opencode: model.to_string() },
+        }
+    }
+
+    /// Records `current` for the runtime being left and returns the model kept
+    /// for the runtime being entered.
+    fn switch(&mut self, leaving: CodingProvider, entering: CodingProvider, current: &str) -> String {
+        *self.slot(leaving) = current.to_string();
+        self.slot(entering).clone()
+    }
+
+    fn slot(&mut self, provider: CodingProvider) -> &mut String {
+        match provider {
+            CodingProvider::Claude => &mut self.claude,
+            CodingProvider::OpenCode => &mut self.opencode,
+        }
+    }
 }
 
 #[component]
@@ -43,6 +73,9 @@ pub fn TaskEditModal(
     let (category, set_category) = signal(TaskCategory::Feature);
     let (priority, set_priority) = signal(TaskPriority::Medium);
     let (model, set_model) = signal("default".to_string());
+    // The model each runtime keeps during this edit, so switching the Worker
+    // away and back restores it. Nothing is saved until the form is.
+    let kept = RwSignal::new(KeptModels::for_task(CodingProvider::Claude, "default"));
     let (provider, set_provider) = signal(CodingProvider::Claude);
     let (review_mode, set_review_mode) = signal(ReviewMode::Automatic);
     // The AI Reviewer model as a text value; empty means no reviewer is chosen.
@@ -68,18 +101,15 @@ pub fn TaskEditModal(
         TaskEditMode::Edit(task) => choice_for(Some(&*task)),
     });
 
-    let (available_models, set_available_models) = signal(Vec::<ModelInfo>::new());
-
-    // Load available models on mount
-    Effect::new(move |prev: Option<bool>| {
-        if prev.is_some() { return true; }
-        spawn_local(async move {
-            if let Ok(models) = list_available_models().await {
-                set_available_models.set(models);
-            }
-        });
-        true
+    // The Worker's models follow its provider. Switching provider reloads the list only;
+    // the saved model is never replaced by another one.
+    let worker_picker = PickerState::new();
+    let reviewer_picker = PickerState::new();
+    Effect::new(move |_| {
+        worker_picker.load(runtime_name(provider.get()), false);
     });
+    // The AI Reviewer runs on Claude models only.
+    reviewer_picker.load("claude", false);
 
     let (submitting, set_submitting) = signal(false);
     let (deleting, set_deleting) = signal(false);
@@ -112,6 +142,7 @@ pub fn TaskEditModal(
                     set_category.set(TaskCategory::Feature);
                     set_priority.set(TaskPriority::Medium);
                     set_model.set("default".to_string());
+                    kept.set(KeptModels::for_task(CodingProvider::Claude, "default"));
                     set_provider.set(CodingProvider::Claude);
                     set_review_mode.set(ReviewMode::Automatic);
                     set_reviewer_model.set(String::new());
@@ -125,6 +156,7 @@ pub fn TaskEditModal(
                     set_category.set(task.category.clone());
                     set_priority.set(task.priority.clone());
                     set_model.set(task.model.clone());
+                    kept.set(KeptModels::for_task(task.provider, &task.model));
                     set_provider.set(task.provider);
                     set_review_mode.set(task.review_mode);
                     set_reviewer_model.set(task.reviewer_model.clone().unwrap_or_default());
@@ -329,13 +361,17 @@ pub fn TaskEditModal(
                                                 "opencode" => CodingProvider::OpenCode,
                                                 _ => CodingProvider::Claude,
                                             };
-                                            // The model is kept, so switching back to Claude restores it.
-                                            // Saving with OpenCode stores the provider/model typed in the AI Model field.
-                                            // A provider/model id is not a Claude model, so it is not kept for Claude.
-                                            if next == CodingProvider::Claude && model.get().contains('/') {
-                                                set_model.set("default".to_string());
+                                            // The model chosen for the runtime being left is kept, and the one kept
+                                            // for the runtime being entered is restored. A runtime with none kept
+                                            // starts empty, so a model must be chosen before saving: no model is
+                                            // substituted, and a provider/model id is never offered to Claude.
+                                            if next != provider.get() {
+                                                let mut models = kept.get();
+                                                let next_model = models.switch(provider.get(), next, &model.get());
+                                                kept.set(models);
+                                                set_model.set(next_model);
+                                                set_provider.set(next);
                                             }
-                                            set_provider.set(next);
                                         }
                                         class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                                         disabled=move || submitting.get()
@@ -383,45 +419,20 @@ pub fn TaskEditModal(
 
                         // AI Model
                         <div>
-                            <label class="block text-sm font-medium text-white/70 mb-1.5">"AI Model"</label>
-                            // OpenCode names its model as provider/model. The run starts
-                            // only on that exact id, and it is part of the approved input.
-                            <input
-                                type="text"
-                                placeholder="provider/model, for example ollama/llama3.2:3b"
-                                prop:value=move || model.get()
-                                on:input=move |ev| set_model.set(event_target_value(&ev))
-                                class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                                hidden=move || provider.get() != CodingProvider::OpenCode
-                                disabled=move || submitting.get()
+                            <label for="task-ai-model" class="block text-sm font-medium text-white/70 mb-1.5">"AI Model"</label>
+                            // The list follows the Worker's provider. A saved model that the list does
+                            // not contain stays selected, and switching provider never picks another one.
+                            <ModelCombobox
+                                id="task-ai-model"
+                                options=Signal::derive(move || worker_picker.options.get())
+                                selected=model
+                                on_change=Callback::new(move |chosen: String| set_model.set(chosen))
+                                on_refresh=Callback::new(move |_: ()| worker_picker.load(runtime_name(provider.get()), true))
+                                refreshable=Signal::derive(move || provider.get() == CodingProvider::OpenCode)
+                                loading=Signal::derive(move || worker_picker.loading.get())
+                                error=Signal::derive(move || worker_picker.error.get())
+                                disabled=Signal::derive(move || submitting.get())
                             />
-
-                            <select
-                                on:change=move |ev| set_model.set(event_target_value(&ev))
-                                class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                                disabled=move || submitting.get() || provider.get() == CodingProvider::OpenCode
-                                hidden=move || provider.get() == CodingProvider::OpenCode
-                            >
-                                {move || {
-                                    let models = available_models.get();
-                                    let current = model.get();
-                                    let items: Vec<ModelInfo> = if provider.get() == CodingProvider::OpenCode {
-                                        vec![ModelInfo { id: "default".to_string(), name: "OpenCode default".to_string(), alias: None }]
-                                    } else if models.is_empty() {
-                                        vec![ModelInfo { id: "default".to_string(), name: "Default (auto)".to_string(), alias: None }]
-                                    } else {
-                                        models
-                                    };
-                                    items.iter().map(|m| {
-                                        let id = m.id.clone();
-                                        let name = m.name.clone();
-                                        let selected = id == current;
-                                        view! {
-                                            <option value=id selected=selected>{name}</option>
-                                        }
-                                    }).collect::<Vec<_>>()
-                                }}
-                            </select>
                             {move || match mode.get() {
                                 TaskEditMode::Edit(task) => task.last_observed_model.map(|observed| view! {
                                     <p class="mt-1.5 text-xs text-white/50">
@@ -437,40 +448,23 @@ pub fn TaskEditModal(
                         // chosen by default, so no reviewer starts until a person picks one.
                         <div>
                             <label for="task-ai-reviewer-select" class="block text-sm font-medium text-white/70 mb-1.5">"AI Reviewer (Claude)"</label>
-                            <select
+                            <ModelCombobox
                                 id="task-ai-reviewer-select"
-                                on:change=move |ev| set_reviewer_model.set(event_target_value(&ev))
-                                class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                                disabled=move || submitting.get()
-                            >
-                                {move || {
-                                    let current = reviewer_model.get();
-                                    let mut items = vec![ModelInfo {
-                                        id: String::new(),
-                                        name: "Not chosen: AI Review will not run".to_string(),
-                                        alias: None,
-                                    }];
-                                    // The provider default is not a reviewer choice.
-                                    items.extend(available_models.get().into_iter().filter(|m| m.id != "default"));
-                                    // A configured reviewer stays selectable when the list lacks it, so
-                                    // saving this form cannot clear it by accident.
-                                    if !current.is_empty() && !items.iter().any(|m| m.id == current) {
-                                        items.push(ModelInfo {
-                                            id: current.clone(),
-                                            name: format!("{current} (configured)"),
-                                            alias: None,
-                                        });
-                                    }
-                                    items.iter().map(|m| {
-                                        let id = m.id.clone();
-                                        let name = m.name.clone();
-                                        let selected = id == current;
-                                        view! {
-                                            <option value=id selected=selected>{name}</option>
-                                        }
-                                    }).collect::<Vec<_>>()
-                                }}
-                            </select>
+                                options=Signal::derive(move || {
+                                    // The first row means no reviewer. The provider default is never one.
+                                    let mut rows = vec![PickerOption::new("", "Not chosen: AI Review will not run", "")];
+                                    rows.extend(reviewer_picker.options.get().into_iter().filter(|o| o.id != "default"));
+                                    rows
+                                })
+                                selected=reviewer_model
+                                on_change=Callback::new(move |chosen: String| set_reviewer_model.set(chosen))
+                                on_refresh=Callback::new(move |_: ()| reviewer_picker.load("claude", true))
+                                refreshable=false
+                                loading=Signal::derive(move || reviewer_picker.loading.get())
+                                error=Signal::derive(move || reviewer_picker.error.get())
+                                disabled=Signal::derive(move || submitting.get())
+                                refused_ids=vec!["default".to_string()]
+                            />
                             <p class="mt-1 text-xs text-white/50">
                                 {move || match review_mode.get() {
                                     ReviewMode::Automatic => "AI Review runs on this Claude model after each coding run, whichever Worker ran it. Without one, a finished run waits in Human Review and no reviewer starts.",
@@ -508,7 +502,8 @@ pub fn TaskEditModal(
                         </div>
                     </div>
 
-                    <div class="sticky bottom-0 flex items-center justify-between gap-3 p-6 border-t border-white/5 bg-[#0B0B0F]">
+                    // Above the model lists (z-50), so an open list never covers Save's edge.
+                    <div class="sticky bottom-0 z-[60] flex items-center justify-between gap-3 p-6 border-t border-white/5 bg-[#0B0B0F]">
                         <div>
                             {move || is_edit_mode().then(|| {
                                 view! {
@@ -557,15 +552,8 @@ pub fn TaskEditModal(
                                         set_error_msg.set(Some("Task title is required".to_string()));
                                         return;
                                     }
-                                    // An OpenCode run needs its model as provider/model. The backend
-                                    // refuses any other id when the run starts, so the form refuses it first.
-                                    if provider.get() == CodingProvider::OpenCode && !is_opencode_model_id(model.get().trim()) {
-                                        set_error_msg.set(Some(
-                                            "OpenCode needs its model as provider/model, for example ollama/llama3.2:3b".to_string(),
-                                        ));
-                                        return;
-                                    }
-
+                                    // The backend is the one validation boundary: it refuses a missing or
+                                    // malformed model before any write, and returns the reason in the form.
                                     set_submitting.set(true);
                                     set_error_msg.set(None);
 
@@ -621,15 +609,8 @@ pub fn TaskEditModal(
                                                 }).await
                                             }
                                             TaskEditMode::Edit(task) => {
-                                                // The dependency is refused or written before the other fields, so
-                                                // a refusal leaves the Task as it was and the form as it is.
-                                                if let Some(wanted) = edit_dependency {
-                                                    if let Err(e) = set_task_dependencies(task.id.to_string(), wanted).await {
-                                                        set_error_msg.set(Some(e));
-                                                        set_submitting.set(false);
-                                                        return;
-                                                    }
-                                                }
+                                                // The dependency and the other fields are one backend write: a refused
+                                                // part changes nothing, so the Task never keeps a partial Save.
                                                 update_task(crate::services::task_service::UpdateTaskParams {
                                                     task_id: task.id.to_string(),
                                                     title: Some(title_val),
@@ -644,6 +625,7 @@ pub fn TaskEditModal(
                                                     provider: Some(provider_val),
                                                     review_mode: Some(review_mode_val),
                                                     planning_mode: Some(planning_val),
+                                                    dependencies: edit_dependency,
                                                 }).await.map(|opt| opt.unwrap_or(*task))
                                             }
                                         };
@@ -694,18 +676,23 @@ pub fn TaskEditModal(
 
 #[cfg(test)]
 mod tests {
-    use super::is_opencode_model_id;
+    use super::{CodingProvider, KeptModels};
 
+    /// Switching the Worker never writes the provider default over a saved
+    /// model, and a runtime that has none kept starts empty.
     #[test]
-    fn an_opencode_model_is_provider_and_model_without_whitespace() {
-        assert!(is_opencode_model_id("ollama/llama3.2:3b"));
-        assert!(is_opencode_model_id("ollama/dcostenco/prism-coder:4b"));
-        assert!(!is_opencode_model_id("default"));
-        assert!(!is_opencode_model_id("sonnet"));
-        assert!(!is_opencode_model_id(""));
-        assert!(!is_opencode_model_id("ollama/"));
-        assert!(!is_opencode_model_id("/llama3.2:3b"));
-        assert!(!is_opencode_model_id("ollama/llama 3"));
-        assert!(!is_opencode_model_id("ollama/llama\n3"));
+    fn switching_the_worker_keeps_each_runtimes_model_and_substitutes_none() {
+        use CodingProvider::{Claude, OpenCode};
+        let mut kept = KeptModels::for_task(Claude, "sonnet");
+        // Nothing is kept for OpenCode yet, so no model is chosen for it.
+        assert_eq!(kept.switch(Claude, OpenCode, "sonnet"), "");
+        // The OpenCode choice is kept, and switching back restores sonnet.
+        assert_eq!(kept.switch(OpenCode, Claude, "ollama/llama3.2:3b"), "sonnet");
+        assert_eq!(kept.switch(Claude, OpenCode, "sonnet"), "ollama/llama3.2:3b");
+
+        // A saved OpenCode Task has no Claude model kept, so Claude starts empty.
+        let mut saved = KeptModels::for_task(OpenCode, "ollama/llama3.2:3b");
+        assert_eq!(saved.switch(OpenCode, Claude, "ollama/llama3.2:3b"), "");
+        assert_eq!(saved.switch(Claude, OpenCode, ""), "ollama/llama3.2:3b");
     }
 }

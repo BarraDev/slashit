@@ -456,6 +456,9 @@ pub async fn record_typed(
 /// whether it changed anything.
 pub type Revise<'a> = &'a (dyn Fn(&mut HashMap<Uuid, Task>) -> bool + Send + Sync);
 
+/// A checked edit: `Err` refuses it, and nothing is written.
+pub type CheckedRevise<'a> = &'a (dyn Fn(&mut HashMap<Uuid, Task>) -> Result<(), String> + Send + Sync);
+
 /// [`record`], for an observation that is often already on the record.
 ///
 /// `revise` answers whether it changed anything. When it did not, nothing is
@@ -589,6 +592,37 @@ pub async fn commit_task(
     record(tasks, storage, task_id, amend).await?;
 
     Ok(tasks.read().await.get(&task_id).cloned())
+}
+
+/// [`commit_task`] for an edit whose parts can refuse. `revise` runs inside the
+/// one write, against the staged Tasks of the Task's Project. An `Err` refuses
+/// the whole edit: nothing is published, so no part of it survives alone.
+pub async fn commit_task_checked(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    revise: CheckedRevise<'_>,
+) -> Result<Option<Task>, String> {
+    let refusal = std::sync::Mutex::new(None::<String>);
+    let amend = |staged: &mut HashMap<Uuid, Task>| -> bool {
+        let recovery = staged.get(&task_id).and_then(Task::worker_recovery_refusal);
+        match recovery.map_or_else(|| revise(staged), Err) {
+            Ok(()) => true,
+            Err(error) => {
+                *refusal.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                false
+            }
+        }
+    };
+    let written = record_classified_if_changed(tasks, storage, task_id, &amend).await;
+    if let Some(error) = refusal.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        return Err(error);
+    }
+    match written {
+        Ok(_) => Ok(tasks.read().await.get(&task_id).cloned()),
+        Err(RecordFailure::TaskAbsent(_)) => Ok(None),
+        Err(RecordFailure::Write(error)) => Err(error.to_string()),
+    }
 }
 
 /// Say what a creation failure did, not only what broke.
