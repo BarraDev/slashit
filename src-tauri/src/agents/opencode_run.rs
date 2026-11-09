@@ -11,23 +11,40 @@
 //! turn that does not end with `end_turn` is a failure, and so is a turn that
 //! times out.
 //!
-//! Permission policy: [`OPENCODE_POLICY_CONTENT`] denies every tool except
-//! reads, searches and edits, and it refuses reads, writes, searches and
-//! globs whose path is outside the Task Checkout. A denied tool is removed from
-//! the model's tool list, so it issues no request. OpenCode is started under
+//! Permission policy: [`OPENCODE_POLICY_CONTENT`] is the native OpenCode V2
+//! permission set every Worker runs under. It allows reads, globs, searches,
+//! edits and the shell, so a Worker can build and test its checkout, and it
+//! denies every other action and `external_directory`. Limits of that policy:
+//!
+//! - The shell is not confined by `external_directory`. It runs as the host
+//!   account, so it can read, write or delete outside the Task Checkout and reach
+//!   the network. This is an accepted product choice for trusted local Workers,
+//!   and it is not an OS sandbox.
+//! - OpenCode still offers the model `skill`, but every call is refused with
+//!   `permission.rejected`.
+//! - The built-in `opencode_worktree_remove` is gated by `edit`, which is allowed,
+//!   so the deny rule does not stop it. OpenCode refuses any directory it did not
+//!   register as a worktree of the project, which excludes the Task Checkouts
+//!   SlashIt creates with `git worktree add`. A worktree OpenCode did register
+//!   may still be removed, including with `force`; that case was not tested. This
+//!   is a limit of the tool's behavior, not a guarantee against filesystem
+//!   deletion. A shell-enabled Worker already has the host account's filesystem
+//!   authority.
+//!
+//! OpenCode is started under
 //! [`policy_env`], which also points its global configuration at an empty
 //! directory that this run owns, and turns off the repository's own
 //! configuration. The user's global configuration would otherwise override the
 //! policy: its agent permissions win over the inline policy, and its plugins
 //! load inside the Worker.
 //!
-//! The policy was checked against OpenCode 2.0.32 with a scripted model and no
-//! paid provider, for the tools the model was offered (read, glob, grep, edit,
-//! write, shell, execute, webfetch, subagent) and for the scenarios named
-//! there. Known gaps: a symbolic link inside the checkout is followed by `read`,
-//! because the path check does not see its target, and that is not closed here.
-//! Global commands and the `question`, `skill` and `websearch` tools were not
-//! exercised individually.
+//! The Coding policy was probed against OpenCode 2.2.5 with a local scripted
+//! model and no paid provider: the tools offered to the model, shell execution,
+//! refusal of writes outside the checkout, and the `skill` and worktree-removal
+//! behavior above. Known gaps: a symbolic link inside the checkout is followed by
+//! `read`, because the path check does not see its target, and that is not
+//! closed here. Global commands and the `question` and `websearch` tools were
+//! not exercised individually.
 //!
 //! SlashIt has no interactive approval path yet, so nothing is approved. A
 //! request that arrives anyway is refused, and a request with no reject option
@@ -69,16 +86,16 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Permission requests are answered at once, so this is only the connection's
 /// upper bound on an answer that never comes.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Bounds the `--version` probe that runs before each Worker starts.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The OpenCode permission policy every run is started under. Denied tools are
-/// removed from the model's list, so a denied call is never offered. The
-/// allowed tools are read, glob, grep and edit (OpenCode's `edit` permission
-/// also covers `write`). `external_directory` refuses paths outside the Task
-/// Checkout, including a relative `../` path, for the file tools that were
-/// checked. Shell, network fetch, subagents and the code runtime (`execute`) are
-/// not offered, because they are denied by default. An inline policy outranks
-/// the project's `opencode.json`, and [`policy_env`] turns that file off as well.
-pub const OPENCODE_POLICY_CONTENT: &str = r#"{"permission":{"*":"deny","read":"allow","glob":"allow","grep":"allow","edit":"allow","external_directory":"deny"}}"#;
+/// The OpenCode permission policy every Worker runs under, in OpenCode's V2
+/// `permissions` form. Every action not named is denied, and the last matching
+/// rule wins. Allowed: read, glob, grep, edit (which also covers `write`) and
+/// shell. `external_directory` is denied for the file tools, not for the shell.
+/// An inline policy outranks the project's `opencode.json`, and [`policy_env`]
+/// turns that file off as well.
+pub const OPENCODE_POLICY_CONTENT: &str = r#"{"permissions":[{"action":"*","resource":"*","effect":"deny"},{"action":"read","resource":"*","effect":"allow"},{"action":"glob","resource":"*","effect":"allow"},{"action":"grep","resource":"*","effect":"allow"},{"action":"edit","resource":"*","effect":"allow"},{"action":"shell","resource":"*","effect":"allow"},{"action":"external_directory","resource":"*","effect":"deny"}]}"#;
 
 /// The variables that pin the OpenCode policy for one process. The Task
 /// Checkout is written by a model, so a repository's `opencode.json` must not
@@ -110,6 +127,46 @@ pub fn opencode_spawn_env(
         .collect();
     env.extend(policy_env(config_dir));
     env
+}
+
+/// The major version in a `--version` report such as `opencode v2.2.6`.
+fn major_version(report: &str) -> Option<u64> {
+    report.split_whitespace().find_map(|word| {
+        let (major, _) = word.strip_prefix('v').unwrap_or(word).split_once('.')?;
+        major.parse().ok()
+    })
+}
+
+/// Refuses an installed OpenCode that predates the V2 permission format the
+/// Worker's policy is written in. Only a report that names a major version
+/// below 2 is refused. A probe that fails, times out or prints no version
+/// leaves the launch to report its own error, so an unrelated failure is never
+/// reported as a version problem. The probe runs the same program with the
+/// same environment as the launch.
+async fn check_opencode_version(
+    program: &str,
+    cwd: &std::path::Path,
+    env: &[(String, String)],
+) -> Result<(), String> {
+    let mut command = crate::host_process::tokio_command(program);
+    command
+        .arg("--version")
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(VERSION_PROBE_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => output,
+        _ => return Ok(()),
+    };
+    match major_version(&String::from_utf8_lossy(&output.stdout)) {
+        Some(major) if major < 2 => Err(format!(
+            "The OpenCode executable {program} is OpenCode version {major}. SlashIt's OpenCode Coding Worker requires OpenCode V2, which uses the V2 permission format. Install OpenCode V2 and make sure it is the executable SlashIt starts, then try again."
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// What a run needs to start. The prompt is written to the agent's session
@@ -216,6 +273,7 @@ impl OpenCodeRunner {
             request_timeout: REQUEST_TIMEOUT,
             permission_timeout: PERMISSION_TIMEOUT,
         };
+        check_opencode_version(&spec.program, &spec.cwd, &spec.env).await?;
         let connection = Connection::spawn_holding(&spec, lease, Box::new(config_dir))
             .map_err(|e| e.to_string())?;
         connection.initialize().await.map_err(|e| e.to_string())?;
@@ -493,20 +551,34 @@ mod tests {
         assert_eq!(env["OPENCODE_CONFIG_CONTENT"], OPENCODE_POLICY_CONTENT);
     }
 
+    /// The policy, as OpenCode reads it: deny everything, then allow exactly the
+    /// listed actions (last match wins), and deny the external directory boundary.
     #[test]
-    fn the_policy_denies_by_default_and_allows_only_checkout_reads_and_edits() {
-        let policy: serde_json::Value =
-            serde_json::from_str(OPENCODE_POLICY_CONTENT).expect("the policy is JSON");
+    fn the_policy_denies_by_default_and_allows_only_checkout_reads_edits_and_shell() {
+        let rules = |policy: &str| -> Vec<(String, String)> {
+            let value: serde_json::Value = serde_json::from_str(policy).expect("the policy is JSON");
+            value["permissions"]
+                .as_array()
+                .expect("a permissions array")
+                .iter()
+                .map(|rule| {
+                    assert_eq!(rule["resource"], "*", "every rule matches all resources");
+                    (rule["action"].as_str().unwrap().to_string(), rule["effect"].as_str().unwrap().to_string())
+                })
+                .collect()
+        };
+        let pair = |action: &str, effect: &str| (action.to_string(), effect.to_string());
         assert_eq!(
-            policy,
-            serde_json::json!({"permission": {
-                "*": "deny",
-                "read": "allow",
-                "glob": "allow",
-                "grep": "allow",
-                "edit": "allow",
-                "external_directory": "deny"
-            }})
+            rules(OPENCODE_POLICY_CONTENT),
+            vec![
+                pair("*", "deny"),
+                pair("read", "allow"),
+                pair("glob", "allow"),
+                pair("grep", "allow"),
+                pair("edit", "allow"),
+                pair("shell", "allow"),
+                pair("external_directory", "deny"),
+            ]
         );
     }
 
@@ -693,6 +765,67 @@ mod tests {
             .err()
             .expect("start must fail");
         assert!(error.contains("protocol version"), "{error}");
+    }
+
+    #[test]
+    fn the_version_report_names_its_major_version() {
+        assert_eq!(major_version("opencode v2.2.6\n"), Some(2));
+        assert_eq!(major_version("1.18.33"), Some(1));
+        assert_eq!(major_version("opencode"), None);
+        assert_eq!(major_version(""), None);
+    }
+
+    /// A stand-in `opencode` whose `--version` prints `report`. Every other
+    /// command runs the fixture agent.
+    #[cfg(unix)]
+    fn versioned_program(report: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("opencode");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '{report}'; exit 0; fi\nexec '{}' \"$@\"\n",
+            fixture("ok").program
+        );
+        // Written through the shared helper: a script written in-process races
+        // with other tests' forks and fails with ETXTBSY.
+        crate::test_helpers::write_executable(&path, &script);
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_v1_opencode_is_refused_before_any_session_starts() {
+        let (_dir, program) = versioned_program("opencode v1.18.33");
+        let mut config = fixture("ok");
+        config.program = program;
+        let error = match OpenCodeRunner::start(config, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("a V1 OpenCode must not start"),
+        };
+        assert!(error.contains("version 1"), "{error}");
+        assert!(error.contains("requires OpenCode V2"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_v2_or_unreadable_version_starts_the_run() {
+        for report in ["opencode v2.2.6", "garbage with no version"] {
+            let (_dir, program) = versioned_program(report);
+            let mut config = fixture("ok");
+            config.program = program;
+            let run = OpenCodeRunner::start(config, None).await.expect(report);
+            assert_eq!(run.wait().await, Ok(true), "{report}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_executable_is_not_reported_as_a_version_problem() {
+        let mut config = fixture("ok");
+        config.program = "/nonexistent/slashit-opencode-probe".into();
+        let error = match OpenCodeRunner::start(config, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("a missing executable must not start"),
+        };
+        assert!(!error.contains("OpenCode V2"), "{error}");
     }
 
     #[tokio::test]
