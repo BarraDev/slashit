@@ -96,11 +96,12 @@ async fn open_terminal(driver: &WebDriver, marker: &Path) -> Result<[i32; 2]> {
 async fn hiding_keeps_a_terminal_running_and_closing_or_quitting_ends_it() {
     let context = TestContext::new("terminal_lifecycle").expect("harness setup");
     let shell_path = context.state().path().join("hangup-shell.sh");
-    fs::write(&shell_path, HANGUP_SHELL).expect("write the shell");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&shell_path, fs::Permissions::from_mode(0o755)).expect("make the shell executable");
-    }
+    // Published through the shared helper, whose short-lived child owns the
+    // write descriptor: the application execs this file as the terminal's
+    // `SHELL`, and a descriptor held open here at a concurrent fork would
+    // make that exec fail with ETXTBSY.
+    slashit_acceptance::fixture::write_executable(&shell_path, HANGUP_SHELL)
+        .expect("publish the hangup shell");
     let marker = context.state().path().join("hangup-marker");
     context.set_child_env("SHELL", shell_path.as_os_str().to_os_string());
     context.set_child_env("HUP_MARKER", marker.as_os_str().to_os_string());

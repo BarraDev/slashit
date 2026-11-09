@@ -4355,26 +4355,25 @@ branch refs/heads/some-other-branch
     #[cfg(unix)]
     #[tokio::test]
     async fn a_present_checkout_is_removed_by_a_git_without_listing_z() {
-        use std::os::unix::fs::PermissionsExt;
-
         // Handed to this test's own calls through `test_git::scope`, not put
         // on `PATH`: every other test spawning git meanwhile would find it
         // there, including while it is still being written or already gone.
         let bin = tempfile::tempdir().expect("tempdir");
         let log = bin.path().join("invocations.log");
         let old_git = bin.path().join("git");
-        std::fs::write(
+        // Published by `write_executable`'s short-lived child, not written by
+        // this process, so git's exec of the wrapper cannot fail with ETXTBSY
+        // while a forked sibling that inherited a here-open descriptor still
+        // holds it.
+        crate::test_helpers::write_executable(
             &old_git,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\n\
                  case \" $* \" in *' list '*' -z '*) \
                  echo \"error: unknown switch \\`z'\" >&2; exit 129;; esac\n\
                  exec git \"$@\"\n"
             ),
-        )
-        .expect("write old git");
-        std::fs::set_permissions(&old_git, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod old git");
+        );
 
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
@@ -6673,13 +6672,14 @@ branch refs/heads/some-other-branch
     #[cfg(unix)]
     #[tokio::test]
     async fn stacked_git_fallback_keeps_a_branch_a_failed_attach_checked_out() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         run_git(repo_path, &["branch", "task-5678abcd"]);
         let hook = tmp.path().join(".git/hooks/post-checkout");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Published by `write_executable`'s short-lived child, not written by
+        // this process, so git's exec of the hook cannot fail with ETXTBSY
+        // while a fork still holds it open for writing.
+        crate::test_helpers::write_executable(&hook, "#!/bin/sh\nexit 1\n");
 
         let mgr = test_manager();
         let result = mgr
@@ -6704,7 +6704,6 @@ branch refs/heads/some-other-branch
     #[cfg(unix)]
     #[tokio::test]
     async fn a_stacked_attempt_a_failed_hook_left_behind_is_picked_up_on_retry() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         run_git(repo_path, &["checkout", "-q", "-b", "task-5678abcd"]);
@@ -6712,8 +6711,10 @@ branch refs/heads/some-other-branch
         run_git(repo_path, &["checkout", "-q", "main"]);
         let dependency_tip = run_git(repo_path, &["rev-parse", "task-5678abcd"]);
         let hook = tmp.path().join(".git/hooks/post-checkout");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Published by `write_executable`'s short-lived child, not written by
+        // this process, so git's exec of the hook cannot fail with ETXTBSY
+        // while a fork still holds it open for writing.
+        crate::test_helpers::write_executable(&hook, "#!/bin/sh\nexit 1\n");
 
         let mgr = test_manager();
         let first = mgr
@@ -7277,16 +7278,16 @@ branch refs/heads/some-other-branch
     #[cfg(unix)]
     #[tokio::test]
     async fn a_checkout_a_hook_moved_is_not_recorded_as_starting_at_the_default_base() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let hook = tmp.path().join(".git/hooks/post-checkout");
-        std::fs::write(
+        // Published by `write_executable`'s short-lived child, not written by
+        // this process, so git's exec of the hook cannot fail with ETXTBSY
+        // while a fork still holds it open for writing.
+        crate::test_helpers::write_executable(
             &hook,
             "#!/bin/sh\ngit -c user.email=h@example.com -c user.name=Hook commit -q --allow-empty -m hook\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let refused = test_manager()
             .create_or_adopt(repo_path, "task-0a1b2c3d", None)
@@ -7605,7 +7606,6 @@ branch refs/heads/some-other-branch
     #[cfg(unix)]
     #[tokio::test]
     async fn a_partial_take_back_says_the_worktree_went_and_the_branch_stayed() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
@@ -7613,12 +7613,13 @@ branch refs/heads/some-other-branch
         let created_at = base.expect("created").commit;
         let hook = tmp.path().join(".git").join("hooks").join("reference-transaction");
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-        std::fs::write(
+        // Published by `write_executable`'s short-lived child, not written by
+        // this process, so git's exec of the hook cannot fail with ETXTBSY
+        // while a fork still holds it open for writing.
+        crate::test_helpers::write_executable(
             &hook,
             "#!/bin/sh\n[ \"$1\" = prepared ] && grep -q ' refs/heads/task-0a1b2c3d$' && exit 1\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let kept = mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect_err("kept");
 

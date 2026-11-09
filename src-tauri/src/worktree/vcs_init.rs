@@ -1113,11 +1113,10 @@ mod partial_failure_tests {
         let hooks = temp.path().join("hooks");
         std::fs::create_dir_all(&hooks).unwrap();
         let hook = hooks.join("pre-commit");
-        std::fs::write(&hook, "#!/bin/sh\necho 'hook says no' >&2\nexit 1\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // Published by `write_executable`'s short-lived child, not written by
+        // this process, so git's exec of the hook cannot fail with ETXTBSY
+        // while a fork still holds it open for writing.
+        crate::test_helpers::write_executable(&hook, "#!/bin/sh\necho 'hook says no' >&2\nexit 1\n");
         let mut env = test_env::isolated(temp.path(), "trunk-xyz");
         env.push(("GIT_CONFIG_COUNT".to_string(), "1".to_string()));
         env.push(("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string()));

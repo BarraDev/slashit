@@ -350,9 +350,13 @@ mod tests {
     async fn a_commit_a_hook_rejects_is_an_error_with_the_hook_s_reason() {
         let (_tmp, repo, checkout) = repo_with_task_checkout();
         let hook = repo.join(".git/hooks/pre-commit");
-        std::fs::write(&hook, "#!/bin/sh\necho 'commits are refused here' >&2\nexit 1\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Published by `write_executable`'s short-lived child, not written by
+        // this process, so git's exec of the hook cannot fail with ETXTBSY
+        // while a fork still holds it open for writing.
+        crate::test_helpers::write_executable(
+            &hook,
+            "#!/bin/sh\necho 'commits are refused here' >&2\nexit 1\n",
+        );
         std::fs::write(checkout.join("new.txt"), "new\n").unwrap();
         let before = git_ok(&checkout, &["rev-parse", "task"]);
 

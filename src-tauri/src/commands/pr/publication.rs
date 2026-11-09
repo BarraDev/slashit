@@ -687,15 +687,16 @@ mod orchestration {
         /// The push itself succeeds, so the settled record write is the one that fails.
         #[cfg(unix)]
         fn block_persistence_after_next_push(&self) {
-            use std::os::unix::fs::PermissionsExt;
             let dir = self.config.join("tasks");
             let hook = self.remote.join("hooks").join("post-receive");
             let script = format!(
                 "#!/bin/sh\nrm -rf '{d}'\nprintf 'not a directory' > '{d}'\n",
                 d = dir.display()
             );
-            std::fs::write(&hook, script).expect("write post-receive hook");
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("make hook executable");
+            // Published by `write_executable`'s short-lived child, not written
+            // by this process, so git's exec of the hook cannot fail with
+            // ETXTBSY while a fork still holds it open for writing.
+            crate::test_helpers::write_executable(&hook, &script);
         }
 
         #[cfg(unix)]

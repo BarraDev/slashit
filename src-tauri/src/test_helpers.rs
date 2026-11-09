@@ -313,11 +313,22 @@ pub fn write_executable(path: &std::path::Path, body: &str) {
     source.push(".source");
     let source = std::path::PathBuf::from(source);
     std::fs::write(&source, body).expect("write the script source");
+    // A failed copy must leave no temporary source behind for the next fixture
+    // using the same directory, and the copy's own failure is the one reported,
+    // not the cleanup's.
     let copied = std::process::Command::new("/bin/cp")
         .arg(&source)
         .arg(path)
-        .status()
-        .expect("run /bin/cp");
+        .status();
+    let failed = match &copied {
+        // `/bin/cp` not being runnable is also a failed publication.
+        Err(_) => true,
+        Ok(status) => !status.success(),
+    };
+    if failed {
+        let _ = std::fs::remove_file(&source);
+    }
+    let copied = copied.expect("run /bin/cp");
     assert!(copied.success(), "could not create {}: {copied}", path.display());
     std::fs::remove_file(&source).expect("remove the script source");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod script");
@@ -407,6 +418,45 @@ mod executable_fixture_tests {
         assert!(status.success());
         assert!(!dir.path().join("gh.source").exists(), "the source copy is removed");
         pending.finish();
+    }
+
+    /// A publication that cannot be copied reports the copy's own failure and
+    /// leaves no temporary source behind, so the next fixture at the same
+    /// path does not find a stale `.source`.
+    #[test]
+    fn a_failed_copy_is_reported_and_leaves_no_source() {
+        // Root ignores the write bit this test relies on, so it has no
+        // reproduction for an unwritable destination.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = dir.path().join("occupied");
+        std::fs::write(&occupied, "stale\n").unwrap();
+        std::fs::set_permissions(&occupied, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let message = std::panic::catch_unwind(|| write_executable(&occupied, SCRIPT))
+            .expect_err("an unwritable destination defeats the copy")
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("could not create"),
+            "the copy's own error is reported, not the cleanup: {message}"
+        );
+        assert!(
+            !dir.path().join("occupied.source").exists(),
+            "the failed publication leaves no temporary source"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&occupied).unwrap(),
+            "stale\n",
+            "the publication never rewrote what stands there"
+        );
+
+        // Restore before the tempdir is removed, so cleanup cannot be blamed
+        // for needing its own privileges.
+        std::fs::set_permissions(&occupied, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 }
 

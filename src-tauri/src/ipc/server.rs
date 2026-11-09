@@ -2177,8 +2177,6 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_git_run_started_by_a_handler_does_not_outlive_ownership() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = TempDir::new().unwrap();
         let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
             .map(|dir| dir.join("git"))
@@ -2187,9 +2185,12 @@ pub(crate) mod tests {
         let bin = root.path().join("fakebin");
         std::fs::create_dir_all(&bin).unwrap();
         let wrapper = bin.join("git");
-        std::fs::write(
+        // The wrapper is published by `write_executable`'s short-lived child,
+        // not written by this process, so the child's exec of it cannot fail
+        // with ETXTBSY while a fork still holds it open for writing.
+        crate::test_helpers::write_executable(
             &wrapper,
-            format!(
+            &format!(
                 "#!/bin/sh\n\
                  if [ \"$1\" = worktree ] && [ \"$2\" = remove ]; then\n\
                  : > \"${GIT_CHILD_ROOT}/in-git\"\n\
@@ -2198,9 +2199,7 @@ pub(crate) mod tests {
                  exec \"{}\" \"$@\"\n",
                 real_git.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut path = std::ffi::OsString::from(&bin);
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap());

@@ -176,6 +176,11 @@ mod tests {
         dir
     }
 
+    /// An executable file a `PATH` resolution can find.
+    ///
+    /// Not a race: no process ever executes these files. `isolate` and
+    /// `resolve_on_path` only inspect the filesystem, so the writer here
+    /// cannot meet an `exec` of the file in a forked child.
     fn executable(dir: &Path, name: &str) -> PathBuf {
         std::fs::create_dir_all(dir).expect("create the bin directory");
         let path = dir.join(name);
