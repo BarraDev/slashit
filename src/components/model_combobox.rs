@@ -142,6 +142,15 @@ pub fn manual_option(
     Some(PickerOption::new(typed, format!("Use \"{typed}\" as typed"), "typed"))
 }
 
+/// The typed entry a blur commits. Text that still matches a listed row is a
+/// search the person did not finish, not an ID, so blur commits nothing for it.
+pub fn blur_entry(options: &[PickerOption], query: &str, refused_ids: &[String]) -> Option<PickerOption> {
+    if !filter_indices(options, query).is_empty() {
+        return None;
+    }
+    manual_option(options, query, refused_ids)
+}
+
 /// The DOM ID of one row, derived from the component ID so several pickers on
 /// one page do not share IDs.
 fn option_dom_id(prefix: &str, index: usize) -> String {
@@ -286,7 +295,7 @@ pub fn ModelCombobox(
                     on:blur=move |_| {
                         // A typed ID the person never chose is kept, not dropped on blur.
                         let typed = query.get_untracked();
-                        if let Some(manual) = manual_option(&options.get_untracked(), &typed, &refused.get_value()) {
+                        if let Some(manual) = blur_entry(&options.get_untracked(), &typed, &refused.get_value()) {
                             choose(manual.id);
                         } else {
                             set_open.set(false);
@@ -442,6 +451,18 @@ mod tests {
         assert_eq!(saved_label(&options(), "ollama/gone:1"), "ollama/gone:1");
         assert_eq!(saved_label(&options(), "sonnet"), "Claude Sonnet (latest alias)");
         assert_eq!(saved_label(&options(), ""), "");
+    }
+
+    #[test]
+    fn a_blur_commits_a_typed_id_only_when_no_listed_row_matches() {
+        let none: Vec<String> = Vec::new();
+        assert!(blur_entry(&options(), "son", &none).is_none(), "a partial search is not an ID");
+        assert!(blur_entry(&options(), "sonnet", &none).is_none(), "a listed ID is chosen from the list");
+        assert_eq!(
+            blur_entry(&options(), "custom/model", &none).map(|o| o.id),
+            Some("custom/model".to_string()),
+            "an ID no row matches is kept"
+        );
     }
 
     #[test]
