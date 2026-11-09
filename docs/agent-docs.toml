@@ -28,7 +28,7 @@ external = ["AppHandle::emit", "ProjectDirs::from", "TypeId", "WebKitWebDriver",
 test_only = ["RecordingEventSink"]
 
 [modules]
-"crates/slashit-acceptance" = "covered-by:AGENTS.md"
+"crates/slashit-acceptance" = "documented"
 "crates/slashit-activity" = "covered-by:AGENTS.md"
 "crates/slashit-attention" = "covered-by:AGENTS.md"
 "crates/slashit-cli" = "covered-by:AGENTS.md"
