@@ -165,11 +165,20 @@ pub fn print_features(data: &serde_json::Value) {
 /// is a CSI in itself), DEL and carriage returns that redraw the line. Every
 /// such character is replaced by a visible `\u{xx}` escape, so no untrusted
 /// sequence can reach the terminal as itself; a backslash is doubled, so an
-/// escape is never ambiguous. Ordinary characters — accented ones and every
-/// other printable Unicode included — pass through untouched. Only an
-/// untrusted value's own characters are touched; the report's labels, the
-/// line breaks it lays out itself and the JSON the instance sends are not
-/// affected by this function.
+/// escape is never ambiguous.
+///
+/// The same is true for the invisible Unicode that cannot move a cursor but
+/// can still mislead a person reading the report: the bidirectional controls
+/// U+202A–U+202E and the isolates U+2066–U+2069, which reorder everything
+/// after them (right-to-left override is one of these); the directional marks
+/// U+200E/U+200F, which nudge the direction of neutral characters between
+/// runs; and the line and paragraph separators U+2028/U+2029, which break up
+/// the report's own lines on a terminal that honors them. Each becomes a
+/// visible `\u{xx}` escape too. Ordinary Unicode — accented characters, and
+/// ZWJ and ZWNJ, which deliberately shape ordinary text — passes through
+/// untouched. Only an untrusted value's own characters are touched; the
+/// report's labels, the line breaks it lays out itself and the JSON the
+/// instance sends are not affected by this function.
 fn escape_terminal(text: &str) -> String {
     use std::fmt::Write as _;
 
@@ -182,6 +191,19 @@ fn escape_terminal(text: &str) -> String {
             '\t' => out.push_str("\\t"),
             _ if (ch as u32) < 0x20 || (0x7F..=0x9F).contains(&(ch as u32)) => {
                 let _ = write!(out, "\\u{{{:02x}}}", ch as u32);
+            }
+            // The bidirectional embeds and overrides (U+202A–U+202E), the
+            // isolates (U+2066–U+2069), the directional marks (U+200E and
+            // U+200F) and the line/paragraph separators (U+2028 and U+2029).
+            // U+200C and U+200D, the zero-width non-joiner and joiner, are
+            // not among them: they are ordinary text shaping.
+            '\u{200e}'
+            | '\u{200f}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}' => {
+                let _ = write!(out, "\\u{{{:04x}}}", ch as u32);
             }
             _ => out.push(ch),
         }
@@ -306,8 +328,12 @@ pub fn run_report_text(data: &serde_json::Value) -> String {
             let bound = run["outcome"]["echo_chars_omitted"].as_u64();
             match bound {
                 Some(0) | None => out.push_str(&format!("      result: {text}\n")),
+                // `echo_chars_omitted` counts the characters of the recorded
+                // text that this echo left out when it cut further — not the
+                // full length the record itself kept, and not a count of
+                // anything the record holds beyond it.
                 Some(hidden) => out.push_str(&format!(
-                    "      result ({hidden} further chars in the record): {text}…\n"
+                    "      result (this echo left out {hidden} more of the recorded text's characters): {text}…\n"
                 )),
             }
         } else if let Some(reason) = run["outcome"]["reason"].as_str() {
@@ -457,7 +483,10 @@ mod runs_report_tests {
         assert!(text.contains("provider OpenCode"), "{text}");
         // The configured model, saved on the Task, and the latest observed
         // one, recorded by a run — with the Task-level identity spelled out.
-        assert!(text.contains("Model configured: ollama/llama3.2:3b"), "{text}");
+        assert!(
+            text.contains("Model configured: ollama/llama3.2:3b"),
+            "{text}"
+        );
         assert!(
             text.contains(
                 "Model observed:   ollama/llama3.2:3b (the Task's latest observed; no per-run identity is kept, and no alias is read back as evidence)"
@@ -470,15 +499,20 @@ mod runs_report_tests {
             "an available outcome is echoed whole: {text}"
         );
         assert!(
-            text.contains("result (500 further chars in the record): xxxxxx"),
-            "a truncated outcome names exactly how much was left out, and the \
-             echoed text starts at the cut: {text}"
+            text.contains(
+                "result (this echo left out 500 more of the recorded text's characters): xxxxxx"
+            ),
+            "a truncated outcome names exactly what the count is: this echo's own \
+             cut of the recorded text, and the echoed text starts at the cut: {text}"
         );
         assert!(
             text.contains("result unavailable: the provider said nothing"),
             "an unavailable outcome is named with the record's reason: {text}"
         );
-        assert!(text.contains("run 1 · failed · provider unreachable"), "{text}");
+        assert!(
+            text.contains("run 1 · failed · provider unreachable"),
+            "{text}"
+        );
         assert!(text.contains("run 2 · failed"), "{text}");
         assert!(text.contains("review 2"), "{text}");
         assert!(text.contains("signoff: approved"), "{text}");
@@ -522,7 +556,9 @@ mod runs_report_tests {
         });
         let text = run_report_text(&value);
         assert!(
-            text.contains("Session:          no live run; state failed (the provider replied 401)\n"),
+            text.contains(
+                "Session:          no live run; state failed (the provider replied 401)\n"
+            ),
             "a failed session names its reason, not just a word: {text}"
         );
     }
@@ -668,16 +704,74 @@ mod runs_report_tests {
         assert!(text.contains("state failed (stopped "), "{text:?}");
     }
 
+    /// Nothing a Task title, a provider error, a run's result or an output
+    /// line carries may reach the report as itself, in a shape that changes
+    /// how the report is read. The bidirectional controls U+202A–U+202E and
+    /// the isolates U+2066–U+2069 reorder or isolate the characters printed
+    /// after them — an RLO in a title can visually rewrite the labels and
+    /// numbers of every line below — the directional marks U+200E/U+200F
+    /// nudge neutral characters between runs of text, and the Unicode line
+    /// and paragraph separators U+2028/U+2029 can break the report's own
+    /// lines apart on a terminal that honors them. Every one becomes a
+    /// visible `\u{xx}` escape, in every free-text field.
+    #[test]
+    fn direction_controls_cannot_reorder_or_rewrite_the_report() {
+        // An RLO right after "Fix" would make what follows render mirrored;
+        // the PDF ends it. An LRI with its PDI would visually hide what it
+        // encloses. A mark between two words pulls the direction around.
+        let mut value = sample();
+        value["title"] = json!("Fix \u{202e}mirrored\u{202c}");
+        value["ai_review"]["reason"] = json!("failed \u{200f}quietly");
+        value["runs"][0]["outcome"]["text"] = json!("did \u{2066}isolated\u{2069} work");
+        value["runs"][1]["outcome"]["text"] = json!("broken\u{2028}lines\u{2029}here");
+        value["output"]["entries"][0]["message"] = json!("note \u{202a}left\u{202b}right");
+        value["configured_model"] = json!("model \u{2068}popped\u{2067}");
+        value["failure_reason"] = json!("gone \u{200e}missing");
+
+        let text = run_report_text(&value);
+
+        // No raw directional control, mark or separator reaches the rendered
+        // report, in any field it was planted in.
+        for raw in [
+            '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}', '\u{202a}', '\u{202b}', '\u{202c}',
+            '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            let raw: String = raw.into();
+            assert!(
+                !text.contains(raw.as_str()),
+                "a raw direction control {raw:?} reached the report: {text:?}"
+            );
+        }
+        // ... and each is visible as its own escape in the field that carried
+        // it, so a person reading the report sees the report was shaped by an
+        // untrusted value, not reordered by it.
+        assert!(text.contains(r"Fix \u{202e}mirrored\u{202c}"), "{text:?}");
+        assert!(text.contains(r"failed \u{200f}quietly"), "{text:?}");
+        assert!(
+            text.contains(r"did \u{2066}isolated\u{2069} work"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains(r"broken\u{2028}lines\u{2029}here"),
+            "{text:?}"
+        );
+        assert!(text.contains(r"note \u{202a}left\u{202b}right"), "{text:?}");
+        assert!(text.contains(r"model \u{2068}popped\u{2067}"), "{text:?}");
+        assert!(text.contains(r"gone \u{200e}missing"), "{text:?}");
+    }
+
     /// The escaping exists for hostile shapes; ordinary characters, an accent
-    /// included, are meant to survive whole.
+    /// included, are meant to survive whole. Zero-width joiners and
+    /// non-joiners are ordinary shaping of text, not direction controls, so
+    /// they survive too.
     #[test]
     fn ordinary_unicode_is_not_escaped() {
         let mut value = sample();
         value["title"] = json!("Fix the café éditeur — façade");
-        value["runs"][0]["outcome"]["text"] = json!("café prêt");
+        value["runs"][0]["outcome"]["text"] = json!("café prêt 👍\u{200d}set");
         let text = run_report_text(&value);
         assert!(text.contains("Fix the café éditeur — façade"), "{text}");
-        assert!(text.contains("result: café prêt\n"), "{text}");
+        assert!(text.contains("café prêt 👍\u{200d}set"), "{text}");
         assert!(!text.contains(r"\u{"), "{text}");
     }
 
@@ -686,7 +780,10 @@ mod runs_report_tests {
         let text = run_report_text(&serde_json::json!({}));
         // No panic, and every degraded line is a specific placeholder, not a
         // vague one: the report is honest about exactly what was not sent.
-        assert!(text.contains("Task ? \"(untitled)\" — provider ?\n"), "{text}");
+        assert!(
+            text.contains("Task ? \"(untitled)\" — provider ?\n"),
+            "{text}"
+        );
         assert!(
             text.contains("Model configured: provider default (saved on the Task)\n"),
             "{text}"
@@ -699,7 +796,10 @@ mod runs_report_tests {
             text.contains("Session:          this instance supervises no run state\n"),
             "{text}"
         );
-        assert!(text.contains("AI review:        none on record\n"), "{text}");
+        assert!(
+            text.contains("AI review:        none on record\n"),
+            "{text}"
+        );
         assert!(text.contains("Failure:          none\n"), "{text}");
         assert!(
             text.contains("Runs:             0 described, 0 older not described\n"),

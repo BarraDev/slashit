@@ -592,12 +592,8 @@ fn evidence_runs(activity: &[slashit_activity::Entry]) -> (Vec<RunEvidence>, usi
             | Kind::NewAttemptAuthorized { run } => {
                 numbers.insert(*run);
             }
-            Kind::RunFailed {
-                run: Some(run), ..
-            }
-            | Kind::RecoveryRequired {
-                run: Some(run), ..
-            } => {
+            Kind::RunFailed { run: Some(run), .. }
+            | Kind::RecoveryRequired { run: Some(run), .. } => {
                 numbers.insert(*run);
             }
             _ => {}
@@ -656,17 +652,16 @@ fn evidence_runs(activity: &[slashit_activity::Entry]) -> (Vec<RunEvidence>, usi
                     evidence.failure_reason = Some(evidence_failure_reason(reason).0);
                 }
                 Kind::RunResult { run: r, result } if r == run => {
-                    evidence.outcome.get_or_insert_with(|| evidence_outcome(result));
+                    evidence
+                        .outcome
+                        .get_or_insert_with(|| evidence_outcome(result));
                 }
                 _ => {}
             }
         }
         runs.push(evidence);
     }
-    (
-        runs,
-        total.saturating_sub(MAX_EVIDENCE_RUNS),
-    )
+    (runs, total.saturating_sub(MAX_EVIDENCE_RUNS))
 }
 
 /// One persisted run result, re-bounded and re-redacted for this echo.
@@ -837,9 +832,7 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
 /// is historical: one written by an older build — before a masking rule
 /// existed, or before it was this strong — is echoed under today's policy.
 /// The stored record itself is never touched.
-fn evidence_activity(
-    activity: &[slashit_activity::Entry],
-) -> (Vec<serde_json::Value>, usize) {
+fn evidence_activity(activity: &[slashit_activity::Entry]) -> (Vec<serde_json::Value>, usize) {
     let mut echoed = Vec::new();
     let mut bytes = 0usize;
     let mut taken = 0usize;
@@ -861,10 +854,7 @@ fn evidence_activity(
         taken += 1;
         echoed.push(value);
     }
-    (
-        echoed,
-        activity.len().saturating_sub(taken),
-    )
+    (echoed, activity.len().saturating_sub(taken))
 }
 
 /// The redaction policy, applied to every string `value` carries, in place.
@@ -939,8 +929,7 @@ async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcRespo
 
     let (runs, runs_omitted) = evidence_runs(&task.activity);
     let ai_review = evidence_ai_review(&task.activity);
-    let (failure_reason, failure_reason_truncated) =
-        evidence_failure(&task, snapshot.as_ref());
+    let (failure_reason, failure_reason_truncated) = evidence_failure(&task, snapshot.as_ref());
 
     // The title and the model identifiers are echoed through the same
     // redaction and bound the rest of the answer obeys; each cut is flagged
@@ -967,10 +956,7 @@ async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcRespo
         crate::domain::QaStatus::Rejected => "rejected".to_string(),
     });
 
-    let output = evidence_output(
-        output_entries,
-        !runs.is_empty(),
-    );
+    let output = evidence_output(output_entries, !runs.is_empty());
     let (activity, activity_omitted) = evidence_activity(&task.activity);
 
     let answer = TaskEvidence {
@@ -1006,19 +992,18 @@ async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcRespo
 /// client mistake what is missing for evidence that it does not exist.
 fn evidence_reply(task_id: &str, answer: TaskEvidence) -> IpcResponse {
     match serde_json::to_string(&answer) {
-        Ok(text) if text.len() <= MAX_EVIDENCE_RESPONSE_BYTES =>
+        Ok(text) if text.len() <= MAX_EVIDENCE_RESPONSE_BYTES => {
             match serde_json::from_str(&text) {
                 Ok(value) => IpcResponse::success(value),
-                Err(e) => IpcResponse::error(format!(
-                    "Could not encode the evidence for {task_id}: {e}"
-                )),
-            },
+                Err(e) => {
+                    IpcResponse::error(format!("Could not encode the evidence for {task_id}: {e}"))
+                }
+            }
+        }
         Ok(_) => IpcResponse::error(format!(
             "The evidence answer for {task_id} would exceed the response bound and was not sent"
         )),
-        Err(e) => IpcResponse::error(format!(
-            "Could not encode the evidence for {task_id}: {e}"
-        )),
+        Err(e) => IpcResponse::error(format!("Could not encode the evidence for {task_id}: {e}")),
     }
 }
 
@@ -3703,9 +3688,7 @@ mod import_lock_order {
 mod get_task_evidence {
     use super::*;
     use crate::domain::task::{CodingProvider, QaSignoff, QaStatus};
-    use crate::test_helpers::{
-        attach_test_executor_ipc, create_test_task_full, ipc_test_context,
-    };
+    use crate::test_helpers::{attach_test_executor_ipc, create_test_task_full, ipc_test_context};
     use slashit_activity::{Kind, RunResult};
     use std::sync::Arc;
 
@@ -3757,29 +3740,65 @@ mod get_task_evidence {
             session_id: Uuid::new_v4(),
         });
         let at = chrono::Utc::now() - chrono::Duration::hours(1);
-        task.record_activity_at(at, Kind::RunStarted { run: 1, addressing_feedback: false });
-        task.record_activity_at(at, Kind::ToolUsed { run: 1, tool: "Bash".into(), detail: Some("ls".into()), count: 1 });
+        task.record_activity_at(
+            at,
+            Kind::RunStarted {
+                run: 1,
+                addressing_feedback: false,
+            },
+        );
+        task.record_activity_at(
+            at,
+            Kind::ToolUsed {
+                run: 1,
+                tool: "Bash".into(),
+                detail: Some("ls".into()),
+                count: 1,
+            },
+        );
         task.record_activity_at(at, Kind::RunCompleted { run: 1 });
         task.record_activity_at(
             at,
-            Kind::RunResult { run: 1, result: RunResult::Available { text: "did the work".into() } },
+            Kind::RunResult {
+                run: 1,
+                result: RunResult::Available {
+                    text: "did the work".into(),
+                },
+            },
         );
-        task.record_activity_at(at, Kind::RunStarted { run: 2, addressing_feedback: true });
+        task.record_activity_at(
+            at,
+            Kind::RunStarted {
+                run: 2,
+                addressing_feedback: true,
+            },
+        );
         task.record_activity_at(at, Kind::RunCompleted { run: 2 });
         task.record_activity_at(
             at,
             Kind::RunResult {
                 run: 2,
-                result: RunResult::Truncated { text: "partial answer".into(), original_chars: 9_999 },
+                result: RunResult::Truncated {
+                    text: "partial answer".into(),
+                    original_chars: 9_999,
+                },
             },
         );
         task.record_activity_at(at, Kind::AiReviewStarted { review: 3 });
         task.record_activity_at(at, Kind::AiReviewApproved { review: 3 });
-        assert!(task.record_activity_at(at, Kind::RunFailed { run: Some(4), reason: "provider unreachable".into() }));
+        assert!(task.record_activity_at(
+            at,
+            Kind::RunFailed {
+                run: Some(4),
+                reason: "provider unreachable".into()
+            }
+        ));
 
         let id = task.id;
         ctx.tasks.write().await.insert(id, task.clone());
-        ctx.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        ctx.storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
         (tmp, ctx, id)
     }
 
@@ -3847,9 +3866,17 @@ mod get_task_evidence {
         let activity = d["activity"].as_array().expect("activity");
         assert!(!activity.is_empty());
         assert!(activity.len() <= MAX_EVIDENCE_ACTIVITY_ENTRIES);
-        let first = activity[0]["kind"].as_object().expect("a kind").keys().next();
+        let first = activity[0]["kind"]
+            .as_object()
+            .expect("a kind")
+            .keys()
+            .next();
         // Ordered newest first, so the oldest-looking milestone is last.
-        assert_eq!(activity.last().unwrap()["kind"]["type"], "run_started", "{first:?}");
+        assert_eq!(
+            activity.last().unwrap()["kind"]["type"],
+            "run_started",
+            "{first:?}"
+        );
 
         // No executor is installed here, so there is nothing this process
         // supervised: the session half is null (the executor-backed shape is
@@ -3952,7 +3979,10 @@ mod get_task_evidence {
         // A second instance over the same storage: the task is re-read from
         // the board, and this new process's executor has its own empty maps.
         let before = evidence(&first, &id.to_string()).await;
-        assert_eq!(before["output"]["available"], true, "the first instance held output");
+        assert_eq!(
+            before["output"]["available"], true,
+            "the first instance held output"
+        );
 
         let ctx = ipc_test_context(first.paths.clone());
         let project_id = task.project_id;
@@ -4002,16 +4032,30 @@ mod get_task_evidence {
         let mut task = create_test_task_full("many runs", project_id, TaskStatus::Error, 0);
         let at = chrono::Utc::now();
         for run in 1..=7 {
-            task.record_activity_at(at, Kind::RunStarted { run, addressing_feedback: false });
+            task.record_activity_at(
+                at,
+                Kind::RunStarted {
+                    run,
+                    addressing_feedback: false,
+                },
+            );
             // A large result per run, so the byte bound is exercised too.
             task.record_activity_at(
                 at,
                 Kind::RunResult {
                     run,
-                    result: RunResult::Available { text: "x".repeat(4_000) },
+                    result: RunResult::Available {
+                        text: "x".repeat(4_000),
+                    },
                 },
             );
-            task.record_activity_at(at, Kind::RunFailed { run: Some(run), reason: format!("run {run} failed") });
+            task.record_activity_at(
+                at,
+                Kind::RunFailed {
+                    run: Some(run),
+                    reason: format!("run {run} failed"),
+                },
+            );
         }
         let id = task.id;
         ctx.tasks.write().await.insert(id, task.clone());
@@ -4028,7 +4072,10 @@ mod get_task_evidence {
             assert_eq!(run["outcome"]["kind"], "available");
             let text = run["outcome"]["text"].as_str().expect("text");
             assert_eq!(text.chars().count(), MAX_EVIDENCE_RESULT_CHARS);
-            assert_eq!(run["outcome"]["echo_chars_omitted"].as_u64().unwrap(), 3_000);
+            assert_eq!(
+                run["outcome"]["echo_chars_omitted"].as_u64().unwrap(),
+                3_000
+            );
         }
     }
 
@@ -4046,13 +4093,21 @@ mod get_task_evidence {
         let mut task = create_test_task_full("long history", project_id, TaskStatus::Error, 0);
         let at = chrono::Utc::now();
         for run in 1..=30 {
-            task.record_activity_at(at, Kind::RunStarted { run, addressing_feedback: false });
+            task.record_activity_at(
+                at,
+                Kind::RunStarted {
+                    run,
+                    addressing_feedback: false,
+                },
+            );
             task.record_activity_at(at, Kind::RunCompleted { run });
             task.record_activity_at(
                 at,
                 Kind::RunResult {
                     run,
-                    result: RunResult::Available { text: "y".repeat(4_000) },
+                    result: RunResult::Available {
+                        text: "y".repeat(4_000),
+                    },
                 },
             );
         }
@@ -4067,7 +4122,10 @@ mod get_task_evidence {
             .map(|v| serde_json::to_string(v).unwrap().len())
             .sum();
         assert!(bytes <= MAX_EVIDENCE_ACTIVITY_BYTES, "{bytes}");
-        assert_eq!(d["activity_omitted"].as_u64().unwrap() + activity.len() as u64, 90);
+        assert_eq!(
+            d["activity_omitted"].as_u64().unwrap() + activity.len() as u64,
+            90
+        );
     }
 
     #[tokio::test]
@@ -4086,7 +4144,9 @@ mod get_task_evidence {
     async fn unknown_or_malformed_request_fails_closed() {
         let (_tmp, ctx, _id) = rich_world().await;
         let bad = dispatch(
-            IpcRequest::GetTaskEvidence { task_id: "nope".into() },
+            IpcRequest::GetTaskEvidence {
+                task_id: "nope".into(),
+            },
             &ctx,
             &PeerContext {
                 endpoint: slashit_ipc::Endpoint::Unix {
@@ -4107,7 +4167,9 @@ mod get_task_evidence {
 
     async fn evidence_or_error(ctx: &IpcContext, id: &str) -> IpcResponse {
         dispatch(
-            IpcRequest::GetTaskEvidence { task_id: id.to_string() },
+            IpcRequest::GetTaskEvidence {
+                task_id: id.to_string(),
+            },
             ctx,
             &PeerContext {
                 endpoint: slashit_ipc::Endpoint::Unix {
@@ -4133,7 +4195,10 @@ mod get_task_evidence {
             let task = tasks.get_mut(&id).expect("seeded");
             task.record_activity_at(
                 chrono::Utc::now(),
-                Kind::RunStarted { run: 5, addressing_feedback: false },
+                Kind::RunStarted {
+                    run: 5,
+                    addressing_feedback: false,
+                },
             );
         }
 
@@ -4177,11 +4242,20 @@ mod get_task_evidence {
             create_test_task_full("fix then rerun", Uuid::new_v4(), TaskStatus::AiReview, 0);
         let at = chrono::Utc::now();
         task.record_activity_at(at, Kind::AiReviewStarted { review: 1 });
-        task.record_activity_at(at, Kind::AiReviewChangesRequested { review: 1, issues: 2 });
+        task.record_activity_at(
+            at,
+            Kind::AiReviewChangesRequested {
+                review: 1,
+                issues: 2,
+            },
+        );
         task.record_activity_at(at, Kind::AiFixApplied { review: 1 });
         task.record_activity_at(
             at,
-            Kind::RunStarted { run: 2, addressing_feedback: true },
+            Kind::RunStarted {
+                run: 2,
+                addressing_feedback: true,
+            },
         );
 
         let id = task.id;
@@ -4211,11 +4285,20 @@ mod get_task_evidence {
         let mut task =
             create_test_task_full("never reviewed", Uuid::new_v4(), TaskStatus::Error, 0);
         let at = chrono::Utc::now();
-        task.record_activity_at(at, Kind::RunStarted { run: 1, addressing_feedback: false });
+        task.record_activity_at(
+            at,
+            Kind::RunStarted {
+                run: 1,
+                addressing_feedback: false,
+            },
+        );
         task.record_activity_at(at, Kind::RunCompleted { run: 1 });
         task.record_activity_at(
             at,
-            Kind::RunFailed { run: Some(1), reason: "the provider dropped".into() },
+            Kind::RunFailed {
+                run: Some(1),
+                reason: "the provider dropped".into(),
+            },
         );
 
         let id = task.id;
@@ -4246,7 +4329,13 @@ mod get_task_evidence {
         let mut task = create_test_task_full("fix failed", Uuid::new_v4(), TaskStatus::AiReview, 0);
         let at = chrono::Utc::now();
         task.record_activity_at(at, Kind::AiReviewStarted { review: 1 });
-        task.record_activity_at(at, Kind::AiReviewChangesRequested { review: 1, issues: 3 });
+        task.record_activity_at(
+            at,
+            Kind::AiReviewChangesRequested {
+                review: 1,
+                issues: 3,
+            },
+        );
         task.record_activity_at(at, Kind::AiFixStarted { review: 1 });
         task.record_activity_at(
             at,
@@ -4272,7 +4361,10 @@ mod get_task_evidence {
         // bound every echoed reason obeys.
         assert!(!serde_json::to_string(&d).unwrap().contains(SECRET_SHAPED));
         let reason = review["reason"].as_str().expect("reason");
-        assert!(reason.chars().count() <= MAX_EVIDENCE_FAILURE_CHARS, "{reason}");
+        assert!(
+            reason.chars().count() <= MAX_EVIDENCE_FAILURE_CHARS,
+            "{reason}"
+        );
     }
 
     /// A credential-shaped word versus which nothing in the answer may survive
@@ -4298,7 +4390,13 @@ mod get_task_evidence {
                 create_test_task_full("fix under way", Uuid::new_v4(), TaskStatus::AiReview, 0);
             let at = chrono::Utc::now();
             task.record_activity_at(at, Kind::AiReviewStarted { review: 1 });
-            task.record_activity_at(at, Kind::AiReviewChangesRequested { review: 1, issues: 2 });
+            task.record_activity_at(
+                at,
+                Kind::AiReviewChangesRequested {
+                    review: 1,
+                    issues: 2,
+                },
+            );
             task.record_activity_at(at, kind);
             let id = task.id;
             ctx.tasks.write().await.insert(id, task);
@@ -4321,6 +4419,13 @@ mod get_task_evidence {
     /// above are verified to add up under the documented wire frame limit
     /// (`MAX_REQUEST_BYTES`, which the read the client makes is bounded by)
     /// and under this read's own aggregate ceiling.
+    ///
+    /// The answer is not merely *within* every bound: each bound is the one
+    /// that decided — the runs and the echoed output entries are capped at
+    /// their own constants with older ones counted in the omitted fields, and
+    /// the Activity echo stops on its byte budget, not on its entry cap. A
+    /// test that only checked an upper bound could pass while an under-built
+    /// answer echoed half of what the constants allow.
     #[tokio::test]
     async fn the_whole_answer_stays_within_the_wire_frame_limit() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -4346,7 +4451,13 @@ mod get_task_evidence {
         task.error_message = Some(fat.clone());
         let at = chrono::Utc::now();
         for run in 1..=40 {
-            task.record_activity_at(at, Kind::RunStarted { run, addressing_feedback: false });
+            task.record_activity_at(
+                at,
+                Kind::RunStarted {
+                    run,
+                    addressing_feedback: false,
+                },
+            );
             task.record_activity_at(at, Kind::RunCompleted { run });
             task.record_activity_at(
                 at,
@@ -4369,9 +4480,14 @@ mod get_task_evidence {
         let id = task.id;
         ctx.tasks.write().await.insert(id, task.clone());
         let executor = attach_test_executor_ipc(&ctx).await;
+        // More output lines than the echo keeps, so the echo's own cap is
+        // what bounds the answer, not however many were recorded.
         let mut lines = Vec::new();
-        for i in 0..32 {
-            lines.push(format!("line {i} ✩{}", "output ζ̈\\\"\n".repeat(500).repeat(2)));
+        for i in 0..(MAX_EVIDENCE_OUTPUT_ENTRIES + 8) {
+            lines.push(format!(
+                "line {i} ✩{}",
+                "output ζ̈\\\"\n".repeat(500).repeat(2)
+            ));
         }
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         executor
@@ -4384,7 +4500,96 @@ mod get_task_evidence {
 
         let reply = handle_get_task_evidence(&ctx, id.to_string()).await;
         assert!(reply.ok, "{:?}", reply.error);
-        let bytes = serde_json::to_string(&reply.data).unwrap().len();
+        let d = &reply.data;
+
+        // The intended caps are reached, not merely satisfied. Nothing here
+        // just stayed under an upper bound: each bound below is the one that
+        // decided.
+        // runs — five described, newest first, the other thirty-five counted;
+        // every outcome is cut to the echo's own result bound.
+        let runs = d["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), MAX_EVIDENCE_RUNS);
+        assert_eq!(runs[0]["run"], 40);
+        assert_eq!(runs[MAX_EVIDENCE_RUNS - 1]["run"], 36);
+        assert_eq!(
+            d["runs_omitted"].as_u64(),
+            Some((40 - MAX_EVIDENCE_RUNS) as u64)
+        );
+        for run in runs {
+            let outcome = &run["outcome"];
+            // The record cut each result to its own bound (`truncated`, with
+            // the full length it kept), and the echo cut further still.
+            assert!(
+                outcome["kind"] == "truncated",
+                "a result this size is recorded cut, with the full length \
+                 named: {run:?}"
+            );
+            let text = outcome["text"].as_str().expect("text");
+            assert_eq!(
+                text.chars().count(),
+                MAX_EVIDENCE_RESULT_CHARS,
+                "the echo's own result bound is what the outcome was cut to: {run:?}"
+            );
+            assert!(
+                outcome["echo_chars_omitted"].as_u64().unwrap_or(0) > 0,
+                "the echo genuinely cut further than the record did: {run:?}"
+            );
+        }
+        // output — thirty-two long entries echoed, the eight older ones
+        // counted, each message cut to its own bound.
+        let output = &d["output"];
+        let entries = output["entries"].as_array().expect("output entries");
+        assert_eq!(entries.len(), MAX_EVIDENCE_OUTPUT_ENTRIES);
+        assert_eq!(
+            output["entries_omitted"].as_u64(),
+            Some((lines.len() - MAX_EVIDENCE_OUTPUT_ENTRIES) as u64)
+        );
+        for entry in entries {
+            assert_eq!(
+                entry["message"].as_str().map(|m| m.chars().count()),
+                Some(MAX_EVIDENCE_MESSAGE_CHARS),
+                "every echoed line is at the echo's own message bound: {entry:?}"
+            );
+            assert_eq!(entry["message_truncated"], true, "{entry:?}");
+        }
+        // Activity — the richest the bounds allow, and the byte budget is the
+        // cap that fired: the echoed milestones sit within the budget, and
+        // echoing the next stored milestone would not have fit within it,
+        // which is exactly why echoing stopped where it did. The whole
+        // history is much longer than the entry cap, so this is the budget's
+        // doing, not a run of shorter history.
+        let activity = d["activity"].as_array().expect("activity");
+        let activity_bytes: usize = activity
+            .iter()
+            .map(|value| serde_json::to_string(value).unwrap().len())
+            .sum();
+        assert!(
+            activity_bytes <= MAX_EVIDENCE_ACTIVITY_BYTES,
+            "the echoed milestones total {activity_bytes} bytes"
+        );
+        assert!(
+            activity.len() < MAX_EVIDENCE_ACTIVITY_ENTRIES,
+            "the byte budget, not the entry cap, is what stopped the echo: \
+             {} milestones fit",
+            activity.len()
+        );
+        assert!(d["activity_omitted"].as_u64().unwrap_or(0) > 0);
+        {
+            // The next stored milestone the echo declined, newest first, and
+            // what it would have cost — the same measurement the echo makes.
+            let next = &task.activity[task.activity.len() - 1 - activity.len()];
+            let mut next_value = serde_json::to_value(next).expect("serializable");
+            evidence_redact_value(&mut next_value);
+            let next_cost = serde_json::to_string(&next_value).unwrap().len();
+            assert!(
+                activity_bytes + next_cost > MAX_EVIDENCE_ACTIVITY_BYTES,
+                "the byte budget was genuinely reached: {activity_bytes} bytes \
+                 echoed, and holding the next milestone would only have cost \
+                 {next_cost} more"
+            );
+        }
+
+        let bytes = serde_json::to_string(d).unwrap().len();
         // The response the handler built is within this read's own aggregate
         // ceiling ...
         assert!(
@@ -4498,7 +4703,10 @@ mod get_task_evidence {
             text.contains("latest observed"),
             "the Task-level identity: {text}"
         );
-        assert!(text.contains("claude-opus-4-0-20250514"), "the model: {text}");
+        assert!(
+            text.contains("claude-opus-4-0-20250514"),
+            "the model: {text}"
+        );
         assert!(
             text.contains("run 4 · failed · provider unreachable"),
             "the newest run, its status and its reason: {text}"
@@ -4509,7 +4717,10 @@ mod get_task_evidence {
         );
         assert!(text.contains("run 1 · completed"), "an older run: {text}");
         assert!(text.contains("review 3"), "the review ordinal: {text}");
-        assert!(text.contains("signoff: approved"), "the review signoff: {text}");
+        assert!(
+            text.contains("signoff: approved"),
+            "the review signoff: {text}"
+        );
         assert!(
             text.contains("the last run failed: worker exited"),
             "the Task's failure reason: {text}"
@@ -4549,7 +4760,10 @@ mod evidence_run_end_events {
     }
 
     fn start(run: u32) -> Kind {
-        Kind::RunStarted { run, addressing_feedback: false }
+        Kind::RunStarted {
+            run,
+            addressing_feedback: false,
+        }
     }
 
     fn started(run: u32, entries: &[Entry]) -> Vec<Entry> {
@@ -4559,20 +4773,33 @@ mod evidence_run_end_events {
     }
 
     fn run_of(entries: &[Entry]) -> RunEvidence {
-        evidence_runs(entries).0.into_iter().next().expect("a run was named")
+        evidence_runs(entries)
+            .0
+            .into_iter()
+            .next()
+            .expect("a run was named")
     }
 
     #[test]
     fn a_completion_recorded_after_a_failure_stays_completed() {
-        let mut entries = started(1, &[entry(
-            2,
-            Kind::RunFailed { run: Some(1), reason: "provider dropped".into() },
-        )]);
+        let mut entries = started(
+            1,
+            &[entry(
+                2,
+                Kind::RunFailed {
+                    run: Some(1),
+                    reason: "provider dropped".into(),
+                },
+            )],
+        );
         entries.push(entry(3, Kind::RunCompleted { run: 1 }));
 
         let run = run_of(&entries);
         assert_eq!(run.status, "completed");
-        assert!(run.failure_reason.is_none(), "a completed run carries no failure");
+        assert!(
+            run.failure_reason.is_none(),
+            "a completed run carries no failure"
+        );
         assert_eq!(run.started_at, Some(entries[0].at));
         assert_eq!(run.ended_at, Some(entries[2].at), "the latest end's time");
     }
@@ -4580,7 +4807,13 @@ mod evidence_run_end_events {
     #[test]
     fn a_failure_recorded_after_a_completion_reads_failed() {
         let mut entries = started(1, &[entry(2, Kind::RunCompleted { run: 1 })]);
-        entries.push(entry(3, Kind::RunFailed { run: Some(1), reason: "crashed at the end".into() }));
+        entries.push(entry(
+            3,
+            Kind::RunFailed {
+                run: Some(1),
+                reason: "crashed at the end".into(),
+            },
+        ));
 
         let run = run_of(&entries);
         assert_eq!(run.status, "failed");
@@ -4590,15 +4823,29 @@ mod evidence_run_end_events {
 
     #[test]
     fn runs_keep_their_own_events_when_they_are_interleaved() {
-        let entries = started(1, &[
-            entry(2, start(2)),
-            entry(3, Kind::RunFailed { run: Some(2), reason: "run 2 out of memory".into() }),
-            entry(4, Kind::RunResult {
-                run: 1,
-                result: RunResult::Available { text: "run 1's answer".into() },
-            }),
-            entry(5, Kind::RunCompleted { run: 1 }),
-        ]);
+        let entries = started(
+            1,
+            &[
+                entry(2, start(2)),
+                entry(
+                    3,
+                    Kind::RunFailed {
+                        run: Some(2),
+                        reason: "run 2 out of memory".into(),
+                    },
+                ),
+                entry(
+                    4,
+                    Kind::RunResult {
+                        run: 1,
+                        result: RunResult::Available {
+                            text: "run 1's answer".into(),
+                        },
+                    },
+                ),
+                entry(5, Kind::RunCompleted { run: 1 }),
+            ],
+        );
 
         let (runs, omitted) = evidence_runs(&entries);
         assert_eq!(omitted, 0);
@@ -4607,7 +4854,10 @@ mod evidence_run_end_events {
         // never touches run 1, and run 1's completion never rewrites run 2.
         assert_eq!(runs[0].run, 2);
         assert_eq!(runs[0].status, "failed");
-        assert_eq!(runs[0].failure_reason.as_deref(), Some("run 2 out of memory"));
+        assert_eq!(
+            runs[0].failure_reason.as_deref(),
+            Some("run 2 out of memory")
+        );
         assert!(runs[0].outcome.is_none());
         assert_eq!(runs[1].run, 1);
         assert_eq!(runs[1].status, "completed");
@@ -4620,7 +4870,18 @@ mod evidence_run_end_events {
 
     #[test]
     fn a_run_the_record_never_ended_reads_started() {
-        let entries = started(1, &[entry(1, Kind::ToolUsed { run: 1, tool: "Bash".into(), detail: None, count: 1 })]);
+        let entries = started(
+            1,
+            &[entry(
+                1,
+                Kind::ToolUsed {
+                    run: 1,
+                    tool: "Bash".into(),
+                    detail: None,
+                    count: 1,
+                },
+            )],
+        );
 
         let run = run_of(&entries);
         assert_eq!(run.status, "started");
@@ -4631,15 +4892,27 @@ mod evidence_run_end_events {
 
     #[test]
     fn a_recovery_is_earlier_history_of_a_later_completion() {
-        let mut entries = started(1, &[
-            entry(2, Kind::RecoveryRequired { run: Some(1), reason: "the run ended uncleanly".into() }),
-            entry(3, Kind::NewAttemptAuthorized { run: 1 }),
-        ]);
+        let mut entries = started(
+            1,
+            &[
+                entry(
+                    2,
+                    Kind::RecoveryRequired {
+                        run: Some(1),
+                        reason: "the run ended uncleanly".into(),
+                    },
+                ),
+                entry(3, Kind::NewAttemptAuthorized { run: 1 }),
+            ],
+        );
         entries.push(entry(4, Kind::RunCompleted { run: 1 }));
 
         let run = run_of(&entries);
         assert_eq!(run.status, "completed");
-        assert!(run.failure_reason.is_none(), "the deciding end is the completion");
+        assert!(
+            run.failure_reason.is_none(),
+            "the deciding end is the completion"
+        );
         assert_eq!(run.ended_at, Some(entries[3].at));
     }
 }
@@ -4672,11 +4945,23 @@ mod evidence_ai_review_supersession {
     #[test]
     fn a_completed_review_followed_by_a_run_is_superseded_by_that_run() {
         let entries = [
-            entry(1, Kind::RunStarted { run: 1, addressing_feedback: false }),
+            entry(
+                1,
+                Kind::RunStarted {
+                    run: 1,
+                    addressing_feedback: false,
+                },
+            ),
             entry(2, Kind::RunCompleted { run: 1 }),
             entry(3, Kind::AiReviewStarted { review: 1 }),
             entry(4, Kind::AiReviewApproved { review: 1 }),
-            entry(5, Kind::RunStarted { run: 2, addressing_feedback: false }),
+            entry(
+                5,
+                Kind::RunStarted {
+                    run: 2,
+                    addressing_feedback: false,
+                },
+            ),
         ];
 
         let review = review_of(&entries);
@@ -4693,10 +4978,28 @@ mod evidence_ai_review_supersession {
     fn a_fix_attempt_followed_by_a_run_is_superseded_by_that_run() {
         let entries = [
             entry(1, Kind::AiReviewStarted { review: 1 }),
-            entry(2, Kind::AiReviewChangesRequested { review: 1, issues: 2 }),
+            entry(
+                2,
+                Kind::AiReviewChangesRequested {
+                    review: 1,
+                    issues: 2,
+                },
+            ),
             entry(3, Kind::AiFixStarted { review: 1 }),
-            entry(4, Kind::AiFixFailed { review: 1, reason: "the fix could not deliver".into() }),
-            entry(5, Kind::RunStarted { run: 2, addressing_feedback: true }),
+            entry(
+                4,
+                Kind::AiFixFailed {
+                    review: 1,
+                    reason: "the fix could not deliver".into(),
+                },
+            ),
+            entry(
+                5,
+                Kind::RunStarted {
+                    run: 2,
+                    addressing_feedback: true,
+                },
+            ),
         ];
 
         let review = review_of(&entries);
@@ -4711,10 +5014,22 @@ mod evidence_ai_review_supersession {
     #[test]
     fn an_unverdicted_review_after_a_run_is_superseded_the_same_way() {
         let entries = [
-            entry(1, Kind::RunStarted { run: 1, addressing_feedback: false }),
+            entry(
+                1,
+                Kind::RunStarted {
+                    run: 1,
+                    addressing_feedback: false,
+                },
+            ),
             entry(2, Kind::RunCompleted { run: 1 }),
             entry(3, Kind::AiReviewStarted { review: 1 }),
-            entry(4, Kind::RunStarted { run: 2, addressing_feedback: false }),
+            entry(
+                4,
+                Kind::RunStarted {
+                    run: 2,
+                    addressing_feedback: false,
+                },
+            ),
         ];
 
         let review = review_of(&entries);
@@ -4728,10 +5043,28 @@ mod evidence_ai_review_supersession {
     #[test]
     fn a_review_nothing_started_after_is_not_superseded() {
         let entries = [
-            entry(1, Kind::RunStarted { run: 1, addressing_feedback: false }),
+            entry(
+                1,
+                Kind::RunStarted {
+                    run: 1,
+                    addressing_feedback: false,
+                },
+            ),
             entry(2, Kind::RunCompleted { run: 1 }),
-            entry(3, Kind::RunStarted { run: 2, addressing_feedback: false }),
-            entry(4, Kind::RunStarted { run: 3, addressing_feedback: false }),
+            entry(
+                3,
+                Kind::RunStarted {
+                    run: 2,
+                    addressing_feedback: false,
+                },
+            ),
+            entry(
+                4,
+                Kind::RunStarted {
+                    run: 3,
+                    addressing_feedback: false,
+                },
+            ),
             entry(5, Kind::AiReviewStarted { review: 2 }),
             entry(6, Kind::AiReviewApproved { review: 2 }),
         ];
@@ -4753,10 +5086,18 @@ mod evidence_ai_review_supersession {
                 3,
                 Kind::RunResult {
                     run: 1,
-                    result: slashit_activity::RunResult::Available { text: "the answer".into() },
+                    result: slashit_activity::RunResult::Available {
+                        text: "the answer".into(),
+                    },
                 },
             ),
-            entry(4, Kind::RunFailed { run: Some(1), reason: "in the ledger late".into() }),
+            entry(
+                4,
+                Kind::RunFailed {
+                    run: Some(1),
+                    reason: "in the ledger late".into(),
+                },
+            ),
             entry(5, Kind::NewAttemptAuthorized { run: 1 }),
         ];
 
@@ -4771,9 +5112,21 @@ mod evidence_ai_review_supersession {
     #[test]
     fn a_record_with_runs_and_no_review_answers_no_review() {
         let entries = [
-            entry(1, Kind::RunStarted { run: 1, addressing_feedback: false }),
+            entry(
+                1,
+                Kind::RunStarted {
+                    run: 1,
+                    addressing_feedback: false,
+                },
+            ),
             entry(2, Kind::RunCompleted { run: 1 }),
-            entry(3, Kind::RunStarted { run: 2, addressing_feedback: false }),
+            entry(
+                3,
+                Kind::RunStarted {
+                    run: 2,
+                    addressing_feedback: false,
+                },
+            ),
         ];
 
         assert!(
@@ -4789,8 +5142,20 @@ mod evidence_ai_review_supersession {
         let entries = [
             entry(1, Kind::AiReviewStarted { review: 1 }),
             entry(2, Kind::AiReviewApproved { review: 1 }),
-            entry(3, Kind::RunStarted { run: 2, addressing_feedback: false }),
-            entry(4, Kind::RunStarted { run: 3, addressing_feedback: false }),
+            entry(
+                3,
+                Kind::RunStarted {
+                    run: 2,
+                    addressing_feedback: false,
+                },
+            ),
+            entry(
+                4,
+                Kind::RunStarted {
+                    run: 3,
+                    addressing_feedback: false,
+                },
+            ),
         ];
 
         let review = review_of(&entries);
@@ -4822,7 +5187,9 @@ mod evidence_bounds_and_redaction {
 
     async fn read_evidence(ctx: &IpcContext, id: &str) -> serde_json::Value {
         let reply = dispatch(
-            IpcRequest::GetTaskEvidence { task_id: id.to_string() },
+            IpcRequest::GetTaskEvidence {
+                task_id: id.to_string(),
+            },
             ctx,
             &PeerContext {
                 endpoint: slashit_ipc::Endpoint::Unix {
@@ -4866,7 +5233,9 @@ mod evidence_bounds_and_redaction {
             "the secret reached the response unmasked: {d}"
         );
         assert!(
-            serde_json::to_string(d).unwrap().contains(slashit_activity::MASK),
+            serde_json::to_string(d)
+                .unwrap()
+                .contains(slashit_activity::MASK),
             "no mask anywhere: the redaction was not exercised: {d}"
         );
     }
@@ -4931,7 +5300,10 @@ mod evidence_bounds_and_redaction {
         let ctx = ipc_test_context(paths);
         ctx.tasks.write().await.insert(id, task);
         let executor = attach_test_executor_ipc(&ctx).await;
-        let line = format!("the run printed token {SECRET} and then {}", "y".repeat(900));
+        let line = format!(
+            "the run printed token {SECRET} and then {}",
+            "y".repeat(900)
+        );
         executor
             .record_ended_execution_for_test(id, crate::domain::AgentStatus::Stopped, &[&line])
             .await;
@@ -4949,7 +5321,13 @@ mod evidence_bounds_and_redaction {
     async fn a_recorded_run_failure_named_a_secret_is_masked() {
         let mut task = task_with("failed loudly", None);
         let at = chrono::Utc::now();
-        task.record_activity_at(at, Kind::RunStarted { run: 1, addressing_feedback: false });
+        task.record_activity_at(
+            at,
+            Kind::RunStarted {
+                run: 1,
+                addressing_feedback: false,
+            },
+        );
         task.record_activity_at(
             at,
             Kind::RunFailed {
@@ -4971,21 +5349,33 @@ mod evidence_bounds_and_redaction {
             chrono::Utc::now(),
             Kind::AiReviewFailed {
                 review: 1,
-                reason: format!("the reviewer could not read its credentials, {SECRET}; {}", "z".repeat(2_000)),
+                reason: format!(
+                    "the reviewer could not read its credentials, {SECRET}; {}",
+                    "z".repeat(2_000)
+                ),
             },
         );
 
         let d = echo(task).await;
         field_leaks(&d, SECRET);
         let reason = d["ai_review"]["reason"].as_str().expect("reason");
-        assert!(reason.chars().count() <= slashit_activity::MAX_REASON_CHARS, "{reason}");
+        assert!(
+            reason.chars().count() <= slashit_activity::MAX_REASON_CHARS,
+            "{reason}"
+        );
     }
 
     #[tokio::test]
     async fn a_run_result_keeps_a_secret_masked_and_within_the_echo_bound() {
         let mut task = task_with("big result", None);
         let at = chrono::Utc::now();
-        task.record_activity_at(at, Kind::RunStarted { run: 1, addressing_feedback: false });
+        task.record_activity_at(
+            at,
+            Kind::RunStarted {
+                run: 1,
+                addressing_feedback: false,
+            },
+        );
         task.record_activity_at(
             at,
             Kind::RunResult {
@@ -5016,7 +5406,10 @@ mod evidence_bounds_and_redaction {
 
         let d = echo(task).await;
         assert_eq!(d["title_truncated"], true);
-        assert_eq!(d["title"].as_str().unwrap().chars().count(), MAX_EVIDENCE_TITLE_CHARS);
+        assert_eq!(
+            d["title"].as_str().unwrap().chars().count(),
+            MAX_EVIDENCE_TITLE_CHARS
+        );
         assert_eq!(d["configured_model_truncated"], true);
         assert_eq!(
             d["configured_model"].as_str().unwrap().chars().count(),
@@ -5077,7 +5470,14 @@ mod evidence_bounds_and_redaction {
     #[tokio::test]
     async fn a_historical_run_failure_reason_stored_raw_is_masked_at_read_time() {
         let mut task = task_with("failed long ago", None);
-        paste(&mut task, 1, Kind::RunStarted { run: 1, addressing_feedback: false });
+        paste(
+            &mut task,
+            1,
+            Kind::RunStarted {
+                run: 1,
+                addressing_feedback: false,
+            },
+        );
         paste(
             &mut task,
             2,
@@ -5100,7 +5500,14 @@ mod evidence_bounds_and_redaction {
     #[tokio::test]
     async fn a_historical_run_result_stored_raw_is_masked_at_read_time() {
         let mut task = task_with("resulted long ago", None);
-        paste(&mut task, 1, Kind::RunStarted { run: 1, addressing_feedback: false });
+        paste(
+            &mut task,
+            1,
+            Kind::RunStarted {
+                run: 1,
+                addressing_feedback: false,
+            },
+        );
         paste(
             &mut task,
             2,
@@ -5125,7 +5532,14 @@ mod evidence_bounds_and_redaction {
     #[tokio::test]
     async fn a_historical_unavailable_reason_stored_raw_is_masked_at_read_time() {
         let mut task = task_with("no result long ago", None);
-        paste(&mut task, 1, Kind::RunStarted { run: 1, addressing_feedback: false });
+        paste(
+            &mut task,
+            1,
+            Kind::RunStarted {
+                run: 1,
+                addressing_feedback: false,
+            },
+        );
         paste(
             &mut task,
             2,
@@ -5150,7 +5564,14 @@ mod evidence_bounds_and_redaction {
     #[tokio::test]
     async fn a_historical_tool_detail_stored_raw_is_masked_in_the_activity_echo() {
         let mut task = task_with("tooled long ago", None);
-        paste(&mut task, 1, Kind::RunStarted { run: 1, addressing_feedback: false });
+        paste(
+            &mut task,
+            1,
+            Kind::RunStarted {
+                run: 1,
+                addressing_feedback: false,
+            },
+        );
         paste(
             &mut task,
             2,
