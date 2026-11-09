@@ -502,7 +502,8 @@ pub fn TaskEditModal(
                         </div>
                     </div>
 
-                    <div class="sticky bottom-0 flex items-center justify-between gap-3 p-6 border-t border-white/5 bg-[#0B0B0F]">
+                    // Above the model lists (z-50), so an open list never covers Save's edge.
+                    <div class="sticky bottom-0 z-[60] flex items-center justify-between gap-3 p-6 border-t border-white/5 bg-[#0B0B0F]">
                         <div>
                             {move || is_edit_mode().then(|| {
                                 view! {

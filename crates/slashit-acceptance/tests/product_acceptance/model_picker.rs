@@ -116,14 +116,14 @@ async fn keyboard(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
     expect(&picker_state(driver).await?, "value", &json!(SAVED_CLAUDE_LABEL), "the saved model survives reopen")?;
     focus_field(driver).await?;
     send(driver, Key::Up).await?;
-    expect(&picker_state(driver).await?, "active", &json!("task-ai-model-option-3"), "ArrowUp from no highlight reaches the last row")?;
+    expect(&picker_state(driver).await?, "active", &json!("task-ai-model-option-haiku"), "ArrowUp from no highlight reaches the last row")?;
     send(driver, Key::Down).await?;
-    expect(&picker_state(driver).await?, "active", &json!("task-ai-model-option-0"), "ArrowDown wraps to the first row")?;
+    expect(&picker_state(driver).await?, "active", &json!("task-ai-model-option-default"), "ArrowDown wraps to the first row")?;
     send(driver, Key::Up).await?;
     send(driver, Key::Up).await?;
     let highlighted = picker_state(driver).await?;
-    expect(&highlighted, "active", &json!("task-ai-model-option-2"), "ArrowUp moves the highlight")?;
-    expect(&highlighted, "selected", &json!(["task-ai-model-option-2"]), "the highlighted row is aria-selected")?;
+    expect(&highlighted, "active", &json!("task-ai-model-option-opus"), "ArrowUp moves the highlight")?;
+    expect(&highlighted, "selected", &json!(["task-ai-model-option-opus"]), "the highlighted row is aria-selected")?;
     send(driver, Key::Down).await?;
     send(driver, Key::Enter).await?;
     let chosen = picker_state(driver).await?;
@@ -153,7 +153,7 @@ async fn keyboard(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
         .await?;
     send(driver, Key::Down).await?;
     let typed = picker_state(driver).await?;
-    expect(&typed, "active", &json!("task-ai-model-option-0"), "the typed entry is the first row")?;
+    expect(&typed, "active", &json!("task-ai-model-option-_typed"), "the typed entry is the first row")?;
     expect(&typed, "refresh", &json!(true), "an OpenCode picker offers Refresh, its list is discovered")?;
     send(driver, Key::Enter).await?;
     save(driver, &project_id, &task_id, OPENCODE_MODEL).await?;
@@ -294,4 +294,104 @@ async fn listed(driver: &WebDriver, project_id: &str, task_id: &str) -> Result<V
         .and_then(|all| all.iter().find(|task| task.get("id").and_then(Value::as_str) == Some(task_id)))
         .cloned()
         .with_context(|| format!("the product no longer lists Task {task_id}"))
+}
+
+/// At the window's minimum height the AI Reviewer list reaches the top edge of
+/// Save. Save must stay the element a press lands on, so the press saves.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_open_reviewer_list_never_stops_save() {
+    let context = TestContext::new("model_picker_reviewer_save").expect("harness setup");
+    let outcome = reviewer_save_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn reviewer_save_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let (_agent, _gh) = install_fakes(context, &root)?;
+    let repository = GitFixture::create_local_only(&root.join("fixture-repo"))?;
+    let session = context.start_session("model-picker-reviewer-save").await?;
+    let outcome = reviewer_save(session.driver(), &repository).await;
+    context
+        .close_session(session, "model-picker-reviewer-save", &outcome)
+        .await?;
+    outcome
+}
+
+/// The point at the centre of Save's top edge, and what is element there.
+const SAVE_TOP_EDGE: &str = r#"
+const save = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Save Changes');
+const r = save.getBoundingClientRect();
+const x = r.left + r.width / 2;
+const y = r.top + 2;
+const hit = document.elementFromPoint(x, y);
+return { x, y, hitIsSave: !!hit && save.contains(hit) };
+"#;
+
+async fn reviewer_save(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
+    let Prerequisites { project_id, task_id, title } = create_prerequisites(
+        driver,
+        repository,
+        "Reviewer over Save",
+        "Saves while the AI Reviewer list is open.",
+    )
+    .await?;
+    open_board(driver, &project_id).await?;
+    open_editor(driver, &task_id, &title).await?;
+    let before = listed(driver, &project_id, &task_id).await?;
+
+    // The minimum window height is where the list reaches Save.
+    driver
+        .set_window_rect(0, 0, 1280, 600)
+        .await
+        .context("could not set the window to its minimum height")?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    driver
+        .execute(
+            "document.getElementById('task-ai-reviewer-select').scrollIntoView({ block: 'center' });",
+            vec![],
+        )
+        .await?;
+    driver
+        .find(By::Id("task-ai-reviewer-select"))
+        .await
+        .context("the editor shows no AI Reviewer field")?
+        .click()
+        .await
+        .context("could not open the AI Reviewer list")?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let edge = driver.execute(SAVE_TOP_EDGE, vec![]).await?.json().clone();
+    if edge["hitIsSave"] != json!(true) {
+        bail!("the AI Reviewer list covers the top edge of Save: {edge}");
+    }
+    let x = edge["x"].as_f64().unwrap_or(0.0) as i64;
+    let y = edge["y"].as_f64().unwrap_or(0.0) as i64;
+    driver
+        .action_chain()
+        .move_to(x, y)
+        .click()
+        .perform()
+        .await
+        .context("could not press Save's top edge")?;
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let open = driver
+            .execute("return !!document.getElementById('task-ai-reviewer-select');", vec![])
+            .await?
+            .json()
+            .clone();
+        if open == json!(false) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("pressing Save's top edge did not save the Task: the editor is still open");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let after = listed(driver, &project_id, &task_id).await?;
+    if after.get("reviewer_model") != before.get("reviewer_model") {
+        bail!("pressing Save chose a reviewer row: before {before}, after {after}");
+    }
+    Ok(())
 }
