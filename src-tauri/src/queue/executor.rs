@@ -10422,10 +10422,15 @@ mod tests {
     /// number, which is its third argument.
     #[cfg(unix)]
     fn fake_gh(dir: &std::path::Path, cases: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("gh");
-        std::fs::write(&path, format!("#!/bin/sh\ncase \"$3\" in\n{cases}\nesac\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The script is published by `write_executable`'s short-lived child,
+        // not written by this process: no descriptor of ours is open for
+        // writing when the poll execs `gh`, so no fork can have inherited one
+        // and made that exec fail with ETXTBSY.
+        crate::test_helpers::write_executable(
+            &path,
+            &format!("#!/bin/sh\ncase \"$3\" in\n{cases}\nesac\n"),
+        );
         path
     }
 
@@ -15746,7 +15751,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_hook_moved_checkout_is_adopted_on_retry_without_a_starting_commit() {
-        use std::os::unix::fs::PermissionsExt;
         let (executor, temps) = test_executor();
         let (repo, task_id, _) = stacked_task_fixture(
             &executor,
@@ -15766,12 +15770,13 @@ mod tests {
             .clear();
         publish_default_base(&repo);
         let hook = repo.join(".git/hooks/post-checkout");
-        std::fs::write(
+        // Published by `write_executable`'s short-lived child, not written by
+        // this process, so the checkout's exec of the hook cannot meet the
+        // file still open for writing in a forked child (ETXTBSY).
+        crate::test_helpers::write_executable(
             &hook,
             "#!/bin/sh\ngit -c user.email=h@example.com -c user.name=Hook commit -q --allow-empty -m hook\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let (_, first) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
@@ -17969,13 +17974,11 @@ mod tests {
                     pidfile = pidfile,
                 );
                 let bin = bin_dir.join("claude");
-                std::fs::write(&bin, &script).expect("write fixture script");
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
-                        .expect("chmod fixture script");
-                }
+                // The script is published by `write_executable`'s short-lived
+                // child, not written by this process, so the executor's exec
+                // of the fake `claude` cannot meet the file still open for
+                // writing in some thread's forked child (ETXTBSY).
+                crate::test_helpers::write_executable(&bin, &script);
 
                 let saved_path = std::env::var("PATH").ok();
                 let new_path = match &saved_path {
@@ -18208,9 +18211,11 @@ mod tests {
                         review_stream = review_stream,
                     );
                     let bin = bin_dir.join("claude");
-                    std::fs::write(&bin, &script).unwrap();
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+                    // Published by `write_executable`'s short-lived child,
+                    // like `MockClaude`, so no descriptor of this process open
+                    // for writing can make the executor's exec of it fail
+                    // with ETXTBSY.
+                    crate::test_helpers::write_executable(&bin, &script);
                     let saved_path = std::env::var("PATH").ok();
                     let new_path = match &saved_path {
                         Some(p) if without_jj => {
@@ -19233,14 +19238,14 @@ VERDICT: APPROVED"
                         .join("hooks");
                         std::fs::create_dir_all(&hooks).unwrap();
                         let hook = hooks.join("pre-commit");
-                        std::fs::write(
+                        // Published by `write_executable`'s short-lived child,
+                        // not written by this process, so git's exec of the
+                        // hook cannot fail with ETXTBSY while a fork still
+                        // holds it open for writing.
+                        crate::test_helpers::write_executable(
                             &hook,
                             "#!/bin/sh\necho 'commits are refused here' >&2\nexit 1\n",
-                        )
-                        .unwrap();
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
-                            .unwrap();
+                        );
                     }
 
                     /// The fix is in the task branch's tip commit and nothing
@@ -22243,15 +22248,13 @@ VERDICT: APPROVED"
             git_in(&w.repo, &["config", "user.email", "t@example.com"]);
             git_in(&w.repo, &["config", "user.name", "T"]);
             let hook = w.repo.join(".git/hooks/pre-commit");
-            std::fs::write(
+            // Published by `write_executable`'s short-lived child, not written
+            // by this process, so the run's git execs the hook cleanly (no
+            // ETXTBSY from a forked child still holding it open to write).
+            crate::test_helpers::write_executable(
                 &hook,
                 "#!/bin/sh\necho 'commits are refused here' >&2\nexit 1\n",
-            )
-            .unwrap();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            );
             let _agent = crate::test_helpers::FakeProgram::install(
                 "claude",
                 "cat >/dev/null; printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"permissionMode\":\"auto\"}'; printf 'work\\n' > agent_work.txt; \

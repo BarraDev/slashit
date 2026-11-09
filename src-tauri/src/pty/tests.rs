@@ -423,18 +423,19 @@ mod quit_tests {
     #[test]
     #[ignore = "spawns a shell and changes SHELL for this process; run alone with --ignored --exact"]
     fn dropping_a_session_ends_a_shell_that_ignores_hangup_and_its_children() {
-        use std::os::unix::fs::PermissionsExt;
         let _locks = lock_shell();
 
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("hup-ignoring-shell.sh");
         let pids = dir.path().join("pids");
-        std::fs::write(
+        // The script is published by `write_executable`'s copy, not written
+        // by this process: a descriptor of ours open for writing could reach
+        // a child that forks before its exec and make the session's exec of
+        // the shell fail with ETXTBSY.
+        crate::test_helpers::write_executable(
             &script,
-            format!("#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n", pids.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n", pids.display()),
+        );
         std::env::set_var("SHELL", &script);
 
         let (session, reader) = spawn_pty_session(
@@ -479,18 +480,19 @@ mod quit_tests {
     #[test]
     #[ignore = "spawns a shell and changes SHELL for this process; run alone with --ignored --exact"]
     fn ending_the_sessions_at_shutdown_has_ended_a_shell_that_ignores_hangup_when_it_returns() {
-        use std::os::unix::fs::PermissionsExt;
         let _locks = lock_shell();
 
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("hup-ignoring-shell.sh");
         let pids = dir.path().join("pids");
-        std::fs::write(
+        // The script is published by `write_executable`'s copy, not written
+        // by this process: a descriptor of ours open for writing could reach
+        // a child that forks before its exec and make the session's exec of
+        // the shell fail with ETXTBSY.
+        crate::test_helpers::write_executable(
             &script,
-            format!("#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n", pids.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n", pids.display()),
+        );
         std::env::set_var("SHELL", &script);
 
         let (session, reader) = spawn_pty_session(
