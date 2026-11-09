@@ -790,6 +790,27 @@ pub struct UpdateTaskParams {
     pub dependencies: Option<Vec<String>>,
 }
 
+/// The model an Edit stores, judged against the provider the staged Task has
+/// after the write. An Edit that names a provider and no model re-judges the
+/// stored model under that provider. `None` when it names neither.
+fn edit_model(
+    staged: &HashMap<Uuid, Task>,
+    task_id: Uuid,
+    named_provider: Option<CodingProvider>,
+    named_model: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(current) = staged.get(&task_id) else {
+        return Ok(None);
+    };
+    let provider = named_provider.unwrap_or(current.provider);
+    let requested = match (named_model, named_provider.is_some()) {
+        (Some(model), _) => model,
+        (None, true) => current.model.as_str(),
+        (None, false) => return Ok(None),
+    };
+    crate::domain::task::parse_worker_model(provider, requested).map(Some)
+}
+
 #[tauri::command]
 pub async fn update_task(
     _gui: GuiMutation,
@@ -819,28 +840,11 @@ pub async fn update_task(
         // named as such. The write checks the staged Tasks again.
         dependency_change(&*state.task.tasks.read().await, task_id, requested)?;
     }
-    // The model is checked against the provider the Task will have after this
-    // write, so a provider change and its model are judged together.
-    // A provider change without a model re-checks the stored model against the new runtime.
-    let current = state
-        .task
-        .tasks
-        .read()
-        .await
-        .get(&task_id)
-        .map(|task| (task.provider, task.model.clone()));
-    let provider = params.provider.or(current.as_ref().map(|(provider, _)| *provider));
-    let requested = params
-        .model
-        .clone()
-        .or_else(|| params.provider.and(current.as_ref().map(|(_, model)| model.clone())));
-    let model = match (provider, requested) {
-        (Some(provider), Some(requested)) => {
-            Some(crate::domain::task::parse_worker_model(provider, &requested)?)
-        }
-        _ => None,
-    };
+    // The model is judged inside the staged write, against the provider the
+    // Task has after it, so a provider change committed by another write is
+    // seen rather than a value read before this call.
     let amend = move |staged: &mut HashMap<Uuid, Task>| -> Result<(), String> {
+        let model = edit_model(staged, task_id, params.provider, params.model.as_deref())?;
         if let Some(requested) = &dependencies {
             if dependency_change(staged, task_id, requested)? {
                 if let Some(task) = staged.get_mut(&task_id) {
@@ -3677,6 +3681,37 @@ mod task_dependency_contract {
             planning_mode: None,
             dependencies: dependencies.map(|ids| ids.iter().map(Uuid::to_string).collect()),
         }
+    }
+
+    /// An Edit's model is judged against the staged Task's provider. A Task that
+    /// another write has already made an OpenCode Task refuses a Claude alias,
+    /// and a Claude Task refuses a provider/model identifier.
+    #[test]
+    fn an_edit_judges_its_model_against_the_staged_provider() {
+        let project_id = Uuid::new_v4();
+        let mut child = task(project_id, "child", TaskStatus::Backlog, vec![]);
+        child.provider = CodingProvider::OpenCode;
+        child.model = "ollama/llama3.2:3b".to_string();
+        let id = child.id;
+        let staged = HashMap::from([(id, child)]);
+
+        let alias = edit_model(&staged, id, None, Some("sonnet")).expect_err("a Claude alias is not an OpenCode model");
+        assert!(alias.contains("was not saved"), "{alias}");
+        assert_eq!(edit_model(&staged, id, None, None), Ok(None), "an Edit naming nothing judges nothing");
+        assert_eq!(
+            edit_model(&staged, id, Some(CodingProvider::OpenCode), None),
+            Ok(Some("ollama/llama3.2:3b".to_string())),
+            "a provider named alone re-judges the stored model under it"
+        );
+        assert!(
+            edit_model(&staged, id, Some(CodingProvider::Claude), None).is_err(),
+            "switching to Claude refuses the stored OpenCode model"
+        );
+        assert_eq!(
+            edit_model(&staged, Uuid::new_v4(), None, Some("sonnet")),
+            Ok(None),
+            "a Task absent from the staged map is left to the write's own checks"
+        );
     }
 
     /// An Edit is one write: a refused model refuses its dependency and its
