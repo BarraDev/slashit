@@ -160,7 +160,10 @@ pub fn print_features(data: &serde_json::Value) {
 ///
 /// The report is read out of the response's JSON the same way the machine form
 /// is, defensively: a field the instance does not send (an older one answering)
-/// degrades to a placeholder rather than a panic.
+/// degrades to a placeholder rather than a panic. The full handler-to-CLI
+/// contract — the real typed answer, rendered — is exercised where the handler
+/// lives, in the backend's own tests; the tests here pin the degraded shapes
+/// and the per-field lines a shaped answer produces.
 pub fn print_runs(data: &serde_json::Value) {
     println!("{}", run_report_text(data));
 }
@@ -170,7 +173,11 @@ pub fn print_runs(data: &serde_json::Value) {
 /// Run output is the one thing this read serves that is not persisted, so the
 /// report always says where it lives, and never silently omits a bound: what
 /// the instance left out is counted, in runs and in milestones.
-pub(crate) fn run_report_text(data: &serde_json::Value) -> String {
+///
+/// Public so the backend's own tests can run the real report against answers
+/// its handler really produced — the handler-to-CLI contract, not a
+/// reconstruction of one.
+pub fn run_report_text(data: &serde_json::Value) -> String {
     let mut out = String::new();
 
     let title = data["title"].as_str().unwrap_or("(untitled)");
@@ -182,12 +189,12 @@ pub(crate) fn run_report_text(data: &serde_json::Value) -> String {
         Some(model) => out.push_str(&format!("  Model configured: {model} (saved on the Task)\n")),
         None => out.push_str("  Model configured: provider default (saved on the Task)\n"),
     }
-    match data["observed_model"].as_str() {
+    match data["latest_observed_model"].as_str() {
         Some(model) => out.push_str(&format!(
-            "  Model observed:   {model} (reported by a run; never inferred from the configured id)\n"
+            "  Model observed:   {model} (the Task's latest observed; no per-run identity is kept, and no alias is read back as evidence)\n"
         )),
         None => out.push_str(
-            "  Model observed:   none — no run has recorded a model; an alias is a request, never evidence\n",
+            "  Model observed:   none — no run has ever reported a model; an alias is a request, never evidence\n",
         ),
     }
 
@@ -211,6 +218,13 @@ pub(crate) fn run_report_text(data: &serde_json::Value) -> String {
             review["review"].as_u64().unwrap_or(0),
             data["qa_signoff"].as_str().unwrap_or("none"),
         ));
+        // A review or fix pass that recorded a reason — failed, skipped, a
+        // fix that could not deliver its changes — keeps it bounded and
+        // redacted by the instance; the report shows it rather than a bare
+        // outcome word.
+        if let Some(reason) = review["reason"].as_str().filter(|r| !r.is_empty()) {
+            out.push_str(&format!("                    reason: {reason}\n"));
+        }
     } else {
         out.push_str("  AI review:        none on record\n");
     }
@@ -325,14 +339,19 @@ mod runs_report_tests {
     use super::*;
     use serde_json::json;
 
-    /// The shaped answer, as the build it targets serializes it.
+    /// The shaped answer, as the handler serializes it: same keys, same
+    /// nesting. The keys are pinned field names of the backend's
+    /// `GetTaskEvidence` answer — the handler-to-CLI contract is exercised
+    /// end to end in the backend's own tests against the real handler; this
+    /// sample only has to agree with it, and the backend contract test fails
+    /// if it does not.
     fn sample() -> serde_json::Value {
         json!({
             "task_id": "39bd237c-abcd-abcd-abcd-abcdabcdabcd",
             "title": "Fix the login flow",
             "provider": "OpenCode",
             "configured_model": "ollama/llama3.2:3b",
-            "observed_model": "ollama/llama3.2:3b",
+            "latest_observed_model": "ollama/llama3.2:3b",
             "session": {
                 "live": false,
                 "status": "stopped",
@@ -351,12 +370,15 @@ mod runs_report_tests {
                 ],
             },
             "runs": [
-                {"run": 2, "status": "completed", "started_at": "2026-11-09T09:00:00Z", "ended_at": "2026-11-09T09:10:00Z",
+                {"run": 3, "status": "completed", "started_at": "2026-11-09T10:00:00Z", "ended_at": "2026-11-09T10:10:00Z",
                  "failure_reason": null,
                  "outcome": {"kind": "available", "text": "the work was committed", "original_chars": null, "echo_chars_omitted": null, "reason": null}},
+                {"run": 2, "status": "failed", "started_at": "2026-11-09T09:00:00Z", "ended_at": "2026-11-09T09:10:00Z",
+                 "failure_reason": null,
+                 "outcome": {"kind": "truncated", "text": "x".repeat(60), "original_chars": 4_000, "echo_chars_omitted": 500, "reason": null}},
                 {"run": 1, "status": "failed", "started_at": "2026-11-09T08:00:00Z", "ended_at": "2026-11-09T08:01:00Z",
                  "failure_reason": "provider unreachable",
-                 "outcome": {"kind": "truncated", "text": "x".repeat(60), "original_chars": 4_000, "echo_chars_omitted": 500, "reason": null}},
+                 "outcome": {"kind": "unavailable", "text": null, "original_chars": null, "echo_chars_omitted": null, "reason": "the provider said nothing"}},
             ],
             "runs_omitted": 0,
             "ai_review": {"review": 2, "outcome": "approved", "issues": null, "reason": null},
@@ -364,7 +386,7 @@ mod runs_report_tests {
             "failure_reason": null,
             "failure_reason_truncated": false,
             "activity": [
-                {"seq": 2, "at": "2026-11-09T09:00:00Z", "kind": {"type": "run_started", "run": 2, "addressing_feedback": false}}
+                {"seq": 2, "at": "2026-11-09T10:10:00Z", "kind": {"type": "run_result", "run": 3, "result": {"outcome": "available", "text": "the work was committed"}}}
             ],
             "activity_omitted": 0,
         })
@@ -375,10 +397,31 @@ mod runs_report_tests {
         let text = run_report_text(&sample());
         assert!(text.contains("Fix the login flow"), "{text}");
         assert!(text.contains("provider OpenCode"), "{text}");
-        assert!(text.contains("ollama/llama3.2:3b"), "{text}");
-        assert!(text.contains("run 2 · completed"), "{text}");
+        // The configured model, saved on the Task, and the latest observed
+        // one, recorded by a run — with the Task-level identity spelled out.
+        assert!(text.contains("Model configured: ollama/llama3.2:3b"), "{text}");
+        assert!(
+            text.contains(
+                "Model observed:   ollama/llama3.2:3b (the Task's latest observed; no per-run identity is kept, and no alias is read back as evidence)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("run 3 · completed"), "{text}");
+        assert!(
+            text.contains("result: the work was committed\n"),
+            "an available outcome is echoed whole: {text}"
+        );
+        assert!(
+            text.contains("result (500 further chars in the record): xxxxxx"),
+            "a truncated outcome names exactly how much was left out, and the \
+             echoed text starts at the cut: {text}"
+        );
+        assert!(
+            text.contains("result unavailable: the provider said nothing"),
+            "an unavailable outcome is named with the record's reason: {text}"
+        );
         assert!(text.contains("run 1 · failed · provider unreachable"), "{text}");
-        assert!(text.contains("result unavailable") || text.contains("500 further chars"), "{text}");
+        assert!(text.contains("run 2 · failed"), "{text}");
         assert!(text.contains("review 2"), "{text}");
         assert!(text.contains("signoff: approved"), "{text}");
     }
@@ -410,12 +453,62 @@ mod runs_report_tests {
     }
 
     #[test]
-    fn a_configured_alias_is_never_passed_off_as_an_observed_model() {
+    fn a_failed_session_state_is_shown_as_failed_with_its_reason() {
         let mut value = sample();
-        value["observed_model"] = json!(null);
+        value["session"] = json!({
+            "live": false,
+            "status": {"failed": "the provider replied 401"},
+            "execution_id": null,
+            "started_at": "2026-11-09T10:00:00Z",
+            "stopped_at": "2026-11-09T10:01:00Z",
+        });
         let text = run_report_text(&value);
         assert!(
-            text.contains("Model observed:   none"),
+            text.contains("Session:          no live run; state failed (the provider replied 401)\n"),
+            "a failed session names its reason, not just a word: {text}"
+        );
+    }
+
+    #[test]
+    fn an_absent_session_is_shown_as_supervised_by_nothing() {
+        let mut value = sample();
+        value["session"] = json!(null);
+        let text = run_report_text(&value);
+        assert!(
+            text.contains("Session:          this instance supervises no run state\n"),
+            "an absent session is the restart shape, and says so: {text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_fix_pass_is_reported_as_such() {
+        let mut value = sample();
+        value["ai_review"] = json!({
+            "review": 2,
+            "outcome": "fix_failed",
+            "issues": null,
+            "reason": "the fix agent could not write the checkout, ***",
+        });
+        let text = run_report_text(&value);
+        assert!(
+            text.contains("AI review:        fix_failed (review 2, signoff: approved)\n"),
+            "a fix failure is its own outcome line, not a changes request: \n{text}"
+        );
+        assert!(
+            text.contains("fix agent could not write the checkout, ***"),
+            "the fix's bounded reason travels with it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_configured_alias_is_never_passed_off_as_an_observed_model() {
+        let mut value = sample();
+        value["latest_observed_model"] = json!(null);
+        let text = run_report_text(&value);
+        assert!(
+            text.contains(
+                "Model observed:   none — no run has ever reported a model; an alias is a request, never evidence\n"
+            ),
             "a reported model must not be invented from the configuration: {text}"
         );
     }
@@ -423,9 +516,30 @@ mod runs_report_tests {
     #[test]
     fn shapes_the_instance_never_sends_degrade_defensively() {
         let text = run_report_text(&serde_json::json!({}));
-        // No panic, and every line the report promises is honest about the gap.
-        assert!(text.contains("(untitled)"), "{text}");
-        assert!(text.contains("Runs:"), "{text}");
-        assert!(text.contains("none"), "{text}");
+        // No panic, and every degraded line is a specific placeholder, not a
+        // vague one: the report is honest about exactly what was not sent.
+        assert!(text.contains("Task ? \"(untitled)\" — provider ?\n"), "{text}");
+        assert!(
+            text.contains("Model configured: provider default (saved on the Task)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Model observed:   none — no run has ever reported a model; an alias is a request, never evidence\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Session:          this instance supervises no run state\n"),
+            "{text}"
+        );
+        assert!(text.contains("AI review:        none on record\n"), "{text}");
+        assert!(text.contains("Failure:          none\n"), "{text}");
+        assert!(
+            text.contains("Runs:             0 described, 0 older not described\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Activity:         0 milestone(s) echoed, 0 older not echoed\n"),
+            "{text}"
+        );
     }
 }

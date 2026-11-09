@@ -231,7 +231,9 @@ async fn handle_get_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
 // every lifecycle transition, and the live-run registry that
 // `TaskExecutor::task_run` and `TaskExecutor::get_task_output` read for the
 // desktop — so there is no second logging system, nothing is written here,
-// and nothing streams: one request, one bounded answer.
+// and nothing streams: one request, one bounded answer. Bounded twice over:
+// every echoed field has its own limit below, and their serialized sum is
+// checked once against [`MAX_EVIDENCE_RESPONSE_BYTES`] before it is sent.
 
 /// The persisted runs one evidence answer describes, newest first.
 const MAX_EVIDENCE_RUNS: usize = 5;
@@ -261,12 +263,24 @@ const MAX_EVIDENCE_FAILURE_CHARS: usize = 500;
 /// echo bounds it too and flags the cut.
 const MAX_EVIDENCE_TITLE_CHARS: usize = 300;
 /// Longest echoed model identifier, in characters. The configured model is
-/// whatever the Task record names, and the observed one is whatever the
-/// provider reported, so neither is assumed well-shaped here. Identity is
+/// whatever the Task record names, and the latest observed one is whatever the
+/// provider last reported, so neither is assumed well-shaped here. Identity is
 /// passed through faithfully up to this bound, redaction included so a
 /// credential-shaped word in a reported identifier obeys the same policy as
 /// everything else, and the cut is flagged.
 const MAX_EVIDENCE_MODEL_CHARS: usize = 200;
+/// Hard byte ceiling for one serialized evidence answer.
+///
+/// Every echoed field is already bounded by a limit above. Their sum —
+/// measured on the maximum combination of those bounds, in the test
+/// `the_whole_answer_stays_within_the_wire_frame_limit` — lands far below this
+/// number, which is itself under [`slashit_ipc::protocol::MAX_REQUEST_BYTES`],
+/// the frame limit the client reads a response back through. The check that
+/// applies this constant is the explicit aggregate bound: a record written by
+/// an older build could carry text today's bounds never earned, so an answer
+/// that would exceed the ceiling is refused once, here, rather than sent
+/// whole and unreadable at the other end.
+const MAX_EVIDENCE_RESPONSE_BYTES: usize = 512 * 1024;
 
 /// What the run-output echo says whenever it carries entries.
 const OUTPUT_MEMORY_ONLY_NOTE: &str = "The entries echoed here are held only in this instance's memory. Run output is not persisted: a restart loses all of it, and a client that asks again after one finds none of it. What survives is the Task's own record: its Activity milestones and the run outcomes echoed here.";
@@ -296,13 +310,17 @@ struct TaskEvidence {
     configured_model: Option<String>,
     /// Whether [`Self::configured_model`] was cut to its echo bound.
     configured_model_truncated: bool,
-    /// The model the provider most recently reported for one of the Task's
-    /// runs, exactly as a run recorded it. `None` when no run recorded one.
-    /// It is never inferred from the configured identifier: an alias is the
-    /// model requested, not the model that reported itself.
-    observed_model: Option<String>,
-    /// Whether [`Self::observed_model`] was cut to its echo bound.
-    observed_model_truncated: bool,
+    /// The Task's latest observed model: `last_observed_model` on the Task
+    /// record, the model the provider last reported while actually running
+    /// this Task. It is a Task-level identity, deliberately: SlashIt does not
+    /// persist which model served each individual run, so nothing here may be
+    /// attributed to one of [`Self::runs`] — a per-run observation would be
+    /// invented history. `None` when no run ever reported one, and never
+    /// inferred from the configured identifier: an alias is the model
+    /// requested, not the model that reported itself.
+    latest_observed_model: Option<String>,
+    /// Whether [`Self::latest_observed_model`] was cut to its echo bound.
+    latest_observed_model_truncated: bool,
     /// What this instance's executor holds for the Task right now. This is
     /// the only part of the answer that dies with the process, and the
     /// session's execution id is this session's evidence only: the run
@@ -402,8 +420,12 @@ struct OutcomeEvidence {
 struct AiReviewEvidence {
     /// The review ordinal the Activity record uses.
     review: u32,
-    /// `started`, `approved`, `changes_requested`, `failed`, `skipped` or
-    /// `awaiting_verdict` (the review began and recorded no verdict yet).
+    /// `started`, `approved`, `changes_requested`, `fix_failed`, `failed`,
+    /// `skipped` or `awaiting_verdict` (the review began and recorded no
+    /// verdict yet). A fix pass that ended in an error is `fix_failed` with
+    /// its bounded reason — it is not the verdict itself, which was still the
+    /// changes request the fix answered, so the two are distinguishable here:
+    /// an ordinary request for changes is `changes_requested`.
     outcome: &'static str,
     /// How many issues a changes-requested verdict listed.
     issues: Option<u32>,
@@ -729,16 +751,32 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
                 });
             }
             // A fix pass is the follow-up of a changes-requested verdict, so
-            // the verdict to report is still that one.
+            // a fix under way or finished without incident leaves the verdict
+            // to report as that one.
             Kind::AiFixStarted { review }
             | Kind::AiFixApplied { review }
-            | Kind::AiFixUnchanged { review }
-            | Kind::AiFixFailed { review, .. } => {
+            | Kind::AiFixUnchanged { review } => {
                 return Some(AiReviewEvidence {
                     review: *review,
                     outcome: "changes_requested",
                     issues: None,
                     reason: None,
+                });
+            }
+            // A fix pass that itself ended in an error is reported as such,
+            // with its bounded reason, rather than blurred into the verdict
+            // it tried to answer: the reviewer asked for changes, the fix
+            // could not deliver them, and the persistence keeps both facts.
+            Kind::AiFixFailed { review, reason } => {
+                return Some(AiReviewEvidence {
+                    review: *review,
+                    outcome: "fix_failed",
+                    issues: None,
+                    // Re-bounded here, exactly like a failed review's reason:
+                    // the record keeps at most `MAX_REASON_CHARS`, within the
+                    // failure bound, so the cut flag the bound would set
+                    // cannot fire.
+                    reason: Some(evidence_failure_reason(reason).0),
                 });
             }
             // A run that began after the last review cycle ended: that next
@@ -844,7 +882,7 @@ async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcRespo
         }
         None => (None, false),
     };
-    let (observed_model, observed_model_truncated) = match &task.last_observed_model {
+    let (latest_observed_model, latest_observed_model_truncated) = match &task.last_observed_model {
         Some(model) => {
             let (model, cut) = evidence_text(model, MAX_EVIDENCE_MODEL_CHARS);
             (Some(model), cut)
@@ -871,8 +909,8 @@ async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcRespo
         provider: task.provider.label(),
         configured_model,
         configured_model_truncated,
-        observed_model,
-        observed_model_truncated,
+        latest_observed_model,
+        latest_observed_model_truncated,
         session,
         output,
         runs,
@@ -885,8 +923,28 @@ async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcRespo
         activity_omitted,
     };
 
-    match serde_json::to_value(answer) {
-        Ok(value) => IpcResponse::success(value),
+    evidence_reply(&task_id, answer)
+}
+
+/// Serialize one assembled answer, apply the aggregate bound and wrap it.
+///
+/// The aggregate bound ([`MAX_EVIDENCE_RESPONSE_BYTES`]) applies here, to the
+/// whole response rather than to any field: individual bounds could stay
+/// within reason field by field and still blow the client's frame limit
+/// together. Too large is refused whole — trimming silently could make a
+/// client mistake what is missing for evidence that it does not exist.
+fn evidence_reply(task_id: &str, answer: TaskEvidence) -> IpcResponse {
+    match serde_json::to_string(&answer) {
+        Ok(text) if text.len() <= MAX_EVIDENCE_RESPONSE_BYTES =>
+            match serde_json::from_str(&text) {
+                Ok(value) => IpcResponse::success(value),
+                Err(e) => IpcResponse::error(format!(
+                    "Could not encode the evidence for {task_id}: {e}"
+                )),
+            },
+        Ok(_) => IpcResponse::error(format!(
+            "The evidence answer for {task_id} would exceed the response bound and was not sent"
+        )),
         Err(e) => IpcResponse::error(format!(
             "Could not encode the evidence for {task_id}: {e}"
         )),
@@ -3667,7 +3725,20 @@ mod get_task_evidence {
         assert_eq!(d["title"], "Evidence test");
         assert_eq!(d["provider"], "OpenCode");
         assert_eq!(d["configured_model"], "claude-sonnet-5-5");
-        assert_eq!(d["observed_model"], "claude-opus-4-0-20250514");
+        assert_eq!(d["latest_observed_model"], "claude-opus-4-0-20250514");
+        // The observed identity is the Task's latest, kept whole on the Task
+        // record — never broken out per run below.
+        assert_eq!(
+            d["runs"]
+                .as_array()
+                .expect("runs")
+                .iter()
+                .filter(|run| run.get("observed_model").is_some()
+                    || run.get("latest_observed_model").is_some())
+                .count(),
+            0,
+            "no run carries a model identity"
+        );
 
         // Persisted runs, newest first, with the record's own outcome. Runs
         // 1, 2 and 4 ran; the reviews are 3, and are not runs.
@@ -3687,6 +3758,11 @@ mod get_task_evidence {
         assert_eq!(runs[1]["outcome"]["original_chars"], 9_999);
         for run in runs {
             assert!(run["outcome"].is_null() || run["outcome"]["echo_chars_omitted"].is_null());
+            assert!(
+                run.get("observed_model").is_none() && run.get("latest_observed_model").is_none(),
+                "no run carries a model identity: the latest observed model is a Task-level \
+                 fact, and attributing it to a run would be invented history: {run}"
+            );
         }
 
         assert_eq!(d["ai_review"]["review"], 3);
@@ -3738,7 +3814,7 @@ mod get_task_evidence {
         let d = evidence(&ctx, &id.to_string()).await;
         assert_eq!(d["configured_model"], "haiku");
         assert!(
-            d["observed_model"].is_null(),
+            d["latest_observed_model"].is_null(),
             "an observed model was invented from a configured alias: {d}"
         );
     }
@@ -3785,9 +3861,10 @@ mod get_task_evidence {
     }
 
     /// The restart case. The Task's persisted evidence — its record, its
-    /// Activity, the run outcomes and the observed model — survives, while
-    /// everything this session held (the output, the execution id, the run
-    /// state) is gone, and the answer says so in one sentence.
+    /// Activity, the run outcomes and the Task's latest observed model —
+    /// survives, while everything this session held (the output, the
+    /// execution id, the run state) is gone, and the answer says so in one
+    /// sentence.
     #[tokio::test]
     async fn after_a_restart_the_persisted_evidence_is_all_there_is() {
         let (_tmp, first, id) = rich_world().await;
@@ -3822,7 +3899,7 @@ mod get_task_evidence {
 
         // What was durable is still there.
         assert_eq!(after["task_id"], id.to_string());
-        assert_eq!(after["observed_model"], "claude-opus-4-0-20250514");
+        assert_eq!(after["latest_observed_model"], "claude-opus-4-0-20250514");
         assert_eq!(after["runs"].as_array().map(Vec::len).unwrap(), 3);
         assert_eq!(after["runs"][0]["failure_reason"], "provider unreachable");
 
@@ -3970,6 +4047,304 @@ mod get_task_evidence {
         )
         .await
         .response
+    }
+
+    #[tokio::test]
+    async fn a_fix_failure_is_distinguished_from_an_ordinary_changes_request() {
+        // A review asked for changes, the fix pass answered, and the fix pass
+        // itself ended in an error: the persistence keeps all four facts, and
+        // the answer reports the fix failure — with its bounded reason —
+        // rather than blurring it into the changes-requested verdict it tried
+        // to answer.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        let mut task = create_test_task_full("fix failed", Uuid::new_v4(), TaskStatus::AiReview, 0);
+        let at = chrono::Utc::now();
+        task.record_activity_at(at, Kind::AiReviewStarted { review: 1 });
+        task.record_activity_at(at, Kind::AiReviewChangesRequested { review: 1, issues: 3 });
+        task.record_activity_at(at, Kind::AiFixStarted { review: 1 });
+        task.record_activity_at(
+            at,
+            Kind::AiFixFailed {
+                review: 1,
+                reason: format!(
+                    "the fix agent could not write the checkout, {SECRET_SHAPED}; {}",
+                    "e".repeat(700)
+                ),
+            },
+        );
+        let id = task.id;
+        ctx.tasks.write().await.insert(id, task);
+
+        let d = evidence(&ctx, &id.to_string()).await;
+        let review = &d["ai_review"];
+        assert_eq!(review["review"], 1, "{review}");
+        assert_eq!(
+            review["outcome"], "fix_failed",
+            "a failed fix pass is its own outcome, not a changes request: {review}"
+        );
+        // The fix's own failure explanation is kept, redacted and within the
+        // bound every echoed reason obeys.
+        assert!(!serde_json::to_string(&d).unwrap().contains(SECRET_SHAPED));
+        let reason = review["reason"].as_str().expect("reason");
+        assert!(reason.chars().count() <= MAX_EVIDENCE_FAILURE_CHARS, "{reason}");
+    }
+
+    /// A credential-shaped word versus which nothing in the answer may survive
+    /// whole.
+    const SECRET_SHAPED: &str = "ghp_theOtherToken9876543210";
+
+    #[tokio::test]
+    async fn a_fix_under_way_or_finished_without_incident_keeps_the_verdict() {
+        for kind in [
+            Kind::AiFixStarted { review: 1 },
+            Kind::AiFixApplied { review: 1 },
+            Kind::AiFixUnchanged { review: 1 },
+        ] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+                tmp.path().join("config"),
+                tmp.path().join("data"),
+                tmp.path().join("cache"),
+                tmp.path().join("runtime"),
+            ));
+            let ctx = ipc_test_context(paths);
+            let mut task =
+                create_test_task_full("fix under way", Uuid::new_v4(), TaskStatus::AiReview, 0);
+            let at = chrono::Utc::now();
+            task.record_activity_at(at, Kind::AiReviewStarted { review: 1 });
+            task.record_activity_at(at, Kind::AiReviewChangesRequested { review: 1, issues: 2 });
+            task.record_activity_at(at, kind);
+            let id = task.id;
+            ctx.tasks.write().await.insert(id, task);
+
+            let d = evidence(&ctx, &id.to_string()).await;
+            assert_eq!(
+                d["ai_review"]["outcome"], "changes_requested",
+                "the verdict to report is still the changes request: {d}"
+            );
+            assert!(d["ai_review"]["reason"].is_null(), "{d}");
+        }
+    }
+
+    /// The whole answer, largest legal combination of everything at once: a
+    /// bounding-needle title and models, a bounding failure reason, a failed
+    /// session with a bounding reason, five runs each carrying a bounding
+    /// outcome and reason, a bounding output buffer of long lines, and an
+    /// Activity history big enough to spend the echo's byte budget. The
+    /// serialized answer is the thing measured — this is how the constants
+    /// above are verified to add up under the documented wire frame limit
+    /// (`MAX_REQUEST_BYTES`, which the read the client makes is bounded by)
+    /// and under this read's own aggregate ceiling.
+    #[tokio::test]
+    async fn the_whole_answer_stays_within_the_wire_frame_limit() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full(
+            &format!("edge{}", "t".repeat(MAX_EVIDENCE_TITLE_CHARS + 100)),
+            project_id,
+            TaskStatus::Error,
+            0,
+        );
+        // Four-byte characters everywhere, so character bounds are also byte
+        // bounds; quotes and newlines so JSON escaping is spent too.
+        let fat = format!("✩{}", "ζ̈\\\"\n".repeat(300).repeat(2));
+        task.model = fat.clone();
+        task.last_observed_model = Some(fat.clone());
+        task.error_message = Some(fat.clone());
+        let at = chrono::Utc::now();
+        for run in 1..=40 {
+            task.record_activity_at(at, Kind::RunStarted { run, addressing_feedback: false });
+            task.record_activity_at(at, Kind::RunCompleted { run });
+            task.record_activity_at(
+                at,
+                Kind::RunResult {
+                    run,
+                    result: RunResult::Available {
+                        text: format!("r{run} ✩{}", "result ζ̈\\\"\n".repeat(500).repeat(3)),
+                    },
+                },
+            );
+            task.record_activity_at(
+                at,
+                Kind::RunFailed {
+                    run: Some(run),
+                    reason: format!("run {run} ✩{}", "failed ζ̈\\\"\n".repeat(500).repeat(2)),
+                },
+            );
+        }
+
+        let id = task.id;
+        ctx.tasks.write().await.insert(id, task.clone());
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let mut lines = Vec::new();
+        for i in 0..32 {
+            lines.push(format!("line {i} ✩{}", "output ζ̈\\\"\n".repeat(500).repeat(2)));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        executor
+            .record_ended_execution_for_test(
+                id,
+                crate::domain::AgentStatus::Failed(fat.clone()),
+                &refs,
+            )
+            .await;
+
+        let reply = handle_get_task_evidence(&ctx, id.to_string()).await;
+        assert!(reply.ok, "{:?}", reply.error);
+        let bytes = serde_json::to_string(&reply.data).unwrap().len();
+        // The response the handler built is within this read's own aggregate
+        // ceiling ...
+        assert!(
+            bytes <= MAX_EVIDENCE_RESPONSE_BYTES,
+            "the best-effort worst case measured {bytes} bytes"
+        );
+        // ... and within the wire frame limit, so the client the CLI makes
+        // can read the answer whole.
+        assert!(
+            u32::try_from(bytes)
+                .is_ok_and(|b| b as u64 <= slashit_ipc::protocol::MAX_REQUEST_BYTES),
+            "the best-effort worst case measured {bytes} bytes"
+        );
+    }
+
+    /// The aggregate bound fails closed: an answer past
+    /// [`MAX_EVIDENCE_RESPONSE_BYTES`] is refused whole, with a reason that
+    /// names the bound, and nothing oversized goes out with fields silently
+    /// trimmed.
+    #[test]
+    fn an_answer_past_the_aggregate_bound_is_refused_whole() {
+        let oversized = TaskEvidence {
+            task_id: "id".into(),
+            title: "m".repeat(MAX_EVIDENCE_RESPONSE_BYTES),
+            title_truncated: true,
+            provider: "OpenCode",
+            configured_model: None,
+            configured_model_truncated: false,
+            latest_observed_model: None,
+            latest_observed_model_truncated: false,
+            session: None,
+            output: OutputEvidence {
+                available: false,
+                memory_only: true,
+                note: OUTPUT_NEVER_RUN_NOTE,
+                entries_omitted: 0,
+                truncated: false,
+                entries: Vec::new(),
+            },
+            runs: Vec::new(),
+            runs_omitted: 0,
+            ai_review: None,
+            qa_signoff: None,
+            failure_reason: None,
+            failure_reason_truncated: false,
+            activity: Vec::new(),
+            activity_omitted: 0,
+        };
+        let reply = evidence_reply("39bd237c-0000-0000-0000-000000000009", oversized);
+        assert!(!reply.ok);
+        let error = reply.error.expect("an error");
+        assert!(error.contains("response bound"), "{error}");
+        assert!(error.contains("was not sent"), "{error}");
+    }
+
+    /// The CLI contract: the typed answer the actual handler produces,
+    /// serialized the way production serializes it, rendered through the
+    /// CLI's own report function. Schema and rendering are validated together,
+    /// so neither side can drift from the other: the handler renames a field,
+    /// this fails; the report loses a line, this fails.
+    #[tokio::test]
+    async fn the_cli_report_renders_the_handler_s_typed_answer() {
+        let (_tmp, ctx, id) = rich_world().await;
+        let executor = attach_test_executor_ipc(&ctx).await;
+        executor
+            .record_ended_execution_for_test(
+                id,
+                crate::domain::AgentStatus::Stopped,
+                &["Session started: e7e1f7d0 (model: claude-opus-4-0-20250514)"],
+            )
+            .await;
+        let reply = handle_get_task_evidence(&ctx, id.to_string()).await;
+        assert!(reply.ok, "{:?}", reply.error);
+
+        // Schema compatibility: every field the CLI report reads is present
+        // in the handler's serialized answer, under the exact key the CLI
+        // reads.
+        for key in [
+            "task_id",
+            "title",
+            "title_truncated",
+            "provider",
+            "configured_model",
+            "latest_observed_model",
+            "session",
+            "output",
+            "runs",
+            "runs_omitted",
+            "ai_review",
+            "qa_signoff",
+            "failure_reason",
+            "activity",
+            "activity_omitted",
+        ] {
+            assert!(
+                reply.data.get(key).is_some(),
+                "the handler's answer is missing the key the CLI report reads: {key}"
+            );
+        }
+
+        let text = slashit::output::run_report_text(&reply.data);
+        assert!(text.contains("Evidence test"), "the title: {text}");
+        assert!(text.contains("provider OpenCode"), "the provider: {text}");
+        assert!(
+            text.contains("Model configured: claude-sonnet-5-5"),
+            "the configured model, verbatim: {text}"
+        );
+        // The observed model is named as the Task's latest, not attributed to
+        // any run, and never to the configured alias instead.
+        assert!(
+            text.contains("latest observed"),
+            "the Task-level identity: {text}"
+        );
+        assert!(text.contains("claude-opus-4-0-20250514"), "the model: {text}");
+        assert!(
+            text.contains("run 4 · failed · provider unreachable"),
+            "the newest run, its status and its reason: {text}"
+        );
+        assert!(
+            text.contains("run 2 · completed") && text.contains("partial answer"),
+            "a completed run with its recorded outcome: {text}"
+        );
+        assert!(text.contains("run 1 · completed"), "an older run: {text}");
+        assert!(text.contains("review 3"), "the review ordinal: {text}");
+        assert!(text.contains("signoff: approved"), "the review signoff: {text}");
+        assert!(
+            text.contains("the last run failed: worker exited"),
+            "the Task's failure reason: {text}"
+        );
+        assert!(
+            text.contains("held only in this instance's memory"),
+            "the memory-only hold on run output: {text}"
+        );
+        assert!(
+            text.contains("[info] Session started: e7e1f7d0"),
+            "an echoed output line: {text}"
+        );
+        // Nothing was degraded on the way through: no placeholder survived.
+        assert!(!text.contains("(untitled)"), "the title rendered: {text}");
     }
 }
 
@@ -4308,9 +4683,9 @@ mod evidence_bounds_and_redaction {
             d["configured_model"].as_str().unwrap().chars().count(),
             MAX_EVIDENCE_MODEL_CHARS,
         );
-        assert_eq!(d["observed_model_truncated"], true);
+        assert_eq!(d["latest_observed_model_truncated"], true);
         assert_eq!(
-            d["observed_model"].as_str().unwrap().chars().count(),
+            d["latest_observed_model"].as_str().unwrap().chars().count(),
             MAX_EVIDENCE_MODEL_CHARS,
         );
     }
@@ -4324,7 +4699,7 @@ mod evidence_bounds_and_redaction {
         let d = echo(task).await;
         assert_eq!(d["title_truncated"], false);
         assert_eq!(d["configured_model_truncated"], false);
-        assert_eq!(d["observed_model_truncated"], false);
+        assert_eq!(d["latest_observed_model_truncated"], false);
         assert_eq!(d["configured_model"], "claude-sonnet-5-5");
     }
 }

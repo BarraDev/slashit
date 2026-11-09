@@ -11,12 +11,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The control channel answers `GetTaskEvidence`, read-only: one Task's recent
   execution evidence, assembled from its persisted record and Activity (run
   outcomes and failure reasons, the AI-review outcome and signoff, the
-  configured and the observed Worker model, the newest milestones) plus what
-  the running instance holds in memory for its latest run. The number of runs
-  and the size of the answer are bounded, and the memory-only part names
-  itself. Reached through the new `slashit runs TASK_ID` command; nothing
-  streams, nothing is stored, and no alias is ever read back as an observed
-  model.
+  configured Worker model and the Task's latest observed model — a Task-level
+  identity, not attributed to any single run — and the newest milestones) plus
+  what the running instance holds in memory for its latest run. The number of
+  runs and the size of the answer are bounded, the memory-only part names
+  itself, and a fix pass that itself failed is told apart from the changes
+  request it answered. Reached through the new `slashit runs TASK_ID`
+  command; nothing streams, nothing is stored, and no alias is ever read back
+  as an observed model.
 
 ## [0.0.3]
 

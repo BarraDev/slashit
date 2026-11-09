@@ -499,13 +499,6 @@ impl Drop for UnwritableDir {
 /// `ipc` module itself.
 pub use crate::ipc::{serve, IpcContext, IpcServer};
 
-/// An [`IpcContext`] with empty state, rooted at explicit directories.
-///
-/// Everything the IPC server does — framing, protocol versioning,
-/// authentication, authorization — is worth testing without a window, a webview
-/// or the developer's real configuration. So the event sink discards, the
-/// instance control is inert, and every path lands in whatever tempdir the
-/// caller passed.
 /// `root`'s whole subtree as (path, bytes), sorted — the shape a "this read
 /// wrote nothing" test needs to compare a directory tree before and after.
 pub fn files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
@@ -526,6 +519,13 @@ pub fn files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)>
     out
 }
 
+/// An [`IpcContext`] with empty state, rooted at explicit directories.
+///
+/// Everything the IPC server does — framing, protocol versioning,
+/// authentication, authorization — is worth testing without a window, a webview
+/// or the developer's real configuration. So the event sink discards, the
+/// instance control is inert, and every path lands in whatever tempdir the
+/// caller passed.
 pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -> IpcContext {
     use std::collections::HashMap;
     use std::sync::Arc;

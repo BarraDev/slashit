@@ -44,11 +44,14 @@ pub enum IpcRequest {
     ///
     /// The answer is built from evidence that already exists: the Task's
     /// persisted Activity and its Task record (run outcomes, review outcomes,
-    /// the configured and the observed model), plus what the running instance
-    /// still holds in memory for the Task's latest run — the same data the
-    /// desktop's `get_task_run` and `get_task_output` commands serve the UI.
-    /// The in-memory part exists only for this instance's lifetime and is gone
-    /// after a restart; the answer says so. The number of runs described and
+    /// the configured model and the Task's latest observed model), plus what
+    /// the running instance still holds in memory for the Task's latest run —
+    /// the same data the desktop's `get_task_run` and `get_task_output`
+    /// commands serve the UI. The in-memory part exists only for this
+    /// instance's lifetime and is gone after a restart; the answer says so.
+    /// The observed model is a Task-level identity, not attributed to any
+    /// single run — per-run model history is not persisted — and it is never
+    /// inferred from the configured alias. The number of runs described and
     /// the bytes of the answer are bounded by the instance.
     GetTaskEvidence { task_id: String },
     /// Create a new task

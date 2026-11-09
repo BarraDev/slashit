@@ -121,6 +121,10 @@ updater-test-endpoints = []
 # `target/<profile>/acp_fixture_agent`. A plain `cargo build` does not enable
 # dev-dependency features (resolver 2), so the binary is not built for it.
 slashit-ui = { path = ".", features = ["acp-fixture"] }
+# TEST-ONLY. The `slashit runs` report function the CLI prints through, so a
+# handler test can render the answer the handler really produced and catch
+# schema or wording drift between the two crates.
+slashit = { path = "../crates/slashit-cli" }
 # TEST-ONLY. Deterministic fault injection for the durable write protocol.
 slashit-durable-fs = { path = "../crates/slashit-durable-fs", features = ["fault-injection"] }
 # TEST-ONLY. `test-util` is what makes `tokio::time::pause` available, so a

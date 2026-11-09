@@ -5,13 +5,11 @@
 //! The instance may be the desktop app or the headless daemon; the CLI does not
 //! care, and `slashit ping` is how a user finds out which one answered.
 
-mod client;
-mod output;
-
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use slashit::{client, output};
 use slashit_ipc::client::{ClientError, ClientOptions};
 use slashit_ipc::{InstanceInfo, IpcRequest};
 
@@ -62,10 +60,12 @@ enum Commands {
     ///
     /// The answer reports the Task's persisted runs and their outcomes, the
     /// AI-review outcome and signoff where kept, the configured Worker model
-    /// (the saved Task model) and the observed one where a run recorded it,
-    /// the newest Activity milestones, and this instance's hold on the latest
-    /// run — which is memory only, and the answer says when it is gone. The
-    /// number of runs and the size of the answer are bounded by the instance.
+    /// (the saved Task model) and the Task's latest observed model where a
+    /// run recorded one — a Task-level identity, not attributed to any single
+    /// run — plus the newest Activity milestones, and this instance's hold on
+    /// the latest run, which is memory only; the answer says when it is gone.
+    /// The number of runs and the size of the answer are bounded by the
+    /// instance.
     Runs {
         /// Task ID
         task_id: String,
