@@ -20932,7 +20932,8 @@ VERDICT: APPROVED"
             );
             let task = settled(&w).await;
             assert_eq!(task.status, TaskStatus::AiReview, "error: {:?}", task.error_message);
-            assert_eq!(agent.launches("opencode"), 1, "one OpenCode run");
+            // The first is the `--version` probe that precedes every run.
+            assert_eq!(agent.launches("opencode"), 2, "one version probe and one OpenCode run");
             assert_eq!(agent.launches("claude"), 0, "the Worker never ran as Claude");
 
             let executions = w.executor.executions.read().await;
