@@ -637,6 +637,90 @@ async fn task_evidence_is_readable_by_a_verified_tcp_peer_and_never_writes() {
     assert_eq!(response.data["task_id"], id.to_string());
 }
 
+/// The fail-closed case over the wire: evidence is still a privileged read,
+/// so a TCP client the credential does not vouch for gets the same refusal it
+/// would get for any other verb, and learns nothing about the Task it named.
+/// The typed client refuses to send an unauthenticated request at all
+/// (`TokenRequired`), so these go out as raw envelopes, the way an attacker
+/// would send them.
+#[tokio::test]
+async fn task_evidence_is_refused_without_the_tcp_token() {
+    let h = Harness::start().await;
+    let id = seed_evidence_task(&h).await;
+
+    let demanded = envelope_roundtrip(
+        &h.tcp,
+        &serde_json::to_value(IpcEnvelope::new(IpcRequest::GetTaskEvidence {
+            task_id: id.to_string(),
+        }))
+        .unwrap(),
+    )
+    .await;
+    let error = error_of(&demanded);
+    assert!(
+        error.to_lowercase().contains("authentication"),
+        "no token, no evidence: {error}"
+    );
+    assert!(
+        !error.contains(&id.to_string()),
+        "the refusal must not name the task"
+    );
+
+    let wrong = envelope_roundtrip(
+        &h.tcp,
+        &serde_json::to_value(IpcEnvelope::with_auth(
+            IpcRequest::GetTaskEvidence { task_id: id.to_string() },
+            "0".repeat(64),
+        ))
+        .unwrap(),
+    )
+    .await;
+    let error = error_of(&wrong);
+    assert!(
+        error.to_lowercase().contains("authentication"),
+        "a guessed token is refused, not debatable: {error}"
+    );
+    assert!(
+        !serde_json::to_string(&wrong)
+            .unwrap()
+            .contains(&id.to_string()),
+        "an unauthenticated answer must not reach the task"
+    );
+}
+
+/// A request no parser can read fails closed: a malformed `get_task_evidence`
+/// envelope is a decode error, never an answer.
+#[tokio::test]
+async fn task_evidence_fails_closed_on_a_malformed_envelope() {
+    let h = Harness::start().await;
+
+    let no_id = envelope_roundtrip(
+        &h.local,
+        &serde_json::json!({ "version": PROTOCOL_VERSION, "cmd": "get_task_evidence" }),
+    )
+    .await;
+    let error = error_of(&no_id);
+    assert!(
+        error.starts_with("Invalid request"),
+        "a malformed request is told apart from an answer: {error}"
+    );
+
+    let not_an_id = envelope_roundtrip(
+        &h.local,
+        &serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "cmd": "get_task_evidence",
+            "task_id": 12_345
+        }),
+    )
+    .await;
+    let error = error_of(&not_an_id);
+    assert!(
+        error.starts_with("Invalid request"),
+        "a task_id of the wrong type is malformed: {error}"
+    );
+}
+
 
 // ---------------------------------------------------------------------------
 // Single-instance ownership

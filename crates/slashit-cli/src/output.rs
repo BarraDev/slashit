@@ -279,6 +279,8 @@ pub(crate) fn run_report_text(data: &serde_json::Value) -> String {
 
 /// A run state, for one line: `starting`, `running`, `stopping`, `stopped`,
 /// `failed (reason)` or `none` when this instance never saw the task run.
+/// The failed reason arrives already redacted and bounded by the instance,
+/// in line with everything else the answer echoes.
 fn describe_status(status: &serde_json::Value) -> String {
     match status {
         serde_json::Value::Null => "none (nothing has run in this instance)".to_string(),

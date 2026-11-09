@@ -256,6 +256,17 @@ const MAX_EVIDENCE_RESULT_CHARS: usize = 1_000;
 /// entry is already one bounded line; a Task's `error_message` is not, so it
 /// is redacted and cut here.
 const MAX_EVIDENCE_FAILURE_CHARS: usize = 500;
+/// Longest echoed Task title, in characters. A title is the person's own
+/// wording, bounded by the request that created it but by nothing else; the
+/// echo bounds it too and flags the cut.
+const MAX_EVIDENCE_TITLE_CHARS: usize = 300;
+/// Longest echoed model identifier, in characters. The configured model is
+/// whatever the Task record names, and the observed one is whatever the
+/// provider reported, so neither is assumed well-shaped here. Identity is
+/// passed through faithfully up to this bound, redaction included so a
+/// credential-shaped word in a reported identifier obeys the same policy as
+/// everything else, and the cut is flagged.
+const MAX_EVIDENCE_MODEL_CHARS: usize = 200;
 
 /// What the run-output echo says whenever it carries entries.
 const OUTPUT_MEMORY_ONLY_NOTE: &str = "The entries echoed here are held only in this instance's memory. Run output is not persisted: a restart loses all of it, and a client that asks again after one finds none of it. What survives is the Task's own record: its Activity milestones and the run outcomes echoed here.";
@@ -271,18 +282,27 @@ const OUTPUT_NEVER_RUN_NOTE: &str = "This instance holds no run output for this 
 #[derive(Debug, serde::Serialize)]
 struct TaskEvidence {
     task_id: String,
+    /// The Task's own title, redacted, bounded to
+    /// [`MAX_EVIDENCE_TITLE_CHARS`], with [`Self::title_truncated`] set when
+    /// it was cut.
     title: String,
+    /// Whether [`Self::title`] was cut to its echo bound.
+    title_truncated: bool,
     /// Which coding Worker the Task runs on, as the Task record keeps it.
     provider: &'static str,
     /// The Task's saved Worker model, as a launch names it (`None` when the
     /// Task asks for the provider default). This is configuration, nothing
     /// more: it is never read back as evidence of what ran.
     configured_model: Option<String>,
+    /// Whether [`Self::configured_model`] was cut to its echo bound.
+    configured_model_truncated: bool,
     /// The model the provider most recently reported for one of the Task's
     /// runs, exactly as a run recorded it. `None` when no run recorded one.
     /// It is never inferred from the configured identifier: an alias is the
     /// model requested, not the model that reported itself.
     observed_model: Option<String>,
+    /// Whether [`Self::observed_model`] was cut to its echo bound.
+    observed_model_truncated: bool,
     /// What this instance's executor holds for the Task right now. This is
     /// the only part of the answer that dies with the process, and the
     /// session's execution id is this session's evidence only: the run
@@ -324,8 +344,10 @@ struct SessionEvidence {
     live: bool,
     /// The owned run's state (`starting`, `running`, `stopping`), or, once
     /// the run is gone, how this session's latest execution for the Task
-    /// ended (`stopped`, `failed`). `None` when nothing has run in this
-    /// session. How the Task looks after a restart is visible here: absent.
+    /// ended (`stopped`, or `failed` with its reason — the failure text is
+    /// externally influenced, so it is redacted and bounded like any echoed
+    /// free text). `None` when nothing has run in this session. How the Task
+    /// looks after a restart is visible here: absent.
     status: Option<crate::domain::AgentStatus>,
     /// This session's execution identity, when one is recorded. Never
     /// persisted, and never inferred from a run's persisted number.
@@ -340,8 +362,10 @@ struct RunEvidence {
     /// The run's number: the identity the Activity record gives it (starting
     /// at 1), the same number the Task's timeline and its review records show.
     run: u32,
-    /// `started`, `completed`, `failed` or `recovery_required` — the latest
-    /// end the record has, or `started` while the record says it never ended.
+    /// `started`, `completed`, `failed` or `recovery_required` — the run's
+    /// latest recorded end, or `started` while the record says it never
+    /// ended. The record is read newest first, so an older end event never
+    /// overrules what a newer one decided.
     status: &'static str,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     /// When the record's latest end for this run happened.
@@ -407,18 +431,29 @@ struct OutputEvidence {
     entries: Vec<serde_json::Value>,
 }
 
-/// `reason` redacted and cut to the failure-echo bound.
-fn evidence_failure_reason(reason: &str) -> (String, bool) {
-    let redacted = slashit_activity::redact(reason);
-    let chars = redacted.chars().count();
-    if chars > MAX_EVIDENCE_FAILURE_CHARS {
-        (
-            redacted.chars().take(MAX_EVIDENCE_FAILURE_CHARS).collect(),
-            true,
-        )
+/// `text` cut to `max` characters, and whether the cut happened.
+fn evidence_cut(text: &str, max: usize) -> (String, bool) {
+    let chars = text.chars().count();
+    if chars > max {
+        (text.chars().take(max).collect(), true)
     } else {
-        (redacted, false)
+        (text.to_string(), false)
     }
+}
+
+/// Free text the answer echoes, redacted first and cut after, so a mask is
+/// never cut in half. `redact` is idempotent, so already-redacted activity
+/// text passes through unchanged.
+fn evidence_text(text: &str, max: usize) -> (String, bool) {
+    evidence_cut(&slashit_activity::redact(text), max)
+}
+
+/// One failure reason, redacted and cut to the failure-echo bound. A reason
+/// on an Activity entry was redacted and bounded to
+/// `slashit_activity::MAX_REASON_CHARS` when it was recorded; a Task's
+/// `error_message` was not, so every echoed reason passes through here.
+fn evidence_failure_reason(reason: &str) -> (String, bool) {
+    evidence_text(reason, MAX_EVIDENCE_FAILURE_CHARS)
 }
 
 /// Echo the run output this instance holds, bounded, most recent first.
@@ -429,8 +464,6 @@ fn evidence_output(
     entries: Vec<crate::domain::AgentLogEntry>,
     persisted_evidence: bool,
 ) -> OutputEvidence {
-    let redact = slashit_activity::redact;
-
     let total = entries.len();
     let hold = entries
         .into_iter()
@@ -440,15 +473,8 @@ fn evidence_output(
     let mut truncated = false;
     let mut echoed = Vec::with_capacity(hold.len());
     for entry in hold {
-        let redacted = redact(&entry.message);
-        let chars = redacted.chars().count();
-        let cut = chars > MAX_EVIDENCE_MESSAGE_CHARS;
+        let (message, cut) = evidence_text(&entry.message, MAX_EVIDENCE_MESSAGE_CHARS);
         truncated |= cut;
-        let message = if cut {
-            redacted.chars().take(MAX_EVIDENCE_MESSAGE_CHARS).collect()
-        } else {
-            redacted
-        };
         echoed.push(serde_json::json!({
             "timestamp": entry.timestamp,
             "level": entry.level,
@@ -496,6 +522,23 @@ fn evidence_failure(
     (None, false)
 }
 
+/// The session's run state, as the evidence echoes it. A `failed` state
+/// carries the run's recorded error message — externally influenced text,
+/// since a provider error shaped it — so it is redacted and cut to the same
+/// bound a persisted failure gets; the other states are fixed identifiers
+/// and pass through.
+fn evidence_session_status(
+    status: Option<crate::domain::AgentStatus>,
+) -> Option<crate::domain::AgentStatus> {
+    status.map(|status| match status {
+        crate::domain::AgentStatus::Failed(reason) => {
+            let (reason, _) = evidence_failure_reason(&reason);
+            crate::domain::AgentStatus::Failed(reason)
+        }
+        other => other,
+    })
+}
+
 /// The persisted runs, newest first, bounded, from the Activity record.
 fn evidence_runs(activity: &[slashit_activity::Entry]) -> (Vec<RunEvidence>, usize) {
     use slashit_activity::Kind;
@@ -535,32 +578,42 @@ fn evidence_runs(activity: &[slashit_activity::Entry]) -> (Vec<RunEvidence>, usi
             failure_reason: None,
             outcome: None,
         };
-        // Later entries decide: a run that recovered and then completed is
-        // recorded as completed, and the recovery is its earlier history.
+        // The Activity is read newest first here, so the first valid end
+        // event matched below is the run's latest one, and once an end has
+        // settled, every older one is skipped: the run's status, its
+        // `ended_at` and its failure reason all come from that one, latest
+        // end event, and an older end of a different kind — or another
+        // run's events, which never match the guard — cannot override it.
+        let mut ended = false;
         for entry in activity.iter().rev() {
             match &entry.kind {
                 Kind::RunStarted { run: r, .. } if r == run => {
-                    evidence.started_at = Some(entry.at);
+                    if evidence.started_at.is_none() {
+                        evidence.started_at = Some(entry.at);
+                    }
                 }
-                Kind::RunCompleted { run: r } if r == run => {
+                Kind::RunCompleted { run: r } if r == run && !ended => {
+                    ended = true;
                     evidence.status = "completed";
                     evidence.ended_at = Some(entry.at);
                 }
                 Kind::RunFailed {
                     run: Some(r),
                     reason,
-                } if r == run => {
+                } if r == run && !ended => {
+                    ended = true;
                     evidence.status = "failed";
                     evidence.ended_at = Some(entry.at);
-                    let _ = evidence.failure_reason.get_or_insert(reason.clone());
+                    evidence.failure_reason = Some(reason.clone());
                 }
                 Kind::RecoveryRequired {
                     run: Some(r),
                     reason,
-                } if r == run => {
+                } if r == run && !ended => {
+                    ended = true;
                     evidence.status = "recovery_required";
                     evidence.ended_at = Some(entry.at);
-                    let _ = evidence.failure_reason.get_or_insert(reason.clone());
+                    evidence.failure_reason = Some(reason.clone());
                 }
                 Kind::RunResult { run: r, result } if r == run => {
                     evidence.outcome.get_or_insert_with(|| evidence_outcome(result));
@@ -661,7 +714,10 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
                     review: *review,
                     outcome: "failed",
                     issues: None,
-                    reason: Some(reason.clone()),
+                    // Re-bounded here: the record keeps at most
+                    // `MAX_REASON_CHARS`, within the failure bound, so the
+                    // cut flag the bound would set cannot fire.
+                    reason: Some(evidence_failure_reason(reason).0),
                 });
             }
             Kind::AiReviewSkipped { review, reason } => {
@@ -669,7 +725,7 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
                     review: *review,
                     outcome: "skipped",
                     issues: None,
-                    reason: Some(reason.clone()),
+                    reason: Some(evidence_failure_reason(reason).0),
                 });
             }
             // A fix pass is the follow-up of a changes-requested verdict, so
@@ -764,7 +820,9 @@ async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcRespo
 
     let session = snapshot.as_ref().map(|snapshot| SessionEvidence {
         live: snapshot.live,
-        status: snapshot.status.clone(),
+        // A failed state names the run's error, so it goes out as any echoed
+        // free text does: redacted and bounded.
+        status: evidence_session_status(snapshot.status.clone()),
         execution_id: snapshot.last_execution.as_ref().map(|e| e.id.to_string()),
         started_at: snapshot.last_execution.as_ref().map(|e| e.started_at),
         stopped_at: snapshot.last_execution.as_ref().and_then(|e| e.stopped_at),
@@ -774,6 +832,25 @@ async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcRespo
     let ai_review = evidence_ai_review(&task.activity);
     let (failure_reason, failure_reason_truncated) =
         evidence_failure(&task, snapshot.as_ref());
+
+    // The title and the model identifiers are echoed through the same
+    // redaction and bound the rest of the answer obeys; each cut is flagged
+    // rather than silent.
+    let (title, title_truncated) = evidence_text(&task.title, MAX_EVIDENCE_TITLE_CHARS);
+    let (configured_model, configured_model_truncated) = match task.configured_model() {
+        Some(model) => {
+            let (model, cut) = evidence_text(model, MAX_EVIDENCE_MODEL_CHARS);
+            (Some(model), cut)
+        }
+        None => (None, false),
+    };
+    let (observed_model, observed_model_truncated) = match &task.last_observed_model {
+        Some(model) => {
+            let (model, cut) = evidence_text(model, MAX_EVIDENCE_MODEL_CHARS);
+            (Some(model), cut)
+        }
+        None => (None, false),
+    };
 
     let qa_signoff = task.qa_signoff.as_ref().map(|s| match s.status {
         crate::domain::QaStatus::Approved => "approved".to_string(),
@@ -789,10 +866,13 @@ async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcRespo
 
     let answer = TaskEvidence {
         task_id: task.id.to_string(),
-        title: task.title.clone(),
+        title,
+        title_truncated,
         provider: task.provider.label(),
-        configured_model: task.configured_model().map(str::to_string),
-        observed_model: task.last_observed_model.clone(),
+        configured_model,
+        configured_model_truncated,
+        observed_model,
+        observed_model_truncated,
         session,
         output,
         runs,
@@ -2594,21 +2674,7 @@ mod get_task {
     }
 
     fn files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else {
-                    let bytes = std::fs::read(&path).unwrap_or_default();
-                    out.push((path, bytes));
-                }
-            }
-        }
-        out.sort();
-        out
+        crate::test_helpers::files_under(root)
     }
 
     async fn rich_world() -> (tempfile::TempDir, IpcContext, Uuid) {
@@ -3589,21 +3655,7 @@ mod get_task_evidence {
     }
 
     fn files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else {
-                    let bytes = std::fs::read(&path).unwrap_or_default();
-                    out.push((path, bytes));
-                }
-            }
-        }
-        out.sort();
-        out
+        crate::test_helpers::files_under(root)
     }
 
     #[tokio::test]
@@ -3696,11 +3748,15 @@ mod get_task_evidence {
         let (_tmp, ctx, id) = rich_world().await;
         let executor = attach_test_executor_ipc(&ctx).await;
         let execution = executor
-            .record_ended_execution_for_test(id, &[
-                "Session started: 11111111-1111-1111-1111-111111111111 (model: claude-opus-4-0-20250514)",
-                "Using tool: Bash",
-                "wrote ghp_abcdefghij123456 into the patch",
-            ])
+            .record_ended_execution_for_test(
+                id,
+                crate::domain::AgentStatus::Stopped,
+                &[
+                    "Session started: 11111111-1111-1111-1111-111111111111 (model: claude-opus-4-0-20250514)",
+                    "Using tool: Bash",
+                    "wrote ghp_abcdefghij123456 into the patch",
+                ],
+            )
             .await;
 
         let d = evidence(&ctx, &id.to_string()).await;
@@ -3737,7 +3793,13 @@ mod get_task_evidence {
         let (_tmp, first, id) = rich_world().await;
         let task = first.tasks.read().await.get(&id).expect("seeded").clone();
         let executor = attach_test_executor_ipc(&first).await;
-        executor.record_ended_execution_for_test(id, &["this session saw output"]).await;
+        executor
+            .record_ended_execution_for_test(
+                id,
+                crate::domain::AgentStatus::Stopped,
+                &["this session saw output"],
+            )
+            .await;
 
         // A second instance over the same storage: the task is re-read from
         // the board, and this new process's executor has its own empty maps.
@@ -3758,7 +3820,7 @@ mod get_task_evidence {
 
         let after = evidence(&ctx, &id.to_string()).await;
 
-        // What was dusturable is still there.
+        // What was durable is still there.
         assert_eq!(after["task_id"], id.to_string());
         assert_eq!(after["observed_model"], "claude-opus-4-0-20250514");
         assert_eq!(after["runs"].as_array().map(Vec::len).unwrap(), 3);
@@ -3908,5 +3970,361 @@ mod get_task_evidence {
         )
         .await
         .response
+    }
+}
+
+/// What a run's recorded end events decide for it. Regression tests for the
+/// reconstruction rule: the record is scanned newest first, the FIRST valid
+/// end event that matches a run settles that run's `status` and `ended_at`,
+/// and neither an older end event of a different kind nor any event naming
+/// another run can override the decision. The entries are built directly (a
+/// record could arrive this way from an older version of the app or a bug),
+/// which is exactly the shape the rule must survive.
+#[cfg(test)]
+mod evidence_run_end_events {
+    use super::*;
+    use slashit_activity::{Entry, Kind, RunResult};
+
+    fn entry(seq: u32, kind: Kind) -> Entry {
+        Entry {
+            seq,
+            at: chrono::DateTime::from_timestamp(1_700_000_000 + i64::from(seq), 0)
+                .expect("an instant"),
+            kind,
+        }
+    }
+
+    fn start(run: u32) -> Kind {
+        Kind::RunStarted { run, addressing_feedback: false }
+    }
+
+    fn started(run: u32, entries: &[Entry]) -> Vec<Entry> {
+        let mut entries = entries.to_vec();
+        entries.insert(0, entry(0, start(run)));
+        entries
+    }
+
+    fn run_of(entries: &[Entry]) -> RunEvidence {
+        evidence_runs(entries).0.into_iter().next().expect("a run was named")
+    }
+
+    #[test]
+    fn a_completion_recorded_after_a_failure_stays_completed() {
+        let mut entries = started(1, &[entry(
+            2,
+            Kind::RunFailed { run: Some(1), reason: "provider dropped".into() },
+        )]);
+        entries.push(entry(3, Kind::RunCompleted { run: 1 }));
+
+        let run = run_of(&entries);
+        assert_eq!(run.status, "completed");
+        assert!(run.failure_reason.is_none(), "a completed run carries no failure");
+        assert_eq!(run.started_at, Some(entries[0].at));
+        assert_eq!(run.ended_at, Some(entries[2].at), "the latest end's time");
+    }
+
+    #[test]
+    fn a_failure_recorded_after_a_completion_reads_failed() {
+        let mut entries = started(1, &[entry(2, Kind::RunCompleted { run: 1 })]);
+        entries.push(entry(3, Kind::RunFailed { run: Some(1), reason: "crashed at the end".into() }));
+
+        let run = run_of(&entries);
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.failure_reason.as_deref(), Some("crashed at the end"));
+        assert_eq!(run.ended_at, Some(entries[2].at));
+    }
+
+    #[test]
+    fn runs_keep_their_own_events_when_they_are_interleaved() {
+        let entries = started(1, &[
+            entry(2, start(2)),
+            entry(3, Kind::RunFailed { run: Some(2), reason: "run 2 out of memory".into() }),
+            entry(4, Kind::RunResult {
+                run: 1,
+                result: RunResult::Available { text: "run 1's answer".into() },
+            }),
+            entry(5, Kind::RunCompleted { run: 1 }),
+        ]);
+
+        let (runs, omitted) = evidence_runs(&entries);
+        assert_eq!(omitted, 0);
+        assert_eq!(runs.len(), 2);
+        // Newest run first, each with only its own history: run 2's failure
+        // never touches run 1, and run 1's completion never rewrites run 2.
+        assert_eq!(runs[0].run, 2);
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].failure_reason.as_deref(), Some("run 2 out of memory"));
+        assert!(runs[0].outcome.is_none());
+        assert_eq!(runs[1].run, 1);
+        assert_eq!(runs[1].status, "completed");
+        assert!(runs[1].failure_reason.is_none());
+        assert_eq!(
+            runs[1].outcome.as_ref().and_then(|o| o.text.as_deref()),
+            Some("run 1's answer"),
+        );
+    }
+
+    #[test]
+    fn a_run_the_record_never_ended_reads_started() {
+        let entries = started(1, &[entry(1, Kind::ToolUsed { run: 1, tool: "Bash".into(), detail: None, count: 1 })]);
+
+        let run = run_of(&entries);
+        assert_eq!(run.status, "started");
+        assert!(run.failure_reason.is_none());
+        assert!(run.ended_at.is_none());
+        assert_eq!(run.started_at, Some(entries[0].at));
+    }
+
+    #[test]
+    fn a_recovery_is_earlier_history_of_a_later_completion() {
+        let mut entries = started(1, &[
+            entry(2, Kind::RecoveryRequired { run: Some(1), reason: "the run ended uncleanly".into() }),
+            entry(3, Kind::NewAttemptAuthorized { run: 1 }),
+        ]);
+        entries.push(entry(4, Kind::RunCompleted { run: 1 }));
+
+        let run = run_of(&entries);
+        assert_eq!(run.status, "completed");
+        assert!(run.failure_reason.is_none(), "the deciding end is the completion");
+        assert_eq!(run.ended_at, Some(entries[3].at));
+    }
+}
+
+/// Every echoed field obeys the same redaction and bound. Regression tests
+/// with representative secrets: a credential-shaped value that reaches any
+/// echo — through the Task's error message, a failed session state, an
+/// output line, an AI-review reason or a run result — goes out masked, and
+/// every variable-length field is cut with its flag set.
+#[cfg(test)]
+mod evidence_bounds_and_redaction {
+    use super::*;
+    use crate::test_helpers::{attach_test_executor_ipc, create_test_task_full, ipc_test_context};
+    use slashit_activity::{Kind, RunResult};
+    use std::sync::Arc;
+
+    /// One call: a Github-shaped token versus which nothing in the answer may
+    /// survive whole.
+    const SECRET: &str = "ghp_theTokenToFind0123456789";
+
+    async fn read_evidence(ctx: &IpcContext, id: &str) -> serde_json::Value {
+        let reply = dispatch(
+            IpcRequest::GetTaskEvidence { task_id: id.to_string() },
+            ctx,
+            &PeerContext {
+                endpoint: slashit_ipc::Endpoint::Unix {
+                    path: std::path::PathBuf::from("/nonexistent-for-tests"),
+                },
+                os_verified: true,
+            },
+        )
+        .await
+        .response;
+        assert!(reply.ok, "{:?}", reply.error);
+        reply.data
+    }
+
+    async fn echo(task: crate::domain::Task) -> serde_json::Value {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        let id = task.id;
+        ctx.tasks.write().await.insert(id, task);
+        let d = read_evidence(&ctx, &id.to_string()).await;
+        // The tempdir is dropped here; the answer was read before that.
+        drop(tmp);
+        d
+    }
+
+    fn task_with(title: &str, error_message: Option<String>) -> crate::domain::Task {
+        let mut task = create_test_task_full(title, Uuid::new_v4(), TaskStatus::Error, 0);
+        task.error_message = error_message;
+        task
+    }
+
+    fn field_leaks(d: &serde_json::Value, secret: &str) {
+        assert!(
+            !serde_json::to_string(d).unwrap().contains(secret),
+            "the secret reached the response unmasked: {d}"
+        );
+        assert!(
+            serde_json::to_string(d).unwrap().contains(slashit_activity::MASK),
+            "no mask anywhere: the redaction was not exercised: {d}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_error_message_is_redacted_cut_and_flagged() {
+        let reason = format!(
+            "the provider refused the run; token {SECRET}; {}",
+            "x".repeat(1_200),
+        );
+        let d = echo(task_with("failed task", Some(reason))).await;
+
+        field_leaks(&d, SECRET);
+        assert_eq!(d["failure_reason_truncated"], true);
+        let echoed = d["failure_reason"].as_str().expect("reason");
+        assert_eq!(echoed.chars().count(), MAX_EVIDENCE_FAILURE_CHARS);
+    }
+
+    #[tokio::test]
+    async fn a_failed_session_state_names_a_redacted_reason() {
+        let task = task_with("failed in this session", None);
+        let id = task.id;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        ctx.tasks.write().await.insert(id, task);
+        let executor = attach_test_executor_ipc(&ctx).await;
+        executor
+            .record_ended_execution_for_test(
+                id,
+                crate::domain::AgentStatus::Failed(format!(
+                    "the provider replied 401 to token {SECRET}"
+                )),
+                &[],
+            )
+            .await;
+
+        let d = read_evidence(&ctx, &id.to_string()).await;
+        field_leaks(&d, SECRET);
+        let status = d["session"]["status"].as_object().expect("a failed state");
+        assert!(status.contains_key("failed"), "{status:?}");
+        let reason = status["failed"].as_str().expect("the failure text");
+        assert!(reason.chars().count() <= MAX_EVIDENCE_FAILURE_CHARS);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_output_line_is_redacted_cut_and_flagged() {
+        let task = task_with("chatty failure", None);
+        let id = task.id;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        ctx.tasks.write().await.insert(id, task);
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let line = format!("the run printed token {SECRET} and then {}", "y".repeat(900));
+        executor
+            .record_ended_execution_for_test(id, crate::domain::AgentStatus::Stopped, &[&line])
+            .await;
+
+        let d = read_evidence(&ctx, &id.to_string()).await;
+        field_leaks(&d, SECRET);
+        let entry = &d["output"]["entries"][0];
+        assert_eq!(entry["message_truncated"], true);
+        let message = entry["message"].as_str().expect("message");
+        assert!(message.chars().count() <= MAX_EVIDENCE_MESSAGE_CHARS);
+        assert_eq!(d["output"]["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_run_failure_named_a_secret_is_masked() {
+        let mut task = task_with("failed loudly", None);
+        let at = chrono::Utc::now();
+        task.record_activity_at(at, Kind::RunStarted { run: 1, addressing_feedback: false });
+        task.record_activity_at(
+            at,
+            Kind::RunFailed {
+                run: Some(1),
+                reason: format!("the run's own last line was token {SECRET}"),
+            },
+        );
+
+        let d = echo(task).await;
+        field_leaks(&d, SECRET);
+        let reason = d["runs"][0]["failure_reason"].as_str().expect("reason");
+        assert!(reason.chars().count() <= slashit_activity::MAX_REASON_CHARS);
+    }
+
+    #[tokio::test]
+    async fn an_ai_review_failure_reason_is_redacted_and_bounded() {
+        let mut task = task_with("review failed", None);
+        task.record_activity_at(
+            chrono::Utc::now(),
+            Kind::AiReviewFailed {
+                review: 1,
+                reason: format!("the reviewer could not read its credentials, {SECRET}; {}", "z".repeat(2_000)),
+            },
+        );
+
+        let d = echo(task).await;
+        field_leaks(&d, SECRET);
+        let reason = d["ai_review"]["reason"].as_str().expect("reason");
+        assert!(reason.chars().count() <= slashit_activity::MAX_REASON_CHARS, "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_run_result_keeps_a_secret_masked_and_within_the_echo_bound() {
+        let mut task = task_with("big result", None);
+        let at = chrono::Utc::now();
+        task.record_activity_at(at, Kind::RunStarted { run: 1, addressing_feedback: false });
+        task.record_activity_at(
+            at,
+            Kind::RunResult {
+                run: 1,
+                result: RunResult::Available {
+                    text: format!("the patch holds {SECRET} and {}", "w".repeat(3_000)),
+                },
+            },
+        );
+
+        let d = echo(task).await;
+        field_leaks(&d, SECRET);
+        let outcome = &d["runs"][0]["outcome"];
+        // The record stored the whole (redacted) answer within its own bound,
+        // so the echo's tighter bound is what cut it, and the flag says so.
+        assert_eq!(
+            outcome["text"].as_str().unwrap().chars().count(),
+            MAX_EVIDENCE_RESULT_CHARS,
+        );
+        assert!(outcome["echo_chars_omitted"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn the_title_and_the_model_identifiers_are_bounded_and_flagged() {
+        let mut task = task_with(&format!("t{}", "m".repeat(2_000)), None);
+        task.model = "n".repeat(500);
+        task.last_observed_model = Some("o".repeat(500));
+
+        let d = echo(task).await;
+        assert_eq!(d["title_truncated"], true);
+        assert_eq!(d["title"].as_str().unwrap().chars().count(), MAX_EVIDENCE_TITLE_CHARS);
+        assert_eq!(d["configured_model_truncated"], true);
+        assert_eq!(
+            d["configured_model"].as_str().unwrap().chars().count(),
+            MAX_EVIDENCE_MODEL_CHARS,
+        );
+        assert_eq!(d["observed_model_truncated"], true);
+        assert_eq!(
+            d["observed_model"].as_str().unwrap().chars().count(),
+            MAX_EVIDENCE_MODEL_CHARS,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_untouched_title_and_models_carry_no_flag() {
+        let mut task = task_with("clean", None);
+        task.model = "claude-sonnet-5-5".to_string();
+        task.last_observed_model = Some("a-provider/model-name".to_string());
+
+        let d = echo(task).await;
+        assert_eq!(d["title_truncated"], false);
+        assert_eq!(d["configured_model_truncated"], false);
+        assert_eq!(d["observed_model_truncated"], false);
+        assert_eq!(d["configured_model"], "claude-sonnet-5-5");
     }
 }

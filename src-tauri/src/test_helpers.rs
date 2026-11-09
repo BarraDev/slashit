@@ -506,6 +506,26 @@ pub use crate::ipc::{serve, IpcContext, IpcServer};
 /// or the developer's real configuration. So the event sink discards, the
 /// instance control is inert, and every path lands in whatever tempdir the
 /// caller passed.
+/// `root`'s whole subtree as (path, bytes), sorted — the shape a "this read
+/// wrote nothing" test needs to compare a directory tree before and after.
+pub fn files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                out.push((path, bytes));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -> IpcContext {
     use std::collections::HashMap;
     use std::sync::Arc;

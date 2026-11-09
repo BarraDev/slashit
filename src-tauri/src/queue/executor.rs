@@ -8871,11 +8871,14 @@ impl TaskExecutor {
     /// Records an ended execution for `task_id`, with the output a reader
     /// (`get_task_output`) will find, without launching anything. Stands in
     /// for a run this instance supervised and returned from, which is
-    /// exactly the evidence the control channel's read verbs serve.
+    /// exactly the evidence the control channel's read verbs serve. `status`
+    /// is how the run ended (`Stopped`, or `Failed` with the recorded
+    /// reason).
     #[cfg(test)]
     pub(crate) async fn record_ended_execution_for_test(
         &self,
         task_id: Uuid,
+        status: AgentStatus,
         output: &[&str],
     ) -> Uuid {
         let execution = AgentExecution {
@@ -8883,7 +8886,7 @@ impl TaskExecutor {
             worktree_id: None,
             task_id: Some(task_id),
             agent_type: "claude-code".to_string(),
-            status: AgentStatus::Stopped,
+            status,
             started_at: chrono::Utc::now(),
             stopped_at: Some(chrono::Utc::now()),
         };
