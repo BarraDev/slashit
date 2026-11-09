@@ -24,6 +24,7 @@
 //! small function is cheaper and clearer than that dependency.
 
 use anyhow::{anyhow, Context, Result};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Write `body` to `path` as an executable script another process can run.
@@ -35,11 +36,15 @@ use std::path::{Path, PathBuf};
 /// source file is never executed, so writing it in-process is safe.
 ///
 /// An existing `path` is replaced, because the copy opens its destination
-/// rather than recreating it. `cp` follows a symlink at the destination, so
-/// a `path` that is itself a symbolic link is removed first: the entry is
-/// replaced, and the link's target -- for instance the checked-in fake agent
-/// script a generated entry used to point at -- is never rewritten by a
-/// fixture publication.
+/// rather than recreating it. `cp` also writes through what it finds there:
+/// it follows a symbolic link at the destination, and it opens and truncates
+/// a file even when that file has other hard links. Either would rewrite a
+/// file a publication must never touch -- the checked-in fake agent script a
+/// generated entry used to point at, or whatever else shares its entry's
+/// inode -- so an entry that would be written through is removed first and
+/// the copy creates a fresh file in its place. A lone regular file is written
+/// in place, which is also what keeps a failed copy from having destroyed
+/// the previous script.
 ///
 /// The copy itself is Linux-only, matching the crate: `/bin/cp` is named by
 /// an absolute path, both because the Linux desktop runtime is the only
@@ -54,9 +59,16 @@ pub fn write_executable(path: &Path, body: &str) -> Result<()> {
     let source = PathBuf::from(source);
     std::fs::write(&source, body)
         .with_context(|| format!("could not write {}", source.display()))?;
-    // `cp` follows a symlink at the destination, which would rewrite whatever
-    // it points at instead of replacing the entry here.
-    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+    // `cp` writes through an entry that shares its inode with another file:
+    // it follows a symlink at the destination, and it opens and truncates a
+    // file even when that file has other hard links. Either would rewrite a
+    // file this publication must never touch, so such an entry is removed
+    // first and the copy creates a fresh file in its place. A lone regular
+    // file is written in place, which keeps a failed copy from having
+    // destroyed the previous script.
+    let writes_through = std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_symlink() || meta.nlink() > 1);
+    if writes_through {
         std::fs::remove_file(path)
             .with_context(|| format!("could not replace the entry at {}", path.display()))?;
     }
@@ -91,26 +103,20 @@ pub fn write_executable(path: &Path, body: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::write_executable;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    /// The crate's own scratch naming: under `TMPDIR`, named for this
-    /// process and the current nanosecond, so concurrent test binaries do
-    /// not collide, and removed by the test that made it.
-    fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "slashit-fixture-{}-{}-{label}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).expect("create the scratch directory");
-        dir
+    /// A scratch directory for one test, named for the test that made it and
+    /// removed when the returned guard drops -- including during a panic's
+    /// unwind, so a failing test leaves no litter behind in `TMPDIR`. The
+    /// guard's name is unique, so concurrent test binaries do not collide.
+    fn scratch(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("slashit-fixture-{label}-"))
+            .tempdir()
+            .expect("create the scratch directory")
     }
 
     /// A published script runs, and nothing of the publication is left
@@ -118,7 +124,7 @@ mod tests {
     #[test]
     fn a_published_script_runs_and_leaves_no_source() {
         let dir = scratch("single");
-        let path = dir.join("fixture.sh");
+        let path = dir.path().join("fixture.sh");
         write_executable(&path, "#!/bin/sh\necho published\n").expect("publish");
 
         let run = std::process::Command::new(&path)
@@ -128,15 +134,13 @@ mod tests {
         assert!(run.status.success(), "{run:?}");
         assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "published");
         assert!(
-            !dir.join("fixture.sh.source").exists(),
+            !dir.path().join("fixture.sh.source").exists(),
             "the source copy is removed"
         );
         assert!(
             std::fs::metadata(&path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0),
             "the script is executable"
         );
-
-        std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
     }
 
     /// A publication that cannot be copied reports the copy's own failure,
@@ -150,7 +154,7 @@ mod tests {
             return;
         }
         let dir = scratch("copy-failure");
-        let path = dir.join("read-only.sh");
+        let path = dir.path().join("read-only.sh");
         std::fs::write(&path, "stale\n").expect("write the stale script");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
             .expect("make the destination unwritable");
@@ -162,7 +166,7 @@ mod tests {
             "the copy's own error is reported, not the cleanup: {error:#}"
         );
         assert!(
-            !dir.join("read-only.sh.source").exists(),
+            !dir.path().join("read-only.sh.source").exists(),
             "the failed publication leaves no temporary source"
         );
         assert!(
@@ -174,7 +178,6 @@ mod tests {
         // be blamed for needing its own privileges.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("restore the destination");
-        std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
     }
 
     /// A published script replaces a symlink at its destination rather than
@@ -182,9 +185,9 @@ mod tests {
     #[test]
     fn a_published_entry_replaces_a_link_instead_of_following_it() {
         let dir = scratch("publish-over-link");
-        let target = dir.join("checked-in.sh");
+        let target = dir.path().join("checked-in.sh");
         write_executable(&target, "#!/bin/sh\necho original\n").expect("publish the target");
-        let entry = dir.join("entry.sh");
+        let entry = dir.path().join("entry.sh");
         std::os::unix::fs::symlink(&target, &entry).expect("link to the target");
 
         write_executable(&entry, "#!/bin/sh\necho replaced\n").expect("publish over the link");
@@ -196,8 +199,33 @@ mod tests {
         assert_eq!(published, "#!/bin/sh\necho replaced\n");
         let target_text = std::fs::read_to_string(&target).expect("read the target");
         assert_eq!(target_text, "#!/bin/sh\necho original\n");
+    }
 
-        std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
+    /// A published script replaces a hard link at its destination rather than
+    /// writing through it: `cp` opens and truncates the shared inode, so
+    /// without the entry's removal a publication would rewrite the other
+    /// link's file too.
+    #[test]
+    fn a_published_entry_replaces_a_hard_link_instead_of_writing_through_it() {
+        let dir = scratch("publish-over-hard-link");
+        let sibling = dir.path().join("sibling.sh");
+        write_executable(&sibling, "#!/bin/sh\necho original\n").expect("publish the sibling");
+        let entry = dir.path().join("entry.sh");
+        std::fs::hard_link(&sibling, &entry).expect("hard-link the entry to the sibling");
+
+        write_executable(&entry, "#!/bin/sh\necho replaced\n").expect("publish over the hard link");
+
+        // The entry is a file of its own now, and the file it used to share
+        // an inode with still says what it always said.
+        assert_eq!(
+            std::fs::metadata(&entry).expect("read the published entry").nlink(),
+            1,
+            "the published entry shares its inode with nothing"
+        );
+        let published = std::fs::read_to_string(&entry).expect("read the published entry");
+        assert_eq!(published, "#!/bin/sh\necho replaced\n");
+        let sibling_text = std::fs::read_to_string(&sibling).expect("read the sibling");
+        assert_eq!(sibling_text, "#!/bin/sh\necho original\n");
     }
 
     /// Eight threads that run `/bin/true` until dropped, each joined: the
@@ -255,7 +283,7 @@ mod tests {
         let dir = scratch("stress");
         let spawners = SpawnerThreads::start(8);
         for i in 0..50 {
-            let path = dir.join(format!("stress-{i}.sh"));
+            let path = dir.path().join(format!("stress-{i}.sh"));
             write_executable(&path, "#!/bin/sh\nexit 0\n")
                 .unwrap_or_else(|error| panic!("publishing {} failed: {error:#}", path.display()));
             let status = Command::new(&path)
@@ -266,7 +294,6 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{} did not execute: {error}", path.display()));
             assert!(status.success(), "{} exited with {status}", path.display());
         }
-        std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
         drop(spawners);
     }
 }

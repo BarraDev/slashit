@@ -306,13 +306,30 @@ impl FakeProgram {
 /// writer lives only in `cp`, which has exited before this returns. The source
 /// file is never executed, so writing it in-process is safe. Tests that need a
 /// fake program call this instead of writing and running one themselves.
+///
+/// An entry that shares its inode with another file -- a symbolic link at
+/// `path`, or a hard link -- is removed before the copy, so `cp` creates a
+/// fresh file instead of rewriting the other file through it.
 #[cfg(unix)]
 pub fn write_executable(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     let mut source = path.as_os_str().to_owned();
     source.push(".source");
     let source = std::path::PathBuf::from(source);
     std::fs::write(&source, body).expect("write the script source");
+    // `cp` writes through an entry that shares its inode with another file:
+    // it follows a symlink at the destination, and it opens and truncates a
+    // file even when that file has other hard links. Either would rewrite a
+    // file this publication must never touch, so such an entry is removed
+    // first and the copy creates a fresh file in its place. A lone regular
+    // file is written in place, which keeps a failed copy from having
+    // destroyed the previous script.
+    let writes_through = std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_symlink() || meta.nlink() > 1);
+    if writes_through {
+        std::fs::remove_file(path).expect("replace the entry at the destination");
+    }
     // A failed copy must leave no temporary source behind for the next fixture
     // using the same directory, and the copy's own failure is the one reported,
     // not the cleanup's.
@@ -339,7 +356,7 @@ mod executable_fixture_tests {
     use super::write_executable;
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
@@ -457,6 +474,57 @@ mod executable_fixture_tests {
         // Restore before the tempdir is removed, so cleanup cannot be blamed
         // for needing its own privileges.
         std::fs::set_permissions(&occupied, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// A publication replaces a hard link at its destination rather than
+    /// writing through it: `cp` opens and truncates the shared inode, so
+    /// without the entry's removal it would rewrite the other link's file.
+    #[test]
+    fn a_published_entry_replaces_a_hard_link_instead_of_writing_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("sibling");
+        std::fs::write(&sibling, "stale\n").unwrap();
+        let occupied = dir.path().join("occupied");
+        std::fs::hard_link(&sibling, &occupied).unwrap();
+
+        write_executable(&occupied, SCRIPT);
+
+        assert_eq!(
+            std::fs::metadata(&occupied).unwrap().nlink(),
+            1,
+            "the published entry shares its inode with nothing"
+        );
+        assert_eq!(std::fs::read_to_string(&occupied).unwrap(), SCRIPT);
+        assert_eq!(
+            std::fs::read_to_string(&sibling).unwrap(),
+            "stale\n",
+            "the other hard link's file is untouched"
+        );
+    }
+
+    /// A publication replaces a symlink at its destination rather than
+    /// rewriting the file it points at.
+    #[test]
+    fn a_published_entry_replaces_a_symlink_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("checked-in");
+        std::fs::write(&target, "stale\n").unwrap();
+        let occupied = dir.path().join("occupied");
+        std::os::unix::fs::symlink(&target, &occupied).unwrap();
+
+        write_executable(&occupied, SCRIPT);
+
+        assert!(
+            std::fs::symlink_metadata(&occupied)
+                .is_ok_and(|meta| !meta.file_type().is_symlink()),
+            "the entry is a file of its own now"
+        );
+        assert_eq!(std::fs::read_to_string(&occupied).unwrap(), SCRIPT);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "stale\n",
+            "the symlink's target is untouched"
+        );
     }
 }
 

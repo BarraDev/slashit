@@ -29,6 +29,10 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 libc = "0.2"
 
 [dev-dependencies]
+# RAII scratch directories for the helper's own tests: a temporary directory
+# removed when its guard drops, including during a panic's unwind, so a
+# failing test leaves no litter in `TMPDIR`.
+tempfile = "3"
 # The helper assertions read the task-store TOML the same way the product writes it.
 toml = "0.8"
 # Only to crop an element screenshot: WebKitWebDriver pads one by the
