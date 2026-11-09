@@ -178,9 +178,8 @@ async fn keyboard(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
     send(driver, Key::Tab).await?;
     let left = picker_state(driver).await?;
     expect(&left, "value", &json!(MANUAL_CLAUDE_MODEL), "a typed identifier is kept when the field loses focus")?;
-    // Tab moves focus into the AI Reviewer field, whose list opens over the footer
-    // and would intercept the Save click. Escape closes it and keeps focus there.
-    send(driver, Key::Escape).await?;
+    // Tab moves focus into the AI Reviewer field. Save must be clickable here,
+    // with no keystroke to dismiss anything first.
     save(driver, &project_id, &task_id, MANUAL_CLAUDE_MODEL).await?;
     let blurred_saved = listed(driver, &project_id, &task_id).await?;
     // The default provider is omitted from a stored Task, so no key means Claude.

@@ -277,7 +277,9 @@ pub fn ModelCombobox(
                     placeholder="Search or type a model ID"
                     disabled=move || disabled.get()
                     prop:value=move || if open.get() { query.get() } else { saved_label(&options.get(), &selected.get()) }
-                    on:focus=move |_| {
+                    // Opened by a click, typing or an arrow key, not by focus alone: tabbing
+                    // through the form must not drop a list over the footer's Save button.
+                    on:click=move |_| {
                         set_open.set(true);
                         set_active.set(None);
                     }
