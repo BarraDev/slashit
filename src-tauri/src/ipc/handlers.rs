@@ -334,7 +334,9 @@ struct TaskEvidence {
     /// How many older persisted runs the answer did not describe.
     runs_omitted: usize,
     /// The latest persisted AI-review evidence. `None` when no review entry
-    /// is on the record.
+    /// is on the record. A review a later run began after is still returned —
+    /// it is the latest review on record — with
+    /// [`AiReviewEvidence::superseded_by_run`] naming that newer run.
     ai_review: Option<AiReviewEvidence>,
     /// The Task's persisted review signoff, when one is kept: `approved`,
     /// `fixes_applied` or `rejected`.
@@ -346,8 +348,12 @@ struct TaskEvidence {
     failure_reason: Option<String>,
     /// Whether [`Self::failure_reason`] was cut to its echo bound.
     failure_reason_truncated: bool,
-    /// The Task's persisted Activity milestones, newest first, exactly as
-    /// they are stored — each was redacted and bounded when it was recorded.
+    /// The Task's persisted Activity milestones, newest first, as redacted
+    /// echo copies: every string in them goes out under the current redaction
+    /// policy, applied at read time, so a milestone written by an older build
+    /// is echoed clean even when the stored record predates a masking rule.
+    /// Each was redacted and bounded when it was recorded, and the copy here
+    /// never changes the stored record.
     activity: Vec<serde_json::Value>,
     /// How many older milestones the answer did not echo, by count or by the
     /// byte budget.
@@ -389,11 +395,14 @@ struct RunEvidence {
     /// When the record's latest end for this run happened.
     ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The bounded, one-line reason the record keeps for a failed or
-    /// recovered run.
+    /// recovered run, redacted under the current policy at read time: a
+    /// record written by an older build, before a masking rule existed, is
+    /// echoed clean anyway.
     failure_reason: Option<String>,
-    /// What the provider reported as the run's final result, exactly as the
-    /// Activity record keeps it — already redacted and bounded when it was
-    /// recorded. `None` when no result is persisted for the run, which is
+    /// What the provider reported as the run's final result, re-redacted and
+    /// re-bounded for this echo: already redacted and bounded on the record,
+    /// and sanitized again at read time so a result a policy predates is
+    /// echoed clean. `None` when no result is persisted for the run, which is
     /// also the shape of every run recorded before results were.
     outcome: Option<OutcomeEvidence>,
 }
@@ -403,7 +412,8 @@ struct RunEvidence {
 struct OutcomeEvidence {
     /// `available`, `truncated` or `unavailable`, as the record keeps it.
     kind: &'static str,
-    /// The recorded redacted text, cut to the echo's own tighter bound here.
+    /// The recorded redacted text, re-redacted at read time and cut to the
+    /// echo's own tighter bound here.
     text: Option<String>,
     /// The full length the record itself says the result had, when the
     /// record cut it (that is `slashit_activity::MAX_RESULT_CHARS`).
@@ -431,6 +441,11 @@ struct AiReviewEvidence {
     issues: Option<u32>,
     /// The bounded reason a failed or skipped review recorded.
     reason: Option<String>,
+    /// The run that began after this review was recorded, when one did. The
+    /// review is still the latest one on record, but it predates that run:
+    /// it is not evidence about it. `None` while the review is the newest
+    /// thing the record holds.
+    superseded_by_run: Option<u32>,
 }
 
 /// The Task's most recent run output as this instance holds it.
@@ -626,7 +641,10 @@ fn evidence_runs(activity: &[slashit_activity::Entry]) -> (Vec<RunEvidence>, usi
                     ended = true;
                     evidence.status = "failed";
                     evidence.ended_at = Some(entry.at);
-                    evidence.failure_reason = Some(reason.clone());
+                    // A persisted reason was redacted when it was recorded;
+                    // the echo re-redacts it so a reason a policy predates is
+                    // never echoed as it was stored.
+                    evidence.failure_reason = Some(evidence_failure_reason(reason).0);
                 }
                 Kind::RecoveryRequired {
                     run: Some(r),
@@ -635,7 +653,7 @@ fn evidence_runs(activity: &[slashit_activity::Entry]) -> (Vec<RunEvidence>, usi
                     ended = true;
                     evidence.status = "recovery_required";
                     evidence.ended_at = Some(entry.at);
-                    evidence.failure_reason = Some(reason.clone());
+                    evidence.failure_reason = Some(evidence_failure_reason(reason).0);
                 }
                 Kind::RunResult { run: r, result } if r == run => {
                     evidence.outcome.get_or_insert_with(|| evidence_outcome(result));
@@ -651,7 +669,7 @@ fn evidence_runs(activity: &[slashit_activity::Entry]) -> (Vec<RunEvidence>, usi
     )
 }
 
-/// One persisted run result, re-bounded for the echo.
+/// One persisted run result, re-bounded and re-redacted for this echo.
 fn evidence_outcome(result: &slashit_activity::RunResult) -> OutcomeEvidence {
     match result {
         slashit_activity::RunResult::Available { text } => OutcomeEvidence {
@@ -671,19 +689,29 @@ fn evidence_outcome(result: &slashit_activity::RunResult) -> OutcomeEvidence {
             text: None,
             original_chars: None,
             echo_chars_omitted: None,
-            reason: Some(reason.clone()),
+            // A reason in an `Unavailable` result is provider text too. It was
+            // redacted and bounded when it was recorded; a record written
+            // before that policy existed is sanitized again on the way out.
+            reason: Some(evidence_failure_reason(reason).0),
         },
     }
 }
 
-/// `text`, the recorded redacted result, cut to the echo's bound.
+/// `text`, redacted again at read time, cut to the echo's bound.
+///
+/// A result was redacted when it was recorded, but the stored record is
+/// historical: a result written by an older build — before a masking rule
+/// existed, or before it was this strong — is echoed under today's policy,
+/// not the writer's. Redaction comes before the cut, so a mask is never cut
+/// in half.
 fn evidence_excerpt(text: &str) -> OutcomeEvidence {
-    let chars = text.chars().count();
+    let redacted = slashit_activity::redact(text);
+    let chars = redacted.chars().count();
     let (shown, omitted) = if chars <= MAX_EVIDENCE_RESULT_CHARS {
-        (text.to_string(), None)
+        (redacted, None)
     } else {
         (
-            text.chars().take(MAX_EVIDENCE_RESULT_CHARS).collect(),
+            redacted.chars().take(MAX_EVIDENCE_RESULT_CHARS).collect(),
             Some(u32::try_from(chars - MAX_EVIDENCE_RESULT_CHARS).unwrap_or(u32::MAX)),
         )
     };
@@ -698,21 +726,32 @@ fn evidence_excerpt(text: &str) -> OutcomeEvidence {
 
 /// The latest persisted AI-review evidence, from the Activity record.
 ///
-/// Scanning newest first stops at the first verdict, at a review that started
-/// without one, or at the run that followed the last review cycle: a run that
-/// began after the last verdict is not yet reviewed, and its predecessor's
-/// cycle is finished business.
+/// Scanning newest first stops at the first review or fix event: a run that
+/// later began does not erase the review, but marks it
+/// [`AiReviewEvidence::superseded_by_run`] — the review is still the latest
+/// on record and is returned, with the run that followed it named, never
+/// attributed to that run. `None` only when no review record exists at all.
 fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEvidence> {
     use slashit_activity::Kind;
 
+    // The run that began most recently and still precedes the first review
+    // event the scan reaches: it started after that review was recorded.
+    // Run starts that follow the review event in the record (they are older
+    // than it) are not reached, because the scan stops there.
+    let mut superseded_by_run: Option<u32> = None;
+
     for entry in activity.iter().rev() {
         match &entry.kind {
+            Kind::RunStarted { run, .. } => {
+                superseded_by_run.get_or_insert(*run);
+            }
             Kind::AiReviewStarted { review } => {
                 return Some(AiReviewEvidence {
                     review: *review,
                     outcome: "awaiting_verdict",
                     issues: None,
                     reason: None,
+                    superseded_by_run,
                 });
             }
             Kind::AiReviewApproved { review } => {
@@ -721,6 +760,7 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
                     outcome: "approved",
                     issues: None,
                     reason: None,
+                    superseded_by_run,
                 });
             }
             Kind::AiReviewChangesRequested { review, issues } => {
@@ -729,6 +769,7 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
                     outcome: "changes_requested",
                     issues: Some(*issues),
                     reason: None,
+                    superseded_by_run,
                 });
             }
             Kind::AiReviewFailed { review, reason } => {
@@ -740,6 +781,7 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
                     // `MAX_REASON_CHARS`, within the failure bound, so the
                     // cut flag the bound would set cannot fire.
                     reason: Some(evidence_failure_reason(reason).0),
+                    superseded_by_run,
                 });
             }
             Kind::AiReviewSkipped { review, reason } => {
@@ -748,6 +790,7 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
                     outcome: "skipped",
                     issues: None,
                     reason: Some(evidence_failure_reason(reason).0),
+                    superseded_by_run,
                 });
             }
             // A fix pass is the follow-up of a changes-requested verdict, so
@@ -761,6 +804,7 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
                     outcome: "changes_requested",
                     issues: None,
                     reason: None,
+                    superseded_by_run,
                 });
             }
             // A fix pass that itself ended in an error is reported as such,
@@ -777,11 +821,9 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
                     // failure bound, so the cut flag the bound would set
                     // cannot fire.
                     reason: Some(evidence_failure_reason(reason).0),
+                    superseded_by_run,
                 });
             }
-            // A run that began after the last review cycle ended: that next
-            // run has not been reviewed, and the older cycle is over.
-            Kind::RunStarted { .. } => return None,
             _ => {}
         }
     }
@@ -789,6 +831,12 @@ fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEv
 }
 
 /// The echoed Activity milestones, newest first, within both bounds.
+///
+/// Each milestone is a *copy* of the stored entry, redacted again on the way
+/// out. Entries were sanitized when they were written, but the stored record
+/// is historical: one written by an older build — before a masking rule
+/// existed, or before it was this strong — is echoed under today's policy.
+/// The stored record itself is never touched.
 fn evidence_activity(
     activity: &[slashit_activity::Entry],
 ) -> (Vec<serde_json::Value>, usize) {
@@ -799,9 +847,10 @@ fn evidence_activity(
         if taken == MAX_EVIDENCE_ACTIVITY_ENTRIES {
             break;
         }
-        let Ok(value) = serde_json::to_value(entry) else {
+        let Some(mut value) = serde_json::to_value(entry).ok() else {
             continue;
         };
+        evidence_redact_value(&mut value);
         // A stored entry is bounded, so no single entry can reasonably blow
         // the budget; the one-decision cut is here, on what is already held.
         let cost = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
@@ -816,6 +865,28 @@ fn evidence_activity(
         echoed,
         activity.len().saturating_sub(taken),
     )
+}
+
+/// The redaction policy, applied to every string `value` carries, in place.
+///
+/// `redact` is idempotent, so text a compliant record already holds passes
+/// through unchanged; a credential that a historical record kept intact is
+/// masked here, on the echo copy only.
+fn evidence_redact_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = slashit_activity::redact(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                evidence_redact_value(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, item) in map.iter_mut() {
+                evidence_redact_value(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The IPC-side instance snapshot this evidence reads run state from.
@@ -4049,6 +4120,114 @@ mod get_task_evidence {
         .response
     }
 
+    /// A review a newer run began after is not erased from the evidence: it
+    /// is the latest review on record, reported with that run named so it is
+    /// never passed off as a verdict about the run that followed it.
+    #[tokio::test]
+    async fn a_review_the_newest_run_started_after_is_reported_superseded() {
+        let (_tmp, ctx, id) = rich_world().await;
+        // The last thing rich_world's record holds is the failed run 4; a
+        // later run starts after its latest review (review 3).
+        {
+            let mut tasks = ctx.tasks.write().await;
+            let task = tasks.get_mut(&id).expect("seeded");
+            task.record_activity_at(
+                chrono::Utc::now(),
+                Kind::RunStarted { run: 5, addressing_feedback: false },
+            );
+        }
+
+        let d = evidence(&ctx, &id.to_string()).await;
+        let review = &d["ai_review"];
+        assert_eq!(review["outcome"], "approved", "{review}");
+        assert_eq!(review["review"], 3, "{review}");
+        assert_eq!(
+            review["superseded_by_run"], 5,
+            "the review must say which run it predates: {review}"
+        );
+
+        // The rendered report carries the same honesty, bound to the run.
+        let text = slashit::output::run_report_text(&d);
+        assert!(
+            text.contains("AI review:        approved (review 3, signoff: approved)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "superseded by run 5: recorded before run 5 began, not evidence about run 5\n"
+            ),
+            "{text}"
+        );
+    }
+
+    /// A fix attempt is still the changes-requested verdict it answered when
+    /// a later run begins; the report may keep it, but only as a verdict the
+    /// newer run has not yet earned.
+    #[tokio::test]
+    async fn a_fix_attempt_followed_by_a_new_run_is_reported_superseded() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        let mut task =
+            create_test_task_full("fix then rerun", Uuid::new_v4(), TaskStatus::AiReview, 0);
+        let at = chrono::Utc::now();
+        task.record_activity_at(at, Kind::AiReviewStarted { review: 1 });
+        task.record_activity_at(at, Kind::AiReviewChangesRequested { review: 1, issues: 2 });
+        task.record_activity_at(at, Kind::AiFixApplied { review: 1 });
+        task.record_activity_at(
+            at,
+            Kind::RunStarted { run: 2, addressing_feedback: true },
+        );
+
+        let id = task.id;
+        ctx.tasks.write().await.insert(id, task);
+
+        let d = evidence(&ctx, &id.to_string()).await;
+        assert_eq!(d["ai_review"]["outcome"], "changes_requested", "{d}");
+        assert_eq!(d["ai_review"]["review"], 1, "{d}");
+        assert_eq!(
+            d["ai_review"]["superseded_by_run"], 2,
+            "a fix attempt before run 2 began is a verdict about run 1's work: {d}"
+        );
+    }
+
+    /// A record with runs and no review anywhere reports no review at all —
+    /// the absence is not the loss of one.
+    #[tokio::test]
+    async fn no_persisted_review_is_no_review() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        let mut task =
+            create_test_task_full("never reviewed", Uuid::new_v4(), TaskStatus::Error, 0);
+        let at = chrono::Utc::now();
+        task.record_activity_at(at, Kind::RunStarted { run: 1, addressing_feedback: false });
+        task.record_activity_at(at, Kind::RunCompleted { run: 1 });
+        task.record_activity_at(
+            at,
+            Kind::RunFailed { run: Some(1), reason: "the provider dropped".into() },
+        );
+
+        let id = task.id;
+        ctx.tasks.write().await.insert(id, task);
+
+        let d = evidence(&ctx, &id.to_string()).await;
+        assert!(
+            d["ai_review"].is_null(),
+            "no review record exists, so no review is reported: {d}"
+        );
+    }
+
     #[tokio::test]
     async fn a_fix_failure_is_distinguished_from_an_ordinary_changes_request() {
         // A review asked for changes, the fix pass answered, and the fix pass
@@ -4465,11 +4644,171 @@ mod evidence_run_end_events {
     }
 }
 
+/// What a review's evidence says when a run follows it. The latest persisted
+/// review is returned even though a newer `RunStarted` exists on the record —
+/// with that run named as `superseded_by_run`, never attributed to it — and
+/// `None` only when no review record exists at all. The entries are built
+/// directly, as a record could arrive from an older version of the app.
+#[cfg(test)]
+mod evidence_ai_review_supersession {
+    use super::*;
+    use slashit_activity::{Entry, Kind};
+
+    fn entry(seq: u32, kind: Kind) -> Entry {
+        Entry {
+            seq,
+            at: chrono::DateTime::from_timestamp(1_700_000_000 + i64::from(seq), 0)
+                .expect("an instant"),
+            kind,
+        }
+    }
+
+    fn review_of(entries: &[Entry]) -> AiReviewEvidence {
+        evidence_ai_review(entries).expect("a review was on the record")
+    }
+
+    /// A completed review followed by a run that has no review yet: the old
+    /// verdict is reported, saying which run it predates.
+    #[test]
+    fn a_completed_review_followed_by_a_run_is_superseded_by_that_run() {
+        let entries = [
+            entry(1, Kind::RunStarted { run: 1, addressing_feedback: false }),
+            entry(2, Kind::RunCompleted { run: 1 }),
+            entry(3, Kind::AiReviewStarted { review: 1 }),
+            entry(4, Kind::AiReviewApproved { review: 1 }),
+            entry(5, Kind::RunStarted { run: 2, addressing_feedback: false }),
+        ];
+
+        let review = review_of(&entries);
+        assert_eq!(review.review, 1);
+        assert_eq!(review.outcome, "approved");
+        assert_eq!(review.superseded_by_run, Some(2));
+    }
+
+    /// A review that asked for changes and a fix attempt after it, then a
+    /// run: the verdict the fix answered stays the reported outcome, marked
+    /// superseded by the later run — not silently dropped, and not passed off
+    /// as anything about that run.
+    #[test]
+    fn a_fix_attempt_followed_by_a_run_is_superseded_by_that_run() {
+        let entries = [
+            entry(1, Kind::AiReviewStarted { review: 1 }),
+            entry(2, Kind::AiReviewChangesRequested { review: 1, issues: 2 }),
+            entry(3, Kind::AiFixStarted { review: 1 }),
+            entry(4, Kind::AiFixFailed { review: 1, reason: "the fix could not deliver".into() }),
+            entry(5, Kind::RunStarted { run: 2, addressing_feedback: true }),
+        ];
+
+        let review = review_of(&entries);
+        assert_eq!(review.review, 1);
+        assert_eq!(review.outcome, "fix_failed");
+        assert_eq!(review.superseded_by_run, Some(2));
+    }
+
+    /// A run that began while the latest review was still being asked for
+    /// marks that review superseded too: the review started after the run, and
+    /// it is still the latest decision on record.
+    #[test]
+    fn an_unverdicted_review_after_a_run_is_superseded_the_same_way() {
+        let entries = [
+            entry(1, Kind::RunStarted { run: 1, addressing_feedback: false }),
+            entry(2, Kind::RunCompleted { run: 1 }),
+            entry(3, Kind::AiReviewStarted { review: 1 }),
+            entry(4, Kind::RunStarted { run: 2, addressing_feedback: false }),
+        ];
+
+        let review = review_of(&entries);
+        assert_eq!(review.review, 1);
+        assert_eq!(review.outcome, "awaiting_verdict");
+        assert_eq!(review.superseded_by_run, Some(2));
+    }
+
+    /// Run starts from before the review cycle — older entries the scan never
+    /// reaches, because the review event settles first — name no successor.
+    #[test]
+    fn a_review_nothing_started_after_is_not_superseded() {
+        let entries = [
+            entry(1, Kind::RunStarted { run: 1, addressing_feedback: false }),
+            entry(2, Kind::RunCompleted { run: 1 }),
+            entry(3, Kind::RunStarted { run: 2, addressing_feedback: false }),
+            entry(4, Kind::RunStarted { run: 3, addressing_feedback: false }),
+            entry(5, Kind::AiReviewStarted { review: 2 }),
+            entry(6, Kind::AiReviewApproved { review: 2 }),
+        ];
+
+        let review = review_of(&entries);
+        assert_eq!(review.review, 2);
+        assert_eq!(review.outcome, "approved");
+        assert_eq!(review.superseded_by_run, None);
+    }
+
+    /// Other run events — a result, a failure, a recovery — are not run
+    /// starts, and do not mark a review superseded on their own.
+    #[test]
+    fn run_events_that_name_no_new_start_supersede_nothing() {
+        let entries = [
+            entry(1, Kind::AiReviewStarted { review: 1 }),
+            entry(2, Kind::AiReviewApproved { review: 1 }),
+            entry(
+                3,
+                Kind::RunResult {
+                    run: 1,
+                    result: slashit_activity::RunResult::Available { text: "the answer".into() },
+                },
+            ),
+            entry(4, Kind::RunFailed { run: Some(1), reason: "in the ledger late".into() }),
+            entry(5, Kind::NewAttemptAuthorized { run: 1 }),
+        ];
+
+        let review = review_of(&entries);
+        assert_eq!(review.review, 1);
+        assert_eq!(review.outcome, "approved");
+        assert_eq!(review.superseded_by_run, None);
+    }
+
+    /// Runs without any review on the record answer no review at all — this
+    /// is the shape `None` is reserved for.
+    #[test]
+    fn a_record_with_runs_and_no_review_answers_no_review() {
+        let entries = [
+            entry(1, Kind::RunStarted { run: 1, addressing_feedback: false }),
+            entry(2, Kind::RunCompleted { run: 1 }),
+            entry(3, Kind::RunStarted { run: 2, addressing_feedback: false }),
+        ];
+
+        assert!(
+            evidence_ai_review(&entries).is_none(),
+            "there is no review to report, not a lost one"
+        );
+    }
+
+    /// Of two run starts after the review, the newest one is what the review
+    /// predates.
+    #[test]
+    fn the_newest_starting_run_is_the_review_s_successor() {
+        let entries = [
+            entry(1, Kind::AiReviewStarted { review: 1 }),
+            entry(2, Kind::AiReviewApproved { review: 1 }),
+            entry(3, Kind::RunStarted { run: 2, addressing_feedback: false }),
+            entry(4, Kind::RunStarted { run: 3, addressing_feedback: false }),
+        ];
+
+        let review = review_of(&entries);
+        assert_eq!(review.superseded_by_run, Some(3));
+    }
+}
+
 /// Every echoed field obeys the same redaction and bound. Regression tests
 /// with representative secrets: a credential-shaped value that reaches any
 /// echo — through the Task's error message, a failed session state, an
 /// output line, an AI-review reason or a run result — goes out masked, and
 /// every variable-length field is cut with its flag set.
+///
+/// The redaction is applied at read time as well: the later tests in this
+/// module push raw Activity entries past `record_activity_at`'s write-time
+/// sanitization, the shape a record written by a version of the app that
+/// lagged behind the current policy can arrive in, and require the echo to
+/// mask what the stored record kept intact.
 #[cfg(test)]
 mod evidence_bounds_and_redaction {
     use super::*;
@@ -4701,5 +5040,162 @@ mod evidence_bounds_and_redaction {
         assert_eq!(d["configured_model_truncated"], false);
         assert_eq!(d["latest_observed_model_truncated"], false);
         assert_eq!(d["configured_model"], "claude-sonnet-5-5");
+    }
+
+    // --- Historical records, read-time redaction ------------------------------
+    //
+    // Each test below pushes raw entries straight onto `task.activity`,
+    // bypassing the write-time sanitization `record_activity_at` applies, so
+    // the stored record is the shape an older build could have written: a
+    // credential intact, in a run failure reason, a run result, an
+    // `Unavailable` reason, a tool detail or an AI-review failure reason.
+    // Nothing in the answer — the IPC response or the human-readable CLI
+    // report — may repeat it.
+
+    /// A raw entry, pushed past `record_activity_at`'s write-time
+    /// sanitization: the shape a record written before the current policy
+    /// existed can arrive in. `seq` keeps the pushed position intact.
+    fn paste(task: &mut crate::domain::Task, seq: u32, kind: Kind) {
+        task.activity.push(slashit_activity::Entry {
+            seq,
+            at: chrono::DateTime::from_timestamp(1_700_000_000 + i64::from(seq), 0)
+                .expect("an instant"),
+            kind,
+        });
+    }
+
+    /// The same guarantee for the human-readable report: whatever the answer
+    /// echoes, the CLI report built from it must stay clean too.
+    fn report_leaks(d: &serde_json::Value, secret: &str) {
+        let text = slashit::output::run_report_text(d);
+        assert!(
+            !text.contains(secret),
+            "the secret reached the rendered report unmasked: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_historical_run_failure_reason_stored_raw_is_masked_at_read_time() {
+        let mut task = task_with("failed long ago", None);
+        paste(&mut task, 1, Kind::RunStarted { run: 1, addressing_feedback: false });
+        paste(
+            &mut task,
+            2,
+            Kind::RunFailed {
+                run: Some(1),
+                reason: format!("the run's last line carried token {SECRET}"),
+            },
+        );
+
+        let d = echo(task).await;
+        field_leaks(&d, SECRET);
+        report_leaks(&d, SECRET);
+        let reason = d["runs"][0]["failure_reason"].as_str().expect("reason");
+        assert!(
+            reason.contains(slashit_activity::MASK),
+            "the credential is masked on the echo: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_historical_run_result_stored_raw_is_masked_at_read_time() {
+        let mut task = task_with("resulted long ago", None);
+        paste(&mut task, 1, Kind::RunStarted { run: 1, addressing_feedback: false });
+        paste(
+            &mut task,
+            2,
+            Kind::RunResult {
+                run: 1,
+                result: RunResult::Available {
+                    text: format!("the patch includes {SECRET}, honestly"),
+                },
+            },
+        );
+
+        let d = echo(task).await;
+        field_leaks(&d, SECRET);
+        report_leaks(&d, SECRET);
+        let text = d["runs"][0]["outcome"]["text"].as_str().expect("text");
+        assert!(
+            text.contains(slashit_activity::MASK),
+            "the credential is masked on the echo: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_historical_unavailable_reason_stored_raw_is_masked_at_read_time() {
+        let mut task = task_with("no result long ago", None);
+        paste(&mut task, 1, Kind::RunStarted { run: 1, addressing_feedback: false });
+        paste(
+            &mut task,
+            2,
+            Kind::RunResult {
+                run: 1,
+                result: RunResult::Unavailable {
+                    reason: format!("the provider was reached with {SECRET} and said nothing"),
+                },
+            },
+        );
+
+        let d = echo(task).await;
+        field_leaks(&d, SECRET);
+        report_leaks(&d, SECRET);
+        let reason = d["runs"][0]["outcome"]["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains(slashit_activity::MASK),
+            "the credential is masked on the echo: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_historical_tool_detail_stored_raw_is_masked_in_the_activity_echo() {
+        let mut task = task_with("tooled long ago", None);
+        paste(&mut task, 1, Kind::RunStarted { run: 1, addressing_feedback: false });
+        paste(
+            &mut task,
+            2,
+            Kind::ToolUsed {
+                run: 1,
+                tool: "Bash".into(),
+                detail: Some(format!("export API_KEY={SECRET} && ./deploy.sh")),
+                count: 1,
+            },
+        );
+
+        let d = echo(task).await;
+        field_leaks(&d, SECRET);
+        report_leaks(&d, SECRET);
+        let activity = d["activity"].as_array().expect("activity");
+        let tool = activity
+            .iter()
+            .find(|entry| entry["kind"]["type"] == "tool_used")
+            .expect("the tool milestone is echoed");
+        let detail = tool["kind"]["detail"].as_str().expect("detail");
+        assert!(
+            detail.contains(slashit_activity::MASK),
+            "the credential is masked on the echo: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_historical_ai_review_failure_reason_stored_raw_is_masked_at_read_time() {
+        let mut task = task_with("reviewed long ago", None);
+        paste(
+            &mut task,
+            1,
+            Kind::AiReviewFailed {
+                review: 1,
+                reason: format!("the reviewer could not read {SECRET}"),
+            },
+        );
+
+        let d = echo(task).await;
+        field_leaks(&d, SECRET);
+        report_leaks(&d, SECRET);
+        let reason = d["ai_review"]["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains(slashit_activity::MASK),
+            "the credential is masked on the echo: {reason}"
+        );
     }
 }

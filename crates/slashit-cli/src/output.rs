@@ -156,6 +156,39 @@ pub fn print_features(data: &serde_json::Value) {
     }
 }
 
+/// One free-text value made safe to print into a terminal.
+///
+/// Everything this report echoes that the Task, the provider or a run shaped —
+/// title, model identifiers, failure reasons, results, output lines — can
+/// carry terminal control sequences: ANSI CSI, OSC (including OSC 52, which
+/// can read the clipboard), ESC and BEL, the 8-bit C1 controls (a bare U+009B
+/// is a CSI in itself), DEL and carriage returns that redraw the line. Every
+/// such character is replaced by a visible `\u{xx}` escape, so no untrusted
+/// sequence can reach the terminal as itself; a backslash is doubled, so an
+/// escape is never ambiguous. Ordinary characters — accented ones and every
+/// other printable Unicode included — pass through untouched. Only an
+/// untrusted value's own characters are touched; the report's labels, the
+/// line breaks it lays out itself and the JSON the instance sends are not
+/// affected by this function.
+fn escape_terminal(text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ if (ch as u32) < 0x20 || (0x7F..=0x9F).contains(&(ch as u32)) => {
+                let _ = write!(out, "\\u{{{:02x}}}", ch as u32);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// One Task's execution evidence, as `slashit runs` shows it.
 ///
 /// The report is read out of the response's JSON the same way the machine form
@@ -180,18 +213,22 @@ pub fn print_runs(data: &serde_json::Value) {
 pub fn run_report_text(data: &serde_json::Value) -> String {
     let mut out = String::new();
 
-    let title = data["title"].as_str().unwrap_or("(untitled)");
-    let provider = data["provider"].as_str().unwrap_or("?");
+    let title = escape_terminal(data["title"].as_str().unwrap_or("(untitled)"));
+    let provider = escape_terminal(data["provider"].as_str().unwrap_or("?"));
     let short = short_id(data["task_id"].as_str().unwrap_or("?"));
     out.push_str(&format!("Task {short} \"{title}\" — provider {provider}\n"));
 
     match data["configured_model"].as_str() {
-        Some(model) => out.push_str(&format!("  Model configured: {model} (saved on the Task)\n")),
+        Some(model) => out.push_str(&format!(
+            "  Model configured: {} (saved on the Task)\n",
+            escape_terminal(model)
+        )),
         None => out.push_str("  Model configured: provider default (saved on the Task)\n"),
     }
     match data["latest_observed_model"].as_str() {
         Some(model) => out.push_str(&format!(
-            "  Model observed:   {model} (the Task's latest observed; no per-run identity is kept, and no alias is read back as evidence)\n"
+            "  Model observed:   {} (the Task's latest observed; no per-run identity is kept, and no alias is read back as evidence)\n",
+            escape_terminal(model)
         )),
         None => out.push_str(
             "  Model observed:   none — no run has ever reported a model; an alias is a request, never evidence\n",
@@ -214,23 +251,38 @@ pub fn run_report_text(data: &serde_json::Value) -> String {
         let outcome = review["outcome"].as_str().unwrap_or("unknown");
         out.push_str(&format!(
             "  AI review:        {} (review {}, signoff: {})\n",
-            outcome,
+            escape_terminal(outcome),
             review["review"].as_u64().unwrap_or(0),
-            data["qa_signoff"].as_str().unwrap_or("none"),
+            escape_terminal(data["qa_signoff"].as_str().unwrap_or("none")),
         ));
+        // A review a newer run began after is still the latest one on record,
+        // so it is shown — with what makes it honest: it predates that run,
+        // and it is never passed off as evidence about it. A missing field
+        // (an older instance answering) means nothing was superseded.
+        if let Some(run) = review.get("superseded_by_run").and_then(|v| v.as_u64()) {
+            out.push_str(&format!(
+                "                    superseded by run {run}: recorded before run {run} began, not evidence about run {run}\n"
+            ));
+        }
         // A review or fix pass that recorded a reason — failed, skipped, a
         // fix that could not deliver its changes — keeps it bounded and
         // redacted by the instance; the report shows it rather than a bare
         // outcome word.
         if let Some(reason) = review["reason"].as_str().filter(|r| !r.is_empty()) {
-            out.push_str(&format!("                    reason: {reason}\n"));
+            out.push_str(&format!(
+                "                    reason: {}\n",
+                escape_terminal(reason)
+            ));
         }
     } else {
         out.push_str("  AI review:        none on record\n");
     }
 
     match data["failure_reason"].as_str() {
-        Some(reason) => out.push_str(&format!("  Failure:          {reason}\n")),
+        Some(reason) => out.push_str(&format!(
+            "  Failure:          {}\n",
+            escape_terminal(reason)
+        )),
         None => out.push_str("  Failure:          none\n"),
     }
 
@@ -243,13 +295,14 @@ pub fn run_report_text(data: &serde_json::Value) -> String {
     ));
     for run in &runs {
         let number = run["run"].as_u64().unwrap_or(0);
-        let status = run["status"].as_str().unwrap_or("unknown");
+        let status = escape_terminal(run["status"].as_str().unwrap_or("unknown"));
         out.push_str(&format!("    run {number} · {status}"));
         if let Some(reason) = run["failure_reason"].as_str() {
-            out.push_str(&format!(" · {reason}"));
+            out.push_str(&format!(" · {}", escape_terminal(reason)));
         }
         out.push('\n');
         if let Some(text) = run["outcome"]["text"].as_str() {
+            let text = escape_terminal(text);
             let bound = run["outcome"]["echo_chars_omitted"].as_u64();
             match bound {
                 Some(0) | None => out.push_str(&format!("      result: {text}\n")),
@@ -258,7 +311,10 @@ pub fn run_report_text(data: &serde_json::Value) -> String {
                 )),
             }
         } else if let Some(reason) = run["outcome"]["reason"].as_str() {
-            out.push_str(&format!("      result unavailable: {reason}\n"));
+            out.push_str(&format!(
+                "      result unavailable: {}\n",
+                escape_terminal(reason)
+            ));
         }
     }
 
@@ -271,12 +327,13 @@ pub fn run_report_text(data: &serde_json::Value) -> String {
     if let Some(note) = output["note"].as_str() {
         // The note is the honest sentence for what is here — or for why there
         // is nothing here — so a script (or a person) is told the hold, not
-        // just the absence.
-        out.push_str(&format!("                    {note}\n"));
+        // just the absence. It is this instance's own wording, escaped like
+        // everything else the report echoes.
+        out.push_str(&format!("                    {}\n", escape_terminal(note)));
     }
     for entry in &entries {
-        let level = entry["level"].as_str().unwrap_or("info");
-        let message = entry["message"].as_str().unwrap_or("");
+        let level = escape_terminal(entry["level"].as_str().unwrap_or("info"));
+        let message = escape_terminal(entry["message"].as_str().unwrap_or(""));
         out.push_str(&format!("    [{level}] {message}\n"));
     }
 
@@ -294,14 +351,15 @@ pub fn run_report_text(data: &serde_json::Value) -> String {
 /// A run state, for one line: `starting`, `running`, `stopping`, `stopped`,
 /// `failed (reason)` or `none` when this instance never saw the task run.
 /// The failed reason arrives already redacted and bounded by the instance,
-/// in line with everything else the answer echoes.
+/// in line with everything else the answer echoes, and is escaped here like
+/// every other echoed free text.
 fn describe_status(status: &serde_json::Value) -> String {
     match status {
         serde_json::Value::Null => "none (nothing has run in this instance)".to_string(),
-        serde_json::Value::String(state) => state.clone(),
+        serde_json::Value::String(state) => escape_terminal(state),
         other => {
             let reason = other["failed"].as_str().unwrap_or("?");
-            format!("failed ({reason})")
+            format!("failed ({})", escape_terminal(reason))
         }
     }
 }
@@ -381,7 +439,7 @@ mod runs_report_tests {
                  "outcome": {"kind": "unavailable", "text": null, "original_chars": null, "echo_chars_omitted": null, "reason": "the provider said nothing"}},
             ],
             "runs_omitted": 0,
-            "ai_review": {"review": 2, "outcome": "approved", "issues": null, "reason": null},
+            "ai_review": {"review": 2, "outcome": "approved", "issues": null, "reason": null, "superseded_by_run": null},
             "qa_signoff": "approved",
             "failure_reason": null,
             "failure_reason_truncated": false,
@@ -511,6 +569,116 @@ mod runs_report_tests {
             ),
             "a reported model must not be invented from the configuration: {text}"
         );
+    }
+
+    /// A review the record still keeps is not erased by a run that started
+    /// later: it is shown, with the run that followed it named — and so the
+    /// word "superseded" names the review's age, never a claim about that run.
+    #[test]
+    fn a_superseded_review_is_shown_with_the_run_that_followed_it() {
+        let mut value = sample();
+        value["ai_review"] = json!({
+            "review": 2,
+            "outcome": "approved",
+            "issues": null,
+            "reason": null,
+            "superseded_by_run": 3,
+        });
+        let text = run_report_text(&value);
+        assert!(
+            text.contains("AI review:        approved (review 2, signoff: approved)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "superseded by run 3: recorded before run 3 began, not evidence about run 3\n"
+            ),
+            "{text}"
+        );
+    }
+
+    /// An older instance that does not send the supersession field, or a
+    /// review nothing followed, must not cause the report to say "superseded"
+    /// of anything.
+    #[test]
+    fn an_unsuperseded_review_says_nothing_about_supersession() {
+        let mut value = sample();
+        value["ai_review"] = json!({
+            "review": 2,
+            "outcome": "approved",
+            "issues": null,
+            "reason": null,
+            "superseded_by_run": null,
+        });
+        let text = run_report_text(&value);
+        assert!(!text.contains("superseded"), "{text}");
+    }
+
+    /// Nothing a Task title, a provider error, a run's result or an output
+    /// line carries may reach the terminal as itself. ANSI CSI, an OSC 52
+    /// clipboard write, a bare ESC, BEL, the 8-bit C1 CSI (U+009B alone) and
+    /// carriage returns become visible `\u{xx}` escapes in every free-text
+    /// field, so an untrusted sequence cannot move the cursor, recolor the
+    /// report or read a clipboard.
+    #[test]
+    fn control_sequences_cannot_reach_the_report_as_themselves() {
+        let csi = "\x1b[31mred\x1b[0m";
+        let osc52 = "\x1b]52;c;aGVsbG8=\x07";
+        let bel = "bel\u{7}led";
+        let c1_csi = "\u{9b}31m";
+        let cr = "over\rwritten";
+        let mut value = sample();
+        value["title"] = json!(format!("title {csi} {osc52}"));
+        value["ai_review"]["reason"] = json!(format!("why {csi}"));
+        value["failure_reason"] = json!(format!("failed {osc52} {bel}"));
+        value["runs"][0]["outcome"]["text"] = json!(format!("did {c1_csi} work"));
+        value["runs"][2]["failure_reason"] = json!(format!("out {cr} of reach"));
+        value["output"]["entries"][0]["message"] = json!(format!("note {osc52}"));
+        value["session"] = json!({
+            "live": false,
+            "status": {"failed": format!("stopped {csi}")},
+            "execution_id": null,
+            "started_at": null,
+            "stopped_at": null,
+        });
+        value["configured_model"] = json!(format!("model {csi}"));
+        value["latest_observed_model"] = json!(format!("observed {osc52}"));
+
+        let text = run_report_text(&value);
+
+        // No raw control character reaches the rendered report, whatever
+        // field carried it.
+        for raw in ["\x1b", "\u{9b}", "\u{7}", "\r"] {
+            assert!(
+                !text.contains(raw),
+                "a raw control sequence reached the rendered report: {text:?}"
+            );
+        }
+        // ... and each escaped shape is visible in the field that carried it,
+        // so a person reading the report sees what the value holds.
+        assert!(text.contains(r"\u{1b}[31mred\u{1b}[0m"), "{text:?}");
+        assert!(text.contains(r"\u{1b}]52;c;aGVsbG8=\u{07}"), "{text:?}");
+        assert!(text.contains(r"\u{9b}31m"), "{text:?}");
+        assert!(text.contains(r"over\rwritten"), "{text:?}");
+        assert!(text.contains(r"bel\u{07}led"), "{text:?}");
+        // The readable words around the escapes survive.
+        assert!(text.contains("did \\u{9b}31m work"), "{text:?}");
+        assert!(text.contains("Model configured: model "), "{text:?}");
+        assert!(text.contains("Model observed:   observed "), "{text:?}");
+        assert!(text.contains("state failed (stopped "), "{text:?}");
+    }
+
+    /// The escaping exists for hostile shapes; ordinary characters, an accent
+    /// included, are meant to survive whole.
+    #[test]
+    fn ordinary_unicode_is_not_escaped() {
+        let mut value = sample();
+        value["title"] = json!("Fix the café éditeur — façade");
+        value["runs"][0]["outcome"]["text"] = json!("café prêt");
+        let text = run_report_text(&value);
+        assert!(text.contains("Fix the café éditeur — façade"), "{text}");
+        assert!(text.contains("result: café prêt\n"), "{text}");
+        assert!(!text.contains(r"\u{"), "{text}");
     }
 
     #[test]
