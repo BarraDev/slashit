@@ -546,6 +546,98 @@ async fn a_read_only_verb_is_allowed_from_both_endpoints() {
     }
 }
 
+// --- Task evidence ----------------------------------------------------------
+//
+// `GetTaskEvidence` is a read: the evidence answer is what `slashit runs`
+// shows, and the same properties are pinned here over a real socket.
+
+use slashit_ui_lib::test_helpers::create_test_task_full;
+
+/// Seed one Task the answer can be read against.
+async fn seed_evidence_task(h: &Harness) -> uuid::Uuid {
+    let mut task = create_test_task_full(
+        "Wire evidence task",
+        uuid::Uuid::new_v4(),
+        slashit_ui_lib::domain::TaskStatus::Error,
+        0,
+    );
+    task.record_activity(slashit_activity::Kind::RunFailed {
+        run: Some(1),
+        reason: "provider unreachable over the wire".to_string(),
+    });
+    let id = task.id;
+    h.ctx.tasks.write().await.insert(id, task);
+    id
+}
+
+#[tokio::test]
+async fn task_evidence_round_trips_over_the_local_endpoint() {
+    let h = Harness::start().await;
+    let id = seed_evidence_task(&h).await;
+
+    let response = send(
+        &IpcRequest::GetTaskEvidence {
+            task_id: id.to_string(),
+        },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("the local endpoint should answer");
+
+    assert!(response.ok, "{response:?}");
+    let d = response.data;
+    assert_eq!(d["task_id"], id.to_string());
+    assert_eq!(d["title"], "Wire evidence task");
+    assert_eq!(d["runs"][0]["run"], 1);
+    assert_eq!(d["runs"][0]["status"], "failed");
+    assert_eq!(d["runs"][0]["failure_reason"], "provider unreachable over the wire");
+    assert_eq!(d["output"]["memory_only"], true);
+}
+
+#[tokio::test]
+async fn task_evidence_fails_closed_on_an_unreadable_or_unknown_id() {
+    let h = Harness::start().await;
+
+    let bad = send(
+        &IpcRequest::GetTaskEvidence { task_id: "nope".into() },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("answered, not dropped");
+    assert!(!bad.ok);
+    assert!(error_of(&bad).contains("Invalid task_id"));
+
+    let missing = send(
+        &IpcRequest::GetTaskEvidence {
+            task_id: uuid::Uuid::new_v4().to_string(),
+        },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("answered, not dropped");
+    assert!(!missing.ok);
+    assert!(error_of(&missing).contains("not found"));
+}
+
+#[tokio::test]
+async fn task_evidence_is_readable_by_a_verified_tcp_peer_and_never_writes() {
+    let h = Harness::start().await;
+    let id = seed_evidence_task(&h).await;
+
+    // A verified TCP peer: the read is a status verb, so the answer arrives.
+    let response = send(
+        &IpcRequest::GetTaskEvidence {
+            task_id: id.to_string(),
+        },
+        &h.options(&h.tcp, Some(&h.token)),
+    )
+    .await
+    .expect("an authenticated TCP client should be answered");
+    assert!(response.ok, "{response:?}");
+    assert_eq!(response.data["task_id"], id.to_string());
+}
+
+
 // ---------------------------------------------------------------------------
 // Single-instance ownership
 //

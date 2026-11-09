@@ -56,6 +56,9 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
             Dispatch::reply(handle_list_tasks(ctx, project_id).await)
         }
         IpcRequest::GetTask { task_id } => Dispatch::reply(handle_get_task(ctx, task_id).await),
+        IpcRequest::GetTaskEvidence { task_id } => {
+            Dispatch::reply(handle_get_task_evidence(ctx, task_id).await)
+        }
         IpcRequest::CreateTask {
             project_id,
             title,
@@ -218,6 +221,595 @@ async fn handle_get_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
             Err(e) => IpcResponse::error(format!("Could not encode task {task_id}: {e}")),
         },
         None => IpcResponse::error(format!("Task {task_id} not found")),
+    }
+}
+
+// --- Task execution evidence -------------------------------------------------
+//
+// One read-only answer per Task. It assembles evidence that already exists —
+// the Task's persisted record and Activity, which the executor writes with
+// every lifecycle transition, and the live-run registry that
+// `TaskExecutor::task_run` and `TaskExecutor::get_task_output` read for the
+// desktop — so there is no second logging system, nothing is written here,
+// and nothing streams: one request, one bounded answer.
+
+/// The persisted runs one evidence answer describes, newest first.
+const MAX_EVIDENCE_RUNS: usize = 5;
+/// The Activity milestones one answer echoes, newest first.
+const MAX_EVIDENCE_ACTIVITY_ENTRIES: usize = 20;
+/// Hard byte budget for the echoed Activity milestones. They are persisted
+/// and sanitized already, but a long history of large provider results would
+/// still make one answer grow past reason, so echoing stops here and what it
+/// left out is counted.
+const MAX_EVIDENCE_ACTIVITY_BYTES: usize = 20 * 1024;
+/// The run-output entries one answer echoes, most recent first. The
+/// executor's own buffer is larger; neither the buffer nor this bound is any
+/// kind of persistence record, because output is session memory only.
+const MAX_EVIDENCE_OUTPUT_ENTRIES: usize = 32;
+/// Longest echoed run-output message, in characters.
+const MAX_EVIDENCE_MESSAGE_CHARS: usize = 500;
+/// Longest echoed provider result per run, in characters. The stored result
+/// is already redacted and within `slashit_activity::MAX_RESULT_CHARS`; this
+/// is the echo's own tighter bound.
+const MAX_EVIDENCE_RESULT_CHARS: usize = 1_000;
+/// Longest echoed failure reason, in characters. A reason on an Activity
+/// entry is already one bounded line; a Task's `error_message` is not, so it
+/// is redacted and cut here.
+const MAX_EVIDENCE_FAILURE_CHARS: usize = 500;
+
+/// What the run-output echo says whenever it carries entries.
+const OUTPUT_MEMORY_ONLY_NOTE: &str = "The entries echoed here are held only in this instance's memory. Run output is not persisted: a restart loses all of it, and a client that asks again after one finds none of it. What survives is the Task's own record: its Activity milestones and the run outcomes echoed here.";
+
+/// What the run-output echo says when a Task ran before, under some
+/// instance, and this one holds none of the output.
+const OUTPUT_NOT_HELD_NOTE: &str = "This instance holds no run output for this Task. Run output lives only in an instance's memory and is not persisted, so what a previous instance held was lost when that instance ended. The Task's own record survives: the runs, their outcomes and its Activity milestones.";
+
+/// What the run-output echo says when nothing has ever run for the Task.
+const OUTPUT_NEVER_RUN_NOTE: &str = "This instance holds no run output for this Task, because no run of it is recorded. Run output lives only in memory and is not persisted.";
+
+/// One Task's recent execution evidence, read-only.
+#[derive(Debug, serde::Serialize)]
+struct TaskEvidence {
+    task_id: String,
+    title: String,
+    /// Which coding Worker the Task runs on, as the Task record keeps it.
+    provider: &'static str,
+    /// The Task's saved Worker model, as a launch names it (`None` when the
+    /// Task asks for the provider default). This is configuration, nothing
+    /// more: it is never read back as evidence of what ran.
+    configured_model: Option<String>,
+    /// The model the provider most recently reported for one of the Task's
+    /// runs, exactly as a run recorded it. `None` when no run recorded one.
+    /// It is never inferred from the configured identifier: an alias is the
+    /// model requested, not the model that reported itself.
+    observed_model: Option<String>,
+    /// What this instance's executor holds for the Task right now. This is
+    /// the only part of the answer that dies with the process, and the
+    /// session's execution id is this session's evidence only: the run
+    /// numbers on [`TaskEvidence::runs`] are the identity that persists.
+    session: Option<SessionEvidence>,
+    /// Where the Task's most recent run output lives, and what is echoed of
+    /// it. Always present, because the answer must say what it does not hold.
+    output: OutputEvidence,
+    /// The Task's persisted runs, newest first, from its Activity record.
+    runs: Vec<RunEvidence>,
+    /// How many older persisted runs the answer did not describe.
+    runs_omitted: usize,
+    /// The latest persisted AI-review evidence. `None` when no review entry
+    /// is on the record.
+    ai_review: Option<AiReviewEvidence>,
+    /// The Task's persisted review signoff, when one is kept: `approved`,
+    /// `fixes_applied` or `rejected`.
+    qa_signoff: Option<String>,
+    /// Why the Task failed, from its own record or this process's run: the
+    /// Task's saved error message first (the durable record), then this
+    /// session's failed run. Each persisted run's own failure reason is on
+    /// that run below. `None` when neither failed.
+    failure_reason: Option<String>,
+    /// Whether [`Self::failure_reason`] was cut to its echo bound.
+    failure_reason_truncated: bool,
+    /// The Task's persisted Activity milestones, newest first, exactly as
+    /// they are stored — each was redacted and bounded when it was recorded.
+    activity: Vec<serde_json::Value>,
+    /// How many older milestones the answer did not echo, by count or by the
+    /// byte budget.
+    activity_omitted: usize,
+}
+
+/// What this instance's executor holds about the Task's run, if anything.
+#[derive(Debug, serde::Serialize)]
+struct SessionEvidence {
+    /// Whether the executor owns a run for the Task right now — exactly when
+    /// stopping it has something to end.
+    live: bool,
+    /// The owned run's state (`starting`, `running`, `stopping`), or, once
+    /// the run is gone, how this session's latest execution for the Task
+    /// ended (`stopped`, `failed`). `None` when nothing has run in this
+    /// session. How the Task looks after a restart is visible here: absent.
+    status: Option<crate::domain::AgentStatus>,
+    /// This session's execution identity, when one is recorded. Never
+    /// persisted, and never inferred from a run's persisted number.
+    execution_id: Option<String>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    stopped_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One persisted run's evidence, read from the Task's Activity.
+#[derive(Debug, serde::Serialize)]
+struct RunEvidence {
+    /// The run's number: the identity the Activity record gives it (starting
+    /// at 1), the same number the Task's timeline and its review records show.
+    run: u32,
+    /// `started`, `completed`, `failed` or `recovery_required` — the latest
+    /// end the record has, or `started` while the record says it never ended.
+    status: &'static str,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the record's latest end for this run happened.
+    ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The bounded, one-line reason the record keeps for a failed or
+    /// recovered run.
+    failure_reason: Option<String>,
+    /// What the provider reported as the run's final result, exactly as the
+    /// Activity record keeps it — already redacted and bounded when it was
+    /// recorded. `None` when no result is persisted for the run, which is
+    /// also the shape of every run recorded before results were.
+    outcome: Option<OutcomeEvidence>,
+}
+
+/// One persisted run result, re-bounded for this echo.
+#[derive(Debug, serde::Serialize)]
+struct OutcomeEvidence {
+    /// `available`, `truncated` or `unavailable`, as the record keeps it.
+    kind: &'static str,
+    /// The recorded redacted text, cut to the echo's own tighter bound here.
+    text: Option<String>,
+    /// The full length the record itself says the result had, when the
+    /// record cut it (that is `slashit_activity::MAX_RESULT_CHARS`).
+    original_chars: Option<u32>,
+    /// Characters of the recorded text that this echo left out, when the
+    /// echo cut further.
+    echo_chars_omitted: Option<u32>,
+    /// Why the record has no result, when it recorded one.
+    reason: Option<String>,
+}
+
+/// The latest persisted AI-review evidence.
+#[derive(Debug, serde::Serialize)]
+struct AiReviewEvidence {
+    /// The review ordinal the Activity record uses.
+    review: u32,
+    /// `started`, `approved`, `changes_requested`, `failed`, `skipped` or
+    /// `awaiting_verdict` (the review began and recorded no verdict yet).
+    outcome: &'static str,
+    /// How many issues a changes-requested verdict listed.
+    issues: Option<u32>,
+    /// The bounded reason a failed or skipped review recorded.
+    reason: Option<String>,
+}
+
+/// The Task's most recent run output as this instance holds it.
+#[derive(Debug, serde::Serialize)]
+struct OutputEvidence {
+    /// Whether there are entries to see at all.
+    available: bool,
+    /// Where the held output lives: only this instance's memory. Run output
+    /// is never persisted, so the answer carries this sentence on every read.
+    memory_only: bool,
+    /// The availability in one sentence, so no client has to guess which of
+    /// "held here", "an earlier instance lost it" and "nothing ever ran".
+    note: &'static str,
+    /// How many older entries the echo left out of the executor's buffer.
+    entries_omitted: usize,
+    /// Whether any echoed message was cut to its own bound.
+    truncated: bool,
+    /// The echoed entries, most recent first. Each message is already
+    /// redacted and cut for this echo; a cut is flagged on the entry.
+    entries: Vec<serde_json::Value>,
+}
+
+/// `reason` redacted and cut to the failure-echo bound.
+fn evidence_failure_reason(reason: &str) -> (String, bool) {
+    let redacted = slashit_activity::redact(reason);
+    let chars = redacted.chars().count();
+    if chars > MAX_EVIDENCE_FAILURE_CHARS {
+        (
+            redacted.chars().take(MAX_EVIDENCE_FAILURE_CHARS).collect(),
+            true,
+        )
+    } else {
+        (redacted, false)
+    }
+}
+
+/// Echo the run output this instance holds, bounded, most recent first.
+///
+/// Always an answer, never silence: what this read *did not* hold is evidence
+/// too, and the note says it in one sentence.
+fn evidence_output(
+    entries: Vec<crate::domain::AgentLogEntry>,
+    persisted_evidence: bool,
+) -> OutputEvidence {
+    let redact = slashit_activity::redact;
+
+    let total = entries.len();
+    let hold = entries
+        .into_iter()
+        .rev()
+        .take(MAX_EVIDENCE_OUTPUT_ENTRIES)
+        .collect::<Vec<_>>();
+    let mut truncated = false;
+    let mut echoed = Vec::with_capacity(hold.len());
+    for entry in hold {
+        let redacted = redact(&entry.message);
+        let chars = redacted.chars().count();
+        let cut = chars > MAX_EVIDENCE_MESSAGE_CHARS;
+        truncated |= cut;
+        let message = if cut {
+            redacted.chars().take(MAX_EVIDENCE_MESSAGE_CHARS).collect()
+        } else {
+            redacted
+        };
+        echoed.push(serde_json::json!({
+            "timestamp": entry.timestamp,
+            "level": entry.level,
+            "message": message,
+            "message_truncated": cut,
+        }));
+    }
+
+    let note = if total > 0 {
+        OUTPUT_MEMORY_ONLY_NOTE
+    } else if persisted_evidence {
+        OUTPUT_NOT_HELD_NOTE
+    } else {
+        OUTPUT_NEVER_RUN_NOTE
+    };
+    OutputEvidence {
+        available: total > 0,
+        memory_only: true,
+        note,
+        entries_omitted: total.saturating_sub(MAX_EVIDENCE_OUTPUT_ENTRIES),
+        truncated,
+        entries: echoed,
+    }
+}
+
+/// The Task's failure, for the answer. The Task's own saved error message
+/// comes first — it is the durable, Task-failure record — then this session's
+/// failed run. Persisted run failures are not folded in here: each run's own
+/// reason is on its [`RunEvidence`], which names the run it belongs to.
+fn evidence_failure(
+    task: &crate::domain::Task,
+    snapshot: Option<&TaskExecutorSnapshot>,
+) -> (Option<String>, bool) {
+    if let Some(message) = &task.error_message {
+        let (text, cut) = evidence_failure_reason(message);
+        return (Some(text), cut);
+    }
+    if let Some(reason) = snapshot.and_then(|s| match &s.status {
+        Some(crate::domain::AgentStatus::Failed(reason)) => Some(reason.as_str()),
+        _ => None,
+    }) {
+        let (text, cut) = evidence_failure_reason(reason);
+        return (Some(text), cut);
+    }
+    (None, false)
+}
+
+/// The persisted runs, newest first, bounded, from the Activity record.
+fn evidence_runs(activity: &[slashit_activity::Entry]) -> (Vec<RunEvidence>, usize) {
+    use slashit_activity::Kind;
+
+    // The runs the record knows, ascending: a run exists once anything names it.
+    let mut numbers: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for entry in activity {
+        match &entry.kind {
+            Kind::RunStarted { run, .. }
+            | Kind::ToolUsed { run, .. }
+            | Kind::ToolsOmitted { run, .. }
+            | Kind::RunCompleted { run }
+            | Kind::RunResult { run, .. }
+            | Kind::NewAttemptAuthorized { run } => {
+                numbers.insert(*run);
+            }
+            Kind::RunFailed {
+                run: Some(run), ..
+            }
+            | Kind::RecoveryRequired {
+                run: Some(run), ..
+            } => {
+                numbers.insert(*run);
+            }
+            _ => {}
+        }
+    }
+
+    let total = numbers.len();
+    let mut runs = Vec::with_capacity(total.min(MAX_EVIDENCE_RUNS));
+    for run in numbers.iter().rev().take(MAX_EVIDENCE_RUNS) {
+        let mut evidence = RunEvidence {
+            run: *run,
+            status: "started",
+            started_at: None,
+            ended_at: None,
+            failure_reason: None,
+            outcome: None,
+        };
+        // Later entries decide: a run that recovered and then completed is
+        // recorded as completed, and the recovery is its earlier history.
+        for entry in activity.iter().rev() {
+            match &entry.kind {
+                Kind::RunStarted { run: r, .. } if r == run => {
+                    evidence.started_at = Some(entry.at);
+                }
+                Kind::RunCompleted { run: r } if r == run => {
+                    evidence.status = "completed";
+                    evidence.ended_at = Some(entry.at);
+                }
+                Kind::RunFailed {
+                    run: Some(r),
+                    reason,
+                } if r == run => {
+                    evidence.status = "failed";
+                    evidence.ended_at = Some(entry.at);
+                    let _ = evidence.failure_reason.get_or_insert(reason.clone());
+                }
+                Kind::RecoveryRequired {
+                    run: Some(r),
+                    reason,
+                } if r == run => {
+                    evidence.status = "recovery_required";
+                    evidence.ended_at = Some(entry.at);
+                    let _ = evidence.failure_reason.get_or_insert(reason.clone());
+                }
+                Kind::RunResult { run: r, result } if r == run => {
+                    evidence.outcome.get_or_insert_with(|| evidence_outcome(result));
+                }
+                _ => {}
+            }
+        }
+        runs.push(evidence);
+    }
+    (
+        runs,
+        total.saturating_sub(MAX_EVIDENCE_RUNS),
+    )
+}
+
+/// One persisted run result, re-bounded for the echo.
+fn evidence_outcome(result: &slashit_activity::RunResult) -> OutcomeEvidence {
+    match result {
+        slashit_activity::RunResult::Available { text } => OutcomeEvidence {
+            kind: "available",
+            ..evidence_excerpt(text)
+        },
+        slashit_activity::RunResult::Truncated {
+            text,
+            original_chars,
+        } => OutcomeEvidence {
+            kind: "truncated",
+            original_chars: Some(*original_chars),
+            ..evidence_excerpt(text)
+        },
+        slashit_activity::RunResult::Unavailable { reason } => OutcomeEvidence {
+            kind: "unavailable",
+            text: None,
+            original_chars: None,
+            echo_chars_omitted: None,
+            reason: Some(reason.clone()),
+        },
+    }
+}
+
+/// `text`, the recorded redacted result, cut to the echo's bound.
+fn evidence_excerpt(text: &str) -> OutcomeEvidence {
+    let chars = text.chars().count();
+    let (shown, omitted) = if chars <= MAX_EVIDENCE_RESULT_CHARS {
+        (text.to_string(), None)
+    } else {
+        (
+            text.chars().take(MAX_EVIDENCE_RESULT_CHARS).collect(),
+            Some(u32::try_from(chars - MAX_EVIDENCE_RESULT_CHARS).unwrap_or(u32::MAX)),
+        )
+    };
+    OutcomeEvidence {
+        kind: "",
+        text: Some(shown),
+        original_chars: None,
+        echo_chars_omitted: omitted,
+        reason: None,
+    }
+}
+
+/// The latest persisted AI-review evidence, from the Activity record.
+///
+/// Scanning newest first stops at the first verdict, at a review that started
+/// without one, or at the run that followed the last review cycle: a run that
+/// began after the last verdict is not yet reviewed, and its predecessor's
+/// cycle is finished business.
+fn evidence_ai_review(activity: &[slashit_activity::Entry]) -> Option<AiReviewEvidence> {
+    use slashit_activity::Kind;
+
+    for entry in activity.iter().rev() {
+        match &entry.kind {
+            Kind::AiReviewStarted { review } => {
+                return Some(AiReviewEvidence {
+                    review: *review,
+                    outcome: "awaiting_verdict",
+                    issues: None,
+                    reason: None,
+                });
+            }
+            Kind::AiReviewApproved { review } => {
+                return Some(AiReviewEvidence {
+                    review: *review,
+                    outcome: "approved",
+                    issues: None,
+                    reason: None,
+                });
+            }
+            Kind::AiReviewChangesRequested { review, issues } => {
+                return Some(AiReviewEvidence {
+                    review: *review,
+                    outcome: "changes_requested",
+                    issues: Some(*issues),
+                    reason: None,
+                });
+            }
+            Kind::AiReviewFailed { review, reason } => {
+                return Some(AiReviewEvidence {
+                    review: *review,
+                    outcome: "failed",
+                    issues: None,
+                    reason: Some(reason.clone()),
+                });
+            }
+            Kind::AiReviewSkipped { review, reason } => {
+                return Some(AiReviewEvidence {
+                    review: *review,
+                    outcome: "skipped",
+                    issues: None,
+                    reason: Some(reason.clone()),
+                });
+            }
+            // A fix pass is the follow-up of a changes-requested verdict, so
+            // the verdict to report is still that one.
+            Kind::AiFixStarted { review }
+            | Kind::AiFixApplied { review }
+            | Kind::AiFixUnchanged { review }
+            | Kind::AiFixFailed { review, .. } => {
+                return Some(AiReviewEvidence {
+                    review: *review,
+                    outcome: "changes_requested",
+                    issues: None,
+                    reason: None,
+                });
+            }
+            // A run that began after the last review cycle ended: that next
+            // run has not been reviewed, and the older cycle is over.
+            Kind::RunStarted { .. } => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The echoed Activity milestones, newest first, within both bounds.
+fn evidence_activity(
+    activity: &[slashit_activity::Entry],
+) -> (Vec<serde_json::Value>, usize) {
+    let mut echoed = Vec::new();
+    let mut bytes = 0usize;
+    let mut taken = 0usize;
+    for entry in activity.iter().rev() {
+        if taken == MAX_EVIDENCE_ACTIVITY_ENTRIES {
+            break;
+        }
+        let Ok(value) = serde_json::to_value(entry) else {
+            continue;
+        };
+        // A stored entry is bounded, so no single entry can reasonably blow
+        // the budget; the one-decision cut is here, on what is already held.
+        let cost = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+        if !echoed.is_empty() && bytes + cost > MAX_EVIDENCE_ACTIVITY_BYTES {
+            break;
+        }
+        bytes += cost;
+        taken += 1;
+        echoed.push(value);
+    }
+    (
+        echoed,
+        activity.len().saturating_sub(taken),
+    )
+}
+
+/// The IPC-side instance snapshot this evidence reads run state from.
+type TaskExecutorSnapshot = crate::queue::executor::TaskRunSnapshot;
+
+/// Read one Task's recent execution evidence. Read-only.
+///
+/// The Task record and its Activity come from the Task store; the run state
+/// and the output come from the executor's own registry, the same reads the
+/// desktop's `get_task_run` and `get_task_output` commands make. What is
+/// answered, how much of it, and which part dies with this process are all
+/// explicit in the answer.
+async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcResponse {
+    let task_uuid = match Uuid::parse_str(&task_id) {
+        Ok(id) => id,
+        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
+    };
+
+    // Read the Task briefly and work on the clone: the persistently-sourced
+    // half of the answer must not race with a lifecycle write that is still
+    // holding the store.
+    let task = {
+        let tasks = ctx.tasks.read().await;
+        match tasks.get(&task_uuid) {
+            Some(task) => task.clone(),
+            None => return IpcResponse::error(format!("Task {task_id} not found")),
+        }
+    };
+
+    // The executor's registry — the same reads the desktop makes.
+    let executor = ctx.executor.get();
+    let (snapshot, output_entries) = match executor {
+        Some(executor) => {
+            let snapshot = executor.task_run(task_uuid).await;
+            let output = executor.get_task_output(task_uuid).await;
+            (Some(snapshot), output)
+        }
+        None => (None, Vec::new()),
+    };
+
+    let session = snapshot.as_ref().map(|snapshot| SessionEvidence {
+        live: snapshot.live,
+        status: snapshot.status.clone(),
+        execution_id: snapshot.last_execution.as_ref().map(|e| e.id.to_string()),
+        started_at: snapshot.last_execution.as_ref().map(|e| e.started_at),
+        stopped_at: snapshot.last_execution.as_ref().and_then(|e| e.stopped_at),
+    });
+
+    let (runs, runs_omitted) = evidence_runs(&task.activity);
+    let ai_review = evidence_ai_review(&task.activity);
+    let (failure_reason, failure_reason_truncated) =
+        evidence_failure(&task, snapshot.as_ref());
+
+    let qa_signoff = task.qa_signoff.as_ref().map(|s| match s.status {
+        crate::domain::QaStatus::Approved => "approved".to_string(),
+        crate::domain::QaStatus::FixesApplied => "fixes_applied".to_string(),
+        crate::domain::QaStatus::Rejected => "rejected".to_string(),
+    });
+
+    let output = evidence_output(
+        output_entries,
+        !runs.is_empty(),
+    );
+    let (activity, activity_omitted) = evidence_activity(&task.activity);
+
+    let answer = TaskEvidence {
+        task_id: task.id.to_string(),
+        title: task.title.clone(),
+        provider: task.provider.label(),
+        configured_model: task.configured_model().map(str::to_string),
+        observed_model: task.last_observed_model.clone(),
+        session,
+        output,
+        runs,
+        runs_omitted,
+        ai_review,
+        qa_signoff,
+        failure_reason,
+        failure_reason_truncated,
+        activity,
+        activity_omitted,
+    };
+
+    match serde_json::to_value(answer) {
+        Ok(value) => IpcResponse::success(value),
+        Err(e) => IpcResponse::error(format!(
+            "Could not encode the evidence for {task_id}: {e}"
+        )),
     }
 }
 
@@ -2908,5 +3500,413 @@ mod import_lock_order {
         assert!(exported.ok, "{exported:?}");
         let handler = handle_preview_import(&ctx, destination.to_string_lossy().into_owned());
         assert_tasks_held_before_projects(&ctx, handler).await;
+    }
+}
+
+/// `GetTaskEvidence`: one Task's recent execution evidence, read-only.
+#[cfg(test)]
+mod get_task_evidence {
+    use super::*;
+    use crate::domain::task::{CodingProvider, QaSignoff, QaStatus};
+    use crate::test_helpers::{
+        attach_test_executor_ipc, create_test_task_full, ipc_test_context,
+    };
+    use slashit_activity::{Kind, RunResult};
+    use std::sync::Arc;
+
+    async fn evidence(ctx: &IpcContext, id: &str) -> serde_json::Value {
+        let reply = dispatch(
+            IpcRequest::GetTaskEvidence {
+                task_id: id.to_string(),
+            },
+            ctx,
+            &peer(),
+        )
+        .await
+        .response;
+        assert!(reply.ok, "{:?}", reply.error);
+        reply.data
+    }
+
+    fn peer() -> PeerContext {
+        PeerContext {
+            endpoint: slashit_ipc::Endpoint::Unix {
+                path: std::path::PathBuf::from("/nonexistent-for-tests"),
+            },
+            os_verified: true,
+        }
+    }
+
+    /// A Task whose record shows everything this read reports on: two
+    /// completed runs with results, a failed latest one, one AI review, and
+    /// a configured-versus-observed model pair.
+    async fn rich_world() -> (tempfile::TempDir, IpcContext, Uuid) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("Evidence test", project_id, TaskStatus::Error, 0);
+        task.model = "claude-sonnet-5-5".to_string();
+        task.provider = CodingProvider::OpenCode;
+        task.last_observed_model = Some("claude-opus-4-0-20250514".to_string());
+        task.error_message = Some("the last run failed: worker exited".to_string());
+        task.qa_signoff = Some(QaSignoff {
+            status: QaStatus::Approved,
+            issues_found: Vec::new(),
+            timestamp: chrono::Utc::now(),
+            session_id: Uuid::new_v4(),
+        });
+        let at = chrono::Utc::now() - chrono::Duration::hours(1);
+        task.record_activity_at(at, Kind::RunStarted { run: 1, addressing_feedback: false });
+        task.record_activity_at(at, Kind::ToolUsed { run: 1, tool: "Bash".into(), detail: Some("ls".into()), count: 1 });
+        task.record_activity_at(at, Kind::RunCompleted { run: 1 });
+        task.record_activity_at(
+            at,
+            Kind::RunResult { run: 1, result: RunResult::Available { text: "did the work".into() } },
+        );
+        task.record_activity_at(at, Kind::RunStarted { run: 2, addressing_feedback: true });
+        task.record_activity_at(at, Kind::RunCompleted { run: 2 });
+        task.record_activity_at(
+            at,
+            Kind::RunResult {
+                run: 2,
+                result: RunResult::Truncated { text: "partial answer".into(), original_chars: 9_999 },
+            },
+        );
+        task.record_activity_at(at, Kind::AiReviewStarted { review: 3 });
+        task.record_activity_at(at, Kind::AiReviewApproved { review: 3 });
+        assert!(task.record_activity_at(at, Kind::RunFailed { run: Some(4), reason: "provider unreachable".into() }));
+
+        let id = task.id;
+        ctx.tasks.write().await.insert(id, task.clone());
+        ctx.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        (tmp, ctx, id)
+    }
+
+    fn files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    out.push((path, bytes));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn reports_the_persisted_evidence_the_record_holds() {
+        let (_tmp, ctx, id) = rich_world().await;
+        let d = evidence(&ctx, &id.to_string()).await;
+
+        assert_eq!(d["task_id"], id.to_string());
+        assert_eq!(d["title"], "Evidence test");
+        assert_eq!(d["provider"], "OpenCode");
+        assert_eq!(d["configured_model"], "claude-sonnet-5-5");
+        assert_eq!(d["observed_model"], "claude-opus-4-0-20250514");
+
+        // Persisted runs, newest first, with the record's own outcome. Runs
+        // 1, 2 and 4 ran; the reviews are 3, and are not runs.
+        let runs = d["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0]["run"], 4);
+        assert_eq!(runs[0]["status"], "failed");
+        assert_eq!(runs[0]["failure_reason"], "provider unreachable");
+        assert!(runs[0]["outcome"].is_null());
+        assert_eq!(runs[2]["run"], 1);
+        assert_eq!(runs[2]["status"], "completed");
+        assert_eq!(runs[2]["outcome"]["kind"], "available");
+        assert_eq!(runs[2]["outcome"]["text"], "did the work");
+        assert_eq!(runs[1]["run"], 2);
+        assert_eq!(runs[1]["status"], "completed");
+        assert_eq!(runs[1]["outcome"]["kind"], "truncated");
+        assert_eq!(runs[1]["outcome"]["original_chars"], 9_999);
+        for run in runs {
+            assert!(run["outcome"].is_null() || run["outcome"]["echo_chars_omitted"].is_null());
+        }
+
+        assert_eq!(d["ai_review"]["review"], 3);
+        assert_eq!(d["ai_review"]["outcome"], "approved");
+        assert_eq!(d["qa_signoff"], "approved");
+
+        assert_eq!(d["failure_reason"], "the last run failed: worker exited");
+        assert_eq!(d["failure_reason_truncated"], false);
+
+        // Newest first, and the run milestones the runs above describe.
+        let activity = d["activity"].as_array().expect("activity");
+        assert!(!activity.is_empty());
+        assert!(activity.len() <= MAX_EVIDENCE_ACTIVITY_ENTRIES);
+        let first = activity[0]["kind"].as_object().expect("a kind").keys().next();
+        // Ordered newest first, so the oldest-looking milestone is last.
+        assert_eq!(activity.last().unwrap()["kind"]["type"], "run_started", "{first:?}");
+
+        // No executor is installed here, so there is nothing this process
+        // supervised: the session half is null (the executor-backed shape is
+        // the subject of the next tests).
+        assert!(d["session"].is_null());
+
+        // And the answer always says what it does not hold.
+        assert_eq!(d["output"]["available"], false);
+        assert_eq!(d["output"]["memory_only"], true);
+        let note = d["output"]["note"].as_str().expect("note");
+        assert!(note.contains("memory"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn an_observed_model_is_only_ever_a_recorded_one() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("alias only", project_id, TaskStatus::Backlog, 0);
+        // A configured alias is the model requested. No run has ever reported
+        // one, and none may be invented from the alias.
+        task.model = "haiku".to_string();
+        assert_eq!(task.last_observed_model, None);
+        let id = task.id;
+        ctx.tasks.write().await.insert(id, task.clone());
+
+        let d = evidence(&ctx, &id.to_string()).await;
+        assert_eq!(d["configured_model"], "haiku");
+        assert!(
+            d["observed_model"].is_null(),
+            "an observed model was invented from a configured alias: {d}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_latest_run_describes_what_this_instance_supervised() {
+        let (_tmp, ctx, id) = rich_world().await;
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let execution = executor
+            .record_ended_execution_for_test(id, &[
+                "Session started: 11111111-1111-1111-1111-111111111111 (model: claude-opus-4-0-20250514)",
+                "Using tool: Bash",
+                "wrote ghp_abcdefghij123456 into the patch",
+            ])
+            .await;
+
+        let d = evidence(&ctx, &id.to_string()).await;
+
+        let session = &d["session"];
+        assert_eq!(session["live"], false);
+        assert_eq!(session["status"], "stopped");
+        assert_eq!(session["execution_id"], execution.to_string());
+        assert!(session["started_at"].is_string());
+        assert!(session["stopped_at"].is_string());
+
+        let output = &d["output"];
+        assert_eq!(output["available"], true);
+        assert_eq!(output["memory_only"], true);
+        let note = output["note"].as_str().expect("note");
+        assert!(note.contains("restart"), "{note}");
+        let entries = output["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 3);
+        // A credential-shaped value in the run's own output is masked here, as
+        // it is everywhere else the record repeats agent text. The newest
+        // entry is first.
+        let newest = entries[0]["message"].as_str().expect("msg");
+        assert!(newest.contains("***"), "{newest}");
+        assert_eq!(entries[1]["message"], "Using tool: Bash");
+        assert_eq!(entries[1]["message_truncated"], false);
+    }
+
+    /// The restart case. The Task's persisted evidence — its record, its
+    /// Activity, the run outcomes and the observed model — survives, while
+    /// everything this session held (the output, the execution id, the run
+    /// state) is gone, and the answer says so in one sentence.
+    #[tokio::test]
+    async fn after_a_restart_the_persisted_evidence_is_all_there_is() {
+        let (_tmp, first, id) = rich_world().await;
+        let task = first.tasks.read().await.get(&id).expect("seeded").clone();
+        let executor = attach_test_executor_ipc(&first).await;
+        executor.record_ended_execution_for_test(id, &["this session saw output"]).await;
+
+        // A second instance over the same storage: the task is re-read from
+        // the board, and this new process's executor has its own empty maps.
+        let before = evidence(&first, &id.to_string()).await;
+        assert_eq!(before["output"]["available"], true, "the first instance held output");
+
+        let ctx = ipc_test_context(first.paths.clone());
+        let project_id = task.project_id;
+        let reloaded = ctx
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board is readable")
+            .into_iter()
+            .find(|t| t.id == id)
+            .expect("the task is on disk");
+        ctx.tasks.write().await.insert(id, reloaded);
+        attach_test_executor_ipc(&ctx).await;
+
+        let after = evidence(&ctx, &id.to_string()).await;
+
+        // What was dusturable is still there.
+        assert_eq!(after["task_id"], id.to_string());
+        assert_eq!(after["observed_model"], "claude-opus-4-0-20250514");
+        assert_eq!(after["runs"].as_array().map(Vec::len).unwrap(), 3);
+        assert_eq!(after["runs"][0]["failure_reason"], "provider unreachable");
+
+        // What was only in memory is not: and the answer says what happened.
+        let session = &after["session"];
+        assert_eq!(session["live"], false);
+        assert!(session["status"].is_null());
+        assert!(session["execution_id"].is_null());
+        let output = &after["output"];
+        assert_eq!(output["available"], false);
+        let note = output["note"].as_str().expect("note");
+        assert!(
+            note.contains("lost when that instance ended"),
+            "the answer must say the output died with the earlier instance: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_number_of_runs_described_is_bounded() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("many runs", project_id, TaskStatus::Error, 0);
+        let at = chrono::Utc::now();
+        for run in 1..=7 {
+            task.record_activity_at(at, Kind::RunStarted { run, addressing_feedback: false });
+            // A large result per run, so the byte bound is exercised too.
+            task.record_activity_at(
+                at,
+                Kind::RunResult {
+                    run,
+                    result: RunResult::Available { text: "x".repeat(4_000) },
+                },
+            );
+            task.record_activity_at(at, Kind::RunFailed { run: Some(run), reason: format!("run {run} failed") });
+        }
+        let id = task.id;
+        ctx.tasks.write().await.insert(id, task.clone());
+
+        let d = evidence(&ctx, &id.to_string()).await;
+        let runs = d["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), MAX_EVIDENCE_RUNS, "newest first");
+        assert_eq!(runs[0]["run"], 7);
+        assert_eq!(runs[4]["run"], 3);
+        assert_eq!(d["runs_omitted"], 2);
+        // Every echoed result is within the echo's own bound; the record set
+        // no truncation, so the flag names what this echo cut.
+        for run in runs {
+            assert_eq!(run["outcome"]["kind"], "available");
+            let text = run["outcome"]["text"].as_str().expect("text");
+            assert_eq!(text.chars().count(), MAX_EVIDENCE_RESULT_CHARS);
+            assert_eq!(run["outcome"]["echo_chars_omitted"].as_u64().unwrap(), 3_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_activity_echo_is_bounded_in_entries_and_bytes() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("long history", project_id, TaskStatus::Error, 0);
+        let at = chrono::Utc::now();
+        for run in 1..=30 {
+            task.record_activity_at(at, Kind::RunStarted { run, addressing_feedback: false });
+            task.record_activity_at(at, Kind::RunCompleted { run });
+            task.record_activity_at(
+                at,
+                Kind::RunResult {
+                    run,
+                    result: RunResult::Available { text: "y".repeat(4_000) },
+                },
+            );
+        }
+        let id = task.id;
+        ctx.tasks.write().await.insert(id, task.clone());
+
+        let d = evidence(&ctx, &id.to_string()).await;
+        let activity = d["activity"].as_array().expect("activity");
+        assert!(activity.len() <= MAX_EVIDENCE_ACTIVITY_ENTRIES);
+        let bytes: usize = activity
+            .iter()
+            .map(|v| serde_json::to_string(v).unwrap().len())
+            .sum();
+        assert!(bytes <= MAX_EVIDENCE_ACTIVITY_BYTES, "{bytes}");
+        assert_eq!(d["activity_omitted"].as_u64().unwrap() + activity.len() as u64, 90);
+    }
+
+    #[tokio::test]
+    async fn makes_no_write() {
+        let (tmp, ctx, id) = rich_world().await;
+        let before = files_under(tmp.path());
+        let _ = evidence(&ctx, &id.to_string()).await;
+        assert_eq!(
+            files_under(tmp.path()),
+            before,
+            "an evidence read must leave the store byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_or_malformed_request_fails_closed() {
+        let (_tmp, ctx, _id) = rich_world().await;
+        let bad = dispatch(
+            IpcRequest::GetTaskEvidence { task_id: "nope".into() },
+            &ctx,
+            &PeerContext {
+                endpoint: slashit_ipc::Endpoint::Unix {
+                    path: std::path::PathBuf::from("/nonexistent-for-tests"),
+                },
+                os_verified: true,
+            },
+        )
+        .await
+        .response;
+        assert!(!bad.ok);
+        assert!(bad.error.unwrap().contains("Invalid task_id"));
+
+        let missing = evidence_or_error(&ctx, &Uuid::new_v4().to_string()).await;
+        assert!(!missing.ok);
+        assert!(missing.error.unwrap().contains("not found"));
+    }
+
+    async fn evidence_or_error(ctx: &IpcContext, id: &str) -> IpcResponse {
+        dispatch(
+            IpcRequest::GetTaskEvidence { task_id: id.to_string() },
+            ctx,
+            &PeerContext {
+                endpoint: slashit_ipc::Endpoint::Unix {
+                    path: std::path::PathBuf::from("/nonexistent-for-tests"),
+                },
+                os_verified: true,
+            },
+        )
+        .await
+        .response
     }
 }

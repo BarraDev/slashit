@@ -58,6 +58,18 @@ enum Commands {
         /// Task ID
         task_id: String,
     },
+    /// Show one Task's recent execution evidence (read-only)
+    ///
+    /// The answer reports the Task's persisted runs and their outcomes, the
+    /// AI-review outcome and signoff where kept, the configured Worker model
+    /// (the saved Task model) and the observed one where a run recorded it,
+    /// the newest Activity milestones, and this instance's hold on the latest
+    /// run — which is memory only, and the answer says when it is gone. The
+    /// number of runs and the size of the answer are bounded by the instance.
+    Runs {
+        /// Task ID
+        task_id: String,
+    },
     /// Create a new task
     Create {
         /// Project ID
@@ -226,6 +238,9 @@ async fn main() -> Result<()> {
         Commands::Inspect { task_id } => IpcRequest::GetTask {
             task_id: task_id.clone(),
         },
+        Commands::Runs { task_id } => IpcRequest::GetTaskEvidence {
+            task_id: task_id.clone(),
+        },
         Commands::Create {
             project,
             title,
@@ -320,6 +335,7 @@ async fn main() -> Result<()> {
         Commands::Terminals => output::print_terminals(&response.data),
         Commands::Ping => output::print_instance(&response.data),
         Commands::Features => output::print_features(&response.data),
+        Commands::Runs { .. } => output::print_runs(&response.data),
         _ => {
             // For mutation commands, print a simple success message
             if let Some(msg) = response.data.as_str() {
