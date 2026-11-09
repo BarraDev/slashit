@@ -2361,7 +2361,6 @@ mod task_configuration_writes {
         let message = answer.error.unwrap_or_default();
         assert!(message.contains("son net"), "{message}");
         assert!(message.contains("was not saved"), "{message}");
-        assert!(message.contains("was not saved"), "{message}");
         assert_eq!(
             serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap(),
             memory_before,

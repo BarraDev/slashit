@@ -286,12 +286,6 @@ mod tests {
         assert_eq!(ids, vec!["default", "sonnet", "opus", "haiku"]);
     }
 
-    #[test]
-    fn claude_entries_are_only_aliases_not_pinned_ids() {
-        let ids: Vec<String> = claude_models().into_iter().map(|m| m.id).collect();
-        assert_eq!(ids, vec!["default", "sonnet", "opus", "haiku"]);
-    }
-
     #[tokio::test]
     async fn a_listing_within_the_bound_is_read_whole() {
         let bytes = read_capped(&b"ollama/llama3.2:3b\n"[..], 64).await.expect("within the bound");

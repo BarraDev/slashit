@@ -1973,15 +1973,16 @@ pub fn parse_worker_model(provider: CodingProvider, requested: &str) -> Result<S
 const MAX_WORKER_MODEL_LEN: usize = 200;
 
 /// Syntax of a Claude Worker model: a letter or digit first, then only letters,
-/// digits and `-._[]`, with each `[` closed by a later `]` and no empty group.
-/// The identifier can never be read as a CLI option, and the `[1m]` context
-/// suffix is allowed.
+/// digits and `-._:@[]`, with each `[` closed by a later `]` and no empty group.
+/// `:` and `@` cover the Bedrock and Vertex forms. The identifier is passed as
+/// one argument without a shell, and a leading letter or digit means it can
+/// never be read as a CLI option. The `[1m]` context suffix is allowed.
 fn is_claude_model_id(model: &str) -> bool {
     model.len() <= MAX_WORKER_MODEL_LEN
         && model.starts_with(|c: char| c.is_ascii_alphanumeric())
         && model
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '[' | ']'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '@' | '[' | ']'))
         && brackets_are_paired(model)
 }
 
@@ -3214,7 +3215,16 @@ mod tests {
         use crate::domain::task::{parse_worker_model, CodingProvider};
         // Claude takes its aliases, the provider default, and a full ID that no
         // catalog has to list. The identifier is kept as given, trimmed.
-        for id in ["sonnet", "opus", "haiku", "default", "sonnet[1m]", "claude-sonnet-4-5-20250929"] {
+        for id in [
+            "sonnet",
+            "opus",
+            "haiku",
+            "default",
+            "sonnet[1m]",
+            "claude-sonnet-4-5-20250929",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "claude-sonnet-4-5@20250929",
+        ] {
             assert_eq!(parse_worker_model(CodingProvider::Claude, id).as_deref(), Ok(id), "{id}");
         }
         assert_eq!(parse_worker_model(CodingProvider::Claude, " opus \n").as_deref(), Ok("opus"));
