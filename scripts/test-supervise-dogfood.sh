@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=136
+EXPECTED_TOTAL=138
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -177,6 +177,10 @@ fi
 exit 0
 STUB
 chmod +x "$bin_dir/slashit-ui"
+# Backdated so the stub is unambiguously older than any instance it starts: the
+# stale-instance check compares whole-second mtimes with process start, and a
+# stub written in the instance's start second reads as rebuilt (a CI race).
+touch -d '2000-01-01 00:00:00' "$bin_dir/slashit-ui"
 # The stub is an embedded build for the supervisor's frontend gate, bound to its
 # own sha256, so no case depends on a dev server on localhost:1420.
 printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$(sha256sum "$bin_dir/slashit-ui" | cut -d' ' -f1)" >"$bin_dir/slashit-ui.frontend"
@@ -404,6 +408,13 @@ if [[ "$out" == *"commit:         $commit_id"* ]]; then ok "status reports the p
 if [[ "$out" == *"endpoint:       unix:$socket"* ]]; then ok "status reports the endpoint"; else bad "status lost the endpoint: $out"; fi
 
 out=$(sv verify 2>&1); expect pass "verify confirms the endpoint and environment" "$out" $?
+
+# Stale-instance regression: a binary rebuilt after its instance started is
+# reported. A future mtime stands in for the rebuild, so no timing is involved.
+touch -d '+1 hour' "$bin_dir/slashit-ui"
+out=$(sv verify 2>&1); expect fail "verify reports a binary rebuilt after its instance started" "$out" $? "STALE INSTANCE"
+touch -d '2000-01-01 00:00:00' "$bin_dir/slashit-ui"
+out=$(sv verify 2>&1); expect pass "verify passes again once the binary is no newer than the instance" "$out" $?
 
 out=$(sv start 2>&1); st=$?
 if [ "$st" -eq 1 ] && [[ "$out" == *"already answers on"* ]]; then
