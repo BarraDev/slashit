@@ -1249,6 +1249,45 @@ scripts/supervise-dogfood.sh status
 scripts/supervise-dogfood.sh verify
 ```
 
+### Build modes, frontend verification and recovery
+
+Three build modes exist. They do not share a binary path:
+
+| Mode | How it is built and run | Frontend | Binary |
+|---|---|---|---|
+| Development | `trunk serve` or `./dev.sh`; `cargo tauri dev` | loaded from `http://localhost:1420`; the supervisor refuses a start while nothing answers there | `target/debug/slashit-ui` (no sidecar) |
+| Self-contained dogfood | `scripts/build-dogfood-app.sh`, then `scripts/supervise-dogfood.sh start` | embedded in the binary; no Trunk and no server at run time | `target/dogfood/slashit-ui`, with `slashit` and `slashit-ui.frontend` beside it |
+| Production AppImage | the release pipeline (`docs/releasing.md`) | embedded | not supervised by this script |
+
+- **Promotion.** `cargo tauri build` writes `target/debug/slashit-ui`, which
+  `scripts/build-acceptance-app.sh` also overwrites with a binary that has no
+  embedded frontend. The dogfood build therefore copies its binary and CLI into
+  `target/dogfood/` and writes the sidecar there, last, through a rename. The
+  sidecar `slashit-ui.frontend` records `mode=embedded`, the binary's `sha256`
+  and the embedded WASM name. The supervisor treats a sidecar whose digest does
+  not match the binary as stale and refuses it. Promoted artifacts live inside
+  the workspace's `target/` and are regenerable. They are not Task data and are
+  not part of the restart snapshot.
+- **Frontend is not webview evidence.** `verify` proves the control channel,
+  the endpoint and the declared environment. It states that the webview is not
+  verified, because rendering needs a screenshot. A running instance whose
+  binary was rebuilt after it started is reported as `STALE INSTANCE` and must
+  be restarted to load the current frontend.
+- **Backup retention.** `restart` keeps the newest five snapshots under
+  `~/.local/state/slashit-dogfood/supervisor/backup/` and deletes older ones
+  after each successful backup. WebKit's regenerable caches
+  (`WebKitCache/`, `CacheStorage/`, `mediakeys/`, `hsts-storage.sqlite*`) are
+  not compared or backed up. A reload rewrites the WebKit origin storage
+  (`localstorage/`, `storage/`) that holds UI preferences; a restart reports
+  those rewrites and does not fail on them. Application state still fails the
+  restart.
+- **Recovery after a reboot.** No systemd unit is enabled automatically. After
+  a reboot, run `scripts/supervise-dogfood.sh start` (or
+  `systemctl --user start` if the unit is installed), then `status` and
+  `verify`. Check the persisted Task and Project records, and confirm the
+  webview renders by looking at the window. Enabling autostart is a separate
+  owner decision.
+
 ### Optional systemd user unit
 
 `scripts/slashit-dogfood.service` runs `scripts/supervise-dogfood.sh run`,

@@ -213,7 +213,9 @@ BINARY=
 if [ -n "${SLASHIT_DOGFOOD_BINARY:-}" ]; then
   BINARY=$SLASHIT_DOGFOOD_BINARY
 elif [ -n "$REPO_ROOT" ]; then
-  BINARY=$REPO_ROOT/target/debug/slashit-ui
+  # The promoted copy scripts/build-dogfood-app.sh writes, not the cargo output
+  # that acceptance builds overwrite.
+  BINARY=$REPO_ROOT/target/dogfood/slashit-ui
 fi
 
 SUP_DIR=$STATE_BASE/supervisor
@@ -581,6 +583,10 @@ env_verdict() {
 #                                           target/ build trees, which are
 #                                           regenerable; they are not compared
 #                                           and not backed up
+#   data/*/WebKitCache/, CacheStorage/,
+#   mediakeys/, hsts-storage.sqlite*
+#                                           WebKit's regenerable caches, rebuilt
+#                                           by every GUI start; never SlashIt data
 # The backup copies exactly this set, so a restore means copying the files the
 # manifest lists. The evidence is fail-closed: a base that is missing or cannot
 # be traversed, an unreadable or unchecksummable file, or an empty compared set
@@ -590,7 +596,16 @@ PROTECTED_EXCLUDES=(
   ! -path 'data/slashit-app/pr-helper-logs/*'
   ! -path 'data/slashit-app/terminal_sessions.toml'
   ! -path 'data/slashit-app/worktrees/*'
+  ! -path 'data/*/WebKitCache/*'
+  ! -path 'data/*/CacheStorage/*'
+  ! -path 'data/*/mediakeys/*'
+  ! -path 'data/*/hsts-storage.sqlite*'
 )
+# WebKit origin storage (data/<app>/localstorage and storage). It holds UI
+# preferences (last page, last selected Project). It stays in the compared set,
+# but a restart reports its changes rather than failing on them, because a
+# reload rewrites it. Everything else in the set is application state.
+UI_PREFERENCE_DIFF_RE='^[<>] [0-9a-f]{64}  data/[^/]+/(localstorage|storage)/'
 
 # NUL-terminated paths of the compared set, relative to BASE. Fails when BASE
 # is not a directory or any part of the traversal fails.
@@ -654,6 +669,58 @@ EOF
 # a verified CLI beside the binary and a binary that answers --version. Sets
 # version_line. start runs them; restart runs them before it stops the instance,
 # so a restart that could not start again is refused while the instance is up.
+# The frontend a binary loads. A binary built by scripts/build-dogfood-app.sh
+# embeds its assets and has a sidecar <binary>.frontend (mode=embedded, plus
+# the sha256 of the binary it was built into): it needs no server. Any other
+# binary is a development build: it loads DEV_URL, which must answer before
+# the GUI can be called healthy. A sidecar whose sha256 does not match the
+# binary is stale, so a rebuilt or replaced binary is never trusted on the
+# strength of an old record.
+DEV_URL=${SLASHIT_DOGFOOD_DEV_URL:-http://localhost:1420/}
+frontend_mode() { # sets FRONTEND_MODE: embedded | devserver | stale | invalid
+  local side="$BINARY.frontend" mode want sha
+  FRONTEND_MODE=devserver
+  [ -n "$BINARY" ] && [ -f "$side" ] || return 0
+  mode=$(sed -n 's/^mode=//p' "$side" | head -n 1)
+  want=$(sed -n 's/^sha256=//p' "$side" | head -n 1)
+  sha=$(sha256sum "$BINARY" 2>/dev/null | cut -d' ' -f1)
+  case $mode in
+    embedded) if [ -n "$sha" ] && [ "$sha" = "$want" ]; then FRONTEND_MODE=embedded; else FRONTEND_MODE=stale; fi ;;
+    *) FRONTEND_MODE=invalid ;;
+  esac
+}
+frontend_ready() { # the development server answers
+  command -v curl >/dev/null 2>&1 && curl -fsS --max-time 2 -o /dev/null "$DEV_URL"
+}
+# Prints the frontend line of verify and status. Returns 1 when the GUI would
+# be degraded: a development build without its server, or a stale record.
+frontend_report() {
+  # A live instance older than the binary on disk runs the frontend the old
+  # binary had, not the one on disk: the declaration on disk must not be
+  # reported as the running instance's frontend.
+  if [ -n "${FRONTEND_PID:-}" ] && [ -f "$BINARY" ]; then
+    local elapsed bin_mtime
+    elapsed=$(ps -o etimes= -p "$FRONTEND_PID" 2>/dev/null | tr -d ' ')
+    bin_mtime=$(stat -c %Y "$BINARY" 2>/dev/null)
+    if [ -n "$elapsed" ] && [ -n "$bin_mtime" ] && [ "$bin_mtime" -gt $(( $(date +%s) - elapsed )) ]; then
+      echo "frontend:       STALE INSTANCE — pid $FRONTEND_PID started before $BINARY was rebuilt, so it runs the old frontend; restart it to load the current build"
+      return 1
+    fi
+  fi
+  frontend_mode
+  case $FRONTEND_MODE in
+    embedded) echo "frontend:       embedded in the binary (no server required)"; return 0 ;;
+    devserver)
+      if frontend_ready; then
+        echo "frontend:       development server answers on $DEV_URL"; return 0
+      fi
+      echo "frontend:       UNAVAILABLE — this is a development build, which loads $DEV_URL, and nothing answers there; the GUI is degraded (its WebView shows a connection error)"
+      return 1 ;;
+    stale) echo "frontend:       STALE — $BINARY.frontend does not match the binary (rebuilt since?); rebuild with scripts/build-dogfood-app.sh"; return 1 ;;
+    *) echo "frontend:       invalid sidecar $BINARY.frontend (unknown mode)"; return 1 ;;
+  esac
+}
+
 launch_gates() {
   [ -n "$CLI_BIN" ] ||
     refuse "cannot verify the endpoint: no \`slashit\` CLI is available (it normally sits beside the binary; set SLASHIT_DOGFOOD_CLI) — a launch refuses an unverified control channel"
@@ -670,6 +737,15 @@ launch_gates() {
     refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
   version_line=$(printf '%s\n' "$out" | head -n 1)
   [ -n "$version_line" ] || refuse "the binary answers --version with nothing; refusing it: $BINARY"
+  # A launch must not start a GUI that cannot show its frontend. Refused here,
+  # before any stop, so a restart does not take the running instance down first.
+  frontend_mode
+  case $FRONTEND_MODE in
+    embedded) ;;
+    stale) refuse "$BINARY.frontend does not match the binary's sha256 (the binary was replaced after its frontend was recorded); rebuild with scripts/build-dogfood-app.sh" ;;
+    invalid) refuse "$BINARY.frontend declares an unknown frontend mode" ;;
+    *) frontend_ready || refuse "this is a development build, which loads $DEV_URL, and nothing answers there; start \`trunk serve\` on port 1420, or build a self-contained binary with scripts/build-dogfood-app.sh" ;;
+  esac
 }
 
 # A start that fails after its spawn must not leave the child running untracked.
@@ -1095,12 +1171,18 @@ cmd_restart() {
   state_snapshot "$STATE_BASE" >"$after" ||
     fail "the instance was restarted, but the protected state cannot be verified afterwards; the backup is $backup"
   if ! cmp -s "$after" "$backup/manifest.sha256"; then
-    diff <(sort "$backup/manifest.sha256") <(sort "$after") |
-      grep '^[<>]' | head -n 20 | sed 's/^/    /' >&2 || true
-    fail "state files changed during the restart. The backup with the intact copy is $backup; diagnose the list above before proceeding and restore only deliberately"
+    local changes app_changes
+    changes=$(diff <(sort "$backup/manifest.sha256") <(sort "$after") | grep '^[<>]' || true)
+    app_changes=$(printf '%s\n' "$changes" | grep -v -E "$UI_PREFERENCE_DIFF_RE" || true)
+    if [ -n "$app_changes" ]; then
+      printf '%s\n' "$app_changes" | head -n 20 | sed 's/^/    /' >&2
+      fail "state files changed during the restart. The backup with the intact copy is $backup; diagnose the list above before proceeding and restore only deliberately"
+    fi
+    printf '%s\n' "$changes" | head -n 20 | sed 's/^/    /' >&2
+    note "UI preference files (WebKit origin storage) were rewritten by the reload; they are not application state, so the restart is not failed"
   fi
   rm -f "$after"
-  note "verified: state files are checksum-identical before and after the restart"
+  note "verified: application state is checksum-identical before and after the restart"
 }
 
 # The record part of the non-running status branch, from record_state. mode:
@@ -1155,6 +1237,8 @@ cmd_status() {
     else
       echo "control channel: answering on '$PING_ENDPOINT', which is NOT the declared endpoint"
     fi
+    FRONTEND_PID=$PING_PID
+    frontend_report || [ "$code" -ne 0 ] || code=1
     verify_env "$PING_PID"
     env_verdict
     # Precedence: a record or endpoint that is not as declared (1) before a
@@ -1220,6 +1304,10 @@ cmd_verify() {
   if [ -n "$rec" ] && [ "$rec" != "$PING_PID" ]; then
     fail "the endpoint is served by pid $PING_PID, but the launch record names pid $rec"
   fi
+  FRONTEND_PID=$PING_PID
+  frontend_report || exit 1
+  # The control channel proves the backend and its endpoint, not rendering.
+  echo "webview:        not verified by the control channel (rendering needs a screenshot)"
   verify_env "$PING_PID"
   env_verdict
   case $ENV_CHECK in
