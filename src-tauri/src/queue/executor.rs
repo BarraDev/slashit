@@ -18374,6 +18374,34 @@ mod tests {
                     Self::lines(&self.opencode_args_file)
                 }
 
+                /// Replaces the stand-in `opencode` with the fake ACP agent running
+                /// `scenario` (its arguments after the program name). No model runs.
+                fn opencode_runs_fixture(&self, scenario: &str) {
+                    let exe = std::env::current_exe().expect("test executable path");
+                    let fixture = exe
+                        .parent()
+                        .and_then(std::path::Path::parent)
+                        .expect("target/debug directory")
+                        .join("acp_fixture_agent");
+                    let bin = self._tmp.path().join("bin").join("opencode");
+                    let script = format!(
+                        "#!/bin/sh\n\
+                         for a in \"$@\"; do printf '%s\\n' \"$a\" >> {args:?}; done\n\
+                         if [ \"$1\" = \"--version\" ]; then echo 2.0.32; exit 0; fi\n\
+                         exec {fixture:?} {scenario}\n",
+                        args = self.opencode_args_file,
+                    );
+                    crate::test_helpers::write_executable(&bin, &script);
+                }
+
+                /// Runs the fix as the `edit-on-prompt` scenario. Returns the file
+                /// the prompt and the selected model are recorded to, as JSON.
+                fn opencode_edits_the_checkout(&self) -> std::path::PathBuf {
+                    let record = self._tmp.path().join("opencode.prompt");
+                    self.opencode_runs_fixture(&format!("edit-on-prompt {record:?}"));
+                    record
+                }
+
                 fn lines(file: &std::path::Path) -> Vec<String> {
                     std::fs::read_to_string(file)
                         .unwrap_or_default()
@@ -19214,6 +19242,134 @@ VERDICT: APPROVED"
                 );
                 assert_eq!(task.model, "ollama/llama3.2:3b");
                 assert_eq!(task.provider, CodingProvider::OpenCode);
+            }
+
+            /// A review-fix on an OpenCode Task completes through the ACP session
+            /// and edits the Task checkout: the fix runs on OpenCode with the
+            /// reviewer's findings, no Claude fix agent runs, and the fix is
+            /// recorded as applied.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_opencode_fix_that_edits_the_checkout_is_recorded_as_applied() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_with_fixer(CHANGES_REQUESTED, 0, "Fixed everything.", 0);
+                let prompt_record = mock.opencode_edits_the_checkout();
+                let (repo, base_commit) = git_repo_with_change();
+                let working_dir = repo.path().to_str().unwrap().to_string();
+                let task = review_task_in(&mock, &working_dir, &base_commit, |task| {
+                    task.provider = CodingProvider::OpenCode;
+                    task.model = "ollama/llama3.2:3b".to_string();
+                })
+                .await;
+
+                assert!(mock.fix_args().is_empty(), "no Claude fix agent ran");
+                let launched = mock.opencode_args();
+                assert!(
+                    launched.iter().any(|a| a == "acp"),
+                    "the fix launched OpenCode: {launched:?}"
+                );
+                let recorded: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(&prompt_record)
+                        .expect("the OpenCode session recorded its prompt"),
+                )
+                .expect("the record is JSON");
+                // The model the session reports as current is the Task's own,
+                // not a default and not a Claude alias.
+                assert_eq!(recorded["model"], "ollama/llama3.2:3b");
+                assert!(
+                    recorded["prompt"].to_string().contains("a.rs:1 - broken"),
+                    "the findings reached the OpenCode session: {recorded}"
+                );
+                assert!(
+                    repo.path().join("fixed-by-opencode.txt").exists(),
+                    "the OpenCode edit landed in the Task checkout"
+                );
+                let signoff = task.qa_signoff.clone().expect("a signoff");
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::FixesApplied,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert_eq!(task.model, "ollama/llama3.2:3b");
+                assert_eq!(task.provider, CodingProvider::OpenCode);
+            }
+
+            /// A review-fix whose OpenCode turn fails after the session started is
+            /// not a fix: the findings stay on the Task and the failure is recorded.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_opencode_fix_whose_turn_fails_keeps_the_findings_and_claims_no_fix() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_with_fixer(CHANGES_REQUESTED, 0, "Fixed everything.", 0);
+                mock.opencode_runs_fixture("exit-on-prompt");
+                let task = review_task(&mock, |task| {
+                    task.provider = CodingProvider::OpenCode;
+                    task.model = "ollama/llama3.2:3b".to_string();
+                })
+                .await;
+
+                assert!(mock.fix_args().is_empty(), "no Claude fix agent ran");
+                assert_eq!(task.model, "ollama/llama3.2:3b");
+                let signoff = task.qa_signoff.clone().expect("a signoff");
+                assert_ne!(
+                    signoff.status,
+                    QaStatus::FixesApplied,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|i| i.contains("a.rs:1 - broken")),
+                    "the findings are kept: {:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|i| i.starts_with("Fix agent failed")),
+                    "the failure is recorded: {:?}",
+                    signoff.issues_found
+                );
+            }
+
+            /// A review-fix cancelled while its OpenCode turn runs stops the agent
+            /// promptly and is reported as cancelled, never as applied.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_cancelled_opencode_fix_turn_is_not_applied() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_with_fixer(CHANGES_REQUESTED, 0, "Fixed everything.", 0);
+                mock.opencode_runs_fixture("hang-on-prompt");
+                let checkout = tempfile::tempdir().expect("a temporary checkout");
+                let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+                let canceller = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    cancel_tx.send(true).expect("the fix is listening");
+                });
+                let start = start_opencode_run(
+                    "fix".to_string(),
+                    checkout.path().to_str().unwrap().to_string(),
+                    Some("ollama/llama3.2:3b".to_string()),
+                    true,
+                    None,
+                );
+                let outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    TaskExecutor::run_started_cancellably(
+                        async move { start.await.map_err(opencode_start_failure) },
+                        &mut cancel_rx,
+                    ),
+                )
+                .await
+                .expect("a cancelled fix returns without waiting for the turn");
+                canceller.await.expect("the canceller ran");
+
+                assert!(matches!(outcome, Ok(None)), "the turn was not cancelled");
+                assert!(matches!(fix_outcome(outcome), FixOutcome::Cancelled));
             }
 
             /// An OpenCode Task whose model OpenCode cannot run (a Claude alias)

@@ -18,6 +18,10 @@
 //! - `model-refuse`: answers session/set_config_option with an error, as
 //!   OpenCode does for a model it does not know.
 //! - `model-mismatch`: answers session/set_config_option reporting another model.
+//! - `edit-on-prompt <record>`: writes the prompt it was sent and the model the
+//!   session selected to `<record>` as JSON, writes `fixed-by-opencode.txt` in its
+//!   working directory, then ends the turn.
+//! - `hang-on-prompt`: never answers session/prompt.
 //!
 //! Every other scenario accepts session/set_config_option and reports the value.
 //!
@@ -180,6 +184,11 @@ fn dispatch(io: &mut Io, scenario: &str, message: &Value) {
                     permission_turn(io, &id, &session, scenario)
                 }
                 "model-echo" => echo_model_turn(io, &id, &session),
+                "edit-on-prompt" => edit_turn(io, &id, &session, message),
+                // Never ends the turn: the client must cancel it.
+                "hang-on-prompt" => loop {
+                    thread::sleep(Duration::from_secs(3600));
+                },
                 _ => stream_turn(io, &id, &session),
             }
         }
@@ -224,6 +233,20 @@ fn stream_turn(io: &mut Io, id: &Value, session: &Value) {
         json!({"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "completed"}),
     );
     io.update(session, json!({"sessionUpdate": "mystery_event"}));
+    respond(io, id, json!({"stopReason": "end_turn"}));
+}
+
+/// Records the prompt it was sent in the file named by the second argument,
+/// makes one change in its working directory, and ends the turn normally.
+fn edit_turn(io: &mut Io, id: &Value, session: &Value, message: &Value) {
+    if let Some(record) = std::env::args().nth(2) {
+        let model = SELECTED_MODEL.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let body = json!({"prompt": message["params"]["prompt"], "model": model});
+        std::fs::write(record, body.to_string()).expect("the prompt record is writable");
+    }
+    std::fs::write("fixed-by-opencode.txt", "fixed through the ACP session\n")
+        .expect("the fixture writes in its working directory");
+    io.text_update(session, "fixed");
     respond(io, id, json!({"stopReason": "end_turn"}));
 }
 
