@@ -121,3 +121,18 @@ The updater does not replace `/usr/bin/slashit-ui`.
 - The binary package has been built and inspected locally. Its launch, daemon and
   desktop-integration behavior is not verified here.
 - Isolated Pacman install and removal were run earlier; see the PR history.
+
+## Owner decisions
+
+These decisions were made by the owner and are recorded here so they stay with
+the recipe. Source: the engineering plan in PR #334.
+
+- Package names `slashit-bin` and `slashit` are approved, conditional on AUR
+  namespace and ownership verification. This PR ships only `slashit-bin`; the
+  name `slashit` is reserved for a future source package.
+- Recipes live under `packaging/arch/` in this repository. No Git submodules.
+- Local packaging development and validation are authorized. Public AUR
+  publication is not authorized. No publication credential is configured, no AUR
+  repository is pushed, and no package is installed into the owner's normal
+  environment without a separate authorization.
+- Maintainer identity: `Shingonoide <shingonoide at gmail dot com>`.
