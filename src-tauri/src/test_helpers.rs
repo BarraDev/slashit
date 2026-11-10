@@ -297,6 +297,44 @@ impl FakeProgram {
     }
 }
 
+/// A name no other publication in this process is using, in the
+/// destination's own directory -- where the finished publication has to be
+/// built, because `std::fs::rename` is atomic only within one filesystem.
+/// The destination's own file name, distinguished by this process's id and a
+/// per-process counter, also keeps two publications to the same directory
+/// from colliding. A process that died before cleaning up leaves its
+/// temporaries behind -- invisible clutter under names only publications
+/// use -- and cannot be mistaken for another's.
+#[cfg(unix)]
+fn publication_scratch(path: &std::path::Path, tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "script".into());
+    name.push(format!(
+        ".{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+    ));
+    path.with_file_name(name)
+}
+
+/// A temporary file removed when this value drops, however the guarded
+/// function ends -- error return or panic alike. The removal's own failure
+/// is not reported: the caller learns of the step that failed, and a
+/// leftover is at worst clutter under a name only publications use.
+#[cfg(unix)]
+struct RemoveOnDrop(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Write `body` to `path` as an executable script that another process can run.
 ///
 /// The bytes are copied in by a short-lived `/bin/cp` child, not written by
@@ -306,29 +344,51 @@ impl FakeProgram {
 /// writer lives only in `cp`, which has exited before this returns. The source
 /// file is never executed, so writing it in-process is safe. Tests that need a
 /// fake program call this instead of writing and running one themselves.
+///
+/// The publication itself is prepared out of the way and moved into place
+/// atomically: the copy lands in a uniquely named temporary file beside the
+/// destination, receives its final mode, and only the finished copy is
+/// renamed onto `path`. Until that rename, whatever stands at `path` -- a
+/// plain script, a symbolic link to a script elsewhere, or a hard link
+/// sharing an entry's inode -- is untouched, so a failed copy, mode change
+/// or rename cannot truncate, remove or corrupt the previous script, and the
+/// temporaries of the failed attempt are removed. The rename replaces the
+/// entry itself, so the publication follows no destination symlink and
+/// rewrites no file another link shares: both keep saying what they said
+/// before, and the published entry has an inode of its own.
 #[cfg(unix)]
 pub fn write_executable(path: &std::path::Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
-    let mut source = path.as_os_str().to_owned();
-    source.push(".source");
-    let source = std::path::PathBuf::from(source);
-    std::fs::write(&source, body).expect("write the script source");
+    let source = RemoveOnDrop(publication_scratch(path, "source"));
+    let staged = RemoveOnDrop(publication_scratch(path, "staged"));
+    std::fs::write(&source.0, body)
+        .unwrap_or_else(|error| panic!("could not write {}: {error}", source.0.display()));
+    // A failed step must leave no temporary of its own behind for the next
+    // fixture using the same directory, must not touch what stands at the
+    // destination, and must report the failing step's own error, not the
+    // cleanup's.
     let copied = std::process::Command::new("/bin/cp")
-        .arg(&source)
-        .arg(path)
-        .status()
-        .expect("run /bin/cp");
-    assert!(copied.success(), "could not create {}: {copied}", path.display());
-    std::fs::remove_file(&source).expect("remove the script source");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod script");
+        .arg(&source.0)
+        .arg(&staged.0)
+        .status();
+    match copied {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("could not create {}: {status}", staged.0.display()),
+        // `/bin/cp` not being runnable is also a failed publication.
+        Err(error) => panic!("could not create {}: {error}", staged.0.display()),
+    }
+    std::fs::set_permissions(&staged.0, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("could not make {} executable: {error}", staged.0.display()));
+    std::fs::rename(&staged.0, path)
+        .unwrap_or_else(|error| panic!("could not rename {} into place: {error}", path.display()));
 }
 
 #[cfg(all(test, unix))]
 mod executable_fixture_tests {
-    use super::write_executable;
+    use super::{write_executable, UnwritableDir};
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
@@ -405,8 +465,172 @@ mod executable_fixture_tests {
             .status()
             .expect("the published script must be executable");
         assert!(status.success());
-        assert!(!dir.path().join("gh.source").exists(), "the source copy is removed");
+        assert_eq!(
+            entries(dir.path()),
+            vec!["gh".to_string()],
+            "no temporary survives the publication"
+        );
         pending.finish();
+    }
+
+    /// What a directory holds, sorted, for assertions that are about the
+    /// absence or presence of entries rather than their order.
+    fn entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("list the directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A publication over an existing script replaces it with the complete
+    /// new content: the rename moves a fully written file, so `path` never
+    /// shows a partial publication, and the previous content is not
+    /// truncated in place on the way there.
+    #[test]
+    fn a_replacement_publishes_the_complete_new_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture");
+        write_executable(&path, "#!/bin/sh\necho first\n");
+        write_executable(&path, SCRIPT);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            SCRIPT,
+            "the replacement published all of its content"
+        );
+        let status = Command::new(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .expect("the replaced script must be executable");
+        assert!(status.success());
+    }
+
+    /// A publication whose preparation fails leaves the previous script
+    /// exactly as it stood: every step before the rename works on uniquely
+    /// named temporaries, so a directory without write permission defeats
+    /// the publication before anything at `path` is touched.
+    #[test]
+    fn a_failed_publication_leaves_the_previous_script_intact() {
+        // Root ignores the write bit this test relies on, so it has no
+        // reproduction for a publication defeated by permissions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("argued-away");
+        write_executable(&path, "#!/bin/sh\necho previous\n");
+        // Restores write access on drop, including when an assertion below
+        // unwinds, so `tempdir`'s cleanup never meets a read-only directory.
+        let _unwritable = UnwritableDir::new(dir.path()).expect("the directory still accepts writes");
+
+        let message = std::panic::catch_unwind(|| write_executable(&path, SCRIPT))
+            .expect_err("a directory without write permission defeats the publication")
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("could not write"),
+            "the failing step's own error is reported, not the cleanup: {message}"
+        );
+        assert_eq!(
+            entries(dir.path()),
+            vec!["argued-away".to_string()],
+            "the failed publication leaves no temporary behind"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "#!/bin/sh\necho previous\n",
+            "the failed publication never touched what stands there"
+        );
+        assert!(
+            std::fs::metadata(&path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0),
+            "what stands there is still executable"
+        );
+    }
+
+    /// A publication can prepare for a destination it cannot replace -- here
+    /// a directory -- and fails at the rename with the temporaries cleaned
+    /// up and what stands at the destination untouched.
+    #[test]
+    fn a_publication_that_cannot_rename_leaves_no_temporaries_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir(&occupied).expect("occupy the destination with a directory");
+
+        let message = std::panic::catch_unwind(|| write_executable(&occupied, SCRIPT))
+            .expect_err("a directory cannot be replaced by the rename")
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("could not rename"),
+            "the rename's own error is reported, not the cleanup: {message}"
+        );
+        assert_eq!(
+            entries(dir.path()),
+            vec!["occupied".to_string()],
+            "no temporary survives the failed publication"
+        );
+        assert!(
+            std::fs::metadata(&occupied).is_ok_and(|meta| meta.is_dir()),
+            "what stands at the destination is untouched"
+        );
+    }
+
+    /// A publication replaces a hard link at its destination rather than
+    /// writing through it: the rename gives the entry a fresh inode, so the
+    /// file another link shares keeps what it said.
+    #[test]
+    fn a_published_entry_replaces_a_hard_link_instead_of_writing_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("sibling");
+        std::fs::write(&sibling, "stale\n").unwrap();
+        let occupied = dir.path().join("occupied");
+        std::fs::hard_link(&sibling, &occupied).unwrap();
+
+        write_executable(&occupied, SCRIPT);
+
+        assert_eq!(
+            std::fs::metadata(&occupied).unwrap().nlink(),
+            1,
+            "the published entry shares its inode with nothing"
+        );
+        assert_eq!(std::fs::read_to_string(&occupied).unwrap(), SCRIPT);
+        assert_eq!(
+            std::fs::read_to_string(&sibling).unwrap(),
+            "stale\n",
+            "the other hard link's file is untouched"
+        );
+    }
+
+    /// A publication replaces a symlink at its destination rather than
+    /// rewriting the file it points at: the rename moves the entry itself,
+    /// so nothing follows the link.
+    #[test]
+    fn a_published_entry_replaces_a_symlink_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("checked-in");
+        std::fs::write(&target, "stale\n").unwrap();
+        let occupied = dir.path().join("occupied");
+        std::os::unix::fs::symlink(&target, &occupied).unwrap();
+
+        write_executable(&occupied, SCRIPT);
+
+        assert!(
+            std::fs::symlink_metadata(&occupied)
+                .is_ok_and(|meta| !meta.file_type().is_symlink()),
+            "the entry is a file of its own now"
+        );
+        assert_eq!(std::fs::read_to_string(&occupied).unwrap(), SCRIPT);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "stale\n",
+            "the symlink's target is untouched"
+        );
     }
 }
 

@@ -228,8 +228,6 @@ const GENERATED_HEADER: &str =
 /// Does nothing when the `claude` that the journey's `PATH` resolves to is not
 /// this fixture, so a journey that never installed it is unaffected.
 pub fn publish_controls(child_env: &[(OsString, OsString)]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
     let path = crate::developer_tools::requested_path(child_env, std::env::var_os("PATH"));
     let Some(entry) = resolve_on_path(EXECUTABLE, &path) else {
         return Ok(());
@@ -255,12 +253,17 @@ pub fn publish_controls(child_env: &[(OsString, OsString)]) -> Result<()> {
     }
     body.push_str(&format!("exec {} \"$@\"\n", shell_quote(&script.to_string_lossy())));
 
-    std::fs::remove_file(&entry)
-        .with_context(|| format!("could not replace {}", entry.display()))?;
-    std::fs::write(&entry, body)
-        .with_context(|| format!("could not write {}", entry.display()))?;
-    std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("could not make {} executable", entry.display()))?;
+    // The wrapper is published by the shared helper's short-lived child, not
+    // written by this process: the product (and the tests here, which exec
+    // the entry) cannot meet the file still open for writing in a child a
+    // concurrent fork inherited. The helper builds the finished script in a
+    // uniquely named temporary beside the entry and renames it onto the
+    // entry, so an entry that shares another file's inode -- a fixture
+    // symlink or a hard link to the checked-in script -- is replaced, not
+    // followed or written through, and the checked-in script is never
+    // rewritten.
+    crate::fixture::write_executable(&entry, &body)
+        .with_context(|| format!("could not publish {}", entry.display()))?;
     Ok(())
 }
 
@@ -1581,6 +1584,9 @@ mod tests {
 
         // Present in both, executable only in the second: a non-executable
         // file must not shadow the real one, exactly as the shell behaves.
+        // Not a race: nothing ever executes these files. `resolve_on_path`
+        // only stats them, so no fork can meet a writer of a file being
+        // exec'd.
         std::fs::write(first.join(EXECUTABLE), "not executable").expect("write");
         let real = second.join(EXECUTABLE);
         std::fs::write(&real, "#!/bin/sh\n").expect("write");

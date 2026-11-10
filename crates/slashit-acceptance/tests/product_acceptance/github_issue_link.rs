@@ -55,16 +55,18 @@ async fn issue_link_journey(context: &TestContext) -> Result<()> {
 /// address it is given to a log, which is what the product's open action
 /// reaches on Linux.
 fn install_url_opener(context: &TestContext, root: &Path, agent: &FakeAgent) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let bin = root.join("opener-bin");
     std::fs::create_dir_all(&bin)?;
     let log = root.join("opened-urls.txt");
     let script = bin.join("xdg-open");
-    std::fs::write(
+    // Published through the shared helper, whose short-lived child owns the
+    // write descriptor: the application execs this file to open an Issue in
+    // a browser, and a descriptor held open here at a concurrent fork would
+    // make that exec fail with ETXTBSY.
+    slashit_acceptance::fixture::write_executable(
         &script,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\n", log.display()),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\n", log.display()),
     )?;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
     let path = std::env::join_paths(
         std::iter::once(bin).chain(std::env::split_paths(agent.path_value())),
     )?;

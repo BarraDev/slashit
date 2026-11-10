@@ -5152,6 +5152,7 @@ dependencies = [
  "libc",
  "serde_json",
  "sha2",
+ "tempfile",
  "thirtyfour",
  "tokio",
  "toml 0.8.2",

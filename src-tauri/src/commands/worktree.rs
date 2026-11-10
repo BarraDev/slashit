@@ -791,11 +791,10 @@ mod tests {
             let w = world(Class::Created).await;
             let hook = w.repo.join(".git").join("hooks").join("post-checkout");
             std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-            std::fs::write(&hook, "#!/bin/sh\necho made-by-hook > hook-output.txt\n").unwrap();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            // Published by `write_executable`'s short-lived child, not written
+            // by this process, so git's exec of the hook cannot fail with
+            // ETXTBSY while a fork still holds it open for writing.
+            crate::test_helpers::write_executable(&hook, "#!/bin/sh\necho made-by-hook > hook-output.txt\n");
             let Some(unwritable) = crate::test_helpers::UnwritableDir::new(&w.tasks_dir()) else {
                 eprintln!("skipped: the tasks directory stays writable (running as root?)");
                 return;
