@@ -1785,19 +1785,19 @@ mod tests {
         let seen = fixture._tmp.path().join("backend-seen");
         std::fs::create_dir_all(&hooks).unwrap();
         let hook = hooks.join("post-rewrite");
-        std::fs::write(
-            &hook,
-            format!(
-                "#!/bin/sh\ncat >/dev/null\nif [ -d \"$(git rev-parse --git-path rebase-merge)\" ]; then echo merge; \
-                 else echo other; fi > {seen:?}\n"
-            ),
-        )
-        .unwrap();
+        // Unix: the hook is published by `write_executable`'s short-lived
+        // child, not written by this process, so git's exec of it cannot fail
+        // with ETXTBSY while a fork still holds it open for writing.
+        // Elsewhere it is only copied by `git_in`'s fixtures, so an in-process
+        // write is safe.
+        let script = format!(
+            "#!/bin/sh\ncat >/dev/null\nif [ -d \"$(git rev-parse --git-path rebase-merge)\" ]; then echo merge; \
+             else echo other; fi > {seen:?}\n"
+        );
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_helpers::write_executable(&hook, &script);
+        #[cfg(not(unix))]
+        std::fs::write(&hook, script).unwrap();
         git_in(&fixture.worktree, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
         let restack = fixture.restack();
 

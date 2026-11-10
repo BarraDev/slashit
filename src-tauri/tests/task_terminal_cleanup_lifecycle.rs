@@ -167,9 +167,12 @@ fn install_test_environment() -> TestEnvironment {
     fs::create_dir_all(&barrier_root).expect("barrier root");
 
     let shim = shim_dir.join("git");
-    fs::write(
+    // Published through the shared helper: an in-process write would leave a
+    // descriptor open for writing that a concurrently forked child can inherit,
+    // and the shim's own exec would then fail with ETXTBSY.
+    slashit_ui_lib::test_helpers::write_executable(
         &shim,
-        format!(
+        &format!(
             r#"#!/bin/sh
 # TEST SHIM. Installed by tests/task_terminal_cleanup_lifecycle.rs.
 #
@@ -233,9 +236,7 @@ exec "$REAL_GIT" "$@"
             real_git = real_git.display(),
             barrier_root = barrier_root.display(),
         ),
-    )
-    .expect("write git shim");
-    make_executable(&shim);
+    );
 
     // One `set_var` burst, performed inside the `LazyLock` initialiser, so it
     // happens exactly once and every other test thread is parked inside the
@@ -262,13 +263,6 @@ exec "$REAL_GIT" "$@"
         _root: root,
         barrier_root,
     }
-}
-
-fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path).expect("stat shim").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).expect("chmod shim");
 }
 
 // ---------------------------------------------------------------------------

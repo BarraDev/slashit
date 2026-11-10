@@ -905,13 +905,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_probe_runs_no_program_the_repository_configures() {
-        use std::os::unix::fs::PermissionsExt;
         let mut fx = Fixture::new();
         let checkout = fx.checkout("task-a", TaskStatus::HumanReview);
         let marker = fx.outside.join("hook-ran");
         let hook = fx.outside.join("fsmonitor-hook");
-        fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display())).unwrap();
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        // Published by `write_executable`'s short-lived child, not written by
+        // this process, so git's exec of the hook cannot fail with ETXTBSY
+        // while a fork still holds it open for writing.
+        crate::test_helpers::write_executable(
+            &hook,
+            &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        );
         git(&checkout, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
         fs::write(checkout.join(".gitignore"), "/target\n").unwrap();
         write(&checkout.join("target/big"), 128 * KIB);
