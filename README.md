@@ -140,6 +140,7 @@ The `slashit` CLI lets you control the running app from any terminal:
 slashit status                              # App status overview
 slashit projects                            # List projects
 slashit tasks [--project ID]                # List tasks
+slashit runs TASK_ID                        # Show one Task's recent execution evidence
 slashit create --project ID "Task title"    # Create task
 slashit move TASK_ID queue                  # Move task to status
 slashit edit TASK_ID --title "New title"    # Edit task

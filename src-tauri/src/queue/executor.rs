@@ -1649,6 +1649,9 @@ impl Drop for StoppingMark {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExecutionSnapshot {
+    /// The execution's own identity. Not persisted: it is this session's
+    /// evidence only, and it is gone when the process ends.
+    pub id: Uuid,
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// `None` while the execution's agent is still running.
     pub stopped_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -8047,6 +8050,7 @@ impl TaskExecutor {
         let (last_execution, ended) = match latest {
             Some((id, started_at, stopped_at, status)) => (
                 Some(ExecutionSnapshot {
+                    id,
                     started_at,
                     stopped_at,
                     output: self.logs.read().await.get(&id).cloned().unwrap_or_default(),
@@ -8862,6 +8866,36 @@ impl TaskExecutor {
             },
         );
         cleaned_up
+    }
+
+    /// Records an ended execution for `task_id`, with the output a reader
+    /// (`get_task_output`) will find, without launching anything. Stands in
+    /// for a run this instance supervised and returned from, which is
+    /// exactly the evidence the control channel's read verbs serve. `status`
+    /// is how the run ended (`Stopped`, or `Failed` with the recorded
+    /// reason).
+    #[cfg(test)]
+    pub(crate) async fn record_ended_execution_for_test(
+        &self,
+        task_id: Uuid,
+        status: AgentStatus,
+        output: &[&str],
+    ) -> Uuid {
+        let execution = AgentExecution {
+            id: Uuid::new_v4(),
+            worktree_id: None,
+            task_id: Some(task_id),
+            agent_type: "claude-code".to_string(),
+            status,
+            started_at: chrono::Utc::now(),
+            stopped_at: Some(chrono::Utc::now()),
+        };
+        let id = execution.id;
+        self.executions.write().await.insert(id, execution);
+        for line in output {
+            record_output(&self.logs, id, LogLevel::Info, line.to_string()).await;
+        }
+        id
     }
 
     /// Same as [`Self::register_fake_running_execution_for_test`], for

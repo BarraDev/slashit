@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- The control channel answers `GetTaskEvidence`, read-only: one Task's recent
+  execution evidence, assembled from its persisted record and Activity (run
+  outcomes and failure reasons, the AI-review outcome and signoff, the
+  configured Worker model and the Task's latest observed model — a Task-level
+  identity, not attributed to any single run — and the newest milestones) plus
+  what the running instance holds in memory for its latest run. The number of
+  runs and the size of the answer are bounded, the memory-only part names
+  itself, and a fix pass that itself failed is told apart from the changes
+  request it answered. Reached through the new `slashit runs TASK_ID`
+  command; nothing streams, nothing is stored, and no alias is ever read back
+  as an observed model. Every echoed copy of a stored Activity entry, run
+  failure reason and run result is redacted again under the current policy at
+  read time, so a record written before a masking rule existed is echoed
+  clean; a review a newer run began after is still reported, named as
+  superseded by that run; and the `slashit runs` report renders every
+  externally influenced value with terminal control sequences escaped.
+
 ## [0.0.3]
 
 An experimental prerelease that adds a temporary startup mitigation for the

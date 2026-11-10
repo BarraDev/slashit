@@ -546,6 +546,182 @@ async fn a_read_only_verb_is_allowed_from_both_endpoints() {
     }
 }
 
+// --- Task evidence ----------------------------------------------------------
+//
+// `GetTaskEvidence` is a read: the evidence answer is what `slashit runs`
+// shows, and the same properties are pinned here over a real socket.
+
+use slashit_ui_lib::test_helpers::create_test_task_full;
+
+/// Seed one Task the answer can be read against.
+async fn seed_evidence_task(h: &Harness) -> uuid::Uuid {
+    let mut task = create_test_task_full(
+        "Wire evidence task",
+        uuid::Uuid::new_v4(),
+        slashit_ui_lib::domain::TaskStatus::Error,
+        0,
+    );
+    task.record_activity(slashit_activity::Kind::RunFailed {
+        run: Some(1),
+        reason: "provider unreachable over the wire".to_string(),
+    });
+    let id = task.id;
+    h.ctx.tasks.write().await.insert(id, task);
+    id
+}
+
+#[tokio::test]
+async fn task_evidence_round_trips_over_the_local_endpoint() {
+    let h = Harness::start().await;
+    let id = seed_evidence_task(&h).await;
+
+    let response = send(
+        &IpcRequest::GetTaskEvidence {
+            task_id: id.to_string(),
+        },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("the local endpoint should answer");
+
+    assert!(response.ok, "{response:?}");
+    let d = response.data;
+    assert_eq!(d["task_id"], id.to_string());
+    assert_eq!(d["title"], "Wire evidence task");
+    assert_eq!(d["runs"][0]["run"], 1);
+    assert_eq!(d["runs"][0]["status"], "failed");
+    assert_eq!(d["runs"][0]["failure_reason"], "provider unreachable over the wire");
+    assert_eq!(d["output"]["memory_only"], true);
+}
+
+#[tokio::test]
+async fn task_evidence_fails_closed_on_an_unreadable_or_unknown_id() {
+    let h = Harness::start().await;
+
+    let bad = send(
+        &IpcRequest::GetTaskEvidence { task_id: "nope".into() },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("answered, not dropped");
+    assert!(!bad.ok);
+    assert!(error_of(&bad).contains("Invalid task_id"));
+
+    let missing = send(
+        &IpcRequest::GetTaskEvidence {
+            task_id: uuid::Uuid::new_v4().to_string(),
+        },
+        &h.options(&h.local, None),
+    )
+    .await
+    .expect("answered, not dropped");
+    assert!(!missing.ok);
+    assert!(error_of(&missing).contains("not found"));
+}
+
+#[tokio::test]
+async fn task_evidence_is_readable_by_a_verified_tcp_peer_and_never_writes() {
+    let h = Harness::start().await;
+    let id = seed_evidence_task(&h).await;
+
+    // A verified TCP peer: the read is a status verb, so the answer arrives.
+    let response = send(
+        &IpcRequest::GetTaskEvidence {
+            task_id: id.to_string(),
+        },
+        &h.options(&h.tcp, Some(&h.token)),
+    )
+    .await
+    .expect("an authenticated TCP client should be answered");
+    assert!(response.ok, "{response:?}");
+    assert_eq!(response.data["task_id"], id.to_string());
+}
+
+/// The fail-closed case over the wire: evidence is still a privileged read,
+/// so a TCP client the credential does not vouch for gets the same refusal it
+/// would get for any other verb, and learns nothing about the Task it named.
+/// The typed client refuses to send an unauthenticated request at all
+/// (`TokenRequired`), so these go out as raw envelopes, the way an attacker
+/// would send them.
+#[tokio::test]
+async fn task_evidence_is_refused_without_the_tcp_token() {
+    let h = Harness::start().await;
+    let id = seed_evidence_task(&h).await;
+
+    let demanded = envelope_roundtrip(
+        &h.tcp,
+        &serde_json::to_value(IpcEnvelope::new(IpcRequest::GetTaskEvidence {
+            task_id: id.to_string(),
+        }))
+        .unwrap(),
+    )
+    .await;
+    let error = error_of(&demanded);
+    assert!(
+        error.to_lowercase().contains("authentication"),
+        "no token, no evidence: {error}"
+    );
+    assert!(
+        !error.contains(&id.to_string()),
+        "the refusal must not name the task"
+    );
+
+    let wrong = envelope_roundtrip(
+        &h.tcp,
+        &serde_json::to_value(IpcEnvelope::with_auth(
+            IpcRequest::GetTaskEvidence { task_id: id.to_string() },
+            "0".repeat(64),
+        ))
+        .unwrap(),
+    )
+    .await;
+    let error = error_of(&wrong);
+    assert!(
+        error.to_lowercase().contains("authentication"),
+        "a guessed token is refused, not debatable: {error}"
+    );
+    assert!(
+        !serde_json::to_string(&wrong)
+            .unwrap()
+            .contains(&id.to_string()),
+        "an unauthenticated answer must not reach the task"
+    );
+}
+
+/// A request no parser can read fails closed: a malformed `get_task_evidence`
+/// envelope is a decode error, never an answer.
+#[tokio::test]
+async fn task_evidence_fails_closed_on_a_malformed_envelope() {
+    let h = Harness::start().await;
+
+    let no_id = envelope_roundtrip(
+        &h.local,
+        &serde_json::json!({ "version": PROTOCOL_VERSION, "cmd": "get_task_evidence" }),
+    )
+    .await;
+    let error = error_of(&no_id);
+    assert!(
+        error.starts_with("Invalid request"),
+        "a malformed request is told apart from an answer: {error}"
+    );
+
+    let not_an_id = envelope_roundtrip(
+        &h.local,
+        &serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "cmd": "get_task_evidence",
+            "task_id": 12_345
+        }),
+    )
+    .await;
+    let error = error_of(&not_an_id);
+    assert!(
+        error.starts_with("Invalid request"),
+        "a task_id of the wrong type is malformed: {error}"
+    );
+}
+
+
 // ---------------------------------------------------------------------------
 // Single-instance ownership
 //

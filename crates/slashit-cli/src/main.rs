@@ -5,13 +5,11 @@
 //! The instance may be the desktop app or the headless daemon; the CLI does not
 //! care, and `slashit ping` is how a user finds out which one answered.
 
-mod client;
-mod output;
-
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use slashit::{client, output};
 use slashit_ipc::client::{ClientError, ClientOptions};
 use slashit_ipc::{InstanceInfo, IpcRequest};
 
@@ -55,6 +53,20 @@ enum Commands {
     },
     /// Show one task's full record as JSON (read-only)
     Inspect {
+        /// Task ID
+        task_id: String,
+    },
+    /// Show one Task's recent execution evidence (read-only)
+    ///
+    /// The answer reports the Task's persisted runs and their outcomes, the
+    /// AI-review outcome and signoff where kept, the configured Worker model
+    /// (the saved Task model) and the Task's latest observed model where a
+    /// run recorded one — a Task-level identity, not attributed to any single
+    /// run — plus the newest Activity milestones, and this instance's hold on
+    /// the latest run, which is memory only; the answer says when it is gone.
+    /// The number of runs and the size of the answer are bounded by the
+    /// instance.
+    Runs {
         /// Task ID
         task_id: String,
     },
@@ -217,13 +229,73 @@ async fn main() -> Result<()> {
         }
     }
 
-    let request = match &cli.command {
+    // Not a plain request/response: "no daemon is running" is an answer
+    // rather than a failure, and it has to set the exit status.
+    if let Commands::Daemon { command: DaemonCommands::Status } = &cli.command {
+        return daemon_status(&options, cli.json).await;
+    }
+    let request = request_for(&cli.command)?;
+
+    let response = slashit_ipc::client::send(&request, &options).await?;
+
+    if !response.ok {
+        let msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+        eprintln!("{}", output::error_line(&msg));
+        std::process::exit(1);
+    }
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&response.data)?);
+        return Ok(());
+    }
+
+    // Format output based on command type
+    match &cli.command {
+        // The record is JSON by nature; there is no table form.
+        Commands::Inspect { .. } => println!("{}", serde_json::to_string_pretty(&response.data)?),
+        Commands::Status => output::print_status(&response.data),
+        Commands::Projects => output::print_projects(&response.data),
+        Commands::Tasks { .. } => output::print_tasks(&response.data),
+        Commands::Queue => output::print_queue(&response.data),
+        Commands::Terminals => output::print_terminals(&response.data),
+        Commands::Ping => output::print_instance(&response.data),
+        Commands::Features => output::print_features(&response.data),
+        Commands::Runs { .. } => output::print_runs(&response.data),
+        _ => {
+            // For mutation commands, print a simple success message
+            if let Some(msg) = response.data.as_str() {
+                println!("{msg}");
+            } else if response.data.is_null() {
+                println!("Done.");
+            } else {
+                println!("{}", serde_json::to_string_pretty(&response.data)?);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The path as an absolute one, resolved from this shell's directory. The
+/// instance writes relative to its own directory, so a relative path must be
+/// made absolute here.
+fn absolute_path(path: &std::path::Path) -> Result<String> {
+    Ok(std::path::absolute(path)?.to_string_lossy().into_owned())
+}
+
+/// The request a command sends to the running instance. `main` answers the
+/// daemon status check itself, so it never reaches this mapping.
+fn request_for(command: &Commands) -> Result<IpcRequest> {
+    Ok(match command {
         Commands::Status => IpcRequest::Status,
         Commands::Projects => IpcRequest::ListProjects,
         Commands::Tasks { project } => IpcRequest::ListTasks {
             project_id: project.clone(),
         },
         Commands::Inspect { task_id } => IpcRequest::GetTask {
+            task_id: task_id.clone(),
+        },
+        Commands::Runs { task_id } => IpcRequest::GetTaskEvidence {
             task_id: task_id.clone(),
         },
         Commands::Create {
@@ -289,57 +361,46 @@ async fn main() -> Result<()> {
         Commands::Import { path, .. } => IpcRequest::PreviewImport {
             path: absolute_path(path)?,
         },
-        // Not a plain request/response: "no daemon is running" is an answer
-        // rather than a failure, and it has to set the exit status.
-        Commands::Daemon { command } => match command {
-            DaemonCommands::Status => return daemon_status(&options, cli.json).await,
-        },
-    };
+        Commands::Daemon { .. } => {
+            anyhow::bail!("daemon status is answered by `main`, not sent as a request")
+        }
+    })
+}
 
-    let response = slashit_ipc::client::send(&request, &options).await?;
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
 
-    if !response.ok {
-        let msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
-        eprintln!("Error: {msg}");
-        std::process::exit(1);
+    const TASK: &str = "6f96fefa-0000-0000-0000-000000000003";
+
+    fn request_for_args(args: &[&str]) -> IpcRequest {
+        let cli = Cli::try_parse_from(args).expect("the arguments parse");
+        request_for(&cli.command).expect("the command maps to a request")
     }
 
-    if cli.json {
-        println!("{}", serde_json::to_string_pretty(&response.data)?);
-        return Ok(());
-    }
-
-    // Format output based on command type
-    match &cli.command {
-        // The record is JSON by nature; there is no table form.
-        Commands::Inspect { .. } => println!("{}", serde_json::to_string_pretty(&response.data)?),
-        Commands::Status => output::print_status(&response.data),
-        Commands::Projects => output::print_projects(&response.data),
-        Commands::Tasks { .. } => output::print_tasks(&response.data),
-        Commands::Queue => output::print_queue(&response.data),
-        Commands::Terminals => output::print_terminals(&response.data),
-        Commands::Ping => output::print_instance(&response.data),
-        Commands::Features => output::print_features(&response.data),
-        _ => {
-            // For mutation commands, print a simple success message
-            if let Some(msg) = response.data.as_str() {
-                println!("{msg}");
-            } else if response.data.is_null() {
-                println!("Done.");
-            } else {
-                println!("{}", serde_json::to_string_pretty(&response.data)?);
-            }
+    /// `slashit runs` reaches the evidence verb, and only that verb: it must
+    /// not fall through to the full Task record `inspect` asks for.
+    #[test]
+    fn runs_sends_the_read_only_evidence_request() {
+        match request_for_args(&["slashit", "runs", TASK]) {
+            IpcRequest::GetTaskEvidence { task_id } => assert_eq!(task_id, TASK),
+            other => panic!("runs mapped to {other:?}"),
         }
     }
 
-    Ok(())
-}
+    #[test]
+    fn inspect_still_sends_the_full_task_record_request() {
+        match request_for_args(&["slashit", "inspect", TASK]) {
+            IpcRequest::GetTask { task_id } => assert_eq!(task_id, TASK),
+            other => panic!("inspect mapped to {other:?}"),
+        }
+    }
 
-/// The path as an absolute one, resolved from this shell's directory. The
-/// instance writes relative to its own directory, so a relative path must be
-/// made absolute here.
-fn absolute_path(path: &std::path::Path) -> Result<String> {
-    Ok(std::path::absolute(path)?.to_string_lossy().into_owned())
+    #[test]
+    fn the_daemon_command_is_not_a_request() {
+        let cli = Cli::try_parse_from(["slashit", "daemon", "status"]).expect("parses");
+        assert!(request_for(&cli.command).is_err());
+    }
 }
 
 /// Answer "is a daemon running?" with an exit status a script can branch on.
@@ -353,7 +414,7 @@ async fn daemon_status(options: &ClientOptions, json: bool) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("could not understand the instance's reply: {e}"))?,
         Ok(response) => {
             let msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
-            eprintln!("Error: {msg}");
+            eprintln!("{}", output::error_line(&msg));
             std::process::exit(1);
         }
         // Nothing listening is the expected negative answer, not a crash.

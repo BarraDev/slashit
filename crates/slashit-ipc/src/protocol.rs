@@ -40,6 +40,20 @@ pub enum IpcRequest {
     ListTasks { project_id: Option<String> },
     /// Read one task as its full stored record. Never writes.
     GetTask { task_id: String },
+    /// Read one Task's recent execution evidence. Never writes.
+    ///
+    /// The answer is built from evidence that already exists: the Task's
+    /// persisted Activity and its Task record (run outcomes, review outcomes,
+    /// the configured model and the Task's latest observed model), plus what
+    /// the running instance still holds in memory for the Task's latest run —
+    /// the same data the desktop's `get_task_run` and `get_task_output`
+    /// commands serve the UI. The in-memory part exists only for this
+    /// instance's lifetime and is gone after a restart; the answer says so.
+    /// The observed model is a Task-level identity, not attributed to any
+    /// single run — per-run model history is not persisted — and it is never
+    /// inferred from the configured alias. The number of runs described and
+    /// the bytes of the answer are bounded by the instance.
+    GetTaskEvidence { task_id: String },
     /// Create a new task
     CreateTask {
         project_id: String,
@@ -126,6 +140,7 @@ impl IpcRequest {
                 | Self::ListProjects
                 | Self::ListTasks { .. }
                 | Self::GetTask { .. }
+                | Self::GetTaskEvidence { .. }
                 | Self::QueueStatus
                 | Self::ListTerminals
                 | Self::Features
@@ -174,6 +189,7 @@ impl IpcRequest {
             Self::ListProjects => "list_projects",
             Self::ListTasks { .. } => "list_tasks",
             Self::GetTask { .. } => "get_task",
+            Self::GetTaskEvidence { .. } => "get_task_evidence",
             Self::CreateTask { .. } => "create_task",
             Self::MoveTask { .. } => "move_task",
             Self::EditTask { .. } => "edit_task",
@@ -480,6 +496,33 @@ mod tests {
                     req.verb()
                 );
             }
+        }
+    }
+
+    /// A read that serves one Task's execution evidence is a status verb: it
+    /// changes nothing, spawns nothing and needs no verified peer.
+    #[test]
+    fn task_evidence_is_a_read_only_status_verb() {
+        let req = IpcRequest::GetTaskEvidence {
+            task_id: String::new(),
+        };
+        assert!(!req.is_mutating(), "{} changes nothing", req.verb());
+        assert!(!req.spawns_agent());
+        assert!(!req.needs_verified_peer());
+    }
+
+    #[test]
+    fn a_task_evidence_request_round_trips_on_the_wire() {
+        let env = IpcEnvelope::new(IpcRequest::GetTaskEvidence {
+            task_id: "6f96fefa-0000-0000-0000-000000000003".into(),
+        });
+        let line = serde_json::to_string(&env).unwrap();
+        let back: IpcEnvelope = serde_json::from_str(&line).unwrap();
+        match back.request {
+            IpcRequest::GetTaskEvidence { task_id } => {
+                assert!(task_id.ends_with("0003"));
+            }
+            other => panic!("decoded as {other:?}"),
         }
     }
 
