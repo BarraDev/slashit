@@ -44,9 +44,6 @@ sidecar=$binary.frontend
 grep -Eq '"beforeBuildCommand": *"trunk build"' src-tauri/tauri.conf.json ||
   fail "src-tauri/tauri.conf.json no longer runs \`trunk build\`; update this script to match"
 
-# A failed build must not leave a sidecar vouching for a stale binary.
-rm -f "$sidecar"
-
 echo "==> trunk build (release-style frontend into dist/)"
 trunk build || fail "trunk build failed; see above"
 
@@ -66,7 +63,26 @@ grep -a -q -F "$wasm" "$cargo_binary" ||
 
 # Promotion: copy to a temporary name beside the destination, then rename. A
 # rename replaces the directory entry and leaves a running executable intact.
+# Nothing is removed before the new pair is complete: the previous pair is kept
+# aside, and any failure from here on restores it, so the last known-good
+# binary and its sidecar stay consistent.
 mkdir -p "$promoted"
+backup="$promoted/.previous.$$"
+mkdir -p "$backup"
+for f in "$binary" "$cli" "$sidecar"; do
+  [ -f "$f" ] && cp -p -- "$f" "$backup/${f##*/}"
+done
+promoted_ok=0
+restore() {
+  [ "$promoted_ok" = 1 ] && return
+  for f in "$binary" "$cli" "$sidecar"; do
+    if [ -f "$backup/${f##*/}" ]; then mv -f -- "$backup/${f##*/}" "$f"
+    elif [ -f "$f" ]; then rm -f -- "$f"; fi
+  done
+  rm -rf -- "$backup"
+  echo "build-dogfood-app: promotion failed; the previous promoted pair is restored" >&2
+}
+trap restore EXIT
 publish() { # source destination
   local tmp="$2.tmp.$$"
   cp -- "$1" "$tmp" && chmod 755 "$tmp" && mv -f -- "$tmp" "$2" ||
@@ -85,4 +101,6 @@ side_tmp="$sidecar.tmp.$$"
   echo "wasm=$wasm"
 } >"$side_tmp" && mv -f -- "$side_tmp" "$sidecar" ||
   { rm -f -- "$side_tmp"; fail "cannot write the sidecar $sidecar"; }
+promoted_ok=1
+rm -rf -- "$backup"
 echo "==> embedded frontend verified ($wasm); promoted to $binary and recorded in $sidecar"

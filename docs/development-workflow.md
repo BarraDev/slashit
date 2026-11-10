@@ -1268,6 +1268,9 @@ Three build modes exist. They do not share a binary path:
   not match the binary as stale and refuses it. Promoted artifacts live inside
   the workspace's `target/` and are regenerable. They are not Task data and are
   not part of the restart snapshot.
+- **Failure keeps the last good pair.** A failed trunk or cargo build publishes
+  nothing. A failure during promotion restores the previously promoted binary,
+  CLI and sidecar, so the sidecar always describes the binary beside it.
 - **Frontend is not webview evidence.** `verify` proves the control channel,
   the endpoint and the declared environment. It states that the webview is not
   verified, because rendering needs a screenshot. A running instance whose
