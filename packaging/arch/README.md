@@ -1,12 +1,12 @@
 # Arch Linux packaging
 
-These recipes package SlashIt for Arch Linux. They live in this repository so
-that the repository is the single source for them. The AUR is not used as a
-source of truth.
+This recipe packages SlashIt for Arch Linux. It lives in this repository so that
+the repository is the single source for it. The AUR is not used as a source of
+truth.
 
-**Status.** Nothing here is published. The packages are not in the AUR, and no
-`pacman -S slashit-bin` or AUR helper command is available yet. Build them
-locally as described below. SlashIt 0.0.3 is an experimental prerelease; read
+**Status.** Nothing here is published. The package is not in the AUR, and no
+`pacman -S` or AUR helper command is available yet. Build it locally as described
+below. SlashIt 0.0.3 is an experimental prerelease; read
 [the installation guide](../../docs/installation.md) before you install it.
 
 ## Packages
@@ -14,16 +14,18 @@ locally as described below. SlashIt 0.0.3 is an experimental prerelease; read
 | Directory | Package | Contents | Build input |
 |---|---|---|---|
 | `slashit-bin/` | `slashit-bin` | The upstream `SlashIt_0.0.3_amd64.deb` release asset, unpacked and installed without changes. | Pinned `.deb` URL and SHA-256 on GitHub Releases. Nothing is compiled. |
-| `slashit/` | `slashit` | The tagged source (`v0.0.3`), built as in `.github/workflows/release.yml`. | Pinned GitHub tag archive and SHA-256. Rust crates are fetched from crates.io and checked against the tagged `Cargo.lock`. |
 
-The two packages conflict with each other, because both install
-`/usr/bin/slashit-ui`. `slashit-bin` also provides `slashit`. Install one of
-them, not both.
+`slashit-bin` provides and conflicts with the name `slashit`, which is reserved
+for a future source package. Do not install another SlashIt package alongside it.
 
-`slashit-bin` is the quicker option and runs the binaries that CI built and
-the release published. `slashit` compiles from source with the same procedure
-as the release workflow. It takes much longer, needs the build dependencies
-below, and its output is not byte-identical to the release binaries.
+### Deferred: source package
+
+There is no source package in this repository yet. A source recipe built from the
+`v0.0.3` tag would install the updater as it stands on that tag. That code
+classifies any process started with an inherited `APPIMAGE` variable as an
+AppImage. The tag does not contain the guard added in PR #335, so a source build
+from it could replace a package-managed binary. Reconsider a source package only
+after an official tagged release contains that guard.
 
 ## Build locally with makepkg
 
@@ -36,7 +38,7 @@ scratch location:
 ```bash
 export SLASHIT_SCRATCH="$HOME/.cache/agent-scratch/slashit-app/arch"
 mkdir -p "$SLASHIT_SCRATCH"/{build,srcdest,pkgdest,srcpkgdest}
-cd packaging/arch/slashit-bin          # or packaging/arch/slashit
+cd packaging/arch/slashit-bin
 BUILDDIR="$SLASHIT_SCRATCH/build" \
 SRCDEST="$SLASHIT_SCRATCH/srcdest" \
 PKGDEST="$SLASHIT_SCRATCH/pkgdest" \
@@ -44,90 +46,60 @@ SRCPKGDEST="$SLASHIT_SCRATCH/srcpkgdest" \
   makepkg -f --noconfirm
 ```
 
-Regenerate `.SRCINFO` after any change to a PKGBUILD, with
+Regenerate `.SRCINFO` after any change to the PKGBUILD, with
 `makepkg --printsrcinfo > .SRCINFO`. The AUR reads `.SRCINFO`, not the PKGBUILD.
 
-Check a recipe before you build it, and inspect the package it produced. Use
-the commands for the package you built; the two packages have different names.
+Check the recipe and inspect the package it produced:
 
 ```bash
-# slashit-bin
-cd packaging/arch/slashit-bin
 namcap PKGBUILD
 namcap "$SLASHIT_SCRATCH/pkgdest/slashit-bin-0.0.3-1-x86_64.pkg.tar.zst"
 bsdtar -tvf "$SLASHIT_SCRATCH/pkgdest/slashit-bin-0.0.3-1-x86_64.pkg.tar.zst"
-
-# slashit (source)
-cd packaging/arch/slashit
-namcap PKGBUILD
-namcap "$SLASHIT_SCRATCH/pkgdest/slashit-0.0.3-1-x86_64.pkg.tar.zst"
-bsdtar -tvf "$SLASHIT_SCRATCH/pkgdest/slashit-0.0.3-1-x86_64.pkg.tar.zst"
 ```
+
+`namcap` reports the binaries as unstripped. That is intentional: the PKGBUILD
+sets `!strip` so the installed files stay byte-identical to the release.
 
 ## Directories makepkg uses
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `BUILDDIR` | `$startdir` (the package directory) | Parent of `src/` and `pkg/`. Set it to scratch. |
-| `srcdir` | `$BUILDDIR/<pkgbase>/src` | Where sources are extracted and built. |
+| `srcdir` | `$BUILDDIR/<pkgbase>/src` | Where sources are extracted. |
 | `pkgdir` | `$BUILDDIR/<pkgbase>/pkg` | The fake root the package is installed into. |
 | `SRCDEST` | the package directory | Downloaded sources, reused between builds. |
 | `PKGDEST` | the current directory | Where the finished `.pkg.tar.zst` is written. |
 | `SRCPKGDEST` | the current directory | Where `--source` packages are written. |
-| `CARGO_TARGET_DIR` | `srcdir/slashit-0.0.3/target` (set to `target` inside the source tree by the `slashit` PKGBUILD) | Compiler output for the source build. It is not shared with any other build. |
-
-The source build has no separate compiler cache. The `slashit` recipe does not
-use sccache or a shared Cargo target. Rust crates are cached by Cargo in
-`$CARGO_HOME` (`~/.cargo` by default), which makepkg does not clean.
 
 `makepkg -c` (`--clean`) removes `srcdir` and `pkgdir` after a successful build.
-It does not remove `SRCDEST` (the downloaded tarball or `.deb`), the Cargo
-registry, or the packages written to `PKGDEST`. Delete those yourself when you
-no longer need them.
+It does not remove `SRCDEST` (the downloaded `.deb`) or the packages written to
+`PKGDEST`. Delete those yourself when you no longer need them.
 
-## Build dependencies
+## Dependencies
 
-Both recipes need `makepkg`, which comes from the `base-devel` group. Install
-it with `sudo pacman -S --needed base-devel` if it is missing.
+`makepkg` comes from the `base-devel` group. Install it with
+`sudo pacman -S --needed base-devel` if it is missing.
 
-`slashit-bin` needs only the runtime dependencies listed in its PKGBUILD:
+`slashit-bin` needs the runtime dependencies listed in its PKGBUILD:
 `webkit2gtk-4.1`, `gtk3`, `libsoup3`, `libayatana-appindicator` and `dbus`.
-
-`slashit` also needs the makedepends in its PKGBUILD: `cargo`, `rust`,
-`rust-wasm`, `trunk`, `wasm-bindgen`, `binaryen`, `librsvg` and `pkgconf`.
-Install them with pacman yourself. The recipe does not install anything.
+pacman installs them when you install the package.
 
 ## Install and remove
 
-These packages are not in the AUR or any other repository. After a local build,
-install the package file with pacman:
+After a local build, install the package file with pacman:
 
 ```bash
-sudo pacman -U "$SLASHIT_SCRATCH/pkgdest/slashit-bin-0.0.3-1-x86_64.pkg.tar.zst"   # or the slashit-0.0.3 file
+sudo pacman -U "$SLASHIT_SCRATCH/pkgdest/slashit-bin-0.0.3-1-x86_64.pkg.tar.zst"
 ```
 
-Do not install both packages; they conflict. Remove the package with:
+Remove it with:
 
 ```bash
-sudo pacman -R slashit-bin    # or: sudo pacman -R slashit
+sudo pacman -R slashit-bin
 ```
 
 Pacman removes only the files the package owns. Your SlashIt data directories
 are not owned by the package, so removing it leaves them in place.
-
-## Known gaps in the source recipe
-
-These are open. They are listed so that nobody mistakes the recipe for a
-verified build.
-
-- It has not been built. `makepkg --verifysource` passes for the pinned tarball,
-  and that is all that was run on it.
-- `trunk` downloads Tailwind CSS 4.1.10 at build time (see `Trunk.toml`), and
-  it uses a `wasm-bindgen` that must match `Cargo.lock` (0.2.114). The Arch
-  `wasm-bindgen` package is 0.2.128, so `trunk` will fetch its own copy.
-  Neither download is pinned by the PKGBUILD.
-- Arch's `rust` is newer than the toolchain in `rust-toolchain.toml` (1.98.1).
-  The system `cargo` ignores that file.
 
 ## Updates and the updater on Arch
 
@@ -136,20 +108,16 @@ refuses to replace files it does not own. The refusal happens before any file is
 changed. Source: `src-tauri/src/commands/updater.rs`, `install_kind` and
 `unsupported_reason`.
 
-- `slashit-bin`: the binary carries the Debian bundle marker that the upstream
-  `.deb` build wrote into it. The updater classifies it as a Debian install and
-  refuses to update. After PR #335, the refusal names `pacman` for Arch.
-- `slashit`: the source build has no bundle marker, so the updater classifies it
-  as an unpackaged binary and refuses to update. The refusal says the install is
-  unpackaged and names the AppImage build, which is not the Arch form.
-- An inherited `APPIMAGE` variable is the one case that could change this. The
-  variable is passed to every child process, so a package-managed binary started
-  from an AppImage's terminal would look like an AppImage. The plugin then
-  replaces the running executable, which is `/usr/bin/slashit-ui`. PR #335 stops
-  this by counting `APPIMAGE` only when the running executable is inside the
-  AppImage's own mount (`APPDIR`). Do not publish the source package before that
-  change is on `main`.
+`slashit-bin` carries the Debian bundle marker that the upstream `.deb` build
+wrote into the binary. The marker is checked before the `APPIMAGE` variable, so
+an inherited `APPIMAGE` cannot change the classification. The updater refuses to
+update and, after PR #335, names `pacman` as the package manager to use.
 
-On Arch, update by rebuilding the package from a newer recipe and installing
-the result with `pacman -U`. The updater does not replace `/usr/bin/slashit-ui`
-once PR #335 is on `main`.
+On Arch, update by building a newer recipe and installing it with `pacman -U`.
+The updater does not replace `/usr/bin/slashit-ui`.
+
+## Known gaps
+
+- The binary package has been built and inspected locally. Its launch, daemon and
+  desktop-integration behavior is not verified here.
+- Isolated Pacman install and removal were run earlier; see the PR history.
