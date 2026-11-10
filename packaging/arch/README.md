@@ -47,12 +47,21 @@ SRCPKGDEST="$SLASHIT_SCRATCH/srcpkgdest" \
 Regenerate `.SRCINFO` after any change to a PKGBUILD, with
 `makepkg --printsrcinfo > .SRCINFO`. The AUR reads `.SRCINFO`, not the PKGBUILD.
 
-Check a recipe before you build it:
+Check a recipe before you build it, and inspect the package it produced. Use
+the commands for the package you built; the two packages have different names.
 
 ```bash
+# slashit-bin
+cd packaging/arch/slashit-bin
 namcap PKGBUILD
-namcap "$SLASHIT_SCRATCH/pkgdest"/*.pkg.tar.zst
-bsdtar -tvf "$SLASHIT_SCRATCH/pkgdest"/slashit-bin-0.0.3-1-x86_64.pkg.tar.zst
+namcap "$SLASHIT_SCRATCH/pkgdest/slashit-bin-0.0.3-1-x86_64.pkg.tar.zst"
+bsdtar -tvf "$SLASHIT_SCRATCH/pkgdest/slashit-bin-0.0.3-1-x86_64.pkg.tar.zst"
+
+# slashit (source)
+cd packaging/arch/slashit
+namcap PKGBUILD
+namcap "$SLASHIT_SCRATCH/pkgdest/slashit-0.0.3-1-x86_64.pkg.tar.zst"
+bsdtar -tvf "$SLASHIT_SCRATCH/pkgdest/slashit-0.0.3-1-x86_64.pkg.tar.zst"
 ```
 
 ## Directories makepkg uses
@@ -65,7 +74,7 @@ bsdtar -tvf "$SLASHIT_SCRATCH/pkgdest"/slashit-bin-0.0.3-1-x86_64.pkg.tar.zst
 | `SRCDEST` | the package directory | Downloaded sources, reused between builds. |
 | `PKGDEST` | the current directory | Where the finished `.pkg.tar.zst` is written. |
 | `SRCPKGDEST` | the current directory | Where `--source` packages are written. |
-| `CARGO_TARGET_DIR` | `srcdir/target` (set in the `slashit` PKGBUILD) | Compiler output for the source build. It is not shared with any other build. |
+| `CARGO_TARGET_DIR` | `srcdir/slashit-0.0.3/target` (set to `target` inside the source tree by the `slashit` PKGBUILD) | Compiler output for the source build. It is not shared with any other build. |
 
 The source build has no separate compiler cache. The `slashit` recipe does not
 use sccache or a shared Cargo target. Rust crates are cached by Cargo in
@@ -78,12 +87,33 @@ no longer need them.
 
 ## Build dependencies
 
+Both recipes need `makepkg`, which comes from the `base-devel` group. Install
+it with `sudo pacman -S --needed base-devel` if it is missing.
+
 `slashit-bin` needs only the runtime dependencies listed in its PKGBUILD:
 `webkit2gtk-4.1`, `gtk3`, `libsoup3`, `libayatana-appindicator` and `dbus`.
 
 `slashit` also needs the makedepends in its PKGBUILD: `cargo`, `rust`,
 `rust-wasm`, `trunk`, `wasm-bindgen`, `binaryen`, `librsvg` and `pkgconf`.
 Install them with pacman yourself. The recipe does not install anything.
+
+## Install and remove
+
+These packages are not in the AUR or any other repository. After a local build,
+install the package file with pacman:
+
+```bash
+sudo pacman -U "$SLASHIT_SCRATCH/pkgdest/slashit-bin-0.0.3-1-x86_64.pkg.tar.zst"   # or the slashit-0.0.3 file
+```
+
+Do not install both packages; they conflict. Remove the package with:
+
+```bash
+sudo pacman -R slashit-bin    # or: sudo pacman -R slashit
+```
+
+Pacman removes only the files the package owns. Your SlashIt data directories
+are not owned by the package, so removing it leaves them in place.
 
 ## Known gaps in the source recipe
 
@@ -108,12 +138,18 @@ changed. Source: `src-tauri/src/commands/updater.rs`, `install_kind` and
 
 - `slashit-bin`: the binary carries the Debian bundle marker that the upstream
   `.deb` build wrote into it. The updater classifies it as a Debian install and
-  refuses to update. The refusal text says to use `apt` or `dpkg`, which is
-  incorrect on Arch.
+  refuses to update. After PR #335, the refusal names `pacman` for Arch.
 - `slashit`: the source build has no bundle marker, so the updater classifies it
-  as an unpackaged binary and refuses to update. The refusal text suggests the
-  AppImage, which is also not the Arch form.
+  as an unpackaged binary and refuses to update. The refusal says the install is
+  unpackaged and names the AppImage build, which is not the Arch form.
+- An inherited `APPIMAGE` variable is the one case that could change this. The
+  variable is passed to every child process, so a package-managed binary started
+  from an AppImage's terminal would look like an AppImage. The plugin then
+  replaces the running executable, which is `/usr/bin/slashit-ui`. PR #335 stops
+  this by counting `APPIMAGE` only when the running executable is inside the
+  AppImage's own mount (`APPDIR`). Do not publish the source package before that
+  change is on `main`.
 
 On Arch, update by rebuilding the package from a newer recipe and installing
-the result with `pacman -U`. The updater will not replace `/usr/bin/slashit-ui`.
-The wording of the refusal is an open item for the maintainer.
+the result with `pacman -U`. The updater does not replace `/usr/bin/slashit-ui`
+once PR #335 is on `main`.

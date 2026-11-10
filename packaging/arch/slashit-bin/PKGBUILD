@@ -1,4 +1,4 @@
-# Maintainer: <set the maintainer before AUR publication>
+# Maintainer: Shingonoide <shingonoide at gmail dot com>
 #
 # Binary package: repackages the upstream SlashIt .deb release asset. The
 # binaries are the ones CI built and the release published; nothing is rebuilt.

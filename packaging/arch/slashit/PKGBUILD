@@ -1,4 +1,4 @@
-# Maintainer: <set the maintainer before AUR publication>
+# Maintainer: Shingonoide <shingonoide at gmail dot com>
 #
 # Source package: builds the tagged upstream release from its GitHub archive,
 # following .github/workflows/release.yml (trunk for the frontend, then the
