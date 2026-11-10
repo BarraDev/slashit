@@ -513,8 +513,9 @@ pub fn unsupported_reason(probe: &InstallProbe) -> Option<String> {
         // and rpm cannot install; the package manager that owns these files is
         // the only thing that can replace them.
         InstallKind::Deb => Some(
-            "SlashIt was installed from a .deb package. Update it with apt or dpkg — \
-             the published update artifact is an AppImage, which dpkg cannot install."
+            "SlashIt was installed from a .deb package. Update it with the package manager \
+             that installed it: apt or dpkg on Debian-based systems, pacman on Arch Linux. \
+             The published update artifact is an AppImage, which dpkg cannot install."
                 .to_string(),
         ),
         InstallKind::Rpm => Some(
@@ -1478,6 +1479,7 @@ mod tests {
         let deb = unsupported_reason(&probe("linux", InstallKind::Deb)).expect("deb must refuse");
         assert!(deb.contains("dpkg"), "{deb}");
         assert!(deb.contains("apt"), "{deb}");
+        assert!(deb.contains("pacman"), "{deb}");
 
         let rpm = unsupported_reason(&probe("linux", InstallKind::Rpm)).expect("rpm must refuse");
         assert!(rpm.contains("rpm"), "{rpm}");
