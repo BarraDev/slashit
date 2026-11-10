@@ -622,6 +622,10 @@ echo "== frontend mode: an embedded build needs no server; a development build n
 fe=$work/frontend
 mkdir -p "$fe"
 cp "$bin_dir/slashit-ui" "$fe/slashit-ui"
+# Backdate the fixture binary: the stale-instance check compares whole-second
+# mtimes with process age, so a binary written in the same second as its
+# instance's start reads as rebuilt-after-start (a race, seen on CI).
+touch -d '2000-01-01 00:00:00' "$fe/slashit-ui"
 fe_sha=$(sha256sum "$fe/slashit-ui" | cut -d' ' -f1)
 fe_dead=http://127.0.0.1:9/
 printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\n' "$fe_sha" >"$fe/slashit-ui.frontend"
