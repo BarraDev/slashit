@@ -225,6 +225,43 @@ async fn git(working_dir: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Identifies the content of a checkout as a Git tree id: its committed and
+/// uncommitted content, tracked and untracked files alike, with ignored files
+/// left out. Two checkouts with the same id hold the same content, however many
+/// commits or edits produced it, so comparing ids before and after an agent run
+/// shows whether the run changed anything, without crediting content that was
+/// already there. The checkout's own index is not touched: the snapshot is taken
+/// through a temporary index that is removed afterwards.
+pub async fn checkout_content_id(working_dir: &str) -> Result<String, String> {
+    let git_dir = git(working_dir, &["rev-parse", "--absolute-git-dir"])
+        .await
+        .map_err(|e| format!("could not locate the checkout's Git directory: {e}"))?;
+    let index = Path::new(&git_dir).join("slashit-content-snapshot.index");
+    let _ = std::fs::remove_file(&index);
+    let result = async {
+        git_with_index(working_dir, &index, &["add", "-A"]).await?;
+        git_with_index(working_dir, &index, &["write-tree"]).await
+    }
+    .await;
+    let _ = std::fs::remove_file(&index);
+    result
+}
+
+/// Runs one Git command against a temporary index file.
+async fn git_with_index(working_dir: &str, index: &Path, args: &[&str]) -> Result<String, String> {
+    let output = crate::host_process::tokio_command("git")
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .current_dir(working_dir)
+        .output()
+        .await
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("git {} failed: {}", args[0], explain(&output)));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Git's explanation of a failure on one bounded line: its stderr, or its
 /// stdout when stderr is empty (some hooks write there), or the exit status.
 fn explain(output: &std::process::Output) -> String {

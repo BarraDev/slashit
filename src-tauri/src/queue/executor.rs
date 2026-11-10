@@ -7754,13 +7754,22 @@ impl TaskExecutor {
                 // holds the checkout refuses it here, and the fix counts as not
                 // started. A launch the Task's provider cannot take refuses it
                 // before the lease is taken.
-                let fix_run = match fix_launch.map_err(LaunchError::before_spawn).and_then(
-                    |launch| {
+                // The checkout's content before the fix agent runs. A fix is
+                // credited only with content it changed from this state.
+                let fix_before = crate::worktree::checkout_content_id(&working_dir).await;
+                let fix_run = match fix_launch
+                    .map_err(LaunchError::before_spawn)
+                    .and_then(|launch| {
                         acquire_task_provider_lease(&storage, task_id)
                             .map(|lease| (launch, lease))
                             .map_err(LaunchError::before_spawn)
-                    },
-                ) {
+                    })
+                    .and_then(|launched| match &fix_before {
+                        Ok(_) => Ok(launched),
+                        Err(e) => Err(LaunchError::before_spawn(format!(
+                            "The checkout could not be read before the fix agent ran, so the fix was not started: {e}"
+                        ))),
+                    }) {
                     Err(error) => Err(error),
                     Ok(((fix_provider, fix_model), fix_lease)) => {
                         events.agent_event(AgentEvent::Log {
@@ -7851,28 +7860,21 @@ impl TaskExecutor {
                                 .map(|t| (t.title.clone(), t.branch_name.clone()))
                                 .unwrap_or_default()
                         };
-                        let message = format!("task: {title} (with review fixes)");
-                        let committed = match &branch {
-                            Some(branch) => {
-                                crate::worktree::commit_checkout(&working_dir, branch, &message)
-                                    .await
-                            }
-                            None => Err(NO_TASK_BRANCH.to_string()),
+                        // Whether the checkout's content changed while the fix
+                        // agent ran, whatever commits it made. A commit that
+                        // leaves the content as it was is not a fix.
+                        let after = crate::worktree::checkout_content_id(&working_dir).await;
+                        let changed = match (&fix_before, after) {
+                            (Ok(before), Ok(after)) => Ok(*before != after),
+                            (Err(e), _) => Err(e.clone()),
+                            (Ok(_), Err(e)) => Err(e),
                         };
-                        match committed {
-                            Ok(CheckoutCommit::Committed { commit }) => {
+                        match changed {
+                            Ok(false) => {
                                 events.agent_event(AgentEvent::Log {
                                     task_id: task_id_str.clone(),
                                     level: LogLevel::Info,
-                                    message: format!("Review fixes committed as {commit}"),
-                                });
-                                None
-                            }
-                            Ok(CheckoutCommit::NothingToCommit) => {
-                                events.agent_event(AgentEvent::Log {
-                                    task_id: task_id_str.clone(),
-                                    level: LogLevel::Info,
-                                    message: "The fix agent changed no files, so there was \
+                                    message: "The fix agent changed no content, so there was \
                                               nothing to commit"
                                         .to_string(),
                                 });
@@ -7881,8 +7883,8 @@ impl TaskExecutor {
                             }
                             Err(e) => {
                                 let message = format!(
-                                    "The review fixes could not be committed: {e}. They remain \
-                                     as uncommitted edits in the task checkout."
+                                    "The fix agent finished, but the task checkout could not be \
+                                     read to see what it changed, so no fix was recorded: {e}."
                                 );
                                 events.agent_event(AgentEvent::Log {
                                     task_id: task_id_str.clone(),
@@ -7890,6 +7892,55 @@ impl TaskExecutor {
                                     message: message.clone(),
                                 });
                                 Some(message)
+                            }
+                            Ok(true) => {
+                                let message = format!("task: {title} (with review fixes)");
+                                let committed = match &branch {
+                                    Some(branch) => {
+                                        crate::worktree::commit_checkout(
+                                            &working_dir,
+                                            branch,
+                                            &message,
+                                        )
+                                        .await
+                                    }
+                                    None => Err(NO_TASK_BRANCH.to_string()),
+                                };
+                                match committed {
+                                    Ok(CheckoutCommit::Committed { commit }) => {
+                                        events.agent_event(AgentEvent::Log {
+                                            task_id: task_id_str.clone(),
+                                            level: LogLevel::Info,
+                                            message: format!("Review fixes committed as {commit}"),
+                                        });
+                                        None
+                                    }
+                                    // The fix agent committed its own changes, so the
+                                    // checkout is already clean and the fixes are on the
+                                    // task branch.
+                                    Ok(CheckoutCommit::NothingToCommit) => {
+                                        events.agent_event(AgentEvent::Log {
+                                            task_id: task_id_str.clone(),
+                                            level: LogLevel::Info,
+                                            message: "The fix agent committed its own review \
+                                                      fixes"
+                                                .to_string(),
+                                        });
+                                        None
+                                    }
+                                    Err(e) => {
+                                        let message = format!(
+                                            "The review fixes could not be committed: {e}. They \
+                                             remain as uncommitted edits in the task checkout."
+                                        );
+                                        events.agent_event(AgentEvent::Log {
+                                            task_id: task_id_str.clone(),
+                                            level: LogLevel::Error,
+                                            message: message.clone(),
+                                        });
+                                        Some(message)
+                                    }
+                                }
                             }
                         }
                     }
@@ -18154,6 +18205,32 @@ mod tests {
             (dir, base_commit)
         }
 
+        /// [`git_repo_with_change`] with the Worker's change committed, as run
+        /// completion does before a review.
+        fn git_repo_with_worker_commit() -> (tempfile::TempDir, String) {
+            let (repo, base_commit) = git_repo_with_change();
+            for args in [&["add", "-A"][..], &["commit", "-q", "-m", "worker"][..]] {
+                let status = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(repo.path())
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "git {args:?} failed");
+            }
+            (repo, base_commit)
+        }
+
+        /// The output of one Git command in `path`, trimmed.
+        fn git_output(path: &std::path::Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
         fn reviewing_task(project_id: Uuid, worktree_path: &str, base_commit: &str) -> Task {
             let mut task =
                 create_test_task_full("under review", project_id, TaskStatus::AiReview, 0);
@@ -18228,6 +18305,20 @@ mod tests {
                     fix_exit: i32,
                 ) -> Self {
                     Self::build(result, exit, fix_result, fix_exit, "", false, stream)
+                }
+
+                /// A reviewer that asks for changes and a fix agent that runs
+                /// `script` (shell) in the checkout and exits with `fix_exit`.
+                fn install_scripted_fixer(script: &str, fix_exit: i32) -> Self {
+                    Self::build(
+                        "VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a.rs:1 - broken",
+                        0,
+                        "Fixed everything.",
+                        fix_exit,
+                        &format!("{script}\n"),
+                        false,
+                        ReviewStream::ResultOnly,
+                    )
                 }
 
                 /// A reviewer that asks for changes and a fix agent that
@@ -18451,6 +18542,17 @@ mod tests {
             /// fresh repository, and return the Task as it ends.
             async fn review_task(mock: &MockReviewer, configure: impl FnOnce(&mut Task)) -> Task {
                 let (repo, base_commit) = git_repo_with_change();
+                review_task_in(mock, repo.path().to_str().unwrap(), &base_commit, configure).await
+            }
+
+            /// [`review_task`] with the Worker's change committed first, as run
+            /// completion does. A fix agent is then credited only with what it
+            /// itself changes.
+            async fn review_task_after_worker_commit(
+                mock: &MockReviewer,
+                configure: impl FnOnce(&mut Task),
+            ) -> Task {
+                let (repo, base_commit) = git_repo_with_worker_commit();
                 review_task_in(mock, repo.path().to_str().unwrap(), &base_commit, configure).await
             }
 
@@ -18887,16 +18989,26 @@ VERDICT: APPROVED"
             #[tokio::test(flavor = "multi_thread")]
             async fn a_review_answer_streamed_twice_yields_one_finding() {
                 let _path_guard = PATH_LOCK.lock().await;
-                let mock = MockReviewer::install_streaming(
-                    ReviewStream::AssistantAndResult,
+                let mock = MockReviewer::build(
                     "VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a.rs:1 - broken",
                     0,
                     "Fixed everything.",
                     0,
+                    "printf 'fixed\\n' > review-fix.txt\n",
+                    false,
+                    ReviewStream::AssistantAndResult,
                 );
-                let task = review_task(&mock, |_| {}).await;
-                let signoff = task.qa_signoff.clone().expect("the review records a signoff");
-                assert_eq!(signoff.status, QaStatus::FixesApplied, "{:?}", signoff.issues_found);
+                let task = review_task_after_worker_commit(&mock, |_| {}).await;
+                let signoff = task
+                    .qa_signoff
+                    .clone()
+                    .expect("the review records a signoff");
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::FixesApplied,
+                    "{:?}",
+                    signoff.issues_found
+                );
                 assert_eq!(
                     signoff.issues_found,
                     vec!["- ISSUE: [high] a.rs:1 - broken".to_string()],
@@ -19061,6 +19173,136 @@ VERDICT: APPROVED"
             }
 
             #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_agent_that_commits_its_own_edit_is_recorded_as_fixes_applied() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_scripted_fixer(
+                    "printf 'fixed\\n' > review-fix.txt\ngit add -A\ngit commit -q -m 'agent fix'",
+                    0,
+                );
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path();
+                let signoff = review_in(&mock, path.to_str().unwrap(), &base_commit).await;
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::FixesApplied,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert_eq!(
+                    git_output(path, &["show", "--name-only", "--format=", "HEAD"]),
+                    "review-fix.txt",
+                    "the agent's own commit is the fix"
+                );
+                assert_eq!(git_output(path, &["status", "--porcelain"]), "");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_agent_whose_commits_leave_the_content_unchanged_is_not_recorded() {
+                let _path_guard = PATH_LOCK.lock().await;
+                // Two commits that add and then remove a file: HEAD moves, the
+                // content does not.
+                let mock = MockReviewer::install_scripted_fixer(
+                    "printf 'temp\\n' > temp.txt\ngit add -A\ngit commit -q -m add\ngit rm -q temp.txt\ngit commit -q -m remove",
+                    0,
+                );
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path();
+                let signoff = review_in(&mock, path.to_str().unwrap(), &base_commit).await;
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::Rejected,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|issue| issue.contains("changed no files")),
+                    "{:?}",
+                    signoff.issues_found
+                );
+                // The agent's commits stay on the branch; SlashIt does not rewrite them.
+                assert_eq!(git_output(path, &["rev-list", "--count", "HEAD"]), "4");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_agent_that_makes_an_empty_commit_is_not_recorded() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_scripted_fixer("git commit -q --allow-empty -m noop", 0);
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path();
+                let signoff = review_in(&mock, path.to_str().unwrap(), &base_commit).await;
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::Rejected,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|issue| issue.contains("changed no files")),
+                    "{:?}",
+                    signoff.issues_found
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn preexisting_uncommitted_content_is_neither_credited_nor_committed() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_scripted_fixer("true", 0);
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path();
+                std::fs::write(path.join("dirty.txt"), "from before the fix\n").unwrap();
+                let signoff = review_in(&mock, path.to_str().unwrap(), &base_commit).await;
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::Rejected,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert_eq!(
+                    git_output(path, &["status", "--porcelain"]),
+                    "?? dirty.txt",
+                    "the pre-existing edit stays uncommitted"
+                );
+                assert!(
+                    !git_output(path, &["log", "--format=", "--name-only"]).contains("dirty.txt")
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_fix_after_a_partial_edit_is_not_recorded_and_keeps_the_edit() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_scripted_fixer("printf 'partial\\n' > review-fix.txt", 1);
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path();
+                let signoff = review_in(&mock, path.to_str().unwrap(), &base_commit).await;
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::Rejected,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|issue| issue.contains("partial edits")),
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert_eq!(
+                    git_output(path, &["status", "--porcelain"]),
+                    "?? review-fix.txt"
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
             async fn a_fix_agent_that_succeeds_records_fixes() {
                 let _path_guard = PATH_LOCK.lock().await;
                 // The fix agent edits review-fix.txt. The Worker's change is
@@ -19183,8 +19425,10 @@ VERDICT: APPROVED"
             async fn a_haiku_task_runs_its_fix_agent_on_haiku() {
                 let _path_guard = PATH_LOCK.lock().await;
                 let mock =
-                    MockReviewer::install_with_fixer(CHANGES_REQUESTED, 0, "Fixed everything.", 0);
-                let task = review_task(&mock, |task| task.model = "haiku".to_string()).await;
+                    MockReviewer::install_scripted_fixer("printf 'fixed\\n' > review-fix.txt", 0);
+                let task =
+                    review_task_after_worker_commit(&mock, |task| task.model = "haiku".to_string())
+                        .await;
 
                 let signoff = task.qa_signoff.clone().expect("a signoff");
                 assert_eq!(
@@ -19240,13 +19484,14 @@ VERDICT: APPROVED"
             async fn a_default_model_task_launches_its_fix_agent_without_a_model() {
                 let _path_guard = PATH_LOCK.lock().await;
                 for model in ["default", ""] {
-                    let mock = MockReviewer::install_with_fixer(
-                        CHANGES_REQUESTED,
-                        0,
-                        "Fixed everything.",
+                    let mock = MockReviewer::install_scripted_fixer(
+                        "printf 'fixed\\n' > review-fix.txt",
                         0,
                     );
-                    let task = review_task(&mock, |task| task.model = model.to_string()).await;
+                    let task = review_task_after_worker_commit(&mock, |task| {
+                        task.model = model.to_string()
+                    })
+                    .await;
                     assert_eq!(
                         task.qa_signoff.as_ref().map(|s| &s.status),
                         Some(&QaStatus::FixesApplied)
