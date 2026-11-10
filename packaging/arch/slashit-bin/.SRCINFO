@@ -1,0 +1,20 @@
+pkgbase = slashit-bin
+	pkgdesc = AI agent workspace manager (Tauri desktop app, upstream precompiled binaries)
+	pkgver = 0.0.3
+	pkgrel = 1
+	url = https://github.com/BarraDev/slashit
+	arch = x86_64
+	license = MPL-2.0
+	depends = webkit2gtk-4.1
+	depends = gtk3
+	depends = libsoup3
+	depends = libayatana-appindicator
+	depends = dbus
+	provides = slashit
+	conflicts = slashit
+	options = !strip
+	options = !debug
+	source = SlashIt_0.0.3_amd64.deb::https://github.com/BarraDev/slashit/releases/download/v0.0.3/SlashIt_0.0.3_amd64.deb
+	sha256sums = a17357f71c21b54d2ba61f98a1f9d82bb386d4cc608bcc894f1741cfb44daa15
+
+pkgname = slashit-bin

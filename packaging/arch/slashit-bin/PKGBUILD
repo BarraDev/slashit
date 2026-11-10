@@ -1,0 +1,56 @@
+# Maintainer: <set the maintainer before AUR publication>
+#
+# Binary package: repackages the upstream SlashIt .deb release asset. The
+# binaries are the ones CI built and the release published; nothing is rebuilt.
+# This is a prerelease (v0.0.3, experimental). See packaging/arch/README.md.
+
+pkgname=slashit-bin
+pkgver=0.0.3
+pkgrel=1
+pkgdesc='AI agent workspace manager (Tauri desktop app, upstream precompiled binaries)'
+arch=('x86_64')
+url='https://github.com/BarraDev/slashit'
+license=('MPL-2.0')
+depends=(
+  'webkit2gtk-4.1'
+  'gtk3'
+  'libsoup3'
+  'libayatana-appindicator'
+  'dbus'
+)
+provides=('slashit')
+conflicts=('slashit')
+# The upstream binaries are already stripped by the release build; keep them
+# byte-identical to the published artifact.
+options=('!strip' '!debug')
+_deb="SlashIt_${pkgver}_amd64.deb"
+source=("${_deb}::https://github.com/BarraDev/slashit/releases/download/v${pkgver}/${_deb}")
+sha256sums=('a17357f71c21b54d2ba61f98a1f9d82bb386d4cc608bcc894f1741cfb44daa15')
+
+prepare() {
+  # A .deb is an ar archive holding control.tar.* and data.tar.*; only the
+  # payload is used. The Debian control scripts and md5sums are not carried over.
+  mkdir -p "$srcdir/payload"
+  bsdtar -xf "$srcdir/$_deb" -C "$srcdir" 'data.tar.*'
+  bsdtar -xf "$srcdir"/data.tar.* -C "$srcdir/payload"
+}
+
+package() {
+  cd "$srcdir/payload"
+
+  install -Dm755 usr/bin/slashit-ui "$pkgdir/usr/bin/slashit-ui"
+  install -Dm755 usr/bin/slashitd "$pkgdir/usr/bin/slashitd"
+  install -Dm755 usr/bin/slashit "$pkgdir/usr/bin/slashit"
+
+  install -Dm644 usr/share/applications/SlashIt.desktop \
+    "$pkgdir/usr/share/applications/SlashIt.desktop"
+
+  local size
+  for size in 32x32 128x128 256x256@2; do
+    install -Dm644 "usr/share/icons/hicolor/$size/apps/slashit-ui.png" \
+      "$pkgdir/usr/share/icons/hicolor/$size/apps/slashit-ui.png"
+  done
+
+  install -Dm644 usr/share/doc/slash-it/copyright \
+    "$pkgdir/usr/share/licenses/$pkgname/copyright"
+}
