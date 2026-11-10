@@ -67,8 +67,10 @@ grep -a -q -F "$wasm" "$cargo_binary" ||
 # aside, and any failure from here on restores it, so the last known-good
 # binary and its sidecar stay consistent.
 mkdir -p "$promoted"
-backup="$promoted/.previous.$$"
-mkdir -p "$backup"
+# Temporary names come from mktemp, not from $$: a predictable name in a shared
+# directory can be pre-created as a symlink and written through.
+backup=$(mktemp -d "$promoted/.previous.XXXXXX") ||
+  fail "cannot create a backup directory in $promoted"
 for f in "$binary" "$cli" "$sidecar"; do
   [ -f "$f" ] && cp -p -- "$f" "$backup/${f##*/}"
 done
@@ -84,7 +86,8 @@ restore() {
 }
 trap restore EXIT
 publish() { # source destination
-  local tmp="$2.tmp.$$"
+  local tmp
+  tmp=$(mktemp "$2.tmp.XXXXXX") || fail "cannot create a temporary file beside $2"
   cp -- "$1" "$tmp" && chmod 755 "$tmp" && mv -f -- "$tmp" "$2" ||
     { rm -f -- "$tmp"; fail "cannot promote $1 to $2"; }
 }
@@ -94,12 +97,13 @@ publish "$cargo_cli" "$cli"
 # The sidecar is written beside its binary through a temporary file and a
 # rename, so the supervisor never reads a half-written declaration.
 sha=$(sha256sum "$binary" | cut -d' ' -f1)
-side_tmp="$sidecar.tmp.$$"
+side_tmp=$(mktemp "$sidecar.tmp.XXXXXX") ||
+  fail "cannot create a temporary file beside $sidecar"
 {
   echo "mode=embedded"
   echo "sha256=$sha"
   echo "wasm=$wasm"
-} >"$side_tmp" && mv -f -- "$side_tmp" "$sidecar" ||
+} >"$side_tmp" && chmod 644 "$side_tmp" && mv -f -- "$side_tmp" "$sidecar" ||
   { rm -f -- "$side_tmp"; fail "cannot write the sidecar $sidecar"; }
 promoted_ok=1
 rm -rf -- "$backup"

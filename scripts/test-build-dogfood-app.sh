@@ -46,12 +46,14 @@ case " $* " in
   *) echo "stub cargo: unexpected: $*" >&2; exit 2 ;;
 esac
 STUB
-# Stub mv: fails the CLI's promotion rename when STUB_MV_FAIL_CLI is set, to
-# simulate a promotion that fails after the binary was already replaced.
+# Stub mv: fails the CLI's promotion rename when STUB_MV_FAIL_CLI is set, or the
+# sidecar's when STUB_MV_FAIL_SIDE is set, to simulate a promotion that fails
+# after the binary (and possibly the CLI) was already replaced.
 real_mv=$(command -v mv)
 cat >"$work/bin/mv" <<STUB
 #!/usr/bin/env bash
 if [ -n "\${STUB_MV_FAIL_CLI:-}" ] && [[ "\$*" == *".tmp."* ]] && [[ "\$*" == */slashit ]]; then exit 1; fi
+if [ -n "\${STUB_MV_FAIL_SIDE:-}" ] && [[ "\$*" == *".tmp."* ]] && [[ "\$*" == *.frontend ]]; then exit 1; fi
 exec "$real_mv" "\$@"
 STUB
 chmod +x "$work/bin/trunk" "$work/bin/cargo" "$work/bin/mv"
@@ -117,6 +119,19 @@ if [ "$st" -ne 0 ] && [[ "$out" == *"previous promoted pair is restored"* ]] &&
   [ -z "$(find "$repo/target/dogfood" -name '*.tmp.*' -print -quit)" ]; then
   ok "a failed promotion restores the previous binary, CLI and sidecar"
 else bad "failed promotion left the promoted pair inconsistent (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# 7. Regression: a sidecar rename that fails after the binary and the CLI were
+#    both replaced restores all three files, so the sidecar still vouches for
+#    the binary it describes, and the new build's binary is not left behind.
+want=$(sha256sum "$repo/target/dogfood/slashit-ui" | cut -d' ' -f1)
+cli_before=$(sha256sum "$repo/target/dogfood/slashit" | cut -d' ' -f1)
+out=$(STUB_BUILD_ID=3 STUB_MV_FAIL_SIDE=1 run_build); st=$?
+if [ "$st" -ne 0 ] && [[ "$out" == *"previous promoted pair is restored"* ]] &&
+  promoted_pair_intact &&
+  [ "$(sha256sum "$repo/target/dogfood/slashit" | cut -d' ' -f1)" = "$cli_before" ] &&
+  [ -z "$(find "$repo/target/dogfood" -name '*.tmp.*' -print -quit)" ]; then
+  ok "a failed sidecar promotion after the binary and CLI were replaced restores all three"
+else bad "partial promotion left the promoted pair inconsistent (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 echo "$pass passed, $fails failed"
 [ "$fails" -eq 0 ]

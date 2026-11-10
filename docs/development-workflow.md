@@ -1285,9 +1285,9 @@ Three build modes exist. They do not share a binary path:
   those rewrites and does not fail on them. Application state still fails the
   restart.
 - **Recovery after a reboot.** No systemd unit is enabled automatically. After
-  a reboot, run `scripts/supervise-dogfood.sh start` (or
-  `systemctl --user start` if the unit is installed), then `status` and
-  `verify`. Check the persisted Task and Project records, and confirm the
+  a reboot, run `scripts/supervise-dogfood.sh start` (or, if the unit is
+  installed, `systemctl --user start slashit-dogfood.service`), then `status`
+  and `verify`. Check the persisted Task and Project records, and confirm the
   webview renders by looking at the window. Enabling autostart is a separate
   owner decision.
 
@@ -1307,7 +1307,8 @@ or a unit start still refuses a second instance. A verified backup comes only
 from the script's `restart`, which needs a running instance. After
 `systemctl --user stop`, `restart` refuses with `nothing found to operate on`
 and backs up nothing. A stopped instance comes back with
-`systemctl --user start` (no backup) or `scripts/supervise-dogfood.sh start`.
+`systemctl --user start slashit-dogfood.service` (no backup) or
+`scripts/supervise-dogfood.sh start`.
 
 **Deployment blocker: a stale endpoint after a crash.** Do not install or enable
 the unit yet. The application removes its control socket only on a clean drop,

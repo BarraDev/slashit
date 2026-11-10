@@ -110,6 +110,11 @@ fixture_supervisor() { # job
 cleanup_all() {
   cleanup_instances
   local rec
+  if [ -n "${fe_srv:-}" ]; then
+    kill "$fe_srv" 2>/dev/null || true
+    wait "$fe_srv" 2>/dev/null || true
+    fe_srv=
+  fi
   for rec in "${foreign_pids[@]+"${foreign_pids[@]}"}"; do
     signal_owned KILL "$rec" || true
   done
@@ -647,19 +652,39 @@ if [ "$st" -eq 1 ] && [[ "$out" == *"UNAVAILABLE"* ]]; then ok "verify is degrad
 else bad "verify did not report the degraded development frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
 cleanup_instances
 
-if command -v python3 >/dev/null 2>&1; then
-  (cd "$fe" && exec python3 -m http.server 14299 --bind 127.0.0.1 >/dev/null 2>&1) &
-  fe_srv=$!
-  sleep 1
-  out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL=http://127.0.0.1:14299/ start 2>&1)
-  expect pass "a development build starts once its dev server answers" "$out" $?
-  out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL=http://127.0.0.1:14299/ verify 2>&1)
-  st=$?
-  if [ "$st" -eq 0 ] && [[ "$out" == *"development server answers"* ]]; then ok "verify reports a ready dev server"
-  else bad "verify did not report the ready dev server (exit $st)"; printf '%s\n' "$out" >&2; fi
+if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+  # A free port picked at run time, and readiness only once this server
+  # answers on it while its own process is alive: an unrelated listener on a
+  # fixed port can neither be bound over nor be mistaken for ours.
+  fe_port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()') ||
+    { bad "cannot pick a free port for the test dev server"; fe_port=; }
+  fe_url="http://127.0.0.1:$fe_port/"
+  fe_ready=0
+  if [ -n "$fe_port" ]; then
+    (cd "$fe" && exec python3 -m http.server "$fe_port" --bind 127.0.0.1 >/dev/null 2>&1) &
+    fe_srv=$!
+    for _ in $(seq 1 100); do
+      kill -0 "$fe_srv" 2>/dev/null || break
+      curl -fsS --max-time 1 -o /dev/null "$fe_url" 2>/dev/null && { fe_ready=1; break; }
+      sleep 0.1
+    done
+  fi
+  if [ "$fe_ready" = 1 ]; then
+    out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" start 2>&1)
+    expect pass "a development build starts once its dev server answers" "$out" $?
+    out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" verify 2>&1)
+    st=$?
+    if [ "$st" -eq 0 ] && [[ "$out" == *"development server answers"* ]]; then ok "verify reports a ready dev server"
+    else bad "verify did not report the ready dev server (exit $st)"; printf '%s\n' "$out" >&2; fi
+  else
+    bad "the test dev server did not answer on $fe_url while its process was alive"
+  fi
   cleanup_instances
-  kill "$fe_srv" 2>/dev/null || true
-  wait "$fe_srv" 2>/dev/null || true
+  if [ -n "$fe_srv" ]; then
+    kill "$fe_srv" 2>/dev/null || true
+    wait "$fe_srv" 2>/dev/null || true
+    fe_srv=
+  fi
 else
   ok "dev-server readiness positive case skipped: python3 is not installed"
 fi
@@ -667,10 +692,18 @@ fi
 echo "== restart snapshots are bounded to the newest five"
 cleanup_instances
 sv start >/dev/null 2>&1 || bad "retention fixture: start failed"
-for _ in 1 2 3 4 5 6; do sv restart >/dev/null 2>&1 || break; done
-kept=$(ls -1d "$state"/supervisor/backup/[0-9]* 2>/dev/null | wc -l)
-if [ "$kept" -ge 1 ] && [ "$kept" -le 5 ]; then ok "six restarts leave $kept snapshots (bounded to five)"
-else bad "snapshot retention kept $kept backups; expected 1 to 5"; fi
+restarts_ok=0
+for i in 1 2 3 4 5 6; do
+  out=$(sv restart 2>&1) || { bad "restart $i of 6 failed"; printf '%s\n' "$out" >&2; break; }
+  restarts_ok=$((restarts_ok + 1))
+done
+# Count backup directories by glob, not by parsing ls output.
+kept=0
+for dir in "$state"/supervisor/backup/[0-9]*/; do
+  [ -d "$dir" ] && kept=$((kept + 1))
+done
+if [ "$restarts_ok" -eq 6 ] && [ "$kept" -eq 5 ]; then ok "six successful restarts leave exactly five snapshots"
+else bad "after $restarts_ok successful restarts, $kept snapshots remain; expected exactly 5 after 6"; fi
 cleanup_instances
 
 # A small protected-state fixture: two compared files and two excluded ones.
@@ -829,15 +862,19 @@ env XDG_CONFIG_HOME="$work/not-declared/config" XDG_DATA_HOME="$state/data" XDG_
   SLASHIT_TEST_STUB_DIR="$stub_dir" SLASHIT_TEST_SOCKET="$socket" \
   "$bin_dir/slashit-ui" >"$work/mismatch.log" 2>&1 &
 for _ in $(seq 100); do [ -s "$stub_dir/pid" ] && break; sleep 0.05; done
+# Hold the embedded-frontend sidecar aside so the frontend is a development
+# build with no server (degraded). The environment verdict must still report.
+mv "$bin_dir/slashit-ui.frontend" "$bin_dir/slashit-ui.frontend.held"
 out=$(sv status 2>&1); st=$?
-if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]]; then
-  ok "status exits 4 for a live instance whose environment differs from the declaration"
+if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]] && [[ "$out" == *"UNAVAILABLE"* ]]; then
+  ok "status exits 4 for a mismatched environment even when the frontend is degraded"
 else
-  bad "status did not exit 4 for an environment mismatch (exit $st)"; printf '%s\n' "$out" >&2
+  bad "status did not exit 4 with the mismatch and the degraded frontend both reported (exit $st)"; printf '%s\n' "$out" >&2
 fi
 out=$(sv verify 2>&1); st=$?
-if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]]; then
-  ok "verify exits 4 for the same environment mismatch"
+mv "$bin_dir/slashit-ui.frontend.held" "$bin_dir/slashit-ui.frontend"
+if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]] && [[ "$out" == *"UNAVAILABLE"* ]]; then
+  ok "verify exits 4 and reports the environment mismatch even when the frontend is degraded"
 else
   bad "verify did not exit 4 for an environment mismatch (exit $st)"; printf '%s\n' "$out" >&2
 fi

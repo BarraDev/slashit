@@ -1238,16 +1238,19 @@ cmd_status() {
       echo "control channel: answering on '$PING_ENDPOINT', which is NOT the declared endpoint"
     fi
     FRONTEND_PID=$PING_PID
-    frontend_report || [ "$code" -ne 0 ] || code=1
+    local fe_rc=0
+    frontend_report || fe_rc=1
     verify_env "$PING_PID"
     env_verdict
     # Precedence: a record or endpoint that is not as declared (1) before a
-    # mismatched environment (4) before an unreadable one (3).
+    # mismatched environment (4) before an unreadable one (3) before a degraded
+    # frontend (1). A degraded frontend never hides the environment verdict.
     case $ENV_CHECK in
       0) ;;
       1) [ "$code" -eq 0 ] && code=4 ;;
       *) [ "$code" -eq 0 ] && code=3 ;;
     esac
+    [ "$code" -eq 0 ] && [ "$fe_rc" -ne 0 ] && code=1
   else
     # An endpoint path that exists but has no verified answer is not a stopped
     # instance: a live process may be behind it (a stale file cannot be told
@@ -1305,13 +1308,16 @@ cmd_verify() {
     fail "the endpoint is served by pid $PING_PID, but the launch record names pid $rec"
   fi
   FRONTEND_PID=$PING_PID
-  frontend_report || exit 1
+  # A degraded frontend is recorded, not returned early: the environment check
+  # is the isolation guarantee and must still run and report.
+  local fe_rc=0
+  frontend_report || fe_rc=1
   # The control channel proves the backend and its endpoint, not rendering.
   echo "webview:        not verified by the control channel (rendering needs a screenshot)"
   verify_env "$PING_PID"
   env_verdict
   case $ENV_CHECK in
-    0) exit 0 ;;
+    0) exit "$fe_rc" ;;
     1) exit 4 ;; # environment mismatch
     *) exit 3 ;; # the process environment cannot be read
   esac
