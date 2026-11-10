@@ -19063,18 +19063,36 @@ VERDICT: APPROVED"
             #[tokio::test(flavor = "multi_thread")]
             async fn a_fix_agent_that_succeeds_records_fixes() {
                 let _path_guard = PATH_LOCK.lock().await;
-                let mock = MockReviewer::install_with_fixer(
-                    "VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a.rs:1 - broken",
-                    0,
-                    "Fixed everything.",
-                    0,
-                );
-                let signoff = review_once(&mock).await;
+                // The fix agent edits review-fix.txt. The Worker's change is
+                // committed first, as run completion does, so the fix commit
+                // must hold the fix alone.
+                let mock = MockReviewer::install_editing_fixer(true, "");
+                let (repo, base_commit) = git_repo_with_change();
+                let path = repo.path();
+                for args in [&["add", "-A"][..], &["commit", "-q", "-m", "worker"][..]] {
+                    let status = std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(path)
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "git {args:?} failed");
+                }
+                let signoff = review_in(&mock, path.to_str().unwrap(), &base_commit).await;
                 assert_eq!(
                     signoff.status,
                     QaStatus::FixesApplied,
                     "{:?}",
                     signoff.issues_found
+                );
+                let changed = std::process::Command::new("git")
+                    .args(["show", "--name-only", "--format=", "HEAD"])
+                    .current_dir(path)
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&changed.stdout).trim(),
+                    "review-fix.txt",
+                    "the fix commit must hold only the fix agent's file"
                 );
 
                 // The fix agent runs under Auto with full tools, and its prompt,
