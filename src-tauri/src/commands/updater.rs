@@ -513,8 +513,9 @@ pub fn unsupported_reason(probe: &InstallProbe) -> Option<String> {
         // and rpm cannot install; the package manager that owns these files is
         // the only thing that can replace them.
         InstallKind::Deb => Some(
-            "SlashIt was installed from a .deb package. Update it with apt or dpkg — \
-             the published update artifact is an AppImage, which dpkg cannot install."
+            "SlashIt was installed from a .deb package. Update it with the package manager \
+             that installed it: apt or dpkg on Debian-based systems, pacman on Arch Linux. \
+             The published update artifact is an AppImage, which dpkg cannot install."
                 .to_string(),
         ),
         InstallKind::Rpm => Some(
@@ -546,14 +547,35 @@ fn capability_refusal(probe: &InstallProbe) -> Option<String> {
     Some(err(kind, &reason))
 }
 
+/// Whether the running executable lives inside the AppImage mount that
+/// `APPIMAGE` names. The variable is inherited by every child process, so a
+/// package-managed or source-built binary started from an AppImage's terminal
+/// carries it too. The updater replaces the running executable, so only a
+/// binary that really runs from the mount may be classified as an AppImage.
+fn running_inside_appimage(
+    appimage_env: bool,
+    appdir: Option<std::path::PathBuf>,
+    exe: Option<std::path::PathBuf>,
+) -> bool {
+    match (appdir, exe) {
+        (Some(dir), Some(exe)) => appimage_env && exe.starts_with(dir),
+        _ => false,
+    }
+}
+
 /// Inspect the running process.
 fn probe_install(app: &AppHandle) -> InstallProbe {
+    let canonical = |path: Option<std::path::PathBuf>| path.and_then(|p| p.canonicalize().ok());
     InstallProbe {
         debug_build: cfg!(debug_assertions),
         os: std::env::consts::OS,
         install: install_kind(
             tauri::utils::platform::bundle_type(),
-            std::env::var_os("APPIMAGE").is_some(),
+            running_inside_appimage(
+                std::env::var_os("APPIMAGE").is_some(),
+                canonical(std::env::var_os("APPDIR").map(Into::into)),
+                canonical(std::env::current_exe().ok()),
+            ),
         ),
         updater_unavailable: app.updater().err().map(|e| e.to_string()),
     }
@@ -1478,6 +1500,7 @@ mod tests {
         let deb = unsupported_reason(&probe("linux", InstallKind::Deb)).expect("deb must refuse");
         assert!(deb.contains("dpkg"), "{deb}");
         assert!(deb.contains("apt"), "{deb}");
+        assert!(deb.contains("pacman"), "{deb}");
 
         let rpm = unsupported_reason(&probe("linux", InstallKind::Rpm)).expect("rpm must refuse");
         assert!(rpm.contains("rpm"), "{rpm}");
@@ -1572,6 +1595,43 @@ mod tests {
         // A marker present always wins: `APPIMAGE` inherited from an unrelated
         // parent process must not turn a .deb into an AppImage.
         assert_eq!(install_kind(Some(BundleType::Deb), true), InstallKind::Deb);
+    }
+
+    #[test]
+    fn an_inherited_appimage_variable_alone_does_not_make_a_binary_an_appimage() {
+        use std::path::PathBuf;
+        let mount = Some(PathBuf::from("/tmp/.mount_slash1"));
+
+        // Real AppImage run: the executable is inside the mount.
+        assert!(running_inside_appimage(
+            true,
+            mount.clone(),
+            Some(PathBuf::from("/tmp/.mount_slash1/usr/bin/slashit-ui")),
+        ));
+        // A pacman-installed binary started from an AppImage's terminal.
+        assert!(!running_inside_appimage(
+            true,
+            mount.clone(),
+            Some(PathBuf::from("/usr/bin/slashit-ui")),
+        ));
+        // Component boundary: "/tmp/.mount_slash10" is not inside "/tmp/.mount_slash1".
+        assert!(!running_inside_appimage(
+            true,
+            mount.clone(),
+            Some(PathBuf::from("/tmp/.mount_slash10/usr/bin/slashit-ui")),
+        ));
+        // Missing APPDIR or an unresolvable executable never counts as an AppImage.
+        assert!(!running_inside_appimage(
+            true,
+            None,
+            Some(PathBuf::from("/tmp/.mount_slash1/x"))
+        ));
+        assert!(!running_inside_appimage(true, mount, None));
+        assert!(!running_inside_appimage(
+            false,
+            Some(PathBuf::from("/tmp/.mount_slash1")),
+            Some(PathBuf::from("/tmp/.mount_slash1/x"))
+        ));
     }
 
     // --- Error classification ----------------------------------------------
