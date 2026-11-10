@@ -111,21 +111,32 @@ changed. Source: `src-tauri/src/commands/updater.rs`, `install_kind` and
 `slashit-bin` carries the Debian bundle marker that the upstream `.deb` build
 wrote into the binary. The marker is checked before the `APPIMAGE` variable, so
 an inherited `APPIMAGE` cannot change the classification. The updater refuses to
-update and, after PR #335, names `pacman` as the package manager to use.
+update and does not replace the package-managed files.
+
+The packaged `v0.0.3` binary does not contain the updater guard added in PR #335.
+Its refusal says "Update it with apt or dpkg", which is wrong on Arch. The
+refusal names `pacman` only in builds from `main` after PR #335. Do not rely on
+the updater's advice for `slashit-bin` until an official tagged release contains
+that change.
 
 On Arch, update by building a newer recipe and installing it with `pacman -U`.
 The updater does not replace `/usr/bin/slashit-ui`.
 
 ## Known gaps
 
-- The binary package has been built and inspected locally. Its launch, daemon and
-  desktop-integration behavior is not verified here.
-- Isolated Pacman install and removal were run earlier; see the PR history.
+- The package was installed and removed with `pacman -U` and `pacman -R` in an
+  Arch container. The CLI and daemon started against a live state directory.
+  The desktop UI started under Xvfb, and its tray initialized. Window rendering
+  and interaction were not checked.
+- The updater refusal was not run on an installed package.
+- The `v0.0.3` binary does not contain the PR #335 guard (see above).
+- The icon directory `256x256@2` is non-standard. Whether icon lookup uses it was
+  not checked.
 
 ## Owner decisions
 
 These decisions were made by the owner and are recorded here so they stay with
-the recipe. Source: the engineering plan in PR #334.
+the recipe.
 
 - Package names `slashit-bin` and `slashit` are approved, conditional on AUR
   namespace and ownership verification. This PR ships only `slashit-bin`; the
@@ -135,4 +146,4 @@ the recipe. Source: the engineering plan in PR #334.
   publication is not authorized. No publication credential is configured, no AUR
   repository is pushed, and no package is installed into the owner's normal
   environment without a separate authorization.
-- Maintainer identity: `Shingonoide <shingonoide at gmail dot com>`.
+- Maintainer identity: `Rui Andrada <shingonoide at gmail dot com>`.
