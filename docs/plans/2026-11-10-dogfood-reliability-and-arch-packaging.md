@@ -184,8 +184,11 @@ Items 1 and 2 never imply 3. Item 3 never implies 5. Item 6 is always separate.
 
 ## 9. Published pull requests
 
-None yet. Entries are added here when a bookmark is published, with the exact
-revision.
+- PR #333, `ai-review-noop-fix`, revision `c45ffd23` (unit A1, review fix).
+- PR #334, `dogfood-reliability-plan`, revision `753f52e1` (this plan).
+
+Each entry names the exact revision published. A later review fix is a child
+change and advances the bookmark by fast-forward.
 
 ## 10. Known risks
 
