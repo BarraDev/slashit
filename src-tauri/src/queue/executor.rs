@@ -60,8 +60,8 @@ impl StartFailure {
 ///
 /// Only the coding run uses OpenCode. AI review still runs on Claude for every
 /// Task, so an OpenCode Task that reaches review can still invoke a Claude
-/// model, billed separately from OpenCode. Review-fix is refused for an
-/// OpenCode Task (see `fix_agent_model`). The test suite stands that Claude in
+/// model, billed separately from OpenCode. A review-fix agent runs on the
+/// Task's own provider (see `fix_agent_launch`). The test suite stands that Claude in
 /// with a fake program, so no test calls a model.
 /// Where a Task's Project stood in its Workspace when a launch read it. A
 /// start commits only while the Project still stands exactly here (see
@@ -160,6 +160,16 @@ async fn start_opencode_run(
     )
     .await
     .map_err(StartFailure::failed)
+}
+
+/// A start failure that was not a refusal may have spawned a process, so it is
+/// a start that may have edited the checkout, not one that never started.
+fn opencode_start_failure(failure: StartFailure) -> LaunchError {
+    if failure.refused_before_spawn {
+        LaunchError::before_spawn(failure.message)
+    } else {
+        LaunchError::after_spawn(failure.message)
+    }
 }
 
 /// A coding run whose start is on disk.
@@ -713,19 +723,20 @@ fn fix_outcome(outcome: Result<Option<AgentRun>, LaunchError>) -> FixOutcome {
 /// the provider chooses and which is not necessarily an economical model. The
 /// model is the one requested, an alias included: the provider resolves it.
 ///
-/// The fix agent runs on Claude for every Task. A model that only OpenCode
-/// can run is not one Claude can take, and starting the fix agent without it
-/// would run an unconfigured, possibly costlier, model, so that Task's fix
-/// agent is refused instead.
-fn fix_agent_model(task: &Task) -> Result<Option<String>, String> {
+/// The provider and model the review-fix agent runs on: the Task's own, the
+/// same pair the coding Worker runs on. No other provider or default model is
+/// substituted. An OpenCode Task whose model its run would refuse is refused
+/// here, before the Task's lease is taken.
+fn fix_agent_launch(task: &Task) -> Result<(CodingProvider, Option<String>), String> {
+    let model = task.configured_model().map(str::to_string);
     match task.provider {
-        CodingProvider::Claude => Ok(task.configured_model().map(str::to_string)),
-        CodingProvider::OpenCode => Err(match task.configured_model() {
-            Some(model) => format!(
-                "this Task's model {model} is an OpenCode model, and the review-fix agent runs on Claude, which cannot take it. No fix agent was started and no other model was substituted. Address the findings in Human Review, or run this Task with Claude"
-            ),
-            None => "this Task runs on OpenCode and names no model the review-fix agent, which runs on Claude, could use. No fix agent was started and no other model was substituted. Address the findings in Human Review, or run this Task with Claude".to_string(),
-        }),
+        CodingProvider::Claude => Ok((CodingProvider::Claude, model)),
+        // The fix edits no extra directories, so the Task's extra-directory
+        // check passes: the fix's own `additional_dirs` is empty.
+        CodingProvider::OpenCode => match opencode_refusal(model.as_deref(), true) {
+            Some(refusal) => Err(refusal),
+            None => Ok((CodingProvider::OpenCode, model)),
+        },
     }
 }
 
@@ -6825,10 +6836,23 @@ impl TaskExecutor {
         lease: Option<crate::agents::provider_lease::ProviderLease>,
         cancelled: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<Option<AgentRun>, LaunchError> {
+        Self::run_started_cancellably(
+            async move { CodingRunner::start_claude(config, lease).await },
+            cancelled,
+        )
+        .await
+    }
+
+    /// [`Self::run_cancellable_agent`] for any provider: `start` launches the
+    /// run and is awaited only if no cancellation has arrived. Same contract.
+    async fn run_started_cancellably(
+        start: impl std::future::Future<Output = Result<CodingRunner, LaunchError>>,
+        cancelled: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Option<AgentRun>, LaunchError> {
         if *cancelled.borrow() {
             return Ok(None);
         }
-        let runner = CodingRunner::start_claude(config, lease).await?;
+        let runner = start.await?;
         tokio::select! {
             biased;
             result = runner.wait() => {
@@ -7713,10 +7737,10 @@ impl TaskExecutor {
                 // Spawn fix agent that validates before fixing
                 // The model comes from the same read of the Task as the prompt:
                 // the Task's configured model, never what a run reported.
-                let (fix_prompt, fix_model) = {
+                let (fix_prompt, fix_launch) = {
                     let tasks_r = tasks.read().await;
                     match tasks_r.get(&task_id) {
-                        Some(t) => (build_fix_prompt(t, &findings), fix_agent_model(t)),
+                        Some(t) => (build_fix_prompt(t, &findings), fix_agent_launch(t)),
                         None => {
                             reviewing_handles.write().await.remove(&task_id);
                             return;
@@ -7728,17 +7752,17 @@ impl TaskExecutor {
                 // The fix agent edits the checkout, so it takes the Task's lease
                 // first. A Worker, PR helper or Conversation Worker that still
                 // holds the checkout refuses it here, and the fix counts as not
-                // started. A model it cannot be given refuses it before the
-                // lease is taken.
-                let fix_run = match fix_model
-                    .map_err(LaunchError::before_spawn)
-                    .and_then(|model| {
+                // started. A launch the Task's provider cannot take refuses it
+                // before the lease is taken.
+                let fix_run = match fix_launch.map_err(LaunchError::before_spawn).and_then(
+                    |launch| {
                         acquire_task_provider_lease(&storage, task_id)
-                            .map(|lease| (model, lease))
+                            .map(|lease| (launch, lease))
                             .map_err(LaunchError::before_spawn)
-                    }) {
+                    },
+                ) {
                     Err(error) => Err(error),
-                    Ok((fix_model, fix_lease)) => {
+                    Ok(((fix_provider, fix_model), fix_lease)) => {
                         events.agent_event(AgentEvent::Log {
                             task_id: task_id_str.clone(),
                             level: LogLevel::Info,
@@ -7751,33 +7775,61 @@ impl TaskExecutor {
                                     .to_string(),
                             },
                         });
-                        Self::run_cancellable_agent(
-                            ClaudeRunConfig {
-                                prompt: fix_prompt,
-                                working_dir: working_dir.clone(),
-                                // Auto, like the coding Worker: the fix agent keeps
-                                // the full default tool set, Bash included, and the
-                                // classifier reviews each call.
-                                tools: ToolAccess::Full {
-                                    auto_approve: Vec::new(),
-                                    permission_mode: Some("auto".to_string()),
-                                },
-                                max_turns: Some(20),
-                                max_budget_usd: None,
-                                session_id: Some(Uuid::new_v4().to_string()),
-                                resume_session: None,
-                                model: fix_model,
-                                system_prompt: None,
-                                append_system_prompt: Some(worker_scratch_rule(&working_dir)),
-                                disable_mcp: true,
-                                additional_dirs: Vec::new(),
-                                // As for the coding Worker: no user or project hooks or settings.
-                                isolate_customizations: true,
-                            },
-                            fix_lease,
-                            &mut cancelled,
-                        )
-                        .await
+                        match fix_provider {
+                            CodingProvider::Claude => {
+                                Self::run_cancellable_agent(
+                                    ClaudeRunConfig {
+                                        prompt: fix_prompt,
+                                        working_dir: working_dir.clone(),
+                                        // Auto, like the coding Worker: the fix agent keeps
+                                        // the full default tool set, Bash included, and the
+                                        // classifier reviews each call.
+                                        tools: ToolAccess::Full {
+                                            auto_approve: Vec::new(),
+                                            permission_mode: Some("auto".to_string()),
+                                        },
+                                        max_turns: Some(20),
+                                        max_budget_usd: None,
+                                        session_id: Some(Uuid::new_v4().to_string()),
+                                        resume_session: None,
+                                        model: fix_model,
+                                        system_prompt: None,
+                                        append_system_prompt: Some(worker_scratch_rule(
+                                            &working_dir,
+                                        )),
+                                        disable_mcp: true,
+                                        additional_dirs: Vec::new(),
+                                        // As for the coding Worker: no user or project hooks or settings.
+                                        isolate_customizations: true,
+                                    },
+                                    fix_lease,
+                                    &mut cancelled,
+                                )
+                                .await
+                            }
+                            // The OpenCode fix runs the coding Worker's own launch and
+                            // policy: no extra permission profile, no extra directories.
+                            // A start failure that was not a refusal may have spawned a
+                            // process, so it counts as a run that may have edited.
+                            CodingProvider::OpenCode => {
+                                let opencode_dir = working_dir.clone();
+                                Self::run_started_cancellably(
+                                    async move {
+                                        start_opencode_run(
+                                            fix_prompt,
+                                            opencode_dir,
+                                            fix_model,
+                                            true,
+                                            fix_lease,
+                                        )
+                                        .await
+                                        .map_err(opencode_start_failure)
+                                    },
+                                    &mut cancelled,
+                                )
+                                .await
+                            }
+                        }
                     }
                 };
 
@@ -18136,6 +18188,8 @@ mod tests {
                 fix_args_file: std::path::PathBuf,
                 review_prompt_file: std::path::PathBuf,
                 fix_prompt_file: std::path::PathBuf,
+                /// The arguments of each `opencode` launch, one per line.
+                opencode_args_file: std::path::PathBuf,
                 saved_path: Option<String>,
             }
 
@@ -18250,6 +18304,16 @@ mod tests {
                     // for writing can make the executor's exec of it fail
                     // with ETXTBSY.
                     crate::test_helpers::write_executable(&bin, &script);
+                    // A stand-in `opencode` that records its arguments and exits
+                    // before the ACP handshake: it proves which program a
+                    // review-fix launched, and no model call is made.
+                    let opencode_args_file = tmp.path().join("opencode.args");
+                    crate::test_helpers::write_executable(
+                        &bin_dir.join("opencode"),
+                        &format!(
+                            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {opencode_args_file:?}; done\nexit 3\n"
+                        ),
+                    );
                     let saved_path = std::env::var("PATH").ok();
                     let new_path = match &saved_path {
                         Some(p) if without_jj => {
@@ -18276,6 +18340,7 @@ mod tests {
                         fix_args_file,
                         review_prompt_file,
                         fix_prompt_file,
+                        opencode_args_file,
                         saved_path,
                     }
                 }
@@ -18302,6 +18367,11 @@ mod tests {
                 /// The fix agent's own arguments, empty if it never ran.
                 fn fix_args(&self) -> Vec<String> {
                     Self::lines(&self.fix_args_file)
+                }
+
+                /// The arguments of every `opencode` launch, empty if none ran.
+                fn opencode_args(&self) -> Vec<String> {
+                    Self::lines(&self.opencode_args_file)
                 }
 
                 fn lines(file: &std::path::Path) -> Vec<String> {
@@ -18983,7 +19053,7 @@ VERDICT: APPROVED"
             }
 
             #[test]
-            fn the_fix_agent_model_is_the_tasks_configured_model_or_a_refusal() {
+            fn the_fix_launch_is_the_tasks_provider_and_model_or_a_refusal() {
                 let task = |provider: CodingProvider, model: &str| {
                     let mut task =
                         create_test_task_full("fix model", Uuid::new_v4(), TaskStatus::AiReview, 0);
@@ -18993,27 +19063,32 @@ VERDICT: APPROVED"
                 };
                 for model in ["haiku", "sonnet", "claude-haiku-4-5-20251001"] {
                     assert_eq!(
-                        fix_agent_model(&task(CodingProvider::Claude, model)),
-                        Ok(Some(model.to_string()))
+                        fix_agent_launch(&task(CodingProvider::Claude, model)),
+                        Ok((CodingProvider::Claude, Some(model.to_string())))
                     );
                 }
                 // Only a Task that asks for the provider default gets it.
                 for model in ["default", ""] {
                     assert_eq!(
-                        fix_agent_model(&task(CodingProvider::Claude, model)),
-                        Ok(None)
+                        fix_agent_launch(&task(CodingProvider::Claude, model)),
+                        Ok((CodingProvider::Claude, None))
                     );
                 }
-                let refused =
-                    fix_agent_model(&task(CodingProvider::OpenCode, "ollama/llama3.2:3b"))
-                        .expect_err("Claude cannot run an OpenCode model");
-                assert!(refused.contains("ollama/llama3.2:3b"), "{refused}");
-                assert!(
-                    refused.contains("no other model was substituted"),
-                    "{refused}"
+                // An OpenCode Task's fix runs on its own provider and model.
+                assert_eq!(
+                    fix_agent_launch(&task(CodingProvider::OpenCode, "ollama/llama3.2:3b")),
+                    Ok((
+                        CodingProvider::OpenCode,
+                        Some("ollama/llama3.2:3b".to_string())
+                    ))
                 );
-                // An OpenCode Task never falls to a default either.
-                assert!(fix_agent_model(&task(CodingProvider::OpenCode, "default")).is_err());
+                // A model OpenCode cannot run is refused, never replaced by a default
+                // or by Claude: no provider, no model, and nothing substituted.
+                for model in ["default", "", "sonnet"] {
+                    let refused = fix_agent_launch(&task(CodingProvider::OpenCode, model))
+                        .expect_err("OpenCode refuses a model it cannot run");
+                    assert!(!refused.is_empty(), "{model:?}");
+                }
             }
 
             /// A Task configured for Haiku has its fix agent launched on
@@ -19099,9 +19174,52 @@ VERDICT: APPROVED"
                 }
             }
 
-            /// A model Claude cannot run is not replaced by Claude's default.
-            /// The fix agent is not started: it names the reason, the findings
-            /// stay for the person, and the Task's model is untouched.
+            /// An OpenCode Task's review-fix runs on OpenCode with the Task's
+            /// model, never on Claude. The stand-in `opencode` is launched, and
+            /// its failed start is recorded as a fix that may have edited, while
+            /// the reviewer's findings are kept.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_opencode_task_runs_its_fix_agent_on_opencode() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_with_fixer(CHANGES_REQUESTED, 0, "Fixed everything.", 0);
+                let task = review_task(&mock, |task| {
+                    task.provider = CodingProvider::OpenCode;
+                    task.model = "ollama/llama3.2:3b".to_string();
+                })
+                .await;
+
+                assert!(mock.fix_args().is_empty(), "no Claude fix agent ran");
+                let launched = mock.opencode_args();
+                assert!(
+                    launched.iter().any(|a| a == "acp"),
+                    "the fix launched OpenCode: {launched:?}"
+                );
+                let signoff = task.qa_signoff.clone().expect("a signoff");
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|i| i.starts_with("Fix agent failed to start")),
+                    "the failed fix is recorded: {:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|i| i.contains("a.rs:1 - broken")),
+                    "the reviewer's issues are kept: {:?}",
+                    signoff.issues_found
+                );
+                assert_eq!(task.model, "ollama/llama3.2:3b");
+                assert_eq!(task.provider, CodingProvider::OpenCode);
+            }
+
+            /// An OpenCode Task whose model OpenCode cannot run (a Claude alias)
+            /// is not given a fix agent on another provider or default. The fix
+            /// agent is not started: it names the reason, the findings stay for
+            /// the person, and the Task's model is untouched.
             #[tokio::test(flavor = "multi_thread")]
             async fn an_opencode_model_refuses_the_fix_agent_instead_of_using_a_default() {
                 let _path_guard = PATH_LOCK.lock().await;
@@ -19109,7 +19227,7 @@ VERDICT: APPROVED"
                     MockReviewer::install_with_fixer(CHANGES_REQUESTED, 0, "Fixed everything.", 0);
                 let task = review_task(&mock, |task| {
                     task.provider = CodingProvider::OpenCode;
-                    task.model = "ollama/llama3.2:3b".to_string();
+                    task.model = "sonnet".to_string();
                 })
                 .await;
 
@@ -19130,8 +19248,7 @@ VERDICT: APPROVED"
                         .issues_found
                         .iter()
                         .any(|i| i.starts_with("Fix agent did not start")
-                            && i.contains("ollama/llama3.2:3b")
-                            && i.contains("no other model was substituted")),
+                            && i.contains("sonnet is not one")),
                     "the signoff says why: {:?}",
                     signoff.issues_found
                 );
@@ -19158,7 +19275,7 @@ VERDICT: APPROVED"
                         .any(|entry| matches!(entry.kind, ActivityKind::AiFixFailed { .. })),
                     "the timeline records the failed fix"
                 );
-                assert_eq!(task.model, "ollama/llama3.2:3b");
+                assert_eq!(task.model, "sonnet");
                 assert_eq!(task.provider, CodingProvider::OpenCode);
             }
 
