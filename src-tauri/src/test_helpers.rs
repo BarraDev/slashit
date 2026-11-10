@@ -385,7 +385,7 @@ pub fn write_executable(path: &std::path::Path, body: &str) {
 
 #[cfg(all(test, unix))]
 mod executable_fixture_tests {
-    use super::write_executable;
+    use super::{write_executable, UnwritableDir};
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -523,8 +523,9 @@ mod executable_fixture_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("argued-away");
         write_executable(&path, "#!/bin/sh\necho previous\n");
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
-            .expect("take the directory's write permission away");
+        // Restores write access on drop, including when an assertion below
+        // unwinds, so `tempdir`'s cleanup never meets a read-only directory.
+        let _unwritable = UnwritableDir::new(dir.path()).expect("the directory still accepts writes");
 
         let message = std::panic::catch_unwind(|| write_executable(&path, SCRIPT))
             .expect_err("a directory without write permission defeats the publication")
@@ -549,11 +550,6 @@ mod executable_fixture_tests {
             std::fs::metadata(&path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0),
             "what stands there is still executable"
         );
-
-        // Restore before the tempdir is removed, so cleanup cannot be blamed
-        // for needing its own privileges.
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
-            .expect("restore the directory");
     }
 
     /// A publication can prepare for a destination it cannot replace -- here

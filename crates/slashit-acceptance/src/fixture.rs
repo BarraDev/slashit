@@ -216,6 +216,9 @@ mod tests {
         write_executable(&path, "#!/bin/sh\necho previous\n").expect("publish the previous script");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
             .expect("take the directory's write permission away");
+        // Declared after `dir`, so it drops first, also while an assertion
+        // unwinds: `TempDir` cannot remove a read-only directory's entries.
+        let _restore = RestoreWriteAccess(dir.path().to_path_buf());
 
         let error = write_executable(&path, "#!/bin/sh\nexit 0\n")
             .expect_err("a directory without write permission defeats the publication");
@@ -237,11 +240,16 @@ mod tests {
             std::fs::metadata(&path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0),
             "what stands there is still executable"
         );
+    }
 
-        // Restore before the scratch directory is removed, so cleanup cannot
-        // be blamed for needing its own privileges.
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
-            .expect("restore the directory");
+    /// Restores a directory's write permission when dropped, so the scratch
+    /// directory can be removed whether the test passes or unwinds.
+    struct RestoreWriteAccess(std::path::PathBuf);
+
+    impl Drop for RestoreWriteAccess {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
     }
 
     /// A publication can prepare for a destination it cannot replace -- here
