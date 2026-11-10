@@ -179,7 +179,7 @@ pub fn print_features(data: &serde_json::Value) {
 /// untouched. Only an untrusted value's own characters are touched; the
 /// report's labels, the line breaks it lays out itself and the JSON the
 /// instance sends are not affected by this function.
-fn escape_terminal(text: &str) -> String {
+pub fn escape_terminal(text: &str) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::with_capacity(text.len());
@@ -193,11 +193,13 @@ fn escape_terminal(text: &str) -> String {
                 let _ = write!(out, "\\u{{{:02x}}}", ch as u32);
             }
             // The bidirectional embeds and overrides (U+202A–U+202E), the
-            // isolates (U+2066–U+2069), the directional marks (U+200E and
-            // U+200F) and the line/paragraph separators (U+2028 and U+2029).
-            // U+200C and U+200D, the zero-width non-joiner and joiner, are
-            // not among them: they are ordinary text shaping.
-            '\u{200e}'
+            // isolates (U+2066–U+2069), the directional marks (U+200E, U+200F
+            // and the Arabic letter mark, U+061C) and the line/paragraph
+            // separators (U+2028 and U+2029). U+200C and U+200D, the
+            // zero-width non-joiner and joiner, are not among them: they are
+            // ordinary text shaping.
+            '\u{061c}'
+            | '\u{200e}'
             | '\u{200f}'
             | '\u{2028}'
             | '\u{2029}'
@@ -209,6 +211,12 @@ fn escape_terminal(text: &str) -> String {
         }
     }
     out
+}
+
+/// The line printed for a failed request. The instance's message can echo
+/// text it did not write, so it goes through the same escaping as the report.
+pub fn error_line(message: &str) -> String {
+    format!("Error: {}", escape_terminal(message))
 }
 
 /// One Task's execution evidence, as `slashit runs` shows it.
@@ -323,6 +331,9 @@ pub fn run_report_text(data: &serde_json::Value) -> String {
             out.push_str(&format!(" · {}", escape_terminal(reason)));
         }
         out.push('\n');
+        if let Some(reason) = run["earlier_failure_reason"].as_str() {
+            out.push_str(&format!("      earlier failure: {}\n", escape_terminal(reason)));
+        }
         if let Some(text) = run["outcome"]["text"].as_str() {
             let text = escape_terminal(text);
             let bound = run["outcome"]["echo_chars_omitted"].as_u64();
@@ -809,5 +820,20 @@ mod runs_report_tests {
             text.contains("Activity:         0 milestone(s) echoed, 0 older not echoed\n"),
             "{text}"
         );
+    }
+
+    /// U+061C is a bidirectional control like its neighbors U+200E and U+200F,
+    /// so it is escaped; the joiners that shape ordinary text pass through.
+    #[test]
+    fn the_arabic_letter_mark_is_escaped_and_joiners_are_not() {
+        assert_eq!(escape_terminal("a\u{061c}b"), "a\\u{061c}b");
+        assert_eq!(escape_terminal("\u{200d}\u{200c}"), "\u{200d}\u{200c}");
+    }
+
+    /// A failed request's message reaches the terminal escaped, so an echoed
+    /// escape sequence cannot act on the operator's screen.
+    #[test]
+    fn an_error_line_escapes_the_message() {
+        assert_eq!(error_line("bad\x1b[2J"), "Error: bad\\u{1b}[2J");
     }
 }

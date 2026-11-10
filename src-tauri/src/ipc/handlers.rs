@@ -212,7 +212,8 @@ async fn handle_list_tasks(ctx: &IpcContext, project_id: Option<String>) -> IpcR
 async fn handle_get_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
     let task_uuid = match Uuid::parse_str(&task_id) {
         Ok(id) => id,
-        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
+        // The input is not echoed: it is caller-sized and unbounded.
+        Err(_) => return IpcResponse::error("Invalid task_id: expected a UUID"),
     };
     let tasks = ctx.tasks.read().await;
     match tasks.get(&task_uuid) {
@@ -399,6 +400,11 @@ struct RunEvidence {
     /// record written by an older build, before a masking rule existed, is
     /// echoed clean anyway.
     failure_reason: Option<String>,
+    /// The reason of the run's own failure record when a later recovery or
+    /// completion decided `status` instead, so the failure is not lost behind
+    /// the explanation that followed it. `None` when the run never failed, or
+    /// when `failure_reason` already is that failure.
+    earlier_failure_reason: Option<String>,
     /// What the provider reported as the run's final result, re-redacted and
     /// re-bounded for this echo: already redacted and bounded on the record,
     /// and sanitized again at read time so a result a policy predates is
@@ -609,8 +615,19 @@ fn evidence_runs(activity: &[slashit_activity::Entry]) -> (Vec<RunEvidence>, usi
             started_at: None,
             ended_at: None,
             failure_reason: None,
+            earlier_failure_reason: None,
             outcome: None,
         };
+        // The run's newest failure record, whatever end event later decided
+        // its status. Matched on the run number, so another run's failure
+        // never attaches here.
+        let newest_failure = activity.iter().rev().find_map(|entry| match &entry.kind {
+            Kind::RunFailed {
+                run: Some(r),
+                reason,
+            } if r == run => Some(evidence_failure_reason(reason).0),
+            _ => None,
+        });
         // The Activity is read newest first here, so the first valid end
         // event matched below is the run's latest one, and once an end has
         // settled, every older one is skipped: the run's status, its
@@ -658,6 +675,11 @@ fn evidence_runs(activity: &[slashit_activity::Entry]) -> (Vec<RunEvidence>, usi
                 }
                 _ => {}
             }
+        }
+        // A failed run's failure is already its `failure_reason`; any other
+        // status that follows a recorded failure keeps that failure visible.
+        if evidence.status != "failed" {
+            evidence.earlier_failure_reason = newest_failure;
         }
         runs.push(evidence);
     }
@@ -844,11 +866,12 @@ fn evidence_activity(activity: &[slashit_activity::Entry]) -> (Vec<serde_json::V
             continue;
         };
         evidence_redact_value(&mut value);
-        // A stored entry is bounded, so no single entry can reasonably blow
-        // the budget; the one-decision cut is here, on what is already held.
+        // The budget holds for every entry, the newest included. An entry that
+        // does not fit is skipped and counted among the omitted; older entries
+        // that do fit are still echoed, newest first.
         let cost = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
-        if !echoed.is_empty() && bytes + cost > MAX_EVIDENCE_ACTIVITY_BYTES {
-            break;
+        if bytes + cost > MAX_EVIDENCE_ACTIVITY_BYTES {
+            continue;
         }
         bytes += cost;
         taken += 1;
@@ -892,7 +915,9 @@ type TaskExecutorSnapshot = crate::queue::executor::TaskRunSnapshot;
 async fn handle_get_task_evidence(ctx: &IpcContext, task_id: String) -> IpcResponse {
     let task_uuid = match Uuid::parse_str(&task_id) {
         Ok(id) => id,
-        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
+        // The input is not echoed: it is caller-sized and unbounded, and the
+        // CLI already shows what the caller typed.
+        Err(_) => return IpcResponse::error("Invalid task_id: expected a UUID"),
     };
 
     // Read the Task briefly and work on the clone: the persistently-sourced
@@ -4140,6 +4165,18 @@ mod get_task_evidence {
         );
     }
 
+    /// The caller's input is not echoed, so a huge or control-laden invalid id
+    /// gets the same short fixed error as any other malformed id.
+    #[tokio::test]
+    async fn a_huge_or_control_laden_invalid_id_gets_a_fixed_short_error() {
+        let (_tmp, ctx, _id) = rich_world().await;
+        for input in ["x".repeat(1_000_000), "bad\u{1b}[2J\u{1}".to_string()] {
+            let reply = evidence_or_error(&ctx, &input).await;
+            assert!(!reply.ok);
+            assert_eq!(reply.error.as_deref(), Some("Invalid task_id: expected a UUID"));
+        }
+    }
+
     #[tokio::test]
     async fn unknown_or_malformed_request_fails_closed() {
         let (_tmp, ctx, _id) = rich_world().await;
@@ -4567,27 +4604,13 @@ mod get_task_evidence {
             activity_bytes <= MAX_EVIDENCE_ACTIVITY_BYTES,
             "the echoed milestones total {activity_bytes} bytes"
         );
-        assert!(
-            activity.len() < MAX_EVIDENCE_ACTIVITY_ENTRIES,
-            "the byte budget, not the entry cap, is what stopped the echo: \
-             {} milestones fit",
-            activity.len()
-        );
+        // Milestones that do not fit are skipped and counted, so the omitted
+        // count is exactly what the echo left out.
         assert!(d["activity_omitted"].as_u64().unwrap_or(0) > 0);
-        {
-            // The next stored milestone the echo declined, newest first, and
-            // what it would have cost — the same measurement the echo makes.
-            let next = &task.activity[task.activity.len() - 1 - activity.len()];
-            let mut next_value = serde_json::to_value(next).expect("serializable");
-            evidence_redact_value(&mut next_value);
-            let next_cost = serde_json::to_string(&next_value).unwrap().len();
-            assert!(
-                activity_bytes + next_cost > MAX_EVIDENCE_ACTIVITY_BYTES,
-                "the byte budget was genuinely reached: {activity_bytes} bytes \
-                 echoed, and holding the next milestone would only have cost \
-                 {next_cost} more"
-            );
-        }
+        assert_eq!(
+            d["activity_omitted"].as_u64(),
+            Some((task.activity.len() - activity.len()) as u64),
+        );
 
         let bytes = serde_json::to_string(d).unwrap().len();
         // The response the handler built is within this read's own aggregate
@@ -4914,6 +4937,156 @@ mod evidence_run_end_events {
             "the deciding end is the completion"
         );
         assert_eq!(run.ended_at, Some(entries[3].at));
+    }
+}
+
+/// A run's failure history, and the Activity byte budget. Entries are built
+/// directly, the shape an older record can take.
+#[cfg(test)]
+mod evidence_failure_history {
+    use super::*;
+    use slashit_activity::{Entry, Kind, RunResult};
+
+    fn entry(seq: u32, kind: Kind) -> Entry {
+        Entry {
+            seq,
+            at: chrono::DateTime::from_timestamp(1_700_000_000 + i64::from(seq), 0)
+                .expect("an instant"),
+            kind,
+        }
+    }
+
+    fn start(seq: u32, run: u32) -> Entry {
+        entry(
+            seq,
+            Kind::RunStarted {
+                run,
+                addressing_feedback: false,
+            },
+        )
+    }
+
+    fn failed(seq: u32, run: u32, reason: &str) -> Entry {
+        entry(
+            seq,
+            Kind::RunFailed {
+                run: Some(run),
+                reason: reason.into(),
+            },
+        )
+    }
+
+    fn recovered(seq: u32, run: u32, reason: &str) -> Entry {
+        entry(
+            seq,
+            Kind::RecoveryRequired {
+                run: Some(run),
+                reason: reason.into(),
+            },
+        )
+    }
+
+    fn run_of(entries: &[Entry], run: u32) -> RunEvidence {
+        evidence_runs(entries)
+            .0
+            .into_iter()
+            .find(|evidence| evidence.run == run)
+            .expect("the run is named")
+    }
+
+    /// The provider failed, then the commit needed recovery: the recovery
+    /// explanation is the terminal reason, and the failure it followed is kept.
+    #[test]
+    fn a_recovery_after_a_failure_keeps_the_failure() {
+        let entries = [
+            start(1, 1),
+            failed(2, 1, "git commit refused by a hook"),
+            recovered(3, 1, "outcome unknown"),
+        ];
+        let run = run_of(&entries, 1);
+        assert_eq!(run.status, "recovery_required");
+        assert_eq!(run.failure_reason.as_deref(), Some("outcome unknown"));
+        assert_eq!(
+            run.earlier_failure_reason.as_deref(),
+            Some("git commit refused by a hook")
+        );
+    }
+
+    /// A failed run states its failure once, as its failure reason.
+    #[test]
+    fn a_failure_is_not_repeated_as_an_earlier_one() {
+        let entries = [start(1, 1), failed(2, 1, "provider exited")];
+        let run = run_of(&entries, 1);
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.failure_reason.as_deref(), Some("provider exited"));
+        assert!(run.earlier_failure_reason.is_none());
+    }
+
+    #[test]
+    fn a_recovery_without_an_earlier_failure_has_none() {
+        let entries = [start(1, 1), recovered(2, 1, "outcome unknown")];
+        let run = run_of(&entries, 1);
+        assert_eq!(run.status, "recovery_required");
+        assert!(run.earlier_failure_reason.is_none());
+    }
+
+    /// A later completion decides the status; the failure it followed stays
+    /// visible rather than vanishing.
+    #[test]
+    fn a_completion_after_a_failure_reports_that_failure() {
+        let entries = [
+            start(1, 1),
+            failed(2, 1, "transient"),
+            entry(3, Kind::RunCompleted { run: 1 }),
+        ];
+        let run = run_of(&entries, 1);
+        assert_eq!(run.status, "completed");
+        assert!(run.failure_reason.is_none());
+        assert_eq!(run.earlier_failure_reason.as_deref(), Some("transient"));
+    }
+
+    /// Interleaved runs never exchange failures: each keeps its own history.
+    #[test]
+    fn interleaved_runs_keep_their_own_failures() {
+        let entries = [
+            start(1, 1),
+            start(2, 2),
+            failed(3, 1, "one failed"),
+            recovered(4, 2, "two recovered"),
+            recovered(5, 1, "one recovered"),
+        ];
+        let one = run_of(&entries, 1);
+        assert_eq!(one.failure_reason.as_deref(), Some("one recovered"));
+        assert_eq!(one.earlier_failure_reason.as_deref(), Some("one failed"));
+        let two = run_of(&entries, 2);
+        assert_eq!(two.failure_reason.as_deref(), Some("two recovered"));
+        assert!(two.earlier_failure_reason.is_none());
+    }
+
+    /// The newest milestone alone exceeds the Activity budget: it is skipped
+    /// and counted as omitted, and the older milestones that fit are still
+    /// echoed, newest first, within the budget.
+    #[test]
+    fn an_oversized_newest_milestone_is_omitted_and_older_ones_still_echo() {
+        let entries = [
+            start(1, 1),
+            entry(2, Kind::RunCompleted { run: 1 }),
+            entry(
+                3,
+                Kind::RunResult {
+                    run: 1,
+                    result: RunResult::Available {
+                        text: "a".repeat(25_000),
+                    },
+                },
+            ),
+        ];
+        let (values, omitted) = evidence_activity(&entries);
+        assert_eq!(omitted, 1);
+        let seqs: Vec<u64> = values.iter().map(|v| v["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, vec![2, 1]);
+        let serialized = serde_json::to_string(&values).unwrap();
+        assert!(serialized.len() <= MAX_EVIDENCE_ACTIVITY_BYTES);
     }
 }
 
