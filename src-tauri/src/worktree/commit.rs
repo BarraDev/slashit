@@ -225,6 +225,69 @@ async fn git(working_dir: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The content of a checkout at one moment, as Git tree ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutSnapshot {
+    /// Committed and uncommitted content, tracked and untracked files alike,
+    /// ignored untracked files left out. Equal ids mean equal content, however
+    /// many commits or edits produced it.
+    pub content: String,
+    /// Whether the content is exactly HEAD's tree: no uncommitted change.
+    pub clean: bool,
+}
+
+/// Snapshots the content of the checkout at `working_dir`, so that comparing a
+/// snapshot from before an agent run with one from after shows whether the run
+/// changed anything. The snapshot starts from a copy of the checkout's index,
+/// so tracked files that match an ignore rule are still compared, and the
+/// checkout's own index is never written. The copy and the lock Git takes while
+/// it writes are removed afterwards.
+pub async fn checkout_snapshot(working_dir: &str) -> Result<CheckoutSnapshot, String> {
+    let git_dir = git(working_dir, &["rev-parse", "--absolute-git-dir"])
+        .await
+        .map_err(|e| format!("could not locate the checkout's Git directory: {e}"))?;
+    let index = Path::new(&git_dir).join("slashit-content-snapshot.index");
+    let lock = Path::new(&git_dir).join("slashit-content-snapshot.index.lock");
+    let real_index = git(working_dir, &["rev-parse", "--git-path", "index"])
+        .await
+        .map_err(|e| format!("could not locate the checkout's index: {e}"))?;
+    let real_index = Path::new(working_dir).join(real_index);
+    let _ = std::fs::remove_file(&index);
+    let _ = std::fs::remove_file(&lock);
+    if real_index.exists() {
+        std::fs::copy(&real_index, &index)
+            .map_err(|e| format!("could not copy the checkout's index: {e}"))?;
+    }
+    let result = async {
+        git_with_index(working_dir, &index, &["add", "-A"]).await?;
+        let content = git_with_index(working_dir, &index, &["write-tree"]).await?;
+        let head = git(working_dir, &["rev-parse", "HEAD^{tree}"]).await?;
+        Ok(CheckoutSnapshot {
+            clean: content == head,
+            content,
+        })
+    }
+    .await;
+    let _ = std::fs::remove_file(&index);
+    let _ = std::fs::remove_file(&lock);
+    result
+}
+
+/// Runs one Git command against a temporary index file.
+async fn git_with_index(working_dir: &str, index: &Path, args: &[&str]) -> Result<String, String> {
+    let output = crate::host_process::tokio_command("git")
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .current_dir(working_dir)
+        .output()
+        .await
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("git {} failed: {}", args[0], explain(&output)));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Git's explanation of a failure on one bounded line: its stderr, or its
 /// stdout when stderr is empty (some hooks write there), or the exit status.
 fn explain(output: &std::process::Output) -> String {
