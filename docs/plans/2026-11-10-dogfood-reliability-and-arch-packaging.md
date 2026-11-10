@@ -1,5 +1,12 @@
 # Dogfood reliability, durable execution history and Arch Linux packaging
 
+Migration status (2026-11-10): the DECIDED entries are being moved to their
+subject documents. Partial-edit policy: docs/architecture/task-checkouts-and-stacks.md
+("Failed review-fix runs"). Package names, location and publication limits:
+packaging/arch/README.md ("Owner decisions", PR #336). Diagnostic bounds and the
+#220 milestone rule: docs/architecture/run-diagnostics.md (PR #337). This file
+is proposed for supersession, not deletion, until the owner approves closing #334.
+
 Status: working plan. Keep it current as each unit lands. Each entry carries one
 of these labels:
 

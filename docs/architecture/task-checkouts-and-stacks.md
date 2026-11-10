@@ -294,3 +294,27 @@ When `jj` is missing, those paths are skipped or the Git path is used, and Task
 Checkouts, commits and restacks work as in a plain Git repository. A Jujutsu
 repository that is not colocated with Git cannot get a Task Checkout (see
 [product-model.md](product-model.md#task-checkout)).
+
+## Failed review-fix runs
+
+Decided (owner, recorded in the engineering plan of PR #334, second request,
+2026-11-10). This section states the policy; the mechanism is not implemented.
+
+A review-fix run can fail after it has edited files in the Task Checkout. Such a
+partial checkout is preserved and never discarded silently. It is never silently
+incorporated into a later Worker commit or review-fix commit. The uncertain state
+is explicit, and a human decides before the affected work continues. Any discard
+is a separate, authorized operation that states what would be lost. Automatic
+cleanup is not an acceptable shortcut.
+
+Current behavior, verified by reading `commit_changes` in
+`src-tauri/src/queue/executor.rs`: the step runs after every Worker run and
+commits everything uncommitted in the checkout. It therefore does not yet honor
+this policy. A reproduction through `commit_changes` with a leftover edit is the
+next step before the fix.
+
+Proposed, not implemented: record the checkout's tree before and after a fix run.
+A failed run with a changed tree is marked as holding partial edits. A Task in
+that state refuses further commits until a human chooses to keep the edits for
+review or to discard them. That needs a new persisted Task field with a serde
+default for existing records, and a human decision surface.
