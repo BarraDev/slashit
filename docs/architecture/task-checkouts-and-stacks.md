@@ -297,8 +297,8 @@ repository that is not colocated with Git cannot get a Task Checkout (see
 
 ## Failed review-fix runs
 
-Decided (owner, recorded in the engineering plan of PR #334, second request,
-2026-11-10). This section states the policy; the mechanism is not implemented.
+This section states the owner's policy and the requirements for its mechanism.
+The mechanism is not implemented.
 
 A review-fix run can fail after it has edited files in the Task Checkout. Such a
 partial checkout is preserved and never discarded silently. It is never silently
@@ -307,14 +307,30 @@ is explicit, and a human decides before the affected work continues. Any discard
 is a separate, authorized operation that states what would be lost. Automatic
 cleanup is not an acceptable shortcut.
 
-Current behavior, verified by reading `commit_changes` in
-`src-tauri/src/queue/executor.rs`: the step runs after every Worker run and
-commits everything uncommitted in the checkout. It therefore does not yet honor
-this policy. A reproduction through `commit_changes` with a leftover edit is the
-next step before the fix.
+Current behavior: `commit_changes` in `src-tauri/src/queue/executor.rs` runs after
+every Worker run and commits everything uncommitted in the checkout. It does not
+yet honor this policy.
 
-Proposed, not implemented: record the checkout's tree before and after a fix run.
-A failed run with a changed tree is marked as holding partial edits. A Task in
-that state refuses further commits until a human chooses to keep the edits for
-review or to discard them. That needs a new persisted Task field with a serde
-default for existing records, and a human decision surface.
+Requirements for the mechanism:
+
+- Durable evidence before the fix starts. Before a review-fix agent runs, SlashIt
+  persists a record that identifies the Task Checkout and its baseline tree and
+  marks the fix as in progress. The record must survive an interruption (process
+  exit or restart) that happens before the post-fix comparison.
+- Recovery. A Task whose fix record shows a started fix without a completion
+  record is treated as holding possibly partial edits, after a restart or at the
+  next AI Review. It refuses further commits until a human chooses to keep the
+  edits for review or to discard them.
+- Post-fix comparison. A failed run whose checkout tree differs from the baseline
+  is treated the same way.
+- Reproduction first. A synthetic reproduction through `commit_changes` with a
+  leftover edit, including an interruption before the post-fix comparison and
+  recovery after restart, must exist before the mechanism lands.
+- Schema changes need analysis first. If the evidence is stored as a new persisted
+  Task field, the change must state, before it is introduced: schema compatibility
+  with existing records (a serde default for old records); downgrade behavior,
+  since the board schema refuses unknown fields and an older build refuses the
+  whole Project board (see [run-diagnostics.md](run-diagnostics.md)); the backup
+  taken before the first write; and the rollback path to the previous build. A
+  storage location that older builds can read is an acceptable alternative if it
+  meets the same requirements.
