@@ -82,12 +82,17 @@ jobs:
 
       # Both scripts are executed directly; a missing execute bit fails with exit 126.
       - name: Check the supervisor scripts are executable
-        run: test -x scripts/supervise-dogfood.sh && test -x scripts/test-supervise-dogfood.sh
+        run: test -x scripts/supervise-dogfood.sh && test -x scripts/test-supervise-dogfood.sh && test -x scripts/build-dogfood-app.sh && test -x scripts/test-build-dogfood-app.sh
 
       - name: Run the supervisor harness
         env:
           TMPDIR: ${{ runner.temp }}
         run: scripts/test-supervise-dogfood.sh
+
+      - name: Run the dogfood build harness
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: scripts/test-build-dogfood-app.sh
 
   # The Linux validation is three independent jobs rather than one serial one,
   # so the wall-clock is the slowest of them, not their sum. Each installs and

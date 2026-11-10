@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=125
+EXPECTED_TOTAL=136
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -110,6 +110,11 @@ fixture_supervisor() { # job
 cleanup_all() {
   cleanup_instances
   local rec
+  if [ -n "${fe_srv:-}" ]; then
+    kill "$fe_srv" 2>/dev/null || true
+    wait "$fe_srv" 2>/dev/null || true
+    fe_srv=
+  fi
   for rec in "${foreign_pids[@]+"${foreign_pids[@]}"}"; do
     signal_owned KILL "$rec" || true
   done
@@ -172,6 +177,9 @@ fi
 exit 0
 STUB
 chmod +x "$bin_dir/slashit-ui"
+# The stub is an embedded build for the supervisor's frontend gate, bound to its
+# own sha256, so no case depends on a dev server on localhost:1420.
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$(sha256sum "$bin_dir/slashit-ui" | cut -d' ' -f1)" >"$bin_dir/slashit-ui.frontend"
 
 # Stub of the `slashit` CLI: answers --version (provenance), answers ping
 # while the stub instance is up, sends its quit flag otherwise, in the same
@@ -255,6 +263,7 @@ BASEENV=(
   SLASHIT_DOGFOOD_RUNTIME="$runtime"
   SLASHIT_DOGFOOD_BINARY="$bin_dir/slashit-ui"
   SLASHIT_DOGFOOD_CLI="$stub_dir/slashit"
+  SLASHIT_DOGFOOD_DEV_URL=http://127.0.0.1:9/
   SLASHIT_DOGFOOD_START_TIMEOUT=10
   SLASHIT_DOGFOOD_STOP_TIMEOUT=8
   SLASHIT_DOGFOOD_FORCE_TIMEOUT=5
@@ -585,6 +594,122 @@ fi
 cleanup_instances
 printf 'settings v1\n' >"$state/config/slashit-app/settings.toml"
 
+echo "== WebKit cache regeneration and UI preferences do not fail a restart; Task data still does"
+webcache="$state/data/com.barradev.slashit-app/WebKitCache/Version 17/entry"
+webprefs="$state/data/com.barradev.slashit-app/localstorage/http_localhost_1420.localstorage"
+mkdir -p "$(dirname "$webcache")" "$(dirname "$webprefs")"
+printf 'cache v1\n' >"$webcache"
+printf 'prefs v1\n' >"$webprefs"
+sv start >/dev/null 2>&1 || bad "webkit fixture: start failed"
+out=$(sv SLASHIT_TEST_STARTUP_TOUCH="$webcache" restart 2>&1); status=$?
+if [ "$status" -eq 0 ]; then ok "a regenerated WebKit cache entry does not fail the restart"
+else bad "a WebKit cache rewrite failed the restart (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+sv start >/dev/null 2>&1 || bad "webkit prefs fixture: start failed"
+out=$(sv SLASHIT_TEST_STARTUP_TOUCH="$webprefs" restart 2>&1); status=$?
+if [ "$status" -eq 0 ] && [[ "$out" == *"UI preference files"* ]]; then ok "a rewritten UI preference file is reported, not failed"
+else bad "a UI preference rewrite was not reported as expected (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+sv start >/dev/null 2>&1 || bad "task-data fixture: start failed"
+out=$(sv SLASHIT_TEST_STARTUP_TOUCH="$state/data/slashit-app/board.toml" restart 2>&1); status=$?
+if [ "$status" -eq 1 ] && [[ "$out" == *"state files changed during the restart"* ]]; then ok "a boot-time change to Task data is still a restart divergence"
+else bad "a Task-data change was not refused (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+printf 'session 7\n' >"$state/data/slashit-app/board.toml"
+rm -rf "$state/data/com.barradev.slashit-app"
+
+echo "== frontend mode: an embedded build needs no server; a development build needs its dev server"
+fe=$work/frontend
+mkdir -p "$fe"
+cp "$bin_dir/slashit-ui" "$fe/slashit-ui"
+# Backdate the fixture binary: the stale-instance check compares whole-second
+# mtimes with process age, so a binary written in the same second as its
+# instance's start reads as rebuilt-after-start (a race, seen on CI).
+touch -d '2000-01-01 00:00:00' "$fe/slashit-ui"
+fe_sha=$(sha256sum "$fe/slashit-ui" | cut -d' ' -f1)
+fe_dead=http://127.0.0.1:9/
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\n' "$fe_sha" >"$fe/slashit-ui.frontend"
+
+out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start 2>&1)
+expect pass "an embedded build starts with no dev server answering" "$out" $?
+out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" verify 2>&1); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"frontend:       embedded in the binary"* ]]; then ok "verify reports the embedded frontend, not a server"
+else bad "verify did not report the embedded frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+printf 'mode=embedded\nsha256=0000000000000000000000000000000000000000000000000000000000000000\n' >"$fe/slashit-ui.frontend"
+out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start 2>&1)
+expect fail "a sidecar whose sha256 does not match the binary is refused" "$out" $? "does not match the binary's sha256"
+cleanup_instances
+
+rm -f "$fe/slashit-ui.frontend"
+out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start 2>&1)
+expect fail "a development build without its dev server is refused, not started blank" "$out" $? "this is a development build"
+cleanup_instances
+# A running instance whose frontend record is then lost (a development build
+# now, with no server) must be reported as degraded, not healthy.
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\n' "$fe_sha" >"$fe/slashit-ui.frontend"
+sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start >/dev/null 2>&1 || bad "degraded-verify fixture: start failed"
+rm -f "$fe/slashit-ui.frontend"
+out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" verify 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"UNAVAILABLE"* ]]; then ok "verify is degraded when a running development build has no dev server"
+else bad "verify did not report the degraded development frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+  # A free port picked at run time, and readiness only once this server
+  # answers on it while its own process is alive: an unrelated listener on a
+  # fixed port can neither be bound over nor be mistaken for ours.
+  fe_port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()') ||
+    { bad "cannot pick a free port for the test dev server"; fe_port=; }
+  fe_url="http://127.0.0.1:$fe_port/"
+  fe_ready=0
+  if [ -n "$fe_port" ]; then
+    (cd "$fe" && exec python3 -m http.server "$fe_port" --bind 127.0.0.1 >/dev/null 2>&1) &
+    fe_srv=$!
+    for _ in $(seq 1 100); do
+      kill -0 "$fe_srv" 2>/dev/null || break
+      curl -fsS --max-time 1 -o /dev/null "$fe_url" 2>/dev/null && { fe_ready=1; break; }
+      sleep 0.1
+    done
+  fi
+  if [ "$fe_ready" = 1 ]; then
+    out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" start 2>&1)
+    expect pass "a development build starts once its dev server answers" "$out" $?
+    out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" verify 2>&1)
+    st=$?
+    if [ "$st" -eq 0 ] && [[ "$out" == *"development server answers"* ]]; then ok "verify reports a ready dev server"
+    else bad "verify did not report the ready dev server (exit $st)"; printf '%s\n' "$out" >&2; fi
+  else
+    bad "the test dev server did not answer on $fe_url while its process was alive"
+  fi
+  cleanup_instances
+  if [ -n "$fe_srv" ]; then
+    kill "$fe_srv" 2>/dev/null || true
+    wait "$fe_srv" 2>/dev/null || true
+    fe_srv=
+  fi
+else
+  ok "dev-server readiness positive case skipped: python3 is not installed"
+fi
+
+echo "== restart snapshots are bounded to the newest five"
+cleanup_instances
+sv start >/dev/null 2>&1 || bad "retention fixture: start failed"
+restarts_ok=0
+for i in 1 2 3 4 5 6; do
+  out=$(sv restart 2>&1) || { bad "restart $i of 6 failed"; printf '%s\n' "$out" >&2; break; }
+  restarts_ok=$((restarts_ok + 1))
+done
+# Count backup directories by glob, not by parsing ls output.
+kept=0
+for dir in "$state"/supervisor/backup/[0-9]*/; do
+  [ -d "$dir" ] && kept=$((kept + 1))
+done
+if [ "$restarts_ok" -eq 6 ] && [ "$kept" -eq 5 ]; then ok "six successful restarts leave exactly five snapshots"
+else bad "after $restarts_ok successful restarts, $kept snapshots remain; expected exactly 5 after 6"; fi
+cleanup_instances
+
 # A small protected-state fixture: two compared files and two excluded ones.
 make_state() {
   mkdir -p "$1/config/slashit-app" "$1/data/slashit-app/logs" "$1/data/slashit-app/worktrees"
@@ -596,9 +721,9 @@ make_state() {
 
 echo "== default discovery: no explicit binary or CLI, inside a git checkout"
 disc=$work/disc
-mkdir -p "$disc/main/target/debug" "$disc/main/scripts"
-cp "$bin_dir/slashit-ui" "$disc/main/target/debug/slashit-ui"
-cp "$stub_dir/slashit" "$disc/main/target/debug/slashit"
+mkdir -p "$disc/main/target/dogfood" "$disc/main/scripts"
+cp "$bin_dir/slashit-ui" "$disc/main/target/dogfood/slashit-ui"
+cp "$stub_dir/slashit" "$disc/main/target/dogfood/slashit"
 cp "$sup" "$disc/main/scripts/supervise-dogfood.sh"
 git -C "$disc/main" init -q
 git -C "$disc/main" config user.name "Supervise Test"
@@ -608,8 +733,8 @@ git -C "$disc/main" commit -q -m layout
 d_env=(SLASHIT_DOGFOOD_STATE="$state" SLASHIT_DOGFOOD_RUNTIME="$runtime"
   XDG_CONFIG_HOME= XDG_DATA_HOME= XDG_CACHE_HOME= XDG_STATE_HOME= XDG_RUNTIME_DIR= GH_CONFIG_DIR=)
 out=$(cd / && env "${d_env[@]}" timeout 60 bash "$disc/main/scripts/supervise-dogfood.sh" env 2>&1); st=$?
-if [ "$st" -eq 0 ] && grep -qxE "BINARY +$disc/main/target/debug/slashit-ui" <<<"$out" &&
-  grep -qxE "CLI +$disc/main/target/debug/slashit" <<<"$out"; then
+if [ "$st" -eq 0 ] && grep -qxE "BINARY +$disc/main/target/dogfood/slashit-ui" <<<"$out" &&
+  grep -qxE "CLI +$disc/main/target/dogfood/slashit" <<<"$out"; then
   ok "default discovery finds the binary and the CLI beside it, with no overrides"
 else
   bad "default discovery did not resolve the checkout layout (exit $st)"; printf '%s\n' "$out" >&2
@@ -617,13 +742,13 @@ fi
 
 git -C "$disc/main" worktree add -q "$disc/task" -b task-probe >/dev/null 2>&1
 out=$(cd / && env "${d_env[@]}" timeout 60 bash "$disc/task/scripts/supervise-dogfood.sh" env 2>&1); st=$?
-if [ "$st" -eq 0 ] && grep -qxE "BINARY +$disc/main/target/debug/slashit-ui" <<<"$out"; then
+if [ "$st" -eq 0 ] && grep -qxE "BINARY +$disc/main/target/dogfood/slashit-ui" <<<"$out"; then
   ok "discovery from a linked worktree (the Task Checkout geometry) resolves the main checkout's build"
 else
   bad "discovery from a linked worktree did not resolve the main checkout (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
-rm -f "$disc/main/target/debug/slashit"
+rm -f "$disc/main/target/dogfood/slashit"
 out=$(cd / && env "${d_env[@]}" timeout 60 bash "$disc/main/scripts/supervise-dogfood.sh" status 2>&1); st=$?
 if [ "$st" -eq 3 ] && [[ "$out" == *"cannot verify (no CLI)"* ]]; then
   ok "without a CLI beside the binary, status exits 3 and says it cannot verify"
@@ -741,15 +866,19 @@ env XDG_CONFIG_HOME="$work/not-declared/config" XDG_DATA_HOME="$state/data" XDG_
   SLASHIT_TEST_STUB_DIR="$stub_dir" SLASHIT_TEST_SOCKET="$socket" \
   "$bin_dir/slashit-ui" >"$work/mismatch.log" 2>&1 &
 for _ in $(seq 100); do [ -s "$stub_dir/pid" ] && break; sleep 0.05; done
+# Hold the embedded-frontend sidecar aside so the frontend is a development
+# build with no server (degraded). The environment verdict must still report.
+mv "$bin_dir/slashit-ui.frontend" "$bin_dir/slashit-ui.frontend.held"
 out=$(sv status 2>&1); st=$?
-if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]]; then
-  ok "status exits 4 for a live instance whose environment differs from the declaration"
+if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]] && [[ "$out" == *"UNAVAILABLE"* ]]; then
+  ok "status exits 4 for a mismatched environment even when the frontend is degraded"
 else
-  bad "status did not exit 4 for an environment mismatch (exit $st)"; printf '%s\n' "$out" >&2
+  bad "status did not exit 4 with the mismatch and the degraded frontend both reported (exit $st)"; printf '%s\n' "$out" >&2
 fi
 out=$(sv verify 2>&1); st=$?
-if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]]; then
-  ok "verify exits 4 for the same environment mismatch"
+mv "$bin_dir/slashit-ui.frontend.held" "$bin_dir/slashit-ui.frontend"
+if [ "$st" -eq 4 ] && [[ "$out" == *"MISMATCH"* ]] && [[ "$out" == *"UNAVAILABLE"* ]]; then
+  ok "verify exits 4 and reports the environment mismatch even when the frontend is degraded"
 else
   bad "verify did not exit 4 for an environment mismatch (exit $st)"; printf '%s\n' "$out" >&2
 fi
