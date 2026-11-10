@@ -20,8 +20,8 @@ depends=(
 )
 provides=('slashit')
 conflicts=('slashit')
-# The upstream binaries are already stripped by the release build; keep them
-# byte-identical to the published artifact.
+# The upstream binaries keep their symbol tables (no debug info). !strip keeps
+# them byte-identical to the published artifact.
 options=('!strip' '!debug')
 _deb="SlashIt_${pkgver}_amd64.deb"
 source=("${_deb}::https://github.com/BarraDev/slashit/releases/download/v${pkgver}/${_deb}")
