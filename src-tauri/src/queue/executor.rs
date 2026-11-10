@@ -7923,8 +7923,14 @@ impl TaskExecutor {
                     .count()
                     .try_into()
                     .unwrap_or(u32::MAX);
+                // A fix run that changed no files did not address the findings.
+                let fix_unchanged = fix_changed_nothing.then(|| {
+                    "The fix agent changed no files, so the review findings are not addressed."
+                        .to_string()
+                });
                 let issues: Vec<String> = fix_failure
                     .iter()
+                    .chain(fix_unchanged.iter())
                     .cloned()
                     .chain(
                         findings
@@ -7935,7 +7941,7 @@ impl TaskExecutor {
                     .collect();
 
                 let signoff = QaSignoff {
-                    status: if fix_failure.is_none() {
+                    status: if fix_failure.is_none() && !fix_changed_nothing {
                         QaStatus::FixesApplied
                     } else {
                         QaStatus::Rejected
@@ -19017,6 +19023,39 @@ VERDICT: APPROVED"
                         .iter()
                         .any(|i| i.contains("a.rs:1 - broken")),
                     "the reviewer's issues are kept: {:?}",
+                    signoff.issues_found
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_run_that_changes_no_files_is_not_recorded_as_fixes_applied() {
+                let _path_guard = PATH_LOCK.lock().await;
+                // The fix agent succeeds but edits nothing. The Worker's change is
+                // committed first, as run completion does, so the checkout is clean.
+                let mock = MockReviewer::install_with_fixer(
+                    "VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a.rs:1 - broken",
+                    0,
+                    "I looked and changed nothing.",
+                    0,
+                );
+                let (repo, base_commit) = git_repo_with_change();
+                let path = repo.path();
+                for args in [&["add", "-A"][..], &["commit", "-q", "-m", "worker"][..]] {
+                    let status = std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(path)
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "git {args:?} failed");
+                }
+                let signoff = review_in(&mock, path.to_str().unwrap(), &base_commit).await;
+                assert_eq!(signoff.status, QaStatus::Rejected, "{:?}", signoff.issues_found);
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|issue| issue.contains("changed no files")),
+                    "{:?}",
                     signoff.issues_found
                 );
             }
