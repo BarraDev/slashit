@@ -7756,7 +7756,7 @@ impl TaskExecutor {
                 // before the lease is taken.
                 // The checkout's content before the fix agent runs. A fix is
                 // credited only with content it changed from this state.
-                let fix_before = crate::worktree::checkout_content_id(&working_dir).await;
+                let fix_before = crate::worktree::checkout_snapshot(&working_dir).await;
                 let fix_run = match fix_launch
                     .map_err(LaunchError::before_spawn)
                     .and_then(|launch| {
@@ -7863,14 +7863,19 @@ impl TaskExecutor {
                         // Whether the checkout's content changed while the fix
                         // agent ran, whatever commits it made. A commit that
                         // leaves the content as it was is not a fix.
-                        let after = crate::worktree::checkout_content_id(&working_dir).await;
+                        let after = crate::worktree::checkout_snapshot(&working_dir).await;
+                        // The second value says whether the checkout was clean before
+                        // the run. A commit of a dirty checkout would also commit the
+                        // edits that were already there, so it is refused.
                         let changed = match (&fix_before, after) {
-                            (Ok(before), Ok(after)) => Ok(*before != after),
+                            (Ok(before), Ok(after)) => {
+                                Ok((before.content != after.content, before.clean))
+                            }
                             (Err(e), _) => Err(e.clone()),
                             (Ok(_), Err(e)) => Err(e),
                         };
                         match changed {
-                            Ok(false) => {
+                            Ok((false, _)) => {
                                 events.agent_event(AgentEvent::Log {
                                     task_id: task_id_str.clone(),
                                     level: LogLevel::Info,
@@ -7893,7 +7898,21 @@ impl TaskExecutor {
                                 });
                                 Some(message)
                             }
-                            Ok(true) => {
+                            Ok((true, false)) => {
+                                let message = "The task checkout had uncommitted changes before \
+                                               the fix agent ran, so SlashIt cannot separate the \
+                                               fix from them and committed nothing. The fix and \
+                                               the earlier edits remain uncommitted in the task \
+                                               checkout for a Human decision."
+                                    .to_string();
+                                events.agent_event(AgentEvent::Log {
+                                    task_id: task_id_str.clone(),
+                                    level: LogLevel::Error,
+                                    message: message.clone(),
+                                });
+                                Some(message)
+                            }
+                            Ok((true, true)) => {
                                 let message = format!("task: {title} (with review fixes)");
                                 let committed = match &branch {
                                     Some(branch) => {
@@ -19303,6 +19322,71 @@ VERDICT: APPROVED"
             }
 
             #[tokio::test(flavor = "multi_thread")]
+            async fn a_real_fix_over_preexisting_uncommitted_content_is_refused_without_a_commit() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_scripted_fixer("printf 'fixed\\n' > review-fix.txt", 0);
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path();
+                std::fs::write(path.join("dirty.txt"), "from before the fix\n").unwrap();
+                let signoff = review_in(&mock, path.to_str().unwrap(), &base_commit).await;
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::Rejected,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert!(
+                    signoff
+                        .issues_found
+                        .iter()
+                        .any(|issue| issue.contains("uncommitted changes before")),
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert_eq!(git_output(path, &["rev-list", "--count", "HEAD"]), "2");
+                let status = git_output(path, &["status", "--porcelain"]);
+                assert!(
+                    status.contains("?? dirty.txt") && status.contains("?? review-fix.txt"),
+                    "{status}"
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_edit_to_a_tracked_file_that_matches_an_ignore_rule_is_a_fix() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_scripted_fixer("printf 'v2\\n' > ignored.txt", 0);
+                let (repo, base_commit) = git_repo_with_change();
+                let path = repo.path();
+                // The file is tracked although an ignore rule matches it.
+                std::fs::write(path.join(".gitignore"), "ignored.txt\n").unwrap();
+                std::fs::write(path.join("ignored.txt"), "v1\n").unwrap();
+                for args in [
+                    &["add", "-A"][..],
+                    &["add", "-f", "ignored.txt"][..],
+                    &["commit", "-q", "-m", "worker"][..],
+                ] {
+                    let status = std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(path)
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "git {args:?} failed");
+                }
+                let signoff = review_in(&mock, path.to_str().unwrap(), &base_commit).await;
+                assert_eq!(
+                    signoff.status,
+                    QaStatus::FixesApplied,
+                    "{:?}",
+                    signoff.issues_found
+                );
+                assert_eq!(
+                    git_output(path, &["show", "--name-only", "--format=", "HEAD"]),
+                    "ignored.txt"
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
             async fn a_fix_agent_that_succeeds_records_fixes() {
                 let _path_guard = PATH_LOCK.lock().await;
                 // The fix agent edits review-fix.txt. The Worker's change is
@@ -19556,7 +19640,8 @@ VERDICT: APPROVED"
                 let mock =
                     MockReviewer::install_with_fixer(CHANGES_REQUESTED, 0, "Fixed everything.", 0);
                 let prompt_record = mock.opencode_edits_the_checkout();
-                let (repo, base_commit) = git_repo_with_change();
+                // The Worker's change is committed first, as run completion does.
+                let (repo, base_commit) = git_repo_with_worker_commit();
                 let working_dir = repo.path().to_str().unwrap().to_string();
                 let task = review_task_in(&mock, &working_dir, &base_commit, |task| {
                     task.provider = CodingProvider::OpenCode;

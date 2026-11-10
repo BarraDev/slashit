@@ -225,25 +225,51 @@ async fn git(working_dir: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Identifies the content of a checkout as a Git tree id: its committed and
-/// uncommitted content, tracked and untracked files alike, with ignored files
-/// left out. Two checkouts with the same id hold the same content, however many
-/// commits or edits produced it, so comparing ids before and after an agent run
-/// shows whether the run changed anything, without crediting content that was
-/// already there. The checkout's own index is not touched: the snapshot is taken
-/// through a temporary index that is removed afterwards.
-pub async fn checkout_content_id(working_dir: &str) -> Result<String, String> {
+/// The content of a checkout at one moment, as Git tree ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutSnapshot {
+    /// Committed and uncommitted content, tracked and untracked files alike,
+    /// ignored untracked files left out. Equal ids mean equal content, however
+    /// many commits or edits produced it.
+    pub content: String,
+    /// Whether the content is exactly HEAD's tree: no uncommitted change.
+    pub clean: bool,
+}
+
+/// Snapshots the content of the checkout at `working_dir`, so that comparing a
+/// snapshot from before an agent run with one from after shows whether the run
+/// changed anything. The snapshot starts from a copy of the checkout's index,
+/// so tracked files that match an ignore rule are still compared, and the
+/// checkout's own index is never written. The copy and the lock Git takes while
+/// it writes are removed afterwards.
+pub async fn checkout_snapshot(working_dir: &str) -> Result<CheckoutSnapshot, String> {
     let git_dir = git(working_dir, &["rev-parse", "--absolute-git-dir"])
         .await
         .map_err(|e| format!("could not locate the checkout's Git directory: {e}"))?;
     let index = Path::new(&git_dir).join("slashit-content-snapshot.index");
+    let lock = Path::new(&git_dir).join("slashit-content-snapshot.index.lock");
+    let real_index = git(working_dir, &["rev-parse", "--git-path", "index"])
+        .await
+        .map_err(|e| format!("could not locate the checkout's index: {e}"))?;
+    let real_index = Path::new(working_dir).join(real_index);
     let _ = std::fs::remove_file(&index);
+    let _ = std::fs::remove_file(&lock);
+    if real_index.exists() {
+        std::fs::copy(&real_index, &index)
+            .map_err(|e| format!("could not copy the checkout's index: {e}"))?;
+    }
     let result = async {
         git_with_index(working_dir, &index, &["add", "-A"]).await?;
-        git_with_index(working_dir, &index, &["write-tree"]).await
+        let content = git_with_index(working_dir, &index, &["write-tree"]).await?;
+        let head = git(working_dir, &["rev-parse", "HEAD^{tree}"]).await?;
+        Ok(CheckoutSnapshot {
+            clean: content == head,
+            content,
+        })
     }
     .await;
     let _ = std::fs::remove_file(&index);
+    let _ = std::fs::remove_file(&lock);
     result
 }
 
