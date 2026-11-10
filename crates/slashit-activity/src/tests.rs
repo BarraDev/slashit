@@ -814,3 +814,45 @@ fn a_discarded_unconfirmed_request_is_the_persons_decision_and_claims_no_proof()
     assert!(detail.contains("not confirmed by GitHub"), "{detail}");
     assert!(!detail.contains(&"c".repeat(13)), "only a short commit is shown: {detail}");
 }
+
+/// Pins the open #220 gap, so it stays visible. Tool rows are dropped first,
+/// but once the milestones alone exceed the cap, the oldest of them go: here
+/// the recovery record of run 1, then run 1's start. Until the retention rule
+/// is decided and implemented this fails by design; run it with `--ignored`.
+#[test]
+#[ignore = "pins #220: the cap evicts the oldest milestones once tool rows are gone"]
+fn milestones_outlive_the_cap_once_tool_rows_are_gone() {
+    let mut entries = Vec::new();
+    let recovery = Kind::RecoveryRequired {
+        run: Some(1),
+        reason: "inspect the checkout".into(),
+    };
+    record(&mut entries, t(0), recovery);
+    for run in 1..=100 {
+        let start = Kind::RunStarted {
+            run,
+            addressing_feedback: false,
+        };
+        record(&mut entries, t(0), start);
+        record(&mut entries, t(0), Kind::RunCompleted { run });
+        let result = RunResult::Unavailable {
+            reason: "no final answer".into(),
+        };
+        record(&mut entries, t(0), Kind::RunResult { run, result });
+    }
+    assert_eq!(entries.len(), MAX_ENTRIES);
+    let first_start = Kind::RunStarted {
+        run: 1,
+        addressing_feedback: false,
+    };
+    assert!(
+        entries
+            .iter()
+            .any(|e| matches!(e.kind, Kind::RecoveryRequired { run: Some(1), .. })),
+        "the recovery record of run 1 was evicted"
+    );
+    assert!(
+        entries.iter().any(|e| e.kind == first_start),
+        "the start of run 1 was evicted, so its outcome has no number left"
+    );
+}
