@@ -692,6 +692,44 @@ pub(crate) fn acquire_task_provider_lease(
         })
 }
 
+/// Clears the review-fix record this run wrote once the checkout is resolved:
+/// the fix was applied, or the checkout is back at its baseline. Otherwise the
+/// record stays and refuses Worker commits until a Human decides. Callers
+/// clear only a record they wrote.
+async fn settle_review_fix_record(
+    working_dir: &str,
+    baseline: Option<&str>,
+    applied: bool,
+    events: &SharedEventSink,
+    (task_id, run_id): (Uuid, Uuid),
+) {
+    // Seals what the run left, so a later edit by anyone is never attributed to
+    // it. A failed seal leaves the record unsealed, which is still refused.
+    if let Err(e) = crate::queue::review_fix_record::seal(working_dir, task_id, run_id).await {
+        events.agent_event(AgentEvent::Log {
+            task_id: task_id.to_string(),
+            level: LogLevel::Error,
+            message: format!("{e}. The Task's commits stay refused until a Human decides."),
+        });
+    }
+    let now = crate::worktree::checkout_snapshot(working_dir).await;
+    let resolved = applied
+        || match (baseline, now) {
+            (Some(baseline), Ok(now)) => now.content == baseline,
+            _ => false,
+        };
+    if !resolved {
+        return;
+    }
+    if let Err(e) = crate::queue::review_fix_record::clear(working_dir, task_id, run_id).await {
+        events.agent_event(AgentEvent::Log {
+            task_id: task_id.to_string(),
+            level: LogLevel::Error,
+            message: format!("{e}. The Task's commits stay refused until a Human decides."),
+        });
+    }
+}
+
 /// The outcome of a fix-agent run. Only a successful run applied fixes: one
 /// that exited non-zero or reported an error failed, like one that never
 /// started.
@@ -7756,19 +7794,36 @@ impl TaskExecutor {
                 // before the lease is taken.
                 // The checkout's content before the fix agent runs. A fix is
                 // credited only with content it changed from this state.
-                let fix_before = crate::worktree::checkout_snapshot(&working_dir).await;
-                let fix_run = match fix_launch
+                // The lease comes before the snapshot and the record: a snapshot
+                // taken before it could miss the holder's edits, and a refused
+                // lease must leave no record behind for a fix that never ran.
+                let fix_leased = fix_launch
                     .map_err(LaunchError::before_spawn)
                     .and_then(|launch| {
                         acquire_task_provider_lease(&storage, task_id)
                             .map(|lease| (launch, lease))
                             .map_err(LaunchError::before_spawn)
-                    })
-                    .and_then(|launched| match &fix_before {
+                    });
+                let fix_before = crate::worktree::checkout_snapshot(&working_dir).await;
+                // The record that lets a restart or a later Worker see an
+                // unresolved fix. Written before anything can edit; if it
+                // cannot be written, the fix does not start.
+                let fix_record = match (&fix_leased, &fix_before) {
+                    (Err(_), _) => Err("The fix agent was not started.".to_string()),
+                    (Ok(_), Ok(before)) => crate::queue::review_fix_record::begin(&working_dir, task_id, &before.content)
+                        .await
+                        .map_err(|e| {
+                            format!("The fix agent was not started: its review-fix record could not be written: {e}")
+                        }),
+                    (Ok(_), Err(e)) => Err(format!(
+                        "The checkout could not be read before the fix agent ran, so the fix was not started: {e}"
+                    )),
+                };
+                // Only a record this run wrote may be cleared below.
+                let fix_run_id = fix_record.as_ref().ok().copied();
+                let fix_run = match fix_leased.and_then(|launched| match &fix_record {
                         Ok(_) => Ok(launched),
-                        Err(e) => Err(LaunchError::before_spawn(format!(
-                            "The checkout could not be read before the fix agent ran, so the fix was not started: {e}"
-                        ))),
+                        Err(message) => Err(LaunchError::before_spawn(message.clone())),
                     }) {
                     Err(error) => Err(error),
                     Ok(((fix_provider, fix_model), fix_lease)) => {
@@ -7850,6 +7905,16 @@ impl TaskExecutor {
                         // A stop that arrived while the fix agent finished
                         // owns the checkout now: commit nothing into it.
                         if *cancelled.borrow() {
+                            if let Some(run_id) = fix_run_id {
+                                settle_review_fix_record(
+                                    &working_dir,
+                                    fix_before.as_ref().ok().map(|s| s.content.as_str()),
+                                    false,
+                                    &events,
+                                    (task_id, run_id),
+                                )
+                                .await;
+                            }
                             reviewing_handles.write().await.remove(&task_id);
                             return;
                         }
@@ -7966,7 +8031,18 @@ impl TaskExecutor {
                     FixOutcome::Cancelled => {
                         // Cancelled during the fix agent's run: it has
                         // already been killed by `run_cancellable_agent`.
-                        // Nothing durable is recorded on this path either.
+                        // Its record stays unless the checkout is back at its
+                        // baseline, so a cancelled fix's edits are not swept in.
+                        if let Some(run_id) = fix_run_id {
+                            settle_review_fix_record(
+                                &working_dir,
+                                fix_before.as_ref().ok().map(|s| s.content.as_str()),
+                                false,
+                                &events,
+                                (task_id, run_id),
+                            )
+                            .await;
+                        }
                         reviewing_handles.write().await.remove(&task_id);
                         return;
                     }
@@ -7981,6 +8057,16 @@ impl TaskExecutor {
                         Some(reason)
                     }
                 };
+                if let Some(run_id) = fix_run_id {
+                    settle_review_fix_record(
+                        &working_dir,
+                        fix_before.as_ref().ok().map(|s| s.content.as_str()),
+                        fix_failure.is_none(),
+                        &events,
+                        (task_id, run_id),
+                    )
+                    .await;
+                }
 
                 if *cancelled.borrow() {
                     reviewing_handles.write().await.remove(&task_id);
@@ -8458,6 +8544,18 @@ impl TaskExecutor {
                 .map(|t| (t.title.clone(), t.branch_name.clone()))
                 .unwrap_or_default()
         };
+        // An unresolved AI Review fix may have left edits here; committing
+        // now would make them part of this Task's work.
+        match crate::queue::review_fix_record::pending(working_dir).await {
+            Ok(None) => {}
+            Ok(Some(_)) => return Err(crate::queue::review_fix_record::UNRESOLVED_REFUSAL.to_string()),
+            Err(e) => {
+                return Err(format!(
+                    "{} ({e})",
+                    crate::queue::review_fix_record::UNRESOLVED_REFUSAL
+                ))
+            }
+        }
         let committed = match &branch {
             Some(branch) => {
                 crate::worktree::commit_checkout(working_dir, branch, &format!("task: {title}"))
@@ -19319,6 +19417,166 @@ VERDICT: APPROVED"
                     git_output(path, &["status", "--porcelain"]),
                     "?? review-fix.txt"
                 );
+            }
+
+            /// Reproduction: the Worker's next commit must not sweep in the
+            /// leftover edit of a fix that failed after it began editing.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_worker_commit_after_a_failed_fix_does_not_commit_its_partial_edit() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_scripted_fixer("printf 'partial\\n' > review-fix.txt", 1);
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path().to_str().unwrap().to_string();
+                let _ = review_in(&mock, &path, &base_commit).await;
+                let mut task =
+                    create_test_task_full("sweep", Uuid::new_v4(), TaskStatus::InProgress, 0);
+                task.branch_name = Some(git_output(
+                    repo.path(),
+                    &["rev-parse", "--abbrev-ref", "HEAD"],
+                ));
+                let task_id = task.id;
+                let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+                let result = TaskExecutor::commit_changes(
+                    &tasks,
+                    task_id,
+                    &path,
+                    &crate::events::null_sink(),
+                )
+                .await;
+                assert!(result.is_err(), "a Worker commit swept in a failed fix's edit: {result:?}");
+                assert!(
+                    !git_output(repo.path(), &["log", "--format=", "--name-only"])
+                        .contains("review-fix.txt"),
+                    "review-fix.txt was committed"
+                );
+            }
+
+            /// A failed fix that changed nothing leaves no record behind.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_fix_that_changed_nothing_leaves_no_review_fix_record() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_scripted_fixer("true", 1);
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path().to_str().unwrap().to_string();
+                let _ = review_in(&mock, &path, &base_commit).await;
+                assert_eq!(
+                    crate::queue::review_fix_record::pending(&path).await.unwrap(),
+                    None
+                );
+            }
+
+            /// A failed fix that edited the checkout keeps its record until a
+            /// Human decides.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_fix_after_a_partial_edit_keeps_its_review_fix_record() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_scripted_fixer("printf 'partial\\n' > review-fix.txt", 1);
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path().to_str().unwrap().to_string();
+                let _ = review_in(&mock, &path, &base_commit).await;
+                assert!(crate::queue::review_fix_record::pending(&path)
+                    .await
+                    .unwrap()
+                    .is_some());
+            }
+
+            /// An applied fix clears its record, and its edit is committed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_applied_fix_clears_its_review_fix_record() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock =
+                    MockReviewer::install_scripted_fixer("printf 'fixed\\n' > review-fix.txt", 0);
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path().to_str().unwrap().to_string();
+                let _ = review_in(&mock, &path, &base_commit).await;
+                assert_eq!(
+                    crate::queue::review_fix_record::pending(&path).await.unwrap(),
+                    None
+                );
+                assert!(git_output(repo.path(), &["log", "--format=", "--name-only"])
+                    .contains("review-fix.txt"));
+            }
+
+            /// Interruption before the fix settles: the record and the edit are
+            /// on disk and nothing else runs. A commit attempt made afresh, as
+            /// after a restart, is refused and commits nothing.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_interrupted_fix_refuses_worker_commits_after_restart() {
+                let (repo, _base_commit) = git_repo_with_worker_commit();
+                let path = repo.path().to_str().unwrap().to_string();
+                let mut task =
+                    create_test_task_full("sweep", Uuid::new_v4(), TaskStatus::InProgress, 0);
+                task.branch_name = Some(git_output(
+                    repo.path(),
+                    &["rev-parse", "--abbrev-ref", "HEAD"],
+                ));
+                let task_id = task.id;
+                let baseline = crate::worktree::checkout_snapshot(&path)
+                    .await
+                    .unwrap()
+                    .content;
+                crate::queue::review_fix_record::begin(&path, task_id, &baseline)
+                    .await
+                    .unwrap();
+                std::fs::write(repo.path().join("review-fix.txt"), "partial\n").unwrap();
+                let tip = git_output(repo.path(), &["rev-parse", "HEAD"]);
+                let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+                let result = TaskExecutor::commit_changes(
+                    &tasks,
+                    task_id,
+                    &path,
+                    &crate::events::null_sink(),
+                )
+                .await;
+                assert!(result.is_err(), "{result:?}");
+                assert_eq!(git_output(repo.path(), &["rev-parse", "HEAD"]), tip);
+                assert!(git_output(repo.path(), &["status", "--porcelain"])
+                    .contains("review-fix.txt"));
+            }
+
+            /// The fix agent edits the checkout and then kills itself with SIGKILL
+            /// (`$$` is the agent process). It is the real fix flow: the record
+            /// written before the agent started survives the death of its owner
+            /// and refuses the Worker commit.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_agent_killed_mid_edit_leaves_its_record_and_refuses_commits() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_scripted_fixer(
+                    "printf 'partial\\n' > review-fix.txt\nkill -9 $$",
+                    1,
+                );
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path().to_str().unwrap().to_string();
+                let _ = review_in(&mock, &path, &base_commit).await;
+                assert!(
+                    crate::queue::review_fix_record::pending(&path)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "the record did not outlive the killed fix agent"
+                );
+                assert!(repo.path().join("review-fix.txt").exists());
+                let mut task =
+                    create_test_task_full("sweep", Uuid::new_v4(), TaskStatus::InProgress, 0);
+                task.branch_name = Some(git_output(
+                    repo.path(),
+                    &["rev-parse", "--abbrev-ref", "HEAD"],
+                ));
+                let task_id = task.id;
+                let tip = git_output(repo.path(), &["rev-parse", "HEAD"]);
+                let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+                let result = TaskExecutor::commit_changes(
+                    &tasks,
+                    task_id,
+                    &path,
+                    &crate::events::null_sink(),
+                )
+                .await;
+                assert!(result.is_err(), "{result:?}");
+                assert_eq!(git_output(repo.path(), &["rev-parse", "HEAD"]), tip);
             }
 
             #[tokio::test(flavor = "multi_thread")]

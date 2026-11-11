@@ -2193,9 +2193,15 @@ pub async fn address_pr_review_inner(
                 "task: {} (PR review fixes: {} of {})",
                 task.title, uncommitted.len(), total,
             );
-            let committed = match &task.branch_name {
-                Some(branch) => crate::worktree::commit_checkout(&working_dir, branch, &message).await,
-                None => Err("this task records no branch".to_string()),
+            // The same refusal as a Worker commit: an unresolved AI Review fix
+            // may have left edits in this checkout.
+            let committed = match crate::queue::review_fix_record::pending(&working_dir).await {
+                Ok(None) => match &task.branch_name {
+                    Some(branch) => crate::worktree::commit_checkout(&working_dir, branch, &message).await,
+                    None => Err("this task records no branch".to_string()),
+                },
+                Ok(Some(_)) => Err(crate::queue::review_fix_record::UNRESOLVED_REFUSAL.to_string()),
+                Err(e) => Err(format!("{} ({e})", crate::queue::review_fix_record::UNRESOLVED_REFUSAL)),
             };
             let failure = match committed {
                 // Every fix owed a commit is in this one: the edits of each

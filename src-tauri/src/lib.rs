@@ -522,6 +522,8 @@ pub fn run() {
             discard_local_integration,
             create_approved_task_pr,
             request_task_changes,
+            preview_review_fix,
+            resolve_review_fix,
             get_attention_summary,
             get_storage_usage,
             refresh_storage_usage,

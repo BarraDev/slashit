@@ -298,7 +298,53 @@ repository that is not colocated with Git cannot get a Task Checkout (see
 ## Failed review-fix runs
 
 This section states the owner's policy and the requirements for its mechanism.
-The mechanism is not implemented.
+The mechanism is implemented for the Worker commit and the PR review-fix commit
+(`src-tauri/src/queue/review_fix_record.rs`): a record in the checkout's Git
+directory, written before the fix agent runs, that refuses those commits while it
+is unresolved. The record names its Task and the run that wrote it, and only that
+run clears it. The record also holds a fingerprint of every uncommitted path before
+the fix ran, the HEAD it started from, and, once the run settles, a sealed fingerprint
+of every uncommitted path as the run left it. The fix's paths are those it changed
+before the seal. A path edited after the seal is never attributed to the fix. If the
+run never settled (for example, SlashIt was killed), every path that changed since the
+fix started is attributed, and the preview shows it.
+
+A Human decides in two steps. `preview_review_fix` lists the paths the fix changed,
+the unrelated uncommitted paths left alone, and a digest of that exact state.
+`resolve_review_fix` takes a decision and that digest, and is refused if the
+checkout has changed since the preview. The decisions are:
+
+- `keep` removes the record and changes nothing else. The edits stay uncommitted in
+  the checkout; the next commit SlashIt makes for the Task includes them. Keeping
+  approves, commits and completes nothing.
+- `archive` stashes exactly the fix's paths (`git stash push -- <paths>`), then
+  removes the record. The stash list is shared by every worktree of the repository, so
+  find the entry by its message ("SlashIt: archived AI Review fix edits") and restore
+  it with `git stash pop stash@{n}`.
+- `discard` stashes exactly the fix's paths first (the same stash as `archive`, so the
+  edits stay recoverable from the stash list), restores or removes them, then removes the
+  record. A path the fix deleted cannot be stashed, so discard writes it back from HEAD
+  only while it is still absent; a file that appeared there since the preview is refused,
+  never replaced. A path the fix created and deleted is left as it is.
+
+A path that was uncommitted before the fix and that the fix changed or removed is
+blocked, and so is one that is now clean, since the fix may have reverted it or
+the user may have committed it. Such a path is blocked:
+archive and discard refuse while any remain, and name them. Unrelated edits are not
+touched. Archive and discard also refuse when the fix moved HEAD, because a commit the
+fix made is outside their scope. If a discard or archive fails part way, the paths
+already handled stay handled and the record stays. A retry needs a fresh preview,
+because the checkout no longer matches the old digest; the new preview lists only
+the paths still attributed to the fix. Archive refuses a path that is deleted in the
+worktree, since git cannot stash a deletion; discard handles it. Ignored files are
+never listed or touched by either decision, so ignored output the fix created stays
+where it is. Both decisions are refused while an agent runs for the Task. There is
+no UI for the commands yet.
+
+Git worktree removal does not protect ignored output: `git worktree remove`
+refuses a checkout with modified or untracked files, so such a record is kept
+with its edits, but a checkout whose only edits are ignored files is removed
+together with its record (the record lives in the worktree's Git admin directory).
 
 A review-fix run can fail after it has edited files in the Task Checkout. Such a
 partial checkout is preserved and never discarded silently. It is never silently
@@ -308,8 +354,10 @@ is a separate, authorized operation that states what would be lost. Automatic
 cleanup is not an acceptable shortcut.
 
 Current behavior: `commit_changes` in `src-tauri/src/queue/executor.rs` runs after
-every Worker run and commits everything uncommitted in the checkout. It does not
-yet honor this policy.
+every Worker run and commits everything uncommitted in the checkout. It refuses
+while a review-fix record is unresolved. A process killed mid-fix leaves the record
+in place; an older build ignores it and commits as before, so a downgrade does not
+restore the protection.
 
 Requirements for the mechanism:
 
