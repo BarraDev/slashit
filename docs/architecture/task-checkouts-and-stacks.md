@@ -297,40 +297,37 @@ repository that is not colocated with Git cannot get a Task Checkout (see
 
 ## Failed review-fix runs
 
-This section states the owner's policy and the requirements for its mechanism.
-The mechanism is not implemented.
+A review-fix run can fail after it has edited files in the Task Checkout. The
+partial edits stay in the checkout: nothing discards, stashes or reverts them,
+and the Task moves to Human Review with the failure recorded. There is no
+separate keep, archive or discard step and no persisted marker. The uncertainty
+is carried by existing state: the checkout itself, the provider lease, the
+Worker handoff and the Activity record.
 
-A review-fix run can fail after it has edited files in the Task Checkout. Such a
-partial checkout is preserved and never discarded silently. It is never silently
-incorporated into a later Worker commit or review-fix commit. The uncertain state
-is explicit, and a human decides before the affected work continues. Any discard
-is a separate, authorized operation that states what would be lost. Automatic
-cleanup is not an acceptable shortcut.
+Continuation:
 
-Current behavior: `commit_changes` in `src-tauri/src/queue/executor.rs` runs after
-every Worker run and commits everything uncommitted in the checkout. It does not
-yet honor this policy.
+- A provider that is gone is proven gone by the provider lease, not assumed.
+  A start that cannot prove it is refused (Queue) or left pending, as before.
+  Where no lease exists (Windows), no absence is claimed and the existing
+  refusal or uncertainty handling applies.
+- After the Human requests changes, the next Worker run starts in the same
+  checkout. This needs no further decision. It does not approve, publish or
+  integrate anything, and it does not schedule itself: automatic successors,
+  retry budgets and routing are not implemented.
+- `commit_changes` still commits the whole checkout after a Worker run. The
+  successor's prompt says so, and says that the checkout already held
+  uncommitted edits when the run started, naming up to 50 of their paths. It
+  does not say who made them, because that is not recorded. The note is added
+  to the launch prompt only, after the prompts the approval digests are
+  computed from, so it never changes an approval.
 
-Requirements for the mechanism:
+Known limits:
 
-- Durable evidence before the fix starts. Before a review-fix agent runs, SlashIt
-  persists a record that identifies the Task Checkout and its baseline tree and
-  marks the fix as in progress. The record must survive an interruption (process
-  exit or restart) that happens before the post-fix comparison.
-- Recovery. A Task whose fix record shows a started fix without a completion
-  record is treated as holding possibly partial edits, after a restart or at the
-  next AI Review. It refuses further commits until a human chooses to keep the
-  edits for review or to discard them.
-- Post-fix comparison. A failed run whose checkout tree differs from the baseline
-  is treated the same way.
-- Reproduction first. A synthetic reproduction through `commit_changes` with a
-  leftover edit, including an interruption before the post-fix comparison and
-  recovery after restart, must exist before the mechanism lands.
-- Schema changes need analysis first. If the evidence is stored as a new persisted
-  Task field, the change must state, before it is introduced: schema compatibility
-  with existing records (a serde default for old records); downgrade behavior,
-  since the board schema refuses unknown fields and an older build refuses the
-  whole Project board (see [run-diagnostics.md](run-diagnostics.md)); the backup
-  taken before the first write; and the rollback path to the previous build. A
-  storage location that older builds can read is an acceptable alternative if it
-  meets the same requirements.
+- The note describes the checkout when the run starts. It does not follow edits
+  made while the run is going, and the 10 second bound covers the start, not the
+  Git process behind it.
+- Windows has no provider lease, so nothing there claims the absence of an
+  earlier provider process.
+- No successor is scheduled automatically: a successor run is the controlled
+  continuation after a Human requests changes, and retry budgets and routing are
+  not implemented.

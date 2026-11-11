@@ -5017,6 +5017,22 @@ impl TaskExecutor {
                     .into_inner()
                     .unwrap_or_else(|p| p.into_inner())
                     .expect("a recorded start always captured its launch input");
+                // The checkout as the provider is about to see it. Read after
+                // the start is recorded and outside the digested prompt, so no
+                // approval digest changes; a failed read is said, not hidden.
+                // Bounded: the lease is held and the run is not registered
+                // yet, so a stalled Git must not leave the start hanging. A
+                // timeout is a failed read, and says so in the note.
+                let edits = match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    crate::worktree::integration::uncommitted_paths(&acquired.info.path),
+                )
+                .await
+                {
+                    Ok(edits) => edits,
+                    Err(_) => Err("reading the checkout's status timed out".to_string()),
+                };
+                let prompt = crate::queue::prompt::with_preexisting_edits(prompt, edits);
                 Ok(RunStart {
                     working_dir: acquired.info.path,
                     run: run.load(std::sync::atomic::Ordering::Relaxed),
@@ -22772,6 +22788,37 @@ VERDICT: APPROVED"
             let start = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired.expect("checkout")).await.expect("start");
             w.executor.tasks.write().await.get_mut(&w.task_id).unwrap().description = Some("prompt B".into());
             assert!(start.prompt.contains("prompt A") && !start.prompt.contains("prompt B"));
+        }
+
+        /// A successor's checkout that already holds uncommitted edits is
+        /// said so in the prompt the provider gets, naming the path and not its
+        /// author, and a clean checkout gets no such note. Starting is not
+        /// refused either way: the start is the existing one, and its
+        /// approval, lease and branch checks are unchanged.
+        #[tokio::test]
+        async fn a_start_over_uncommitted_edits_tells_the_provider_without_naming_an_author() {
+            let w = world(Class::Created).await;
+            approve_current_input(&w, 1).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            std::fs::write(std::path::Path::new(&acquired.info.path).join("left-by-someone.txt"), "x").unwrap();
+
+            let start = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await.expect("start");
+
+            assert!(start.prompt.contains(crate::queue::prompt::PREEXISTING_EDITS_HEADING), "{}", start.prompt);
+            assert!(start.prompt.contains("`left-by-someone.txt`"));
+            assert!(start.prompt.contains("author is not recorded"));
+            assert_eq!(run_starts(&w.in_memory().await), 1, "the run started as usual");
+            assert!(std::path::Path::new(&start.working_dir).join("left-by-someone.txt").exists(), "the edit is untouched");
+        }
+
+        #[tokio::test]
+        async fn a_start_over_a_clean_checkout_adds_no_note() {
+            let w = world(Class::Created).await;
+            approve_current_input(&w, 1).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let start = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired.expect("checkout")).await.expect("start");
+            assert!(!start.prompt.contains(crate::queue::prompt::PREEXISTING_EDITS_HEADING), "{}", start.prompt);
         }
 
         #[tokio::test]
