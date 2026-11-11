@@ -1813,6 +1813,118 @@ fn short_oid(oid: &str) -> &str {
     oid.get(..7).unwrap_or(oid)
 }
 
+/// An approved Fix whose edits sit in the checkout, in the commit or not.
+fn approved_fix(i: &PrReviewItem) -> bool {
+    i.approved && matches!(i.decision, PrReviewDecision::Fix) && i.fix_done && i.fix_uncommitted
+}
+
+/// An approved Fix whose recorded edits no commit holds yet.
+fn owes_a_commit(i: &PrReviewItem) -> bool {
+    approved_fix(i) && i.fix_commit.is_none() && i.fix_effect.is_some()
+}
+
+/// The paths that differ between two trees, read from Git.
+async fn tree_paths(working_dir: &str, from: &str, to: &str) -> Result<Vec<String>, String> {
+    let listed = run_cmd(
+        "git",
+        &["diff-tree", "-r", "--no-renames", "--name-only", "-z", from, to],
+        working_dir,
+    )
+    .await?;
+    Ok(null_paths(&listed))
+}
+
+/// The blob a tree holds at `path`, or `None` when the tree has no such file.
+async fn blob_at(working_dir: &str, tree: &str, path: &str) -> Result<Option<String>, String> {
+    let listed = run_cmd("git", &["ls-tree", "-z", tree, "--", path], working_dir).await?;
+    // One `<mode> SP <type> SP <oid> TAB <path>` record, or nothing.
+    Ok(listed
+        .split('\0')
+        .find(|record| !record.is_empty())
+        .and_then(|record| record.split_once('\t'))
+        .and_then(|(meta, _)| meta.split(' ').nth(2))
+        .map(str::to_string))
+}
+
+/// Refuses to edit or commit over uncommitted edits to paths that no fix of
+/// this plan touched. Committing takes the whole checkout, so such edits would
+/// be published with the fixes by Auto-push, under an approval that never saw
+/// them. `snapshot` is the checkout's tree as the caller read it at the moment
+/// it is about to act, so an earlier check does not stand in for a later one.
+///
+/// Limits: a writer that changes a fix's path to exactly the content the fix
+/// left is indistinguishable from the fix, and a writer that changes the
+/// checkout while a fix agent runs is not told apart from the agent, whose
+/// effect is the whole difference around its run. An edit made between this
+/// check and the commit's own staging is still committed, since the commit
+/// contract takes the live checkout.
+///
+/// A clean checkout passes, and so does one whose every changed path holds
+/// what a pending fix found or left there. A matching analysis fingerprint is
+/// not enough, since it binds the checkout as it was, dirt included.
+///
+/// A path a fix changed is accepted only with the content that fix found or
+/// left, so an edit to such a path made by someone else is refused too.
+async fn ensure_dirt_is_plan_owned(
+    plan: &PrReviewPlan,
+    working_dir: &str,
+    snapshot: Result<String, String>,
+) -> Result<(), String> {
+    let unreadable = |e: String| {
+        format!(
+            "The task checkout's uncommitted edits could not be read ({e}), so it cannot be \
+             shown that applying these fixes would not also commit someone else's edits."
+        )
+    };
+    let snapshot = snapshot.map_err(unreadable)?;
+    let clean_tree = run_cmd("git", &["rev-parse", "HEAD^{tree}"], working_dir)
+        .await
+        .map_err(unreadable)?;
+    let dirty = tree_paths(working_dir, &clean_tree, &snapshot).await.map_err(unreadable)?;
+    // For each path a pending fix changed, the blobs it may hold: what the fix
+    // found there and what it left. A person who discarded a fix's edit leaves
+    // the first; the plan's own edit is the second. Any other content is an
+    // edit no fix made, even in a file a fix also touched.
+    let mut allowed: std::collections::HashMap<String, Vec<Option<String>>> =
+        std::collections::HashMap::new();
+    if !dirty.is_empty() {
+        for effect in plan.items.iter().filter(|i| owes_a_commit(i)).filter_map(|i| i.fix_effect.as_ref()) {
+            for path in tree_paths(working_dir, &effect.before_tree, &effect.after_tree)
+                .await
+                .map_err(unreadable)?
+            {
+                for tree in [&effect.before_tree, &effect.after_tree] {
+                    let blob = blob_at(working_dir, tree, &path).await.map_err(unreadable)?;
+                    let blobs = allowed.entry(path.clone()).or_default();
+                    if !blobs.contains(&blob) {
+                        blobs.push(blob);
+                    }
+                }
+            }
+        }
+    }
+    for path in &dirty {
+        let Some(blobs) = allowed.get(path) else {
+            return Err(unowned_edits_refusal());
+        };
+        let current = blob_at(working_dir, &snapshot, path).await.map_err(unreadable)?;
+        if !blobs.contains(&current) {
+            return Err(unowned_edits_refusal());
+        }
+    }
+    Ok(())
+}
+
+/// Why an apply refuses: edits in the checkout that no fix of the plan made,
+/// with what is and is not known to have happened.
+fn unowned_edits_refusal() -> String {
+    "The task checkout holds uncommitted edits that none of this plan's fixes made, so \
+     committing it would publish them with the fixes. Nothing was committed or pushed, and \
+     SlashIt did not change or revert any file. Commit, stash or discard those edits yourself, \
+     then analyze the PR comments again and apply again."
+        .to_string()
+}
+
 /// Core logic of `address_pr_review` extracted for testability. Owns no
 /// `AppState`; the caller is responsible for fetching the `Task` + working
 /// directory, acquiring the [`crate::queue::PrHelperLease`] this whole
@@ -1890,6 +2002,19 @@ pub async fn address_pr_review_inner(
         }
     }
 
+    // Refused before any fix agent runs or commit is made, when this apply
+    // could do either over edits the plan does not own.
+    if !options.dry_run
+        && approved_indices
+            .iter()
+            .any(|&idx| !updated_plan.items[idx].fix_done || owes_a_commit(&updated_plan.items[idx]))
+    {
+        let snapshot = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
+        ensure_dirt_is_plan_owned(&updated_plan, &working_dir, snapshot)
+            .await
+            .map_err(|e| format!("{e} Nothing was changed."))?;
+    }
+
     let mut per_item_summaries: Vec<String> = Vec::with_capacity(total);
     let mut fixed_ids: Vec<u64> = Vec::new();
     let mut failed_ids: Vec<u64> = Vec::new();
@@ -1898,6 +2023,10 @@ pub async fn address_pr_review_inner(
     // id. A failed agent may have edited any file in the checkout before it
     // failed, so this apply then commits none of its fixes: see below.
     let mut a_fix_failed = false;
+    // An edit no fix made was found between fixes. Every later fix is refused
+    // too: a failed agent's own leftovers switch the check off below, a
+    // foreign edit must not.
+    let mut dirt_refused = false;
     let mut replies_posted = 0u32;
     let mut reply_errors: Vec<String> = Vec::new();
 
@@ -1998,13 +2127,33 @@ pub async fn address_pr_review_inner(
             // The apply helper edits the checkout, so each run takes the Task's lease
             // first. A provider still holding it refuses this item, which then fails
             // like any other helper that did not start.
-            let outcome = match crate::agents::provider_lease::acquire_proven(&provider_lease_path) {
-                Ok(lease) => {
-                    run_claude_pr_helper(prompt, working_dir.clone(), true, cancel_rx.clone(), lease).await
-                }
-                Err(error) => Err(format!(
-                    "The Task's provider lease could not be taken; nothing was launched: {error}"
-                )),
+            // The checkout is read again here, from the same snapshot the
+            // effect starts from: an edit made since the checks above is not
+            // the plan's, and no agent runs over it.
+            // After a fix agent failed in this apply, its partial edits are in
+            // the checkout and nothing is committed or pushed by this apply
+            // (`withheld` below), so the remaining items still run as before.
+            let launch = if dirt_refused {
+                Err("An earlier check refused this checkout's uncommitted edits, so no fix agent was launched.".to_string())
+            } else if a_fix_failed {
+                Ok(())
+            } else {
+                let checked = ensure_dirt_is_plan_owned(&updated_plan, &working_dir, before.clone())
+                    .await
+                    .map_err(|e| format!("{e} No fix agent was launched. Fixes applied earlier in this run were not committed and remain in the checkout."));
+                dirt_refused = checked.is_err();
+                checked
+            };
+            let outcome = match launch {
+                Err(error) => Err(error),
+                Ok(()) => match crate::agents::provider_lease::acquire_proven(&provider_lease_path) {
+                    Ok(lease) => {
+                        run_claude_pr_helper(prompt, working_dir.clone(), true, cancel_rx.clone(), lease).await
+                    }
+                    Err(error) => Err(format!(
+                        "The Task's provider lease could not be taken; nothing was launched: {error}"
+                    )),
+                },
             };
             if outcome.is_ok() {
                 let after = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
@@ -2124,11 +2273,8 @@ pub async fn address_pr_review_inner(
     if !options.dry_run && !cancelled {
         settle_delivery(&working_dir, &task, &mut updated_plan).await;
     }
-    let approved_fix = |i: &PrReviewItem| {
-        i.approved && matches!(i.decision, PrReviewDecision::Fix) && i.fix_done && i.fix_uncommitted
-    };
     let owed_a_commit: Vec<usize> = updated_plan.items.iter().enumerate()
-        .filter(|(_, i)| approved_fix(i) && i.fix_commit.is_none() && i.fix_effect.is_some())
+        .filter(|(_, i)| owes_a_commit(i))
         .map(|(idx, _)| idx)
         .collect();
     let owed_a_push = |plan: &PrReviewPlan| -> Vec<usize> {
@@ -2159,10 +2305,11 @@ pub async fn address_pr_review_inner(
             ""
         };
         let error = format!(
-            "a review fix failed and may have left partial edits in the task checkout, so the \
-             fixes that succeeded were not committed or pushed with them.{also_cancelled} Review \
-             the checkout and remove only what the failed fix left: the successful fixes are not \
-             made again, so their edits must stay. Then {apply_again}.{unpushed_replies_note}"
+            "a review fix failed, so the fixes that succeeded in this run were not committed or \
+             pushed.{also_cancelled} Their edits remain uncommitted in the checkout, and the failed \
+             fix may have left partial edits there too. SlashIt did not revert or clean up any \
+             file. Check the checkout, remove only the partial edits of the failed fix, keep the \
+             successful fixes' edits, then {apply_again}.{unpushed_replies_note}"
         );
         progress(PrReviewProgress {
             task_id: task_id_str.clone(),
@@ -2193,9 +2340,15 @@ pub async fn address_pr_review_inner(
                 "task: {} (PR review fixes: {} of {})",
                 task.title, uncommitted.len(), total,
             );
-            let committed = match &task.branch_name {
-                Some(branch) => crate::worktree::commit_checkout(&working_dir, branch, &message).await,
-                None => Err("this task records no branch".to_string()),
+            // Read again now: anything that is not the plan's own since the
+            // checks above is not committed.
+            let snapshot = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
+            let committed = match ensure_dirt_is_plan_owned(&updated_plan, &working_dir, snapshot).await {
+                Err(e) => Err(e),
+                Ok(()) => match &task.branch_name {
+                    Some(branch) => crate::worktree::commit_checkout(&working_dir, branch, &message).await,
+                    None => Err("this task records no branch".to_string()),
+                },
             };
             let failure = match committed {
                 // Every fix owed a commit is in this one: the edits of each
@@ -18222,6 +18375,9 @@ mod tests {
                 let executor = attach_test_executor(&state);
                 let state = Arc::new(state);
                 let workdir = tempfile::tempdir().expect("workdir");
+                // A checkout the apply can read: it refuses one it cannot.
+                git(workdir.path(), &["init", "-q"]);
+                git(workdir.path(), &["-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-q", "--allow-empty", "-m", "base"]);
                 let task_id =
                     seed_task(&state, "/tmp/unused-repo-for-this-test", Some("task-branch"), TaskStatus::InProgress)
                         .await;
@@ -18722,6 +18878,10 @@ mod tests {
                 let _guard = PATH_LOCK.lock().await;
                 let repo = RepoFixture::new();
                 repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+                // The apply refuses edits no fix made, and this test is about
+                // cancellation, so its checkout starts clean.
+                git(&repo.checkout, &["reset", "-q", "--hard"]);
+                git(&repo.checkout, &["clean", "-fdq"]);
                 let head_before = git(&repo.checkout, &["rev-parse", "HEAD"]);
                 let tools = FixThenBlockTools::install();
 
@@ -18986,11 +19146,26 @@ mod tests {
             /// for a machine without jj.
             async fn apply(
                 task: &Task,
-                mut plan: PrReviewPlan,
+                plan: PrReviewPlan,
                 worktree: &Path,
                 jj: PathBuf,
                 auto_reply: bool,
             ) -> (PrReviewApplyResult, PrReviewPlan) {
+                apply_observed(task, plan, worktree, jj, auto_reply, no_progress())
+                    .await
+                    .expect("the apply flow reports per step, not as a command error")
+            }
+
+            /// [`apply`], with the command-level result and a progress sink
+            /// a test can act from, to change the checkout at a chosen step.
+            async fn apply_observed(
+                task: &Task,
+                mut plan: PrReviewPlan,
+                worktree: &Path,
+                jj: PathBuf,
+                auto_reply: bool,
+                progress: ProgressSink,
+            ) -> Result<(PrReviewApplyResult, PrReviewPlan), String> {
                 plan.backfill_lifecycle_from_last_apply();
                 let options = AddressPrReviewOptions { auto_push: true, auto_reply, dry_run: false };
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -19002,13 +19177,12 @@ mod tests {
                         worktree.to_str().unwrap().to_string(),
                         plan,
                         options,
-                        no_progress(),
+                        progress,
                         cancel_rx,
                         lease_dir.path().join("task.lock"),
                     ),
                 )
                 .await
-                .expect("the apply flow reports per step, not as a command error")
             }
 
             /// Apply one approved fix item in `worktree`, with `auto_push`.
@@ -19278,6 +19452,318 @@ mod tests {
             fn with_item(mut plan: PrReviewPlan, id: u64) -> PrReviewPlan {
                 plan.items.push(fix_item(id));
                 plan
+            }
+
+            /// Nothing may have left the checkout or reached the remote: the
+            /// branch tip is `tip`, the remote has no `task-branch`, and the
+            /// edit at `path` is still on disk, untouched.
+            fn assert_checkout_untouched(repo: &RepoFixture, worktree: &Path, tip: &str, path: &str) {
+                assert_eq!(git(worktree, &["rev-parse", "task-branch"]), tip, "no commit is made");
+                assert_eq!(repo.remote_has_branch("task-branch"), None, "nothing is pushed");
+                assert!(worktree.join(path).exists(), "{path} is still on disk");
+            }
+
+            /// Edits that existed before the apply, and that no fix of the
+            /// plan made, are not committed with its fixes and published by
+            /// Auto-push: the apply refuses before it runs a fix agent, and
+            /// the checkout, the branch and the remote are as they were.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn unexplained_uncommitted_edits_block_an_apply_before_any_agent_commit_or_push() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                std::fs::write(worktree.join("leftover.txt"), "from a failed fix\n").unwrap();
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+
+                let error = apply_observed(&task, plan.clone(), &worktree, no_jj, false, no_progress())
+                    .await
+                    .expect_err("unexplained edits refuse the apply");
+
+                assert!(error.contains("none of this plan's fixes"), "{error}");
+                assert_eq!(claude.runs(), 0, "no fix agent ran");
+                assert_checkout_untouched(&repo, &worktree, &tip, "leftover.txt");
+                assert_eq!(
+                    git(&worktree, &["status", "--porcelain"]),
+                    "?? leftover.txt",
+                    "the checkout is as it was"
+                );
+            }
+
+            /// A matching analysis fingerprint is not a clean checkout: the
+            /// analysis binds the dirt it saw, the checkout check accepts it,
+            /// and the apply still refuses it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_matching_fingerprint_does_not_make_dirt_acceptable() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, mut plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                std::fs::write(worktree.join("leftover.txt"), "from a failed fix\n").unwrap();
+                let facts = worktree_state_facts(worktree.to_str().unwrap(), "task-branch").await.unwrap();
+                plan.analyzed_worktree_oid = Some(facts.tip);
+                plan.analyzed_worktree_fingerprint = Some(facts.fingerprint);
+                check_plan_matches_worktree(&plan, worktree.to_str().unwrap(), Some("task-branch"))
+                    .await
+                    .expect("the analysis fingerprint matches the dirty checkout");
+
+                let outcome = apply_observed(&task, plan, &worktree, no_jj, false, no_progress()).await;
+
+                assert!(outcome.is_err(), "{outcome:?}");
+                assert_eq!(claude.runs(), 0, "no fix agent ran");
+                assert_eq!(repo.remote_has_branch("task-branch"), None, "nothing is pushed");
+            }
+
+            /// A failed fix agent leaves partial edits and the apply withholds
+            /// its commit, as before: the remaining items still run, none of
+            /// them is refused over the failed fix's edits.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_fix_does_not_stop_the_remaining_items_from_running() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install(
+                    "if [ \"$n\" -eq 1 ]; then printf 'partial\\n' > partial.txt; exit 1; fi",
+                );
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (result, _plan) = apply(&task, with_item(plan, 2), &worktree, no_jj, false).await;
+
+                assert_eq!(claude.runs(), 2, "the second item's agent still ran");
+                assert_eq!(result.failed_ids, vec![1], "{result:?}");
+                assert_eq!(result.fixed_ids, vec![2], "{result:?}");
+                assert!(!result.pushed, "nothing is pushed after a failure");
+                assert_eq!(repo.remote_has_branch("task-branch"), None);
+            }
+
+            /// The same refusal holds for a tracked file edited by hand and
+            /// for a tracked file deleted by hand.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_tracked_edit_or_deletion_is_unexplained_dirt_too() {
+                let _guard = PATH_LOCK.lock().await;
+                for (label, edit) in [("modified", "modify"), ("deleted", "delete")] {
+                    let repo = RepoFixture::new();
+                    let worktree = task_checkout_for_review(&repo, false);
+                    let claude = EditingClaude::install("");
+                    let (state, tmp) = build_test_state().await;
+                    let no_jj = tmp.path().join("no-such-jj");
+                    let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                    let tracked = git(&worktree, &["ls-files"]).lines().next().unwrap().to_string();
+                    match edit {
+                        "modify" => std::fs::write(worktree.join(&tracked), "edited by hand\n").unwrap(),
+                        _ => std::fs::remove_file(worktree.join(&tracked)).unwrap(),
+                    }
+                    let tip = git(&worktree, &["rev-parse", "task-branch"]);
+
+                    let outcome = apply_observed(&task, plan, &worktree, no_jj, false, no_progress()).await;
+
+                    let error = outcome.expect_err(label);
+                    assert!(error.contains("none of this plan's fixes"), "{label}: {error}");
+                    assert_eq!(claude.runs(), 0, "{label}: no fix agent ran");
+                    assert_eq!(git(&worktree, &["rev-parse", "task-branch"]), tip, "{label}: no commit");
+                    assert_eq!(repo.remote_has_branch("task-branch"), None, "{label}: no push");
+                    assert!(!git(&worktree, &["status", "--porcelain"]).is_empty(), "{label}: dirt kept");
+                }
+            }
+
+            /// Edits a plan's own earlier fixes left owed a commit are the
+            /// plan's: a later apply, with another fix agent on top, commits
+            /// and pushes both.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn edits_the_plans_own_earlier_fixes_left_are_still_committed() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_commits(&repo);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(!first.pushed, "{first:?}");
+                assert!(worktree.join("review-fix-1.txt").exists(), "the first fix is owed a commit");
+                std::fs::remove_file(&hook).unwrap();
+
+                let (second, plan) = apply(&task, with_item(plan, 2), &worktree, no_jj, false).await;
+
+                assert_eq!(claude.runs(), 2, "only the new item ran an agent");
+                assert!(second.pushed, "{:?}", second.push_error);
+                assert_eq!(git(&worktree, &["status", "--porcelain"]), "", "both fixes are committed");
+                assert!(remote_branch_has_file(&repo, "review-fix-1.txt"));
+                assert!(remote_branch_has_file(&repo, "review-fix-2.txt"));
+                assert!(plan.items.iter().all(|i| i.fix_commit.is_some()), "{:?}", plan.items);
+            }
+
+            /// An edit made by someone else after the apply began, between one
+            /// fix and the next, is not the plan's: the next fix agent is not
+            /// launched, nothing is committed or pushed, and every edit stays.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_edit_made_between_two_fixes_is_not_swept_into_the_commit() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let outside = worktree.join("outside.txt");
+                let writer = outside.clone();
+                let progress: ProgressSink = std::sync::Arc::new(move |event: PrReviewProgress| {
+                    if event.kind == "item_started" && event.current == Some(2) {
+                        std::fs::write(&writer, "someone else\n").unwrap();
+                    }
+                });
+
+                let (result, plan) =
+                    apply_observed(&task, with_item(plan, 2), &worktree, no_jj, false, progress)
+                        .await
+                        .expect("the apply reports per step");
+
+                assert_eq!(claude.runs(), 1, "the second fix agent was not launched");
+                assert_eq!(result.failed_ids, vec![2], "{result:?}");
+                assert!(!result.pushed, "{result:?}");
+                assert_checkout_untouched(&repo, &worktree, &tip, "outside.txt");
+                assert!(worktree.join("review-fix-1.txt").exists(), "the first fix's edit stays");
+                assert!(plan.items[0].fix_uncommitted, "the first fix is still owed a commit");
+            }
+
+            /// The overlap path-level accounting missed: a fix owes a commit
+            /// for `review-fix-1.txt`, and someone else then edits that same
+            /// file. The commit would publish that edit with the fix, so the
+            /// apply refuses it and leaves the file as it was.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_outside_edit_to_a_file_a_pending_fix_changed_is_refused() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_commits(&repo);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(!first.pushed, "{first:?}");
+                std::fs::remove_file(&hook).unwrap();
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                std::fs::write(worktree.join("review-fix-1.txt"), "someone else\n").unwrap();
+
+                let error = apply_observed(&task, plan, &worktree, no_jj, false, no_progress())
+                    .await
+                    .expect_err("an edit no fix made refuses the apply");
+
+                assert!(error.contains("none of this plan's fixes"), "{error}");
+                assert_checkout_untouched(&repo, &worktree, &tip, "review-fix-1.txt");
+                assert_eq!(
+                    std::fs::read_to_string(worktree.join("review-fix-1.txt")).unwrap(),
+                    "someone else\n",
+                    "the outside edit is untouched"
+                );
+            }
+
+            /// A refused launch must not turn the check off for the items
+            /// after it: with three fixes, the third agent does not run over
+            /// the edit that stopped the second.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_refused_fix_keeps_refusing_the_items_after_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let writer = worktree.join("outside.txt");
+                let progress: ProgressSink = std::sync::Arc::new(move |event: PrReviewProgress| {
+                    if event.kind == "item_started" && event.current == Some(2) {
+                        std::fs::write(&writer, "someone else\n").unwrap();
+                    }
+                });
+
+                let (result, _) =
+                    apply_observed(&task, with_item(with_item(plan, 2), 3), &worktree, no_jj, false, progress)
+                        .await
+                        .expect("the apply reports per step");
+
+                assert_eq!(claude.runs(), 1, "neither later fix agent was launched");
+                assert_eq!(result.failed_ids, vec![2, 3], "{result:?}");
+                assert!(!result.pushed, "{result:?}");
+                assert_checkout_untouched(&repo, &worktree, &tip, "outside.txt");
+            }
+
+            /// The same for an apply that only replays an owed commit: an
+            /// edit made after the apply began and before it commits is
+            /// refused at the commit, which is not made.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_edit_made_before_the_commit_is_not_swept_into_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_commits(&repo);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(!first.pushed, "{first:?}");
+                std::fs::remove_file(&hook).unwrap();
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let writer = worktree.join("outside.txt");
+                let progress: ProgressSink = std::sync::Arc::new(move |event: PrReviewProgress| {
+                    if event.kind == "item_succeeded" {
+                        std::fs::write(&writer, "someone else\n").unwrap();
+                    }
+                });
+
+                let (second, plan) = apply_observed(&task, plan, &worktree, no_jj, false, progress)
+                    .await
+                    .expect("the apply reports per step");
+
+                assert!(!second.pushed, "{second:?}");
+                let error = second.push_error.as_deref().unwrap_or_default();
+                assert!(error.contains("none of this plan's fixes"), "{error}");
+                assert_checkout_untouched(&repo, &worktree, &tip, "outside.txt");
+                assert!(worktree.join("review-fix-1.txt").exists(), "the fix's edit stays");
+                assert!(plan.items[0].fix_uncommitted && plan.items[0].fix_commit.is_none());
+            }
+
+            /// A dry run neither edits nor commits, so unexplained edits do
+            /// not stop it from inspecting.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_dry_run_over_unexplained_edits_is_not_refused() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, mut plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                std::fs::write(worktree.join("leftover.txt"), "kept\n").unwrap();
+                plan.backfill_lifecycle_from_last_apply();
+                let options = AddressPrReviewOptions { auto_push: false, auto_reply: false, dry_run: true };
+                let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                let lease_dir = tempfile::tempdir().unwrap();
+
+                address_pr_review_inner(
+                    task,
+                    worktree.to_str().unwrap().to_string(),
+                    plan,
+                    options,
+                    no_progress(),
+                    cancel_rx,
+                    lease_dir.path().join("task.lock"),
+                )
+                .await
+                .expect("a dry run is not refused");
             }
 
             /// A fix committed and pushed by an earlier apply is not

@@ -642,6 +642,14 @@ async fn a_non_collaborator_fix_is_applied_only_after_the_user_approves_it() {
     assert!(!item.approved, "a non-collaborator's fix is not pre-approved");
     assert_eq!(merged.comments[0].body, "Should we retry on failure?", "the comment stays readable");
 
+    // The mock discuss helper leaves a scratch file in the checkout. An apply
+    // refuses edits no fix made, so it is cleared as a person would.
+    assert!(std::process::Command::new("git")
+        .args(["clean", "-fdq"])
+        .current_dir(env.working_dir_str())
+        .status()
+        .expect("run git")
+        .success());
     let opts = AddressPrReviewOptions { auto_push: true, auto_reply: true, dry_run: false };
     let err = address_pr_review_inner(
         task.clone(), env.working_dir_str(), merged.clone(), opts.clone(), no_progress(), never_cancelled(), env.provider_lease_path(),

@@ -295,6 +295,34 @@ Checkouts, commits and restacks work as in a plain Git repository. A Jujutsu
 repository that is not colocated with Git cannot get a Task Checkout (see
 [product-model.md](product-model.md#task-checkout)).
 
+## PR-review apply over uncommitted edits
+
+A PR-review apply commits the whole checkout, and Auto-push then publishes the
+branch by name. Uncommitted edits already in the checkout, such as the partial
+edits of a failed AI Review fix, would be published with the plan's fixes under
+an approval that never covered them.
+
+The apply therefore compares the checkout with what the plan's own fixes still
+owed a commit found or left. A changed path is accepted only with the content a
+pending fix found there (a discarded edit) or left there (the plan's own edit).
+Any other content is refused, including an outside edit to a file a fix also
+touched. It refuses when such an edit is found: before any fix agent runs, again
+immediately before each fix agent launches, and again immediately before the
+commit, so an edit made after an earlier check is refused too. A clean checkout
+and a plan's own pending fixes are not affected, and a dry run is not checked. A
+matching analysis fingerprint does not make edits acceptable, because the
+fingerprint binds the checkout as analyzed, edits included.
+
+When a refusal happens between fixes, the fixes that already succeeded in that
+run stay uncommitted in the checkout, and the fixes after the refusal do not run.
+Nothing is reverted or cleaned up by SlashIt.
+
+Limits: a writer that sets a fix's file to exactly the content the fix left is
+indistinguishable from the fix. A writer that changes the checkout while a fix
+agent runs is not told apart from the agent. An edit made between the final
+check and the commit's own staging is still committed, because the commit takes
+the live checkout. The full policy below is not implemented.
+
 ## Failed review-fix runs
 
 This section states the owner's policy and the requirements for its mechanism.
