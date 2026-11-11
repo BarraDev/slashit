@@ -160,6 +160,64 @@ pub async fn request_task_changes(
     request_changes(&state, task_id, &feedback).await
 }
 
+/// The paths an AI Review fix changed in a task's checkout, for a Human to
+/// review before deciding. Reads only.
+#[tauri::command]
+pub async fn preview_review_fix(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<crate::queue::review_fix_record::ReviewFixPreview, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let task = current(&state, task_id).await.ok_or("Task not found")?;
+    let checkout = task
+        .worktree_path
+        .clone()
+        .ok_or("This task has no Task Checkout, so no AI Review fix can be unresolved in it.")?;
+    crate::queue::review_fix_record::preview(&checkout).await
+}
+
+/// A Human decision on an AI Review fix that ended with its edits unresolved.
+/// Until one is made, the Task's commits are refused.
+///
+/// `decision` is `keep`, `archive` or `discard`. Every decision needs
+/// `confirm_digest`, the digest of a preview from [`preview_review_fix`]; a
+/// checkout that changed since is refused. `keep` only removes the record and
+/// commits, approves and completes nothing. `archive` stashes the fix's paths
+/// and `discard` deletes them. Neither touches unrelated edits.
+#[tauri::command]
+pub async fn resolve_review_fix(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+    decision: String,
+    confirm_digest: String,
+) -> Result<(), String> {
+    use crate::queue::review_fix_record::Decision;
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let decision = match decision.as_str() {
+        "keep" => Decision::Keep,
+        "archive" => Decision::Archive,
+        "discard" => Decision::Discard,
+        _ => return Err("The decision must be keep, archive or discard.".to_string()),
+    };
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let task = current(&state, task_id).await.ok_or("Task not found")?;
+    let checkout = task
+        .worktree_path
+        .clone()
+        .ok_or("This task has no Task Checkout, so no AI Review fix can be unresolved in it.")?;
+    if let Some(executor) = state.executor.get() {
+        if crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), task_id).await {
+            return Err("An agent is still running for this task. Stop the run first.".to_string());
+        }
+    }
+    if !crate::queue::review_fix_record::present(&checkout).await? {
+        return Err("No AI Review fix is unresolved in this task's checkout.".to_string());
+    }
+    crate::queue::review_fix_record::resolve(&checkout, decision, &confirm_digest).await
+}
+
 /// Whether a task's approval still covers its branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]

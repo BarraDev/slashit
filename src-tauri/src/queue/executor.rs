@@ -701,8 +701,17 @@ async fn settle_review_fix_record(
     baseline: Option<&str>,
     applied: bool,
     events: &SharedEventSink,
-    task_id: &str,
+    (task_id, run_id): (Uuid, Uuid),
 ) {
+    // Seals what the run left, so a later edit by anyone is never attributed to
+    // it. A failed seal leaves the record unsealed, which is still refused.
+    if let Err(e) = crate::queue::review_fix_record::seal(working_dir, task_id, run_id).await {
+        events.agent_event(AgentEvent::Log {
+            task_id: task_id.to_string(),
+            level: LogLevel::Error,
+            message: format!("{e}. The Task's commits stay refused until a Human decides."),
+        });
+    }
     let now = crate::worktree::checkout_snapshot(working_dir).await;
     let resolved = applied
         || match (baseline, now) {
@@ -712,7 +721,7 @@ async fn settle_review_fix_record(
     if !resolved {
         return;
     }
-    if let Err(e) = crate::queue::review_fix_record::clear(working_dir).await {
+    if let Err(e) = crate::queue::review_fix_record::clear(working_dir, task_id, run_id).await {
         events.agent_event(AgentEvent::Log {
             task_id: task_id.to_string(),
             level: LogLevel::Error,
@@ -7785,31 +7794,35 @@ impl TaskExecutor {
                 // before the lease is taken.
                 // The checkout's content before the fix agent runs. A fix is
                 // credited only with content it changed from this state.
-                let fix_before = crate::worktree::checkout_snapshot(&working_dir).await;
-                // The record that lets a restart or a later Worker see an
-                // unresolved fix. Written before anything can edit; if it
-                // cannot be written, the fix does not start.
-                let fix_record = match &fix_before {
-                    Ok(before) => crate::queue::review_fix_record::begin(&working_dir, task_id, &before.content)
-                        .await
-                        .map_err(|e| {
-                            format!("The fix agent was not started: its review-fix record could not be written: {e}")
-                        }),
-                    Err(e) => Err(format!(
-                        "The checkout could not be read before the fix agent ran, so the fix was not started: {e}"
-                    )),
-                };
-                // Only a record this run wrote may be cleared below.
-                let fix_recorded = fix_record.is_ok();
-                let fix_run = match fix_launch
+                // The lease comes before the snapshot and the record: a snapshot
+                // taken before it could miss the holder's edits, and a refused
+                // lease must leave no record behind for a fix that never ran.
+                let fix_leased = fix_launch
                     .map_err(LaunchError::before_spawn)
                     .and_then(|launch| {
                         acquire_task_provider_lease(&storage, task_id)
                             .map(|lease| (launch, lease))
                             .map_err(LaunchError::before_spawn)
-                    })
-                    .and_then(|launched| match &fix_record {
-                        Ok(()) => Ok(launched),
+                    });
+                let fix_before = crate::worktree::checkout_snapshot(&working_dir).await;
+                // The record that lets a restart or a later Worker see an
+                // unresolved fix. Written before anything can edit; if it
+                // cannot be written, the fix does not start.
+                let fix_record = match (&fix_leased, &fix_before) {
+                    (Err(_), _) => Err("The fix agent was not started.".to_string()),
+                    (Ok(_), Ok(before)) => crate::queue::review_fix_record::begin(&working_dir, task_id, &before.content)
+                        .await
+                        .map_err(|e| {
+                            format!("The fix agent was not started: its review-fix record could not be written: {e}")
+                        }),
+                    (Ok(_), Err(e)) => Err(format!(
+                        "The checkout could not be read before the fix agent ran, so the fix was not started: {e}"
+                    )),
+                };
+                // Only a record this run wrote may be cleared below.
+                let fix_run_id = fix_record.as_ref().ok().copied();
+                let fix_run = match fix_leased.and_then(|launched| match &fix_record {
+                        Ok(_) => Ok(launched),
                         Err(message) => Err(LaunchError::before_spawn(message.clone())),
                     }) {
                     Err(error) => Err(error),
@@ -7892,13 +7905,13 @@ impl TaskExecutor {
                         // A stop that arrived while the fix agent finished
                         // owns the checkout now: commit nothing into it.
                         if *cancelled.borrow() {
-                            if fix_recorded {
+                            if let Some(run_id) = fix_run_id {
                                 settle_review_fix_record(
                                     &working_dir,
                                     fix_before.as_ref().ok().map(|s| s.content.as_str()),
                                     false,
                                     &events,
-                                    &task_id_str,
+                                    (task_id, run_id),
                                 )
                                 .await;
                             }
@@ -8020,13 +8033,13 @@ impl TaskExecutor {
                         // already been killed by `run_cancellable_agent`.
                         // Its record stays unless the checkout is back at its
                         // baseline, so a cancelled fix's edits are not swept in.
-                        if fix_recorded {
+                        if let Some(run_id) = fix_run_id {
                             settle_review_fix_record(
                                 &working_dir,
                                 fix_before.as_ref().ok().map(|s| s.content.as_str()),
                                 false,
                                 &events,
-                                &task_id_str,
+                                (task_id, run_id),
                             )
                             .await;
                         }
@@ -8044,13 +8057,13 @@ impl TaskExecutor {
                         Some(reason)
                     }
                 };
-                if fix_recorded {
+                if let Some(run_id) = fix_run_id {
                     settle_review_fix_record(
                         &working_dir,
                         fix_before.as_ref().ok().map(|s| s.content.as_str()),
                         fix_failure.is_none(),
                         &events,
-                        &task_id_str,
+                        (task_id, run_id),
                     )
                     .await;
                 }
@@ -19521,6 +19534,49 @@ VERDICT: APPROVED"
                 assert_eq!(git_output(repo.path(), &["rev-parse", "HEAD"]), tip);
                 assert!(git_output(repo.path(), &["status", "--porcelain"])
                     .contains("review-fix.txt"));
+            }
+
+            /// The fix agent edits the checkout and then kills itself with SIGKILL
+            /// (`$$` is the agent process). It is the real fix flow: the record
+            /// written before the agent started survives the death of its owner
+            /// and refuses the Worker commit.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_agent_killed_mid_edit_leaves_its_record_and_refuses_commits() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_scripted_fixer(
+                    "printf 'partial\\n' > review-fix.txt\nkill -9 $$",
+                    1,
+                );
+                let (repo, base_commit) = git_repo_with_worker_commit();
+                let path = repo.path().to_str().unwrap().to_string();
+                let _ = review_in(&mock, &path, &base_commit).await;
+                assert!(
+                    crate::queue::review_fix_record::pending(&path)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "the record did not outlive the killed fix agent"
+                );
+                assert!(repo.path().join("review-fix.txt").exists());
+                let mut task =
+                    create_test_task_full("sweep", Uuid::new_v4(), TaskStatus::InProgress, 0);
+                task.branch_name = Some(git_output(
+                    repo.path(),
+                    &["rev-parse", "--abbrev-ref", "HEAD"],
+                ));
+                let task_id = task.id;
+                let tip = git_output(repo.path(), &["rev-parse", "HEAD"]);
+                let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+                let result = TaskExecutor::commit_changes(
+                    &tasks,
+                    task_id,
+                    &path,
+                    &crate::events::null_sink(),
+                )
+                .await;
+                assert!(result.is_err(), "{result:?}");
+                assert_eq!(git_output(repo.path(), &["rev-parse", "HEAD"]), tip);
             }
 
             #[tokio::test(flavor = "multi_thread")]
