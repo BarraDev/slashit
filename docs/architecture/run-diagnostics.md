@@ -2,8 +2,8 @@
 
 Status: proposed contract. Nothing in this document is implemented yet. The
 diagnostic tail described in section 3 is blocked by the open decisions in
-section 8, and by the retention gap in section 7 (issue #220), which a pinned
-test in `crates/slashit-activity/src/tests.rs` makes visible.
+section 8, and by the interim retention rule in section 7 (issue #220), which
+keeps every milestone but leaves the Board unbounded until an archive exists.
 
 Scope: one bounded, redacted diagnostic tail per coding Run of a Task, read
 through the existing `GetTaskEvidence` answer (the `slashit runs` command,
@@ -30,9 +30,8 @@ Reader:
 
 Activity (`crates/slashit-activity/src/lib.rs`):
 
-- `MAX_ENTRIES = 200` (`:35`). `push` (`:491`) removes the oldest tool row
-  first and, when none is left, the oldest entry of any kind (`:495-500`).
-  This is the #220 gap in section 7.
+- `MAX_ENTRIES = 200`. `push` removes the oldest tool row while the list is
+  over the cap and never removes a milestone. See section 7.
 - `record` (`:401`) refuses a second once-only milestone (run start, run end,
   run result, review verdict, and so on). `sanitize_text` (`:506`) applies the
   redaction and bounds to free text on the way in.
@@ -317,26 +316,47 @@ Redaction is best effort. The tests in section 4 check the shapes the
 redactor already claims (`sanitize.rs` module documentation). They do not claim
 to find every secret.
 
-## 7. Retention gap: issue #220 (blocking)
+## 7. Retention rule: issue #220 (interim)
 
-The Activity cap (`slashit-activity/src/lib.rs:491-500`) removes the oldest
-milestone once no tool row is left. The owner decision says a limit must never
+Rule: the Activity cap drops only disposable tool rows, oldest first. A
+milestone is never evicted. Once a Task holds 200 milestones, every tool row is
+dropped as soon as it is pushed, so such a Task keeps no tool-row tail. The owner decision says a limit must never
 silently delete historical approvals, review decisions or recovery evidence.
-The current code does.
+
+Why this is a correctness rule and not only a history rule. Several readers
+derive an answer from the milestones still present, because no other record
+holds it:
+
+| Reader | Reads | If the milestone were gone |
+|---|---|---|
+| `next_run`, `next_review` | highest run and review number | a number is reused |
+| `completed_locally` | `CompletedLocally` | a locally completed Task no longer reads as completed |
+| `record` | once-only identities | a once-only milestone is recorded twice |
+| New-attempt authorization check (`executor.rs`) | `NewAttemptAuthorized` of the previous run | a failed new-attempt run is offered an ordinary retry instead of recovery |
+| Startup migration (`app_core.rs`) | latest `RunStarted` | the migration reads an older run |
+
+The task's status, phase and review record still decide what a Task may do
+next. Activity only supplies the facts above.
+
+Consequence, stated as an interim condition and not as the finished design:
+the persisted Board is no longer capped at 200 entries. Growth is the
+milestones only, about five to seven and 3.4 KB per run in the one board
+measured, whose busiest Task had 11 runs. A Task needs about 30 to 40 runs to
+reach 200 milestones. A synthetic steady-state workload on ext4 (10 Tasks of
+100 runs each, a whole-board save after every milestone) reached a 2.9 MB board
+with a median save of 78 ms and a 95th percentile of 146 ms; the board is one
+file, so every save rewrites all Tasks. A build before this rule deletes the oldest
+entries on its next push, so a downgrade can lose old milestones, but a board
+with more than 200 entries still loads.
+
+The bounded-history work that would move old milestones out of the Board into
+a durable per-Task archive is not part of this rule. It must durably confirm an
+archive copy before an entry leaves the Board, and it must define export and
+downgrade behavior first, because once a milestone exists only in the archive,
+deleting the archive deletes the last copy.
 
 Pinned test: `milestones_outlive_the_cap_once_tool_rows_are_gone` in
-`crates/slashit-activity/src/tests.rs`. It is `#[ignore]`, and it fails by
-design. Run it with `cargo test -p slashit-activity milestones_outlive -- --ignored`.
-At the time of writing it reports: "the recovery record of run 1 was evicted".
-
-Reachability: tool rows are dropped first, so milestone eviction starts only
-when the milestones alone exceed 200. Each Run adds about three milestones
-(start, end, result), so that happens at about 67 Runs, and review cycles bring
-it sooner. Eviction then removes Run 1's start, which is the outcome metadata
-the tail contract says must survive expiry.
-
-Any fix is a lifecycle-retention change. The owner decision requires explicit
-compatibility and safety tests for it. The fix is not chosen here.
+`crates/slashit-activity/src/tests.rs`.
 
 ## 8. Open decisions
 
@@ -349,8 +369,9 @@ compatibility and safety tests for it. The fix is not chosen here.
   checkpoints for interrupted Runs are part of the first slice.
 - D4. Content: diagnostic lines only (proposed), or also assistant text. The
   owner's raw-transcript rule points to diagnostic lines only.
-- D5. The #220 retention rule (section 7). Blocking for the expiry test and for
-  any claim that outcomes survive beyond about 60 Runs.
+- D5. The bounded-history archive for #220 (section 7). The interim rule keeps
+  every milestone, so outcomes survive beyond about 60 Runs, but the Board is
+  unbounded until an archive exists.
 
 ## 9. Not verified
 

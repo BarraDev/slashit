@@ -14,8 +14,15 @@
 //!   transition it describes, so a milestone is on the timeline exactly when
 //!   the transition is on disk.
 //!
-//! The timeline is history, not authority. Nothing decides what a task may do
-//! from these entries; that stays with its status, phase and review record.
+//! The timeline is history first, but a few readers derive an operational
+//! answer from it because nothing else records it: the next run and review
+//! number ([`next_run`], [`next_review`]), whether a person completed the task
+//! locally ([`completed_locally`]), once-only milestones ([`record`]), and the
+//! backend's recovery and new-attempt checks that look for a recorded run or
+//! authorization. Those answers are only right while the milestones they read
+//! are still present, so a milestone is never evicted to make room; only
+//! disposable tool rows are. The task's status, phase and review record still
+//! decide what a task may do next.
 //!
 //! Raw agent output is never an entry. The one kind of agent activity kept is
 //! a tool call, reduced by the backend to the tool's name and a short detail
@@ -29,9 +36,10 @@ use serde::{Deserialize, Serialize};
 mod sanitize;
 pub use sanitize::{redact, sanitize, MASK};
 
-/// The most entries one task keeps. When a new entry would exceed it, tool
-/// calls are dropped first, oldest first, and milestones only when no tool
-/// call is left.
+/// The most entries one task keeps before its tool rows are dropped, oldest
+/// first. Milestones are never dropped, so a task with more than this many of
+/// them keeps them all: the count grows with runs, reviews and moves, about
+/// five milestones and 3 KB per run, not with tool use.
 pub const MAX_ENTRIES: usize = 200;
 
 /// The most distinct tool-call entries one run keeps. Further calls are
@@ -497,7 +505,9 @@ fn push(entries: &mut Vec<Entry>, at: DateTime<Utc>, kind: Kind) {
         .saturating_add(1);
     entries.push(Entry { seq, at, kind });
     while entries.len() > MAX_ENTRIES {
-        let oldest = entries.iter().position(|e| e.kind.is_tool()).unwrap_or(0);
+        let Some(oldest) = entries.iter().position(|e| e.kind.is_tool()) else {
+            break;
+        };
         entries.remove(oldest);
     }
 }
@@ -539,9 +549,8 @@ pub fn completed_locally(entries: &[Entry]) -> bool {
     entries.iter().any(|e| e.kind == Kind::CompletedLocally {})
 }
 
-/// The number the next coding run gets: one past any run recorded, so a
-/// run whose start was dropped to keep the timeline bounded still has its
-/// number.
+/// The number the next coding run gets: one past any run recorded. Milestones
+/// are never evicted, so the highest number is always still present.
 pub fn next_run(entries: &[Entry]) -> u32 {
     entries
         .iter()
