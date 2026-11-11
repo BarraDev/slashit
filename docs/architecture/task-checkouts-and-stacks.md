@@ -298,7 +298,11 @@ repository that is not colocated with Git cannot get a Task Checkout (see
 ## Failed review-fix runs
 
 This section states the owner's policy and the requirements for its mechanism.
-The mechanism is not implemented.
+The mechanism is implemented for the Worker commit and the PR review-fix commit
+(`src-tauri/src/queue/review_fix_record.rs`): a record in the checkout's Git
+directory, written before the fix agent runs, that refuses those commits while it
+is unresolved. The Human decision that resolves a record (keep for review or
+discard) is not implemented; a record stays until one exists.
 
 A review-fix run can fail after it has edited files in the Task Checkout. Such a
 partial checkout is preserved and never discarded silently. It is never silently
@@ -308,8 +312,10 @@ is a separate, authorized operation that states what would be lost. Automatic
 cleanup is not an acceptable shortcut.
 
 Current behavior: `commit_changes` in `src-tauri/src/queue/executor.rs` runs after
-every Worker run and commits everything uncommitted in the checkout. It does not
-yet honor this policy.
+every Worker run and commits everything uncommitted in the checkout. It refuses
+while a review-fix record is unresolved. A process killed mid-fix leaves the record
+in place; an older build ignores it and commits as before, so a downgrade does not
+restore the protection.
 
 Requirements for the mechanism:
 
