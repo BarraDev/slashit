@@ -569,46 +569,113 @@ async fn restore_absent(working_dir: &str, changed: &str) -> Result<(), String> 
     if !blob.status.success() {
         return Err(format!("{changed} could not be read from HEAD"));
     }
-    let target = Path::new(working_dir).join(changed);
-    let exists = |e: &std::io::Error| e.kind() == std::io::ErrorKind::AlreadyExists;
-    let refused = |e: std::io::Error| {
-        if exists(&e) {
-            format!("{changed} was written since the preview; nothing was replaced")
-        } else {
-            format!("{changed} could not be restored: {e}")
+    #[cfg(unix)]
+    return write_confined(working_dir, changed, &mode, &blob.stdout);
+    #[cfg(not(unix))]
+    {
+        let target = Path::new(working_dir).join(changed);
+        let exists = |e: &std::io::Error| e.kind() == std::io::ErrorKind::AlreadyExists;
+        let refused = |e: std::io::Error| {
+            if exists(&e) {
+                format!("{changed} was written since the preview; nothing was replaced")
+            } else {
+                format!("{changed} could not be restored: {e}")
+            }
+        };
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("{changed} could not be restored: {e}"))?;
         }
-    };
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("{changed} could not be restored: {e}"))?;
-    }
-    if mode == "120000" {
-        #[cfg(unix)]
-        {
-            let link = String::from_utf8_lossy(&blob.stdout).to_string();
-            std::os::unix::fs::symlink(link, &target).map_err(refused)?;
+        if mode == "120000" {
+            return Err(format!(
+                "{changed} is a symbolic link, which cannot be restored here"
+            ));
         }
-        #[cfg(not(unix))]
-        return Err(format!(
-            "{changed} is a symbolic link, which cannot be restored here"
-        ));
-    } else {
         use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        // Mode is set at creation, so the umask applies and no path is chmodded later.
-        #[cfg(unix)]
-        if mode == "100755" {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o755);
-        }
-        let mut file = options.open(&target).map_err(refused)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(refused)?;
         if let Err(e) = file.write_all(&blob.stdout) {
             // Our own partial file must not block a retry or be mistaken for an outside write.
             drop(file);
             let _ = std::fs::remove_file(&target);
             return Err(format!("{changed} could not be restored: {e}"));
         }
+        Ok(())
+    }
+}
+
+/// Creates `changed` under the checkout without following a symlink in its path.
+/// Each directory is opened relative to its parent with `O_NOFOLLOW`, and the
+/// file is created with `O_EXCL`, so a component replaced by a symlink, before
+/// or during the restore, is refused rather than written through.
+#[cfg(unix)]
+fn write_confined(
+    working_dir: &str,
+    changed: &str,
+    mode: &str,
+    content: &[u8],
+) -> Result<(), String> {
+    use rustix::fs::{mkdirat, openat, symlinkat, unlinkat, AtFlags, Mode, OFlags, CWD};
+    use rustix::io::Errno;
+    use std::io::Write;
+
+    let fail = |e: Errno| {
+        if e == Errno::EXIST {
+            format!("{changed} was written since the preview; nothing was replaced")
+        } else if e == Errno::LOOP || e == Errno::NOTDIR {
+            format!("{changed} is under a symbolic link, so it was not restored")
+        } else {
+            format!("{changed} could not be restored: {e}")
+        }
+    };
+    let mut parts: Vec<&str> = changed.split('/').collect();
+    let name = parts.pop().unwrap_or_default();
+    if parts
+        .iter()
+        .chain(std::iter::once(&name))
+        .any(|p| p.is_empty() || *p == "." || *p == "..")
+    {
+        return Err(format!("{changed} is not a path inside the checkout"));
+    }
+    // The checkout root may itself be reached through a symlink; only the
+    // components beneath it are confined.
+    let mut dir = openat(
+        CWD,
+        working_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("{changed} could not be restored: {e}"))?;
+    let no_follow = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    for part in parts {
+        match mkdirat(&dir, part, Mode::from_raw_mode(0o777)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(e) => return Err(fail(e)),
+        }
+        dir = openat(&dir, part, no_follow, Mode::empty()).map_err(fail)?;
+    }
+    if mode == "120000" {
+        let link = String::from_utf8_lossy(content).to_string();
+        return symlinkat(link.as_str(), &dir, name).map_err(fail);
+    }
+    // The mode is given at creation, so the umask applies and nothing is chmodded later.
+    let file_mode = if mode == "100755" { 0o755 } else { 0o666 };
+    let fd = openat(
+        &dir,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(file_mode),
+    )
+    .map_err(fail)?;
+    let mut file = std::fs::File::from(fd);
+    if let Err(e) = file.write_all(content) {
+        // Our own partial file must not block a retry or be mistaken for an outside write.
+        drop(file);
+        let _ = unlinkat(&dir, name, AtFlags::empty());
+        return Err(format!("{changed} could not be restored: {e}"));
     }
     Ok(())
 }
@@ -852,6 +919,59 @@ mod tests {
             std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
             "outside\n"
         );
+    }
+
+    /// A restore never writes through a symlinked parent directory, so a file
+    /// planted in the checkout cannot redirect the write outside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restore_never_writes_through_a_symlinked_parent() {
+        let dir = repo();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/inner.txt"), "base\n").unwrap();
+        git_ok(dir.path(), &["add", "."]);
+        git_ok(dir.path(), &["commit", "-q", "-m", "base"]);
+        let path = dir.path().to_str().unwrap();
+
+        std::fs::remove_dir_all(dir.path().join("sub")).unwrap();
+        restore_absent(path, "sub/inner.txt").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sub/inner.txt")).unwrap(),
+            "base\n"
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::remove_dir_all(dir.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+        assert!(restore_absent(path, "sub/inner.txt").await.is_err());
+        assert!(
+            !outside.path().join("inner.txt").exists(),
+            "a restore wrote outside the checkout"
+        );
+    }
+
+    /// A fix that replaces a deleted file's directory with a symlink out of the
+    /// checkout: git refuses to stash it, so discard fails before any restore
+    /// runs, writes nothing outside the checkout, and keeps the record.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discard_of_a_fix_made_symlink_parent_fails_safe() {
+        let dir = repo();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/inner.txt"), "base\n").unwrap();
+        git_ok(dir.path(), &["add", "."]);
+        git_ok(dir.path(), &["commit", "-q", "-m", "base"]);
+        let path = dir.path().to_str().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        begin(path, Uuid::new_v4(), "x").await.unwrap();
+        std::fs::remove_dir_all(dir.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+        let digest = preview(path).await.unwrap().digest;
+        assert!(resolve(path, Decision::Discard, &digest).await.is_err());
+
+        assert!(!outside.path().join("inner.txt").exists());
+        assert!(pending(path).await.unwrap().is_some());
     }
 
     /// Discard leaves the fix's edits in a stash first, so nothing is lost silently.
