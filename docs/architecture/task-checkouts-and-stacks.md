@@ -321,7 +321,9 @@ checkout has changed since the preview. The decisions are:
   removes the record. The stash list is shared by every worktree of the repository, so
   find the entry by its message ("SlashIt: archived AI Review fix edits") and restore
   it with `git stash pop stash@{n}`.
-- `discard` deletes or restores exactly the fix's paths, then removes the record.
+- `discard` stashes exactly the fix's paths first (the same stash as `archive`, so the
+  edits stay recoverable from the stash list), restores or removes them, then removes the
+  record. A fix's deleted path cannot be stashed, so discard only restores it from HEAD.
 
 A path that was uncommitted before the fix and that the fix changed or removed is
 blocked, and so is one that is now clean, since the fix may have reverted it or

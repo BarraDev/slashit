@@ -183,8 +183,9 @@ pub async fn preview_review_fix(
 /// `decision` is `keep`, `archive` or `discard`. Every decision needs
 /// `confirm_digest`, the digest of a preview from [`preview_review_fix`]; a
 /// checkout that changed since is refused. `keep` only removes the record and
-/// commits, approves and completes nothing. `archive` stashes the fix's paths
-/// and `discard` deletes them. Neither touches unrelated edits.
+/// commits, approves and completes nothing. `archive` and `discard` both stash the
+/// fix's paths first, so the edits stay recoverable; `discard` then restores them.
+/// Neither touches unrelated edits.
 #[tauri::command]
 pub async fn resolve_review_fix(
     _gui: GuiMutation,

@@ -444,11 +444,26 @@ pub async fn resolve(
             Decision::Archive => {
                 archive_paths(working_dir, &preview.attributed, confirm_digest).await?
             }
-            Decision::Discard => remove_paths(working_dir, &preview.attributed).await?,
+            Decision::Discard => {
+                discard_paths(working_dir, &preview.attributed, confirm_digest).await?
+            }
             Decision::Keep => {}
         }
     }
     remove_at(&path)
+}
+
+/// Stashes the attributed paths before restoring them, so an edit that reached
+/// them after the preview (from outside SlashIt) is still in the stash.
+async fn discard_paths(working_dir: &str, paths: &[String], digest: &str) -> Result<(), String> {
+    let (present, deleted): (Vec<String>, Vec<String>) = paths
+        .iter()
+        .cloned()
+        .partition(|p| std::fs::symlink_metadata(Path::new(working_dir).join(p)).is_ok());
+    if !present.is_empty() {
+        archive_paths(working_dir, &present, digest).await?;
+    }
+    remove_paths(working_dir, &deleted).await
 }
 
 /// Stashes exactly the attributed paths, so the edits stay recoverable.
@@ -749,6 +764,25 @@ mod tests {
             std::fs::read_to_string(dir.path().join("user.txt")).unwrap(),
             "mine\n"
         );
+    }
+
+    /// Discard leaves the fix's edits in a stash first, so nothing is lost silently.
+    #[tokio::test]
+    async fn discard_keeps_the_fixes_edits_in_a_stash() {
+        let dir = repo_with_commit();
+        let path = dir.path().to_str().unwrap();
+        let digest = fix_over_user_edits(dir.path()).await;
+        resolve(path, Decision::Discard, &digest).await.unwrap();
+        let list = git_ok(dir.path(), &["stash", "list"]);
+        let list = String::from_utf8_lossy(&list.stdout);
+        assert!(
+            list.contains("SlashIt: archived AI Review fix edits"),
+            "{list}"
+        );
+        let untracked = git_ok(dir.path(), &["show", "stash@{0}^3:review-fix.txt"]);
+        assert_eq!(String::from_utf8_lossy(&untracked.stdout), "partial\n");
+        let tracked = git_ok(dir.path(), &["show", "stash@{0}:tracked.txt"]);
+        assert_eq!(String::from_utf8_lossy(&tracked.stdout), "fixed\n");
     }
 
     /// A checkout that changed after the preview is refused, and nothing moves.
