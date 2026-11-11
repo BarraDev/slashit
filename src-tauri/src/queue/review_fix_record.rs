@@ -460,6 +460,13 @@ async fn discard_paths(working_dir: &str, paths: &[String], digest: &str) -> Res
         .iter()
         .cloned()
         .partition(|p| std::fs::symlink_metadata(Path::new(working_dir).join(p)).is_ok());
+    // Checked before anything is stashed. Git reads a deleted path as a pattern,
+    // so a name with a glob character could match other paths; refuse instead.
+    if let Some(bad) = deleted.iter().find(|p| p.contains(['*', '?', '['])) {
+        return Err(format!(
+            "{bad} was deleted and has a glob character in its name, so discard cannot restore it safely. Nothing was changed; archive it or keep it."
+        ));
+    }
     if !present.is_empty() {
         archive_paths(working_dir, &present, digest).await?;
     }
@@ -501,8 +508,9 @@ async fn archive_paths(working_dir: &str, paths: &[String], digest: &str) -> Res
     Ok(())
 }
 
-/// Returns each attributed path to HEAD, or deletes it when git does not track
-/// it. Refuses on the first failure; paths already handled stay handled.
+/// Brings back the deleted paths the fix left behind. A path is written only
+/// while it is still absent: an outside write that reached it is refused, never
+/// replaced. Refuses on the first failure; paths already handled stay handled.
 async fn remove_paths(working_dir: &str, paths: &[String]) -> Result<(), String> {
     for changed in paths {
         let in_head = git(working_dir, &["cat-file", "-e", &format!("HEAD:{changed}")])
@@ -513,35 +521,93 @@ async fn remove_paths(working_dir: &str, paths: &[String]) -> Result<(), String>
             .await?
             .status
             .success();
-        // Restoring from HEAD covers modified, deleted and staged-deleted paths
-        // alike, and resets the index entry too. A path HEAD does not know is
-        // removed from the index (if staged) and from the worktree. Only a path
-        // git lists as untracked is deleted as a plain file.
-        let output = if in_head {
-            git(
+        if in_head {
+            restore_absent(working_dir, changed).await?;
+            // Index only: the worktree was written above and is not touched again.
+            let output = git(
                 working_dir,
-                &[
-                    "restore",
-                    "--source=HEAD",
-                    "--staged",
-                    "--worktree",
-                    "--",
-                    changed,
-                ],
+                &["restore", "--source=HEAD", "--staged", "--", changed],
             )
-            .await?
+            .await?;
+            if !output.status.success() {
+                return Err(format!(
+                    "{changed} could not be restored: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
         } else if in_index {
-            git(working_dir, &["rm", "-q", "-f", "--", changed]).await?
+            // Index only. Nothing outside git is deleted here.
+            let output = git(working_dir, &["rm", "--cached", "-q", "--", changed]).await?;
+            if !output.status.success() {
+                return Err(format!(
+                    "{changed} could not be unstaged: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        }
+        // Neither in HEAD nor in the index: the fix created and deleted it, so
+        // there is nothing to restore and nothing to delete.
+    }
+    Ok(())
+}
+
+/// Writes HEAD's content of `changed` to the worktree, refusing when anything
+/// is already there. Exclusive creation makes the check and the write one step.
+async fn restore_absent(working_dir: &str, changed: &str) -> Result<(), String> {
+    let listed = git(working_dir, &["ls-tree", "HEAD", "--", changed]).await?;
+    let mode = String::from_utf8_lossy(&listed.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    // `--filters` applies the checkout conversions (eol, LFS) that a plain blob read skips.
+    let blob = git(
+        working_dir,
+        &["cat-file", "--filters", &format!("HEAD:{changed}")],
+    )
+    .await?;
+    if !blob.status.success() {
+        return Err(format!("{changed} could not be read from HEAD"));
+    }
+    let target = Path::new(working_dir).join(changed);
+    let exists = |e: &std::io::Error| e.kind() == std::io::ErrorKind::AlreadyExists;
+    let refused = |e: std::io::Error| {
+        if exists(&e) {
+            format!("{changed} was written since the preview; nothing was replaced")
         } else {
-            std::fs::remove_file(Path::new(working_dir).join(changed))
-                .map_err(|e| format!("{changed} could not be removed: {e}"))?;
-            continue;
-        };
-        if !output.status.success() {
-            return Err(format!(
-                "{changed} could not be restored: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            format!("{changed} could not be restored: {e}")
+        }
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("{changed} could not be restored: {e}"))?;
+    }
+    if mode == "120000" {
+        #[cfg(unix)]
+        {
+            let link = String::from_utf8_lossy(&blob.stdout).to_string();
+            std::os::unix::fs::symlink(link, &target).map_err(refused)?;
+        }
+        #[cfg(not(unix))]
+        return Err(format!(
+            "{changed} is a symbolic link, which cannot be restored here"
+        ));
+    } else {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Mode is set at creation, so the umask applies and no path is chmodded later.
+        #[cfg(unix)]
+        if mode == "100755" {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o755);
+        }
+        let mut file = options.open(&target).map_err(refused)?;
+        if let Err(e) = file.write_all(&blob.stdout) {
+            // Our own partial file must not block a retry or be mistaken for an outside write.
+            drop(file);
+            let _ = std::fs::remove_file(&target);
+            return Err(format!("{changed} could not be restored: {e}"));
         }
     }
     Ok(())
@@ -763,6 +829,28 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("user.txt")).unwrap(),
             "mine\n"
+        );
+    }
+
+    /// A deleted path is written back only while it is absent. A file that an
+    /// outside actor put there is refused and kept, never replaced.
+    #[tokio::test]
+    async fn a_deleted_path_is_restored_only_while_it_is_absent() {
+        let dir = repo_with_commit();
+        let path = dir.path().to_str().unwrap();
+        std::fs::remove_file(dir.path().join("tracked.txt")).unwrap();
+        restore_absent(path, "tracked.txt").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+            "base\n"
+        );
+
+        std::fs::write(dir.path().join("tracked.txt"), "outside\n").unwrap();
+        let refused = restore_absent(path, "tracked.txt").await;
+        assert!(refused.is_err(), "an existing file must be refused");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+            "outside\n"
         );
     }
 

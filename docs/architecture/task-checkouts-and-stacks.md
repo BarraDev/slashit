@@ -323,7 +323,9 @@ checkout has changed since the preview. The decisions are:
   it with `git stash pop stash@{n}`.
 - `discard` stashes exactly the fix's paths first (the same stash as `archive`, so the
   edits stay recoverable from the stash list), restores or removes them, then removes the
-  record. A fix's deleted path cannot be stashed, so discard only restores it from HEAD.
+  record. A path the fix deleted cannot be stashed, so discard writes it back from HEAD
+  only while it is still absent; a file that appeared there since the preview is refused,
+  never replaced. A path the fix created and deleted is left as it is.
 
 A path that was uncommitted before the fix and that the fix changed or removed is
 blocked, and so is one that is now clean, since the fix may have reverted it or
