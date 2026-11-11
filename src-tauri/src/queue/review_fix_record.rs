@@ -573,37 +573,13 @@ async fn restore_absent(working_dir: &str, changed: &str) -> Result<(), String> 
     return write_confined(working_dir, changed, &mode, &blob.stdout);
     #[cfg(not(unix))]
     {
-        let target = Path::new(working_dir).join(changed);
-        let exists = |e: &std::io::Error| e.kind() == std::io::ErrorKind::AlreadyExists;
-        let refused = |e: std::io::Error| {
-            if exists(&e) {
-                format!("{changed} was written since the preview; nothing was replaced")
-            } else {
-                format!("{changed} could not be restored: {e}")
-            }
-        };
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("{changed} could not be restored: {e}"))?;
-        }
-        if mode == "120000" {
-            return Err(format!(
-                "{changed} is a symbolic link, which cannot be restored here"
-            ));
-        }
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)
-            .map_err(refused)?;
-        if let Err(e) = file.write_all(&blob.stdout) {
-            // Our own partial file must not block a retry or be mistaken for an outside write.
-            drop(file);
-            let _ = std::fs::remove_file(&target);
-            return Err(format!("{changed} could not be restored: {e}"));
-        }
-        Ok(())
+        // Path-based creation follows directory junctions, so a fix-made junction
+        // could send the write outside the checkout. Refuse, keep the record, and
+        // leave the restore to the person until a handle-relative write exists here.
+        let _ = (&mode, &blob);
+        Err(format!(
+            "{changed} was deleted by the fix, and it cannot be restored safely on this platform yet. Nothing was changed; keep the record and restore the file by hand."
+        ))
     }
 }
 
