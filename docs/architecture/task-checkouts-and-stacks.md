@@ -298,11 +298,12 @@ repository that is not colocated with Git cannot get a Task Checkout (see
 ## Failed review-fix runs
 
 A review-fix run can fail after it has edited files in the Task Checkout. The
-partial edits stay in the checkout: nothing discards, stashes or reverts them,
-and the Task moves to Human Review with the failure recorded. There is no
-separate keep, archive or discard step and no persisted marker. The uncertainty
-is carried by existing state: the checkout itself, the provider lease, the
-Worker handoff and the Activity record.
+partial edits stay in the checkout: the fix flow does not discard, stash or
+revert them. The failure is recorded in Task Activity as an AI Fix failure, and
+the review sign-off is recorded as rejected. There is no separate keep, archive
+or discard step and no persisted marker. The uncertainty is carried by existing
+state: the checkout itself, the provider lease, the Worker handoff and the
+Activity record.
 
 Continuation:
 
@@ -320,12 +321,26 @@ Continuation:
   does not say who made them, because that is not recorded. The note is added
   to the launch prompt only, after the prompts the approval digests are
   computed from, so it never changes an approval.
+- The note says that the paths are data and that the note authorizes nothing.
+  Each path is shown in ASCII, with a `\u{..}` escape for any other character,
+  for a backtick and for a backslash. Names are shown escaped, not read, so a
+  non-English name is less readable here. A name longer than 200 units is cut
+  and says how many units were left out.
+- The status read runs when the run is started, bounded at 10 seconds. When it
+  times out, SlashIt sends a kill to its Git process: on Unix to the whole
+  process group, on Windows to the Git process only (not tested). The kill is
+  sent but not awaited, so a process stuck in uninterruptible I/O can outlive
+  the bound. The note then says the checkout could not be read.
 
 Known limits:
 
 - The note describes the checkout when the run starts. It does not follow edits
-  made while the run is going, and the 10 second bound covers the start, not the
-  Git process behind it.
+  made while the run is going.
+- A path that is not valid UTF-8 is shown with the replacement escape, so its
+  exact bytes are not recovered.
+- If the start is cancelled rather than timed out, only the Git process itself
+  is killed. A process that Git started, and any process that holds its output
+  pipes open, is not waited for or killed in that case.
 - Windows has no provider lease, so nothing there claims the absence of an
   earlier provider process.
 - No successor is scheduled automatically: a successor run is the controlled

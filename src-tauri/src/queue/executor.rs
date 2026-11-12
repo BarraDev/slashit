@@ -5022,16 +5022,13 @@ impl TaskExecutor {
                 // approval digest changes; a failed read is said, not hidden.
                 // Bounded: the lease is held and the run is not registered
                 // yet, so a stalled Git must not leave the start hanging. A
-                // timeout is a failed read, and says so in the note.
-                let edits = match tokio::time::timeout(
+                // timeout is a failed read, and says so in the note; the
+                // bounded read also ends its Git process.
+                let edits = crate::worktree::integration::uncommitted_paths_within(
+                    &acquired.info.path,
                     std::time::Duration::from_secs(10),
-                    crate::worktree::integration::uncommitted_paths(&acquired.info.path),
                 )
-                .await
-                {
-                    Ok(edits) => edits,
-                    Err(_) => Err("reading the checkout's status timed out".to_string()),
-                };
+                .await;
                 let prompt = crate::queue::prompt::with_preexisting_edits(prompt, edits);
                 Ok(RunStart {
                     working_dir: acquired.info.path,
