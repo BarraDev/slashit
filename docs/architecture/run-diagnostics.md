@@ -320,8 +320,9 @@ to find every secret.
 
 Rule: the Activity cap drops only disposable tool rows, oldest first. A
 milestone is never evicted. Once a Task holds 200 milestones, every tool row is
-dropped as soon as it is pushed, so such a Task keeps no tool-row tail. The owner decision says a limit must never
-silently delete historical approvals, review decisions or recovery evidence.
+dropped as soon as it is pushed, so such a Task keeps no tool-row tail. The
+owner decision says a limit must never silently delete historical approvals,
+review decisions or recovery evidence.
 
 Why this is a correctness rule and not only a history rule. Several readers
 derive an answer from the milestones still present, because no other record
@@ -332,8 +333,8 @@ holds it:
 | `next_run`, `next_review` | highest run and review number | a number is reused |
 | `completed_locally` | `CompletedLocally` | a locally completed Task no longer reads as completed |
 | `record` | once-only identities | a once-only milestone is recorded twice |
-| New-attempt authorization check (`executor.rs`) | `NewAttemptAuthorized` of the previous run | a failed new-attempt run is offered an ordinary retry instead of recovery |
-| Startup migration (`app_core.rs`) | latest `RunStarted` | the migration reads an older run |
+| New-attempt authorization check (`queue/executor.rs`) | `NewAttemptAuthorized` of the previous run | a failed new-attempt run is offered an ordinary retry instead of recovery |
+| Startup migration (`app_core.rs`) | highest run number, then that run's `RunStarted` | the migration reads an older run |
 
 The task's status, phase and review record still decide what a Task may do
 next. Activity only supplies the facts above.
