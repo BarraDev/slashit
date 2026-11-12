@@ -98,6 +98,49 @@ pub async fn visible(driver: &WebDriver, selector: &str) -> Result<WebElement> {
         })
 }
 
+/// What an approval control showed at one reading.
+#[derive(Debug, Clone)]
+pub struct ControlReading {
+    /// The control's text.
+    pub label: String,
+    /// Whether the control is on screen.
+    pub shown: bool,
+    /// Whether the control accepts a click. A label is not evidence of this:
+    /// approval stays disabled until the commit to approve is read.
+    pub enabled: bool,
+    /// What the page says about the prerequisites, for a failure report.
+    pub context: String,
+}
+
+/// Poll `read` until the control is shown and enabled, and return its label.
+///
+/// A failed read is returned at once. A control that is never ready fails at
+/// `deadline`, naming what its last reading showed, so the caller never clicks
+/// a disabled control and never waits out a timeout without a reason.
+pub async fn await_enabled<F, Fut>(what: &str, deadline: Duration, poll: Duration, mut read: F) -> Result<String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ControlReading>>,
+{
+    let started = std::time::Instant::now();
+    loop {
+        let reading = read().await?;
+        if reading.shown && reading.enabled {
+            return Ok(reading.label);
+        }
+        if started.elapsed() > deadline {
+            bail!(
+                "{what} never became enabled: label {:?}, shown: {}, enabled: {}. {}",
+                reading.label,
+                reading.shown,
+                reading.enabled,
+                reading.context
+            );
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 /// Assert an element is not in the document right now.
 ///
 /// Used to establish the "before" half of an interaction, so the "after"
@@ -191,4 +234,69 @@ async fn dispatch(
         .cloned()
         .map(Ok)
         .ok_or_else(|| anyhow!("invoke({command}) returned an unrecognised envelope: {value}"))
+}
+
+#[cfg(test)]
+mod await_enabled_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn reading(label: &str, shown: bool, enabled: bool) -> ControlReading {
+        ControlReading { label: label.into(), shown, enabled, context: "commit error: none".into() }
+    }
+
+    #[tokio::test]
+    async fn a_resolved_label_alone_does_not_end_the_wait() {
+        let reads = Cell::new(0usize);
+        let script = [reading("Approve", true, false), reading("Approve", true, false), reading("Approve", true, true)];
+        let label = await_enabled("the approve button", Duration::from_secs(5), Duration::from_millis(1), || {
+            let r = script[reads.get().min(script.len() - 1)].clone();
+            reads.set(reads.get() + 1);
+            async move { Ok::<_, anyhow::Error>(r) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(label, "Approve");
+        assert_eq!(reads.get(), 3, "returned while the control was still disabled");
+    }
+
+    #[tokio::test]
+    async fn a_control_that_is_never_enabled_fails_and_says_what_it_showed() {
+        let err = await_enabled("the approve button", Duration::from_millis(20), Duration::from_millis(1), || async {
+            Ok::<_, anyhow::Error>(reading("Approve", true, false))
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("never became enabled"), "{err}");
+        assert!(err.contains("enabled: false"), "{err}");
+        assert!(err.contains("commit error: none"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_is_returned_at_once() {
+        let reads = Cell::new(0usize);
+        let err = await_enabled("the approve button", Duration::from_secs(5), Duration::from_millis(1), || {
+            reads.set(reads.get() + 1);
+            async { Err::<ControlReading, _>(anyhow!("driver went away")) }
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "driver went away");
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_control_that_is_not_yet_shown_is_waited_for() {
+        let reads = Cell::new(0usize);
+        let label = await_enabled("the approve button", Duration::from_secs(5), Duration::from_millis(1), || {
+            reads.set(reads.get() + 1);
+            let r = if reads.get() < 2 { reading("", false, false) } else { reading("Approve", true, true) };
+            async move { Ok::<_, anyhow::Error>(r) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(label, "Approve");
+    }
 }

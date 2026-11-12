@@ -15,7 +15,7 @@
 //! other: the product's own `list_tasks`, the task file, git (the fixture and
 //! its bare `origin`), and the arguments `gh` was called with.
 
-use super::human_review::{await_task, click, install_fakes, open_reviewed_drawer, read_task, HR_APPROVE};
+use super::human_review::{await_approval, await_task, click, install_fakes, open_reviewed_drawer, read_task, HR_APPROVE};
 use super::task_runs::{branch_name_of, create_task, git_commit_exists, git_is_ancestor, git_out, register_project, run_to_review};
 use super::*;
 use slashit_acceptance::fake_gh::FakeGh;
@@ -328,7 +328,7 @@ async fn approve_and_open_the_pull_request(driver: &WebDriver, task: &ExecutedTa
     let before = gh.create_attempts()?;
     open_board(driver, &task.project_id).await?;
     open_reviewed_drawer(driver, task).await?;
-    let label = await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
+    let label = await_approval(driver, HR_APPROVE, "the approve action").await?;
     if label != "Approve & Create PR" {
         bail!("a GitHub project should offer Approve & Create PR, the drawer offers {label:?}");
     }
