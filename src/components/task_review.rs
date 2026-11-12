@@ -243,10 +243,10 @@ fn displayed_tip(status: Option<&ApprovalStatus>) -> Option<String> {
 }
 
 /// Whether the commit the Changes tab shows is the one an approval would cover.
-/// A tab that shows no commit (not opened, or not a reviewed checkout) has
-/// nothing to disagree with.
+/// The tab must show exactly the commit to approve. A tab that is not loaded,
+/// or whose load failed, shows none, so it never matches a commit to approve.
 fn viewed_matches(viewed: Option<&str>, shown: Option<&str>) -> bool {
-    viewed.is_none() || viewed == shown
+    viewed == shown
 }
 
 /// Whether the approve controls may be used. Approval needs the pull request
@@ -341,7 +341,7 @@ pub fn HumanReviewPanel(
         let diverged = !viewed_matches(viewed.as_deref(), shown);
         if diverged {
             error.set(Some(
-                "The Changes tab shows a different commit than the one this would approve. It has been reloaded; look at it again before approving."
+                "The Changes tab does not show the commit this would approve, because it is not loaded or shows another commit. It is being reloaded; look at it again before approving."
                     .to_string(),
             ));
             ask_coverage();
@@ -1242,8 +1242,8 @@ mod tests {
     fn the_decision_refuses_a_commit_other_than_the_one_the_changes_tab_shows() {
         let a = "a".repeat(40);
         let b = "b".repeat(40);
-        // A tab that shows no commit has nothing to disagree with.
-        assert!(viewed_matches(None, Some(&a)));
+        // A tab that shows no commit does not match a commit to approve.
+        assert!(!viewed_matches(None, Some(&a)));
         assert!(viewed_matches(None, None));
         assert!(viewed_matches(Some(&a), Some(&a)));
         assert!(!viewed_matches(Some(&a), Some(&b)));

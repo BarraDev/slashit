@@ -379,6 +379,13 @@ pub fn TaskDrawer(
         }
         current
     });
+    // Approval needs the committed changes on screen, so load them as soon as the
+    // task is in Human Review. A failed load stays an error and is not retried in a loop.
+    Effect::new(move |_| {
+        if status.get() == Some(TaskStatus::HumanReview) && changes.with(Option::is_none) {
+            load_changes();
+        }
+    });
     // A task that no longer has changes to show falls back to its output.
     Effect::new(move |_| {
         if !actions.get().changes && tab.get_untracked() == Tab::Changes {
