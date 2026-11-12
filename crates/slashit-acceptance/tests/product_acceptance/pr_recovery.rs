@@ -10,7 +10,7 @@
 //! recorded, and the refs in the fixture's `origin`.
 
 use super::human_review::{
-    attribute, await_task, click, install_fakes, open_reviewed_drawer, persisted_review, read_task,
+    attribute, await_approval, await_task, click, install_fakes, open_reviewed_drawer, persisted_review, read_task,
     HR_APPROVE, HR_DELIVERY, HR_RETRY_PR,
 };
 use super::*;
@@ -102,6 +102,7 @@ async fn leave_the_request_unanswered(
 ) -> Result<ExecutedTask> {
     let executed = execute_one_task(driver, agent, repository).await?;
     open_reviewed_drawer(driver, &executed).await?;
+    await_approval(driver, HR_APPROVE, "Approve & Create PR").await?;
     click(driver, HR_APPROVE, "Approve & Create PR").await?;
 
     let task = await_task(driver, &executed, "an unanswered request", |t| unconfirmed(t).is_some()).await?;

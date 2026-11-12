@@ -200,6 +200,61 @@ pub(super) async fn click(driver: &WebDriver, selector: &str, what: &str) -> Res
         .with_context(|| format!("could not press {what}"))
 }
 
+/// Wait until an approval control is shown and enabled, and return its label.
+///
+/// The label is not readiness: the controls stay disabled until the commit to
+/// approve is read, so a click on a label that already reads right does
+/// nothing. Read the control's state, not only its text.
+pub(super) async fn await_approval(driver: &WebDriver, selector: &str, what: &str) -> Result<String> {
+    slashit_acceptance::ui::await_enabled(what, EXECUTION_DEADLINE, POLL, || approval_reading(driver, selector)).await
+}
+
+async fn approval_reading(driver: &WebDriver, selector: &str) -> Result<slashit_acceptance::ui::ControlReading> {
+    // One read of the page, so a re-rendered button cannot fail the wait with a
+    // stale element between its fields.
+    let reading = page(
+        driver,
+        "const c = document.querySelector(arguments[0]);
+         const text = (s) => { const e = document.querySelector(s); return e ? e.textContent : null; };
+         return {
+            label: c ? c.textContent : '',
+            shown: !!c && c.getClientRects().length > 0,
+            enabled: !!c && !c.disabled,
+            commit: text(arguments[1]),
+            commitError: text(arguments[2]),
+            actionError: text(arguments[3]),
+         };",
+        vec![
+            Value::String(selector.to_owned()),
+            Value::String("[data-testid=\"human-review-approval-commit\"]".to_owned()),
+            Value::String("[data-testid=\"human-review-commit-error\"]".to_owned()),
+            Value::String(HR_ERROR.to_owned()),
+        ],
+    )
+    .await?;
+    let field = |name: &str| reading.get(name).cloned().unwrap_or(Value::Null);
+    // Page text can be a long backend error; a failure report must stay short.
+    let bounded = |name: &str| {
+        let text = field(name).to_string();
+        if text.chars().count() > 300 {
+            format!("{}...", text.chars().take(300).collect::<String>())
+        } else {
+            text
+        }
+    };
+    Ok(slashit_acceptance::ui::ControlReading {
+        label: field("label").as_str().unwrap_or_default().to_owned(),
+        shown: field("shown").as_bool().unwrap_or(false),
+        enabled: field("enabled").as_bool().unwrap_or(false),
+        context: format!(
+            "Commit shown: {}. Commit error: {}. Action error: {}.",
+            bounded("commit"),
+            bounded("commitError"),
+            bounded("actionError")
+        ),
+    })
+}
+
 async fn await_gone(driver: &WebDriver, selector: &str, what: &str) -> Result<()> {
     let started = Instant::now();
     while count(driver, selector).await? != 0 {
@@ -280,7 +335,7 @@ async fn approve_and_open_the_pull_request(
     if verdict.contains("Rejected") || verdict.contains("FixesApplied") {
         bail!("the AI review is shown as a raw status: {verdict:?}");
     }
-    let approve_label = await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
+    let approve_label = await_approval(driver, HR_APPROVE, "the approve action").await?;
     if approve_label != "Approve & Create PR" || attribute(driver, HR_APPROVE, "data-creates-pr").await?.as_deref() != Some("true") {
         bail!("a GitHub project should offer Approve & Create PR, the drawer offers {approve_label:?}");
     }
@@ -402,7 +457,10 @@ async fn approve_while_github_fails(
     let executed = execute_one_task(driver, agent, repository).await?;
     let main_before = repository.branch_tip("main")?;
     open_reviewed_drawer(driver, &executed).await?;
-    await_text(driver, HR_APPROVE, |t| t == "Approve & Create PR", "Approve & Create PR").await?;
+    let label = await_approval(driver, HR_APPROVE, "Approve & Create PR").await?;
+    if label != "Approve & Create PR" {
+        bail!("the drawer offers {label:?}, not Approve & Create PR");
+    }
 
     click(driver, HR_APPROVE, "Approve & Create PR").await?;
 
@@ -511,7 +569,7 @@ async fn approve_without_github(
     let origin_main_before = repository.origin_tip("main")?;
 
     open_reviewed_drawer(driver, &executed).await?;
-    let label = await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
+    let label = await_approval(driver, HR_APPROVE, "the approve action").await?;
     if label != "Approve" || attribute(driver, HR_APPROVE, "data-creates-pr").await?.as_deref() != Some("false") {
         bail!("without GitHub the drawer should offer a plain Approve, it offers {label:?}");
     }
@@ -985,7 +1043,7 @@ async fn complete_approved_changes_locally(
 
     // Nothing to complete until someone has approved.
     open_reviewed_drawer(driver, &executed).await?;
-    await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
+    await_approval(driver, HR_APPROVE, "the approve action").await?;
     assert_not_offered(driver, HR_COMPLETE_LOCALLY, "Complete locally before any decision").await?;
     let refusal = ui::invoke_expecting_refusal(driver, "complete_task_locally", json!({ "taskId": executed.id })).await?;
     if !refusal.contains("Approve the changes") {
@@ -1182,6 +1240,7 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
         &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "moved"],
     )?;
     let moved = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    await_approval(driver, HR_APPROVE, "the approve action before the move is read").await?;
     click(driver, HR_APPROVE, "Approve while the branch has moved").await?;
     ui::visible(driver, HR_ERROR).await.context("a moved branch was approved or silently ignored")?;
     await_text(driver, HR_CURRENT_COMMIT, |t| t.contains(&moved), "the panel to read the moved branch").await?;

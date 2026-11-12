@@ -9,8 +9,8 @@
 //! merge commit, and the bare `origin`, which must never be pushed to.
 
 use super::human_review::{
-    attribute, await_task, click, install_fakes, open_reviewed_drawer, read_task, HR_APPROVE, HR_APPROVED, HR_DELIVERY,
-    HR_RETRY_PR,
+    attribute, await_approval, await_task, click, install_fakes, open_reviewed_drawer, read_task, HR_APPROVE, HR_APPROVED,
+    HR_DELIVERY, HR_RETRY_PR,
 };
 use super::needs_you::{await_header, await_rail, await_reason};
 use super::task_runs::{branch_name_of, create_task, git_is_ancestor, git_out, register_project, run_to_review};
@@ -143,11 +143,12 @@ async fn approve_and_complete_locally(
 ) -> Result<()> {
     open_board(driver, &task.project_id).await?;
     open_reviewed_drawer(driver, task).await?;
-    await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
     if local {
+        await_approval(driver, HR_APPROVE_LOCAL, "the local approval").await?;
         dismiss_toasts(driver).await?;
         click(driver, HR_APPROVE_LOCAL, "Approve for local delivery").await?;
     } else {
+        await_approval(driver, HR_APPROVE, "the approve action").await?;
         dismiss_toasts(driver).await?;
         click(driver, HR_APPROVE, "Approve").await?;
     }
@@ -463,11 +464,11 @@ async fn deliver_locally_in_a_github_project(
     // --- The default is unchanged; the local approval is a named second choice
     open_board(driver, &project_id).await?;
     open_reviewed_drawer(driver, &executed).await?;
-    let label = await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
+    let label = await_approval(driver, HR_APPROVE, "the approve action").await?;
     if label != "Approve & Create PR" {
         bail!("the default approval of a GitHub project reads {label:?}");
     }
-    let local = await_text(driver, HR_APPROVE_LOCAL, |t| !t.is_empty(), "the local approval").await?;
+    let local = await_approval(driver, HR_APPROVE_LOCAL, "the local approval").await?;
     if local != "Approve for local delivery" {
         bail!("the local approval reads {local:?}");
     }
@@ -962,7 +963,7 @@ async fn complete_and_integrate_from_review(driver: &WebDriver, repository: &Git
     // --- Approve; both local alternatives are offered side by side ------------
     open_board(driver, &project_id).await?;
     open_reviewed_drawer(driver, &executed).await?;
-    await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
+    await_approval(driver, HR_APPROVE, "the approve action").await?;
     dismiss_toasts(driver).await?;
     click(driver, HR_APPROVE, "Approve").await?;
     ui::visible(driver, HR_APPROVED).await.context("the drawer does not say Approved")?;
@@ -1133,7 +1134,7 @@ async fn stale_confirmation(driver: &WebDriver, repository: &GitFixture) -> Resu
 
     open_board(driver, &project_id).await?;
     open_reviewed_drawer(driver, &executed).await?;
-    await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
+    await_approval(driver, HR_APPROVE, "the approve action").await?;
     dismiss_toasts(driver).await?;
     click(driver, HR_APPROVE, "Approve").await?;
     ui::visible(driver, HR_APPROVED).await.context("the drawer does not say Approved")?;
