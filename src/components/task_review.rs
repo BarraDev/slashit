@@ -300,6 +300,9 @@ pub fn HumanReviewPanel(
     // whenever the task record changes, so a branch that moved is not shown
     // as approved.
     let coverage = RwSignal::new(None::<ApprovalStatus>);
+    // Kept apart from `error`, which an action clears: a failed read clears
+    // itself when a later read succeeds.
+    let coverage_error = RwSignal::new(None::<String>);
     let asked = StoredValue::new(0u32);
     // Asks what the branch is now. Only the latest question's answer is kept.
     let ask_coverage = move || {
@@ -312,12 +315,13 @@ pub fn HumanReviewPanel(
             match answer {
                 Ok(status) => {
                     coverage.try_set(Some(status));
+                    coverage_error.try_set(None);
                 }
                 // Without a current answer there is no commit to approve, so the
                 // earlier one must not keep the controls enabled.
                 Err(e) => {
                     coverage.try_set(None);
-                    error.try_set(Some(format!("The branch's current commit could not be read, so it cannot be approved yet: {e}")));
+                    coverage_error.try_set(Some(format!("The branch's current commit could not be read, so it cannot be approved yet: {e}")));
                 }
             }
         });
@@ -929,6 +933,9 @@ pub fn HumanReviewPanel(
                 } })}
             </Show>
 
+            {move || coverage_error.get().map(|e| view! {
+                <p data-testid="human-review-commit-error" class="text-xs text-red-300 whitespace-pre-wrap break-words">{e}</p>
+            })}
             {move || error.get().map(|e| view! {
                 <p data-testid="human-review-error" class="text-xs text-red-300 whitespace-pre-wrap break-words">{e}</p>
             })}
