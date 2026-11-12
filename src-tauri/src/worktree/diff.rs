@@ -104,16 +104,26 @@ pub async fn committed_task_diff(
     base: &str,
     approved: &str,
 ) -> Result<TaskDiff, TaskDiffError> {
-    for oid in [base, approved] {
-        if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(TaskDiffError::Failed(
-                "the recorded diff commit is not a full Git object ID".into(),
-            ));
-        }
-    }
+    require_full_oid(base)?;
+    require_full_oid(approved)?;
     let patch = run_git(repo, &["diff", base, approved, "--"]).await?;
     let stat = run_git(repo, &["diff", "--stat", base, approved, "--"]).await?;
     Ok(TaskDiff { patch, stat })
+}
+
+/// What a Task Checkout holds that `commit` does not: staged, unstaged and
+/// untracked edits. While a person decides on `commit`, these are shown apart
+/// from it, because approving covers the commit and not them.
+pub async fn pending_task_diff(working_dir: &str, commit: &str) -> Result<TaskDiff, TaskDiffError> {
+    require_full_oid(commit)?;
+    git_task_diff(working_dir, commit).await
+}
+
+fn require_full_oid(oid: &str) -> Result<(), TaskDiffError> {
+    if matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    Err(TaskDiffError::Failed("the recorded diff commit is not a full Git object ID".into()))
 }
 
 async fn jj_task_diff(working_dir: &str) -> Option<TaskDiff> {

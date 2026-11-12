@@ -2836,6 +2836,7 @@ fn KanbanTaskCard(
                         column_status,
                         TaskStatus::AiReview | TaskStatus::HumanReview | TaskStatus::Done | TaskStatus::PrCreated
                     );
+                    let in_review = column_status == TaskStatus::HumanReview;
                     show_diff.then(|| {
                         let task_id = task.id.to_string();
                         let task_title = task.title.clone();
@@ -2849,6 +2850,28 @@ fn KanbanTaskCard(
                                         let task_title = task_title.clone();
                                         spawn_local(async move {
                                             diff_title.set(format!("Diff: {}", task_title));
+                                            // In Human Review the approval covers the branch commit, so show that commit and
+                                            // say which edits in the checkout are not part of it.
+                                            if in_review {
+                                                match crate::services::human_review_service::get_task_review_changes(task_id.clone()).await {
+                                                    Ok(Some(review)) => {
+                                                        let short: String = review.tip.chars().take(12).collect();
+                                                        let notice = crate::components::task_drawer::pending_summary(&review.pending_patch, &review.pending_stat)
+                                                            .map(|n| format!(" \u{2014} {n}"))
+                                                            .unwrap_or_default();
+                                                        diff_title.set(format!("Diff: {} (commit {}){}", task_title, short, notice));
+                                                        diff_content.set(review.patch);
+                                                        diff_stat_content.set(review.stat);
+                                                        show_diff_modal.set(true);
+                                                        return;
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(e) => {
+                                                        toast::error(format!("Failed to load diff: {}", e));
+                                                        return;
+                                                    }
+                                                }
+                                            }
                                             // Fetch diff and stat in parallel
                                             let diff_fut = get_task_diff(task_id.clone());
                                             let stat_fut = get_task_diff_stat(task_id);

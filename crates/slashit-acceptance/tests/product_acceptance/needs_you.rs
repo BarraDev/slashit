@@ -9,7 +9,7 @@
 //! sends.
 
 use super::human_review::{
-    attribute, await_task, click, install_fakes, open_reviewed_drawer, persisted_review, read_task,
+    attribute, await_approval, await_task, click, install_fakes, open_reviewed_drawer, persisted_review, read_task,
     HR_APPROVE, HR_APPROVED, HR_DELIVERY, HR_FEEDBACK, HR_REQUEST_CHANGES, HR_RETRY_PR,
     HR_SEND_FEEDBACK, FEEDBACK,
 };
@@ -364,7 +364,10 @@ async fn fail_delivery_twice(
     await_header(driver, 1).await?;
 
     open_reviewed_drawer(driver, &executed).await?;
-    await_text(driver, HR_APPROVE, |t| t == "Approve & Create PR", "Approve & Create PR").await?;
+    let label = await_approval(driver, HR_APPROVE, "Approve & Create PR").await?;
+    if label != "Approve & Create PR" {
+        bail!("the drawer offers {label:?}, not Approve & Create PR");
+    }
     click(driver, HR_APPROVE, "Approve & Create PR").await?;
 
     // While the attempt runs: Creating PR, and nothing asked of the user.
@@ -554,7 +557,10 @@ async fn decide_twice(driver: &WebDriver, agent: &FakeAgent, repository: &GitFix
     await_reason(driver, &executed.id, Some("review")).await?;
     await_header(driver, 1).await?;
 
-    await_text(driver, HR_APPROVE, |t| t == "Approve", "Approve").await?;
+    let label = await_approval(driver, HR_APPROVE, "Approve").await?;
+    if label != "Approve" {
+        bail!("the drawer offers {label:?}, not Approve");
+    }
     click(driver, HR_APPROVE, "Approve").await?;
     ui::visible(driver, HR_APPROVED).await.context("the approval was not shown")?;
     await_header(driver, 0).await?;

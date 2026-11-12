@@ -489,6 +489,7 @@ pub fn run() {
             list_sessions,
             get_task_diff,
             get_task_diff_stat,
+            get_task_review_changes,
             get_queue_config,
             update_queue_config,
             add_to_queue,
