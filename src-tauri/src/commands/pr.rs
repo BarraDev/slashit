@@ -1908,22 +1908,29 @@ async fn ensure_dirt_is_plan_owned(
     let mut allowed: std::collections::HashMap<String, Vec<Option<String>>> =
         std::collections::HashMap::new();
     if !dirty.is_empty() {
-        // The plan's own edits to a dirty path start from the committed content.
-        // An owed edit that starts from something else (a failed fix's leftover,
-        // which a later fix built on) is not the plan's, so its path is refused.
-        let mut anchored = std::collections::HashSet::new();
+        // Every owed edit to a dirty path must start from content the plan
+        // explains: the committed blob, or what another owed edit to that path
+        // left (the plan's items may run in any order across applies). A failed
+        // fix's leftover explains nothing, so an edit built on it is refused.
+        let mut steps: Vec<(String, Option<String>, Option<String>)> = Vec::new();
         for effect in plan.items.iter().filter(|i| owes_a_commit(i)).filter_map(|i| i.fix_effect.as_ref()) {
             for path in tree_paths(working_dir, &effect.before_tree, &effect.after_tree)
                 .await
                 .map_err(unreadable)?
             {
-                if dirty.contains(&path) && anchored.insert(path.clone()) {
-                    let head = blob_at(working_dir, &clean_tree, &path).await.map_err(unreadable)?;
+                if dirty.contains(&path) {
                     let before = blob_at(working_dir, &effect.before_tree, &path).await.map_err(unreadable)?;
-                    if before != head {
-                        return Err(unowned_edits_refusal());
-                    }
+                    let after = blob_at(working_dir, &effect.after_tree, &path).await.map_err(unreadable)?;
+                    steps.push((path, before, after));
                 }
+            }
+        }
+        for (path, before, _) in &steps {
+            let head = blob_at(working_dir, &clean_tree, path).await.map_err(unreadable)?;
+            let explained = *before == head
+                || steps.iter().any(|(other, _, after)| other == path && after == before);
+            if !explained {
+                return Err(unowned_edits_refusal());
             }
         }
         let owed = plan.items.iter().filter(|i| owes_a_commit(i)).filter_map(|i| i.fix_effect.as_ref());
@@ -20065,6 +20072,136 @@ mod tests {
                     git(&worktree, &["status", "--porcelain"]).contains("shared.txt"),
                     "the residue stays in the checkout"
                 );
+            }
+
+            /// A fix that builds on a failed fix's residue is refused even when
+            /// an earlier successful fix on the same file starts from the
+            /// committed content: only the residue's own edit can explain it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_built_on_residue_behind_an_earlier_fix_publishes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let claude = EditingClaude::install_editing(
+                    "case \"$n\" in 1) printf 'b\\n' >> shared.txt ;; 2) printf 'partial\\n' > shared.txt; exit 1 ;; *) printf 'c\\n' >> shared.txt ;; esac",
+                    true,
+                );
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let mut plan = with_second_item(plan, Some(2));
+                plan.items.push(fix_item(3));
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(!first.pushed, "the withheld apply pushes nothing: {first:?}");
+                assert_eq!(claude.runs(), 3, "B, A, then C ran: {first:?}");
+
+                let mut plan = plan;
+                plan.items[1].approved = false;
+                let error = match apply_observed(&task, plan, &worktree, no_jj, false, no_progress()).await {
+                    Err(error) => error,
+                    Ok((second, _)) => panic!("the residue must refuse the apply: {second:?}"),
+                };
+                assert!(error.contains("none of this plan's fixes made"), "{error}");
+                assert_eq!(claude.runs(), 3, "no fix agent runs again");
+                assert_eq!(git(&worktree, &["rev-parse", "task-branch"]), tip, "the branch did not move");
+                assert!(repo.remote_has_branch("task-branch").is_none(), "nothing may be pushed");
+            }
+
+            /// Items that run out of plan order across applies still publish:
+            /// the first item's retry starts from the second item's committed
+            /// edit, which is content the plan explains.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn items_on_one_file_applied_out_of_plan_order_are_published() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install_editing(
+                    "case \"$n\" in 1) exit 1 ;; 2) printf 'b\\n' >> shared.txt ;; *) printf 'a\\n' >> shared.txt ;; esac",
+                    true,
+                );
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let plan = with_second_item(plan, Some(2));
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(!first.pushed, "{first:?}");
+                assert_eq!(claude.runs(), 2, "A failed, then B ran: {first:?}");
+
+                let (second, _plan) = apply(&task, plan, &worktree, no_jj, false).await;
+                assert_eq!(claude.runs(), 3, "only A runs again: {second:?}");
+                assert!(second.pushed, "{:?}", second.push_error);
+                assert_eq!(git(&worktree, &["status", "--porcelain"]), "", "both fixes are committed");
+                assert!(remote_branch_has_file(&repo, "review-fix-2.txt"), "B is pushed");
+                assert!(remote_branch_has_file(&repo, "review-fix-3.txt"), "A's retry is pushed");
+            }
+
+            /// A failed fix whose partial edit is still in the checkout is
+            /// approved again without cleanup. Its rerun would build on that
+            /// edit, so the apply refuses before the agent runs and publishes
+            /// nothing.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn rerunning_a_failed_fix_over_its_own_leftover_publishes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let claude = EditingClaude::install_editing(
+                    "if [ \"$n\" -eq 1 ]; then printf 'partial\\n' > shared.txt; exit 1; fi; printf 'b\\n' >> shared.txt",
+                    true,
+                );
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(!first.pushed, "{first:?}");
+                assert_eq!(claude.runs(), 1, "{first:?}");
+
+                let error = match apply_observed(&task, plan, &worktree, no_jj, false, no_progress()).await {
+                    Err(error) => error,
+                    Ok((second, _)) => panic!("the leftover must refuse the rerun: {second:?}"),
+                };
+                assert!(error.contains("none of this plan's fixes made"), "{error}");
+                assert_eq!(claude.runs(), 1, "no fix agent runs again");
+                assert_eq!(git(&worktree, &["rev-parse", "task-branch"]), tip, "the branch did not move");
+                assert!(repo.remote_has_branch("task-branch").is_none(), "nothing is pushed");
+                assert!(
+                    git(&worktree, &["status", "--porcelain"]).contains("shared.txt"),
+                    "the leftover stays in the checkout"
+                );
+            }
+
+            /// A fix that deletes a tracked file and makes another one
+            /// executable is committed and pushed as the fix made it: the
+            /// owed-edit check accepts the deletion and the mode change.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_that_deletes_a_file_and_changes_a_mode_is_committed_and_pushed() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                std::fs::write(worktree.join("old.txt"), "old\n").unwrap();
+                std::fs::write(worktree.join("run.sh"), "echo\n").unwrap();
+                git(&worktree, &["add", "old.txt", "run.sh"]);
+                git(
+                    &worktree,
+                    &["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "add files"],
+                );
+                let claude = EditingClaude::install_editing("rm -f old.txt; chmod +x run.sh", true);
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (result, _plan) = apply(&task, plan, &worktree, no_jj, false).await;
+                assert_eq!(claude.runs(), 1, "{result:?}");
+                assert!(result.pushed, "{:?}", result.push_error);
+                assert_eq!(git(&worktree, &["status", "--porcelain"]), "", "the fix is committed");
+                assert!(remote_branch_has_file(&repo, "review-fix-1.txt"), "the fix is pushed");
+                assert!(!remote_branch_has_file(&repo, "old.txt"), "the deletion is pushed");
+                let mode = git(&worktree, &["ls-tree", "task-branch", "--", "run.sh"]);
+                assert!(mode.starts_with("100755 "), "the mode change is committed: {mode}");
             }
 
             /// Once the checkout is safe again, the next apply runs only the
