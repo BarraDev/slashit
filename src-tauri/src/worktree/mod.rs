@@ -23,7 +23,7 @@ pub use default_base::{resolve_default_base, ResolvedBase};
 pub use commit::{
     checkout_has_work, checkout_head_commit, checkout_snapshot, commit_checkout, CheckoutCommit,
 };
-pub use diff::{committed_task_diff, task_diff, TaskDiff, TaskDiffError};
+pub use diff::{committed_task_diff, pending_task_diff, task_diff, TaskDiff, TaskDiffError};
 pub use manager::{
     carries_locked_registration_notice, locked_registration_notice, CheckoutRegistration,
     CheckoutState, WorktreeInfo, WorktreeManager, WorktreeRecovery,

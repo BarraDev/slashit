@@ -26,6 +26,7 @@ use crate::components::task_review::{AiReviewSection, HumanReviewPanel};
 use crate::components::toast;
 use crate::models::{AgentStatus, LogLevel, Task, TaskPhase, TaskRunSnapshot, TaskStatus};
 use crate::services::task_run_service::{get_task_run, listen_agent_events, stop_task_execution};
+use crate::services::human_review_service::{get_task_review_changes, ReviewChanges};
 use crate::services::{enqueue_task, get_task_diff, get_task_diff_stat, promoted_message, run_queued_task, EnqueueOutcome, RunNowOutcome};
 
 /// The most output entries the drawer renders. The backend keeps more; this
@@ -295,21 +296,70 @@ pub fn TaskDrawer(
     let tab = RwSignal::new(Tab::Output);
     // Loaded when the Changes tab is opened, and again if the task moves on
     // while it is open (an AI review fix changes the code).
-    let changes = RwSignal::new(None::<Result<(String, String), String>>);
+    let changes = RwSignal::new(None::<Result<ChangesView, String>>);
+    // The commit the loaded changes are for, shared with the decision panel so
+    // it can refuse to approve a commit other than the one on screen.
+    let viewed_tip = RwSignal::new(None::<String>);
+    // Only the latest question's answer is kept: a load that was overtaken (the
+    // task moved on, or the panel asked for a fresh one) must not put its older
+    // picture, or the end of its guard, back.
+    let generation = StoredValue::new(0u32);
     let load_changes = move || {
+        let reviewing = status.get_untracked() == Some(TaskStatus::HumanReview);
+        let mine = generation.try_update_value(|n| { *n += 1; *n }).unwrap_or(0);
         spawn_local(async move {
-            let loaded = match get_task_diff(task_id.to_string()).await {
-                Ok(diff) => {
-                    let stat = get_task_diff_stat(task_id.to_string())
-                        .await
-                        .unwrap_or_default();
-                    Ok((diff, stat))
+            let current = move || generation.try_get_value() == Some(mine);
+            let review = if reviewing {
+                match get_task_review_changes(task_id.to_string()).await {
+                    Ok(review) => review,
+                    Err(e) => {
+                        if current() {
+                            viewed_tip.try_set(None);
+                            changes.try_set(Some(Err(e)));
+                        }
+                        return;
+                    }
                 }
-                Err(e) => Err(e),
+            } else {
+                None
             };
-            changes.try_set(Some(loaded));
+            let loaded = match review {
+                Some(review) => Ok(ChangesView {
+                    diff: review.patch.clone(),
+                    stat: review.stat.clone(),
+                    review: Some(review),
+                }),
+                None => match get_task_diff(task_id.to_string()).await {
+                    Ok(diff) => {
+                        let stat = get_task_diff_stat(task_id.to_string())
+                            .await
+                            .unwrap_or_default();
+                        Ok(ChangesView { diff, stat, review: None })
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+            if current() {
+                viewed_tip.try_set(loaded.as_ref().ok().and_then(|v| v.review.as_ref().map(|r| r.tip.clone())));
+                changes.try_set(Some(loaded));
+            }
         });
     };
+    // Drops the picture. While the Changes tab is open it is read again and the
+    // old tip stays the guard until the new picture arrives, so the panel keeps
+    // refusing a commit the person has not seen. With another tab open nothing
+    // is on screen, so there is nothing to guard.
+    let invalidate_changes = move || {
+        changes.set(None);
+        if tab.get_untracked() == Tab::Changes {
+            load_changes();
+        } else {
+            generation.update_value(|n| *n += 1);
+            viewed_tip.set(None);
+        }
+    };
+    // Read again after the decision panel found the tab out of date.
+    let reload_changes = Callback::new(move |()| invalidate_changes());
     let open_changes = move |_| {
         tab.set(Tab::Changes);
         if changes.get_untracked().is_none() {
@@ -319,10 +369,7 @@ pub fn TaskDrawer(
     Effect::new(move |previous: Option<Option<TaskStatus>>| {
         let current = status.get();
         if previous.is_some_and(|p| p != current) {
-            changes.set(None);
-            if tab.get_untracked() == Tab::Changes {
-                load_changes();
-            }
+            invalidate_changes();
         }
         current
     });
@@ -550,7 +597,7 @@ pub fn TaskDrawer(
                                 || t.completed_locally()
                         }))
                     }>
-                        <HumanReviewPanel task_id=task_id task=task apply_task=apply_task />
+                        <HumanReviewPanel task_id=task_id task=task apply_task=apply_task viewed_tip=viewed_tip on_stale=reload_changes />
                     </Show>
 
                     // A request to open the pull request that was never answered, and
@@ -624,7 +671,10 @@ pub fn TaskDrawer(
                                 {move || match changes.get() {
                                     None => view! { <p class="text-xs text-white/40">"Loading changes…"</p> }.into_any(),
                                     Some(Err(e)) => view! { <p class="text-xs text-red-300">{format!("Could not load the changes: {e}")}</p> }.into_any(),
-                                    Some(Ok((diff, stat))) => view! { <DiffViewer diff=diff stat=stat /> }.into_any(),
+                                    Some(Ok(ChangesView { diff, stat, review })) => view! {
+                                        {review.map(|r| view! { <ReviewScope review=r /> })}
+                                        <DiffViewer diff=diff stat=stat />
+                                    }.into_any(),
                                 }}
                             </div>
                         </Show>
@@ -783,6 +833,55 @@ fn phase_label(phase: &TaskPhase) -> &'static str {
     }
 }
 
+/// What the Changes tab shows: the diff, and, in Human Review, the commit it is for.
+#[derive(Clone)]
+struct ChangesView {
+    diff: String,
+    stat: String,
+    review: Option<ReviewChanges>,
+}
+
+/// Names the commit the diff below is, and lists edits the checkout holds that
+/// it does not contain. The person approves the commit, not those edits.
+#[component]
+fn ReviewScope(review: ReviewChanges) -> impl IntoView {
+    let summary = pending_summary(&review.pending_patch, &review.pending_stat);
+    let short: String = review.tip.chars().take(12).collect();
+    view! {
+        <div data-testid="review-changes-scope" class="mb-2 space-y-2">
+            <p class="text-xs text-white/60">
+                "Showing the changes up to commit "
+                <code data-testid="review-changes-commit" class="font-mono text-white/80">{short}</code>
+                ", the commit an approval records."
+            </p>
+            {summary.map(|summary| view! {
+                <details data-testid="review-changes-pending" class="rounded-md border border-amber-500/20 bg-amber-500/[0.06] p-2">
+                    <summary class="text-xs text-amber-200 cursor-pointer">{summary}</summary>
+                    <div class="mt-2">
+                        <DiffViewer diff=review.pending_patch.clone() stat=review.pending_stat.clone() />
+                    </div>
+                </details>
+            })}
+        </div>
+    }
+}
+
+/// The notice for edits the checkout holds that the commit does not. Empty,
+/// binary and oversized untracked files leave a stat line or a marker but no
+/// `diff --git` header, so either part counts as something to list.
+pub fn pending_summary(pending_patch: &str, pending_stat: &str) -> Option<String> {
+    let files = pending_patch.lines().filter(|l| l.starts_with("diff --git ")).count();
+    if files == 0 && pending_patch.trim().is_empty() && pending_stat.trim().is_empty() {
+        return None;
+    }
+    let what = match files {
+        0 => "Uncommitted changes in the checkout".to_string(),
+        1 => "1 file with uncommitted changes in the checkout".to_string(),
+        n => format!("{n} files with uncommitted changes in the checkout"),
+    };
+    Some(format!("{what}. They are not part of this commit and are not approved."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,5 +1011,18 @@ mod tests {
         task.worker_handoff = None;
         let note = no_ai_review_note(&task);
         assert_eq!(note, "No AI Review ran for these changes. Nothing has been approved by AI.");
+    }
+
+    #[test]
+    fn uncommitted_edits_are_noticed_even_when_they_leave_no_diff_header() {
+        assert_eq!(pending_summary("", ""), None);
+        assert_eq!(pending_summary("\n", " \n"), None);
+        let one = pending_summary("diff --git a/x b/x\n+1\n", "").unwrap();
+        assert!(one.starts_with("1 file with uncommitted") && one.contains("not approved"), "{one}");
+        let two = "diff --git a/x b/x\n+1\ndiff --git a/y b/y\n+2\n+diff --git not a header\n";
+        assert!(pending_summary(two, "").unwrap().starts_with("2 files with"));
+        // An empty untracked file: a stat line, no header.
+        let empty = pending_summary("", " empty.txt | 0\n").unwrap();
+        assert!(empty.starts_with("Uncommitted changes in the checkout"), "{empty}");
     }
 }

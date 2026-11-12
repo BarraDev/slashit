@@ -242,6 +242,13 @@ fn displayed_tip(status: Option<&ApprovalStatus>) -> Option<String> {
         .and_then(|s| s.branch_tip.clone())
 }
 
+/// Whether the commit the Changes tab shows is the one an approval would cover.
+/// A tab that shows no commit (not opened, or not a reviewed checkout) has
+/// nothing to disagree with.
+fn viewed_matches(viewed: Option<&str>, shown: Option<&str>) -> bool {
+    viewed.is_none() || viewed == shown
+}
+
 /// Whether the approve controls may be used. Approval needs the pull request
 /// answer. A task that is not loaded cannot be approved. A task with a branch
 /// also needs the commit on screen, because the backend records only the commit
@@ -263,6 +270,10 @@ pub fn HumanReviewPanel(
     #[prop(into)] task: Signal<Option<Task>>,
     /// Apply a task record a command returned.
     apply_task: Callback<Task>,
+    /// The commit the Changes tab is showing, when it shows one.
+    viewed_tip: RwSignal<Option<String>>,
+    /// Asked when the Changes tab shows a commit other than the one to approve.
+    on_stale: Callback<()>,
 ) -> impl IntoView {
     let availability = RwSignal::new(None::<PrAvailability>);
     spawn_local(async move {
@@ -323,8 +334,23 @@ pub fn HumanReviewPanel(
             coverage.with(|c| displayed_tip(c.as_ref())).is_some(),
         )
     };
+    // The approval covers `shown`. If the Changes tab was read at another commit, what
+    // the person looked at is not what they would approve: refuse, and refresh it.
+    let diverged = move |shown: Option<&str>| {
+        let viewed = viewed_tip.get_untracked();
+        let diverged = !viewed_matches(viewed.as_deref(), shown);
+        if diverged {
+            error.set(Some(
+                "The Changes tab shows a different commit than the one this would approve. It has been reloaded; look at it again before approving."
+                    .to_string(),
+            ));
+            ask_coverage();
+            on_stale.run(());
+        }
+        diverged
+    };
     let approve_current_branch = move |tip: String| {
-        if busy.get_untracked() {
+        if busy.get_untracked() || diverged(Some(&tip)) {
             return;
         }
         busy.set(true);
@@ -365,7 +391,9 @@ pub fn HumanReviewPanel(
     };
 
     let approve = move |create_pr: bool| {
-        if busy.get_untracked() {
+        // The commit on screen. The approval covers that commit and no other.
+        let shown = displayed_tip(coverage.get_untracked().as_ref());
+        if busy.get_untracked() || diverged(shown.as_deref()) {
             return;
         }
         busy.set(true);
@@ -375,8 +403,6 @@ pub fn HumanReviewPanel(
                 d.begin(task_id);
             }
         }
-        // The commit on screen. The approval covers that commit and no other.
-        let shown = displayed_tip(coverage.get_untracked().as_ref());
         spawn_local(async move {
             let attempted = match approve_task(task_id.to_string(), create_pr, shown).await {
                 Ok(outcome) => {
@@ -613,7 +639,7 @@ pub fn HumanReviewPanel(
 
             // Undecided: the decision itself.
             <Show when=move || in_review.get() && decision.get().is_none()>
-                <p class="text-xs text-white/50">"Decide on these changes. The diff is in the Changes tab."</p>
+                <p class="text-xs text-white/50">"Decide on these changes. The Changes tab shows the commit you would approve; edits not yet committed are listed apart there and are not approved."</p>
                 // An approval covers the branch commit that is current when the
                 // person approves. Naming the branch shows what that will be.
                 {move || task.with(|t| t.as_ref().and_then(|t| t.branch_name.clone())).map(|branch| view! {
@@ -1210,5 +1236,18 @@ mod tests {
         assert!(approval_ready(true, Some(true), true));
         // A task without a branch has no commit to show.
         assert!(approval_ready(true, Some(false), false));
+    }
+
+    #[test]
+    fn the_decision_refuses_a_commit_other_than_the_one_the_changes_tab_shows() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        // A tab that shows no commit has nothing to disagree with.
+        assert!(viewed_matches(None, Some(&a)));
+        assert!(viewed_matches(None, None));
+        assert!(viewed_matches(Some(&a), Some(&a)));
+        assert!(!viewed_matches(Some(&a), Some(&b)));
+        // The tab shows a commit but none is offered to approve.
+        assert!(!viewed_matches(Some(&a), None));
     }
 }
