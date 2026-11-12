@@ -24,11 +24,23 @@ fn no_worktree_diff(task_id: Uuid) -> String {
 /// The commit an approval would record, while the Task waits for its Human
 /// decision in a checkout. `None` anywhere else, or when the branch tip cannot
 /// be read (an approval is refused then too).
-async fn review_tip(state: &crate::AppState, task: &crate::domain::Task) -> Option<String> {
-    if task.status != crate::domain::TaskStatus::HumanReview || task.worktree_path.is_none() {
-        return None;
+///
+/// A branch whose commit cannot be read is an error: showing the working tree
+/// instead would present content that the approval does not cover.
+async fn review_tip(state: &crate::AppState, task: &crate::domain::Task) -> Result<Option<String>, String> {
+    if task.status != crate::domain::TaskStatus::HumanReview
+        || task.worktree_path.is_none()
+        || task.branch_name.is_none()
+    {
+        return Ok(None);
     }
-    crate::commands::integration::tip_to_approve(state, task).await
+    match crate::commands::pr::task_branch_tip(state, task.id).await? {
+        Some(tip) => Ok(Some(tip)),
+        None => Err(format!(
+            "The commit of Task {}'s branch could not be read, so its changes cannot be shown against the commit an approval would record.",
+            task.id
+        )),
+    }
 }
 
 /// The Task's work up to `tip`, read from Git objects, so it is the same
@@ -72,7 +84,7 @@ pub(crate) async fn fetch_task_diff(
     };
 
     let result = if let Some(wt_path) = task.worktree_path.as_deref() {
-        match review_tip(state, &task).await {
+        match review_tip(state, &task).await? {
             Some(tip) => diff_to_tip(state, &task, &tip).await,
             None => crate::worktree::task_diff(wt_path, task.base_commit.as_deref()).await,
         }
@@ -117,7 +129,10 @@ pub(crate) async fn fetch_review_changes(
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
-    let (Some(tip), Some(wt_path)) = (review_tip(state, &task).await, task.worktree_path.as_deref()) else {
+    let Some(wt_path) = task.worktree_path.as_deref() else {
+        return Ok(None);
+    };
+    let Some(tip) = review_tip(state, &task).await? else {
         return Ok(None);
     };
     let committed = diff_to_tip(state, &task, &tip).await.map_err(|e| describe(task_uuid, e))?;

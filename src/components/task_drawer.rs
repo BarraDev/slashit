@@ -358,8 +358,14 @@ pub fn TaskDrawer(
             viewed_tip.set(None);
         }
     };
-    // Read again after the decision panel found the tab out of date.
-    let reload_changes = Callback::new(move |()| invalidate_changes());
+    // The decision panel found the tab out of date. Open the Changes tab on the
+    // branch's current commit. The old commit stays the guard until it loads, so
+    // nothing can be approved on a picture the person has not seen.
+    let reload_changes = Callback::new(move |()| {
+        changes.set(None);
+        tab.set(Tab::Changes);
+        load_changes();
+    });
     let open_changes = move |_| {
         tab.set(Tab::Changes);
         if changes.get_untracked().is_none() {

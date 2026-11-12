@@ -1505,6 +1505,19 @@ mod tests {
         approve(&local.state, local.task_id, false, Some(&now.tip)).await.expect("the new commit, as shown");
     }
 
+    /// A Task in Human Review whose branch commit cannot be read shows an error,
+    /// never the working tree as if it were the approved commit.
+    #[tokio::test]
+    async fn an_unreadable_review_commit_is_an_error_not_the_working_tree() {
+        let local = local_project().await;
+        {
+            let mut tasks = local.state.task.tasks.write().await;
+            tasks.get_mut(&local.task_id).unwrap().branch_name = Some("no-such-branch".into());
+        }
+        assert!(crate::commands::jj::fetch_review_changes(&local.state, local.task_id).await.is_err());
+        assert!(crate::commands::jj::fetch_task_diff(&local.state, local.task_id).await.is_err());
+    }
+
     #[tokio::test]
     async fn there_are_no_review_changes_outside_human_review() {
         let local = local_project().await;
