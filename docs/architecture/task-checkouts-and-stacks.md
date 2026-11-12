@@ -313,12 +313,15 @@ and a plan's own pending fixes are not affected, and a dry run is not checked. A
 matching analysis fingerprint does not make edits acceptable, because the
 fingerprint binds the checkout as analyzed, edits included.
 
-When a refusal happens between fixes, the fixes that already succeeded in that
-run stay uncommitted in the checkout, and the fixes after the refusal do not run.
-Nothing is reverted or cleaned up by SlashIt.
+When a fix agent fails, the later fixes of the run still run, but only over the
+partial edits that failed fix left; any other edit refuses them. When a refusal
+happens between fixes, the fixes that already succeeded in that run stay
+uncommitted in the checkout, and the fixes after the refusal do not run. Nothing
+is reverted or cleaned up by SlashIt.
 
 Limits: a writer that sets a fix's file to exactly the content the fix left is
-indistinguishable from the fix. A writer that changes the checkout while a fix
+indistinguishable from the fix, and so is a writer that sets a failed fix's
+partial file to exactly what that fix left. A writer that changes the checkout while a fix
 agent runs is not told apart from the agent. An edit made between the final
 check and the commit's own staging is still committed, because the commit takes
 the live checkout. The full policy below is not implemented.

@@ -192,6 +192,22 @@ async fn run_cmd(cmd: &str, args: &[&str], cwd: &str) -> Result<String, String> 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Like `run_cmd`, but keeps the output exactly. A path may begin or end with a
+/// space, and trimming would change it.
+async fn run_cmd_exact(cmd: &str, args: &[&str], cwd: &str) -> Result<String, String> {
+    let output = crate::host_process::tokio_command(program(cmd))
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run {}: {}", cmd, e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("{} failed: {}", cmd, stderr));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn friendly_pr_error(error: String) -> String {
     if error.contains("GH007") || error.contains("private email address") {
         return [
@@ -1825,7 +1841,7 @@ fn owes_a_commit(i: &PrReviewItem) -> bool {
 
 /// The paths that differ between two trees, read from Git.
 async fn tree_paths(working_dir: &str, from: &str, to: &str) -> Result<Vec<String>, String> {
-    let listed = run_cmd(
+    let listed = run_cmd_exact(
         "git",
         &["diff-tree", "-r", "--no-renames", "--name-only", "-z", from, to],
         working_dir,
@@ -1834,16 +1850,19 @@ async fn tree_paths(working_dir: &str, from: &str, to: &str) -> Result<Vec<Strin
     Ok(null_paths(&listed))
 }
 
-/// The blob a tree holds at `path`, or `None` when the tree has no such file.
+/// The file a tree holds at `path` (its mode and blob), or `None` when the tree
+/// has no such file. A mode change alone counts as a different file.
 async fn blob_at(working_dir: &str, tree: &str, path: &str) -> Result<Option<String>, String> {
-    let listed = run_cmd("git", &["ls-tree", "-z", tree, "--", path], working_dir).await?;
+    let listed = run_cmd_exact("git", &["ls-tree", "-z", tree, "--", path], working_dir).await?;
     // One `<mode> SP <type> SP <oid> TAB <path>` record, or nothing.
     Ok(listed
         .split('\0')
         .find(|record| !record.is_empty())
         .and_then(|record| record.split_once('\t'))
-        .and_then(|(meta, _)| meta.split(' ').nth(2))
-        .map(str::to_string))
+        .and_then(|(meta, _)| {
+            let mut fields = meta.split(' ');
+            Some(format!("{} {}", fields.next()?, fields.nth(1)?))
+        }))
 }
 
 /// Refuses to edit or commit over uncommitted edits to paths that no fix of
@@ -1869,6 +1888,7 @@ async fn ensure_dirt_is_plan_owned(
     plan: &PrReviewPlan,
     working_dir: &str,
     snapshot: Result<String, String>,
+    failed_leftovers: &[crate::domain::task::FixEffect],
 ) -> Result<(), String> {
     let unreadable = |e: String| {
         format!(
@@ -1888,7 +1908,8 @@ async fn ensure_dirt_is_plan_owned(
     let mut allowed: std::collections::HashMap<String, Vec<Option<String>>> =
         std::collections::HashMap::new();
     if !dirty.is_empty() {
-        for effect in plan.items.iter().filter(|i| owes_a_commit(i)).filter_map(|i| i.fix_effect.as_ref()) {
+        let owed = plan.items.iter().filter(|i| owes_a_commit(i)).filter_map(|i| i.fix_effect.as_ref());
+        for effect in owed.chain(failed_leftovers.iter()) {
             for path in tree_paths(working_dir, &effect.before_tree, &effect.after_tree)
                 .await
                 .map_err(unreadable)?
@@ -2010,7 +2031,7 @@ pub async fn address_pr_review_inner(
             .any(|&idx| !updated_plan.items[idx].fix_done || owes_a_commit(&updated_plan.items[idx]))
     {
         let snapshot = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
-        ensure_dirt_is_plan_owned(&updated_plan, &working_dir, snapshot)
+        ensure_dirt_is_plan_owned(&updated_plan, &working_dir, snapshot, &[])
             .await
             .map_err(|e| format!("{e} Nothing was changed."))?;
     }
@@ -2027,6 +2048,7 @@ pub async fn address_pr_review_inner(
     // too: a failed agent's own leftovers switch the check off below, a
     // foreign edit must not.
     let mut dirt_refused = false;
+    let mut failed_leftovers: Vec<crate::domain::task::FixEffect> = Vec::new();
     let mut replies_posted = 0u32;
     let mut reply_errors: Vec<String> = Vec::new();
 
@@ -2132,13 +2154,12 @@ pub async fn address_pr_review_inner(
             // the plan's, and no agent runs over it.
             // After a fix agent failed in this apply, its partial edits are in
             // the checkout and nothing is committed or pushed by this apply
-            // (`withheld` below), so the remaining items still run as before.
+            // (`withheld` below). Later items may run over exactly those partial
+            // edits, and over nothing else.
             let launch = if dirt_refused {
                 Err("An earlier check refused this checkout's uncommitted edits, so no fix agent was launched.".to_string())
-            } else if a_fix_failed {
-                Ok(())
             } else {
-                let checked = ensure_dirt_is_plan_owned(&updated_plan, &working_dir, before.clone())
+                let checked = ensure_dirt_is_plan_owned(&updated_plan, &working_dir, before.clone(), &failed_leftovers)
                     .await
                     .map_err(|e| format!("{e} No fix agent was launched. Fixes applied earlier in this run were not committed and remain in the checkout."));
                 dirt_refused = checked.is_err();
@@ -2155,6 +2176,20 @@ pub async fn address_pr_review_inner(
                     )),
                 },
             };
+            // A fix agent that failed may have left partial edits. Later fixes may
+            // run over exactly that content, and no other edit: record what it left.
+            if outcome.is_err() && !dirt_refused {
+                if let Ok(left_before) = before.clone() {
+                    if let Ok(left_after) = crate::worktree::delivery::checkout_snapshot(&working_dir).await {
+                        if left_before != left_after {
+                            failed_leftovers.push(crate::domain::task::FixEffect {
+                                before_tree: left_before,
+                                after_tree: left_after,
+                            });
+                        }
+                    }
+                }
+            }
             if outcome.is_ok() {
                 let after = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
                 if let (Ok(before_tree), Ok(after_tree)) = (before, after) {
@@ -2198,7 +2233,9 @@ pub async fn address_pr_review_inner(
                     });
                 }
                 Err(e) => {
-                    a_fix_failed = true;
+                    if !dirt_refused {
+                        a_fix_failed = true;
+                    }
                     if let Some(id) = item.comment_id { failed_ids.push(id); }
                     fix_errors.push(format!("comment {}: {}", label, e));
                     updated_plan.items[orig_idx].last_error = Some(e.clone());
@@ -2343,7 +2380,7 @@ pub async fn address_pr_review_inner(
             // Read again now: anything that is not the plan's own since the
             // checks above is not committed.
             let snapshot = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
-            let committed = match ensure_dirt_is_plan_owned(&updated_plan, &working_dir, snapshot).await {
+            let committed = match ensure_dirt_is_plan_owned(&updated_plan, &working_dir, snapshot, &failed_leftovers).await {
                 Err(e) => Err(e),
                 Ok(()) => match &task.branch_name {
                     Some(branch) => crate::worktree::commit_checkout(&working_dir, branch, &message).await,
@@ -19665,6 +19702,78 @@ mod tests {
                 assert_checkout_untouched(&repo, &worktree, &tip, "review-fix-1.txt");
                 assert_eq!(
                     std::fs::read_to_string(worktree.join("review-fix-1.txt")).unwrap(),
+                    "someone else\n",
+                    "the outside edit is untouched"
+                );
+            }
+
+            /// A path that begins with a space must come out of the listings
+            /// as it is, or its content would be compared under another name.
+            #[tokio::test]
+            async fn tree_listings_keep_a_leading_space_in_a_path() {
+                let repo = RepoFixture::new();
+                let dir = repo.checkout.to_str().unwrap().to_string();
+                let before = git(&repo.checkout, &["rev-parse", "HEAD^{tree}"]);
+                std::fs::write(repo.checkout.join(" lead.txt"), "x\n").unwrap();
+                git(&repo.checkout, &["add", "--", " lead.txt"]);
+                git(&repo.checkout, &["commit", "-q", "-m", "lead"]);
+                let after = git(&repo.checkout, &["rev-parse", "HEAD^{tree}"]);
+
+                assert_eq!(tree_paths(&dir, &before, &after).await.unwrap(), vec![" lead.txt".to_string()]);
+                assert_eq!(blob_at(&dir, &before, " lead.txt").await.unwrap(), None);
+                assert!(blob_at(&dir, &after, " lead.txt").await.unwrap().is_some());
+            }
+
+            /// A mode change alone is a different file: the content is the same,
+            /// but an executable bit someone else set must not be accepted.
+            #[tokio::test]
+            async fn a_mode_change_alone_is_a_different_file() {
+                let repo = RepoFixture::new();
+                let dir = repo.checkout.to_str().unwrap().to_string();
+                std::fs::write(repo.checkout.join("m.txt"), "same\n").unwrap();
+                git(&repo.checkout, &["add", "m.txt"]);
+                git(&repo.checkout, &["commit", "-q", "-m", "m"]);
+                let before = git(&repo.checkout, &["rev-parse", "HEAD^{tree}"]);
+                git(&repo.checkout, &["update-index", "--chmod=+x", "m.txt"]);
+                git(&repo.checkout, &["commit", "-q", "-m", "mode"]);
+                let after = git(&repo.checkout, &["rev-parse", "HEAD^{tree}"]);
+
+                assert_eq!(tree_paths(&dir, &before, &after).await.unwrap(), vec!["m.txt".to_string()]);
+                let (a, b) = (blob_at(&dir, &before, "m.txt").await.unwrap(), blob_at(&dir, &after, "m.txt").await.unwrap());
+                assert!(a.is_some() && b.is_some() && a != b, "{a:?} vs {b:?}");
+            }
+
+            /// After a fix agent failed, the next fix may run over the failed
+            /// fix's own leftovers, but not over an edit someone else made since:
+            /// that is refused before the next agent starts.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_outside_edit_after_a_failed_fix_is_refused_before_the_next_agent() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install(
+                    "if [ \"$n\" -eq 1 ]; then printf 'partial\\n' > partial.txt; exit 1; fi",
+                );
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let writer = worktree.join("outside.txt");
+                let progress: ProgressSink = std::sync::Arc::new(move |event: PrReviewProgress| {
+                    if event.kind == "item_started" && event.current == Some(3) {
+                        std::fs::write(&writer, "someone else\n").unwrap();
+                    }
+                });
+
+                let (result, _) =
+                    apply_observed(&task, with_item(with_item(plan, 2), 3), &worktree, no_jj, false, progress)
+                        .await
+                        .expect("the apply reports per step");
+
+                assert_eq!(claude.runs(), 2, "the third fix agent did not run over the outside edit");
+                assert_eq!(result.failed_ids, vec![1, 3], "{result:?}");
+                assert!(!result.pushed, "{result:?}");
+                assert_eq!(
+                    std::fs::read_to_string(worktree.join("outside.txt")).unwrap(),
                     "someone else\n",
                     "the outside edit is untouched"
                 );
