@@ -379,10 +379,12 @@ pub fn TaskDrawer(
         }
         current
     });
-    // Approval needs the committed changes on screen, so load them as soon as the
-    // task is in Human Review. A failed load stays an error and is not retried in a loop.
+    // Approval needs the committed changes on screen, so a Human Review task opens
+    // its Changes tab and loads them. The tab is switched only while nothing is
+    // loaded, so a failed load stays an error and is not retried in a loop.
     Effect::new(move |_| {
         if status.get() == Some(TaskStatus::HumanReview) && changes.with(Option::is_none) {
+            tab.set(Tab::Changes);
             load_changes();
         }
     });

@@ -1158,8 +1158,9 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
     std::fs::remove_file(executed.worktree_path.join(&work_file))?;
 
     open_reviewed_drawer(driver, &executed).await?;
-    click(driver, DRAWER_CHANGES_TAB, "the Changes tab").await?;
-    let shown = await_text(driver, REVIEW_COMMIT, |t| !t.is_empty(), "the commit the changes are for").await?;
+    // Nobody opens the Changes tab: the committed diff must appear on its own,
+    // since approval needs it on screen.
+    let shown = await_text(driver, REVIEW_COMMIT, |t| !t.is_empty(), "the commit the changes are for, shown without opening the tab").await?;
     if shown != tip[..12] {
         bail!("the Changes tab names commit {shown}, the branch is at {tip}");
     }
@@ -1184,8 +1185,7 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
     click(driver, HR_APPROVE, "Approve while the branch has moved").await?;
     ui::visible(driver, HR_ERROR).await.context("a moved branch was approved or silently ignored")?;
     await_text(driver, HR_CURRENT_COMMIT, |t| t.contains(&moved), "the panel to read the moved branch").await?;
-    click(driver, HR_APPROVE, "Approve with a stale Changes tab").await?;
-    await_text(driver, HR_ERROR, |t| t.contains("different commit"), "the stale-tab refusal").await?;
+    // Nobody reopens the tab: it follows the branch, and approval waits for it.
     await_text(driver, REVIEW_COMMIT, |t| t == &moved[..12], "the Changes tab to follow the branch").await?;
     assert_not_offered(driver, HR_APPROVED, "an approval").await?;
 
