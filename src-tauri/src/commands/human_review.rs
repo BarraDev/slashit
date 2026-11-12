@@ -216,9 +216,10 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
     }
     if !task.human_review.is_approved() {
         // Not approved yet: name the commit an approval would record now, so
-        // the person can see it before deciding. An unreadable branch shows no
-        // commit and never fails the panel.
-        let branch_tip = crate::commands::pr::task_branch_tip(state, task_id).await.ok().flatten();
+        // the person can see it before deciding. A failed read is an error, so
+        // the panel can say so and offer a retry; a branch that does not exist
+        // is `Ok(None)`, which the panel reports as a missing branch.
+        let branch_tip = crate::commands::pr::task_branch_tip(state, task_id).await?;
         return Ok(ApprovalStatus { branch_tip, ..none(ApprovalCoverage::NotApplicable) });
     }
     let branch_tip = crate::commands::pr::task_branch_tip(state, task_id).await?;
@@ -1951,6 +1952,28 @@ mod tests {
         assert_eq!(status.coverage, ApprovalCoverage::NotApplicable);
         assert!(status.approved_tip.is_none());
         assert_eq!(status.branch_tip.as_deref(), Some(local.tip().as_str()));
+    }
+
+    /// A commit that cannot be read is an error. It must not look like a
+    /// branch that has no commit, which the panel shows without explanation.
+    #[tokio::test]
+    async fn an_undecided_task_whose_commit_cannot_be_read_is_an_error() {
+        let local = local_project().await;
+        let not_a_repository = tempfile::tempdir().unwrap();
+        for repo in local.state.repository.repositories.write().await.values_mut() {
+            repo.local_path = not_a_repository.path().to_str().unwrap().to_string();
+        }
+        assert!(approval_status(&local.state, local.task_id).await.is_err());
+    }
+
+    /// A branch that does not exist is a successful read with no commit.
+    #[tokio::test]
+    async fn an_undecided_task_whose_branch_is_absent_names_no_commit_without_error() {
+        let local = local_project().await;
+        local.state.task.tasks.write().await.get_mut(&local.task_id).unwrap().branch_name = Some("no-such-branch".into());
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::NotApplicable);
+        assert!(status.branch_tip.is_none());
     }
 
     #[tokio::test]

@@ -242,6 +242,12 @@ fn displayed_tip(status: Option<&ApprovalStatus>) -> Option<String> {
         .and_then(|s| s.branch_tip.clone())
 }
 
+/// Whether the branch has no commit because the repository does not have it.
+/// A read error is not this: it is shown as an error, with a retry.
+fn branch_not_found(status: Option<&ApprovalStatus>) -> bool {
+    status.is_some_and(|s| matches!(s.coverage, ApprovalCoverage::NotApplicable) && s.branch_tip.is_none())
+}
+
 /// Whether the commit the Changes tab shows is the one an approval would cover.
 /// Both must be present and equal. A tab that is not loaded, whose load failed,
 /// or that offers no commit to approve never matches, so absent review content
@@ -681,6 +687,19 @@ pub fn HumanReviewPanel(
                             <code class="font-mono text-white/70">{tip}</code>
                         </p>
                     })}
+                // A branch the repository does not have offers no commit to approve.
+                {move || {
+                    let branch = task.with(|t| t.as_ref().and_then(|t| t.branch_name.clone()))?;
+                    coverage
+                        .with(|c| branch_not_found(c.as_ref()))
+                        .then(|| view! {
+                            <p data-testid="human-review-branch-missing" class="text-xs text-amber-200/80 break-all">
+                                "Branch "
+                                <code class="font-mono text-white/70">{branch}</code>
+                                " was not found in the repository, so there is no commit to approve."
+                            </p>
+                        })
+                }}
                 // Why there is no AI verdict, when the record says why.
                 {move || task.with(|t| t.as_ref().and_then(|t| no_verdict_summary(t.qa_signoff.as_ref(), &t.activity))).map(|summary| view! {
                     <p data-testid="human-review-ai-status" class="text-xs text-amber-200/80">{summary}</p>
@@ -934,7 +953,18 @@ pub fn HumanReviewPanel(
             </Show>
 
             {move || coverage_error.get().map(|e| view! {
-                <p data-testid="human-review-commit-error" class="text-xs text-red-300 whitespace-pre-wrap break-words">{e}</p>
+                <div class="flex flex-wrap items-center gap-2">
+                    <p data-testid="human-review-commit-error" class="text-xs text-red-300 whitespace-pre-wrap break-words">{e}</p>
+                    // Asks again through the same latest-answer guard; approval stays
+                    // disabled until a read succeeds.
+                    <button
+                        data-testid="human-review-commit-retry"
+                        class="px-3 py-1.5 rounded-lg text-sm bg-white/5 text-white/80 hover:bg-white/10"
+                        on:click=move |_| ask_coverage()
+                    >
+                        "Try reading the commit again"
+                    </button>
+                </div>
             })}
             {move || error.get().map(|e| view! {
                 <p data-testid="human-review-error" class="text-xs text-red-300 whitespace-pre-wrap break-words">{e}</p>
@@ -1237,6 +1267,15 @@ mod tests {
     fn the_commit_read_for_an_undecided_branch_is_the_one_shown() {
         let tip = "a".repeat(40);
         assert_eq!(displayed_tip(Some(&answer(ApprovalCoverage::NotApplicable, Some(&tip)))), Some(tip));
+    }
+
+    #[test]
+    fn a_missing_branch_is_named_apart_from_a_failed_read() {
+        let tip = "a".repeat(40);
+        assert!(branch_not_found(Some(&answer(ApprovalCoverage::NotApplicable, None))));
+        assert!(!branch_not_found(Some(&answer(ApprovalCoverage::NotApplicable, Some(&tip)))));
+        assert!(!branch_not_found(Some(&answer(ApprovalCoverage::Current, None))));
+        assert!(!branch_not_found(None), "no answer yet, and no failed read either");
     }
 
     /// Stale tip: an approval that no longer covers the branch shows no commit
