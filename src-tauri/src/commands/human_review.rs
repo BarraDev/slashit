@@ -1439,6 +1439,99 @@ mod tests {
         assert_eq!(after_branch_move, before);
     }
 
+    /// Direction 1: an edit that was never committed is not part of an
+    /// approval, so it is not in the diff the person decides on.
+    #[tokio::test]
+    async fn an_uncommitted_addition_is_listed_apart_and_not_in_what_is_approved() {
+        let local = local_project().await;
+        std::fs::write(local.worktree.join("extra.txt"), "never committed\n").unwrap();
+        std::fs::write(local.worktree.join("work.txt"), "work\nunstaged line\n").unwrap();
+
+        let shown = crate::commands::jj::fetch_review_changes(&local.state, local.task_id)
+            .await
+            .expect("readable")
+            .expect("a Task in Human Review");
+        assert!(shown.patch.contains("work.txt") && !shown.patch.contains("extra.txt"), "{}", shown.patch);
+        assert!(!shown.patch.contains("unstaged line"), "{}", shown.patch);
+        assert!(shown.pending_patch.contains("extra.txt") && shown.pending_patch.contains("unstaged line"));
+        assert!(!shown.pending_patch.contains("+work\n"), "committed content is not repeated as pending");
+
+        // The plain diff commands show the same primary content.
+        let plain = crate::commands::jj::fetch_task_diff(&local.state, local.task_id).await.unwrap();
+        assert_eq!((plain.patch, plain.stat), (shown.patch.clone(), shown.stat.clone()));
+
+        // Pending edits do not stop an approval, and it binds the shown commit.
+        approve(&local.state, local.task_id, false, Some(&shown.tip)).await.expect("approved");
+        assert_eq!(local.on_disk().human_review.approved_tip(), Some(shown.tip.as_str()));
+        assert!(local.worktree.join("extra.txt").exists(), "nothing touched the checkout");
+    }
+
+    /// Direction 2, the one that matters: an uncommitted edit that undoes
+    /// committed content must not hide that content from the person deciding.
+    #[tokio::test]
+    async fn an_uncommitted_edit_that_undoes_committed_work_cannot_hide_it() {
+        let local = local_project().await;
+        std::fs::remove_file(local.worktree.join("work.txt")).unwrap();
+
+        let shown = crate::commands::jj::fetch_review_changes(&local.state, local.task_id)
+            .await
+            .unwrap()
+            .expect("a Task in Human Review");
+        assert!(shown.patch.contains("+work"), "the committed content is shown: {}", shown.patch);
+        assert!(shown.pending_patch.contains("-work"), "the deletion is shown as pending: {}", shown.pending_patch);
+        let plain = crate::commands::jj::fetch_task_diff(&local.state, local.task_id).await.unwrap();
+        assert!(plain.patch.contains("+work"), "{}", plain.patch);
+    }
+
+    /// The commit shown and the commit approved cannot drift apart: what was
+    /// shown carries its tip, and a branch that moved since is refused.
+    #[tokio::test]
+    async fn approving_a_commit_that_is_no_longer_the_one_shown_is_refused() {
+        let local = local_project().await;
+        let shown = crate::commands::jj::fetch_review_changes(&local.state, local.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(local.worktree.join("later.txt"), "later\n").unwrap();
+        git(&local.worktree, &["add", "."]);
+        git(&local.worktree, &["commit", "-q", "-m", "later"]);
+
+        let refused = approve(&local.state, local.task_id, false, Some(&shown.tip)).await.expect_err("moved");
+        assert!(!refused.is_empty());
+        assert!(local.on_disk().human_review.approved_tip().is_none(), "nothing was recorded");
+        let now = crate::commands::jj::fetch_review_changes(&local.state, local.task_id).await.unwrap().unwrap();
+        assert_ne!(now.tip, shown.tip);
+        assert!(now.patch.contains("later.txt"));
+        approve(&local.state, local.task_id, false, Some(&now.tip)).await.expect("the new commit, as shown");
+    }
+
+    /// A Task in Human Review whose branch commit cannot be read shows an error,
+    /// never the working tree as if it were the approved commit.
+    #[tokio::test]
+    async fn an_unreadable_review_commit_is_an_error_not_the_working_tree() {
+        let local = local_project().await;
+        {
+            let mut tasks = local.state.task.tasks.write().await;
+            tasks.get_mut(&local.task_id).unwrap().branch_name = Some("no-such-branch".into());
+        }
+        assert!(crate::commands::jj::fetch_review_changes(&local.state, local.task_id).await.is_err());
+        assert!(crate::commands::jj::fetch_task_diff(&local.state, local.task_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn there_are_no_review_changes_outside_human_review() {
+        let local = local_project().await;
+        {
+            let mut tasks = local.state.task.tasks.write().await;
+            tasks.get_mut(&local.task_id).unwrap().status = TaskStatus::InProgress;
+        }
+        assert_eq!(crate::commands::jj::fetch_review_changes(&local.state, local.task_id).await, Ok(None));
+        // The checkout's own diff is still the working-tree one for a running Task.
+        std::fs::write(local.worktree.join("extra.txt"), "x\n").unwrap();
+        let plain = crate::commands::jj::fetch_task_diff(&local.state, local.task_id).await.unwrap();
+        assert!(plain.patch.contains("extra.txt"));
+    }
+
     #[tokio::test]
     async fn changes_nobody_approved_cannot_be_completed_locally() {
         let local = local_project().await;

@@ -1111,3 +1111,113 @@ async fn still_completed_after_restart(
     }
     assert_work_survives(repository, work, "a restart after completing the task locally")
 }
+
+// --- The Changes tab and the commit an approval covers ---------------------------
+
+const REVIEW_COMMIT: &str = "[data-testid=\"review-changes-commit\"]";
+const REVIEW_PENDING: &str = "[data-testid=\"review-changes-pending\"]";
+const HR_CURRENT_COMMIT: &str = "[data-testid=\"human-review-approval-commit\"]";
+
+/// What a person is shown while deciding is the commit an approval records,
+/// with uncommitted edits listed apart; a branch that moves after the tab was
+/// read is never approved under the old picture.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_changes_tab_shows_the_commit_an_approval_covers_and_lists_uncommitted_edits_apart() {
+    let context = TestContext::new("human_review_changes_scope").expect("harness setup");
+    let outcome = changes_scope_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn changes_scope_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let (agent, _gh) = install_fakes(context, &root)?;
+    // A file of the task's own, so the commit it ends in is not empty.
+    context.set_child_env(fake_agent::WRITE_OWN_FILE_VAR, "1");
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+    let session = context.start_session("changes-scope").await?;
+    let outcome = changes_scope(session.driver(), &agent, &repository).await;
+    context.close_session(session, "changes-scope", &outcome).await?;
+    outcome
+}
+
+async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFixture) -> Result<()> {
+    let executed = execute_one_task(driver, agent, repository).await?;
+    let branch = branch_of(&read_task(driver, &executed).await?)?;
+    let tip = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    let directory = executed
+        .worktree_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("the checkout has no name")?;
+    let work_file = fake_agent::own_work_file(directory);
+
+    // Edits no commit holds: a new file, and the committed work file deleted.
+    // The deletion is the one that would hide committed content from a diff
+    // of the checkout.
+    std::fs::write(executed.worktree_path.join("pending-only.txt"), "not committed\n")?;
+    std::fs::remove_file(executed.worktree_path.join(&work_file))?;
+
+    open_reviewed_drawer(driver, &executed).await?;
+    // Nobody opens the Changes tab: the committed diff must appear on its own,
+    // since approval needs it on screen.
+    let shown = await_text(driver, REVIEW_COMMIT, |t| !t.is_empty(), "the commit the changes are for, shown without opening the tab").await?;
+    if shown != tip[..12] {
+        bail!("the Changes tab names commit {shown}, the branch is at {tip}");
+    }
+    let pending = await_text(driver, REVIEW_PENDING, |t| t.contains("pending-only.txt"), "the uncommitted edits").await?;
+    if !pending.contains("not part of this commit") {
+        bail!("the uncommitted edits are not said to be outside the commit: {pending}");
+    }
+    let all = ui::visible(driver, DRAWER_CHANGES).await?.prop("textContent").await?.unwrap_or_default();
+    let primary = all.replace(&pending, "");
+    if !primary.contains(&work_file) || primary.contains("pending-only.txt") {
+        bail!("the primary diff is not the committed content: {primary}");
+    }
+
+    // The branch moves after the tab was read. Approving is refused by the
+    // backend; once the panel knows the new commit, it also refuses while the
+    // tab still shows the old one, and reloads the tab.
+    git(
+        &executed.worktree_path,
+        &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "moved"],
+    )?;
+    let moved = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    click(driver, HR_APPROVE, "Approve while the branch has moved").await?;
+    ui::visible(driver, HR_ERROR).await.context("a moved branch was approved or silently ignored")?;
+    await_text(driver, HR_CURRENT_COMMIT, |t| t.contains(&moved), "the panel to read the moved branch").await?;
+    // Nobody reopens the tab: it follows the branch, and approval waits for it.
+    await_text(driver, REVIEW_COMMIT, |t| t == &moved[..12], "the Changes tab to follow the branch").await?;
+    assert_not_offered(driver, HR_APPROVED, "an approval").await?;
+
+    // Decided on what is shown now.
+    click(driver, HR_APPROVE, "Approve the commit on screen").await?;
+    ui::visible(driver, HR_APPROVED).await.context("the drawer does not say Approved")?;
+    let task = read_task(driver, &executed).await?;
+    let approved = task
+        .pointer("/human_review/entries/0/approved_tip")
+        .and_then(Value::as_str)
+        .context("the approval records no commit")?;
+    if approved != moved {
+        bail!("the approval records {approved}, the commit on screen was {moved}");
+    }
+    if !executed.worktree_path.join("pending-only.txt").is_file() {
+        bail!("approving touched the uncommitted edits");
+    }
+
+    // The board's Diff for the same Task names the same commit and the edits
+    // that are not part of it.
+    close_drawer(driver).await?;
+    await_gone(driver, "[data-testid=\"task-drawer\"]", "the drawer").await?;
+    // Dispatched as a DOM click: the card sits in a scrolled column and WebDriver
+    // refuses the pointer click, but the button's own handler still runs.
+    ui::visible(driver, "[title=\"View diff\"]").await.context("the board's Diff is not offered")?;
+    driver
+        .execute("document.querySelector(arguments[0]).click();", vec![json!("[title=\"View diff\"]")])
+        .await
+        .context("could not press the board's Diff")?;
+    let heading = await_text(driver, "h2", |t| t.contains("commit"), "the board's Diff title").await?;
+    if !heading.contains(&moved[..12]) || !heading.contains("not approved") {
+        bail!("the board's Diff does not name the approved commit and the uncommitted edits: {heading}");
+    }
+    Ok(())
+}

@@ -325,6 +325,7 @@ const DRAWER_EDIT: &str = "[data-testid=\"task-drawer-edit\"]";
 const DRAWER_ERROR: &str = "[data-testid=\"task-drawer-error\"]";
 const DRAWER_ELAPSED: &str = "[data-testid=\"task-drawer-elapsed\"]";
 const DRAWER_CHANGES_TAB: &str = "[data-testid=\"task-drawer-tab-changes\"]";
+const DRAWER_OUTPUT_TAB: &str = "[data-testid=\"task-drawer-tab-output\"]";
 const DRAWER_CHANGES: &str = "[data-testid=\"task-drawer-changes\"]";
 const DRAWER_TIMELINE_ROW: &str = "[data-testid=\"task-drawer-timeline-row\"]";
 /// How many times the drawer is opened and closed before its listener
@@ -828,6 +829,13 @@ async fn fail_and_retry_in_the_drawer(
         );
     }
     await_drawer_status(driver, "humanreview").await?;
+    // Human Review opens the Changes tab, which holds no output lines; read the
+    // output from its own tab, as the person would.
+    ui::visible(driver, DRAWER_OUTPUT_TAB)
+        .await?
+        .click()
+        .await
+        .context("could not open the Output tab")?;
     // The output now belongs to the retry, not the attempt it replaced.
     await_output_containing(driver, "Agent completed").await?;
     let lines = output_lines(driver).await?;

@@ -283,6 +283,24 @@ features are not used. If they are used later, they sit behind a capability
 check and add to this behavior; they are never the record of what is stacked on
 what, and no `gh` extension is required.
 
+## What Human Review shows
+
+An approval records the branch tip commit, so the diff a person decides on is
+that commit's content, read from Git objects (`get_task_review_changes`, and
+`get_task_diff` while the Task is in Human Review). Uncommitted edits in the
+Task Checkout are listed apart, against the same commit, and are marked as not
+part of the approval; they do not block it. Without that, a checkout diff shows
+edits the approval never covers and can hide committed content that an
+uncommitted edit undoes.
+
+The Changes tab names the commit it shows. The decision panel refuses to approve
+a commit other than the one the tab shows and reloads the tab, and the backend
+still refuses an approval whose commit is no longer the branch tip. Outside
+Human Review, and for the AI reviewer, the diff is still the checkout's.
+The board's Diff button for such a Task shows the same commit, and its title
+names the uncommitted edits as not approved. A Task with no branch has no commit
+to show or bind, and keeps the working-tree diff.
+
 ## `jj` is optional
 
 Core behavior needs only `git`. In a repository colocated with Jujutsu, `jj`

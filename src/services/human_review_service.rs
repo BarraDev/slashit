@@ -71,6 +71,23 @@ pub async fn get_attention_summary() -> Result<Vec<ProjectAttention>, String> {
     invoke("get_attention_summary", serde_json::json!({})).await
 }
 
+/// What a person decides on in Human Review. `patch` and `stat` are the
+/// content of commit `tip`, which is what approving records. `pending_*` are
+/// edits in the checkout that `tip` does not contain: not part of the approval.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReviewChanges {
+    pub tip: String,
+    pub patch: String,
+    pub stat: String,
+    pub pending_patch: String,
+    pub pending_stat: String,
+}
+
+/// `None` unless the task is waiting for its Human decision in a checkout.
+pub async fn get_task_review_changes(task_id: String) -> Result<Option<ReviewChanges>, String> {
+    invoke("get_task_review_changes", serde_json::json!({ "taskId": task_id })).await
+}
+
 pub async fn get_pr_availability(task_id: String) -> Result<PrAvailability, String> {
     invoke("get_pr_availability", serde_json::json!({ "taskId": task_id })).await
 }
