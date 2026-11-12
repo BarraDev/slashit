@@ -1908,6 +1908,24 @@ async fn ensure_dirt_is_plan_owned(
     let mut allowed: std::collections::HashMap<String, Vec<Option<String>>> =
         std::collections::HashMap::new();
     if !dirty.is_empty() {
+        // The plan's own edits to a dirty path start from the committed content.
+        // An owed edit that starts from something else (a failed fix's leftover,
+        // which a later fix built on) is not the plan's, so its path is refused.
+        let mut anchored = std::collections::HashSet::new();
+        for effect in plan.items.iter().filter(|i| owes_a_commit(i)).filter_map(|i| i.fix_effect.as_ref()) {
+            for path in tree_paths(working_dir, &effect.before_tree, &effect.after_tree)
+                .await
+                .map_err(unreadable)?
+            {
+                if dirty.contains(&path) && anchored.insert(path.clone()) {
+                    let head = blob_at(working_dir, &clean_tree, &path).await.map_err(unreadable)?;
+                    let before = blob_at(working_dir, &effect.before_tree, &path).await.map_err(unreadable)?;
+                    if before != head {
+                        return Err(unowned_edits_refusal());
+                    }
+                }
+            }
+        }
         let owed = plan.items.iter().filter(|i| owes_a_commit(i)).filter_map(|i| i.fix_effect.as_ref());
         for effect in owed.chain(failed_leftovers.iter()) {
             for path in tree_paths(working_dir, &effect.before_tree, &effect.after_tree)
@@ -19447,8 +19465,11 @@ mod tests {
                     assert!(!result.pushed, "{label}: nothing may be pushed");
                     assert!(repo.remote_has_branch("task-branch").is_none(), "{label}: nothing may be pushed");
                     let error = result.push_error.as_deref().unwrap_or_default();
+                    // The rebase fixture starts from conflicted content the fix did not
+                    // make, so the ownership check may refuse before the rebase check.
                     assert!(
-                        error.contains("could not be committed") && error.contains(reason),
+                        error.contains("could not be committed")
+                            && (error.contains(reason) || error.contains("none of this plan's fixes made")),
                         "{label}: {error:?}"
                     );
                     assert_eq!(git(&worktree, &["rev-parse", "task-branch"]), tip, "{label}: the branch did not move");
@@ -20006,6 +20027,44 @@ mod tests {
                 assert_eq!(claude.runs(), 2, "the pending fix is not made again");
                 assert!(second.fixed_ids.is_empty(), "{second:?}");
                 assert_withheld("pending fix", &repo, &worktree, &tip, &second, &plan);
+            }
+
+            /// Fix A fails part way and leaves `shared.txt` holding its partial
+            /// edit; fix B then succeeds over that same file. A later apply that
+            /// no longer runs A must not commit A's partial edit as part of B.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_later_apply_does_not_publish_a_failed_fixs_residue() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let claude = EditingClaude::install_editing(
+                    "if [ \"$n\" -eq 1 ]; then printf 'partial\\n' > shared.txt; exit 1; fi; printf 'b\\n' >> shared.txt",
+                    true,
+                );
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, with_second_item(plan, Some(2)), &worktree, no_jj.clone(), false).await;
+                assert_eq!(claude.runs(), 2, "A then B ran: {first:?}");
+                assert!(!first.pushed, "the withheld apply pushes nothing: {first:?}");
+
+                // The Human drops fix A and applies again without cleaning up.
+                let mut plan = plan;
+                plan.items[0].approved = false;
+                let error = match apply_observed(&task, plan, &worktree, no_jj, false, no_progress()).await {
+                    Err(error) => error,
+                    Ok((second, _)) => panic!("the residue must refuse the apply: {second:?}"),
+                };
+                assert!(error.contains("none of this plan's fixes made"), "{error}");
+                assert_eq!(claude.runs(), 2, "no fix agent runs again");
+
+                assert_eq!(git(&worktree, &["rev-parse", "task-branch"]), tip, "the branch did not move");
+                assert!(
+                    git(&worktree, &["status", "--porcelain"]).contains("shared.txt"),
+                    "the residue stays in the checkout"
+                );
             }
 
             /// Once the checkout is safe again, the next apply runs only the
