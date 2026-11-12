@@ -19442,6 +19442,38 @@ mod tests {
                 );
             }
 
+            /// A rebase that stops on a conflict, with the conflict resolved to
+            /// the upstream content, leaves no checkout edit that no fix made.
+            /// The ownership check passes and the commit guard reports the
+            /// rebase; nothing is committed or pushed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_genuine_rebase_conflict_is_reported_as_a_rebase() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let claude = EditingClaude::install(
+                    "git checkout -q -b conflicting main && printf 'other\\n' > taskfile.txt \
+                     && git add -A && git commit -q -m conflicting && git checkout -q task-branch \
+                     && git rebase -q conflicting; git checkout -q --ours -- taskfile.txt \
+                     && git add taskfile.txt; true",
+                );
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+
+                let result = apply_one_fix(&state, &repo, &worktree, no_jj).await;
+                drop(claude);
+
+                assert!(!result.pushed, "nothing may be pushed: {result:?}");
+                assert!(repo.remote_has_branch("task-branch").is_none(), "nothing may be pushed");
+                let error = result.push_error.as_deref().unwrap_or_default();
+                assert!(
+                    error.contains("could not be committed") && error.contains("in the middle of a rebase"),
+                    "{error:?}"
+                );
+                assert_eq!(git(&worktree, &["rev-parse", "task-branch"]), tip, "the branch did not move");
+            }
+
             /// Fixes the agent left anywhere but on the task branch are not
             /// committed, and the unmoved task branch is not pushed.
             #[tokio::test(flavor = "multi_thread")]
@@ -19451,11 +19483,14 @@ mod tests {
                     ("detached HEAD", "git checkout -q --detach", "not the task branch"),
                     ("another branch", "git checkout -q -b elsewhere", "not the task branch"),
                     (
-                        "a conflicted rebase",
+                        // The conflict markers are checkout edits no fix made, so the
+                        // ownership refusal comes first; the rebase diagnosis is covered
+                        // by `a_genuine_rebase_conflict_is_reported_as_a_rebase`.
+                        "a conflicted rebase with unexplained edits",
                         "git checkout -q -b conflicting main && printf 'other\\n' > taskfile.txt \
                          && git add -A && git commit -q -m conflicting && git checkout -q task-branch \
                          && git rebase -q conflicting; true",
-                        "in the middle of a rebase",
+                        "none of this plan's fixes made",
                     ),
                 ];
                 for (label, before_fix, reason) in cases {
@@ -19472,11 +19507,8 @@ mod tests {
                     assert!(!result.pushed, "{label}: nothing may be pushed");
                     assert!(repo.remote_has_branch("task-branch").is_none(), "{label}: nothing may be pushed");
                     let error = result.push_error.as_deref().unwrap_or_default();
-                    // The rebase fixture starts from conflicted content the fix did not
-                    // make, so the ownership check may refuse before the rebase check.
                     assert!(
-                        error.contains("could not be committed")
-                            && (error.contains(reason) || error.contains("none of this plan's fixes made")),
+                        error.contains("could not be committed") && error.contains(reason),
                         "{label}: {error:?}"
                     );
                     assert_eq!(git(&worktree, &["rev-parse", "task-branch"]), tip, "{label}: the branch did not move");
