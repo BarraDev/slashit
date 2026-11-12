@@ -242,6 +242,20 @@ fn displayed_tip(status: Option<&ApprovalStatus>) -> Option<String> {
         .and_then(|s| s.branch_tip.clone())
 }
 
+/// Whether the branch has no commit because the repository does not have it.
+/// A read error is not this: it is shown as an error, with a retry.
+fn branch_not_found(status: Option<&ApprovalStatus>) -> bool {
+    status.is_some_and(|s| matches!(s.coverage, ApprovalCoverage::NotApplicable) && s.branch_tip.is_none())
+}
+
+/// Whether the commit the Changes tab shows is the one an approval would cover.
+/// Both must be present and equal. A tab that is not loaded, whose load failed,
+/// or that offers no commit to approve never matches, so absent review content
+/// cannot satisfy the approval.
+fn viewed_matches(viewed: Option<&str>, shown: Option<&str>) -> bool {
+    matches!((viewed, shown), (Some(v), Some(s)) if v == s)
+}
+
 /// Whether the approve controls may be used. Approval needs the pull request
 /// answer. A task that is not loaded cannot be approved. A task with a branch
 /// also needs the commit on screen, because the backend records only the commit
@@ -263,6 +277,10 @@ pub fn HumanReviewPanel(
     #[prop(into)] task: Signal<Option<Task>>,
     /// Apply a task record a command returned.
     apply_task: Callback<Task>,
+    /// The commit the Changes tab is showing, when it shows one.
+    viewed_tip: RwSignal<Option<String>>,
+    /// Asked when the Changes tab shows a commit other than the one to approve.
+    on_stale: Callback<()>,
 ) -> impl IntoView {
     let availability = RwSignal::new(None::<PrAvailability>);
     spawn_local(async move {
@@ -288,6 +306,9 @@ pub fn HumanReviewPanel(
     // whenever the task record changes, so a branch that moved is not shown
     // as approved.
     let coverage = RwSignal::new(None::<ApprovalStatus>);
+    // Kept apart from `error`, which an action clears: a failed read clears
+    // itself when a later read succeeds.
+    let coverage_error = RwSignal::new(None::<String>);
     let asked = StoredValue::new(0u32);
     // Asks what the branch is now. Only the latest question's answer is kept.
     let ask_coverage = move || {
@@ -300,12 +321,13 @@ pub fn HumanReviewPanel(
             match answer {
                 Ok(status) => {
                     coverage.try_set(Some(status));
+                    coverage_error.try_set(None);
                 }
                 // Without a current answer there is no commit to approve, so the
                 // earlier one must not keep the controls enabled.
                 Err(e) => {
                     coverage.try_set(None);
-                    error.try_set(Some(format!("The branch's current commit could not be read, so it cannot be approved yet: {e}")));
+                    coverage_error.try_set(Some(format!("The branch's current commit could not be read, so it cannot be approved yet: {e}")));
                 }
             }
         });
@@ -314,17 +336,49 @@ pub fn HumanReviewPanel(
         task.track();
         ask_coverage();
     });
+    // The branch moved while the Changes tab shows another commit: ask the tab to
+    // follow it. Keyed on the branch's commit alone, so a failed reload does not
+    // trigger another one.
+    Effect::new(move |_| {
+        if let Some(tip) = coverage.with(|c| displayed_tip(c.as_ref())) {
+            if !viewed_tip.with_untracked(|v| viewed_matches(v.as_deref(), Some(&tip))) {
+                on_stale.run(());
+            }
+        }
+    });
     // Read at each use, so the controls follow both the availability answer and
     // the commit answer. Enabling them on availability alone was not enough.
     let approval_ready_now = move || {
+        let shown = coverage.with(|c| displayed_tip(c.as_ref()));
         approval_ready(
             availability.with(Option::is_some),
             task.with(|t| t.as_ref().map(|t| t.branch_name.is_some())),
-            coverage.with(|c| displayed_tip(c.as_ref())).is_some(),
+            shown.as_deref().is_some_and(|s| viewed_tip.with(|v| viewed_matches(v.as_deref(), Some(s)))),
         )
     };
+    // The approval covers `shown`. If the Changes tab was read at another commit, what
+    // the person looked at is not what they would approve: refuse, and refresh it.
+    let diverged = move |shown: Option<&str>| {
+        let viewed = viewed_tip.get_untracked();
+        // Only a task with a branch has a commit to compare. The backend approves a
+        // task without one as it is, so the comparison does not apply to it.
+        let branch = task.with_untracked(|t| t.as_ref().map(|t| t.branch_name.is_some()));
+        let diverged = match branch {
+            Some(false) => false,
+            _ => !viewed_matches(viewed.as_deref(), shown),
+        };
+        if diverged {
+            error.set(Some(
+                "The Changes tab does not show the commit this would approve, because it is not loaded or shows another commit. It is being reloaded; look at it again before approving."
+                    .to_string(),
+            ));
+            ask_coverage();
+            on_stale.run(());
+        }
+        diverged
+    };
     let approve_current_branch = move |tip: String| {
-        if busy.get_untracked() {
+        if busy.get_untracked() || diverged(Some(&tip)) {
             return;
         }
         busy.set(true);
@@ -365,7 +419,9 @@ pub fn HumanReviewPanel(
     };
 
     let approve = move |create_pr: bool| {
-        if busy.get_untracked() {
+        // The commit on screen. The approval covers that commit and no other.
+        let shown = displayed_tip(coverage.get_untracked().as_ref());
+        if busy.get_untracked() || diverged(shown.as_deref()) {
             return;
         }
         busy.set(true);
@@ -375,8 +431,6 @@ pub fn HumanReviewPanel(
                 d.begin(task_id);
             }
         }
-        // The commit on screen. The approval covers that commit and no other.
-        let shown = displayed_tip(coverage.get_untracked().as_ref());
         spawn_local(async move {
             let attempted = match approve_task(task_id.to_string(), create_pr, shown).await {
                 Ok(outcome) => {
@@ -613,7 +667,7 @@ pub fn HumanReviewPanel(
 
             // Undecided: the decision itself.
             <Show when=move || in_review.get() && decision.get().is_none()>
-                <p class="text-xs text-white/50">"Decide on these changes. The diff is in the Changes tab."</p>
+                <p class="text-xs text-white/50">"Decide on these changes. The Changes tab shows the commit you would approve; edits not yet committed are listed apart there and are not approved."</p>
                 // An approval covers the branch commit that is current when the
                 // person approves. Naming the branch shows what that will be.
                 {move || task.with(|t| t.as_ref().and_then(|t| t.branch_name.clone())).map(|branch| view! {
@@ -633,6 +687,19 @@ pub fn HumanReviewPanel(
                             <code class="font-mono text-white/70">{tip}</code>
                         </p>
                     })}
+                // A branch the repository does not have offers no commit to approve.
+                {move || {
+                    let branch = task.with(|t| t.as_ref().and_then(|t| t.branch_name.clone()))?;
+                    coverage
+                        .with(|c| branch_not_found(c.as_ref()))
+                        .then(|| view! {
+                            <p data-testid="human-review-branch-missing" class="text-xs text-amber-200/80 break-all">
+                                "Branch "
+                                <code class="font-mono text-white/70">{branch}</code>
+                                " was not found in the repository, so there is no commit to approve."
+                            </p>
+                        })
+                }}
                 // Why there is no AI verdict, when the record says why.
                 {move || task.with(|t| t.as_ref().and_then(|t| no_verdict_summary(t.qa_signoff.as_ref(), &t.activity))).map(|summary| view! {
                     <p data-testid="human-review-ai-status" class="text-xs text-amber-200/80">{summary}</p>
@@ -757,15 +824,18 @@ pub fn HumanReviewPanel(
                             {blocker.map(|why| view! {
                                 <p data-testid="human-review-approve-again-unavailable" class="text-xs text-white/50">{why}</p>
                             })}
-                            {tip.map(|tip| view! {
+                            {tip.map(|tip| {
+                                let shown = tip.clone();
+                                view! {
                                 <button
                                     data-testid="human-review-approve-again"
                                     class="px-3 py-1.5 rounded-lg text-sm bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50"
-                                    disabled=move || busy.get()
+                                    disabled=move || busy.get() || !viewed_tip.with(|v| viewed_matches(v.as_deref(), Some(shown.as_str())))
                                     on:click=move |_| approve_current_branch(tip.clone())
                                 >
                                     "Approve the branch as it is now"
                                 </button>
+                                }
                             })}
                         </div>
                     }
@@ -882,6 +952,20 @@ pub fn HumanReviewPanel(
                 } })}
             </Show>
 
+            {move || coverage_error.get().map(|e| view! {
+                <div class="flex flex-wrap items-center gap-2">
+                    <p data-testid="human-review-commit-error" class="text-xs text-red-300 whitespace-pre-wrap break-words">{e}</p>
+                    // Asks again through the same latest-answer guard; approval stays
+                    // disabled until a read succeeds.
+                    <button
+                        data-testid="human-review-commit-retry"
+                        class="px-3 py-1.5 rounded-lg text-sm bg-white/5 text-white/80 hover:bg-white/10"
+                        on:click=move |_| ask_coverage()
+                    >
+                        "Try reading the commit again"
+                    </button>
+                </div>
+            })}
             {move || error.get().map(|e| view! {
                 <p data-testid="human-review-error" class="text-xs text-red-300 whitespace-pre-wrap break-words">{e}</p>
             })}
@@ -1185,6 +1269,15 @@ mod tests {
         assert_eq!(displayed_tip(Some(&answer(ApprovalCoverage::NotApplicable, Some(&tip)))), Some(tip));
     }
 
+    #[test]
+    fn a_missing_branch_is_named_apart_from_a_failed_read() {
+        let tip = "a".repeat(40);
+        assert!(branch_not_found(Some(&answer(ApprovalCoverage::NotApplicable, None))));
+        assert!(!branch_not_found(Some(&answer(ApprovalCoverage::NotApplicable, Some(&tip)))));
+        assert!(!branch_not_found(Some(&answer(ApprovalCoverage::Current, None))));
+        assert!(!branch_not_found(None), "no answer yet, and no failed read either");
+    }
+
     /// Stale tip: an approval that no longer covers the branch shows no commit
     /// to approve, so a stale answer cannot authorize a different state.
     #[test]
@@ -1210,5 +1303,19 @@ mod tests {
         assert!(approval_ready(true, Some(true), true));
         // A task without a branch has no commit to show.
         assert!(approval_ready(true, Some(false), false));
+    }
+
+    #[test]
+    fn the_decision_refuses_a_commit_other_than_the_one_the_changes_tab_shows() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        // A tab that shows no commit does not match a commit to approve, and
+        // neither side absent is evidence that anything was presented.
+        assert!(!viewed_matches(None, Some(&a)));
+        assert!(!viewed_matches(None, None));
+        assert!(viewed_matches(Some(&a), Some(&a)));
+        assert!(!viewed_matches(Some(&a), Some(&b)));
+        // The tab shows a commit but none is offered to approve.
+        assert!(!viewed_matches(Some(&a), None));
     }
 }

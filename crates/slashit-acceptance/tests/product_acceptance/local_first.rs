@@ -11,7 +11,7 @@
 //! usable through Settings > Repository.
 
 use super::human_review::{
-    attribute, click, install_fakes, open_reviewed_drawer, read_task, HR_APPROVE, HR_APPROVED,
+    attribute, await_approval, click, install_fakes, open_reviewed_drawer, read_task, HR_APPROVE, HR_APPROVED,
     HR_DELIVERY,
 };
 use super::*;
@@ -149,13 +149,7 @@ pub(super) async fn run_and_approve_locally(
     }
 
     open_reviewed_drawer(driver, &executed).await?;
-    let label = await_text(
-        driver,
-        HR_APPROVE,
-        |t| t != "Checking…",
-        "the approve action",
-    )
-    .await?;
+    let label = await_approval(driver, HR_APPROVE, "the approve action").await?;
     if label != "Approve"
         || attribute(driver, HR_APPROVE, "data-creates-pr")
             .await?

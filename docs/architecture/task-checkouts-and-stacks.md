@@ -283,6 +283,24 @@ features are not used. If they are used later, they sit behind a capability
 check and add to this behavior; they are never the record of what is stacked on
 what, and no `gh` extension is required.
 
+## What Human Review shows
+
+An approval records the branch tip commit, so the diff a person decides on is
+that commit's content, read from Git objects (`get_task_review_changes`, and
+`get_task_diff` while the Task is in Human Review). Uncommitted edits in the
+Task Checkout are listed apart, against the same commit, and are marked as not
+part of the approval; they do not block it. Without that, a checkout diff shows
+edits the approval never covers and can hide committed content that an
+uncommitted edit undoes.
+
+The Changes tab names the commit it shows. The decision panel refuses to approve
+a commit other than the one the tab shows and reloads the tab, and the backend
+still refuses an approval whose commit is no longer the branch tip. Outside
+Human Review, and for the AI reviewer, the diff is still the checkout's.
+The board's Diff button for such a Task shows the same commit, and its title
+names the uncommitted edits as not approved. A Task with no branch has no commit
+to show or bind, and keeps the working-tree diff.
+
 ## `jj` is optional
 
 Core behavior needs only `git`. In a repository colocated with Jujutsu, `jj`
@@ -294,6 +312,37 @@ When `jj` is missing, those paths are skipped or the Git path is used, and Task
 Checkouts, commits and restacks work as in a plain Git repository. A Jujutsu
 repository that is not colocated with Git cannot get a Task Checkout (see
 [product-model.md](product-model.md#task-checkout)).
+
+## PR-review apply over uncommitted edits
+
+A PR-review apply commits the whole checkout, and Auto-push then publishes the
+branch by name. Uncommitted edits already in the checkout, such as the partial
+edits of a failed AI Review fix, would be published with the plan's fixes under
+an approval that never covered them.
+
+The apply therefore compares the checkout with what the plan's own fixes still
+owed a commit found or left. A changed path is accepted only with the content a
+pending fix found there (a discarded edit) or left there (the plan's own edit).
+Any other content is refused, including an outside edit to a file a fix also
+touched. It refuses when such an edit is found: before any fix agent runs, again
+immediately before each fix agent launches, and again immediately before the
+commit, so an edit made after an earlier check is refused too. A clean checkout
+and a plan's own pending fixes are not affected, and a dry run is not checked. A
+matching analysis fingerprint does not make edits acceptable, because the
+fingerprint binds the checkout as analyzed, edits included.
+
+When a fix agent fails, the later fixes of the run still run, but only over the
+partial edits that failed fix left; any other edit refuses them. When a refusal
+happens between fixes, the fixes that already succeeded in that run stay
+uncommitted in the checkout, and the fixes after the refusal do not run. Nothing
+is reverted or cleaned up by SlashIt.
+
+Limits: a writer that sets a fix's file to exactly the content the fix left is
+indistinguishable from the fix, and so is a writer that sets a failed fix's
+partial file to exactly what that fix left. A writer that changes the checkout while a fix
+agent runs is not told apart from the agent. An edit made between the final
+check and the commit's own staging is still committed, because the commit takes
+the live checkout. The full policy below is not implemented.
 
 ## Failed review-fix runs
 
