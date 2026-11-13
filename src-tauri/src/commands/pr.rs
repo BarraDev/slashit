@@ -941,7 +941,7 @@ pub async fn analyze_pr_comments(
     let prior_plan = task.pr_review_plan.clone()
         .filter(|p| p.pr_url == pr_url);
 
-    eprintln!("[pr-review] analyze {} for task {}", pr_url, task_uuid);
+    eprintln!("[pr-review] analyze {} for task {}", pr_log_label(&pr_url), task_uuid);
     let (head_oid, review_decision, comments) = fetch_pr_review_data(&pr_url).await?;
     eprintln!(
         "[pr-review] {} comments fetched (decision={:?})",
@@ -3184,6 +3184,17 @@ fn pr_url_for_task(task: &Task) -> Result<String, String> {
     task.authoritative_pr_url()
         .map(str::to_string)
         .ok_or_else(|| "Task does not have a GitHub PR".to_string())
+}
+
+/// What a log line may say about a PR URL: `#<number>` for a pull request URL
+/// that `parse_pr_url` accepts, otherwise a fixed placeholder. The URL is
+/// task data that can carry userinfo, a query, or control characters, so it is
+/// never printed itself.
+fn pr_log_label(pr_url: &str) -> String {
+    match parse_pr_url(pr_url).ok().and_then(|(_, number)| number.parse::<u32>().ok()) {
+        Some(number) => format!("#{number}"),
+        None => "<unrecognized pull request URL>".to_string(),
+    }
 }
 
 /// Persist `task_id`'s review plan, then publish it to shared memory.
@@ -9068,6 +9079,68 @@ mod tests {
     fn parse_pr_url_invalid_no_number() {
         let result = parse_pr_url_to_ref("https://github.com/org/repo/pull/");
         assert!(result.is_none());
+    }
+
+    // Fictitious values only. The label is the sole text an analyze log line
+    // prints for a PR URL, so these cases pin what can reach the log.
+    #[test]
+    fn pr_log_label_ordinary_url_is_number_only() {
+        assert_eq!(pr_log_label("https://github.com/acme-test/widget-test/pull/42"), "#42");
+        assert_eq!(pr_log_label("https://github.com/acme-test/widget-test/pull/42/"), "#42");
+    }
+
+    #[test]
+    fn pr_log_label_never_shows_userinfo() {
+        let url = "https://fake-user:fake-secret@github.com/acme-test/widget-test/pull/7";
+        let label = pr_log_label(url);
+        assert!(!label.contains("fake-user") && !label.contains("fake-secret"), "{label}");
+        assert!(!label.contains("github.com") && !label.contains("acme-test"), "{label}");
+    }
+
+    #[test]
+    fn pr_log_label_drops_query_and_fragment() {
+        for url in [
+            "https://github.com/acme-test/widget-test/pull/9?token=fake-token",
+            "https://github.com/acme-test/widget-test/pull/9#fake-fragment",
+        ] {
+            let label = pr_log_label(url);
+            assert!(!label.contains("fake-token") && !label.contains("fake-fragment"), "{label}");
+            assert_eq!(label, "<unrecognized pull request URL>");
+        }
+    }
+
+    #[test]
+    fn pr_log_label_control_characters_cannot_add_log_lines() {
+        let url = "https://github.com/acme-test/widget-test/pull/3\nfake-injected-line\r\u{1b}[31m";
+        let label = pr_log_label(url);
+        assert_eq!(label, "<unrecognized pull request URL>");
+        assert!(!label.chars().any(|c| c.is_control()), "{label:?}");
+    }
+
+    #[test]
+    fn pr_log_label_malformed_urls_fall_back_to_placeholder() {
+        for url in [
+            "",
+            "https://github.com/acme-test/widget-test/pull/",
+            "https://github.com/acme-test/widget-test/pull//",
+            "https://github.com/acme-test/widget-test/pull/fake-text",
+            "https://github.com/acme-test/widget-test/pull/99999999999999999999",
+            "https://example.test/fake/pull/5",
+            "fake raw text with no structure",
+        ] {
+            assert_eq!(pr_log_label(url), "<unrecognized pull request URL>", "{url:?}");
+        }
+    }
+
+    // The review operation keeps the exact URL the task carries; only the log
+    // label is reduced.
+    #[test]
+    fn analyze_keeps_original_url_for_the_operation() {
+        let url = "https://fake-user:fake-secret@github.com/acme-test/widget-test/pull/7?x=1#frag";
+        let mut task = create_test_task_full("t", Uuid::new_v4(), TaskStatus::PrCreated, 0);
+        task.pr_url = Some(url.to_string());
+        assert_eq!(pr_url_for_task(&task).unwrap(), url);
+        assert_eq!(pr_log_label(url), "<unrecognized pull request URL>");
     }
 
     // ──────────────────────────────────────────────
