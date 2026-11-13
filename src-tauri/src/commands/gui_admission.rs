@@ -24,7 +24,7 @@
 //! [`LIFECYCLE`] fails that test.
 
 use tauri::ipc::{CommandArg, CommandItem, InvokeError};
-use tauri::Runtime;
+use tauri::{Manager, Runtime};
 
 use crate::queue::executor::AdmissionLease;
 
@@ -47,8 +47,8 @@ impl<'de, R: Runtime> CommandArg<'de, R> for GuiMutation {
     fn from_command(command: CommandItem<'de, R>) -> Result<Self, InvokeError> {
         let executor = command
             .message
-            .state_ref()
-            .try_get::<crate::AppState>()
+            .webview_ref()
+            .try_state::<crate::AppState>()
             .and_then(|state| state.executor.get().cloned());
         // Commands are only dispatched after setup has installed the executor.
         // Before that there is no drain to race.
