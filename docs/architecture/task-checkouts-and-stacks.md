@@ -383,3 +383,29 @@ Requirements for the mechanism:
   taken before the first write; and the rollback path to the previous build. A
   storage location that older builds can read is an acceptable alternative if it
   meets the same requirements.
+
+## Successor notice of preexisting edits
+
+This notice is informational only. It is not failed-review-fix recovery, and it
+does not implement or replace the requirements above, which remain open.
+
+When a Worker run starts in a Task Checkout that already holds uncommitted edits,
+the launch prompt says so and names up to 50 of those paths. It does not say who
+made them, because that is not recorded. The notice is added to the launch prompt
+only, after the prompts that the approval digests are computed from, so it never
+changes an approval.
+
+- The notice says that the paths are data and that it authorizes nothing. Each
+  path is shown in ASCII, with a `\u{..}` escape for any other character, for a
+  backtick and for a backslash. A name longer than 200 units is cut, and the
+  notice says how many units were left out.
+- `commit_changes` still commits the whole checkout after a Worker run. The
+  notice says so, and it does not approve the edits.
+- The status read runs when the run starts. It is bounded at 10 seconds and at
+  1 MiB of output. A timed-out read, or a listing over the cap, is reported as
+  unreadable, and no partial list is shown. On timeout or overflow SlashIt kills
+  the Git process: on Unix the whole process group, on Windows only the Git
+  process (not tested).
+- Edits made after the read are not covered by the notice.
+- The notice does not make partial edits from a failed review-fix run durable or
+  recoverable. Those remain governed by the requirements above.
