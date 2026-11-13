@@ -318,6 +318,11 @@ to find every secret.
 
 ## 7. Retention rule: issue #220 (interim)
 
+Decision: the owner approved this interim direction, keeping lifecycle
+milestones rather than evicting them under the 200-entry cap, on 2026-11-12.
+It is an interim decision linked to issue #220. It is not the completed archival
+design, and issue #220 stays open.
+
 Rule: the Activity cap drops only disposable tool rows, oldest first. A
 milestone is never evicted. Once a Task holds 200 milestones, every tool row is
 dropped as soon as it is pushed, so such a Task keeps no tool-row tail. The
@@ -335,6 +340,9 @@ holds it:
 | `record` | once-only identities | a once-only milestone is recorded twice |
 | New-attempt authorization check (`queue/executor.rs`) | `NewAttemptAuthorized` of the previous run | a failed new-attempt run is offered an ordinary retry instead of recovery |
 | Startup migration (`app_core.rs`) | highest run number, then that run's `RunStarted` | the migration reads an older run |
+| `never_checked_out` (`domain/task.rs`) | `RunStarted` | a Task that never ran reads as having run |
+| `resolved_worker_handoff_was_superseded` (`domain/task.rs`) | `RunCompleted` of the run | a superseded handoff reads as current |
+| `review_admitted_for_current_result` (`domain/task.rs`) | `RunCompleted` of the run | a review admission reads as unmatched to its result |
 
 The task's status, phase and review record still decide what a Task may do
 next. Activity only supplies the facts above.
@@ -355,6 +363,23 @@ a durable per-Task archive is not part of this rule. It must durably confirm an
 archive copy before an entry leaves the Board, and it must define export and
 downgrade behavior first, because once a milestone exists only in the archive,
 deleting the archive deletes the last copy.
+
+Known risks that this interim rule does not address:
+
+- High-frequency `Moved` milestones. A move has no identity, so every drag adds
+  a milestone that the per-run figures above do not include. Growth from them is
+  not measured.
+- Board and read payload. `list_tasks` returns each Task with its full Activity,
+  and the Board loads it. Only the per-Task evidence read is bounded (20 entries,
+  20 KB). The Board payload grows with history and is not measured.
+- Removal paths other than the cap. A milestone also leaves with its Task, and
+  when an unconfirmed review admission is withdrawn, its `AiReviewStarted`
+  milestone is removed (`queue/executor.rs`, `settle_unconfirmed_review_admission`).
+  After that withdrawal, `next_review` can reuse the withdrawn review number.
+- Sequence numbers. A tool row pushed while the milestones are at 200 is evicted
+  at once, so its sequence number can be issued again to a later milestone. Live
+  entries do not collide. The test `positions are never reused` does not check
+  this, so it is not evidence that numbers are never reused.
 
 Pinned test: `milestones_outlive_the_cap_once_tool_rows_are_gone` in
 `crates/slashit-activity/src/tests.rs`.
