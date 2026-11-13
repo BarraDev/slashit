@@ -815,12 +815,11 @@ fn a_discarded_unconfirmed_request_is_the_persons_decision_and_claims_no_proof()
     assert!(!detail.contains(&"c".repeat(13)), "only a short commit is shown: {detail}");
 }
 
-/// Pins the open #220 gap, so it stays visible. Tool rows are dropped first,
-/// but once the milestones alone exceed the cap, the oldest of them go: here
-/// the recovery record of run 1, then run 1's start. Until the retention rule
-/// is decided and implemented this fails by design; run it with `--ignored`.
+/// A milestone is never evicted to stay within the cap: here the recovery
+/// record of run 1 and run 1's start both outlive 100 later runs, so the run
+/// still has its number and the recovery its evidence. The list grows past
+/// [`MAX_ENTRIES`] instead; only tool rows are disposable.
 #[test]
-#[ignore = "pins #220: the cap evicts the oldest milestones once tool rows are gone"]
 fn milestones_outlive_the_cap_once_tool_rows_are_gone() {
     let mut entries = Vec::new();
     let recovery = Kind::RecoveryRequired {
@@ -840,19 +839,87 @@ fn milestones_outlive_the_cap_once_tool_rows_are_gone() {
         };
         record(&mut entries, t(0), Kind::RunResult { run, result });
     }
-    assert_eq!(entries.len(), MAX_ENTRIES);
+    assert_eq!(entries.len(), 301, "one recovery record and three milestones per run");
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e.kind, Kind::RecoveryRequired { run: Some(1), .. })));
     let first_start = Kind::RunStarted {
         run: 1,
         addressing_feedback: false,
     };
-    assert!(
-        entries
-            .iter()
-            .any(|e| matches!(e.kind, Kind::RecoveryRequired { run: Some(1), .. })),
-        "the recovery record of run 1 was evicted"
+    assert!(entries.iter().any(|e| e.kind == first_start));
+    assert_eq!(next_run(&entries), 101);
+}
+
+/// The answers readers derive from the list stay right after a history many
+/// times longer than the cap, and tool rows are what goes.
+#[test]
+fn derived_answers_survive_a_history_much_longer_than_the_cap() {
+    let mut entries = Vec::new();
+    for run in 1..=3 {
+        record(&mut entries, t(0), Kind::RunStarted { run, addressing_feedback: false });
+        record_tool(&mut entries, t(0), run, "Read", Some("src/lib.rs"));
+        record(&mut entries, t(0), Kind::RunCompleted { run });
+        let review = run;
+        record(&mut entries, t(0), Kind::AiReviewStarted { review });
+        record(&mut entries, t(0), Kind::AiReviewApproved { review });
+    }
+    record(&mut entries, t(0), Kind::CompletedLocally {});
+    // 2 000 more milestones that truthfully repeat, and a tool row each time.
+    for i in 0..2_000u32 {
+        let to = if i % 2 == 0 { Column::Queue } else { Column::InProgress };
+        record(&mut entries, t(0), Kind::Moved { from: Column::Backlog, to });
+        record_tool(&mut entries, t(0), 3, "Edit", Some(&format!("src/f{i}.rs")));
+    }
+    assert!(entries.len() > MAX_ENTRIES, "milestones are not capped: {}", entries.len());
+    assert_eq!(
+        entries.iter().filter(|e| e.kind.is_tool()).count(),
+        0,
+        "once the milestones alone pass the cap, a tool row is disposable at once"
     );
-    assert!(
-        entries.iter().any(|e| e.kind == first_start),
-        "the start of run 1 was evicted, so its outcome has no number left"
-    );
+    assert_eq!(next_run(&entries), 4);
+    assert_eq!(next_review(&entries), 4);
+    assert!(completed_locally(&entries));
+    assert!(!record(&mut entries, t(1), Kind::RunStarted { run: 1, addressing_feedback: false }));
+    assert!(!record(&mut entries, t(1), Kind::CompletedLocally {}));
+    let mut seqs: Vec<u32> = entries.iter().map(|e| e.seq).collect();
+    let before = seqs.len();
+    seqs.dedup();
+    assert_eq!(seqs.len(), before, "positions are never reused");
+}
+
+/// An authorization the person gives again for the same recovered run is a
+/// second decision, so both rows stay on the timeline.
+#[test]
+fn a_repeated_new_attempt_authorization_is_kept() {
+    let mut entries = Vec::new();
+    let kind = || Kind::NewAttemptAuthorized { run: 1 };
+    assert!(record(&mut entries, t(0), kind()));
+    assert!(record(&mut entries, t(1), kind()));
+    assert_eq!(entries.len(), 2);
+}
+
+/// Under the cap's pressure the oldest tool rows go first and the newest stay,
+/// and no milestone is touched.
+#[test]
+fn the_oldest_tool_rows_are_dropped_first() {
+    let mut entries = Vec::new();
+    for i in 0..190u32 {
+        let to = if i % 2 == 0 { Column::Queue } else { Column::InProgress };
+        record(&mut entries, t(0), Kind::Moved { from: Column::Backlog, to });
+    }
+    for i in 0..15 {
+        record_tool(&mut entries, t(0), 1, "Read", Some(&format!("f{i}")));
+    }
+    assert_eq!(entries.len(), MAX_ENTRIES);
+    let tools: Vec<String> = entries
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::ToolUsed { detail, .. } => detail.clone(),
+            _ => None,
+        })
+        .collect();
+    let expected: Vec<String> = (5..15).map(|i| format!("f{i}")).collect();
+    assert_eq!(tools, expected);
+    assert_eq!(entries.iter().filter(|e| !e.kind.is_tool()).count(), 190);
 }

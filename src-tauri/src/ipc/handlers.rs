@@ -4628,6 +4628,39 @@ mod get_task_evidence {
         );
     }
 
+    /// A history far past the old 200-entry cap, with large provider results,
+    /// still yields an echo within the entry and byte budgets, so the wire
+    /// answer does not grow with the Task's milestones.
+    #[test]
+    fn the_evidence_echo_does_not_grow_with_a_long_activity_history() {
+        use slashit_activity::{Entry, Kind, RunResult};
+        let at = chrono::Utc::now();
+        let mut activity = Vec::new();
+        for run in 1..=500u32 {
+            let text = "r".repeat(slashit_activity::MAX_RESULT_CHARS);
+            for kind in [
+                Kind::RunStarted { run, addressing_feedback: false },
+                Kind::RunCompleted { run },
+                Kind::RunResult { run, result: RunResult::Available { text } },
+            ] {
+                let seq = activity.len() as u32 + 1;
+                activity.push(Entry { seq, at, kind });
+            }
+        }
+        let total = activity.len();
+        assert!(total > 1_000);
+
+        let (echoed, omitted) = evidence_activity(&activity);
+        let bytes = serde_json::to_vec(&echoed).unwrap().len();
+
+        assert!(echoed.len() <= MAX_EVIDENCE_ACTIVITY_ENTRIES);
+        assert_eq!(echoed.len() + omitted, total);
+        assert!(bytes <= MAX_EVIDENCE_ACTIVITY_BYTES + 8 * 1024, "{bytes}");
+        let (runs, older) = evidence_runs(&activity);
+        assert_eq!(runs.len(), MAX_EVIDENCE_RUNS);
+        assert_eq!(older, 500 - MAX_EVIDENCE_RUNS);
+    }
+
     /// The aggregate bound fails closed: an answer past
     /// [`MAX_EVIDENCE_RESPONSE_BYTES`] is refused whole, with a reason that
     /// names the bound, and nothing oversized goes out with fields silently
