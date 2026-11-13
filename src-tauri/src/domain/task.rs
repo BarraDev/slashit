@@ -336,8 +336,10 @@ pub struct Task {
 
     /// Milestones nothing else on the record keeps, oldest first: runs, AI
     /// reviews, delivery, moves. Each is appended in the durable write of the
-    /// transition it describes. History only -- nothing decides what the
-    /// task may do from it. See [`slashit_activity`].
+    /// transition it describes. Mostly history, but the next run and review
+    /// number, local completion, once-only milestones and the recovery and
+    /// new-attempt checks read it, so a milestone is never evicted; only tool
+    /// rows are dropped past the cap. See [`slashit_activity`].
     ///
     /// A task written before this existed has none, and its timeline shows
     /// only what the rest of its record proves. An entry of a kind this

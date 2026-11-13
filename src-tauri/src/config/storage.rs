@@ -2348,6 +2348,101 @@ mod tests {
         first_task_mut(table).insert("activity".into(), toml::Value::Array(vec![entry.into()]));
     }
 
+    /// A Task with far more milestones than the old 200-entry cap keeps all of
+    /// them through a save and a restart, and the answers derived from them
+    /// are the same afterwards. The board's size is printed, not asserted
+    /// tightly: it is the interim cost of keeping every milestone.
+    #[test]
+    fn a_board_with_a_long_activity_history_round_trips_whole() {
+        use crate::domain::task::ActivityKind;
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let mut task = crate::test_helpers::create_test_task("Long history");
+        for run in 1..=300u32 {
+            task.record_activity(ActivityKind::RunStarted { run, addressing_feedback: false });
+            task.record_activity(ActivityKind::RunCompleted { run });
+            let text = "a provider's final answer ".repeat(20);
+            let result = slashit_activity::RunResult::from_provider(Ok(text));
+            task.record_activity(ActivityKind::RunResult { run, result });
+            task.record_activity(ActivityKind::AiReviewSkipped { review: run, reason: "disabled".into() });
+            task.record_activity(ActivityKind::ReadyForReview { arrival: run });
+        }
+        task.record_activity(ActivityKind::CompletedLocally {});
+        task.status = crate::domain::task::TaskStatus::Done;
+        let before = task.activity.len();
+        assert_eq!(before, 1_501);
+
+        storage.save_project_tasks(project_id, &[task.clone()]).expect("save the board");
+        let bytes = std::fs::metadata(storage.tasks_path(project_id)).unwrap().len();
+        eprintln!("board with {before} milestones: {bytes} bytes");
+        let loaded = storage.load_project_tasks(project_id).expect("load the board");
+        let restarted = loaded.iter().find(|t| t.id == task.id).expect("the Task");
+
+        assert_eq!(restarted.activity, task.activity, "no milestone was dropped");
+        assert_eq!(restarted.next_run(), 301);
+        assert_eq!(restarted.next_review(), 301);
+        assert!(restarted.completed_locally());
+        assert!(!restarted.never_checked_out());
+        assert!(bytes < 2 * 1024 * 1024, "{bytes}");
+    }
+
+    /// Steady-state cost of keeping every milestone: a board of several Tasks,
+    /// saved whole after each milestone, as the lifecycle does. Run with the
+    /// scratch directory on the disk being measured (`TMPDIR`, because /tmp
+    /// may be RAM-backed) and `--ignored --nocapture`. Prints, does not assert
+    /// a latency: it exists to calibrate any later archive design.
+    #[test]
+    #[ignore = "measurement, not a check: run by hand on a real disk"]
+    fn measure_steady_state_board_cost_with_every_milestone_kept() {
+        use crate::domain::task::ActivityKind;
+        use std::time::Instant;
+        const TASKS: usize = 10;
+        const RUNS: u32 = 100;
+        let (storage, dir) = create_test_storage();
+        eprintln!("scratch directory: {}", dir.path().display());
+        let project_id = Uuid::new_v4();
+        let mut tasks: Vec<Task> =
+            (0..TASKS).map(|i| crate::test_helpers::create_test_task(&format!("Task {i}"))).collect();
+        let mut save_micros: Vec<u128> = Vec::new();
+        let mut save = |tasks: &[Task]| {
+            let started = Instant::now();
+            storage.save_project_tasks(project_id, tasks).expect("save");
+            save_micros.push(started.elapsed().as_micros());
+        };
+        for run in 1..=RUNS {
+            for index in 0..tasks.len() {
+                let text = "a provider's final answer, about a screenful of text. ".repeat(40);
+                let result = slashit_activity::RunResult::from_provider(Ok(text));
+                let events = [
+                    ActivityKind::RunStarted { run, addressing_feedback: false },
+                    ActivityKind::RunCompleted { run },
+                    ActivityKind::RunResult { run, result },
+                    ActivityKind::AiReviewSkipped { review: run, reason: "AI review is off".into() },
+                    ActivityKind::ReadyForReview { arrival: run },
+                ];
+                for event in events {
+                    tasks[index].record_activity(event);
+                    save(&tasks);
+                }
+            }
+            if run % 25 == 0 {
+                let bytes = std::fs::metadata(storage.tasks_path(project_id)).unwrap().len();
+                let entries: usize = tasks.iter().map(|t| t.activity.len()).sum();
+                eprintln!("after {run} runs per Task: {entries} milestones in total, board {bytes} bytes");
+            }
+        }
+        let milestones: usize = tasks.iter().map(|t| t.activity.len()).sum();
+        let json: usize = tasks.iter().map(|t| serde_json::to_vec(&t.activity).unwrap().len()).sum();
+        let in_memory = milestones * std::mem::size_of::<slashit_activity::Entry>();
+        save_micros.sort_unstable();
+        let at = |q: f64| save_micros[((save_micros.len() - 1) as f64 * q) as usize];
+        eprintln!(
+            "{} saves; latency us p50 {} p95 {} max {}; milestones {milestones}; activity JSON {json} bytes; \
+             entry structs alone {in_memory} bytes",
+            save_micros.len(), at(0.5), at(0.95), at(1.0),
+        );
+    }
+
     #[test]
     fn checkout_admission_round_trips_through_production_task_board_storage() {
         use crate::domain::task::{CheckoutAdmission, DependencyAdmission, DependencyRequirement};
