@@ -22,7 +22,7 @@ pub fn render_release_notes_markdown(src: &str) -> String {
 }
 
 fn render(src: &str, hard_line_breaks: bool) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
+    use pulldown_cmark::{html, Event, LinkType, Options, Parser, Tag, TagEnd};
 
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -35,8 +35,17 @@ fn render(src: &str, hard_line_breaks: bool) -> String {
     let parser = Parser::new_ext(src, opts).filter_map(|ev| match ev {
         Event::Html(_) | Event::InlineHtml(_) => None,
         Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => None,
-        Event::Start(Tag::Link { ref dest_url, .. }) => {
-            let keep = is_safe_link_destination(dest_url);
+        Event::Start(Tag::Link {
+            ref dest_url,
+            link_type,
+            ..
+        }) => {
+            // An email autolink (`<help@example.com>`) carries the bare address,
+            // and the HTML writer adds `mailto:`: check the destination it emits.
+            let keep = match link_type {
+                LinkType::Email => is_safe_link_destination(&format!("mailto:{dest_url}")),
+                _ => is_safe_link_destination(dest_url),
+            };
             open_links.push(keep);
             keep.then_some(ev)
         }
@@ -128,6 +137,58 @@ mod tests {
             "{nested}"
         );
         assert!(nested.contains("and x <em>y</em>"), "{nested}");
+    }
+
+    #[test]
+    fn email_autolinks_stay_clickable_in_both_renderers() {
+        for render in [render_safe_markdown, render_release_notes_markdown] {
+            let html = render("<help@example.com>");
+            assert_eq!(
+                html.trim(),
+                "<p><a href=\"mailto:help@example.com\">help@example.com</a></p>"
+            );
+            let explicit = render("[mail](mailto:help@example.com)");
+            assert!(
+                explicit.contains("<a href=\"mailto:help@example.com\">mail</a>"),
+                "{explicit}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_email_shaped_input_never_becomes_a_link() {
+        for src in [
+            "<javascript:alert(1)@example.com>",
+            "<a\"b@example.com>",
+            "<@example.com>",
+            "<a@>",
+            "<a@b@c>",
+            "<java script@example.com>",
+        ] {
+            for render in [render_safe_markdown, render_release_notes_markdown] {
+                let html = render(src);
+                assert!(
+                    !html.contains("href") && !html.contains("<a"),
+                    "{src}: {html}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_notes_keep_blocked_destinations_blocked() {
+        for src in [
+            "[click](javascript:alert(1))",
+            "<javascript:alert(1)>",
+            "[click](data:text/html;base64,AAAA)",
+            "[click](//evil.example/x)",
+        ] {
+            let html = render_release_notes_markdown(src);
+            assert!(
+                !html.contains("href") && !html.contains("<a"),
+                "{src}: {html}"
+            );
+        }
     }
 
     #[test]
