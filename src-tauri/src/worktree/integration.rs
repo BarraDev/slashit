@@ -559,58 +559,95 @@ async fn uncommitted_paths_with_program(program: &str, path: &str, limit: std::t
     let mut child = command.spawn().map_err(|e| format!("Failed to run git: {e}"))?;
     let pid = child.id();
     let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
+    // Stderr is drained by its own task, so Git never blocks on a full stderr
+    // pipe while stdout is being read, and the stdout read can end on its own.
+    // Past the cap, stderr is discarded but still drained, so Git cannot stall
+    // on a full pipe and the stdout overflow is what gets reported.
+    let stderr_task = child.stderr.take().map(|mut pipe| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            (&mut pipe).take(STATUS_OUTPUT_LIMIT).read_to_end(&mut buf).await?;
+            tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await?;
+            Ok(buf)
+        })
+    });
+    // `None`: stdout passed the cap, so the read stopped without waiting for
+    // Git, which is then killed the same way as a timed-out one.
+    // Set once `child.wait()` has reaped Git. After that its pid may be reused,
+    // so no group signal may be sent.
+    let reaped = std::sync::atomic::AtomicBool::new(false);
     let finished = tokio::time::timeout(limit, async {
         let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let read_out = async {
-            match stdout_pipe.as_mut() {
-                Some(pipe) => pipe.read_to_end(&mut stdout).await.map(|_| ()),
-                None => Ok(()),
-            }
+        let read_out = match stdout_pipe.as_mut() {
+            Some(pipe) => pipe.take(STATUS_OUTPUT_LIMIT + 1).read_to_end(&mut stdout).await.map(|_| ()),
+            None => Ok(()),
         };
-        let read_err = async {
-            match stderr_pipe.as_mut() {
-                Some(pipe) => pipe.read_to_end(&mut stderr).await.map(|_| ()),
-                None => Ok(()),
-            }
-        };
-        let (out_read, err_read) = tokio::join!(read_out, read_err);
+        if stdout.len() as u64 > STATUS_OUTPUT_LIMIT {
+            return None;
+        }
         let status = child.wait().await;
-        (status, stdout, stderr, out_read.and(err_read))
+        if status.is_ok() {
+            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let (stderr, err_read) = match stderr_task {
+            Some(task) => match task.await {
+                Ok(Ok(buf)) => (buf, Ok(())),
+                Ok(Err(e)) => (Vec::new(), Err(e)),
+                Err(e) => (Vec::new(), Err(std::io::Error::other(e))),
+            },
+            None => (Vec::new(), Ok(())),
+        };
+        Some((status, stdout, stderr, read_out.and(err_read)))
     })
     .await;
+    // Only signals are sent: a process stuck in uninterruptible I/O may not
+    // die promptly, and the bound must hold. The dropped `kill_on_drop` child
+    // is reaped in the background.
+    let stop_git = |child: &mut tokio::process::Child| {
+        // Signal the group only while Git is unreaped, so `pid` still names
+        // the group leader and cannot have been reused.
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            if !reaped.load(std::sync::atomic::Ordering::SeqCst) {
+                // Safety: `pid` leads the group created by `process_group(0)`.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (pid, &reaped);
+        let _ = child.start_kill();
+    };
     match finished {
-        Ok((Err(e), _, _, _)) => Err(format!("git status could not be waited for: {e}")),
-        Ok((Ok(status), _, stderr, _)) if !status.success() => Err(format!(
+        Err(_) => {
+            stop_git(&mut child);
+            Err(format!("reading the checkout's status timed out after {} seconds", limit.as_secs()))
+        }
+        // A cut-short listing is not the complete set of uncommitted paths,
+        // so it is reported as an error rather than a partial list.
+        Ok(None) => {
+            stop_git(&mut child);
+            Err(format!(
+                "git status output exceeded {STATUS_OUTPUT_LIMIT} bytes, so the list of uncommitted paths is incomplete"
+            ))
+        }
+        Ok(Some((Err(e), _, _, _))) => Err(format!("git status could not be waited for: {e}")),
+        Ok(Some((Ok(status), _, stderr, _))) if !status.success() => Err(format!(
             "git status failed (exit {:?}): {}",
             status.code(),
             String::from_utf8_lossy(&stderr).trim()
         )),
         // A pipe that could not be read is not a complete answer: a short
         // stdout would otherwise drop paths from the note without a word.
-        Ok((Ok(_), _, _, Err(e))) => Err(format!("git status output could not be read: {e}")),
-        Ok((Ok(_), stdout, _, Ok(()))) => Ok(parse_status(&String::from_utf8_lossy(&stdout))),
-        Err(_) => {
-            // Not reaped yet, so `pid` still names the group leader and
-            // cannot have been reused.
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                // Safety: `pid` leads the group created by `process_group(0)`.
-                unsafe {
-                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = pid;
-            // Only the signal is sent here, not awaited: a process stuck in
-            // uninterruptible I/O may not die promptly, and the bound must
-            // hold. The dropped `kill_on_drop` child is reaped in the background.
-            let _ = child.start_kill();
-            Err(format!("reading the checkout's status timed out after {} seconds", limit.as_secs()))
-        }
+        Ok(Some((Ok(_), _, _, Err(e)))) => Err(format!("git status output could not be read: {e}")),
+        Ok(Some((Ok(_), stdout, _, Ok(())))) => Ok(parse_status(&String::from_utf8_lossy(&stdout))),
     }
 }
+
+/// Most `git status` output a bounded read keeps. More is reported as
+/// incomplete rather than read in full or cut short.
+const STATUS_OUTPUT_LIMIT: u64 = 1 << 20;
 
 /// The paths named by `git status --porcelain=v1 -z` output.
 fn parse_status(out: &str) -> Vec<String> {
@@ -986,6 +1023,30 @@ mod tests {
         assert!(message.contains("timed out"), "{message}");
         assert!(process_is_gone(dir.path()).await, "the git started for the read was killed and reaped");
         assert_eq!(std::fs::read_to_string(repo.join("kept.txt")).unwrap(), "work\n", "the checkout is untouched");
+    }
+
+    /// A listing larger than the cap must fail as incomplete, never return
+    /// the part read so far as the whole list, and must end its `git`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_oversized_status_listing_is_reported_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("checkout");
+        std::fs::create_dir_all(&repo).unwrap();
+        let fake = dir.path().join("fake-git");
+        let script = "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec head -c 2097152 /dev/zero\n";
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = uncommitted_paths_with_program(
+            &fake.to_string_lossy(),
+            repo.to_str().unwrap(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        let message = result.expect_err("a cut-short listing is not a complete list");
+        assert!(message.contains("incomplete"), "{message}");
+        assert!(process_is_gone(dir.path()).await, "the oversized git was killed and reaped");
     }
 
     #[tokio::test]

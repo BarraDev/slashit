@@ -346,52 +346,66 @@ the live checkout. The full policy below is not implemented.
 
 ## Failed review-fix runs
 
-A review-fix run can fail after it has edited files in the Task Checkout. The
-partial edits stay in the checkout: the fix flow does not discard, stash or
-revert them. The failure is recorded in Task Activity as an AI Fix failure, and
-the review sign-off is recorded as rejected. There is no separate keep, archive
-or discard step and no persisted marker. The uncertainty is carried by existing
-state: the checkout itself, the provider lease, the Worker handoff and the
-Activity record.
+This section states the owner's policy and the requirements for its mechanism.
+The mechanism is not implemented.
 
-Continuation:
+A review-fix run can fail after it has edited files in the Task Checkout. Such a
+partial checkout is preserved and never discarded silently. It is never silently
+incorporated into a later Worker commit or review-fix commit. The uncertain state
+is explicit, and a human decides before the affected work continues. Any discard
+is a separate, authorized operation that states what would be lost. Automatic
+cleanup is not an acceptable shortcut.
 
-- A provider that is gone is proven gone by the provider lease, not assumed.
-  A start that cannot prove it is refused (Queue) or left pending, as before.
-  Where no lease exists (Windows), no absence is claimed and the existing
-  refusal or uncertainty handling applies.
-- After the Human requests changes, the next Worker run starts in the same
-  checkout. This needs no further decision. It does not approve, publish or
-  integrate anything, and it does not schedule itself: automatic successors,
-  retry budgets and routing are not implemented.
+Current behavior: `commit_changes` in `src-tauri/src/queue/executor.rs` runs after
+every Worker run and commits everything uncommitted in the checkout. It does not
+yet honor this policy.
+
+Requirements for the mechanism:
+
+- Durable evidence before the fix starts. Before a review-fix agent runs, SlashIt
+  persists a record that identifies the Task Checkout and its baseline tree and
+  marks the fix as in progress. The record must survive an interruption (process
+  exit or restart) that happens before the post-fix comparison.
+- Recovery. A Task whose fix record shows a started fix without a completion
+  record is treated as holding possibly partial edits, after a restart or at the
+  next AI Review. It refuses further commits until a human chooses to keep the
+  edits for review or to discard them.
+- Post-fix comparison. A failed run whose checkout tree differs from the baseline
+  is treated the same way.
+- Reproduction first. A synthetic reproduction through `commit_changes` with a
+  leftover edit, including an interruption before the post-fix comparison and
+  recovery after restart, must exist before the mechanism lands.
+- Schema changes need analysis first. If the evidence is stored as a new persisted
+  Task field, the change must state, before it is introduced: schema compatibility
+  with existing records (a serde default for old records); downgrade behavior,
+  since the board schema refuses unknown fields and an older build refuses the
+  whole Project board (see [run-diagnostics.md](run-diagnostics.md)); the backup
+  taken before the first write; and the rollback path to the previous build. A
+  storage location that older builds can read is an acceptable alternative if it
+  meets the same requirements.
+
+## Successor notice of preexisting edits
+
+This notice is informational only. It is not failed-review-fix recovery, and it
+does not implement or replace the requirements above, which remain open.
+
+When a Worker run starts in a Task Checkout that already holds uncommitted edits,
+the launch prompt says so and names up to 50 of those paths. It does not say who
+made them, because that is not recorded. The notice is added to the launch prompt
+only, after the prompts that the approval digests are computed from, so it never
+changes an approval.
+
+- The notice says that the paths are data and that it authorizes nothing. Each
+  path is shown in ASCII, with a `\u{..}` escape for any other character, for a
+  backtick and for a backslash. A name longer than 200 units is cut, and the
+  notice says how many units were left out.
 - `commit_changes` still commits the whole checkout after a Worker run. The
-  successor's prompt says so, and says that the checkout already held
-  uncommitted edits when the run started, naming up to 50 of their paths. It
-  does not say who made them, because that is not recorded. The note is added
-  to the launch prompt only, after the prompts the approval digests are
-  computed from, so it never changes an approval.
-- The note says that the paths are data and that the note authorizes nothing.
-  Each path is shown in ASCII, with a `\u{..}` escape for any other character,
-  for a backtick and for a backslash. Names are shown escaped, not read, so a
-  non-English name is less readable here. A name longer than 200 units is cut
-  and says how many units were left out.
-- The status read runs when the run is started, bounded at 10 seconds. When it
-  times out, SlashIt sends a kill to its Git process: on Unix to the whole
-  process group, on Windows to the Git process only (not tested). The kill is
-  sent but not awaited, so a process stuck in uninterruptible I/O can outlive
-  the bound. The note then says the checkout could not be read.
-
-Known limits:
-
-- The note describes the checkout when the run starts. It does not follow edits
-  made while the run is going.
-- A path that is not valid UTF-8 is shown with the replacement escape, so its
-  exact bytes are not recovered.
-- If the start is cancelled rather than timed out, only the Git process itself
-  is killed. A process that Git started, and any process that holds its output
-  pipes open, is not waited for or killed in that case.
-- Windows has no provider lease, so nothing there claims the absence of an
-  earlier provider process.
-- No successor is scheduled automatically: a successor run is the controlled
-  continuation after a Human requests changes, and retry budgets and routing are
-  not implemented.
+  notice says so, and it does not approve the edits.
+- The status read runs when the run starts. It is bounded at 10 seconds and at
+  1 MiB of output. A timed-out read, or a listing over the cap, is reported as
+  unreadable, and no partial list is shown. On timeout or overflow SlashIt kills
+  the Git process: on Unix the whole process group, on Windows only the Git
+  process (not tested).
+- Edits made after the read are not covered by the notice.
+- The notice does not make partial edits from a failed review-fix run durable or
+  recoverable. Those remain governed by the requirements above.
