@@ -10,8 +10,7 @@ SlashIt is a Tauri v2 desktop application for AI agent task orchestration across
 
 - A Project is one repository or root folder managed by SlashIt.
 - Unqualified "Workspace" means the Product Workspace: a container that
-  manages several Projects. Membership is stored on the Project
-  (`domain::project::ProjectScope`).
+  manages several Projects. Membership is stored on the Project (`domain::project::ProjectScope`).
 - A Task Checkout is a Task's isolated working copy. Today it is always a Git
   worktree; JJ workspaces are not a Task Checkout backend.
 - A JJ developer workspace used to develop SlashIt is unrelated to the Product
@@ -54,8 +53,7 @@ scripts/run-desktop-acceptance.sh             # product journeys
 
 ## Testing
 
-Run the tests your change touches. These are the main commands CI runs
-(`.github/workflows/ci.yml`), not a gate for every change.
+Run the tests your change touches. These are the main commands CI runs (`.github/workflows/ci.yml`), not a gate for every change.
 
 - Backend and shared crates: `cargo test -p slashit-ui -p slashit-ipc -p slashit-durable-fs -p slashit-attention -p slashit-activity -p slashit-review-content -p slashit-acceptance`
 - Frontend unit tests, host target, no browser: `cargo test -p slashit-frontend`
@@ -95,12 +93,9 @@ Frontend calls Tauri commands via `invoke()` through services in `src/services/`
 This project uses **Jujutsu (JJ)** as the primary version control system,
 colocated with Git. The rules below are the contract for maintainers and
 agents; [docs/development-workflow.md](docs/development-workflow.md) has the
-procedure, commands, and rationale. External contributors may use plain Git
-(see `CONTRIBUTING.md`).
+procedure, commands, and rationale. External contributors may use plain Git (see `CONTRIBUTING.md`).
 
-Paths below are relative to the canonical repository root. Its parent
-directory (the *project parent*) also holds developer workspaces and local
-private state.
+Paths below are relative to the canonical repository root. Its parent directory (the *project parent*) also holds developer workspaces and local private state.
 
 ### Repository and developer workspaces
 
