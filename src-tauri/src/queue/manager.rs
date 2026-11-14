@@ -100,6 +100,8 @@ impl QueueManager {
             // start for it, so promoting it would park it InProgress holding
             // one of the parallel-limit slots while nothing runs.
             && task.republish_pending_refusal().is_none()
+            // Likewise an unresolved AI Review fix: its checkout holds edits no run may use.
+            && task.review_fix_residue_refusal().is_none()
             // And a task that has checked out with no provider lease on disk:
             // its start is refused for want of proof that no earlier provider
             // is still running, so promoting it would park it the same way.
@@ -249,6 +251,7 @@ mod tests {
                 activity: Vec::new(),
                 worker_handoff: None,
                 worker_handoff_confirmed: false,
+                review_fix_residue: None,
                 last_observed_model: None,
                 reviewer_model: None,
                 new_attempt: None,

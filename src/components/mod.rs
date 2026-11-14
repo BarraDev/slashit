@@ -21,6 +21,7 @@ pub mod task_drawer;
 pub mod task_issue_links;
 pub mod task_live;
 pub mod task_review;
+pub mod review_fix_recovery;
 pub mod worker_recovery;
 pub mod new_attempt;
 pub mod close_without_merge_dialog;

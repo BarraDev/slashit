@@ -177,6 +177,10 @@ pub struct Task {
     pub activity: Vec<slashit_activity::Entry>,
     #[serde(default)]
     pub worker_handoff: Option<WorkerHandoff>,
+    /// An AI Review fix whose edits may still be in the Task Checkout. While it
+    /// is set, SlashIt commits nothing and removes no checkout for this Task.
+    #[serde(default)]
+    pub review_fix_residue: Option<ReviewFixResidue>,
 
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -258,6 +262,19 @@ impl Task {
         }
         .needs_you()
     }
+}
+
+/// Mirrors the backend `ReviewFixResidue`: an AI Review fix whose edits may
+/// still be in the Task Checkout, until a person resolves it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewFixResidue {
+    pub attempt_id: Uuid,
+    pub branch: String,
+    pub checkout_path: String,
+    pub base_head: String,
+    pub reason: String,
+    #[serde(default)]
+    pub commit_authorized: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

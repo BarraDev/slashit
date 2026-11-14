@@ -21,6 +21,7 @@ pub mod orphans;
 pub mod task_boards;
 pub mod worktree;
 pub mod pr;
+pub mod review_fix;
 pub mod roadmap;
 pub mod file;
 pub mod portability;

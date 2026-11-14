@@ -22,6 +22,7 @@ pub mod storage_usage_service;
 pub mod updater_service;
 pub mod task_run_service;
 pub mod human_review_service;
+pub mod review_fix_service;
 pub mod worker_recovery_service;
 pub mod new_attempt_service;
 pub mod integration_service;

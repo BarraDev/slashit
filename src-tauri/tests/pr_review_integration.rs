@@ -157,15 +157,31 @@ impl MockEnv {
         }
     }
 
+    /// The residue ledger for `task`: a board that holds it, and storage in this
+    /// environment's temporary directory.
+    fn ledger_for(&self, task: &slashit_ui_lib::domain::task::Task) -> slashit_ui_lib::review_fix_residue::Ledger {
+        let root = self._tmp.path();
+        let paths = slashit_ui_lib::config::paths::AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        );
+        slashit_ui_lib::review_fix_residue::Ledger {
+            authority: std::sync::Arc::new(slashit_ui_lib::lifecycle::TaskLifecycleLocks::new()),
+            tasks: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from([(
+                task.id,
+                task.clone(),
+            )]))),
+            storage: slashit_ui_lib::config::Storage::with_paths(paths),
+        }
+    }
+
     fn working_dir_str(&self) -> String {
         self.working_dir.display().to_string()
     }
 
     /// The Task's provider lease for this environment, in its temporary directory.
-    fn provider_lease_path(&self) -> std::path::PathBuf {
-        self._tmp.path().join("provider-lease.lock")
-    }
-
     /// Make one fix as an agent would, commit it and push it to `origin`:
     /// the commit and the recorded effect a delivered item carries.
     fn deliver_fix(&self, file: &str) -> (String, slashit_ui_lib::domain::task::FixEffect) {
@@ -304,8 +320,9 @@ async fn dry_run_invokes_claude_only_no_gh_no_push() {
         dry_run: true,
     };
 
+        let ledger = env.ledger_for(&task);
     let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
             .await
             .expect("dry-run apply succeeds");
 
@@ -369,8 +386,9 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
         dry_run: false,
     };
 
+        let ledger = env.ledger_for(&task);
     let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
             .await
             .expect("full apply succeeds");
     // Real applies (dry_run=false) must persist on the plan so the next modal
@@ -651,9 +669,9 @@ async fn a_non_collaborator_fix_is_applied_only_after_the_user_approves_it() {
         .expect("run git")
         .success());
     let opts = AddressPrReviewOptions { auto_push: true, auto_reply: true, dry_run: false };
+    let ledger = env.ledger_for(&task);
     let err = address_pr_review_inner(
-        task.clone(), env.working_dir_str(), merged.clone(), opts.clone(), no_progress(), never_cancelled(), env.provider_lease_path(),
-    )
+        task.clone(), env.working_dir_str(), merged.clone(), opts.clone(), no_progress(), never_cancelled(), ledger)
     .await
     .expect_err("nothing is approved yet");
     assert!(err.contains("No approved fix items"), "got: {err}");
@@ -664,9 +682,9 @@ async fn a_non_collaborator_fix_is_applied_only_after_the_user_approves_it() {
     let mut approved = merged;
     approved.items[0].approved = true;
     let opts = AddressPrReviewOptions { auto_push: true, ..opts };
+    let ledger = env.ledger_for(&task);
     let (result, _) = address_pr_review_inner(
-        task, env.working_dir_str(), approved, opts, no_progress(), never_cancelled(), env.provider_lease_path(),
-    )
+        task, env.working_dir_str(), approved, opts, no_progress(), never_cancelled(), ledger)
     .await
     .expect("the approved fix is applied");
     assert_eq!(result.fixed_ids, vec![201]);
@@ -708,7 +726,8 @@ async fn empty_approved_set_returns_error_and_does_not_call_claude() {
         dry_run: false,
     };
 
-    let err = address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
+    let ledger = env.ledger_for(&task);
+    let err = address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
         .await
         .expect_err("should error when no items are approved");
     assert!(err.contains("No approved fix items"), "got: {err}");
@@ -829,7 +848,8 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
         captured_clone.lock().unwrap().push(ev);
     });
 
-    let (result, _plan) = address_pr_review_inner(task, env.working_dir_str(), plan, opts, sink, never_cancelled(), env.provider_lease_path())
+    let ledger = env.ledger_for(&task);
+    let (result, _plan) = address_pr_review_inner(task, env.working_dir_str(), plan, opts, sink, never_cancelled(), ledger)
         .await
         .expect("two-fix apply succeeds");
 
@@ -887,8 +907,9 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
     };
 
     // Round 1
+        let ledger = env.ledger_for(&task);
     let (round1, plan_after_round1) =
-        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts.clone(), no_progress(), never_cancelled(), env.provider_lease_path())
+        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts.clone(), no_progress(), never_cancelled(), ledger)
             .await
             .expect("round 1 succeeds");
     assert_eq!(round1.fixed_ids, vec![301, 302]);
@@ -905,8 +926,9 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
     assert_eq!(gh_calls_round1, 2, "round 1 should reply per item");
 
     // Round 2 — same task, the now-stamped plan
+        let ledger = env.ledger_for(&task);
     let (round2, plan_after_round2) =
-        address_pr_review_inner(task, env.working_dir_str(), plan_after_round1, opts, no_progress(), never_cancelled(), env.provider_lease_path())
+        address_pr_review_inner(task, env.working_dir_str(), plan_after_round1, opts, no_progress(), never_cancelled(), ledger)
             .await
             .expect("round 2 succeeds");
     assert_eq!(env.claude_invocations(), claude_calls_round1,
@@ -953,8 +975,9 @@ async fn rerunning_apply_with_only_replies_pending_skips_claude() {
         dry_run: false,
     };
 
+        let ledger = env.ledger_for(&task);
     let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
             .await
             .expect("recovery apply succeeds");
 
@@ -1182,8 +1205,9 @@ async fn an_unpushed_fix_gets_no_reply_from_apply_or_sync() {
     let (task, plan) = create_test_pr_review_setup();
     let opts = AddressPrReviewOptions { auto_push: false, auto_reply: true, dry_run: false };
 
+        let ledger = env.ledger_for(&task);
     let (result, mut plan) =
-        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
+        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
             .await
             .expect("full apply succeeds");
     assert_eq!(result.fixed_ids, vec![101]);
@@ -1391,8 +1415,9 @@ async fn apply_reruns_the_fix_for_a_comment_edited_after_the_apply_that_fixed_it
     plan.backfill_lifecycle_from_last_apply();
     let opts = AddressPrReviewOptions { auto_push: false, auto_reply: false, dry_run: false };
 
+        let ledger = env.ledger_for(&task);
     let (result, _plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
             .await
             .expect("apply succeeds");
 

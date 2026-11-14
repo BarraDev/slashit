@@ -359,6 +359,15 @@ pub struct Task {
     #[serde(skip)]
     pub worker_handoff_confirmed: bool,
 
+    /// An AI Review or PR-apply fix attempt whose edits in the Task Checkout
+    /// are not settled. Written durably before the fix agent starts and
+    /// cleared only when the attempt is known to have left no edits, or when
+    /// a person resolves it. While it is present, SlashIt commits nothing into
+    /// the checkout and does not remove it. A crash leaves it in place, so its
+    /// absence after a restart is proof that no attempt was left unsettled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_fix_residue: Option<ReviewFixResidue>,
+
     /// A person's authorization to start a new coding attempt after the
     /// recovery of an interrupted run. It is persisted so a restart can see
     /// it, but it authorizes nothing until `new_attempt_confirmed` is set in
@@ -550,6 +559,42 @@ pub enum WorkerHandoffStage {
     },
 }
 
+/// One AI Review or PR-apply fix attempt that may have left edits in the Task
+/// Checkout. `reason` says why it is unsettled: a crash or an unfinished
+/// attempt, or a failed fix that changed the checkout. Its edits are kept
+/// exactly as found; only a person can resolve it (see
+/// `review_fix_residue` in the crate root).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFixResidue {
+    /// The attempt this record was written for. Settlement and resolution
+    /// name it, so a stale call cannot settle or clear a newer attempt.
+    pub attempt_id: Uuid,
+    /// The Task branch and the checkout path the attempt ran in. A resolution
+    /// must find both unchanged.
+    pub branch: String,
+    pub checkout_path: String,
+    /// HEAD when the attempt started. Evidence only: a person may commit the
+    /// retained edits, which moves HEAD, so resolution does not compare it.
+    pub base_head: String,
+    pub reason: String,
+    /// Set once the fix applied over a clean checkout and SlashIt's own commit of
+    /// its edits is the next step. Only this attempt may commit under it, and a
+    /// restart never does. A commit that fails clears it again.
+    #[serde(default)]
+    pub commit_authorized: bool,
+    /// Set for a PR review apply operation: `attempt_id` is then the operation id,
+    /// and the record protects the apply's uncommitted fixes until its one commit settles it.
+    #[serde(default)]
+    pub apply_scope: bool,
+    /// On an apply scope: set once every item succeeded, so the edits may enter
+    /// the one consolidated commit or a commit-only continuation. Decisions read
+    /// this flag, never `reason`, which is text for a person. Absent from older
+    /// records, which therefore refuse until a person resolves them.
+    #[serde(default)]
+    pub awaiting_commit: bool,
+}
+
 /// `text` with the user's home directory written as `~`, for text the task
 /// file keeps that may name a path on this machine.
 pub(crate) fn without_home_dir(text: &str) -> String {
@@ -715,6 +760,16 @@ impl Task {
                 .activity
                 .iter()
                 .any(|entry| matches!(entry.kind, ActivityKind::RunStarted { .. }))
+    }
+
+    /// Why SlashIt may not commit into or remove this Task Checkout, or `None`.
+    pub fn review_fix_residue_refusal(&self) -> Option<String> {
+        self.review_fix_residue.as_ref().map(|residue| {
+            format!(
+                "A review fix left this Task Checkout unresolved ({}). Its edits were kept and nothing was committed or removed. Inspect the checkout, then resolve the fix explicitly.",
+                residue.reason
+            )
+        })
     }
 
     /// Why ordinary Queue/status commands may not bypass recovery.
@@ -894,6 +949,7 @@ impl Task {
             .then(|| "An earlier cleanup of this Task's checkout is unfinished, so it cannot run yet".to_string())
             .or_else(|| self.republish_pending_refusal())
             .or_else(|| self.worker_recovery_refusal())
+            .or_else(|| self.review_fix_residue_refusal())
             .or_else(|| self.integration_unfinished_refusal())
     }
 
@@ -1007,6 +1063,7 @@ impl Task {
             activity: Vec::new(),
             worker_handoff: None,
             worker_handoff_confirmed: false,
+            review_fix_residue: None,
             new_attempt: None,
             new_attempt_confirmed: false,
             approved_execution: None,
@@ -2434,6 +2491,26 @@ impl HumanReviewRecord {
 
 #[cfg(test)]
 mod tests {
+    /// An unresolved AI Review fix refuses queue entry, so no Worker is admitted
+    /// into a checkout that holds its edits.
+    #[test]
+    fn an_unresolved_review_fix_refuses_queue_entry() {
+        let mut task = startable_task();
+        assert!(task.queue_entry_refusal().is_none());
+        task.review_fix_residue = Some(ReviewFixResidue {
+            attempt_id: uuid::Uuid::new_v4(),
+            branch: "task-branch".into(),
+            checkout_path: "/checkout".into(),
+            base_head: "abc".into(),
+            reason: "an AI Review fix applied, but its edits were not committed".into(),
+            commit_authorized: false,
+            apply_scope: false,
+            awaiting_commit: false,
+        });
+        assert!(task.review_fix_residue_refusal().is_some());
+        assert!(task.queue_entry_refusal().is_some());
+    }
+
     #[test]
     fn checkout_admission_survives_restart_and_bad_evidence_refuses_the_record() {
         use super::{CheckoutAdmission, DependencyAdmission, DependencyRequirement, Task};
