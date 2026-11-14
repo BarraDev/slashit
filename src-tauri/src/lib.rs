@@ -8,6 +8,8 @@ mod agents;
 pub mod config;
 mod session;
 mod queue;
+pub mod review_fix_residue;
+pub mod review_fix_apply;
 mod pty;
 mod host_process;
 mod worktree;
@@ -548,6 +550,7 @@ pub fn run() {
             refresh_pr_status,
             analyze_pr_comments,
             address_pr_review,
+            review_fix::resolve_review_fix,
             sync_pr_review_replies,
             discuss_pr_review_questions,
             refresh_task_pr_state,

@@ -22,41 +22,24 @@ use super::restack;
 /// untracked files and deletions, without touching the checkout's index, its
 /// files or its branch.
 ///
-/// A scratch index is seeded from the checkout's index when possible, then
-/// updated from the working tree, and written out as a tree. Files Git ignores
-/// are not part of it, as they are not part of a commit.
+/// The scratch index starts from HEAD, then is updated from the working tree and
+/// written out as a tree. It is not a copy of the checkout's index: a copy gets
+/// a new file time, so Git can trust a cached entry whose size and time match an
+/// edit made in the same moment and report a stale blob. Files Git ignores are
+/// not part of it, as they are not part of a commit.
 pub async fn checkout_snapshot(working_dir: &str) -> Result<String, String> {
     let scratch = std::env::temp_dir().join(format!("slashit-snapshot-{}.index", uuid::Uuid::new_v4()));
-    let seeded = match crate::host_process::tokio_command("git")
-        .args(["rev-parse", "--git-path", "index"])
-        .env("LC_ALL", "C")
-        .current_dir(working_dir)
-        .output()
-        .await
-    {
-        Ok(output) if output.status.success() => {
-            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let source = Path::new(&raw);
-            let source = if source.is_absolute() {
-                source.to_path_buf()
-            } else {
-                Path::new(working_dir).join(source)
-            };
-            tokio::fs::copy(source, &scratch).await.is_ok()
-        }
-        _ => false,
-    };
-    let result = snapshot_with_index(working_dir, &scratch, seeded).await;
+    let result = snapshot_with_index(working_dir, &scratch).await;
     let _ = tokio::fs::remove_file(&scratch).await;
     result
 }
 
-async fn snapshot_with_index(working_dir: &str, index: &Path, seeded: bool) -> Result<String, String> {
-    let run = |args: &'static [&'static str]| {
+async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, String> {
+    let run = |args: Vec<String>| {
         let index = index.to_path_buf();
         async move {
             let output = crate::host_process::tokio_command("git")
-                .args(args)
+                .args(&args)
                 .env("GIT_INDEX_FILE", &index)
                 .env("LC_ALL", "C")
                 .env("LANGUAGE", "C")
@@ -69,18 +52,43 @@ async fn snapshot_with_index(working_dir: &str, index: &Path, seeded: bool) -> R
             } else {
                 Err(format!(
                     "git {} failed: {}",
-                    args.first().unwrap_or(&""),
+                    args.first().map_or("", String::as_str),
                     String::from_utf8_lossy(&output.stderr).trim()
                 ))
             }
         }
     };
-    if !seeded {
-        // A repository without a commit yet has no HEAD to read: start empty.
-        let _ = run(&["read-tree", "HEAD"]).await;
+    // A repository without a commit yet has no HEAD to read: start empty.
+    let _ = run(vec!["read-tree".into(), "HEAD".into()]).await;
+    // A file staged with `git add -f` despite an ignore rule is part of the commit,
+    // but `add -A` skips it in this scratch index, so its additions are added here.
+    // The real index is read, not the scratch one. A path deleted since staging is
+    // left out, as `add -A` would drop it.
+    let staged = crate::host_process::tokio_command("git")
+        .args(["diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A", "-z"])
+        .current_dir(working_dir)
+        .output()
+        .await
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if !staged.status.success() {
+        return Err(format!(
+            "git diff --cached failed: {}",
+            String::from_utf8_lossy(&staged.stderr).trim()
+        ));
     }
-    run(&["add", "-A"]).await?;
-    run(&["write-tree"]).await
+    let forced: Vec<String> = String::from_utf8_lossy(&staged.stdout)
+        .split('\0')
+        .filter(|p| !p.is_empty() && Path::new(working_dir).join(p).symlink_metadata().is_ok())
+        .map(str::to_string)
+        .collect();
+    if !forced.is_empty() {
+        // `:(literal)`: a name with glob characters must not match other, unstaged files.
+        let mut args = vec!["add".to_string(), "-f".to_string(), "--".to_string()];
+        args.extend(forced.into_iter().map(|p| format!(":(literal){p}")));
+        run(args).await?;
+    }
+    run(vec!["add".into(), "-A".into()]).await?;
+    run(vec!["write-tree".into()]).await
 }
 
 /// What [`effect_survives_in`] found.

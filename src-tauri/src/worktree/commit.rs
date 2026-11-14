@@ -47,7 +47,24 @@ pub async fn commit_checkout(
     branch: &str,
     message: &str,
 ) -> Result<CheckoutCommit, String> {
-    Ok(match commit(working_dir, branch, message, false).await? {
+    Ok(match commit(working_dir, branch, message, false, None).await? {
+        Some(commit) => CheckoutCommit::Committed { commit },
+        None => CheckoutCommit::NothingToCommit,
+    })
+}
+
+/// [`commit_checkout`] for a caller that has checked the checkout's content as
+/// `expected_tree`, a [`checkout_snapshot`] tree id. The staged index is compared
+/// with it before the commit, so an edit made after the check and before staging
+/// refuses the commit, and nothing is committed. Once staged, the commit takes
+/// the index, so later edits to the working tree do not enter it.
+pub async fn commit_checkout_verified(
+    working_dir: &str,
+    branch: &str,
+    message: &str,
+    expected_tree: &str,
+) -> Result<CheckoutCommit, String> {
+    Ok(match commit(working_dir, branch, message, false, Some(expected_tree)).await? {
         Some(commit) => CheckoutCommit::Committed { commit },
         None => CheckoutCommit::NothingToCommit,
     })
@@ -67,7 +84,7 @@ pub async fn commit_checkout_even_if_empty(
     branch: &str,
     message: &str,
 ) -> Result<String, String> {
-    commit(working_dir, branch, message, true)
+    commit(working_dir, branch, message, true, None)
         .await?
         .ok_or_else(|| "git made no commit".to_string())
 }
@@ -115,6 +132,7 @@ async fn commit(
     branch: &str,
     message: &str,
     allow_empty: bool,
+    expected_tree: Option<&str>,
 ) -> Result<Option<String>, String> {
     refuse_unless_on_task_branch(working_dir, branch).await?;
 
@@ -122,9 +140,24 @@ async fn commit(
         .await
         .map_err(|e| format!("git add failed: {e}"))?;
 
+    if let Some(expected) = expected_tree {
+        let staged = git(working_dir, &["write-tree"])
+            .await
+            .map_err(|e| format!("could not read the staged content: {e}"))?;
+        if staged != expected {
+            return Err(
+                "the Task Checkout changed after its content was checked, so nothing was committed"
+                    .to_string(),
+            );
+        }
+    }
+
     if !allow_empty && !has_staged_changes(working_dir).await? {
         return Ok(None);
     }
+
+    // The tip before this commit, so a commit that holds other content can be undone.
+    let before = git(working_dir, &["rev-parse", "--verify", "HEAD"]).await.ok();
 
     let mut args = vec!["commit", "-q"];
     if allow_empty {
@@ -138,7 +171,31 @@ async fn commit(
     let commit = git(working_dir, &["rev-parse", "HEAD"])
         .await
         .map_err(|e| format!("committed, but the new commit could not be read back: {e}"))?;
+    if let Some(expected) = expected_tree {
+        // Pre-commit hooks run after the check above and may stage files, so the
+        // commit can record a tree other than the one that was checked.
+        let holds_checked_tree = git(working_dir, &["rev-parse", "HEAD^{tree}"])
+            .await
+            .is_ok_and(|tree| tree == expected);
+        if !holds_checked_tree {
+            return Err(undo_commit(working_dir, before.as_deref(), &commit).await);
+        }
+    }
     Ok(Some(commit))
+}
+
+/// Moves the task branch back to `before` after a commit whose tree is not the
+/// checked tree. A soft reset: the working tree and the index are untouched, so
+/// every edit, forced ignored files included, stays visible to `git status`.
+async fn undo_commit(working_dir: &str, before: Option<&str>, made: &str) -> String {
+    const REFUSAL: &str = "a Git hook changed the staged content after it was checked";
+    let Some(before) = before else {
+        return format!("{REFUSAL}, and the commit {made} could not be undone, so it stays on the task branch");
+    };
+    match git(working_dir, &["reset", "-q", "--soft", before]).await {
+        Ok(_) => format!("{REFUSAL}, so the commit was undone and nothing was committed"),
+        Err(e) => format!("{REFUSAL}, and the commit {made} could not be undone, so it stays on the task branch: {e}"),
+    }
 }
 
 /// Refuse a checkout that is not exactly where the task's work belongs: see
@@ -213,9 +270,12 @@ async fn has_staged_changes(working_dir: &str) -> Result<bool, String> {
 }
 
 async fn git(working_dir: &str, args: &[&str]) -> Result<String, String> {
+    // A cancelled call stops its git process, so it cannot keep writing the index
+    // after the record gate is released. Hook processes it started are not killed.
     let output = crate::host_process::tokio_command("git")
         .args(args)
         .current_dir(working_dir)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("could not run git: {e}"))?;
@@ -238,27 +298,38 @@ pub struct CheckoutSnapshot {
 
 /// Snapshots the content of the checkout at `working_dir`, so that comparing a
 /// snapshot from before an agent run with one from after shows whether the run
-/// changed anything. The snapshot starts from a copy of the checkout's index,
-/// so tracked files that match an ignore rule are still compared, and the
-/// checkout's own index is never written. The copy and the lock Git takes while
-/// it writes are removed afterwards.
+/// changed anything. The scratch index starts from HEAD, not from a copy of the
+/// checkout's index: a copy gets a new file time, so Git can trust a cached
+/// entry whose size and time match an edit made in the same moment and report
+/// a stale blob. The checkout's own index is never written, and the scratch
+/// index and its lock are removed afterwards.
 pub async fn checkout_snapshot(working_dir: &str) -> Result<CheckoutSnapshot, String> {
     let git_dir = git(working_dir, &["rev-parse", "--absolute-git-dir"])
         .await
         .map_err(|e| format!("could not locate the checkout's Git directory: {e}"))?;
     let index = Path::new(&git_dir).join("slashit-content-snapshot.index");
     let lock = Path::new(&git_dir).join("slashit-content-snapshot.index.lock");
-    let real_index = git(working_dir, &["rev-parse", "--git-path", "index"])
-        .await
-        .map_err(|e| format!("could not locate the checkout's index: {e}"))?;
-    let real_index = Path::new(working_dir).join(real_index);
     let _ = std::fs::remove_file(&index);
     let _ = std::fs::remove_file(&lock);
-    if real_index.exists() {
-        std::fs::copy(&real_index, &index)
-            .map_err(|e| format!("could not copy the checkout's index: {e}"))?;
-    }
     let result = async {
+        // An unborn HEAD has no tree to read: the scratch index then starts empty.
+        let _ = git_with_index(working_dir, &index, &["read-tree", "HEAD"]).await;
+        // A file staged with `git add -f` despite an ignore rule is in the commit that
+        // staging everything would make, but `add -A` skips it here. Its additions are
+        // added explicitly. A path deleted since staging is left out, as `add -A` drops it.
+        // `--no-renames`: a staged rename into an ignored name is an addition too.
+        let staged = git(working_dir, &["diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A", "-z"]).await?;
+        let forced: Vec<&str> = staged
+            .split('\0')
+            .filter(|p| !p.is_empty() && Path::new(working_dir).join(p).symlink_metadata().is_ok())
+            .collect();
+        if !forced.is_empty() {
+            // `:(literal)`: a name with glob characters must not match other, unstaged files.
+            let literal: Vec<String> = forced.iter().map(|p| format!(":(literal){p}")).collect();
+            let mut args = vec!["add", "-f", "--"];
+            args.extend(literal.iter().map(String::as_str));
+            git_with_index(working_dir, &index, &args).await?;
+        }
         git_with_index(working_dir, &index, &["add", "-A"]).await?;
         let content = git_with_index(working_dir, &index, &["write-tree"]).await?;
         let head = git(working_dir, &["rev-parse", "HEAD^{tree}"]).await?;
@@ -370,6 +441,96 @@ mod tests {
     /// The tip of the branch, read back after an agent-style commit of its
     /// own, is what one run with nothing left to commit records as its head.
     #[tokio::test]
+    async fn a_commit_checked_against_a_tree_refuses_content_changed_after_the_check() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        std::fs::write(checkout.join("kept.txt"), "checked\n").unwrap();
+        let checked = checkout_snapshot(dir).await.unwrap().content;
+        let head = git_ok(&checkout, &["rev-parse", "task"]);
+
+        std::fs::write(checkout.join("kept.txt"), "edited after the check\n").unwrap();
+        let refused = commit_checkout_verified(dir, "task", "task: fix it", &checked).await;
+        assert!(refused.is_err(), "a change after the check is refused: {refused:?}");
+        assert_eq!(git_ok(&checkout, &["rev-parse", "task"]), head, "nothing was committed");
+
+        std::fs::write(checkout.join("kept.txt"), "checked\n").unwrap();
+        let outcome = commit_checkout_verified(dir, "task", "task: fix it", &checked)
+            .await
+            .expect("the checked content commits");
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }));
+        assert_eq!(git_ok(&checkout, &["show", "task:kept.txt"]), "checked");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_matches_what_staging_everything_would_commit_in_each_shape() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        std::fs::write(checkout.join("a.txt"), "aaa\n").unwrap();
+        std::fs::write(checkout.join("b.txt"), "bbb\n").unwrap();
+        std::fs::write(checkout.join("c.txt"), "ccc\n").unwrap();
+        git_ok(&checkout, &["add", "-A"]);
+        git_ok(&checkout, &["commit", "-q", "-m", "base files"]);
+
+        // Each step is checked against what `add -A` then `write-tree` would record.
+        let steps: Vec<(&str, Box<dyn Fn(&Path)>)> = vec![
+            ("unstaged same-size edit", Box::new(|c: &Path| std::fs::write(c.join("a.txt"), "AAA\n").unwrap())),
+            ("staged-only edit", Box::new(|c: &Path| {
+                std::fs::write(c.join("b.txt"), "BBB\n").unwrap();
+                git_ok(c, &["add", "b.txt"]);
+            })),
+            ("staged then unstaged edit", Box::new(|c: &Path| std::fs::write(c.join("b.txt"), "bbX\n").unwrap())),
+            ("added and deleted files", Box::new(|c: &Path| {
+                std::fs::write(c.join("new.txt"), "new\n").unwrap();
+                std::fs::remove_file(c.join("c.txt")).unwrap();
+            })),
+        ];
+        #[cfg(unix)]
+        let steps = {
+            let mut steps = steps;
+            steps.push(("mode change and symlink", Box::new(|c: &Path| {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perm = std::fs::metadata(c.join("a.txt")).unwrap().permissions();
+                perm.set_mode(0o755);
+                std::fs::set_permissions(c.join("a.txt"), perm).unwrap();
+                std::os::unix::fs::symlink("a.txt", c.join("link")).unwrap();
+            })));
+            steps
+        };
+        for (name, edit) in steps {
+            edit(&checkout);
+            let snapshot = checkout_snapshot(dir).await.unwrap().content;
+            git_ok(&checkout, &["add", "-A"]);
+            let staged = git_ok(&checkout, &["write-tree"]);
+            assert_eq!(snapshot, staged, "step: {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_reads_an_edit_that_keeps_the_size_and_the_index_time() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        // A staged blob that a refused commit left behind in the real index.
+        std::fs::write(checkout.join("kept.txt"), "EIGHT\n").unwrap();
+        git_ok(&checkout, &["add", "-A"]);
+        let index = checkout.join(git_ok(&checkout, &["rev-parse", "--git-path", "index"]));
+        let index_time = std::fs::metadata(&index).unwrap().modified().unwrap();
+        // The same-size edit, stamped with the index's own time.
+        let edited = checkout.join("kept.txt");
+        std::fs::write(&edited, "eight\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&edited)
+            .unwrap()
+            .set_modified(index_time)
+            .unwrap();
+
+        let snapshot = checkout_snapshot(dir).await.unwrap().content;
+        git_ok(&checkout, &["add", "-A"]);
+        let staged = git_ok(&checkout, &["write-tree"]);
+        assert_eq!(snapshot, staged, "the snapshot reads the file as it is on disk");
+    }
+
+    #[tokio::test]
     async fn checkout_head_commit_names_the_tip_the_commit_left_in_place() {
         let (_tmp, _repo, checkout) = repo_with_task_checkout();
         std::fs::write(checkout.join("own work.txt"), "committed by the agent\n").unwrap();
@@ -405,6 +566,105 @@ mod tests {
         let tip = git_ok(&checkout, &["rev-parse", "task"]);
         assert_ne!(tip, before);
         assert_eq!(commit, tip);
+    }
+
+    /// A file staged with `git add -f` despite an ignore rule is part of the commit
+    /// that staging everything makes, so the checked snapshot must hold it too.
+    #[tokio::test]
+    async fn a_forced_staged_ignored_addition_is_in_the_snapshot() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        std::fs::write(checkout.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(checkout.join("fixture.log"), "forced\n").unwrap();
+        git_ok(&checkout, &["add", "-f", "fixture.log"]);
+        let checked = checkout_snapshot(dir).await.unwrap().content;
+
+        let outcome = commit_checkout_verified(dir, "task", "task: fix it", &checked)
+            .await
+            .expect("the checked content commits");
+
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }));
+        assert_eq!(git_ok(&checkout, &["show", "task:fixture.log"]), "forced");
+    }
+
+    /// A forced name with glob characters is added literally: an unstaged ignored file
+    /// that the same pattern would match is neither in the snapshot nor in the commit.
+    #[tokio::test]
+    async fn a_forced_name_with_glob_characters_adds_only_itself() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        std::fs::write(checkout.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(checkout.join("out[1].log"), "forced\n").unwrap();
+        std::fs::write(checkout.join("out1.log"), "unstaged\n").unwrap();
+        git_ok(&checkout, &["add", "-f", "--", ":(literal)out[1].log"]);
+        let checked = checkout_snapshot(dir).await.unwrap().content;
+
+        let outcome = commit_checkout_verified(dir, "task", "task: fix it", &checked)
+            .await
+            .expect("the checked content commits");
+
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }));
+        assert_eq!(git_ok(&checkout, &["show", "task:out[1].log"]), "forced");
+        assert!(StdCommand::new("git")
+            .args(["cat-file", "-e", "task:out1.log"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap()
+            .code()
+            != Some(0));
+    }
+
+    /// A staged rename into an ignored name is an addition the commit records, so the
+    /// snapshot must hold it, not read it as a rename that drops it.
+    #[tokio::test]
+    async fn a_staged_rename_into_an_ignored_name_is_in_the_snapshot() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        std::fs::write(checkout.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::rename(checkout.join("kept.txt"), checkout.join("renamed.log")).unwrap();
+        git_ok(&checkout, &["rm", "-q", "--cached", "kept.txt"]);
+        git_ok(&checkout, &["add", "-f", "renamed.log"]);
+        let checked = checkout_snapshot(dir).await.unwrap().content;
+
+        let outcome = commit_checkout_verified(dir, "task", "task: fix it", &checked)
+            .await
+            .expect("the checked content commits");
+
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }));
+        assert_eq!(git_ok(&checkout, &["show", "task:renamed.log"]), "kept");
+    }
+
+    /// A pre-commit hook that stages a file changes what the commit records. The
+    /// commit is undone: the branch is where it was, and the edits stay on disk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hook_that_stages_more_than_was_checked_is_undone() {
+        let (_tmp, repo, checkout) = repo_with_task_checkout();
+        // Published by `write_executable`'s short-lived child, as in the hook test below.
+        crate::test_helpers::write_executable(
+            &repo.join(".git/hooks/pre-commit"),
+            "#!/bin/sh\necho extra > extra.txt && git add extra.txt\n",
+        );
+        std::fs::write(checkout.join("kept.txt"), "checked\n").unwrap();
+        std::fs::write(checkout.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(checkout.join("forced.log"), "forced\n").unwrap();
+        git_ok(&checkout, &["add", "-f", "--", ":(literal)forced.log"]);
+        let dir = checkout.to_str().unwrap();
+        let checked = checkout_snapshot(dir).await.unwrap().content;
+        let before = git_ok(&checkout, &["rev-parse", "task"]);
+
+        let error = commit_checkout_verified(dir, "task", "task: fix it", &checked)
+            .await
+            .expect_err("the commit holding the hook's file is refused");
+
+        assert!(error.contains("a Git hook changed the staged content"), "{error}");
+        assert!(error.contains("undone"), "{error}");
+        assert_eq!(git_ok(&checkout, &["rev-parse", "task"]), before, "the commit was undone");
+        assert_eq!(std::fs::read_to_string(checkout.join("kept.txt")).unwrap(), "checked\n");
+        // The forced ignored file is still visible to status, so no clean check can
+        // read the checkout as clean while it is there.
+        let status = git_ok(&checkout, &["status", "--porcelain"]);
+        assert!(status.contains("forced.log"), "{status}");
     }
 
     // The hook is a shell script made executable with Unix permissions.

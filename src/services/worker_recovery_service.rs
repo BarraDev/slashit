@@ -15,7 +15,7 @@ extern "C" {
     fn raw_invoke(cmd: &str, args: JsValue) -> js_sys::Promise;
 }
 
-async fn invoke<T: for<'de> Deserialize<'de>>(cmd: &str, args: serde_json::Value) -> Result<T, String> {
+pub(crate) async fn invoke<T: for<'de> Deserialize<'de>>(cmd: &str, args: serde_json::Value) -> Result<T, String> {
     let args = serde_wasm_bindgen::to_value(&args).map_err(|e| e.to_string())?;
     let response = JsFuture::from(raw_invoke(cmd, args)).await.map_err(|e| {
         e.as_string().unwrap_or_else(|| {
