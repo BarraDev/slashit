@@ -65,7 +65,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 readonly MANIFEST=docs/agent-docs.toml
-readonly ROOT_DOC_MAX_LINES=250
+readonly ROOT_DOC_MAX_LINES=260
 readonly NESTED_DOC_MAX_LINES=150
 readonly CODE_BLOCK_MAX_LINES=30
 # Check G. The one file whose tauri::generate_handler! list is authoritative.

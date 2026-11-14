@@ -232,6 +232,15 @@ repository's public history.
 
 Before changing async lifecycles, shared state, IPC, subprocesses, persistence or approval policy, read [async-safety.md](docs/engineering/async-safety.md) (the binding rules) and [concurrency-standard.md](docs/engineering/concurrency-standard.md) (the reference).
 
+## Decision boundaries
+
+- **Determinism at critical boundaries.** Use deterministic guarantees for persistence, data integrity, authorization, commit identity and content, and consequential or irreversible effects. Existing [async-safety.md](docs/engineering/async-safety.md) and concurrency requirements remain binding.
+- **AI for judgment, not integrity authority.** AI may interpret, classify, plan, recommend, and coordinate actions. Its judgment alone must not bypass required validation, authorization, or Human approval.
+- **Autonomy proportional to risk.** Prefer greater autonomy for observable, reversible, low-risk operations. Apply stronger safeguards when consequences are difficult to reverse or affect user data, permissions, or published work.
+- **Complexity proportional to evidence and consequences.** Before introducing a new mechanism, consider the actual failure or credible threat it addresses, the expected impact, existing safeguards, and simpler alternatives. Favor incremental hardening without compromising essential safety guarantees.
+
+These principles guide architectural choices. They do not replace existing binding safety contracts or require additional processes for trivial changes.
+
 ## Nested AGENTS.md
 
 Module guidance. AGENTS.md is the authoritative source of project instructions. Each directory's `CLAUDE.md` is a compatibility adapter containing only `@AGENTS.md`; keep it. Claude Code and SlashIt's own agent runs read the project instructions through these adapters, so a missing adapter silently drops that directory's guidance:
