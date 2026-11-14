@@ -354,6 +354,11 @@ async fn publish(
                 .to_string(),
         );
     }
+    // An unresolved AI Review fix means the checkout's content is not known to be
+    // the one confirmed. Publication waits for a person to resolve it.
+    if let Some(refusal) = task.review_fix_residue_refusal() {
+        return Err(format!("so nothing was published. {refusal}"));
+    }
     let branch = task
         .branch_name
         .clone()

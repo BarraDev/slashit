@@ -185,13 +185,14 @@ async fn commit(
 }
 
 /// Moves the task branch back to `before` after a commit whose tree is not the
-/// checked tree. The working tree is untouched, so the edits stay where they were.
+/// checked tree. A soft reset: the working tree and the index are untouched, so
+/// every edit, forced ignored files included, stays visible to `git status`.
 async fn undo_commit(working_dir: &str, before: Option<&str>, made: &str) -> String {
     const REFUSAL: &str = "a Git hook changed the staged content after it was checked";
     let Some(before) = before else {
         return format!("{REFUSAL}, and the commit {made} could not be undone, so it stays on the task branch");
     };
-    match git(working_dir, &["reset", "-q", "--mixed", before]).await {
+    match git(working_dir, &["reset", "-q", "--soft", before]).await {
         Ok(_) => format!("{REFUSAL}, so the commit was undone and nothing was committed"),
         Err(e) => format!("{REFUSAL}, and the commit {made} could not be undone, so it stays on the task branch: {e}"),
     }
@@ -323,8 +324,10 @@ pub async fn checkout_snapshot(working_dir: &str) -> Result<CheckoutSnapshot, St
             .filter(|p| !p.is_empty() && Path::new(working_dir).join(p).symlink_metadata().is_ok())
             .collect();
         if !forced.is_empty() {
+            // `:(literal)`: a name with glob characters must not match other, unstaged files.
+            let literal: Vec<String> = forced.iter().map(|p| format!(":(literal){p}")).collect();
             let mut args = vec!["add", "-f", "--"];
-            args.extend(forced);
+            args.extend(literal.iter().map(String::as_str));
             git_with_index(working_dir, &index, &args).await?;
         }
         git_with_index(working_dir, &index, &["add", "-A"]).await?;
@@ -584,6 +587,33 @@ mod tests {
         assert_eq!(git_ok(&checkout, &["show", "task:fixture.log"]), "forced");
     }
 
+    /// A forced name with glob characters is added literally: an unstaged ignored file
+    /// that the same pattern would match is neither in the snapshot nor in the commit.
+    #[tokio::test]
+    async fn a_forced_name_with_glob_characters_adds_only_itself() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        std::fs::write(checkout.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(checkout.join("out[1].log"), "forced\n").unwrap();
+        std::fs::write(checkout.join("out1.log"), "unstaged\n").unwrap();
+        git_ok(&checkout, &["add", "-f", "--", ":(literal)out[1].log"]);
+        let checked = checkout_snapshot(dir).await.unwrap().content;
+
+        let outcome = commit_checkout_verified(dir, "task", "task: fix it", &checked)
+            .await
+            .expect("the checked content commits");
+
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }));
+        assert_eq!(git_ok(&checkout, &["show", "task:out[1].log"]), "forced");
+        assert!(StdCommand::new("git")
+            .args(["cat-file", "-e", "task:out1.log"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap()
+            .code()
+            != Some(0));
+    }
+
     /// A staged rename into an ignored name is an addition the commit records, so the
     /// snapshot must hold it, not read it as a rename that drops it.
     #[tokio::test]
@@ -616,6 +646,9 @@ mod tests {
             "#!/bin/sh\necho extra > extra.txt && git add extra.txt\n",
         );
         std::fs::write(checkout.join("kept.txt"), "checked\n").unwrap();
+        std::fs::write(checkout.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(checkout.join("forced.log"), "forced\n").unwrap();
+        git_ok(&checkout, &["add", "-f", "--", ":(literal)forced.log"]);
         let dir = checkout.to_str().unwrap();
         let checked = checkout_snapshot(dir).await.unwrap().content;
         let before = git_ok(&checkout, &["rev-parse", "task"]);
@@ -628,6 +661,10 @@ mod tests {
         assert!(error.contains("undone"), "{error}");
         assert_eq!(git_ok(&checkout, &["rev-parse", "task"]), before, "the commit was undone");
         assert_eq!(std::fs::read_to_string(checkout.join("kept.txt")).unwrap(), "checked\n");
+        // The forced ignored file is still visible to status, so no clean check can
+        // read the checkout as clean while it is there.
+        let status = git_ok(&checkout, &["status", "--porcelain"]);
+        assert!(status.contains("forced.log"), "{status}");
     }
 
     // The hook is a shell script made executable with Unix permissions.

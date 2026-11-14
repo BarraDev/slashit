@@ -82,8 +82,9 @@ async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, 
         .map(str::to_string)
         .collect();
     if !forced.is_empty() {
+        // `:(literal)`: a name with glob characters must not match other, unstaged files.
         let mut args = vec!["add".to_string(), "-f".to_string(), "--".to_string()];
-        args.extend(forced);
+        args.extend(forced.into_iter().map(|p| format!(":(literal){p}")));
         run(args).await?;
     }
     run(vec!["add".into(), "-A".into()]).await?;
