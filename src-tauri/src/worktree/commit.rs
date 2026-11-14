@@ -271,27 +271,22 @@ pub struct CheckoutSnapshot {
 
 /// Snapshots the content of the checkout at `working_dir`, so that comparing a
 /// snapshot from before an agent run with one from after shows whether the run
-/// changed anything. The snapshot starts from a copy of the checkout's index,
-/// so tracked files that match an ignore rule are still compared, and the
-/// checkout's own index is never written. The copy and the lock Git takes while
-/// it writes are removed afterwards.
+/// changed anything. The scratch index starts from HEAD, not from a copy of the
+/// checkout's index: a copy gets a new file time, so Git can trust a cached
+/// entry whose size and time match an edit made in the same moment and report
+/// a stale blob. The checkout's own index is never written, and the scratch
+/// index and its lock are removed afterwards.
 pub async fn checkout_snapshot(working_dir: &str) -> Result<CheckoutSnapshot, String> {
     let git_dir = git(working_dir, &["rev-parse", "--absolute-git-dir"])
         .await
         .map_err(|e| format!("could not locate the checkout's Git directory: {e}"))?;
     let index = Path::new(&git_dir).join("slashit-content-snapshot.index");
     let lock = Path::new(&git_dir).join("slashit-content-snapshot.index.lock");
-    let real_index = git(working_dir, &["rev-parse", "--git-path", "index"])
-        .await
-        .map_err(|e| format!("could not locate the checkout's index: {e}"))?;
-    let real_index = Path::new(working_dir).join(real_index);
     let _ = std::fs::remove_file(&index);
     let _ = std::fs::remove_file(&lock);
-    if real_index.exists() {
-        std::fs::copy(&real_index, &index)
-            .map_err(|e| format!("could not copy the checkout's index: {e}"))?;
-    }
     let result = async {
+        // An unborn HEAD has no tree to read: the scratch index then starts empty.
+        let _ = git_with_index(working_dir, &index, &["read-tree", "HEAD"]).await;
         git_with_index(working_dir, &index, &["add", "-A"]).await?;
         let content = git_with_index(working_dir, &index, &["write-tree"]).await?;
         let head = git(working_dir, &["rev-parse", "HEAD^{tree}"]).await?;
@@ -421,6 +416,31 @@ mod tests {
             .expect("the checked content commits");
         assert!(matches!(outcome, CheckoutCommit::Committed { .. }));
         assert_eq!(git_ok(&checkout, &["show", "task:kept.txt"]), "checked");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_reads_an_edit_that_keeps_the_size_and_the_index_time() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        // A staged blob that a refused commit left behind in the real index.
+        std::fs::write(checkout.join("kept.txt"), "EIGHT\n").unwrap();
+        git_ok(&checkout, &["add", "-A"]);
+        let index = checkout.join(git_ok(&checkout, &["rev-parse", "--git-path", "index"]));
+        let index_time = std::fs::metadata(&index).unwrap().modified().unwrap();
+        // The same-size edit, stamped with the index's own time.
+        let edited = checkout.join("kept.txt");
+        std::fs::write(&edited, "eight\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&edited)
+            .unwrap()
+            .set_modified(index_time)
+            .unwrap();
+
+        let snapshot = checkout_snapshot(dir).await.unwrap().content;
+        git_ok(&checkout, &["add", "-A"]);
+        let staged = git_ok(&checkout, &["write-tree"]);
+        assert_eq!(snapshot, staged, "the snapshot reads the file as it is on disk");
     }
 
     #[tokio::test]
