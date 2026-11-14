@@ -230,6 +230,18 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
     else {
         return Ok(None);
     };
+    // A clean checkout can still hold a committed AI review fix whose record is
+    // unsettled. Replaying the branch would publish that commit, so refuse here.
+    if let Some(refusal) = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .and_then(|t| t.review_fix_residue_refusal())
+    {
+        return blocked(refusal);
+    }
     let working_dir = resolve_repository_dir(state, task_uuid)
         .await
         .map_err(Refusal::Unknown)?;

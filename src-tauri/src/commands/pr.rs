@@ -5968,6 +5968,18 @@ async fn create_pr_reserved(
         "This task has no branch recorded, so there is nothing to open a pull request for."
             .to_string()
     })?;
+    // An unsettled AI review fix may sit on this branch as a commit no person has
+    // settled. Nothing is pushed or linked until its record resolves.
+    if let Some(refusal) = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .and_then(|t| t.review_fix_residue_refusal())
+    {
+        return Err(refusal);
+    }
 
     // What a person approved is one commit. If the task has a current
     // approval, only that commit may be published (or, after a recovery that
@@ -18990,6 +19002,35 @@ mod tests {
                         assert!(again.is_err(), "{name}: nothing to restack twice");
                         assert_eq!(p.remote_child(), Some(local_tip(&p.landed)), "{name}");
                     }
+                }
+
+                /// A published child whose AI review fix is still unresolved
+                /// keeps its unsettled commits off the pull request: the
+                /// restack that would replay and push them is refused.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_published_child_with_an_unresolved_review_fix_is_not_restacked() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    {
+                        let mut tasks = p.state.task.tasks.write().await;
+                        let task = tasks.get_mut(&p.task_id).unwrap();
+                        task.review_fix_residue = Some(crate::domain::task::ReviewFixResidue {
+                            attempt_id: Uuid::new_v4(),
+                            branch: task.branch_name.clone().unwrap(),
+                            checkout_path: task.worktree_path.clone().unwrap_or_default(),
+                            base_head: p.landed.child_tip.clone(),
+                            reason: "the fix committed and its record did not settle".to_string(),
+                            commit_authorized: false,
+                            apply_scope: false,
+                            awaiting_commit: true,
+                        });
+                    }
+                    let before = p.remote_child();
+                    let Err(refusal) = p.restack().await else {
+                        panic!("an unresolved review fix must refuse the restack");
+                    };
+                    assert!(refusal.contains("unresolved"), "the refusal must say why: {refusal}");
+                    assert_eq!(p.remote_child(), before, "nothing was pushed");
                 }
 
                 /// 2: with a merge commit the parent's commits are on `main`
