@@ -2776,6 +2776,9 @@ pub async fn address_pr_review_inner(
                 _ => Err("no scope record protects these fixes, so nothing was committed".to_string()),
             };
             let snapshot = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
+            // The commit must find exactly this content staged; an edit after this read
+            // refuses it rather than being committed under the plan's approval.
+            let verified_tree = snapshot.clone();
             let committed = match ensure_dirt_is_plan_owned(
                 &updated_plan,
                 &working_dir,
@@ -2787,11 +2790,12 @@ pub async fn address_pr_review_inner(
             .and(provenance)
             {
                 Err(e) => Err(e),
-                Ok(()) => match &task.branch_name {
-                    Some(branch) => {
-                        crate::worktree::commit_checkout(&working_dir, branch, &message).await
+                Ok(()) => match (&task.branch_name, &verified_tree) {
+                    (Some(branch), Ok(tree)) => {
+                        crate::worktree::commit_checkout_verified(&working_dir, branch, &message, tree).await
                     }
-                    None => Err("this task records no branch".to_string()),
+                    (Some(_), Err(e)) => Err(e.clone()),
+                    (None, _) => Err("this task records no branch".to_string()),
                 },
             };
             // The scope record is settled only after its consolidated commit was
@@ -24324,6 +24328,54 @@ mod tests {
                     worktree.join("partial.txt").exists(),
                     "the failed fix's partial edit is kept"
                 );
+            }
+
+            /// A fix whose outcome cannot be recorded is not a fix: nothing is
+            /// marked fixed, committed or pushed, and the checkout stays unresolved.
+            #[tokio::test]
+            async fn a_fix_whose_settlement_cannot_be_recorded_is_not_fixed_committed_or_pushed() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("printf 'applied\\n' > applied.txt");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                // The attempt's record write goes through; the write that settles it fails.
+                let fault = slashit_durable_fs::fault::fail_after(
+                    slashit_durable_fs::Stage::Replace,
+                    std::io::ErrorKind::Other,
+                    1,
+                );
+
+                let ledger = crate::review_fix_residue::Ledger::of(&state);
+                let (result, _plan) = apply_observed_on(
+                    &ledger,
+                    &task,
+                    plan,
+                    &worktree,
+                    no_jj,
+                    false,
+                    no_progress(),
+                )
+                .await
+                .expect("the apply flow reports per step, not as a command error");
+                drop(fault);
+
+                assert_eq!(claude.runs(), 1, "the fix agent ran");
+                assert!(result.fixed_ids.is_empty(), "{result:?}");
+                assert!(!result.pushed, "{result:?}");
+                assert_eq!(git(&worktree, &["rev-parse", "task-branch"]), tip, "nothing was committed");
+                assert_eq!(repo.remote_has_branch("task-branch"), None, "nothing was pushed");
+                assert!(worktree.join("applied.txt").exists(), "the edit is kept in the checkout");
+                let residue = ledger
+                    .tasks
+                    .read()
+                    .await
+                    .get(&task.id)
+                    .and_then(|t| t.review_fix_residue.clone());
+                assert!(residue.is_some(), "the checkout stays unresolved");
             }
 
             /// The same refusal holds for a tracked file edited by hand and

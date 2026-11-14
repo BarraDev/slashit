@@ -11,16 +11,18 @@
 //! "clean" from its absence after an interruption. [`resolve`] is the Human exit.
 //!
 //! Serialization: writes of the record and admissions of a commit run under the
-//! process-wide [`RECORD_GATE`], not the Task's lifecycle lease. `stop_task`
-//! holds the lease while it waits for a running review to finish, and that
-//! review must still record its outcome, so the gate can never be the lease.
-//! Human [`resolve`] takes the lease and then the gate.
+//! record gate of the Task ([`record_gate`]), not the Task's lifecycle lease.
+//! `stop_task` holds the lease while it waits for a running review to finish,
+//! and that review must still record its outcome, so the gate can never be the
+//! lease. Human [`resolve`] takes the lease and then the gate. A record belongs
+//! to one Task and one checkout, so one Task's gate never orders another's.
 //!
 //! Not a sandbox: a process running as the same user can still edit the
 //! checkout or the app data directly. The record stops SlashIt's own commits and
 //! removals, and a person's explicit resolution, not the agent's own tools.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -29,14 +31,25 @@ use crate::domain::task::{ReviewFixResidue, Task};
 use crate::lifecycle::{self, TaskLifecycleLocks, Tasks};
 use crate::worktree::CheckoutCommit;
 
-/// Held for one record write or one commit admission, never while waiting for
-/// a lifecycle lease.
-// shortcut: one gate serializes every Task's record writes and commits, so a slow
-// commit delays another Task's record write, upgrade to a gate per Task if commits get slow.
-pub(crate) static RECORD_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// shortcut: one entry per Task ever touched stays in this map for the process lifetime, upgrade to evicting idle entries if the board grows large.
+static RECORD_GATES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
 
-/// Proof that the caller holds [`RECORD_GATE`].
-pub type RecordGate = tokio::sync::MutexGuard<'static, ()>;
+/// Proof that the caller holds the record gate of one Task, from [`record_gate`].
+pub type RecordGate = tokio::sync::OwnedMutexGuard<()>;
+
+/// The record gate of `task_id`, held for one record write or one commit
+/// admission and never while waiting for a lifecycle lease.
+pub(crate) async fn record_gate(task_id: Uuid) -> RecordGate {
+    let gate = RECORD_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(task_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    gate.lock_owned().await
+}
 
 /// Persists `residue` before a fix agent starts. Refused, and nothing starts,
 /// when an earlier attempt is still unresolved or the record cannot be
@@ -229,7 +242,7 @@ pub async fn resolve(
             return Err("the Task is running an agent or review now, so the unresolved fix cannot be cleared yet".to_string());
         }
     }
-    let _gate = RECORD_GATE.lock().await;
+    let _gate = record_gate(task_id).await;
     let (residue, branch, worktree_path) = {
         let tasks_r = tasks.read().await;
         let task = tasks_r
@@ -330,7 +343,7 @@ impl Ledger {
     }
 
     pub async fn begin_attempt(&self, task_id: Uuid, working_dir: &str) -> Result<Uuid, String> {
-        let gate = RECORD_GATE.lock().await;
+        let gate = record_gate(task_id).await;
         begin_attempt(&gate, &self.tasks, &self.storage, task_id, working_dir).await
     }
 
@@ -340,7 +353,7 @@ impl Ledger {
         attempt_id: Uuid,
         keep: Option<String>,
     ) -> Result<(), String> {
-        let gate = RECORD_GATE.lock().await;
+        let gate = record_gate(task_id).await;
         settle(&gate, &self.tasks, &self.storage, task_id, attempt_id, keep).await
     }
 
@@ -355,7 +368,7 @@ impl Ledger {
     /// Written before that commit, so a crash between the two keeps the edits
     /// recorded and refuses every other commit.
     pub async fn authorize_commit(&self, task_id: Uuid, attempt_id: Uuid) -> Result<(), String> {
-        let _gate = RECORD_GATE.lock().await;
+        let _gate = record_gate(task_id).await;
         let current = open_attempt(&self.tasks, task_id, attempt_id).await?;
         if current.apply_scope {
             return Err("a PR review apply scope is not an AI Review fix".to_string());
@@ -385,8 +398,9 @@ impl Ledger {
         branch: Option<&str>,
         working_dir: &str,
         message: &str,
+        verified_tree: &str,
     ) -> Result<CheckoutCommit, String> {
-        let _gate = RECORD_GATE.lock().await;
+        let _gate = record_gate(task_id).await;
         let current = open_attempt(&self.tasks, task_id, attempt_id).await?;
         if current.apply_scope {
             return Err("a PR review apply scope is not an AI Review fix".to_string());
@@ -395,7 +409,10 @@ impl Ledger {
             return Err("the AI Review fix's edits are not authorized for a commit".to_string());
         }
         let outcome = match branch {
-            Some(branch) => crate::worktree::commit_checkout(working_dir, branch, message).await,
+            Some(branch) => {
+                crate::worktree::commit_checkout_verified(working_dir, branch, message, verified_tree)
+                    .await
+            }
             None => Err("this Task records no branch".to_string()),
         };
         match &outcome {
@@ -429,7 +446,7 @@ impl Ledger {
 /// apply's), refused while any attempt is unresolved. The gate is held by the
 /// caller through the commit.
 pub async fn admit_ordinary_commit(tasks: &Tasks, task_id: Uuid) -> Result<RecordGate, String> {
-    let gate = RECORD_GATE.lock().await;
+    let gate = record_gate(task_id).await;
     let refusal = tasks
         .read()
         .await
@@ -446,6 +463,11 @@ mod tests {
     use super::*;
     use crate::domain::TaskStatus;
     use std::path::{Path, PathBuf};
+
+    /// The content the checkout holds now, as a commit must find it staged.
+    async fn snapshot_of(dir: &str) -> String {
+        crate::worktree::checkout_snapshot(dir).await.unwrap().content
+    }
 
     struct Fx {
         _tmp: tempfile::TempDir,
@@ -769,10 +791,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_gate_blocks_only_its_own_task() {
+        let task = Uuid::new_v4();
+        let held = record_gate(task).await;
+        let same = tokio::time::timeout(std::time::Duration::from_millis(50), record_gate(task)).await;
+        assert!(same.is_err(), "the Task's own writes wait for the gate");
+        let other = tokio::time::timeout(std::time::Duration::from_secs(1), record_gate(Uuid::new_v4())).await;
+        assert!(other.is_ok(), "another Task's writes do not wait for it");
+        drop(held);
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), record_gate(task)).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn an_admission_waits_for_a_writer_and_then_sees_the_settled_record() {
         let fx = fixture().await;
         let dir = fx.checkout.to_str().unwrap().to_string();
-        let gate = RECORD_GATE.lock().await;
+        let gate = record_gate(fx.task_id).await;
         let attempt = begin_attempt(
             &gate,
             &fx.state.task.tasks,
@@ -849,7 +883,7 @@ mod tests {
 
         let outcome = fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix")
+            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot_of(&dir).await)
             .await
             .unwrap();
         assert!(
@@ -875,12 +909,12 @@ mod tests {
 
         assert!(fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "m")
+            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "m", &snapshot_of(&dir).await)
             .await
             .is_err());
         assert!(fx
             .ledger
-            .commit_fix(fx.task_id, Uuid::new_v4(), Some("task-x"), &dir, "m")
+            .commit_fix(fx.task_id, Uuid::new_v4(), Some("task-x"), &dir, "m", &snapshot_of(&dir).await)
             .await
             .is_err());
         assert_eq!(commit_count(&fx.checkout), "1", "no commit was made");
@@ -969,7 +1003,7 @@ mod tests {
         git(&fx.checkout, &["checkout", "-q", "-b", "elsewhere"]);
         assert!(fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "m")
+            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "m", &snapshot_of(&dir).await)
             .await
             .is_err());
         let kept = residue(&fx).await.expect("the record is kept");
@@ -981,7 +1015,7 @@ mod tests {
         git(&fx.checkout, &["checkout", "-q", "task-x"]);
         assert!(fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "m")
+            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "m", &snapshot_of(&dir).await)
             .await
             .is_err());
         assert_eq!(commit_count(&fx.checkout), "1", "no commit was made");

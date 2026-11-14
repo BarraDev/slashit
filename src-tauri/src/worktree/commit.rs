@@ -47,7 +47,24 @@ pub async fn commit_checkout(
     branch: &str,
     message: &str,
 ) -> Result<CheckoutCommit, String> {
-    Ok(match commit(working_dir, branch, message, false).await? {
+    Ok(match commit(working_dir, branch, message, false, None).await? {
+        Some(commit) => CheckoutCommit::Committed { commit },
+        None => CheckoutCommit::NothingToCommit,
+    })
+}
+
+/// [`commit_checkout`] for a caller that has checked the checkout's content as
+/// `expected_tree`, a [`checkout_snapshot`] tree id. The staged index is compared
+/// with it before the commit, so an edit made after the check and before staging
+/// refuses the commit, and nothing is committed. Once staged, the commit takes
+/// the index, so later edits to the working tree do not enter it.
+pub async fn commit_checkout_verified(
+    working_dir: &str,
+    branch: &str,
+    message: &str,
+    expected_tree: &str,
+) -> Result<CheckoutCommit, String> {
+    Ok(match commit(working_dir, branch, message, false, Some(expected_tree)).await? {
         Some(commit) => CheckoutCommit::Committed { commit },
         None => CheckoutCommit::NothingToCommit,
     })
@@ -67,7 +84,7 @@ pub async fn commit_checkout_even_if_empty(
     branch: &str,
     message: &str,
 ) -> Result<String, String> {
-    commit(working_dir, branch, message, true)
+    commit(working_dir, branch, message, true, None)
         .await?
         .ok_or_else(|| "git made no commit".to_string())
 }
@@ -115,12 +132,25 @@ async fn commit(
     branch: &str,
     message: &str,
     allow_empty: bool,
+    expected_tree: Option<&str>,
 ) -> Result<Option<String>, String> {
     refuse_unless_on_task_branch(working_dir, branch).await?;
 
     git(working_dir, &["add", "-A"])
         .await
         .map_err(|e| format!("git add failed: {e}"))?;
+
+    if let Some(expected) = expected_tree {
+        let staged = git(working_dir, &["write-tree"])
+            .await
+            .map_err(|e| format!("could not read the staged content: {e}"))?;
+        if staged != expected {
+            return Err(
+                "the Task Checkout changed after its content was checked, so nothing was committed"
+                    .to_string(),
+            );
+        }
+    }
 
     if !allow_empty && !has_staged_changes(working_dir).await? {
         return Ok(None);
@@ -213,9 +243,12 @@ async fn has_staged_changes(working_dir: &str) -> Result<bool, String> {
 }
 
 async fn git(working_dir: &str, args: &[&str]) -> Result<String, String> {
+    // A cancelled call stops its git process, so it cannot keep writing the index
+    // after the record gate is released. Hook processes it started are not killed.
     let output = crate::host_process::tokio_command("git")
         .args(args)
         .current_dir(working_dir)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("could not run git: {e}"))?;
@@ -369,6 +402,27 @@ mod tests {
 
     /// The tip of the branch, read back after an agent-style commit of its
     /// own, is what one run with nothing left to commit records as its head.
+    #[tokio::test]
+    async fn a_commit_checked_against_a_tree_refuses_content_changed_after_the_check() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        std::fs::write(checkout.join("kept.txt"), "checked\n").unwrap();
+        let checked = checkout_snapshot(dir).await.unwrap().content;
+        let head = git_ok(&checkout, &["rev-parse", "task"]);
+
+        std::fs::write(checkout.join("kept.txt"), "edited after the check\n").unwrap();
+        let refused = commit_checkout_verified(dir, "task", "task: fix it", &checked).await;
+        assert!(refused.is_err(), "a change after the check is refused: {refused:?}");
+        assert_eq!(git_ok(&checkout, &["rev-parse", "task"]), head, "nothing was committed");
+
+        std::fs::write(checkout.join("kept.txt"), "checked\n").unwrap();
+        let outcome = commit_checkout_verified(dir, "task", "task: fix it", &checked)
+            .await
+            .expect("the checked content commits");
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }));
+        assert_eq!(git_ok(&checkout, &["show", "task:kept.txt"]), "checked");
+    }
+
     #[tokio::test]
     async fn checkout_head_commit_names_the_tip_the_commit_left_in_place() {
         let (_tmp, _repo, checkout) = repo_with_task_checkout();

@@ -18,7 +18,7 @@
 use uuid::Uuid;
 
 use crate::domain::task::ReviewFixResidue;
-use crate::review_fix_residue::{open_attempt, write_record, Ledger, RecordGate, RECORD_GATE};
+use crate::review_fix_residue::{open_attempt, record_gate, write_record, Ledger, RecordGate};
 
 /// Reason while an item's fix agent may still be editing the checkout, and
 /// after a crash before an outcome was recorded.
@@ -34,7 +34,7 @@ impl Ledger {
     /// the scope record when none exists; continues it only for the same
     /// operation whose previous item succeeded. Refused for any other record.
     pub async fn begin_apply_item(&self, task_id: Uuid, op: Uuid, working_dir: &str) -> Result<(), String> {
-        let _gate = RECORD_GATE.lock().await;
+        let _gate = record_gate(task_id).await;
         let (branch, existing) = {
             let tasks = self.tasks.read().await;
             let task = tasks.get(&task_id).ok_or_else(|| format!("task {task_id} is not on the board"))?;
@@ -85,7 +85,7 @@ impl Ledger {
     /// Settles one item of operation `op`. `None` means its edits, if any, now
     /// await the consolidated commit; `Some(reason)` keeps the checkout unresolved.
     pub async fn settle_item(&self, task_id: Uuid, op: Uuid, keep: Option<String>) -> Result<(), String> {
-        let _gate = RECORD_GATE.lock().await;
+        let _gate = record_gate(task_id).await;
         let current = open_attempt(&self.tasks, task_id, op).await?;
         if !current.apply_scope {
             return Err("the unresolved record is not a PR review apply scope".to_string());
@@ -110,7 +110,7 @@ impl Ledger {
         task_id: Uuid,
         op: Option<Uuid>,
     ) -> Result<(RecordGate, Option<ReviewFixResidue>), String> {
-        let gate = RECORD_GATE.lock().await;
+        let gate = record_gate(task_id).await;
         let record = self.tasks.read().await.get(&task_id).and_then(|t| t.review_fix_residue.clone());
         match record {
             None => Ok((gate, None)),
@@ -134,7 +134,7 @@ impl Ledger {
     /// Clears the scope record of `op` when it holds no uncommitted work, for an
     /// operation whose items made no change. Keeps it otherwise.
     pub async fn clear_apply_if_clean(&self, task_id: Uuid, op: Uuid) -> Result<(), String> {
-        let _gate = RECORD_GATE.lock().await;
+        let _gate = record_gate(task_id).await;
         let Ok(current) = open_attempt(&self.tasks, task_id, op).await else {
             return Ok(());
         };

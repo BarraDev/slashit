@@ -7928,6 +7928,8 @@ impl TaskExecutor {
                         // agent ran, whatever commits it made. A commit that
                         // leaves the content as it was is not a fix.
                         let after = crate::worktree::checkout_snapshot(&working_dir).await;
+                        // The content the commit must find staged: what was read here.
+                        let verified_tree = after.as_ref().map(|s| s.content.clone()).map_err(Clone::clone);
                         // The second value says whether the checkout was clean before
                         // the run. A commit of a dirty checkout would also commit the
                         // edits that were already there, so it is refused.
@@ -7981,13 +7983,14 @@ impl TaskExecutor {
                                 // Only this attempt's authorized commit may land here. The
                                 // record gate is held through it, and the record settles
                                 // with its outcome.
-                                let committed = match residue_attempt {
-                                    Some(attempt) => {
+                                let committed = match (residue_attempt, &verified_tree) {
+                                    (Some(attempt), Ok(tree)) => {
                                         ledger
-                                            .commit_fix(task_id, attempt, branch.as_deref(), &working_dir, &message)
+                                            .commit_fix(task_id, attempt, branch.as_deref(), &working_dir, &message, tree)
                                             .await
                                     }
-                                    None => Err("the AI Review fix was not recorded, so its edits were not committed".to_string()),
+                                    (Some(_), Err(e)) => Err(e.clone()),
+                                    (None, _) => Err("the AI Review fix was not recorded, so its edits were not committed".to_string()),
                                 };
                                 match committed {
                                     Ok(CheckoutCommit::Committed { commit }) => {

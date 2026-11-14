@@ -21,7 +21,8 @@ pub mod vcs_init;
 pub use branch::{checked_base_branch, checked_task_branch, looks_like_task_branch};
 pub use default_base::{resolve_default_base, ResolvedBase};
 pub use commit::{
-    checkout_has_work, checkout_head_commit, checkout_snapshot, commit_checkout, CheckoutCommit,
+    checkout_has_work, checkout_head_commit, checkout_snapshot, commit_checkout,
+    commit_checkout_verified, CheckoutCommit,
 };
 pub use diff::{committed_task_diff, pending_task_diff, task_diff, TaskDiff, TaskDiffError};
 pub use manager::{
