@@ -2803,6 +2803,9 @@ pub async fn address_pr_review_inner(
             // reconciles a clean checkout on the Task branch without approval.
             if let (Ok(_), Some((gate, Some(record)))) = (&committed, &_commit_lease) {
                 if let Err(e) = ledger.clear_apply(gate, task.id, record).await {
+                    if let Err(kept) = ledger.keep_committed_apply(gate, task.id, record, &e).await {
+                        eprintln!("PR review fix record of task {} not settled after its commit: {kept}", task.id);
+                    }
                     fix_errors.push(format!(
                         "the commit was made, but the PR review fix record could not be cleared, so the Task Checkout stays unresolved until a person resolves it: {e}"
                     ));

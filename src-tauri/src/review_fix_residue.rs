@@ -416,11 +416,30 @@ impl Ledger {
             None => Err("this Task records no branch".to_string()),
         };
         match &outcome {
-            // A commit that was made is reported as made. If clearing the record
-            // fails, the record stays authorized for this attempt only, and
-            // resolve reconciles it once the checkout is clean on the Task branch.
-            Ok(_) => {
-                let _ = write_record(&self.tasks, &self.storage, task_id, None).await;
+            // The commit is made and cannot be undone here, so it is reported as
+            // made. If clearing the record fails, the record stays with its
+            // authorization withdrawn and says what happened, so no second commit
+            // can land, and resolve reconciles it once the checkout is clean.
+            Ok(made) => {
+                if let Err(e) = write_record(&self.tasks, &self.storage, task_id, None).await {
+                    let what = match made {
+                        CheckoutCommit::Committed { commit } => format!("committed as {commit}"),
+                        CheckoutCommit::NothingToCommit => "found already committed".to_string(),
+                    };
+                    let reason = format!(
+                        "an AI Review fix was {what}, but its record could not be cleared: {e}"
+                    );
+                    if let Err(kept) = write_record(
+                        &self.tasks,
+                        &self.storage,
+                        task_id,
+                        Some(ReviewFixResidue { reason, commit_authorized: false, ..current }),
+                    )
+                    .await
+                    {
+                        eprintln!("AI Review fix record of task {task_id} not settled after a commit: {kept}");
+                    }
+                }
             }
             Err(error) => {
                 let reason = format!(
@@ -894,6 +913,59 @@ mod tests {
         assert!(reloaded(&fx).is_none(), "the cleared record is durable");
         assert_eq!(commit_count(&fx.checkout), "2");
         assert!(fx.ledger.admit_commit(fx.task_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_failed_record_clear_after_a_commit_reports_the_commit_and_blocks_a_second_one() {
+        let fx = fixture().await;
+        let dir = fx.checkout.to_str().unwrap().to_string();
+        let attempt = fx.ledger.begin_attempt(fx.task_id, &dir).await.unwrap();
+        std::fs::write(fx.checkout.join("a.txt"), "fixed\n").unwrap();
+        fx.ledger
+            .authorize_commit(fx.task_id, attempt)
+            .await
+            .unwrap();
+        // Only the clearing write fails: the commit is made, then the record write.
+        let _fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+
+        let outcome = fx
+            .ledger
+            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot_of(&dir).await)
+            .await
+            .expect("the commit is reported as made");
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }), "{outcome:?}");
+        assert_eq!(commit_count(&fx.checkout), "2");
+
+        let kept = residue(&fx).await.expect("the record is kept, not cleared");
+        assert!(!kept.commit_authorized, "the commit is not authorized again");
+        assert!(
+            kept.reason.contains("committed as") && kept.reason.contains("could not be cleared"),
+            "{}",
+            kept.reason
+        );
+        assert!(fx.ledger.admit_commit(fx.task_id).await.is_err(), "ordinary commits stay refused");
+        assert!(fx
+            .ledger
+            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot_of(&dir).await)
+            .await
+            .is_err());
+        assert_eq!(commit_count(&fx.checkout), "2", "no second commit was made");
+
+        resolve(
+            &fx.ledger.authority,
+            &fx.state.task.tasks,
+            &fx.state.storage,
+            fx.task_id,
+            attempt,
+            None,
+        )
+        .await
+        .expect("the clean checkout on the Task branch reconciles");
+        assert!(residue(&fx).await.is_none());
+        assert_eq!(status_of(&fx).await, TaskStatus::HumanReview, "reconciling is not approval");
     }
 
     #[tokio::test]

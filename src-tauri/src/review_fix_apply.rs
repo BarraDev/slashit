@@ -131,6 +131,27 @@ impl Ledger {
         write_record(&self.tasks, &self.storage, task_id, None).await
     }
 
+    /// Keeps the scope record `record` after its consolidated commit was made but
+    /// could not be cleared. Its reason no longer matches the clean-scope reason,
+    /// so admission refuses every further commit until [`crate::review_fix_residue::resolve`].
+    pub async fn keep_committed_apply(
+        &self,
+        _gate: &RecordGate,
+        task_id: Uuid,
+        record: &ReviewFixResidue,
+        error: &str,
+    ) -> Result<(), String> {
+        open_attempt(&self.tasks, task_id, record.attempt_id).await?;
+        let reason = format!("PR review fixes were committed, but their record could not be cleared: {error}");
+        write_record(
+            &self.tasks,
+            &self.storage,
+            task_id,
+            Some(ReviewFixResidue { reason, ..record.clone() }),
+        )
+        .await
+    }
+
     /// Clears the scope record of `op` when it holds no uncommitted work, for an
     /// operation whose items made no change. Keeps it otherwise.
     pub async fn clear_apply_if_clean(&self, task_id: Uuid, op: Uuid) -> Result<(), String> {
@@ -385,6 +406,64 @@ mod tests {
         assert_eq!(scope.map(|r| r.attempt_id), Some(op));
         drop(gate);
         assert!(reloaded(&fx).is_some(), "still protected until the commit is made");
+    }
+
+    #[tokio::test]
+    async fn a_scope_kept_after_its_commit_is_refused_until_resolved() {
+        let fx = fixture().await;
+        let op = Uuid::new_v4();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
+        edit(&fx, "one.txt");
+        fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
+        git(&fx.checkout, &["add", "-A"]);
+        git(&fx.checkout, &["commit", "-q", "-m", "fixes"]);
+        let (gate, scope) = fx.ledger.admit_apply_commit(fx.task_id, Some(op)).await.unwrap();
+        fx.ledger
+            .keep_committed_apply(&gate, fx.task_id, &scope.unwrap(), "disk full")
+            .await
+            .unwrap();
+        drop(gate);
+
+        assert!(fx.ledger.admit_apply_commit(fx.task_id, None).await.is_err(), "a continuation is refused");
+        assert!(fx.ledger.admit_commit(fx.task_id).await.is_err());
+        resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.storage, fx.task_id, op, None)
+            .await
+            .expect("the clean checkout on the Task branch reconciles");
+        assert!(record(&fx).await.is_none());
+        assert_eq!(
+            fx.state.task.tasks.read().await.get(&fx.task_id).unwrap().status,
+            TaskStatus::HumanReview,
+            "reconciling is not approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_a_crash_past_the_final_commit_no_second_commit_can_land() {
+        let fx = fixture().await;
+        let op = Uuid::new_v4();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
+        edit(&fx, "one.txt");
+        fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
+        git(&fx.checkout, &["add", "-A"]);
+        git(&fx.checkout, &["commit", "-q", "-m", "fixes"]);
+        let made = commits(&fx);
+        // The process stops after the commit. The next process loads the scope.
+        assert!(reloaded(&fx).is_some());
+
+        assert!(fx.ledger.admit_commit(fx.task_id).await.is_err(), "an ordinary commit is refused");
+        assert!(
+            fx.ledger.admit_apply_commit(fx.task_id, Some(Uuid::new_v4())).await.is_err(),
+            "another operation's commit is refused"
+        );
+        // A commit-only continuation finds the checkout clean and makes nothing.
+        let (_gate, scope) = fx.ledger.admit_apply_commit(fx.task_id, None).await.expect("continuation is admitted");
+        assert!(scope.is_some());
+        let tree = crate::worktree::delivery::checkout_snapshot(&dir(&fx)).await.expect("snapshot");
+        let outcome = crate::worktree::commit_checkout_verified(&dir(&fx), "task-x", "again", &tree)
+            .await
+            .expect("a clean checkout is not an error");
+        assert!(matches!(outcome, CheckoutCommit::NothingToCommit), "{outcome:?}");
+        assert_eq!(commits(&fx), made, "no duplicate commit was made");
     }
 
     #[tokio::test]

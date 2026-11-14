@@ -419,6 +419,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_snapshot_matches_what_staging_everything_would_commit_in_each_shape() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        std::fs::write(checkout.join("a.txt"), "aaa\n").unwrap();
+        std::fs::write(checkout.join("b.txt"), "bbb\n").unwrap();
+        std::fs::write(checkout.join("c.txt"), "ccc\n").unwrap();
+        git_ok(&checkout, &["add", "-A"]);
+        git_ok(&checkout, &["commit", "-q", "-m", "base files"]);
+
+        // Each step is checked against what `add -A` then `write-tree` would record.
+        let steps: Vec<(&str, Box<dyn Fn(&Path)>)> = vec![
+            ("unstaged same-size edit", Box::new(|c: &Path| std::fs::write(c.join("a.txt"), "AAA\n").unwrap())),
+            ("staged-only edit", Box::new(|c: &Path| {
+                std::fs::write(c.join("b.txt"), "BBB\n").unwrap();
+                git_ok(c, &["add", "b.txt"]);
+            })),
+            ("staged then unstaged edit", Box::new(|c: &Path| std::fs::write(c.join("b.txt"), "bbX\n").unwrap())),
+            ("added and deleted files", Box::new(|c: &Path| {
+                std::fs::write(c.join("new.txt"), "new\n").unwrap();
+                std::fs::remove_file(c.join("c.txt")).unwrap();
+            })),
+            ("mode change and symlink", Box::new(|c: &Path| {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perm = std::fs::metadata(c.join("a.txt")).unwrap().permissions();
+                perm.set_mode(0o755);
+                std::fs::set_permissions(c.join("a.txt"), perm).unwrap();
+                std::os::unix::fs::symlink("a.txt", c.join("link")).unwrap();
+            })),
+        ];
+        for (name, edit) in steps {
+            edit(&checkout);
+            let snapshot = checkout_snapshot(dir).await.unwrap().content;
+            git_ok(&checkout, &["add", "-A"]);
+            let staged = git_ok(&checkout, &["write-tree"]);
+            assert_eq!(snapshot, staged, "step: {name}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_snapshot_reads_an_edit_that_keeps_the_size_and_the_index_time() {
         let (_tmp, _repo, checkout) = repo_with_task_checkout();
         let dir = checkout.to_str().unwrap();
