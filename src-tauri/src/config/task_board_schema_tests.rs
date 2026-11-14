@@ -25,8 +25,9 @@ use crate::domain::task::{
     ApprovedExecution, BranchOrigin, CheckoutAdmission, DependencyAdmission,
     DependencyRequirement, ExecutedApproval, ExternalRef, FixEffect, FixedContent,
     HumanReviewDecision, NewAttemptDecision, PendingRepublish, PrCommentKind, PrReviewApplyResult,
-    PrReviewComment, PrReviewDecision, PrReviewItem, PrReviewPlan, QaSignoff, QaStatus, Subtask,
-    Task, UnconfirmedPrCreate, WorkerHandoff, WorkerHandoffStage, WorkerResultAcceptance,
+    PrReviewComment, PrReviewDecision, PrReviewItem, PrReviewPlan, QaSignoff, QaStatus,
+    ReviewFixResidue, Subtask, Task, UnconfirmedPrCreate, WorkerHandoff, WorkerHandoffStage,
+    WorkerResultAcceptance,
 };
 use crate::domain::{IntegrationState, IntegrationStrategy, LocalIntegration};
 
@@ -340,6 +341,15 @@ fn full_task(project_id: Uuid) -> Task {
         }),
         review_mode_unproven: true,
         reviewer_model: Some("sonnet".into()),
+    });
+    task.review_fix_residue = Some(ReviewFixResidue {
+        attempt_id: Uuid::new_v4(),
+        branch: "task/full".into(),
+        checkout_path: "/repo/.checkouts/t".into(),
+        base_head: commit('a'),
+        reason: "the fix agent exited with edits".into(),
+        apply_scope: false,
+        commit_authorized: false,
     });
     task.new_attempt = Some(NewAttemptDecision {
         decision_id: Uuid::new_v4(),

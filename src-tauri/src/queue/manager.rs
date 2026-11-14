@@ -249,6 +249,7 @@ mod tests {
                 activity: Vec::new(),
                 worker_handoff: None,
                 worker_handoff_confirmed: false,
+                review_fix_residue: None,
                 last_observed_model: None,
                 reviewer_model: None,
                 new_attempt: None,

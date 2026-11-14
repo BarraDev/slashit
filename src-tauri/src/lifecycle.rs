@@ -286,6 +286,9 @@ pub enum TerminalizeRefusal {
     /// The Task Checkout is the only remaining evidence for an uncertain
     /// Worker outcome, so terminalization may not remove it.
     WorkerRecoveryRequired,
+    /// An AI Review fix left edits in the Task Checkout that no one has
+    /// resolved. Removing the checkout would delete them.
+    ReviewFixUnresolved,
     /// The task records an unfinished local integration, in whatever status it
     /// happens to be. Only a delete asks this: the record is durable evidence
     /// of a Git operation that may already have moved its target branch, and
@@ -319,6 +322,9 @@ impl std::fmt::Display for TerminalizeRefusal {
             }
             Self::WorkerRecoveryRequired => f.write_str(
                 "Worker recovery is unresolved; the Task Checkout was kept for inspection",
+            ),
+            Self::ReviewFixUnresolved => f.write_str(
+                "An AI Review fix left unresolved edits; the Task Checkout was kept for inspection",
             ),
             Self::DeleteBlockedByIntegration => f.write_str(DELETE_BLOCKED_BY_INTEGRATION_REASON),
         }
@@ -1550,6 +1556,11 @@ pub async fn terminalize_leased(
         if task.worker_recovery_refusal().is_some() {
             return Err(TerminalizeRefusal::WorkerRecoveryRequired);
         }
+        // An unresolved AI Review fix holds edits that exist nowhere else, so
+        // removing the checkout would destroy them.
+        if task.review_fix_residue_refusal().is_some() {
+            return Err(TerminalizeRefusal::ReviewFixUnresolved);
+        }
         // Likewise for an unfinished local integration: finishing the task
         // here would remove the checkout and withdraw the state its Resume
         // re-proves. An integration that completes the task does so only
@@ -2379,6 +2390,41 @@ mod tests {
     // -----------------------------------------------------------------------
     // An unfinished restack of a published branch
     // -----------------------------------------------------------------------
+
+    /// An unresolved AI Review fix keeps its checkout exactly as it is: removal
+    /// is refused before anything is written, whatever the origin.
+    #[tokio::test]
+    async fn an_unresolved_review_fix_keeps_its_checkout_and_status() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
+        world.ctx().tasks.write().await.get_mut(&id).unwrap().review_fix_residue =
+            Some(crate::domain::task::ReviewFixResidue {
+                attempt_id: uuid::Uuid::new_v4(),
+                branch: "task-abcd1234".to_string(),
+                checkout_path: wt.clone(),
+                base_head: "unused".to_string(),
+                reason: "test".to_string(),
+                apply_scope: false,
+                commit_authorized: false,
+            });
+
+        let refusal = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("an unresolved fix must not be removed");
+        assert!(matches!(refusal, TerminalizeRefusal::ReviewFixUnresolved), "{refusal:?}");
+
+        let after = world.task(id).await;
+        assert_eq!(after.status, TaskStatus::InProgress);
+        assert_eq!(after.worktree_path.as_deref(), Some(wt.as_str()));
+        assert!(after.review_fix_residue.is_some(), "the record is kept");
+        assert!(std::path::Path::new(&wt).join("work.txt").exists());
+    }
 
     fn pending_restack() -> crate::domain::PendingRepublish {
         crate::domain::PendingRepublish {

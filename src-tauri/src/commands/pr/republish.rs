@@ -99,7 +99,11 @@ pub enum RepublishStatus {
     /// While it is, nothing else may change the task's branch or checkout.
     /// `discard_blocked` says why Discard would be refused, when origin
     /// already has the rewritten branch.
-    Interrupted { rewritten: bool, detail: String, discard_blocked: Option<String> },
+    Interrupted {
+        rewritten: bool,
+        detail: String,
+        discard_blocked: Option<String>,
+    },
 }
 
 /// What a finished restack did.
@@ -202,8 +206,16 @@ async fn stacked_task(state: &crate::AppState, task_uuid: Uuid) -> Result<Option
         branch: branch.clone(),
         parent_branch: parent_branch.clone(),
         fork_point: task.base_commit.clone(),
-        worktree: task.worktree_path.as_ref().map(PathBuf::from).filter(|p| p.is_dir()),
-        linked: task.pr_url.is_some() || task.external_refs.iter().any(crate::domain::ExternalRef::is_pr),
+        worktree: task
+            .worktree_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir()),
+        linked: task.pr_url.is_some()
+            || task
+                .external_refs
+                .iter()
+                .any(crate::domain::ExternalRef::is_pr),
     }))
 }
 
@@ -212,13 +224,22 @@ async fn stacked_task(state: &crate::AppState, task_uuid: Uuid) -> Result<Option
 /// not landed on the default branch, or its pull request already targets it
 /// and needs no rewrite.
 async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan>, Refusal> {
-    let Some(stacked) = stacked_task(state, task_uuid).await.map_err(Refusal::Unknown)? else {
+    let Some(stacked) = stacked_task(state, task_uuid)
+        .await
+        .map_err(Refusal::Unknown)?
+    else {
         return Ok(None);
     };
-    let working_dir = resolve_repository_dir(state, task_uuid).await.map_err(Refusal::Unknown)?;
-    let branch = checked_task_branch(&stacked.branch).map_err(Refusal::Unknown)?.to_string();
+    let working_dir = resolve_repository_dir(state, task_uuid)
+        .await
+        .map_err(Refusal::Unknown)?;
+    let branch = checked_task_branch(&stacked.branch)
+        .map_err(Refusal::Unknown)?
+        .to_string();
 
-    let child = branch_pr_state(&working_dir, &branch).await.map_err(Refusal::Unknown)?;
+    let child = branch_pr_state(&working_dir, &branch)
+        .await
+        .map_err(Refusal::Unknown)?;
     let (pr_number, child_base) = match (child.state.as_deref(), child.number) {
         (Some("OPEN"), Some(number)) => (Some(number), child.base.clone().unwrap_or_default()),
         // A pull request that is merged or closed is not this restack's to
@@ -235,14 +256,23 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
         },
     };
 
-    let origin = BranchOrigin::Stacked { parent_branch: stacked.parent_branch.clone() };
-    let base = pr_base_for(&working_dir, Some(&origin), stacked.fork_point.as_deref(), true)
-        .await
-        .map_err(Refusal::Unknown)?;
+    let origin = BranchOrigin::Stacked {
+        parent_branch: stacked.parent_branch.clone(),
+    };
+    let base = pr_base_for(
+        &working_dir,
+        Some(&origin),
+        stacked.fork_point.as_deref(),
+        true,
+    )
+    .await
+    .map_err(Refusal::Unknown)?;
     let Some(landed) = base.landed_parent else {
         return Ok(None);
     };
-    let default = checked_task_branch(&landed.default_branch).map_err(Refusal::Unknown)?.to_string();
+    let default = checked_task_branch(&landed.default_branch)
+        .map_err(Refusal::Unknown)?
+        .to_string();
     let context = format!(
         "This task is stacked on {}, whose pull request #{} was merged into {default}",
         landed.parent_branch, landed.number
@@ -257,11 +287,20 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
     };
     let repo = Path::new(&working_dir);
     let branch_ref = format!("refs/heads/{branch}");
-    let Some(tip) = restack::exact_ref(repo, &branch_ref).await.map_err(git_err)? else {
-        return blocked(format!("{context}, but the task's branch does not exist locally."));
+    let Some(tip) = restack::exact_ref(repo, &branch_ref)
+        .await
+        .map_err(git_err)?
+    else {
+        return blocked(format!(
+            "{context}, but the task's branch does not exist locally."
+        ));
     };
-    if !restack::has_commit(repo, &fork_point).await.map_err(git_err)?
-        || !restack::is_ancestor(repo, &fork_point, &tip).await.map_err(git_err)?
+    if !restack::has_commit(repo, &fork_point)
+        .await
+        .map_err(git_err)?
+        || !restack::is_ancestor(repo, &fork_point, &tip)
+            .await
+            .map_err(git_err)?
     {
         return blocked(format!(
             "{context}, but {branch} no longer contains the commit it was started from \
@@ -270,14 +309,22 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
         ));
     }
 
-    let merge_commit = merged_pull_request(&working_dir, &landed).await.map_err(|e| {
-        Refusal::Unknown(format!("{context}, and SlashIt could not confirm what landed: {e}"))
-    })?;
+    let merge_commit = merged_pull_request(&working_dir, &landed)
+        .await
+        .map_err(|e| {
+            Refusal::Unknown(format!(
+                "{context}, and SlashIt could not confirm what landed: {e}"
+            ))
+        })?;
     let onto = restack::fetch_remote_branch(repo, &default)
         .await
         .map_err(|e| Refusal::Unknown(format!("{context}. {e}")))?;
-    if !restack::has_commit(repo, &merge_commit).await.map_err(git_err)?
-        || !restack::is_ancestor(repo, &merge_commit, &onto).await.map_err(git_err)?
+    if !restack::has_commit(repo, &merge_commit)
+        .await
+        .map_err(git_err)?
+        || !restack::is_ancestor(repo, &merge_commit, &onto)
+            .await
+            .map_err(git_err)?
     {
         return blocked(format!(
             "{context} as {merge_commit}, but {default} on origin ({onto}) does not contain that \
@@ -299,7 +346,10 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
         rewrites,
     };
 
-    if restack::is_ancestor(repo, &fork_point, &onto).await.map_err(git_err)? {
+    if restack::is_ancestor(repo, &fork_point, &onto)
+        .await
+        .map_err(git_err)?
+    {
         // The parent's commits are on the default branch as they are, so the
         // branch already differs from it by exactly its own commits.
         // With no pull request there is nothing to retarget either.
@@ -308,11 +358,9 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
 
     match remote_branch_commit(&working_dir, &branch).await {
         Err(e) => return Err(Refusal::Unknown(format!("{context}. {e}"))),
-        Ok(None) => {
-            return blocked(format!(
-                "{context}, but {branch} is not on origin, so there is no published branch to update."
-            ))
-        }
+        Ok(None) => return blocked(format!(
+            "{context}, but {branch} is not on origin, so there is no published branch to update."
+        )),
         Ok(Some(remote)) if remote != tip => {
             return blocked(format!(
                 "{context}, but {branch} is at {tip} here and {remote} on origin. Push or fetch it \
@@ -346,7 +394,8 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
             ))
         }
     }
-    if let Some((title, id, dependent_branch)) = stacked_dependent(state, task_uuid, &branch).await {
+    if let Some((title, id, dependent_branch)) = stacked_dependent(state, task_uuid, &branch).await
+    {
         return blocked(format!(
             "{context}, but task \"{title}\" ({id}) is stacked on {branch}, on branch \
              {dependent_branch}. Rewriting {branch} would strand it on the old commits."
@@ -363,7 +412,11 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
              Rewriting {branch} would strand it on the old commits."
         ));
     }
-    if let Some(merge) = restack::merges_between(repo, &fork_point, &tip).await.map_err(git_err)?.first() {
+    if let Some(merge) = restack::merges_between(repo, &fork_point, &tip)
+        .await
+        .map_err(git_err)?
+        .first()
+    {
         return blocked(format!(
             "{context}, but the branch has a merge commit of its own ({merge}), which a restack \
              would flatten. Move the branch onto {default} yourself."
@@ -375,22 +428,33 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
              task first."
         ));
     };
-    check_worktree(&worktree, &branch, &tip, &context).await.map_err(Refusal::Blocked)?;
+    check_worktree(&worktree, &branch, &tip, &context)
+        .await
+        .map_err(Refusal::Blocked)?;
     Ok(Some(plan(true, tip, Some(worktree))))
 }
 
 /// The worktree must have `branch` checked out at `tip`, clean and in the
 /// middle of nothing.
-async fn check_worktree(worktree: &Path, branch: &str, tip: &str, context: &str) -> Result<(), String> {
+async fn check_worktree(
+    worktree: &Path,
+    branch: &str,
+    tip: &str,
+    context: &str,
+) -> Result<(), String> {
     let shown = worktree.display();
-    let checkout = restack::worktree_state(worktree).await.map_err(|e| format!("{context}, but {e}"))?;
+    let checkout = restack::worktree_state(worktree)
+        .await
+        .map_err(|e| format!("{context}, but {e}"))?;
     if let Some(operation) = checkout.in_progress {
         return Err(format!(
             "{context}, but the task's worktree at {shown} is in the middle of a {operation}. \
              Finish it or abort it there first."
         ));
     }
-    if checkout.head_ref.as_deref() != Some(format!("refs/heads/{branch}").as_str()) || checkout.head != tip {
+    if checkout.head_ref.as_deref() != Some(format!("refs/heads/{branch}").as_str())
+        || checkout.head != tip
+    {
         return Err(format!(
             "{context}, but the task's worktree at {shown} does not have {branch} checked out at \
              {tip}. Check out {branch} there first."
@@ -421,7 +485,13 @@ pub(super) async fn status(
     state: &crate::AppState,
     task_uuid: Uuid,
 ) -> Result<Option<RepublishStatus>, String> {
-    let pending = state.task.tasks.read().await.get(&task_uuid).and_then(|t| t.pending_republish.clone());
+    let pending = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .and_then(|t| t.pending_republish.clone());
     if let Some(pending) = pending {
         let rewritten = pending.rewritten_tip.is_some();
         // Discard itself fails closed when origin cannot be asked, so a failed
@@ -474,7 +544,10 @@ pub(super) async fn status(
 /// Restack the task's published branch onto the default branch its parent
 /// landed on and retarget its pull request, or finish doing so after an
 /// interruption. Only ever called for a user's explicit request.
-pub(super) async fn restack(state: &crate::AppState, task_uuid: Uuid) -> Result<RepublishOutcome, String> {
+pub(super) async fn restack(
+    state: &crate::AppState,
+    task_uuid: Uuid,
+) -> Result<RepublishOutcome, String> {
     let reservation = reserve_task_for_republish(state, task_uuid).await?;
     restack_reserved(state, task_uuid, &reservation).await
 }
@@ -484,22 +557,42 @@ async fn restack_reserved(
     task_uuid: Uuid,
     reservation: &Option<crate::queue::PrHelperLease>,
 ) -> Result<RepublishOutcome, String> {
-    let pending = state.task.tasks.read().await.get(&task_uuid).and_then(|t| t.pending_republish.clone());
+    let pending = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .and_then(|t| t.pending_republish.clone());
     if let Some(pending) = pending {
         let ctx = Context::of(state, task_uuid).await?;
         return advance(state, task_uuid, &ctx, pending, reservation).await;
     }
-    let Some(plan) = observe(state, task_uuid).await.map_err(Refusal::into_message)? else {
-        return Err("There is nothing to restack: this task's parent has not landed on the default \
+    let Some(plan) = observe(state, task_uuid)
+        .await
+        .map_err(Refusal::into_message)?
+    else {
+        return Err(
+            "There is nothing to restack: this task's parent has not landed on the default \
                     branch, or its pull request already targets it."
-            .to_string());
+                .to_string(),
+        );
     };
     if !plan.rewrites {
         let Some(pr_number) = plan.pr_number else {
-            return Err("There is nothing to restack: this task has no pull request to retarget.".to_string());
+            return Err(
+                "There is nothing to restack: this task has no pull request to retarget."
+                    .to_string(),
+            );
         };
         refuse_if_pr_operation_cancelled(reservation, "retargeting the pull request")?;
-        converge_pr_base(&plan.working_dir, pr_number, &plan.branch, &plan.default_branch).await?;
+        converge_pr_base(
+            &plan.working_dir,
+            pr_number,
+            &plan.branch,
+            &plan.default_branch,
+        )
+        .await?;
         return Ok(RepublishOutcome {
             rewritten: false,
             base: plan.default_branch,
@@ -520,7 +613,9 @@ async fn restack_reserved(
     };
     refuse_if_pr_operation_cancelled(reservation, "restacking the branch")?;
     let recorded = std::sync::atomic::AtomicBool::new(false);
-    let stacked = BranchOrigin::Stacked { parent_branch: plan.parent_branch.clone() };
+    let stacked = BranchOrigin::Stacked {
+        parent_branch: plan.parent_branch.clone(),
+    };
     let apply = |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             if task.branch_name.as_deref() == Some(plan.branch.as_str())
@@ -537,12 +632,19 @@ async fn restack_reserved(
         .await
         .map_err(|e| format!("The restack could not be recorded, so nothing was changed: {e}"))?;
     if !recorded.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err("The task changed while its restack was being planned, so nothing was changed.".to_string());
+        return Err(
+            "The task changed while its restack was being planned, so nothing was changed."
+                .to_string(),
+        );
     }
     #[cfg(test)]
     crash_after(Stage::Planned)?;
 
-    let ctx = Context { working_dir: plan.working_dir, branch: plan.branch, worktree: plan.worktree };
+    let ctx = Context {
+        working_dir: plan.working_dir,
+        branch: plan.branch,
+        worktree: plan.worktree,
+    };
     advance(state, task_uuid, &ctx, pending, reservation).await
 }
 
@@ -558,11 +660,18 @@ impl Context {
         let working_dir = resolve_repository_dir(state, task_uuid).await?;
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_uuid).ok_or("Task not found")?;
-        let branch = task.branch_name.clone().ok_or("This task has no branch recorded.")?;
+        let branch = task
+            .branch_name
+            .clone()
+            .ok_or("This task has no branch recorded.")?;
         Ok(Context {
             working_dir,
             branch: checked_task_branch(&branch)?.to_string(),
-            worktree: task.worktree_path.as_ref().map(PathBuf::from).filter(|p| p.is_dir()),
+            worktree: task
+                .worktree_path
+                .as_ref()
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir()),
         })
     }
 }
@@ -646,7 +755,9 @@ async fn advance(
             );
             let new_tip = match replay.replay().await {
                 Ok(new_tip) => new_tip,
-                Err(failure) => return Err(replay_failure(state, task_uuid, &pending, &replay, failure).await),
+                Err(failure) => {
+                    return Err(replay_failure(state, task_uuid, &pending, &replay, failure).await)
+                }
             };
             #[cfg(test)]
             crash_after(Stage::Replayed)?;
@@ -694,7 +805,9 @@ async fn advance(
     let Some(rewritten) = pending.rewritten_tip.clone() else {
         return Err("The restack lost its record of the rewritten branch.".to_string());
     };
-    let tip = restack::exact_ref(repo, &branch_ref).await?.unwrap_or_default();
+    let tip = restack::exact_ref(repo, &branch_ref)
+        .await?
+        .unwrap_or_default();
     if tip != rewritten {
         let approved = approved_tip_note(repo, &backup, &pending.previous_tip).await;
         return Err(format!(
@@ -755,7 +868,7 @@ async fn advance(
                  {approved}; discard the restack to go back to it.",
                 other.unwrap_or("nothing (the branch is gone)"),
                 pending.previous_tip
-            ))
+            ));
         }
     }
     #[cfg(test)]
@@ -768,7 +881,9 @@ async fn advance(
         Some(number) => Some(number),
         None => {
             let found = branch_pr_state(&ctx.working_dir, branch).await?;
-            found.number.filter(|_| found.state.as_deref() == Some("OPEN"))
+            found
+                .number
+                .filter(|_| found.state.as_deref() == Some("OPEN"))
         }
     };
     if let Some(number) = number {
@@ -805,9 +920,14 @@ async fn record_rewrite(
     pending: &PendingRepublish,
     new_tip: &str,
 ) -> Result<PendingRepublish, String> {
-    let updated = PendingRepublish { rewritten_tip: Some(new_tip.to_string()), ..pending.clone() };
+    let updated = PendingRepublish {
+        rewritten_tip: Some(new_tip.to_string()),
+        ..pending.clone()
+    };
     let recorded = std::sync::atomic::AtomicBool::new(false);
-    let stacked = BranchOrigin::Stacked { parent_branch: pending.parent_branch.clone() };
+    let stacked = BranchOrigin::Stacked {
+        parent_branch: pending.parent_branch.clone(),
+    };
     let apply = |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             if task.branch_name.as_deref() == Some(branch)
@@ -816,8 +936,9 @@ async fn record_rewrite(
                 && task.pending_republish.as_ref() == Some(pending)
             {
                 task.base_commit = Some(pending.onto.clone());
-                task.branch_origin =
-                    Some(BranchOrigin::DefaultBase { branch: Some(pending.default_branch.clone()) });
+                task.branch_origin = Some(BranchOrigin::DefaultBase {
+                    branch: Some(pending.default_branch.clone()),
+                });
                 task.pending_republish = Some(updated.clone());
                 recorded.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -849,12 +970,14 @@ async fn clear_pending(
             }
         }
     };
-    crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply).await.map_err(|e| {
-        format!(
-            "The restack is done, but the task could not record that: {e}. Running it again \
+    crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply)
+        .await
+        .map_err(|e| {
+            format!(
+                "The restack is done, but the task could not record that: {e}. Running it again \
              finishes it without changing anything."
-        )
-    })
+            )
+        })
 }
 
 /// The refusal for a replay that did not produce a recorded, verified branch.
@@ -903,35 +1026,59 @@ async fn push_with_lease(working_dir: &str, branch: &str, expected: &str) -> Res
     let branch = checked_task_branch(branch)?;
     let mut git_args: Vec<String> = Vec::new();
     if is_jj_repo(working_dir).await {
-        run_cmd("jj", &["--ignore-working-copy", "git", "export"], working_dir)
-            .await
-            .map_err(|e| format!("jj git export failed: {e}"))?;
+        run_cmd(
+            "jj",
+            &["--ignore-working-copy", "git", "export"],
+            working_dir,
+        )
+        .await
+        .map_err(|e| format!("jj git export failed: {e}"))?;
     }
     if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
         git_args.push(git_dir);
     }
     let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    git_args.extend(["push".to_string(), lease, "--".to_string(), "origin".to_string(), refspec]);
+    git_args.extend([
+        "push".to_string(),
+        lease,
+        "--".to_string(),
+        "origin".to_string(),
+        refspec,
+    ]);
     let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
-    run_cmd("git", &git_args, working_dir).await.map(|_| ()).map_err(|e| {
-        format!(
+    run_cmd("git", &git_args, working_dir)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            format!(
             "SlashIt did not overwrite origin's {branch}: it is no longer at {expected}, the tip \
              that was approved, or could not be updated ({e}). Nothing on origin was changed."
         )
-    })
+        })
 }
 
 /// Make the pull request's base the default branch: read it, edit it only if it
 /// differs, read it again. A pull request GitHub already moved is as good as
 /// one SlashIt moved. A pull request that is no longer open is left alone.
-async fn converge_pr_base(working_dir: &str, number: u64, branch: &str, default: &str) -> Result<(), String> {
+async fn converge_pr_base(
+    working_dir: &str,
+    number: u64,
+    branch: &str,
+    default: &str,
+) -> Result<(), String> {
     let (state, base) = read_pr(working_dir, number, branch).await?;
     if !state.eq_ignore_ascii_case("OPEN") || base == default {
         return Ok(());
     }
     let number = number.to_string();
-    run_cmd("gh", &["pr", "edit", &number, "--base", default], working_dir).await.map_err(|e| {
+    run_cmd(
+        "gh",
+        &["pr", "edit", &number, "--base", default],
+        working_dir,
+    )
+    .await
+    .map_err(|e| {
         format!(
             "The branch is updated on origin, but pull request #{number} could not be retargeted \
              to {default}: {e}. Run the restack again to retry that step."
@@ -950,12 +1097,27 @@ async fn converge_pr_base(working_dir: &str, number: u64, branch: &str, default:
 /// The pull request's state and base, after checking it is `branch`'s own.
 async fn read_pr(working_dir: &str, number: u64, branch: &str) -> Result<(String, String), String> {
     let number = number.to_string();
-    let out = run_cmd("gh", &["pr", "view", &number, "--json", "state,baseRefName,headRefName"], working_dir)
-        .await
-        .map_err(|e| format!("Could not read pull request #{number}: {e}"))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&out).map_err(|e| format!("Failed to parse gh pr view output: {e}"))?;
-    let text = |name: &str| json.get(name).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let out = run_cmd(
+        "gh",
+        &[
+            "pr",
+            "view",
+            &number,
+            "--json",
+            "state,baseRefName,headRefName",
+        ],
+        working_dir,
+    )
+    .await
+    .map_err(|e| format!("Could not read pull request #{number}: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|e| format!("Failed to parse gh pr view output: {e}"))?;
+    let text = |name: &str| {
+        json.get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
     if text("headRefName") != branch {
         return Err(format!(
             "Pull request #{number} is from {:?}, not from {branch}, so SlashIt will not touch it.",
@@ -1008,7 +1170,10 @@ pub(super) async fn discard(state: &crate::AppState, task_uuid: Uuid) -> Result<
         }
     }
     if tip != pending.previous_tip {
-        let worktree = ctx.worktree.as_deref().ok_or("This task has no worktree to restore the branch in.")?;
+        let worktree = ctx
+            .worktree
+            .as_deref()
+            .ok_or("This task has no worktree to restore the branch in.")?;
         let produced = match &pending.rewritten_tip {
             Some(rewritten) => *rewritten == tip,
             None => restack::replay_matches_exactly(
@@ -1035,7 +1200,9 @@ pub(super) async fn discard(state: &crate::AppState, task_uuid: Uuid) -> Result<
         restack::move_branch_back(worktree, branch, &tip, &pending.previous_tip).await?;
     }
 
-    let stacked = BranchOrigin::Stacked { parent_branch: pending.parent_branch.clone() };
+    let stacked = BranchOrigin::Stacked {
+        parent_branch: pending.parent_branch.clone(),
+    };
     let apply = |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             if task.pending_republish.as_ref() == Some(&pending) {
@@ -1048,14 +1215,18 @@ pub(super) async fn discard(state: &crate::AppState, task_uuid: Uuid) -> Result<
             }
         }
     };
-    crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply).await.map_err(|e| {
-        format!(
-            "The branch is back at {}, but the task could not record that: {e}. Discard again.",
-            pending.previous_tip
-        )
-    })?;
+    crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply)
+        .await
+        .map_err(|e| {
+            format!(
+                "The branch is back at {}, but the task could not record that: {e}. Discard again.",
+                pending.previous_tip
+            )
+        })?;
     if let Err(e) = restack::retire_backup(repo, &backup, &pending.previous_tip).await {
-        eprintln!("[pr] discarded the restack of {branch}; its backup {backup} could not be deleted: {e}");
+        eprintln!(
+            "[pr] discarded the restack of {branch}; its backup {backup} could not be deleted: {e}"
+        );
     }
     Ok(())
 }
@@ -1079,7 +1250,10 @@ mod tests {
             r#"{"kind":"needs_restack","parent_branch":"task-parent","parent_pr":7,"default_branch":"main","pr_number":21,"rewrites":true}"#
         );
         assert_eq!(
-            serde_json::to_string(&RepublishStatus::Blocked { reason: "dirty".to_string() }).unwrap(),
+            serde_json::to_string(&RepublishStatus::Blocked {
+                reason: "dirty".to_string()
+            })
+            .unwrap(),
             r#"{"kind":"blocked","reason":"dirty"}"#
         );
         assert_eq!(
