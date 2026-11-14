@@ -349,6 +349,7 @@ fn full_task(project_id: Uuid) -> Task {
         base_head: commit('a'),
         reason: "the fix agent exited with edits".into(),
         apply_scope: false,
+        awaiting_commit: false,
         commit_authorized: false,
     });
     task.new_attempt = Some(NewAttemptDecision {

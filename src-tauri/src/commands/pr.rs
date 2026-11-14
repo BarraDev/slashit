@@ -2792,7 +2792,47 @@ pub async fn address_pr_review_inner(
                 Err(e) => Err(e),
                 Ok(()) => match (&task.branch_name, &verified_tree) {
                     (Some(branch), Ok(tree)) => {
-                        crate::worktree::commit_checkout_verified(&working_dir, branch, &message, tree).await
+                        // Recorded before the commit, so a stop from here on reads as an
+                        // unknown outcome, not as the fixes still waiting for their commit.
+                        let head_before = crate::worktree::checkout_head_commit(&working_dir).await;
+                        let marked = match (&_commit_lease, &head_before) {
+                            (Some((gate, Some(record))), Ok(_)) => ledger.begin_apply_commit(gate, task.id, record).await,
+                            (_, Err(e)) => Err(format!("the checkout's HEAD could not be read, so nothing was committed: {e}")),
+                            _ => Ok(()),
+                        };
+                        match marked {
+                            Err(e) => Err(e),
+                            Ok(()) => {
+                                let outcome =
+                                    crate::worktree::commit_checkout_verified(&working_dir, branch, &message, tree).await;
+                                // Restored only when HEAD did not move: a commit that was made and failed
+                                // its read-back is not "still waiting", so it stays recorded as unknown.
+                                let head_moved = match (&outcome, &head_before) {
+                                    (Err(_), Ok(before)) => match crate::worktree::checkout_head_commit(&working_dir).await {
+                                        Ok(head) => &head != before,
+                                        Err(_) => true,
+                                    },
+                                    _ => false,
+                                };
+                                let restored = match (&outcome, &_commit_lease) {
+                                    (Err(error), Some((gate, Some(record)))) if !head_moved => ledger
+                                        .restore_apply_clean(gate, task.id, record)
+                                        .await
+                                        .err()
+                                        .map(|kept| {
+                                            format!("{error}; the PR review fixes stay unresolved, because their record could not be restored: {kept}")
+                                        }),
+                                    _ => None,
+                                };
+                                match (restored, &outcome) {
+                                    (Some(text), _) => Err(text),
+                                    (None, Err(error)) if head_moved => Err(format!(
+                                        "{error}; the commit may have been made, so the PR review fixes stay unresolved until a person resolves them"
+                                    )),
+                                    _ => outcome,
+                                }
+                            }
+                        }
                     }
                     (Some(_), Err(e)) => Err(e.clone()),
                     (None, _) => Err("this task records no branch".to_string()),
@@ -23727,6 +23767,7 @@ mod tests {
                         reason: crate::review_fix_apply::APPLY_CLEAN_REASON.to_string(),
                         commit_authorized: false,
                         apply_scope: true,
+                        awaiting_commit: true,
                     });
                 }
                 apply_observed(&task, plan, worktree, jj, auto_reply, no_progress())
@@ -24185,6 +24226,7 @@ mod tests {
                     reason: crate::review_fix_apply::APPLY_CLEAN_REASON.to_string(),
                     commit_authorized: false,
                     apply_scope: true,
+                    awaiting_commit: true,
                 });
                 let (second, _plan) = apply(&persisted, plan, &worktree, no_jj, false).await;
 

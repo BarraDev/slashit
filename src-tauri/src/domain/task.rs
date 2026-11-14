@@ -587,6 +587,12 @@ pub struct ReviewFixResidue {
     /// and the record protects the apply's uncommitted fixes until its one commit settles it.
     #[serde(default)]
     pub apply_scope: bool,
+    /// On an apply scope: set once every item succeeded, so the edits may enter
+    /// the one consolidated commit or a commit-only continuation. Decisions read
+    /// this flag, never `reason`, which is text for a person. Absent from older
+    /// records, which therefore refuse until a person resolves them.
+    #[serde(default)]
+    pub awaiting_commit: bool,
 }
 
 /// `text` with the user's home directory written as `~`, for text the task

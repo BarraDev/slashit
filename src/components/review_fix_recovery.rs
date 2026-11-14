@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::models::Task;
 use crate::services::review_fix_service::resolve_review_fix;
+use crate::services::task_service::list_tasks;
 
 #[component]
 pub fn ReviewFixRecoveryPanel(
@@ -40,6 +41,14 @@ pub fn ReviewFixRecoveryPanel(
                 }
                 Err(reason) => {
                     let _ = refusal.try_set(Some(reason));
+                    // A refusal can mean the record moved on; show what the board now holds.
+                    if let Some(project_id) = task.try_get_untracked().flatten().map(|t| t.project_id.to_string()) {
+                        if let Ok(tasks) = list_tasks(project_id).await {
+                            if let Some(fresh) = tasks.into_iter().find(|t| t.id == task_id) {
+                                apply_task.run(fresh);
+                            }
+                        }
+                    }
                 }
             }
         });

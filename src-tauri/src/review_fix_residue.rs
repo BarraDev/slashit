@@ -124,6 +124,7 @@ pub async fn begin_attempt(
             reason: STARTED_REASON.to_string(),
             commit_authorized: false,
             apply_scope: false,
+            awaiting_commit: false,
         },
     )
     .await?;
@@ -133,6 +134,11 @@ pub async fn begin_attempt(
 /// The reason kept when a fix applied but its edits are not committed by the
 /// ordinary commit.
 const APPLIED_UNCOMMITTED: &str = "an AI Review fix applied, but its edits were not committed";
+
+/// Reason while the fix's own commit is being made, and after a stop before its
+/// outcome was recorded. Refuses ordinary commits until a person resolves it.
+const COMMIT_STARTED: &str =
+    "an AI Review fix's edits were being committed, and the outcome of that commit was not recorded; check the Task Checkout, then resolve it";
 
 /// What an attempt leaves for [`settle`]. A fix that applied is the ordinary
 /// fix and goes through the ordinary commit. Otherwise the record stays only if
@@ -239,7 +245,7 @@ pub async fn resolve(
     // still be editing the checkout, so the record must stay.
     if let Some(executor) = executor {
         if executor.is_task_running(task_id).await {
-            return Err("the Task is running an agent or review now, so the unresolved fix cannot be cleared yet".to_string());
+            return Err("the Task is running an agent or review now, so the unresolved fix cannot be cleared yet; press Stop in the Task drawer, wait for it to finish, then press Resolve again".to_string());
         }
     }
     let _gate = record_gate(task_id).await;
@@ -408,6 +414,24 @@ impl Ledger {
         if !current.commit_authorized {
             return Err("the AI Review fix's edits are not authorized for a commit".to_string());
         }
+        // Recorded before the commit, and it withdraws the authorization in the same
+        // write: a stop from here on reads as an unknown outcome, and no second
+        // commit can be authorized under this attempt.
+        let head_before = crate::worktree::checkout_head_commit(working_dir).await.map_err(|e| {
+            format!("the AI Review fix's edits were not committed, because the checkout's HEAD could not be read: {e}")
+        })?;
+        write_record(
+            &self.tasks,
+            &self.storage,
+            task_id,
+            Some(ReviewFixResidue {
+                reason: COMMIT_STARTED.to_string(),
+                commit_authorized: false,
+                ..current.clone()
+            }),
+        )
+        .await
+        .map_err(|e| format!("the AI Review fix's edits were not committed, because its record could not be updated: {e}"))?;
         let outcome = match branch {
             Some(branch) => {
                 crate::worktree::commit_checkout_verified(working_dir, branch, message, verified_tree)
@@ -415,11 +439,20 @@ impl Ledger {
             }
             None => Err("this Task records no branch".to_string()),
         };
+        // A refusal after the commit was made (its read-back failed) must not read as
+        // "not committed": HEAD tells the two apart.
+        let head_moved = match &outcome {
+            Err(_) => match crate::worktree::checkout_head_commit(working_dir).await {
+                Ok(head) => head != head_before,
+                Err(_) => true,
+            },
+            Ok(_) => false,
+        };
         match &outcome {
             // The commit is made and cannot be undone here, so it is reported as
-            // made. If clearing the record fails, the record stays with its
-            // authorization withdrawn and says what happened, so no second commit
-            // can land, and resolve reconciles it once the checkout is clean.
+            // made. If clearing the record fails, the record keeps the commit-started
+            // reason written before the commit, which refuses ordinary commits and
+            // says the outcome is unknown. Resolve reconciles it once the checkout is clean.
             Ok(made) => {
                 if let Err(e) = write_record(&self.tasks, &self.storage, task_id, None).await {
                     let what = match made {
@@ -442,9 +475,13 @@ impl Ledger {
                 }
             }
             Err(error) => {
-                let reason = format!(
-                    "an AI Review fix's edits could not be committed, so they remain uncommitted in the Task Checkout: {error}"
-                );
+                let reason = if head_moved {
+                    format!("an AI Review fix's commit may have been made, but its outcome could not be read back: {error}")
+                } else {
+                    format!(
+                        "an AI Review fix's edits could not be committed, so they remain uncommitted in the Task Checkout: {error}"
+                    )
+                };
                 if let Err(e) = write_record(
                     &self.tasks,
                     &self.storage,
@@ -916,6 +953,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stop_that_fails_both_writes_after_an_ai_review_commit_stays_unknown_and_refused() {
+        let fx = fixture().await;
+        let dir = fx.checkout.to_str().unwrap().to_string();
+        let attempt = fx.ledger.begin_attempt(fx.task_id, &dir).await.unwrap();
+        std::fs::write(fx.checkout.join("a.txt"), "fixed\n").unwrap();
+        fx.ledger.authorize_commit(fx.task_id, attempt).await.unwrap();
+        // The marker write (the first) succeeds; the clearing and fallback writes fail.
+        let fault = slashit_durable_fs::fault::fail_every_after(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+            1,
+        );
+        let snapshot = snapshot_of(&dir).await;
+        let outcome = fx
+            .ledger
+            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot)
+            .await
+            .expect("the commit was made");
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }), "{outcome:?}");
+        drop(fault);
+
+        let durable = reloaded(&fx).expect("the record survives both failures");
+        assert!(durable.reason.contains("outcome"), "{}", durable.reason);
+        assert!(!durable.commit_authorized, "no second commit can be authorized");
+        assert_eq!(residue(&fx).await.as_ref(), Some(&durable), "memory matches the durable record");
+        assert!(fx.ledger.admit_commit(fx.task_id).await.is_err(), "ordinary commits stay refused");
+        assert!(fx
+            .ledger
+            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot)
+            .await
+            .is_err());
+        assert_eq!(commit_count(&fx.checkout), "2", "exactly one commit was made");
+    }
+
+    #[tokio::test]
     async fn a_failed_record_clear_after_a_commit_reports_the_commit_and_blocks_a_second_one() {
         let fx = fixture().await;
         let dir = fx.checkout.to_str().unwrap().to_string();
@@ -925,10 +997,12 @@ mod tests {
             .authorize_commit(fx.task_id, attempt)
             .await
             .unwrap();
-        // Only the clearing write fails: the commit is made, then the record write.
-        let _fault = slashit_durable_fs::fault::fail_at(
+        // The marker write before the commit succeeds; only the clearing write fails,
+        // after the commit is made. The fallback write then succeeds.
+        let _fault = slashit_durable_fs::fault::fail_after(
             slashit_durable_fs::Stage::Replace,
             std::io::ErrorKind::Other,
+            1,
         );
 
         let outcome = fx

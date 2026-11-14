@@ -2406,6 +2406,7 @@ mod tests {
                 base_head: "unused".to_string(),
                 reason: "test".to_string(),
                 apply_scope: false,
+                awaiting_commit: false,
                 commit_authorized: false,
             });
 
