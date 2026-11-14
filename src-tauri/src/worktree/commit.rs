@@ -440,14 +440,19 @@ mod tests {
                 std::fs::write(c.join("new.txt"), "new\n").unwrap();
                 std::fs::remove_file(c.join("c.txt")).unwrap();
             })),
-            ("mode change and symlink", Box::new(|c: &Path| {
+        ];
+        #[cfg(unix)]
+        let steps = {
+            let mut steps = steps;
+            steps.push(("mode change and symlink", Box::new(|c: &Path| {
                 use std::os::unix::fs::PermissionsExt;
                 let mut perm = std::fs::metadata(c.join("a.txt")).unwrap().permissions();
                 perm.set_mode(0o755);
                 std::fs::set_permissions(c.join("a.txt"), perm).unwrap();
                 std::os::unix::fs::symlink("a.txt", c.join("link")).unwrap();
-            })),
-        ];
+            })));
+            steps
+        };
         for (name, edit) in steps {
             edit(&checkout);
             let snapshot = checkout_snapshot(dir).await.unwrap().content;
