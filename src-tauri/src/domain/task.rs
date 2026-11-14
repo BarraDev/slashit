@@ -949,6 +949,7 @@ impl Task {
             .then(|| "An earlier cleanup of this Task's checkout is unfinished, so it cannot run yet".to_string())
             .or_else(|| self.republish_pending_refusal())
             .or_else(|| self.worker_recovery_refusal())
+            .or_else(|| self.review_fix_residue_refusal())
             .or_else(|| self.integration_unfinished_refusal())
     }
 
@@ -2490,6 +2491,26 @@ impl HumanReviewRecord {
 
 #[cfg(test)]
 mod tests {
+    /// An unresolved AI Review fix refuses queue entry, so no Worker is admitted
+    /// into a checkout that holds its edits.
+    #[test]
+    fn an_unresolved_review_fix_refuses_queue_entry() {
+        let mut task = startable_task();
+        assert!(task.queue_entry_refusal().is_none());
+        task.review_fix_residue = Some(ReviewFixResidue {
+            attempt_id: uuid::Uuid::new_v4(),
+            branch: "task-branch".into(),
+            checkout_path: "/checkout".into(),
+            base_head: "abc".into(),
+            reason: "an AI Review fix applied, but its edits were not committed".into(),
+            commit_authorized: false,
+            apply_scope: false,
+            awaiting_commit: false,
+        });
+        assert!(task.review_fix_residue_refusal().is_some());
+        assert!(task.queue_entry_refusal().is_some());
+    }
+
     #[test]
     fn checkout_admission_survives_restart_and_bad_evidence_refuses_the_record() {
         use super::{CheckoutAdmission, DependencyAdmission, DependencyRequirement, Task};

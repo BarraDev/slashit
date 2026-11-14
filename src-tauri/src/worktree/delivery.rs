@@ -35,11 +35,11 @@ pub async fn checkout_snapshot(working_dir: &str) -> Result<String, String> {
 }
 
 async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, String> {
-    let run = |args: &'static [&'static str]| {
+    let run = |args: Vec<String>| {
         let index = index.to_path_buf();
         async move {
             let output = crate::host_process::tokio_command("git")
-                .args(args)
+                .args(&args)
                 .env("GIT_INDEX_FILE", &index)
                 .env("LC_ALL", "C")
                 .env("LANGUAGE", "C")
@@ -52,16 +52,42 @@ async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, 
             } else {
                 Err(format!(
                     "git {} failed: {}",
-                    args.first().unwrap_or(&""),
+                    args.first().map_or("", String::as_str),
                     String::from_utf8_lossy(&output.stderr).trim()
                 ))
             }
         }
     };
     // A repository without a commit yet has no HEAD to read: start empty.
-    let _ = run(&["read-tree", "HEAD"]).await;
-    run(&["add", "-A"]).await?;
-    run(&["write-tree"]).await
+    let _ = run(vec!["read-tree".into(), "HEAD".into()]).await;
+    // A file staged with `git add -f` despite an ignore rule is part of the commit,
+    // but `add -A` skips it in this scratch index, so its additions are added here.
+    // The real index is read, not the scratch one. A path deleted since staging is
+    // left out, as `add -A` would drop it.
+    let staged = crate::host_process::tokio_command("git")
+        .args(["diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A", "-z"])
+        .current_dir(working_dir)
+        .output()
+        .await
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if !staged.status.success() {
+        return Err(format!(
+            "git diff --cached failed: {}",
+            String::from_utf8_lossy(&staged.stderr).trim()
+        ));
+    }
+    let forced: Vec<String> = String::from_utf8_lossy(&staged.stdout)
+        .split('\0')
+        .filter(|p| !p.is_empty() && Path::new(working_dir).join(p).symlink_metadata().is_ok())
+        .map(str::to_string)
+        .collect();
+    if !forced.is_empty() {
+        let mut args = vec!["add".to_string(), "-f".to_string(), "--".to_string()];
+        args.extend(forced);
+        run(args).await?;
+    }
+    run(vec!["add".into(), "-A".into()]).await?;
+    run(vec!["write-tree".into()]).await
 }
 
 /// What [`effect_survives_in`] found.

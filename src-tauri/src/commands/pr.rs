@@ -2313,6 +2313,9 @@ pub async fn address_pr_review_inner(
     // id. A failed agent may have edited any file in the checkout before it
     // failed, so this apply then commits none of its fixes: see below.
     let mut a_fix_failed = false;
+    // Whether an item's outcome could not be written to its scope record. The checkout
+    // is then of unknown content, so nothing is pushed by this apply, even earlier commits.
+    let mut settle_failed = false;
     // An edit no fix made was found between fixes. Every later fix is refused
     // too: a failed agent's own leftovers switch the check off below, a
     // foreign edit must not.
@@ -2513,6 +2516,7 @@ pub async fn address_pr_review_inner(
                     })
                 };
                 if let Err(error) = ledger.settle_item(task.id, attempt, keep).await {
+                    settle_failed = true;
                     settle_error = Some(format!(
                         "comment {label}: the fix record could not be settled, so this fix is not applied and the Task Checkout stays unresolved until a person resolves it: {error}"
                     ));
@@ -2731,8 +2735,25 @@ pub async fn address_pr_review_inner(
     // Also on an apply that made no new fix, when an earlier one left fixes
     // uncommitted or unpushed: applying again commits them, and pushes them
     // only when Auto-push is on, without running their fix agents again.
+    // An operation whose items left no uncommitted work has nothing for its
+    // scope record to protect, so the record is cleared once the checkout is
+    // verified clean. Dirty or failed work keeps it. This runs before the owed-work
+    // gate below and before any push: a no-op fix owes nothing, and its record
+    // would otherwise stay, refusing every later apply and publication.
+    if !options.dry_run && apply_ran && uncommitted.is_empty() {
+        if let Err(e) = ledger.clear_apply_if_clean(task.id, apply_op).await {
+            fix_errors.push(format!("the PR review fix record could not be cleared, so the Task Checkout stays unresolved until a person resolves it: {e}"));
+        }
+    }
+
     if !options.dry_run && anything_owed && !cancelled && !withheld {
-        let mut committed_ok = true;
+        // A settlement failure blocks the commit's push too, not only a commit made here.
+        let mut committed_ok = !settle_failed;
+        if settle_failed && push_error.is_none() && !owed_a_push(&updated_plan).is_empty() {
+            push_error = Some(
+                "a PR review fix record could not be settled, so nothing was pushed. Resolve the Task Checkout, then apply again.".to_string(),
+            );
+        }
         if !uncommitted.is_empty() {
             // A real Git commit on the task branch, whether or not jj is
             // installed: see `crate::worktree::commit_checkout`. A branch that
@@ -2846,8 +2867,11 @@ pub async fn address_pr_review_inner(
                     if let Err(kept) = ledger.keep_committed_apply(gate, task.id, record, &e).await {
                         eprintln!("PR review fix record of task {} not settled after its commit: {kept}", task.id);
                     }
+                    // The record that says the checkout is unresolved must stand before anything
+                    // is published, so an unsettled commit is not pushed.
+                    committed_ok = false;
                     fix_errors.push(format!(
-                        "the commit was made, but the PR review fix record could not be cleared, so the Task Checkout stays unresolved until a person resolves it: {e}"
+                        "the commit was made, but the PR review fix record could not be cleared, so the Task Checkout stays unresolved until a person resolves it and nothing was pushed: {e}"
                     ));
                 }
             }
@@ -2953,15 +2977,22 @@ pub async fn address_pr_review_inner(
         // about a Task that is awaiting its Human Review decision, so for a Task
         // nobody has approved the fixes stay in the local branch, as they do with
         // auto-push off, and nothing reaches the remote branch.
-        // An operation whose items left no uncommitted work has nothing for its
-        // scope record to protect, so the record is cleared once the checkout is
-        // verified clean. Dirty or failed work keeps it.
-        if apply_ran && uncommitted.is_empty() {
-            if let Err(e) = ledger.clear_apply_if_clean(task.id, apply_op).await {
-                fix_errors.push(format!("the PR review fix record could not be cleared, so the Task Checkout stays unresolved until a person resolves it: {e}"));
-            }
-        }
         let to_push = owed_a_push(&updated_plan);
+        // An unresolved scope record means the checkout's content is not known to be the
+        // plan's, whichever Apply left it. Nothing is published while it stands, so an
+        // unsettled commit kept by an earlier Apply is not pushed by a later one.
+        let record_unresolved = ledger
+            .tasks
+            .read()
+            .await
+            .get(&task.id)
+            .is_some_and(|t| t.review_fix_residue.is_some());
+        if record_unresolved && committed_ok && !to_push.is_empty() && options.auto_push {
+            committed_ok = false;
+            push_error.get_or_insert_with(|| {
+                "the Task Checkout has an unresolved PR review fix record, so nothing was pushed. Resolve the Task Checkout, then apply again.".to_string()
+            });
+        }
         let push_held_for_review = task.unapproved_human_review_delivery_refusal().is_some();
         if committed_ok && !to_push.is_empty() && options.auto_push && push_held_for_review {
             let note = format!(
@@ -25627,6 +25658,34 @@ mod tests {
                     "{:?}",
                     plan.items[1]
                 );
+            }
+
+            /// A fix that changes nothing leaves no scope record behind. It owes
+            /// nothing, so the record used to stay and refuse every later apply and commit.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_that_changes_nothing_leaves_no_record_behind() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install_changing_nothing();
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let (_root, ledger) = detached_ledger(&task);
+
+                let (result, _plan) = apply_observed_on(
+                    &ledger,
+                    &task,
+                    plan,
+                    &worktree,
+                    tmp.path().join("no-such-jj"),
+                    true,
+                    no_progress(),
+                )
+                .await
+                .expect("the apply flow reports per step, not as a command error");
+
+                let record = ledger.tasks.read().await.get(&task.id).and_then(|t| t.review_fix_residue.clone());
+                assert!(record.is_none(), "a fix that changed nothing left {record:?} behind: {result:?}");
             }
 
             /// A commit failure posts no reply claiming the fix is done: the

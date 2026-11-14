@@ -12,6 +12,17 @@ use crate::models::Task;
 use crate::services::review_fix_service::resolve_review_fix;
 use crate::services::task_service::list_tasks;
 
+/// Replaces the shown Task with the board's own copy, the authoritative one.
+async fn refresh_authoritative(task: Signal<Option<Task>>, apply_task: Callback<Task>, task_id: Uuid) {
+    if let Some(project_id) = task.try_get_untracked().flatten().map(|t| t.project_id.to_string()) {
+        if let Ok(tasks) = list_tasks(project_id).await {
+            if let Some(fresh) = tasks.into_iter().find(|t| t.id == task_id) {
+                apply_task.run(fresh);
+            }
+        }
+    }
+}
+
 #[component]
 pub fn ReviewFixRecoveryPanel(
     task_id: Uuid,
@@ -33,22 +44,20 @@ pub fn ReviewFixRecoveryPanel(
             let answer = resolve_review_fix(task_id, attempt_id).await;
             let _ = busy.try_set(false);
             match answer {
-                Ok(()) => {
-                    if let Some(mut updated) = task.try_get_untracked().flatten() {
+                Ok(()) => match task.try_get_untracked().flatten() {
+                    // Clear only the record this Resolve answered for. A board refresh may
+                    // have installed a newer attempt meanwhile, and that one is still open.
+                    Some(mut updated) if updated.review_fix_residue.as_ref().is_some_and(|r| r.attempt_id == attempt_id) => {
                         updated.review_fix_residue = None;
                         apply_task.run(updated);
                     }
-                }
+                    Some(_) => refresh_authoritative(task, apply_task, task_id).await,
+                    None => {}
+                },
                 Err(reason) => {
                     let _ = refusal.try_set(Some(reason));
                     // A refusal can mean the record moved on; show what the board now holds.
-                    if let Some(project_id) = task.try_get_untracked().flatten().map(|t| t.project_id.to_string()) {
-                        if let Ok(tasks) = list_tasks(project_id).await {
-                            if let Some(fresh) = tasks.into_iter().find(|t| t.id == task_id) {
-                                apply_task.run(fresh);
-                            }
-                        }
-                    }
+                    refresh_authoritative(task, apply_task, task_id).await;
                 }
             }
         });

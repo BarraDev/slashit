@@ -449,10 +449,11 @@ impl Ledger {
             Ok(_) => false,
         };
         match &outcome {
-            // The commit is made and cannot be undone here, so it is reported as
-            // made. If clearing the record fails, the record keeps the commit-started
-            // reason written before the commit, which refuses ordinary commits and
-            // says the outcome is unknown. Resolve reconciles it once the checkout is clean.
+            // The commit is made and cannot be undone here. If clearing the record
+            // fails, the record keeps the commit-started reason written before the
+            // commit, which refuses ordinary commits and says the outcome is unknown.
+            // That is a failed fix, not a success: the caller must not record it as
+            // applied. Resolve reconciles it once the checkout is clean.
             Ok(made) => {
                 if let Err(e) = write_record(&self.tasks, &self.storage, task_id, None).await {
                     let what = match made {
@@ -472,6 +473,9 @@ impl Ledger {
                     {
                         eprintln!("AI Review fix record of task {task_id} not settled after a commit: {kept}");
                     }
+                    return Err(format!(
+                        "the AI Review fix was {what}, but its record could not be cleared, so the Task Checkout stays unresolved until a person resolves it: {e}"
+                    ));
                 }
             }
             Err(error) => {
@@ -966,12 +970,13 @@ mod tests {
             1,
         );
         let snapshot = snapshot_of(&dir).await;
-        let outcome = fx
+        // The commit was made, but its record could not be settled: that is a failed fix.
+        let error = fx
             .ledger
             .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot)
             .await
-            .expect("the commit was made");
-        assert!(matches!(outcome, CheckoutCommit::Committed { .. }), "{outcome:?}");
+            .expect_err("a commit whose record stays unsettled is not reported as applied");
+        assert!(error.contains("could not be cleared"), "{error}");
         drop(fault);
 
         let durable = reloaded(&fx).expect("the record survives both failures");
@@ -1005,12 +1010,13 @@ mod tests {
             1,
         );
 
-        let outcome = fx
+        // The commit is made, but it is an error: the record could not be settled.
+        let error = fx
             .ledger
             .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot_of(&dir).await)
             .await
-            .expect("the commit is reported as made");
-        assert!(matches!(outcome, CheckoutCommit::Committed { .. }), "{outcome:?}");
+            .expect_err("a commit whose record stays unsettled is not reported as applied");
+        assert!(error.contains("committed as") && error.contains("could not be cleared"), "{error}");
         assert_eq!(commit_count(&fx.checkout), "2");
 
         let kept = residue(&fx).await.expect("the record is kept, not cleared");

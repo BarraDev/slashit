@@ -156,6 +156,9 @@ async fn commit(
         return Ok(None);
     }
 
+    // The tip before this commit, so a commit that holds other content can be undone.
+    let before = git(working_dir, &["rev-parse", "--verify", "HEAD"]).await.ok();
+
     let mut args = vec!["commit", "-q"];
     if allow_empty {
         args.push("--allow-empty");
@@ -168,7 +171,30 @@ async fn commit(
     let commit = git(working_dir, &["rev-parse", "HEAD"])
         .await
         .map_err(|e| format!("committed, but the new commit could not be read back: {e}"))?;
+    if let Some(expected) = expected_tree {
+        // Pre-commit hooks run after the check above and may stage files, so the
+        // commit can record a tree other than the one that was checked.
+        let holds_checked_tree = git(working_dir, &["rev-parse", "HEAD^{tree}"])
+            .await
+            .is_ok_and(|tree| tree == expected);
+        if !holds_checked_tree {
+            return Err(undo_commit(working_dir, before.as_deref(), &commit).await);
+        }
+    }
     Ok(Some(commit))
+}
+
+/// Moves the task branch back to `before` after a commit whose tree is not the
+/// checked tree. The working tree is untouched, so the edits stay where they were.
+async fn undo_commit(working_dir: &str, before: Option<&str>, made: &str) -> String {
+    const REFUSAL: &str = "a Git hook changed the staged content after it was checked";
+    let Some(before) = before else {
+        return format!("{REFUSAL}, and the commit {made} could not be undone, so it stays on the task branch");
+    };
+    match git(working_dir, &["reset", "-q", "--mixed", before]).await {
+        Ok(_) => format!("{REFUSAL}, so the commit was undone and nothing was committed"),
+        Err(e) => format!("{REFUSAL}, and the commit {made} could not be undone, so it stays on the task branch: {e}"),
+    }
 }
 
 /// Refuse a checkout that is not exactly where the task's work belongs: see
@@ -287,6 +313,20 @@ pub async fn checkout_snapshot(working_dir: &str) -> Result<CheckoutSnapshot, St
     let result = async {
         // An unborn HEAD has no tree to read: the scratch index then starts empty.
         let _ = git_with_index(working_dir, &index, &["read-tree", "HEAD"]).await;
+        // A file staged with `git add -f` despite an ignore rule is in the commit that
+        // staging everything would make, but `add -A` skips it here. Its additions are
+        // added explicitly. A path deleted since staging is left out, as `add -A` drops it.
+        // `--no-renames`: a staged rename into an ignored name is an addition too.
+        let staged = git(working_dir, &["diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A", "-z"]).await?;
+        let forced: Vec<&str> = staged
+            .split('\0')
+            .filter(|p| !p.is_empty() && Path::new(working_dir).join(p).symlink_metadata().is_ok())
+            .collect();
+        if !forced.is_empty() {
+            let mut args = vec!["add", "-f", "--"];
+            args.extend(forced);
+            git_with_index(working_dir, &index, &args).await?;
+        }
         git_with_index(working_dir, &index, &["add", "-A"]).await?;
         let content = git_with_index(working_dir, &index, &["write-tree"]).await?;
         let head = git(working_dir, &["rev-parse", "HEAD^{tree}"]).await?;
@@ -523,6 +563,71 @@ mod tests {
         let tip = git_ok(&checkout, &["rev-parse", "task"]);
         assert_ne!(tip, before);
         assert_eq!(commit, tip);
+    }
+
+    /// A file staged with `git add -f` despite an ignore rule is part of the commit
+    /// that staging everything makes, so the checked snapshot must hold it too.
+    #[tokio::test]
+    async fn a_forced_staged_ignored_addition_is_in_the_snapshot() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        std::fs::write(checkout.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(checkout.join("fixture.log"), "forced\n").unwrap();
+        git_ok(&checkout, &["add", "-f", "fixture.log"]);
+        let checked = checkout_snapshot(dir).await.unwrap().content;
+
+        let outcome = commit_checkout_verified(dir, "task", "task: fix it", &checked)
+            .await
+            .expect("the checked content commits");
+
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }));
+        assert_eq!(git_ok(&checkout, &["show", "task:fixture.log"]), "forced");
+    }
+
+    /// A staged rename into an ignored name is an addition the commit records, so the
+    /// snapshot must hold it, not read it as a rename that drops it.
+    #[tokio::test]
+    async fn a_staged_rename_into_an_ignored_name_is_in_the_snapshot() {
+        let (_tmp, _repo, checkout) = repo_with_task_checkout();
+        let dir = checkout.to_str().unwrap();
+        std::fs::write(checkout.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::rename(checkout.join("kept.txt"), checkout.join("renamed.log")).unwrap();
+        git_ok(&checkout, &["rm", "-q", "--cached", "kept.txt"]);
+        git_ok(&checkout, &["add", "-f", "renamed.log"]);
+        let checked = checkout_snapshot(dir).await.unwrap().content;
+
+        let outcome = commit_checkout_verified(dir, "task", "task: fix it", &checked)
+            .await
+            .expect("the checked content commits");
+
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }));
+        assert_eq!(git_ok(&checkout, &["show", "task:renamed.log"]), "kept");
+    }
+
+    /// A pre-commit hook that stages a file changes what the commit records. The
+    /// commit is undone: the branch is where it was, and the edits stay on disk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hook_that_stages_more_than_was_checked_is_undone() {
+        let (_tmp, repo, checkout) = repo_with_task_checkout();
+        // Published by `write_executable`'s short-lived child, as in the hook test below.
+        crate::test_helpers::write_executable(
+            &repo.join(".git/hooks/pre-commit"),
+            "#!/bin/sh\necho extra > extra.txt && git add extra.txt\n",
+        );
+        std::fs::write(checkout.join("kept.txt"), "checked\n").unwrap();
+        let dir = checkout.to_str().unwrap();
+        let checked = checkout_snapshot(dir).await.unwrap().content;
+        let before = git_ok(&checkout, &["rev-parse", "task"]);
+
+        let error = commit_checkout_verified(dir, "task", "task: fix it", &checked)
+            .await
+            .expect_err("the commit holding the hook's file is refused");
+
+        assert!(error.contains("a Git hook changed the staged content"), "{error}");
+        assert!(error.contains("undone"), "{error}");
+        assert_eq!(git_ok(&checkout, &["rev-parse", "task"]), before, "the commit was undone");
+        assert_eq!(std::fs::read_to_string(checkout.join("kept.txt")).unwrap(), "checked\n");
     }
 
     // The hook is a shell script made executable with Unix permissions.

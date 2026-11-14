@@ -4749,6 +4749,7 @@ impl TaskExecutor {
         let refused_launch = std::sync::atomic::AtomicBool::new(false);
         let refusal: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let membership_changed = std::sync::atomic::AtomicBool::new(false);
+        let residue_refused = std::sync::atomic::AtomicBool::new(false);
         // The membership read guards, held from the check to the publish. Taken
         // and dropped in this function only, never across an await.
         let membership_pinned: std::sync::Mutex<Option<MembershipGuards<'_>>> =
@@ -4770,6 +4771,13 @@ impl TaskExecutor {
                 }
                 *membership_pinned.lock().unwrap_or_else(|p| p.into_inner()) =
                     Some((projects, registry));
+                // An unresolved AI Review fix holds edits that no commit may carry, and a run
+                // would edit over them. Refused in this write, so nothing is recorded or launched.
+                if let Some(message) = t.review_fix_residue_refusal() {
+                    *refusal.lock().unwrap_or_else(|p| p.into_inner()) = Some(message);
+                    residue_refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
                 // The one comparison of an approved input with the Task that
                 // will run, in the write that starts the run. A binding that
                 // differs or was made for another run fails the Task closed
@@ -4968,6 +4976,19 @@ impl TaskExecutor {
                 Err(RunStartError::Refused(format!(
                     "The Workspace membership of this Task's Project changed, or could not be confirmed unchanged, before its start was recorded; nothing was recorded or launched, so the start can be asked for again. {cleanup}"
                 )))
+            }
+            // The Task Checkout holds an unresolved AI Review fix. Nothing was started, and
+            // the Task is left as it was; a checkout this call created is taken back.
+            _ if residue_refused.load(std::sync::atomic::Ordering::Relaxed) => {
+                let message = refusal
+                    .into_inner()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .unwrap_or_default();
+                let cleanup = self
+                    .worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                Err(RunStartError::Refused(format!("{message} {cleanup}")))
             }
             // The Worker cannot run this Task as asked. The Task is failed with
             // the refusal and nothing was started; a checkout this call created
@@ -7875,13 +7896,17 @@ impl TaskExecutor {
                 };
 
                 let fix_result = fix_outcome(fix_run);
+                // The checkout as the fix agent left it, read once. The record decision
+                // and the commit both use this content: an edit made after this read is
+                // refused by the commit's staged-tree check, not committed under the fix.
+                let post_run = crate::worktree::checkout_snapshot(&working_dir)
+                    .await
+                    .map(|s| s.content);
                 if let Some(attempt) = residue_attempt {
                     let applied = matches!(fix_result, FixOutcome::Applied);
                     let clean_before = fix_before.as_ref().is_ok_and(|s| s.clean);
                     let before = fix_before.as_ref().map(|s| s.content.clone()).map_err(Clone::clone);
-                    let after = crate::worktree::checkout_snapshot(&working_dir)
-                        .await
-                        .map(|s| s.content);
+                    let after = post_run.clone();
                     // An applied fix over a clean checkout that changed it is the one
                     // edit set SlashIt may commit, and only under this attempt. Its
                     // record stays until that commit settles it, so a crash in
@@ -7926,19 +7951,19 @@ impl TaskExecutor {
                         };
                         // Whether the checkout's content changed while the fix
                         // agent ran, whatever commits it made. A commit that
-                        // leaves the content as it was is not a fix.
-                        let after = crate::worktree::checkout_snapshot(&working_dir).await;
-                        // The content the commit must find staged: what was read here.
-                        let verified_tree = after.as_ref().map(|s| s.content.clone()).map_err(Clone::clone);
+                        // leaves the content as it was is not a fix. This is the
+                        // snapshot the record was decided on, not a later read.
+                        // The content the commit must find staged: the same one.
+                        let verified_tree = post_run.clone();
                         // The second value says whether the checkout was clean before
                         // the run. A commit of a dirty checkout would also commit the
                         // edits that were already there, so it is refused.
-                        let changed = match (&fix_before, after) {
+                        let changed = match (&fix_before, &post_run) {
                             (Ok(before), Ok(after)) => {
-                                Ok((before.content != after.content, before.clean))
+                                Ok((&before.content != after, before.clean))
                             }
                             (Err(e), _) => Err(e.clone()),
-                            (Ok(_), Err(e)) => Err(e),
+                            (Ok(_), Err(e)) => Err(e.clone()),
                         };
                         match changed {
                             Ok((false, _)) => {
@@ -8015,9 +8040,10 @@ impl TaskExecutor {
                                         None
                                     }
                                     Err(e) => {
+                                        // `e` says whether the commit was made. Either way the fix
+                                        // is not recorded as applied.
                                         let message = format!(
-                                            "The review fixes could not be committed: {e}. They \
-                                             remain as uncommitted edits in the task checkout."
+                                            "The review fixes could not be committed or recorded as applied: {e}"
                                         );
                                         events.agent_event(AgentEvent::Log {
                                             task_id: task_id_str.clone(),
