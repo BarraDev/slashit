@@ -1240,6 +1240,33 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// jj with a fixed identity, for the commits these tests make with jj.
+    fn jj(dir: &std::path::Path, args: &[&str]) -> String {
+        let mut all = vec!["--config", "user.name=Test", "--config", "user.email=test@example.com"];
+        all.extend_from_slice(args);
+        let out = std::process::Command::new("jj")
+            .args(&all)
+            .current_dir(dir)
+            .output()
+            .expect("run jj");
+        assert!(out.status.success(), "jj {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The commit `refs/heads/<branch>` names in the backing Git directory of
+    /// a jj workspace, if it is there at all.
+    fn git_ref_at(git_dir: &std::path::Path, branch: &str, cwd: &std::path::Path) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(git_dir)
+            .args(["for-each-ref", "--format=%(objectname)", &format!("refs/heads/{branch}")])
+            .current_dir(cwd)
+            .output()
+            .expect("for-each-ref");
+        let listed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!listed.is_empty()).then_some(listed)
+    }
+
     /// A project whose repository has no remote, a Task Checkout of its own
     /// with committed work, and a task in Human Review that owns both.
     struct Local {
@@ -1932,7 +1959,7 @@ mod tests {
         assert_eq!(status.coverage, ApprovalCoverage::Moved);
         assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()), "the approval covers A, and says so");
         assert_eq!(status.branch_tip.as_deref(), Some(moved.as_str()), "the branch is at B, and that is reported");
-        assert_eq!(status.rewritten, false, "A is still on the branch");
+        assert!(!status.rewritten, "A is still on the branch");
         let reason = status.reason.clone().unwrap_or_default();
         assert!(reason.contains(&approved[..12]) && reason.contains(&moved[..12]), "{reason}");
 
@@ -2035,6 +2062,108 @@ mod tests {
         let status = approval_status(&local.state, local.task_id).await.unwrap();
         assert_eq!((status.coverage, status.rewritten), (ApprovalCoverage::Moved, true));
         approve_again(&local.state, local.task_id, &rewritten).await.expect("approved");
+    }
+
+    /// The read-only read answers in a jj repository too, where the branch's
+    /// commit now comes from the bookmark rather than from Git's refs. An
+    /// approval made through the export path recorded what the export had put
+    /// into Git's refs; when the bookmark moves with jj alone afterwards, a
+    /// stale approval must be reported against the bookmark's commit. Against
+    /// Git's stale ref it would not even be stale, and the approval would
+    /// read as current over changes nobody reviewed.
+    #[tokio::test]
+    async fn a_stale_approval_in_a_jj_repository_is_reported_against_the_bookmark() {
+        let (tmp, state) = test_state().await;
+        // A non-colocated jj workspace: `git` cannot discover its backing
+        // repository from the workspace, so a ref read there is a read of the
+        // bookmark's export, never of something git can reach on its own.
+        let ws = tmp.path().join(format!("jj-{}", Uuid::new_v4()));
+        jj(tmp.path(), &["git", "init", "--no-colocate", ws.to_str().unwrap()]);
+        std::fs::write(ws.join("README.md"), "base\n").unwrap();
+        jj(&ws, &["commit", "-m", "task commit"]);
+        jj(&ws, &["bookmark", "create", "task-branch", "-r", "@-"]);
+        let approved = jj(&ws, &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "task-branch"]);
+
+        // A project whose repository is that workspace, and a task in Human
+        // Review whose branch is the bookmark.
+        let repository_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        state.repository.repositories.write().await.insert(
+            repository_id,
+            crate::domain::Repository {
+                id: repository_id,
+                local_path: ws.to_str().unwrap().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        state.project.projects.write().await.insert(
+            project_id,
+            crate::domain::Project {
+                id: project_id,
+                name: "jj".to_string(),
+                repository_id: Some(repository_id),
+                scope: crate::domain::project::ProjectScope::Standalone,
+                state_location: crate::config::paths::StateLocation::External,
+                base: Some(crate::domain::project::ProjectBase::LocalBranch {
+                    branch: "task-branch".to_string(),
+                }),
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                agent_config: crate::domain::AgentConfig {
+                    agent_type: crate::domain::AgentType::ClaudeCode,
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        let mut task = create_test_task_full("stale in jj", project_id, TaskStatus::HumanReview, 0);
+        task.branch_name = Some("task-branch".to_string());
+        task.human_review.record_arrival();
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+
+        // The approval is made through the export path, as a delivery would
+        // read the branch: it records the commit the export put into Git's
+        // refs.
+        approve_shown(&state, task_id, false).await.expect("approved");
+        assert_eq!(on_disk(&state, project_id, task_id).human_review.approved_tip(), Some(approved.as_str()));
+
+        // The bookmark moves with jj alone, as a person working in jj does,
+        // and the export that recorded the approval does not happen again:
+        // Git's refs still hold the approved commit.
+        jj(&ws, &["--ignore-working-copy", "new", "-m", "moved on"]);
+        jj(&ws, &["--ignore-working-copy", "bookmark", "set", "task-branch", "-r", "@-"]);
+        let moved = jj(&ws, &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "task-branch"]);
+        assert_ne!(moved, approved, "the fixture must have moved the bookmark");
+        let git_dir = ws.join(".jj/repo/store/git");
+        assert_eq!(
+            git_ref_at(&git_dir, "task-branch", tmp.path()),
+            Some(approved.clone()),
+            "the fixture must have left Git's ref at the approved commit"
+        );
+
+        // The read-only status answers the bookmark's commit, so the approval
+        // is reported stale against the branch as it is now — and the read
+        // exports nothing, being one the panel may ask on a cadence.
+        let status = approval_status(&state, task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::Moved);
+        assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()), "the approval covers what it recorded");
+        assert_eq!(status.branch_tip.as_deref(), Some(moved.as_str()), "the branch is where the bookmark is now");
+        assert!(!status.rewritten, "the approved commit is still on the branch");
+        let reason = status.reason.clone().unwrap_or_default();
+        assert!(reason.contains(&approved[..12]) && reason.contains(&moved[..12]), "{reason}");
+        assert_eq!(
+            git_ref_at(&git_dir, "task-branch", tmp.path()),
+            Some(approved),
+            "the read must not export the bookmark into Git's refs"
+        );
     }
 
     #[tokio::test]

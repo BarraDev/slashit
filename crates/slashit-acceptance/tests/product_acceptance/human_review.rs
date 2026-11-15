@@ -202,6 +202,44 @@ pub(super) async fn click(driver: &WebDriver, selector: &str, what: &str) -> Res
         .with_context(|| format!("could not press {what}"))
 }
 
+/// The localStorage key the Human Review panel reads to hold its coverage
+/// cadence (`src/components/task_review.rs`): while it is present the panel
+/// asks nothing on the cadence and publishes no answer, so what a person is
+/// shown is frozen. Held for exactly the one step of
+/// [`changes_scope`] that needs the panel not to learn a branch move on its
+/// own, so that step's refusal is proven rather than raced against.
+const COVERAGE_POLL_HOLD: &str = "slashit-coverage-poll-hold";
+
+async fn hold_coverage_poll(driver: &WebDriver) -> Result<()> {
+    page(
+        driver,
+        "localStorage.setItem(arguments[0], '1'); return true;",
+        vec![Value::String(COVERAGE_POLL_HOLD.to_owned())],
+    )
+    .await?;
+    if page(
+        driver,
+        "return localStorage.getItem(arguments[0]) === '1';",
+        vec![Value::String(COVERAGE_POLL_HOLD.to_owned())],
+    )
+    .await?
+        != Value::Bool(true)
+    {
+        bail!("the coverage cadence could not be held");
+    }
+    Ok(())
+}
+
+async fn release_coverage_poll(driver: &WebDriver) -> Result<()> {
+    page(
+        driver,
+        "localStorage.removeItem(arguments[0]); return true;",
+        vec![Value::String(COVERAGE_POLL_HOLD.to_owned())],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Wait until an approval control is shown and enabled, and return its label.
 ///
 /// The label is not readiness: the controls stay disabled until the commit to
@@ -1201,6 +1239,9 @@ async fn changes_scope_journey(context: &TestContext) -> Result<()> {
 }
 
 async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFixture) -> Result<()> {
+    // A run of this journey that died while the cadence was held must not
+    // hold this one: the key is cleared before anything looks at the panel.
+    release_coverage_poll(driver).await?;
     let executed = execute_one_task(driver, agent, repository).await?;
     let branch = branch_of(&read_task(driver, &executed).await?)?;
     let tip = repository.branch_tip(&branch)?.context("the task branch is missing")?;
@@ -1253,9 +1294,11 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
 
     // Approving while the branch has moved again: the person is shown
     // `moved`, the branch is already at `moved_again`, and the click sends
-    // the commit on screen. Anchored to the cadence boundary above: the panel
-    // was just read and cannot have read the newer move yet, so the refusal
-    // is proven, not raced against.
+    // the commit on screen. The panel's cadence is held for exactly this
+    // step, so no ask of its own can land between the commit and the click
+    // and learn the newer move first: what is shown is provably `moved`,
+    // and the refusal is proven, not raced against.
+    hold_coverage_poll(driver).await?;
     git(
         &executed.worktree_path,
         &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "moved again"],
@@ -1269,6 +1312,9 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
     if !refused.contains("nothing was approved") {
         bail!("the refusal does not say nothing was approved: {refused}");
     }
+    // The cadence is released before the panel reads the branch again, so
+    // what this wait observes is the cadence, as a person's panel would.
+    release_coverage_poll(driver).await?;
     // A refusal records nothing, and the panel then asks what the branch is
     // now, so what is offered next is the branch as it is.
     let task = read_task(driver, &executed).await?;

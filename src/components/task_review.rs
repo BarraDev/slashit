@@ -34,6 +34,24 @@ const VISIBLE_FINDINGS: usize = 8;
 /// person tried something.
 const COVERAGE_POLL_MS: i32 = 5_000;
 
+/// The localStorage key the acceptance harness sets to hold this cadence for
+/// one step of its journey. It proves that approving a commit the branch has
+/// left is refused, which needs the branch to move after the panel read it
+/// and before the person clicks; without a hold, a poll landing between the
+/// move and the click would learn the move first and approve it, so whether
+/// the refusal was proven would be a race. While the key is present the panel
+/// asks nothing on its own and publishes no answer, so what a person is shown
+/// is frozen. Production never sets the key.
+const COVERAGE_POLL_HOLD_KEY: &str = "slashit-coverage-poll-hold";
+
+/// Whether the coverage cadence is being held by the acceptance harness.
+fn coverage_poll_held() -> bool {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(COVERAGE_POLL_HOLD_KEY).ok().flatten())
+        .is_some()
+}
+
 /// Where the pull request for approved changes stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivery {
@@ -348,10 +366,21 @@ pub fn HumanReviewPanel(
     let asked = StoredValue::new(0u32);
     // Asks what the branch is now. Only the latest question's answer is kept.
     let ask_coverage = move || {
+        // A held cadence asks nothing: the panel keeps what it showed when
+        // the hold began, so an acceptance step can move the branch and click
+        // without the panel having read the move.
+        if coverage_poll_held() {
+            return;
+        }
         let ask = asked.try_update_value(|n| { *n += 1; *n }).unwrap_or(0);
         spawn_local(async move {
             let answer = get_approval_status(task_id.to_string()).await;
             if asked.try_get_value() != Some(ask) {
+                return;
+            }
+            // An ask that was in flight when the hold began may have read the
+            // branch after the hold began, so it must not publish either.
+            if coverage_poll_held() {
                 return;
             }
             match answer {
@@ -400,11 +429,16 @@ pub fn HumanReviewPanel(
             )
             .ok()
         });
-        ask.forget();
+        let ask = StoredValue::new_local(Some(ask));
         on_cleanup(move || {
             if let (Some(w), Some(id)) = (web_sys::window(), interval) {
                 w.clear_interval_with_handle(id);
             }
+            // The interval is cleared before the closure is freed, so no
+            // callback can fire on a freed closure: the closure is disposed
+            // here instead of `forget()`-ed for the interval's sake, which
+            // leaked one every time the panel mounted.
+            ask.dispose();
         });
     }
     // The branch moved while the Changes tab shows another commit: ask the tab to

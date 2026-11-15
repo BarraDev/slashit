@@ -9515,9 +9515,16 @@ pub(crate) async fn task_branch_tip_read_only(
 /// the user's working copy. A name that matches no bookmark is `None`, not an
 /// error. `branch` has passed [`checked_task_branch`], whose character set
 /// cannot close the revset's quotes.
+///
+/// A conflicted bookmark names several commits and has no tip. It is an
+/// error, not a tip: the ids of several commits printed one after another
+/// are a string no commit has, and an approval or a comparison must not be
+/// built on it.
 async fn jj_bookmark_tip(working_dir: &str, branch: &str) -> Result<Option<String>, String> {
     let branch = checked_task_branch(branch)?;
-    let tip = run_cmd(
+    // One commit per line, so a conflicted bookmark's commits can be counted
+    // instead of reading as one concatenated, non-existent commit id.
+    let listed = run_cmd(
         "jj",
         &[
             "--ignore-working-copy",
@@ -9526,13 +9533,22 @@ async fn jj_bookmark_tip(working_dir: &str, branch: &str) -> Result<Option<Strin
             &format!("bookmarks(exact:\"{branch}\")"),
             "--no-graph",
             "-T",
-            "commit_id",
+            "commit_id ++ \"\\n\"",
         ],
         working_dir,
     )
     .await
     .map_err(|e| format!("Could not read the tip of branch `{branch}`: {e}"))?;
-    Ok((!tip.is_empty()).then_some(tip))
+    let commits: Vec<&str> = listed.lines().filter(|l| !l.trim().is_empty()).collect();
+    match commits.as_slice() {
+        [] => Ok(None),
+        [tip] => Ok(Some((*tip).to_string())),
+        commits => Err(format!(
+            "The branch `{branch}` is conflicted in jj, naming {} commits, so it has no single \
+             commit to show. Resolve the bookmark conflict, then review again.",
+            commits.len()
+        )),
+    }
 }
 
 /// The `--git-dir` argument `git` needs in `working_dir`: the Git repository
@@ -12643,6 +12659,76 @@ mod tests {
             assert_eq!(
                 jj_bookmark_tip(repo.dir(), "task-gone").await.expect("read"),
                 None
+            );
+        }
+
+        /// A conflicted bookmark names several commits and has no tip. The
+        /// read refuses instead of answering the ids concatenated, which no
+        /// commit has: an approval or a comparison built on that string would
+        /// be about nothing.
+        #[tokio::test]
+        async fn jj_bookmark_tip_refuses_a_conflicted_bookmark() {
+            let repo = NonColocatedJj::new("task-branch");
+            let base = repo.task_sha.clone();
+            // Two sibling commits, so the concurrent sets below move the
+            // bookmark to commits neither of which is the other's ancestor.
+            jj_as_test_user(&repo.workspace, &["new", "-r", &base, "-m", "left"]);
+            let left = jj(
+                &repo.workspace,
+                &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "@"],
+            );
+            jj_as_test_user(&repo.workspace, &["new", "-r", &base, "-m", "right"]);
+            let right = jj(
+                &repo.workspace,
+                &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "@"],
+            );
+            assert_ne!(left, right, "the fixture must have made two sibling commits");
+            // The state the two concurrent sets both change the bookmark from.
+            let before = jj(&repo.workspace, &["op", "log", "--no-graph", "-n", "1", "-T", "self.id()"]);
+            jj_as_test_user(&repo.workspace, &["bookmark", "set", "task-branch", "-r", &left]);
+            jj_as_test_user(
+                &repo.workspace,
+                &[
+                    "--ignore-working-copy",
+                    "bookmark",
+                    "set",
+                    "task-branch",
+                    "-r",
+                    &right,
+                    "--at-op",
+                    &before,
+                ],
+            );
+            let listed = jj(
+                &repo.workspace,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "-r",
+                    "bookmarks(exact:\"task-branch\")",
+                    "--no-graph",
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+            );
+            let mut named: Vec<&str> = listed.lines().collect();
+            named.sort_unstable();
+            assert_eq!(named.len(), 2, "the fixture must have conflicted the bookmark: {listed}");
+            assert!(
+                named.contains(&left.as_str()) && named.contains(&right.as_str()),
+                "the bookmark must name both commits: {listed}"
+            );
+
+            let err = jj_bookmark_tip(repo.dir(), "task-branch")
+                .await
+                .expect_err("a conflicted bookmark has no tip");
+            assert!(
+                err.contains("conflicted") && err.contains("task-branch"),
+                "the refusal must say what is wrong with the bookmark: {err}"
+            );
+            assert!(
+                !err.contains(&left) && !err.contains(&right),
+                "the refusal must not paste commit ids together: {err}"
             );
         }
 
