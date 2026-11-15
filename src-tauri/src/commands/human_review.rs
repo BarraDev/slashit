@@ -331,7 +331,16 @@ pub async fn get_approval_status(
     task_id: String,
 ) -> Result<ApprovalStatus, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    approval_status(&state, task_id).await
+    // The whole answer is bounded, both Git reads in it. A stopped read drops
+    // its queries, and each query's child is killed with it.
+    tokio::time::timeout(crate::commands::pr::COVERAGE_READ_BOUND, approval_status(&state, task_id))
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "Reading the approval's coverage took longer than {} seconds and was stopped.",
+                crate::commands::pr::COVERAGE_READ_BOUND.as_secs()
+            ))
+        })
 }
 
 pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> Result<ApprovalStatus, String> {
@@ -377,9 +386,10 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
         branch_tip.as_deref(),
         crate::commands::integration::repo_path_of(state, task.project_id).await,
     ) {
-        // Only a definite answer from Git says the approved commit is gone.
+        // Only a definite answer from Git says the approved commit is gone. The
+        // query is read-only and killed if the read is stopped (see get_approval_status).
         rewritten = matches!(
-            crate::worktree::restack::is_ancestor(std::path::Path::new(&repo), approved, tip).await,
+            crate::commands::pr::commit_is_ancestor_read_only(&repo, approved, tip).await,
             Ok(false)
         );
     }

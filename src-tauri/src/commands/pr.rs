@@ -9543,13 +9543,42 @@ pub(crate) async fn task_branch_tip_read_only(
 ) -> Result<Option<String>, String> {
     let branch = task_branch(state, task_id).await?;
     let working_dir = resolve_repository_dir(state, task_id).await?;
-    branch_tip_read_bounded(&working_dir, &branch, BRANCH_TIP_READ_BOUND).await
+    branch_tip_read_bounded(&working_dir, &branch, COVERAGE_READ_BOUND).await
 }
 
-/// How long one read of a branch's tip may run. The Human Review panel stops
-/// trusting a read after ten seconds; this ends the read first, and every Git
-/// or jj child it started with it.
-pub(crate) const BRANCH_TIP_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long one approval-coverage read may run in total: the branch's tip and
+/// the ancestry check after it. The Human Review panel stops trusting a read
+/// after ten seconds; this ends the read first, and every Git or jj child it
+/// started with it.
+pub(crate) const COVERAGE_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Whether `ancestor` is an ancestor of `descendant` in `working_dir`. Asked as
+/// a read-only query, so the child is killed if the caller stops waiting. Both
+/// ids are checked to be full commit ids first.
+pub(crate) async fn commit_is_ancestor_read_only(
+    working_dir: &str,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, String> {
+    if !crate::worktree::restack::is_full_object_id(ancestor) || !crate::worktree::restack::is_full_object_id(descendant) {
+        return Err(format!("{ancestor:?} and {descendant:?} must both be full object IDs to be compared"));
+    }
+    let output = crate::host_process::tokio_command(program("git"))
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(working_dir)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git could not tell whether {ancestor} is an ancestor of {descendant}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
 
 /// [`branch_tip_read_only`] within `bound`. Expiry drops the read, and each
 /// query it awaits is a [`run_query`], so the child in flight is killed too.
