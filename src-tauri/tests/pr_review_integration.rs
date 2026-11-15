@@ -118,9 +118,12 @@ impl MockEnv {
         // Mock `claude` — reads its prompt from stdin, as `claude -p` does,
         // then emits one stream-json `result` event so
         // extract_text_from_stream_json picks it up.
+        let (before, after) = claude_cli_contract();
         let claude_script = format!(
-            "#!/bin/sh\n{record}mktemp ./review-fix.XXXXXX > /dev/null\nprintf '%s\\n' '{{\"type\":\"result\",\"result\":{result:?}}}'\n",
+            "#!/bin/sh\n{before}{record}{after}mktemp ./review-fix.XXXXXX > /dev/null\nprintf '%s\\n' '{{\"type\":\"result\",\"result\":{result:?}}}'\n",
+            before = before,
             record = record_claude_run(&claude_log, &claude_prompts),
+            after = after,
             result = claude_result,
         );
         write_executable(&bin_dir.join("claude"), &claude_script);
@@ -269,6 +272,23 @@ fn record_claude_run(log: &Path, prompts: &Path) -> String {
          printf '\\n%s\\n' '{END_PROMPT}' >> {prompts:?}\n",
         template = dir.join("prompt.XXXXXX"),
     )
+}
+
+/// The Claude Code behavior the apply path depends on, for a stand-in `claude`.
+///
+/// Returns the shell that runs before the run's arguments are logged, and the
+/// shell that runs after its prompt is read. `--version` answers as a supported
+/// CLI. The `init` event reports the permission mode the run was launched with
+/// (`dontAsk` when no mode was passed), as Claude Code reports it. A run that
+/// was not launched with `--permission-mode auto` therefore reports a mode the
+/// Auto check refuses, so these fixtures test the contract instead of forcing
+/// a pass.
+#[cfg(unix)]
+fn claude_cli_contract() -> (String, String) {
+    let before = "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' '2.1.325 (Claude Code)'; exit 0; fi\n";
+    let after = "mode=dontAsk; prev=; for a in \"$@\"; do if [ \"$prev\" = \"--permission-mode\" ]; then mode=\"$a\"; fi; prev=\"$a\"; done\n\
+         printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"permissionMode\":\"'\"$mode\"'\"}'\n";
+    (before.to_string(), after.to_string())
 }
 
 /// Assert that no recorded `claude` argument carries `text`: prompts go to
@@ -433,11 +453,22 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
         gh_log
     );
 
-    // Claude got the full edit toolset on the apply path.
+    // The apply path runs under Auto with isolated customizations, and never
+    // with the bypass flag. Auto takes no pre-approved tool list.
     let claude_log = env.read_claude_log();
     assert!(
-        claude_log.contains("Read,Edit,Write,Bash"),
-        "apply path must enable Edit/Write/Bash tools, got:\n{}",
+        claude_log.contains("--permission-mode\nauto\n"),
+        "apply path must run under Auto, got:\n{}",
+        claude_log
+    );
+    assert!(
+        claude_log.contains("--setting-sources\nproject\n"),
+        "apply path must isolate customizations, got:\n{}",
+        claude_log
+    );
+    assert!(
+        !claude_log.contains("--dangerously-skip-permissions"),
+        "apply path must never bypass permissions, got:\n{}",
         claude_log
     );
     assert!(
@@ -1514,11 +1545,14 @@ fn install_obedient_claude(env: &MockEnv, clean: &str, injected: &str) {
         assert!(!json.contains('\''), "the fixture JSON is single-quoted in sh");
         json
     };
+    let (before, after) = claude_cli_contract();
     let script = format!(
-        "#!/bin/sh\n{record}\
+        "#!/bin/sh\n{before}{record}{after}\
          if grep -q OUTSIDER-INJECTION \"$run_prompt\"; then\n  printf '%s\\n' '{injected}'\n\
          else\n  printf '%s\\n' '{clean}'\nfi\n",
+        before = before,
         record = record_claude_run(&env.claude_log, &env.claude_prompts),
+        after = after,
         injected = line(injected),
         clean = line(clean),
     );
