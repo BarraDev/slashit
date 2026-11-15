@@ -9563,8 +9563,12 @@ pub(crate) async fn commit_is_ancestor_read_only(
     if !crate::worktree::restack::is_full_object_id(ancestor) || !crate::worktree::restack::is_full_object_id(descendant) {
         return Err(format!("{ancestor:?} and {descendant:?} must both be full object IDs to be compared"));
     }
+    // A non-colocated jj repository has no `.git` for Git to find here, so the
+    // query names the Git store behind it, as the other reads of it do.
+    let mut args: Vec<String> = jj_git_dir_arg(working_dir).await?.into_iter().collect();
+    args.extend(["merge-base", "--is-ancestor", ancestor, descendant].map(String::from));
     let output = crate::host_process::tokio_command(program("git"))
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .args(&args)
         .current_dir(working_dir)
         .kill_on_drop(true)
         .output()
@@ -13025,6 +13029,26 @@ mod tests {
             let repo = NonColocatedJj::new("task-branch");
             let tip = branch_tip_read_only(repo.dir(), "task-branch").await.expect("the tip is read");
             assert_eq!(tip.as_deref(), Some(repo.task_sha.as_str()));
+        }
+
+        /// The ancestry behind the Human Review `rewritten` flag reads the Git store
+        /// of a non-colocated jj repository. Plain `git` finds no repository there,
+        /// and an unanswered question must be an error, never "not an ancestor".
+        #[tokio::test]
+        async fn commit_ancestry_reads_the_store_of_a_non_colocated_jj_repository() {
+            let repo = NonColocatedJj::new("task-branch");
+            let approved = repo.task_sha.clone();
+
+            jj_as_test_user(&repo.workspace, &["new", "-m", "descendant"]);
+            let descendant = jj(&repo.workspace, &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "@"]);
+            assert_eq!(commit_is_ancestor_read_only(repo.dir(), &approved, &descendant).await, Ok(true));
+
+            jj_as_test_user(&repo.workspace, &["new", "root()", "-m", "replacement"]);
+            let replacement = jj(&repo.workspace, &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "@"]);
+            assert_eq!(commit_is_ancestor_read_only(repo.dir(), &approved, &replacement).await, Ok(false));
+
+            let absent = "0".repeat(40);
+            assert!(commit_is_ancestor_read_only(repo.dir(), &approved, &absent).await.is_err());
         }
 
         /// CR1: a Git repository nested inside an unrelated jj workspace is read

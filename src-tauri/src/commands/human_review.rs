@@ -337,8 +337,9 @@ pub struct ApprovalStatus {
     pub approved_tip: Option<String>,
     /// The branch's tip now: the commit approving again would cover.
     pub branch_tip: Option<String>,
-    /// For `Moved`: the approved commit is no longer on the branch.
-    pub rewritten: bool,
+    /// For `Moved`: whether the approved commit is no longer on the branch. `None`
+    /// when Git could not answer, which is not the same as a branch that only moved on.
+    pub rewritten: Option<bool>,
     /// The published pull request's head, when the Task has a pull request.
     /// It may differ from `approved_tip` even while `coverage` is `Current`,
     /// because another clone can move the pull request without moving the branch.
@@ -380,7 +381,7 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
         coverage,
         approved_tip: approved_tip.clone(),
         branch_tip: None,
-        rewritten: false,
+        rewritten: None,
         reason: None,
         published: published.clone(),
     };
@@ -407,19 +408,20 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
         crate::domain::task::ApprovalBindingRefusal::Moved { .. } => ApprovalCoverage::Moved,
         crate::domain::task::ApprovalBindingRefusal::BranchMissing { .. } => ApprovalCoverage::BranchMissing,
     };
-    let mut rewritten = false;
+    let mut rewritten = None;
     if let (ApprovalCoverage::Moved, Some(approved), Some(tip), Ok(repo)) = (
         coverage,
         approved_tip.as_deref(),
         branch_tip.as_deref(),
         crate::commands::integration::repo_path_of(state, task.project_id).await,
     ) {
-        // Only a definite answer from Git says the approved commit is gone. The
-        // query is read-only and killed if the read is stopped (see get_approval_status).
-        rewritten = matches!(
-            crate::commands::pr::commit_is_ancestor_read_only(&repo, approved, tip).await,
-            Ok(false)
-        );
+        // Only a definite answer from Git says whether the approved commit is
+        // gone; a failed query leaves it unknown. The query is read-only and
+        // killed if the read is stopped (see get_approval_status).
+        rewritten = crate::commands::pr::commit_is_ancestor_read_only(&repo, approved, tip)
+            .await
+            .ok()
+            .map(|is_ancestor| !is_ancestor);
     }
     Ok(ApprovalStatus { branch_tip, rewritten, reason: Some(refusal.to_string()), ..none(coverage) })
 }
@@ -2019,6 +2021,46 @@ mod tests {
         assert_eq!(task.human_review.approved_tip(), None);
     }
 
+    /// A Task that never had a branch can be moved into Human Review, approved and
+    /// linked to a pull request, each by the command that does it. Its approval then
+    /// names no commit, and the status still reports the pull request it is linked to.
+    #[tokio::test]
+    async fn a_branchless_task_linked_to_a_pull_request_has_no_commit_to_cover_it() {
+        use tauri::Manager;
+        let (tmp, state) = test_state().await;
+        let (_repo, project_id, _base) = repo_and_project(&state, &tmp).await;
+        let mut task = create_test_task_full("never run", project_id, TaskStatus::Backlog, 0);
+        task.branch_name = None;
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+
+        crate::commands::task::set_task_status(&state, task_id, TaskStatus::HumanReview, None)
+            .await
+            .expect("a Backlog task can be moved into Human Review");
+        approve_shown(&state, task_id, false).await.expect("approved without a branch");
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        crate::commands::task::link_pr(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            "https://github.com/BarraDev/slashit/pull/7".to_string(),
+        )
+        .await
+        .expect("a pull request can be linked by URL");
+
+        let state = app.state::<crate::AppState>();
+        let linked = on_disk(&state, project_id, task_id);
+        assert!(linked.human_review.is_approved(), "the approval is recorded");
+        assert_eq!(linked.human_review.approved_tip(), None, "no commit was bound to it");
+        let status = approval_status(&state, task_id).await.expect("the status is read");
+        assert_eq!(status.coverage, ApprovalCoverage::NotApplicable);
+        assert_eq!(status.approved_tip, None);
+        assert!(status.published.is_some(), "the linked pull request is reported, not hidden");
+    }
+
     // ---- Approval is bound to the commit that was approved ----
 
     /// A pull request pushed to by another clone, seen the way the status poll
@@ -2209,7 +2251,7 @@ mod tests {
         let later = local.advance();
         let status = approval_status(&local.state, local.task_id).await.unwrap();
         assert_eq!(status.coverage, ApprovalCoverage::Moved);
-        assert!(!status.rewritten);
+        assert_eq!(status.rewritten, Some(false));
         assert_eq!(status.branch_tip.as_deref(), Some(later.as_str()));
         assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()));
 
@@ -2245,7 +2287,7 @@ mod tests {
         assert_eq!(status.coverage, ApprovalCoverage::Moved);
         assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()), "the approval covers A, and says so");
         assert_eq!(status.branch_tip.as_deref(), Some(moved.as_str()), "the branch is at B, and that is reported");
-        assert!(!status.rewritten, "A is still on the branch");
+        assert_eq!(status.rewritten, Some(false), "A is still on the branch");
         let reason = status.reason.clone().unwrap_or_default();
         assert!(reason.contains(&approved[..12]) && reason.contains(&moved[..12]), "{reason}");
 
@@ -2346,7 +2388,7 @@ mod tests {
         local.approve().await;
         let rewritten = local.rewrite();
         let status = approval_status(&local.state, local.task_id).await.unwrap();
-        assert_eq!((status.coverage, status.rewritten), (ApprovalCoverage::Moved, true));
+        assert_eq!((status.coverage, status.rewritten), (ApprovalCoverage::Moved, Some(true)));
         approve_again(&local.state, local.task_id, &rewritten).await.expect("approved");
     }
 
@@ -2442,7 +2484,7 @@ mod tests {
         assert_eq!(status.coverage, ApprovalCoverage::Moved);
         assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()), "the approval covers what it recorded");
         assert_eq!(status.branch_tip.as_deref(), Some(moved.as_str()), "the branch is where the bookmark is now");
-        assert!(!status.rewritten, "the approved commit is still on the branch");
+        assert_eq!(status.rewritten, Some(false), "the approved commit is still on the branch");
         let reason = status.reason.clone().unwrap_or_default();
         assert!(reason.contains(&approved[..12]) && reason.contains(&moved[..12]), "{reason}");
         assert_eq!(

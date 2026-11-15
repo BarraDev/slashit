@@ -351,6 +351,9 @@ enum CoverageView {
     PublishedMoved,
     /// The branch is at the approved commit, but the published pull request's head is not known.
     PublishedUnverified,
+    /// The Task has no branch, so the approval names no commit, and a pull request is linked
+    /// to it. The approval cannot be compared with that pull request's head.
+    NoCommit,
 }
 
 fn coverage_view(status: Option<&ApprovalStatus>, has_branch: bool, approved_now: Option<&str>) -> CoverageView {
@@ -361,8 +364,12 @@ fn coverage_view(status: Option<&ApprovalStatus>, has_branch: bool, approved_now
     }
     match status.map(|s| s.coverage) {
         Some(ApprovalCoverage::Current) => status.map_or(CoverageView::Current, |s| published_view(s, approved_now)),
-        // Only a task without a branch has nothing to bind the approval to.
-        Some(ApprovalCoverage::NotApplicable) if !has_branch => CoverageView::Current,
+        // Only a task without a branch has nothing to bind the approval to. Its
+        // approval covers no pull request, so a linked one is never current for it.
+        Some(ApprovalCoverage::NotApplicable) if !has_branch => match status.and_then(|s| s.published.as_ref()) {
+            Some(_) => CoverageView::NoCommit,
+            None => CoverageView::Current,
+        },
         Some(
             ApprovalCoverage::Moved | ApprovalCoverage::Unrecorded | ApprovalCoverage::BranchMissing,
         ) => CoverageView::Stale,
@@ -398,6 +405,18 @@ fn published_moved_heading(approved: Option<&str>, head: Option<&str>) -> String
     }
 }
 
+/// The heading for an approval that names no commit while a pull request is
+/// linked. The approval is real, but it cannot show what the pull request holds.
+fn no_commit_heading(approved: Option<&str>) -> String {
+    match approved {
+        Some(approved) => format!(
+            "Approved for {}, but the task has no branch, so the published pull request is not covered",
+            short(approved)
+        ),
+        None => "Approved, but no commit was recorded, so the published pull request is not covered".to_string(),
+    }
+}
+
 /// The heading when the published pull request's head is not known.
 fn published_unverified_heading(approved: Option<&str>) -> String {
     match approved {
@@ -413,12 +432,19 @@ fn published_detail(status: Option<&ApprovalStatus>, approved: Option<&str>) -> 
     let published = status?.published.as_ref()?;
     match published.head.as_deref() {
         Some(head) => {
-            let approved = approved.map_or("the approved commit".to_string(), |a| short(a).to_string());
             let at = published.observed_at.as_deref().and_then(read_time).unwrap_or_else(|| "an unknown time".to_string());
-            Some(format!(
-                "Changes after {approved} require review in the pull request. GitHub reported its head as {} at {at}.",
-                short(head)
-            ))
+            Some(match approved {
+                Some(approved) => format!(
+                    "Changes after {} require review in the pull request. GitHub reported its head as {} at {at}.",
+                    short(approved),
+                    short(head)
+                ),
+                // Without a commit there is nothing for the head to be compared with.
+                None => format!(
+                    "GitHub reported its head as {} at {at}. This approval names no commit to compare it with.",
+                    short(head)
+                ),
+            })
         }
         None => published.unverified.clone(),
     }
@@ -1143,6 +1169,7 @@ pub fn HumanReviewPanel(
                         CoverageView::Unknown => "unknown",
                         CoverageView::PublishedMoved => "published-moved",
                         CoverageView::PublishedUnverified => "published-unverified",
+                        CoverageView::NoCommit => "no-commit",
                     }
                     class=move || if approval_view.get() == CoverageView::Current {
                         "flex items-center gap-2 text-sm font-medium text-emerald-300"
@@ -1177,12 +1204,13 @@ pub fn HumanReviewPanel(
                                 published_moved_heading(tip.as_deref(), head)
                             }),
                             CoverageView::PublishedUnverified => published_unverified_heading(tip.as_deref()),
+                            CoverageView::NoCommit => no_commit_heading(tip.as_deref()),
                             CoverageView::Current => approved_label(tip.as_deref()),
                         }
                     }}
                 </p>
                 // The published pull request, when the branch alone would not show it.
-                {move || matches!(approval_view.get(), CoverageView::PublishedMoved | CoverageView::PublishedUnverified)
+                {move || matches!(approval_view.get(), CoverageView::PublishedMoved | CoverageView::PublishedUnverified | CoverageView::NoCommit)
                     .then(|| {
                         let approved = task.with(|t| t.as_ref().and_then(|t| t.human_review.approved_tip().map(str::to_string)));
                         coverage.with(|c| published_detail(c.as_ref(), approved.as_deref()))
@@ -1635,7 +1663,7 @@ mod tests {
             coverage,
             approved_tip: None,
             branch_tip: branch_tip.map(str::to_string),
-            rewritten: false,
+            rewritten: None,
             reason: None,
             published: None,
         }
@@ -1900,6 +1928,54 @@ mod tests {
         // No pull request means the branch alone decides, as before.
         let without_pr = ApprovalStatus { approved_tip: Some(approved.clone()), ..answer(ApprovalCoverage::Current, Some(&approved)) };
         assert_eq!(view_of(&without_pr), CoverageView::Current);
+    }
+
+    /// A Task without a branch has no commit for its approval to name. A linked
+    /// pull request cannot be compared with it, whether its head is known or not,
+    /// so the approval is never current for it. With no pull request, the approval
+    /// is the whole answer, as before.
+    #[test]
+    fn a_branchless_approval_never_claims_a_linked_pull_request_is_covered() {
+        use crate::services::human_review_service::PublishedHead;
+        let known = PublishedHead {
+            head: Some("b".repeat(40)),
+            observed_at: Some("2026-11-15T11:22:57.123Z".to_string()),
+            unverified: None,
+        };
+        let unknown = PublishedHead { head: None, observed_at: None, unverified: Some("GitHub could not be asked.".into()) };
+        let branchless = |published: Option<PublishedHead>| ApprovalStatus {
+            published,
+            ..answer(ApprovalCoverage::NotApplicable, None)
+        };
+        assert_eq!(coverage_view(Some(&branchless(None)), false, None), CoverageView::Current, "no pull request");
+        assert_eq!(coverage_view(Some(&branchless(Some(known))), false, None), CoverageView::NoCommit);
+        assert_eq!(coverage_view(Some(&branchless(Some(unknown))), false, None), CoverageView::NoCommit);
+    }
+
+    /// The copy for an approval with no commit beside a linked pull request says
+    /// what is missing, and never that the approval is current. The head is named
+    /// as read, without comparing it to a commit the approval never recorded.
+    #[test]
+    fn a_branchless_approval_wording_names_what_is_missing() {
+        let heading = no_commit_heading(None);
+        assert!(heading.contains("not covered") && !heading.contains("current"), "{heading}");
+        let approved = "a".repeat(40);
+        let named = no_commit_heading(Some(&approved));
+        assert!(named.contains(&approved[..12]) && named.contains("no branch"), "{named}");
+
+        let head = "b".repeat(40);
+        let read = ApprovalStatus {
+            published: Some(crate::services::human_review_service::PublishedHead {
+                head: Some(head.clone()),
+                observed_at: Some("2026-11-15T11:22:57.123Z".to_string()),
+                unverified: None,
+            }),
+            ..answer(ApprovalCoverage::NotApplicable, None)
+        };
+        let detail = published_detail(Some(&read), None).expect("a read head is described");
+        assert!(detail.contains(&head[..12]) && detail.contains("11:22 UTC"), "{detail}");
+        assert!(detail.contains("names no commit"), "{detail}");
+        assert!(!detail.contains("Changes after"), "{detail}");
     }
 
     #[test]

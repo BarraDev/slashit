@@ -144,7 +144,9 @@ pub struct ApprovalStatus {
     pub coverage: ApprovalCoverage,
     pub approved_tip: Option<String>,
     pub branch_tip: Option<String>,
-    pub rewritten: bool,
+    /// For a moved branch: whether the approved commit was replaced. `None` when
+    /// Git could not answer.
+    pub rewritten: Option<bool>,
     pub reason: Option<String>,
     pub published: Option<PublishedHead>,
 }

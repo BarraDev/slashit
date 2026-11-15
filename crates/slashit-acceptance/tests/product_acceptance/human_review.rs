@@ -127,6 +127,25 @@ fn review_entries(task: &Value) -> Vec<(String, Option<String>)> {
         .unwrap_or_default()
 }
 
+/// Each decision with the commit it recorded, oldest first: the approval record
+/// as the product persists it.
+fn approval_record(task: &Value) -> Vec<(String, Option<String>)> {
+    task.pointer("/human_review/entries")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.get("decision").and_then(Value::as_str).unwrap_or_default().to_string(),
+                        e.get("approved_tip").and_then(Value::as_str).map(str::to_string),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// What the task file holds for one task's review.
 pub(super) struct PersistedReview {
     pub(super) status: String,
@@ -1539,6 +1558,7 @@ async fn unverified_while_unreadable(driver: &WebDriver) -> Result<()> {
 
 const DRAWER_PR_REFRESH: &str = "[data-testid=\"task-drawer-pr-refresh\"]";
 const HR_PUBLISHED: &str = "[data-testid=\"human-review-published\"]";
+const HR_STALE_BOX: &str = "[data-testid=\"human-review-approval-stale\"]";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pull_request_pushed_to_by_another_clone_is_not_shown_as_covered_by_the_approval() {
@@ -1576,6 +1596,10 @@ async fn published_head_moved(
     let task = read_task(driver, &executed).await?;
     let branch = branch_of(&task)?;
     let approved = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    let record_before = approval_record(&task);
+    if record_before != [("approved".to_string(), Some(approved.clone()))] {
+        bail!("the approval does not record the approved commit before the move: {record_before:?}");
+    }
 
     open_reviewed_drawer(driver, &executed).await?;
     await_data_approval(driver, "current", "the approval of a pull request opened at the approved commit").await?;
@@ -1607,9 +1631,30 @@ async fn published_head_moved(
     if class.contains("emerald") {
         bail!("the approval is styled as current while the pull request is at another commit: {shown}");
     }
-    await_text(driver, HR_PUBLISHED, |t| t.contains("require review"), "the note on changes after the approved commit").await?;
-    if count(driver, HR_APPROVE_AGAIN).await? != 0 {
-        bail!("a renewal is offered after the pull request was opened");
+    await_text(
+        driver,
+        HR_PUBLISHED,
+        |t| t.contains("require review") && t.contains(&moved[..12]) && t.contains(&approved[..12]),
+        "the note that changes after the approved commit need review, naming both commits",
+    )
+    .await?;
+
+    // The state above is settled before these are read. Renewal is offered only
+    // in the stale view, so both the renewal control and the box that holds it
+    // must be absent, while the branch and the approval record stay as they were.
+    let (renewals, stale_boxes) = (count(driver, HR_APPROVE_AGAIN).await?, count(driver, HR_STALE_BOX).await?);
+    if renewals != 0 || stale_boxes != 0 {
+        bail!(
+            "the stale approval box is shown while the pull request moved, \
+             with {renewals} renewal control(s) and {stale_boxes} stale box(es)"
+        );
+    }
+    if repository.branch_tip(&branch)?.as_deref() != Some(approved.as_str()) {
+        bail!("the Task's own branch moved while only the pull request should have");
+    }
+    let record_after = approval_record(&read_task(driver, &executed).await?);
+    if record_after != record_before {
+        bail!("the approval record changed while the pull request moved: {record_before:?} -> {record_after:?}");
     }
     capture_evidence(driver, &format!("F-published-head-{}-approval-{}", &moved[..12], &approved[..12])).await?;
 
