@@ -1911,6 +1911,55 @@ mod tests {
         assert_eq!(done.status, TaskStatus::Done);
     }
 
+    /// The stale-approval requirement, proven end to end: approve commit A,
+    /// let the branch move to B outside SlashIt, and record what the state
+    /// reports. The approval is reported stale, named by both commits, and an
+    /// earlier approval stays in the history but is never shown as current:
+    /// when the branch moves again, it is the later approval that is reported.
+    #[tokio::test]
+    async fn an_approval_older_than_the_branch_is_reported_stale_with_both_commits() {
+        let local = local_project().await;
+        let shown = local.tip();
+        local.approve().await;
+        let approved = shown.clone();
+
+        // The branch moved outside SlashIt: no task record changed.
+        let moved = local.advance();
+        assert_ne!(approved, moved);
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::Moved);
+        assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()), "the approval covers A, and says so");
+        assert_eq!(status.branch_tip.as_deref(), Some(moved.as_str()), "the branch is at B, and that is reported");
+        assert_eq!(status.rewritten, false, "A is still on the branch");
+        let reason = status.reason.clone().unwrap_or_default();
+        assert!(reason.contains(&approved[..12]) && reason.contains(&moved[..12]), "{reason}");
+
+        // Approving the branch as it is now makes that approval the current
+        // one; the earlier approval stays in the history.
+        approve_again(&local.state, local.task_id, &moved).await.expect("approved");
+        let task = local.on_disk();
+        assert_eq!(task.human_review.approved_tip(), Some(moved.as_str()), "the renewed approval is the current one");
+        assert!(
+            task.human_review.entries.iter().any(|e| e.approved_tip.as_deref() == Some(approved.as_str())),
+            "the earlier approval is kept in the history"
+        );
+        assert_eq!(approval_status(&local.state, local.task_id).await.unwrap().coverage, ApprovalCoverage::Current);
+
+        // The branch moves again: the renewed approval is the one reported
+        // stale; the first is never shown as current.
+        std::fs::write(local.worktree.join("yet_later.txt"), "yet later\n").unwrap();
+        git(&local.worktree, &["add", "."]);
+        git(&local.worktree, &["commit", "-q", "-m", "moved again"]);
+        let later = local.tip();
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::Moved);
+        assert_eq!(status.approved_tip.as_deref(), Some(moved.as_str()));
+        assert_ne!(status.approved_tip.as_deref(), Some(approved.as_str()), "an earlier approval is never the current one");
+        assert_eq!(status.branch_tip.as_deref(), Some(later.as_str()));
+        let reason = status.reason.clone().unwrap_or_default();
+        assert!(reason.contains(&moved[..12]) && reason.contains(&later[..12]), "{reason}");
+    }
+
     /// The race the drawer can lose: the person is shown one commit, the
     /// branch moves to another, and then they press Approve. The approval
     /// must not record the commit they never saw, and the next approval must

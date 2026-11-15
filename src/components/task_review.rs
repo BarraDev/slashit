@@ -12,6 +12,8 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use uuid::Uuid;
+use wasm_bindgen::prelude::Closure;
+use wasm_bindgen::JsCast;
 
 use crate::components::attention::Deliveries;
 use crate::components::close_without_merge_dialog::close_consequences;
@@ -25,6 +27,12 @@ use crate::services::human_review_service::{
 
 /// The most findings listed before the rest are summarised as a count.
 const VISIBLE_FINDINGS: usize = 8;
+
+/// How often the panel asks again whether the approval still covers the
+/// branch. A branch that moves outside SlashIt changes no task record, so
+/// without this poll a stale approval would keep looking current until the
+/// person tried something.
+const COVERAGE_POLL_MS: i32 = 5_000;
 
 /// Where the pull request for approved changes stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +277,34 @@ fn approval_ready(availability_known: bool, task_has_branch: Option<bool>, tip_s
         }
 }
 
+/// The first twelve characters of a commit, as the drawer names commits.
+fn short(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
+}
+
+/// What the approved line says: the exact commit the approval covers, so an
+/// approval is never shown without it. When the record carries no commit (an
+/// approval made before this was recorded, or a task without a branch) it
+/// says only that it was approved.
+fn approved_label(approved_tip: Option<&str>) -> String {
+    match approved_tip {
+        Some(tip) => format!("Approved for {}", short(tip)),
+        None => "Approved".to_string(),
+    }
+}
+
+/// The stale heading: the approval covered one commit and the branch is now
+/// at another, so the approval is stale — never left looking current. When
+/// either commit is not known, it says only that the branch changed.
+fn stale_heading(approved: Option<&str>, current: Option<&str>) -> String {
+    match (approved, current) {
+        (Some(approved), Some(current)) => {
+            format!("Approved for {}; branch now at {}; stale", short(approved), short(current))
+        }
+        _ => "The branch is not what you approved".to_string(),
+    }
+}
+
 /// The decision section for a task in Human Review, and what became of an
 /// approval once the task has moved on to its pull request.
 #[component]
@@ -320,14 +356,26 @@ pub fn HumanReviewPanel(
             }
             match answer {
                 Ok(status) => {
-                    coverage.try_set(Some(status));
-                    coverage_error.try_set(None);
+                    // Set only what changed: the poll asks on a cadence, and
+                    // an unchanged answer must not rebuild the panel (its
+                    // controls with it) under the person's hand.
+                    if coverage.get_untracked().as_ref() != Some(&status) {
+                        coverage.try_set(Some(status));
+                        coverage_error.try_set(None);
+                    }
                 }
                 // Without a current answer there is no commit to approve, so the
                 // earlier one must not keep the controls enabled.
                 Err(e) => {
-                    coverage.try_set(None);
-                    coverage_error.try_set(Some(format!("The branch's current commit could not be read, so it cannot be approved yet: {e}")));
+                    let message = format!(
+                        "The branch's current commit could not be read, so it cannot be approved yet: {e}"
+                    );
+                    let unchanged = coverage.get_untracked().is_none()
+                        && coverage_error.get_untracked().as_deref() == Some(message.as_str());
+                    if !unchanged {
+                        coverage.try_set(None);
+                        coverage_error.try_set(Some(message));
+                    }
                 }
             }
         });
@@ -336,6 +384,27 @@ pub fn HumanReviewPanel(
         task.track();
         ask_coverage();
     });
+    // The branch can move outside SlashIt while the panel is up, and that
+    // changes no task record, so the answer above would go stale: an older
+    // approval would keep looking current until the person tried something.
+    // Asked on a cadence while the panel is shown, a moved branch is flagged
+    // on its own, and a decided panel learns the branch's commit again.
+    {
+        let ask = Closure::wrap(Box::new(ask_coverage) as Box<dyn Fn()>);
+        let interval = web_sys::window().and_then(|w| {
+            w.set_interval_with_callback_and_timeout_and_arguments_0(
+                ask.as_ref().unchecked_ref(),
+                COVERAGE_POLL_MS,
+            )
+            .ok()
+        });
+        ask.forget();
+        on_cleanup(move || {
+            if let (Some(w), Some(id)) = (web_sys::window(), interval) {
+                w.clear_interval_with_handle(id);
+            }
+        });
+    }
     // The branch moved while the Changes tab shows another commit: ask the tab to
     // follow it. Keyed on the branch's commit alone, so a failed reload does not
     // trigger another one.
@@ -803,13 +872,18 @@ pub fn HumanReviewPanel(
                 </p>
             </Show>
 
-            // Approved: the decision, then delivery on its own line.
+            // Approved: the decision, then delivery on its own line. The
+            // commit the approval covers is named, so the decision always
+            // shows what it was about.
             <Show when=move || decision.get() == Some(HumanReviewDecision::Approved)>
                 <p data-testid="human-review-approved" class="flex items-center gap-2 text-sm font-medium text-emerald-300">
                     <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
                     </svg>
-                    "Approved"
+                    {move || {
+                        let tip = task.with(|t| t.as_ref().and_then(move |t| t.human_review.approved_tip().map(str::to_string)));
+                        approved_label(tip.as_deref())
+                    }}
                 </p>
                 {move || coverage.get().filter(|c| !matches!(c.coverage, ApprovalCoverage::Current | ApprovalCoverage::NotApplicable)).map(|c| {
                     let blocker = task.with(|t| t.as_ref().and_then(renewal_blocker));
@@ -819,7 +893,7 @@ pub fn HumanReviewPanel(
                     let reason = c.reason.clone().unwrap_or_default();
                     view! {
                         <div data-testid="human-review-approval-stale" data-coverage=format!("{:?}", c.coverage) class="rounded-md border border-amber-500/20 bg-amber-500/[0.06] p-2 space-y-2">
-                            <p class="text-xs font-semibold text-amber-200">"The branch is not what you approved"</p>
+                            <p class="text-xs font-semibold text-amber-200">{stale_heading(c.approved_tip.as_deref(), c.branch_tip.as_deref())}</p>
                             <p class="text-xs text-white/70 whitespace-pre-wrap break-words">{reason}</p>
                             {blocker.map(|why| view! {
                                 <p data-testid="human-review-approve-again-unavailable" class="text-xs text-white/50">{why}</p>
@@ -1303,6 +1377,31 @@ mod tests {
         assert!(approval_ready(true, Some(true), true));
         // A task without a branch has no commit to show.
         assert!(approval_ready(true, Some(false), false));
+    }
+
+    /// An approval is never shown without the exact commit it covers.
+    #[test]
+    fn the_approved_line_names_the_commit_the_approval_covers() {
+        let tip = "a".repeat(40);
+        assert_eq!(approved_label(Some(&tip)), format!("Approved for {}", &tip[..12]));
+        // An approval recorded before commits were kept, or one made without a
+        // branch, has no commit to name and still reads as an approval.
+        assert_eq!(approved_label(None), "Approved");
+    }
+
+    /// A stale approval is never displayed as current: both commits are named
+    /// and it is said to be stale.
+    #[test]
+    fn a_stale_approval_names_both_commits_and_says_it_is_stale() {
+        let (approved, current) = ("a".repeat(40), "b".repeat(40));
+        let heading = stale_heading(Some(&approved), Some(&current));
+        assert!(heading.contains("stale"), "{heading}");
+        assert!(heading.contains(&approved[..12]), "{heading}");
+        assert!(heading.contains(&current[..12]), "{heading}");
+        // Without either commit the heading says only that the branch changed.
+        assert_eq!(stale_heading(Some(&approved), None), "The branch is not what you approved");
+        assert_eq!(stale_heading(None, Some(&current)), "The branch is not what you approved");
+        assert_eq!(stale_heading(None, None), "The branch is not what you approved");
     }
 
     #[test]

@@ -1232,23 +1232,24 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
         bail!("the primary diff is not the committed content: {primary}");
     }
 
-    // The branch moves after the tab was read. Approving is refused by the
-    // backend; once the panel knows the new commit, it also refuses while the
-    // tab still shows the old one, and reloads the tab.
+    // The branch moves after the tab was read. The panel asks the branch's
+    // commit on a cadence, so it learns the move on its own: the commit it
+    // offers becomes the moved one, and the Changes tab follows it without
+    // anyone reopening it. Approval waits for the picture on screen, so what
+    // is approved is the branch as it is now, never the picture read before
+    // the move.
     git(
         &executed.worktree_path,
         &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "moved"],
     )?;
     let moved = repository.branch_tip(&branch)?.context("the task branch is missing")?;
-    await_approval(driver, HR_APPROVE, "the approve action before the move is read").await?;
-    click(driver, HR_APPROVE, "Approve while the branch has moved").await?;
-    ui::visible(driver, HR_ERROR).await.context("a moved branch was approved or silently ignored")?;
     await_text(driver, HR_CURRENT_COMMIT, |t| t.contains(&moved), "the panel to read the moved branch").await?;
     // Nobody reopens the tab: it follows the branch, and approval waits for it.
     await_text(driver, REVIEW_COMMIT, |t| t == &moved[..12], "the Changes tab to follow the branch").await?;
     assert_not_offered(driver, HR_APPROVED, "an approval").await?;
 
     // Decided on what is shown now.
+    await_approval(driver, HR_APPROVE, "the approve action on the moved branch").await?;
     click(driver, HR_APPROVE, "Approve the commit on screen").await?;
     ui::visible(driver, HR_APPROVED).await.context("the drawer does not say Approved")?;
     let task = read_task(driver, &executed).await?;
