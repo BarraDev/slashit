@@ -431,7 +431,7 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 | Project Conversation | `domain::conversation::Conversation`, private storage in `commands/conversation.rs` and `config::Storage` |
 | Coordinator Task capabilities | `domain::conversation::ProjectAction`, executed by `conversation_actions.rs` through `lifecycle::create` and `lifecycle::record_if_changed` |
 | Task Checkout | `Task.worktree_path`, `branch_name`, `base_commit`, `branch_origin` (`domain::BranchOrigin`); `worktree::WorktreeManager` |
-| Base of a Task's branch | `worktree::default_base`, `Project.base` (`domain::ProjectBase`), `worktree::project_base` |
+| Base of a Task's branch | `worktree::resolve_default_base`, `Project.base` (`domain::ProjectBase`), `worktree::project_base` |
 | Repository readiness and setup | `worktree::readiness`, `worktree::remote_head`, `worktree::vcs_init`; `commands/repository_setup.rs` |
 | Local delivery and integration | `commands/human_review.rs`, `commands/integration.rs`, `worktree::integration`, `domain::LocalIntegration` (`Task.local_integration`) |
 | Workspace root as agent context | `TaskExecutor::resolve_workspace_launch` in `queue/executor.rs` |

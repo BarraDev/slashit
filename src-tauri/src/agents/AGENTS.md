@@ -1,6 +1,6 @@
 # AGENTS.md (src-tauri/src/agents)
 
-Claude Code and OpenCode coding-run execution. The Agent Communication Protocol client lives in `acp/`, not here.
+Claude Code and OpenCode coding-run execution. The Agent Communication Protocol client lives in `src-tauri/src/acp/`, not here.
 
 ## Architecture
 
@@ -33,8 +33,8 @@ the security boundary of the run:
   (`commands/pr.rs`) and the executor's AI review leg.
 - `ToolAccess::Full` is for agents that edit code: the coding agent, the
   approved PR apply agent and the review-fix agent. They have Bash.
-- `permission_mode: Some("auto")` is the policy for the coding Worker and the
-  review-fix agent. It passes `--permission-mode auto` with no
+- `permission_mode: Some("auto")` is the policy for the coding Worker, the
+  review-fix agent and the approved PR apply agent. It passes `--permission-mode auto` with no
   `--allowedTools` list, so the provider's classifier reviews each call. A
   Claude Code older than `AUTO_MIN_VERSION` is refused before launch
   (`auto_unsupported_reason`); that check is a precondition only.
@@ -45,11 +45,11 @@ the security boundary of the run:
   and the model can retry a denied call many times. The stdout reader
   (`auto_mode_mismatch`) therefore stops an Auto run whose `init` does not
   report `"auto"`, or reports no mode, and `wait()` returns that reason.
-- `permission_mode: None` (bypass) remains only for the approved PR apply
-  agent, which still needs review. An Auto run never falls back to it.
+- `permission_mode: None` (bypass) is not used by any production run; only
+  test fixtures build it. An Auto run never falls back to it.
 - The coding Worker's and the review-fix agent's `--model` is `Task::configured_model()` (none for the provider default, which the provider chooses and which is not necessarily economical), never a reported model (`last_observed_model`). An alias is the model requested, not a resolved one. A review-fix agent that cannot take the Task's model, an OpenCode `provider/model`, is refused rather than run on Claude's default (`fix_agent_model`). The AI reviewer's `--model` is the Task's `reviewer_model`, copied onto the run's `WorkerHandoff` at the run's start, so a later edit never reaches a run in progress; with no reviewer model the automatic review does not start and nothing falls back to the CLI default (`spawn_review`, `current_run_reviewer`). A review that did not run is recorded as `AiReviewSkipped` (no reviewer, no worktree, Manual) with no `QaSignoff`, and a review whose changes could not be read as `AiReviewFailed` with no signoff. A reviewer that ran and failed records `AiReviewFailed` with a `QaStatus::Rejected` signoff, because it approved nothing. A skip never reads as a rejection. The verdict and findings come from the reviewer's `result` answer, not the streamed output, which repeats it; a run with no usable answer fails.
-- `isolate_customizations: true` for the coding Worker and the review-fix
-  agent: `--setting-sources project` (the user's settings, hooks, plugins and
+- `isolate_customizations: true` for the coding Worker, the review-fix agent
+  and the approved PR apply agent (when it can edit): `--setting-sources project` (the user's settings, hooks, plugins and
   `env` are not read), `--settings <path>` (every hook is off,
   `DISABLE_TELEMETRY` is `1`, the `PINNED_ENV` names are pinned to the
   child's values or empty, and the `HELPER_SETTINGS` commands are pinned to
@@ -76,7 +76,6 @@ the security boundary of the run:
   - `PINNED_ENV` covers endpoints, proxies, CA bundles, loaders, `PATH`, all
     provider selectors and skip switches, and `CLOUD_ML_REGION`. Not pinned:
     git's inlets, `HOME`, credential names, `PYTHON*`.
-  - The PR apply agent still runs with bypass (`permission_mode: None`).
   - The Auto classifier verdict and real-CLI cancellation have not been
     exercised in a live run. Both must be confirmed before unattended use.
   - Built-in CLI plugins load, and the CLI's own telemetry and network
