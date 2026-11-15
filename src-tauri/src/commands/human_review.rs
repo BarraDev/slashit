@@ -177,6 +177,135 @@ pub enum ApprovalCoverage {
     BranchMissing,
 }
 
+/// The head of the Task's published pull request, as the status poll last
+/// read it. It is read from memory: asking GitHub is the poll's job, never a
+/// question the panel's cadence asks. The approval is not renewed by it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PublishedHead {
+    /// The head commit GitHub reported at `observed_at`. `None` when the latest
+    /// attempt gave none, so an older head is never offered as current.
+    pub head: Option<String>,
+    /// When `head` was read from GitHub.
+    pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Why the head is not known: the latest attempt failed, or none has
+    /// succeeded yet.
+    pub unverified: Option<String>,
+}
+
+/// How old GitHub's answer about the head may be before it is no longer
+/// trusted as the head now. A poll that has not answered for two intervals may
+/// have missed a push, so the head is then unverified rather than current.
+const PUBLISHED_HEAD_FRESH_SECONDS: i64 = 2 * crate::pr_status::POLL_INTERVAL.as_secs() as i64;
+
+/// The published head as the cache holds it at `now`. Only the latest attempt
+/// counts: a failed attempt makes the head unknown even when an earlier one
+/// read it, and so does an answer older than [`PUBLISHED_HEAD_FRESH_SECONDS`].
+fn published_head(entry: Option<&crate::pr_status::PrStatusEntry>, now: chrono::DateTime<chrono::Utc>) -> PublishedHead {
+    let unknown = |why: String| PublishedHead { head: None, observed_at: None, unverified: Some(why) };
+    let Some(entry) = entry else {
+        return unknown("GitHub has not answered about this pull request yet.".to_string());
+    };
+    if let Some(error) = &entry.error {
+        return unknown(format!("GitHub could not be asked: {error}."));
+    }
+    match entry.status.as_ref().and_then(|s| s.head_oid.clone()) {
+        Some(head) => match entry.fetched_at {
+            Some(at) if (now - at).num_seconds() <= PUBLISHED_HEAD_FRESH_SECONDS => {
+                PublishedHead { head: Some(head), observed_at: Some(at), unverified: None }
+            }
+            Some(_) => unknown(format!(
+                "GitHub's last answer about the pull request's head is more than {} minutes old.",
+                PUBLISHED_HEAD_FRESH_SECONDS / 60
+            )),
+            None => unknown("GitHub's answer about the pull request's head has no read time.".to_string()),
+        },
+        None => unknown("GitHub's answer did not name the pull request's head commit.".to_string()),
+    }
+}
+
+/// The pull request the Task publishes to: the GitHub reference its `pr_url`
+/// names, or else its first one.
+fn published_key(task: &Task) -> Option<crate::pr_status::PrKey> {
+    let refs: Vec<(&str, &str, u32)> = task
+        .external_refs
+        .iter()
+        .filter_map(|r| match r {
+            crate::domain::ExternalRef::GithubPr { url, repo, number, .. } => Some((url.as_str(), repo.as_str(), *number)),
+            _ => None,
+        })
+        .collect();
+    refs.iter()
+        .find(|(url, _, _)| task.pr_url.as_deref() == Some(url))
+        .or(refs.first())
+        .map(|(_, repo, number)| crate::pr_status::PrKey::new(*repo, *number))
+}
+
+#[cfg(test)]
+mod published_head_tests {
+    use super::*;
+    use crate::pr_status::{parse_pr_status, PrFetchError, PrFetchErrorKind, PrStatus, PrStatusEntry};
+    use serde_json::json;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn entry(status: Option<PrStatus>, error: Option<PrFetchError>) -> PrStatusEntry {
+        PrStatusEntry {
+            repo: "o/r".into(),
+            number: 9,
+            status,
+            fetched_at: Some(chrono::Utc::now()),
+            attempted_at: chrono::Utc::now(),
+            error,
+        }
+    }
+
+    fn read_head(head: &str) -> PrStatus {
+        parse_pr_status(&json!({ "state": "OPEN", "headRefOid": head }))
+    }
+
+    #[test]
+    fn a_head_the_latest_attempt_read_is_the_published_head() {
+        let read = published_head(Some(&entry(Some(read_head(HEAD)), None)), chrono::Utc::now());
+        assert_eq!(read.head.as_deref(), Some(HEAD));
+        assert!(read.observed_at.is_some());
+        assert_eq!(read.unverified, None);
+    }
+
+    #[test]
+    fn no_answer_or_an_abbreviated_head_is_unverified_never_a_head() {
+        let none = published_head(None, chrono::Utc::now());
+        assert_eq!(none.head, None);
+        assert!(none.unverified.is_some_and(|w| w.contains("not answered")));
+
+        let abbreviated = published_head(Some(&entry(Some(read_head("0123456")), None)), chrono::Utc::now());
+        assert_eq!(abbreviated.head, None, "an abbreviated head cannot be checked against a commit");
+        assert!(abbreviated.unverified.is_some());
+    }
+
+    #[test]
+    fn a_failed_latest_attempt_hides_the_head_an_earlier_one_read() {
+        let error = PrFetchError { kind: PrFetchErrorKind::Timeout, message: "took too long".into() };
+        let failed = published_head(Some(&entry(Some(read_head(HEAD)), Some(error))), chrono::Utc::now());
+        assert_eq!(failed.head, None, "an earlier head says nothing about the pull request now");
+        assert!(failed.unverified.is_some_and(|w| w.contains("took too long")));
+    }
+
+    /// A head read long ago may have been overtaken by a push nobody has seen,
+    /// so it is unverified once the poll has been silent for two intervals.
+    #[test]
+    fn a_head_older_than_two_poll_intervals_is_unverified_not_current() {
+        let now = chrono::Utc::now();
+        let mut old = entry(Some(read_head(HEAD)), None);
+        old.fetched_at = Some(now - chrono::Duration::seconds(PUBLISHED_HEAD_FRESH_SECONDS + 1));
+        let stale = published_head(Some(&old), now);
+        assert_eq!(stale.head, None, "an old head is not the head now");
+        assert!(stale.unverified.is_some_and(|w| w.contains("more than")));
+
+        old.fetched_at = Some(now - chrono::Duration::seconds(PUBLISHED_HEAD_FRESH_SECONDS));
+        assert_eq!(published_head(Some(&old), now).head.as_deref(), Some(HEAD), "a head at the limit is still fresh");
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ApprovalStatus {
     pub coverage: ApprovalCoverage,
@@ -185,6 +314,10 @@ pub struct ApprovalStatus {
     pub branch_tip: Option<String>,
     /// For `Moved`: the approved commit is no longer on the branch.
     pub rewritten: bool,
+    /// The published pull request's head, when the Task has a pull request.
+    /// It may differ from `approved_tip` even while `coverage` is `Current`,
+    /// because another clone can move the pull request without moving the branch.
+    pub published: Option<PublishedHead>,
     /// What a person can act on, when the approval does not cover the branch.
     pub reason: Option<String>,
 }
@@ -204,12 +337,15 @@ pub async fn get_approval_status(
 pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> Result<ApprovalStatus, String> {
     let task = current(state, task_id).await.ok_or("Task not found")?;
     let approved_tip = task.human_review.approved_tip().map(str::to_string);
+    // Read from the status cache: no GitHub request and no repository access.
+    let published = published_key(&task).map(|key| published_head(state.pr_statuses.get(&key).as_ref(), chrono::Utc::now()));
     let none = |coverage| ApprovalStatus {
         coverage,
         approved_tip: approved_tip.clone(),
         branch_tip: None,
         rewritten: false,
         reason: None,
+        published: published.clone(),
     };
     if task.branch_name.is_none() {
         return Ok(none(ApprovalCoverage::NotApplicable));
@@ -1846,6 +1982,118 @@ mod tests {
     }
 
     // ---- Approval is bound to the commit that was approved ----
+
+    /// A pull request pushed to by another clone, seen the way the status poll
+    /// sees it. Clone A approves commit A and pushes it. Another clone then pushes
+    /// B to the same branch, and clone A never fetches. The branch still names
+    /// A, so the local answer alone says the approval is current. Only GitHub's
+    /// answer, through the status poll, names B. When GitHub cannot answer, the
+    /// head is unverified, and the next answer restores it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_request_pushed_to_by_another_clone_is_seen_only_through_the_status_poll() {
+        use crate::domain::ExternalRef;
+        use crate::pr_status::{PrKey, PrStatuses};
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut local = local_project().await;
+        local.approve().await;
+        let approved = local.tip();
+        let root = local._tmp.path().to_path_buf();
+
+        // Clone A, the Task checkout's repository, publishes its branch.
+        let remote = root.join("remote.git");
+        git(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git(&local.repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&local.repo, &["push", "-q", "origin", &local.branch]);
+
+        // Another clone pushes B to the pull request's branch.
+        let other = root.join("other");
+        git(&root, &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        git(&other, &["config", "user.email", "test@example.com"]);
+        git(&other, &["config", "user.name", "Test"]);
+        git(&other, &["checkout", "-q", &local.branch]);
+        std::fs::write(other.join("pushed.txt"), "from another clone\n").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-q", "-m", "pushed by another clone"]);
+        git(&other, &["push", "-q", "origin", &local.branch]);
+        let head = git(&other, &["rev-parse", "HEAD"]);
+        assert_ne!(head, approved);
+        assert_eq!(
+            git(&local.repo, &["rev-parse", &format!("refs/remotes/origin/{}", local.branch)]),
+            approved,
+            "clone A has not fetched: its remote-tracking ref still names A"
+        );
+
+        // The Task's pull request, and a fake `gh` that answers for it.
+        let key = PrKey::new("o/r", 9);
+        {
+            let mut tasks = local.state.task.tasks.write().await;
+            let task = tasks.get_mut(&local.task_id).unwrap();
+            let url = "https://github.com/o/r/pull/9".to_string();
+            task.pr_url = Some(url.clone());
+            task.external_refs.push(ExternalRef::GithubPr {
+                url,
+                repo: "o/r".into(),
+                number: 9,
+                state: Some("OPEN".into()),
+                merge_commit: None,
+            });
+        }
+        let dir = root.join("gh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let answer = serde_json::json!({
+            "state": "OPEN",
+            "headRefOid": head,
+            "statusCheckRollup": [],
+            "reviewDecision": "",
+            "mergeable": "MERGEABLE",
+        });
+        std::fs::write(dir.join("answer.json"), answer.to_string()).unwrap();
+        let gh = dir.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nd=\"$(dirname \"$0\")\"\nif [ -f \"$d/fail\" ]; then echo 'connection reset' >&2; exit 1; fi\ncat \"$d/answer.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        local.state.pr_statuses = std::sync::Arc::new(PrStatuses::with_program(gh, std::time::Duration::from_secs(20)));
+        let published = |status: &ApprovalStatus| status.published.clone().expect("the pull request is recorded");
+
+        // Before the poll has asked, nothing says what the pull request is.
+        let before = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(before.coverage, ApprovalCoverage::Current, "the local branch alone reads current");
+        assert_eq!(published(&before).head, None);
+        assert!(published(&before).unverified.is_some());
+
+        // The poll asks GitHub: the head is B, while the approval and the branch stay at A.
+        local.state.pr_statuses.refresh(&key).await.expect("GitHub answers");
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::Current);
+        assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()));
+        assert_eq!(published(&status).head.as_deref(), Some(head.as_str()));
+        assert!(published(&status).observed_at.is_some());
+        assert_eq!(published(&status).unverified, None);
+
+        // GitHub cannot answer: the head is unverified, and the last head is not offered.
+        std::fs::write(dir.join("fail"), "").unwrap();
+        assert!(local.state.pr_statuses.refresh(&key).await.is_err());
+        let failed = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(published(&failed).head, None, "a failed answer never keeps the earlier head as current");
+        assert!(published(&failed).unverified.is_some_and(|why| why.contains("could not be asked")));
+
+        // GitHub answers again.
+        std::fs::remove_file(dir.join("fail")).unwrap();
+        local.state.pr_statuses.refresh(&key).await.expect("GitHub answers again");
+        assert_eq!(published(&approval_status(&local.state, local.task_id).await.unwrap()).head.as_deref(), Some(head.as_str()));
+
+        // Nothing was fetched or moved to make that observation.
+        assert_eq!(local.tip(), approved);
+        assert_eq!(
+            git(&local.repo, &["rev-parse", &format!("refs/remotes/origin/{}", local.branch)]),
+            approved
+        );
+    }
 
     impl Local {
         fn tip(&self) -> String {

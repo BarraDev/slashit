@@ -1534,3 +1534,139 @@ async fn unverified_while_unreadable(driver: &WebDriver) -> Result<()> {
     click(driver, HR_COMMIT_RETRY, "Ask again about the branch").await?;
     await_data_approval(driver, "unknown", "the approval after asking again while unreadable").await
 }
+
+// --- A published pull request that another clone moved ----------------------
+
+const DRAWER_PR_REFRESH: &str = "[data-testid=\"task-drawer-pr-refresh\"]";
+const HR_PUBLISHED: &str = "[data-testid=\"human-review-published\"]";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pull_request_pushed_to_by_another_clone_is_not_shown_as_covered_by_the_approval() {
+    let context = TestContext::new("human_review_published_head").expect("harness setup");
+    let outcome = published_head_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn published_head_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let (agent, gh) = install_fakes(context, &root)?;
+    context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+    repository.point_origin_at_github()?;
+
+    let session = context.start_session("published-head").await?;
+    let outcome = published_head_moved(session.driver(), &agent, &gh, &repository, &root).await;
+    context.close_session(session, "published-head", &outcome).await?;
+    outcome
+}
+
+/// The pull request opens at the approved commit A, so the approval covers it.
+/// Another clone then pushes B to the same branch, and GitHub reports B. This
+/// clone never fetches, so the branch still names A. The panel must not keep
+/// showing the approval as covering the pull request, and when GitHub gives no
+/// head it must say the pull request is not verified.
+async fn published_head_moved(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    gh: &FakeGh,
+    repository: &GitFixture,
+    root: &Path,
+) -> Result<()> {
+    let (executed, _pr_url) = approve_and_open_the_pull_request(driver, agent, gh, repository).await?;
+    let task = read_task(driver, &executed).await?;
+    let branch = branch_of(&task)?;
+    let approved = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+
+    open_reviewed_drawer(driver, &executed).await?;
+    await_data_approval(driver, "current", "the approval of a pull request opened at the approved commit").await?;
+    capture_evidence(driver, &format!("E-published-head-at-approved-{}", &approved[..12])).await?;
+    close_drawer(driver).await?;
+
+    // Another clone pushes B to the pull request's branch. Nothing here fetches it.
+    let moved = push_from_another_clone(repository, &branch, root)?;
+    if repository.origin_tip(&branch)?.as_deref() != Some(moved.as_str()) {
+        bail!("the other clone's push did not reach origin");
+    }
+    if repository.branch_tip(&branch)?.as_deref() != Some(approved.as_str()) {
+        bail!("the Task's own branch moved, but only the pull request should have");
+    }
+
+    // GitHub now reports B, and the drawer asks for it.
+    gh.script_pr_view(&pr_view_answer(Some(&moved)))?;
+    open_reviewed_drawer(driver, &executed).await?;
+    click(driver, DRAWER_PR_REFRESH, "Refresh the pull request's status").await?;
+    await_data_approval(driver, "published-moved", "the approval once GitHub reports another head").await?;
+    let shown = await_text(
+        driver,
+        HR_APPROVED,
+        |t| t.contains(&moved[..12]) && t.contains(&approved[..12]),
+        "the approval to name both commits",
+    )
+    .await?;
+    let class = attribute(driver, HR_APPROVED, "class").await?.unwrap_or_default();
+    if class.contains("emerald") {
+        bail!("the approval is styled as current while the pull request is at another commit: {shown}");
+    }
+    await_text(driver, HR_PUBLISHED, |t| t.contains("require review"), "the note on changes after the approved commit").await?;
+    if count(driver, HR_APPROVE_AGAIN).await? != 0 {
+        bail!("a renewal is offered after the pull request was opened");
+    }
+    capture_evidence(driver, &format!("F-published-head-{}-approval-{}", &moved[..12], &approved[..12])).await?;
+
+    // GitHub answers without a head: the pull request is unverified, not current.
+    gh.script_pr_view(&pr_view_answer(None))?;
+    click(driver, DRAWER_PR_REFRESH, "Refresh the pull request's status again").await?;
+    await_data_approval(driver, "published-unverified", "the approval once GitHub names no head").await?;
+    await_text(driver, HR_PUBLISHED, |t| t.contains("did not name"), "the reason the head is not verified").await?;
+    capture_evidence(driver, &format!("G-published-head-unverified-approval-{}", &approved[..12])).await?;
+    Ok(())
+}
+
+fn pr_view_answer(head: Option<&str>) -> Value {
+    let mut answer = json!({
+        "state": "OPEN",
+        "number": 1,
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "",
+        "statusCheckRollup": [],
+        "baseRefName": "main",
+        "isCrossRepository": false,
+    });
+    if let Some(head) = head {
+        answer["headRefOid"] = json!(head);
+    }
+    answer
+}
+
+/// Another clone of the fixture's origin commits to `branch` and pushes it, the
+/// way a collaborator would. It returns the commit it pushed. The Task's own
+/// checkout is not touched.
+fn push_from_another_clone(repository: &GitFixture, branch: &str, root: &Path) -> Result<String> {
+    let origin = repository.origin_path()?;
+    let origin = origin.to_str().context("the origin path is not UTF-8")?;
+    let clone = root.join("another-clone");
+    let clone_path = clone.to_str().context("the clone path is not UTF-8")?;
+    let run = |dir: &Path, args: &[&str]| -> Result<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .with_context(|| format!("could not run git {args:?}"))?;
+        if !output.status.success() {
+            bail!("git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    run(root, &["clone", "-q", origin, clone_path])?;
+    run(&clone, &["config", "user.email", "test@example.com"])?;
+    run(&clone, &["config", "user.name", "Test"])?;
+    run(&clone, &["checkout", "-q", branch])?;
+    std::fs::write(clone.join("pushed-elsewhere.txt"), "from another clone\n")?;
+    run(&clone, &["add", "."])?;
+    run(&clone, &["commit", "-q", "-m", "pushed from another clone"])?;
+    run(&clone, &["push", "-q", "origin", branch])?;
+    run(&clone, &["rev-parse", "HEAD"])
+}

@@ -340,12 +340,17 @@ impl CoverageReads {
 /// What the panel may say about an approval, read from the latest coverage
 /// answer. Only a read that names the approval current says current. A missing
 /// read is unknown, never current, and a stale answer from before the approval
-/// is unknown too.
+/// is unknown too. A branch at the approved commit still is not current while
+/// the published pull request shows another head, or none that was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CoverageView {
     Current,
     Stale,
     Unknown,
+    /// The branch is at the approved commit, but the published pull request is at another one.
+    PublishedMoved,
+    /// The branch is at the approved commit, but the published pull request's head is not known.
+    PublishedUnverified,
 }
 
 fn coverage_view(status: Option<&ApprovalStatus>, has_branch: bool, approved_now: Option<&str>) -> CoverageView {
@@ -355,7 +360,7 @@ fn coverage_view(status: Option<&ApprovalStatus>, has_branch: bool, approved_now
         return CoverageView::Unknown;
     }
     match status.map(|s| s.coverage) {
-        Some(ApprovalCoverage::Current) => CoverageView::Current,
+        Some(ApprovalCoverage::Current) => status.map_or(CoverageView::Current, |s| published_view(s, approved_now)),
         // Only a task without a branch has nothing to bind the approval to.
         Some(ApprovalCoverage::NotApplicable) if !has_branch => CoverageView::Current,
         Some(
@@ -363,6 +368,65 @@ fn coverage_view(status: Option<&ApprovalStatus>, has_branch: bool, approved_now
         ) => CoverageView::Stale,
         Some(ApprovalCoverage::NotApplicable) | None => CoverageView::Unknown,
     }
+}
+
+/// What the published pull request allows the panel to say about an approval
+/// the branch covers. The approval covers the pull request only when its head
+/// is the approved commit. A head that was not read is unverified, never
+/// current.
+fn published_view(status: &ApprovalStatus, approved: Option<&str>) -> CoverageView {
+    let Some(published) = status.published.as_ref() else {
+        return CoverageView::Current;
+    };
+    match (published.head.as_deref(), approved) {
+        (Some(head), Some(approved)) if head == approved => CoverageView::Current,
+        (Some(_), Some(_)) => CoverageView::PublishedMoved,
+        _ => CoverageView::PublishedUnverified,
+    }
+}
+
+/// The heading when the published pull request is at another commit than the
+/// approved one. It names both, and says the approval does not cover the head.
+fn published_moved_heading(approved: Option<&str>, head: Option<&str>) -> String {
+    match (approved, head) {
+        (Some(approved), Some(head)) => format!(
+            "Approved for {}; the published pull request is at {}, which this approval does not cover",
+            short(approved),
+            short(head)
+        ),
+        _ => "The published pull request is at another commit than the one you approved".to_string(),
+    }
+}
+
+/// The heading when the published pull request's head is not known.
+fn published_unverified_heading(approved: Option<&str>) -> String {
+    match approved {
+        Some(approved) => format!("Approved for {}; the published pull request is not verified", short(approved)),
+        None => "Approved; the published pull request is not verified".to_string(),
+    }
+}
+
+/// The line under the heading. A head that was read says what it is and when
+/// GitHub reported it, and that changes after the approved commit need review.
+/// A head that was not read says why.
+fn published_detail(status: Option<&ApprovalStatus>, approved: Option<&str>) -> Option<String> {
+    let published = status?.published.as_ref()?;
+    match published.head.as_deref() {
+        Some(head) => {
+            let approved = approved.map_or("the approved commit".to_string(), |a| short(a).to_string());
+            let at = published.observed_at.as_deref().and_then(read_time).unwrap_or_else(|| "an unknown time".to_string());
+            Some(format!(
+                "Changes after {approved} require review in the pull request. GitHub reported its head as {} at {at}.",
+                short(head)
+            ))
+        }
+        None => published.unverified.clone(),
+    }
+}
+
+/// The UTC clock time of an RFC 3339 timestamp, as `HH:MM UTC`.
+fn read_time(observed_at: &str) -> Option<String> {
+    Some(format!("{} UTC", observed_at.get(11..16)?))
 }
 
 /// Whether the branch has no commit because the repository does not have it.
@@ -1077,6 +1141,8 @@ pub fn HumanReviewPanel(
                         CoverageView::Current => "current",
                         CoverageView::Stale => "stale",
                         CoverageView::Unknown => "unknown",
+                        CoverageView::PublishedMoved => "published-moved",
+                        CoverageView::PublishedUnverified => "published-unverified",
                     }
                     class=move || if approval_view.get() == CoverageView::Current {
                         "flex items-center gap-2 text-sm font-medium text-emerald-300"
@@ -1106,10 +1172,26 @@ pub fn HumanReviewPanel(
                                 stale_heading(approved, current)
                             }),
                             CoverageView::Unknown => unverified_heading(tip.as_deref()),
+                            CoverageView::PublishedMoved => coverage.with(|c| {
+                                let head = c.as_ref().and_then(|c| c.published.as_ref()).and_then(|p| p.head.as_deref());
+                                published_moved_heading(tip.as_deref(), head)
+                            }),
+                            CoverageView::PublishedUnverified => published_unverified_heading(tip.as_deref()),
                             CoverageView::Current => approved_label(tip.as_deref()),
                         }
                     }}
                 </p>
+                // The published pull request, when the branch alone would not show it.
+                {move || matches!(approval_view.get(), CoverageView::PublishedMoved | CoverageView::PublishedUnverified)
+                    .then(|| {
+                        let approved = task.with(|t| t.as_ref().and_then(|t| t.human_review.approved_tip().map(str::to_string)));
+                        coverage.with(|c| published_detail(c.as_ref(), approved.as_deref()))
+                    })
+                    .flatten()
+                    .map(|detail| view! {
+                        <p data-testid="human-review-published" class="text-xs text-white/70 break-words">{detail}</p>
+                    })
+                }
                 // Gated on the same view as the status line: an answer for an
                 // earlier approval must not put its reason or its renewal
                 // control beside a newer approval.
@@ -1555,6 +1637,22 @@ mod tests {
             branch_tip: branch_tip.map(str::to_string),
             rewritten: false,
             reason: None,
+            published: None,
+        }
+    }
+
+    /// An answer for a branch at the approved commit, with the published pull
+    /// request as the poll last read it: either its head, or why it is unknown.
+    fn published_answer(approved: &str, head: Option<&str>, unverified: Option<&str>) -> ApprovalStatus {
+        let published = crate::services::human_review_service::PublishedHead {
+            head: head.map(str::to_string),
+            observed_at: head.map(|_| "2026-11-15T11:22:57.123Z".to_string()),
+            unverified: unverified.map(str::to_string),
+        };
+        ApprovalStatus {
+            approved_tip: Some(approved.to_string()),
+            published: Some(published),
+            ..answer(ApprovalCoverage::Current, Some(approved))
         }
     }
 
@@ -1778,6 +1876,50 @@ mod tests {
     fn an_undecided_answer_does_not_verify_a_new_approval() {
         assert_eq!(view(Some(ApprovalCoverage::NotApplicable), true), CoverageView::Unknown);
         assert_eq!(view(Some(ApprovalCoverage::NotApplicable), false), CoverageView::Current);
+    }
+
+    /// A branch at the approved commit verifies the approval for the published
+    /// pull request only when the pull request's head is that same commit. A
+    /// head that differs, or was not read, is never current.
+    #[test]
+    fn a_published_head_must_be_the_approved_commit_to_read_as_current() {
+        let (approved, moved) = ("a".repeat(40), "b".repeat(40));
+        let view_of = |status: &ApprovalStatus| coverage_view(Some(status), true, Some(&approved));
+        assert_eq!(view_of(&published_answer(&approved, Some(&approved), None)), CoverageView::Current);
+        assert_eq!(view_of(&published_answer(&approved, Some(&moved), None)), CoverageView::PublishedMoved);
+        assert_eq!(
+            view_of(&published_answer(&approved, None, Some("GitHub could not be asked."))),
+            CoverageView::PublishedUnverified,
+        );
+        // The renewed approval's view must not borrow the earlier answer's head.
+        let renewed = "c".repeat(40);
+        assert_eq!(
+            coverage_view(Some(&published_answer(&approved, Some(&moved), None)), true, Some(&renewed)),
+            CoverageView::Unknown,
+        );
+        // No pull request means the branch alone decides, as before.
+        let without_pr = ApprovalStatus { approved_tip: Some(approved.clone()), ..answer(ApprovalCoverage::Current, Some(&approved)) };
+        assert_eq!(view_of(&without_pr), CoverageView::Current);
+    }
+
+    #[test]
+    fn published_wording_names_both_commits_and_never_says_current() {
+        let (approved, head) = ("a".repeat(40), "b".repeat(40));
+        let moved = published_moved_heading(Some(&approved), Some(&head));
+        assert!(moved.contains(&approved[..12]) && moved.contains(&head[..12]), "{moved}");
+        assert!(moved.contains("does not cover"), "{moved}");
+        assert!(!moved.contains("current"), "{moved}");
+
+        let read = published_answer(&approved, Some(&head), None);
+        let detail = published_detail(Some(&read), Some(&approved)).expect("a read head is described");
+        assert!(detail.contains(&format!("Changes after {} require review", &approved[..12])), "{detail}");
+        assert!(detail.contains(&head[..12]) && detail.contains("11:22 UTC"), "{detail}");
+
+        let unread = published_answer(&approved, None, Some("GitHub could not be asked."));
+        assert_eq!(published_detail(Some(&unread), Some(&approved)).as_deref(), Some("GitHub could not be asked."));
+        assert!(published_unverified_heading(Some(&approved)).contains("not verified"));
+        assert!(!published_unverified_heading(Some(&approved)).contains("current"));
+        assert_eq!(published_detail(Some(&answer(ApprovalCoverage::Current, None)), Some(&approved)), None);
     }
 
     #[test]

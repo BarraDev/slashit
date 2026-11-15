@@ -867,6 +867,7 @@ mod tests {
                 review_decision: Some(ReviewDecision::ChangesRequested),
                 mergeable: None,
                 merge_commit: None,
+                head_oid: None,
             },
         );
         let result =

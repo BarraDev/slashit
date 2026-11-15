@@ -203,6 +203,27 @@ async fn run_cmd(cmd: &str, args: &[&str], cwd: &str) -> Result<String, String> 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// `run_cmd` for a read-only query on the approval-coverage path. The child is
+/// killed if this future is dropped, so a read the coverage timeout stops
+/// leaves no process behind. Never use it for a command that changes anything:
+/// a dropped push would be killed half-way.
+async fn run_query(cmd: &str, args: &[&str], cwd: &str) -> Result<String, String> {
+    let output = crate::host_process::tokio_command(program(cmd))
+        .args(args)
+        .current_dir(cwd)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run {}: {}", cmd, e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("{} failed: {}", cmd, stderr));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Like `run_cmd`, but keeps the output exactly. A path may begin or end with a
 /// space, and trimming would change it.
 async fn run_cmd_exact(cmd: &str, args: &[&str], cwd: &str) -> Result<String, String> {
@@ -263,6 +284,7 @@ async fn is_jj_repo(working_dir: &str) -> bool {
     let in_jj = crate::host_process::tokio_command(program("jj"))
         .args(["root"])
         .current_dir(working_dir)
+        .kill_on_drop(true)
         .output()
         .await
         .map(|output| output.status.success())
@@ -274,8 +296,8 @@ async fn is_jj_repo(working_dir: &str) -> bool {
 /// canonical. `None` when either is not found. Equal roots mean a colocated
 /// repository; a Git top level inside the jj root means a nested Git repository.
 async fn git_and_jj_roots(working_dir: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let git_top = run_cmd("git", &["rev-parse", "--show-toplevel"], working_dir).await.ok()?;
-    let jj_root = run_cmd("jj", &["--ignore-working-copy", "root"], working_dir).await.ok()?;
+    let git_top = run_query("git", &["rev-parse", "--show-toplevel"], working_dir).await.ok()?;
+    let jj_root = run_query("jj", &["--ignore-working-copy", "root"], working_dir).await.ok()?;
     Some((std::fs::canonicalize(git_top).ok()?, std::fs::canonicalize(jj_root).ok()?))
 }
 
@@ -9405,7 +9427,7 @@ async fn git_branch_tip(working_dir: &str, branch: &str) -> Result<Option<String
     let name = format!("refs/heads/{branch}");
     args.extend(["for-each-ref", "--format=%(refname) %(objectname)", &name].map(String::from));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let listed = run_cmd("git", &args, working_dir).await?;
+    let listed = run_query("git", &args, working_dir).await?;
     Ok(listed.lines().find_map(|line| {
         let (refname, oid) = line.split_once(' ')?;
         (refname == name).then(|| oid.to_string())
@@ -9521,7 +9543,29 @@ pub(crate) async fn task_branch_tip_read_only(
 ) -> Result<Option<String>, String> {
     let branch = task_branch(state, task_id).await?;
     let working_dir = resolve_repository_dir(state, task_id).await?;
-    branch_tip_read_only(&working_dir, &branch).await
+    branch_tip_read_bounded(&working_dir, &branch, BRANCH_TIP_READ_BOUND).await
+}
+
+/// How long one read of a branch's tip may run. The Human Review panel stops
+/// trusting a read after ten seconds; this ends the read first, and every Git
+/// or jj child it started with it.
+pub(crate) const BRANCH_TIP_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// [`branch_tip_read_only`] within `bound`. Expiry drops the read, and each
+/// query it awaits is a [`run_query`], so the child in flight is killed too.
+async fn branch_tip_read_bounded(
+    working_dir: &str,
+    branch: &str,
+    bound: std::time::Duration,
+) -> Result<Option<String>, String> {
+    tokio::time::timeout(bound, branch_tip_read_only(working_dir, branch))
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "Reading the tip of branch `{branch}` took longer than {} seconds and was stopped.",
+                bound.as_secs()
+            ))
+        })
 }
 
 /// The tip of `branch` in `working_dir`, read without changing anything.
@@ -9560,7 +9604,7 @@ async fn jj_bookmark_tip(working_dir: &str, branch: &str) -> Result<Option<Strin
     let branch = checked_task_branch(branch)?;
     // One commit per line, so a conflicted bookmark's commits can be counted
     // instead of reading as one concatenated, non-existent commit id.
-    let listed = run_cmd(
+    let listed = run_query(
         "jj",
         &[
             "--ignore-working-copy",
@@ -9606,14 +9650,14 @@ async fn jj_git_dir_arg(working_dir: &str) -> Result<Option<String>, String> {
 /// before they are compared. A repository discovered above the workspace
 /// root, or none at all, is `false`.
 async fn git_repository_is_inside_jj_workspace(working_dir: &str) -> bool {
-    let git_location = match run_cmd("git", &["rev-parse", "--show-toplevel"], working_dir).await {
+    let git_location = match run_query("git", &["rev-parse", "--show-toplevel"], working_dir).await {
         Ok(top) => top,
-        Err(_) => match run_cmd("git", &["rev-parse", "--absolute-git-dir"], working_dir).await {
+        Err(_) => match run_query("git", &["rev-parse", "--absolute-git-dir"], working_dir).await {
             Ok(git_dir) => git_dir,
             Err(_) => return false,
         },
     };
-    let Ok(jj_root) = run_cmd("jj", &["--ignore-working-copy", "root"], working_dir).await else {
+    let Ok(jj_root) = run_query("jj", &["--ignore-working-copy", "root"], working_dir).await else {
         return false;
     };
     match (
@@ -9630,7 +9674,7 @@ async fn git_repository_is_inside_jj_workspace(working_dir: &str) -> bool {
 /// when colocated, `.jj/repo/store/git` when not), never a working tree.
 /// Anything else is refused rather than handed to `git`.
 async fn jj_backing_git_dir(working_dir: &str) -> Result<String, String> {
-    let git_dir = run_cmd("jj", &["--ignore-working-copy", "git", "root"], working_dir)
+    let git_dir = run_query("jj", &["--ignore-working-copy", "git", "root"], working_dir)
         .await
         .map_err(|e| format!("Could not find the Git repository behind this jj repository: {e}"))?;
     if git_dir.is_empty() || !std::path::Path::new(&git_dir).is_absolute() {
@@ -10526,6 +10570,7 @@ mod tests {
             review_decision: None,
             mergeable: None,
             merge_commit: None,
+            head_oid: None,
         };
         statuses.remember(&crate::pr_status::PrKey::new("o/r", 5), status.clone());
         statuses.remember(&crate::pr_status::PrKey::new("o/r", 6), status.clone());
@@ -12826,6 +12871,55 @@ mod tests {
             let tip = branch_tip_read_only(repo.dir(), "task-branch").await.expect("the tip is read");
             assert_eq!(tip.as_deref(), Some(moved.as_str()), "the tip is Git's commit, not the stale bookmark");
             assert_eq!(repo.bookmark("task-branch"), repo.task_sha, "the read must not import the move into jj");
+        }
+
+        /// A read the bound stops leaves no process behind: the Git it waits on
+        /// dies with it. The Human Review panel asks again while a read hangs,
+        /// so a child that survived each stop would pile up.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_tip_read_past_its_bound_kills_the_git_it_waits_on() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let repo = ColocatedJj::new("task-branch");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pid_file = dir.path().join("pid");
+            let hung_git = dir.path().join("git");
+            std::fs::write(&hung_git, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 300\n", pid_file.display())).unwrap();
+            std::fs::set_permissions(&hung_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let began = std::time::Instant::now();
+            let err = test_programs::scope(
+                [("git", hung_git)],
+                branch_tip_read_bounded(repo.dir(), "task-branch", std::time::Duration::from_millis(1500)),
+            )
+            .await
+            .expect_err("a read past its bound is refused");
+            assert!(began.elapsed() < std::time::Duration::from_secs(5), "took {:?}", began.elapsed());
+            assert!(err.contains("stopped"), "{err}");
+
+            let pid: i32 = std::fs::read_to_string(&pid_file)
+                .expect("the fake git started")
+                .trim()
+                .parse()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while process_alive(pid) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(!process_alive(pid), "the git the read waited on is still running");
+        }
+
+        /// Whether `pid` runs. A zombie, or one being removed, has stopped.
+        #[cfg(target_os = "linux")]
+        fn process_alive(pid: i32) -> bool {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return false;
+            }
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => !stat.rsplit(')').next().unwrap_or("").trim_start().starts_with(['Z', 'X', 'x']),
+                Err(_) => false,
+            }
         }
 
         /// The read gives the commit the approval's mutating read gives. That read

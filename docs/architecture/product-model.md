@@ -255,6 +255,28 @@ a failed fix), without making them again. A fix already committed is
 never committed again, and an apply that made no new fix and has no such
 uncommitted fix commits nothing.
 
+### Approval coverage
+
+A Human Review approval records the commit it covers, and that record never
+moves. Three values are kept apart and never assumed equal:
+
+- The approved commit, from the approval record.
+- The Task branch's tip, read from the Project's repository without fetching,
+  exporting or importing. A tip other than the approved commit makes the
+  approval stale.
+- The published pull request's head, as the status poll last read it from
+  GitHub, with the time it was read. The panel never asks GitHub on its own
+  cadence. An unanswered or failed read is unverified, never current, and so is
+  a read older than two poll intervals.
+
+A branch at the approved commit does not show the approval as current while
+the published pull request's head is another commit, or has not been read.
+The panel then names the approved commit and the pull request's head, and says
+that changes after the approved commit need review in the pull request. Once a
+pull request exists, the approval is not renewed; the pull request's review and
+merge decide later changes. A Task without a recorded GitHub pull request is
+judged by its branch alone.
+
 ### Local delivery
 
 A Task whose changes a person approved can be finished without a pull request:
