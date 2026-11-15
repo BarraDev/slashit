@@ -25,6 +25,8 @@ pub(super) const HR_RETRY_PR: &str = "[data-testid=\"human-review-retry-pr\"]";
 const HR_PR_LINK: &str = "[data-testid=\"human-review-pr-link\"]";
 const HR_ITERATION: &str = "[data-testid=\"human-review-iteration\"]";
 const HR_HISTORY_ENTRY: &str = "[data-testid=\"human-review-history-entry\"]";
+const HR_APPROVAL_STALE: &str = "[data-testid=\"human-review-approval-stale\"]";
+const HR_APPROVE_AGAIN: &str = "[data-testid=\"human-review-approve-again\"]";
 const DRAWER_REVIEW_VERDICT: &str = "[data-testid=\"task-drawer-review-verdict\"]";
 const CLOSE_DIALOG: &str = "[data-testid=\"close-without-merge-dialog\"]";
 const CLOSE_CONSEQUENCES: &str = "[data-testid=\"close-without-merge-consequences\"]";
@@ -1231,13 +1233,14 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
     if !primary.contains(&work_file) || primary.contains("pending-only.txt") {
         bail!("the primary diff is not the committed content: {primary}");
     }
+    // The panel has read the branch before anything moves, so a later move is
+    // learned by the cadence, not by the panel's first ask.
+    await_text(driver, HR_CURRENT_COMMIT, |t| t.contains(&tip), "the panel to read the branch before it moves").await?;
 
-    // The branch moves after the tab was read. The panel asks the branch's
-    // commit on a cadence, so it learns the move on its own: the commit it
-    // offers becomes the moved one, and the Changes tab follows it without
-    // anyone reopening it. Approval waits for the picture on screen, so what
-    // is approved is the branch as it is now, never the picture read before
-    // the move.
+    // The branch moves outside SlashIt while the panel is deciding. The panel
+    // asks the branch's commit on a cadence, so it learns the move on its
+    // own: the commit it offers becomes the moved one, and the Changes tab
+    // follows it without anyone reopening anything.
     git(
         &executed.worktree_path,
         &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "moved"],
@@ -1248,20 +1251,118 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
     await_text(driver, REVIEW_COMMIT, |t| t == &moved[..12], "the Changes tab to follow the branch").await?;
     assert_not_offered(driver, HR_APPROVED, "an approval").await?;
 
-    // Decided on what is shown now.
+    // Approving while the branch has moved again: the person is shown
+    // `moved`, the branch is already at `moved_again`, and the click sends
+    // the commit on screen. Anchored to the cadence boundary above: the panel
+    // was just read and cannot have read the newer move yet, so the refusal
+    // is proven, not raced against.
+    git(
+        &executed.worktree_path,
+        &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "moved again"],
+    )?;
+    let moved_again = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    assert_ne!(moved_again, moved, "the move must give the branch another commit");
+    await_approval(driver, HR_APPROVE, "Approve while the branch has moved").await?;
+    click(driver, HR_APPROVE, "Approve while the branch has moved").await?;
+    let refused =
+        await_text(driver, HR_ERROR, |t| t.contains("moved after it was shown"), "the refused approval").await?;
+    if !refused.contains("nothing was approved") {
+        bail!("the refusal does not say nothing was approved: {refused}");
+    }
+    // A refusal records nothing, and the panel then asks what the branch is
+    // now, so what is offered next is the branch as it is.
+    let task = read_task(driver, &executed).await?;
+    if task.pointer("/human_review/entries").and_then(Value::as_array).is_some_and(|e| !e.is_empty()) {
+        bail!("the refused approval was recorded: {task}");
+    }
+    assert_not_offered(driver, HR_APPROVED, "an approval that was refused").await?;
+    await_text(
+        driver,
+        HR_CURRENT_COMMIT,
+        |t| t.contains(&moved_again),
+        "the panel to read the branch after the refusal",
+    )
+    .await?;
+    await_text(driver, REVIEW_COMMIT, |t| t == &moved_again[..12], "the Changes tab to follow the refused branch").await?;
+
+    // Decided on what is shown now: the approval names the exact commit it
+    // covers.
     await_approval(driver, HR_APPROVE, "the approve action on the moved branch").await?;
     click(driver, HR_APPROVE, "Approve the commit on screen").await?;
-    ui::visible(driver, HR_APPROVED).await.context("the drawer does not say Approved")?;
+    let approved_line = await_text(
+        driver,
+        HR_APPROVED,
+        |t| t.contains("Approved for") && t.contains(&moved_again[..12]) && !t.contains("stale"),
+        "the approval to name the commit it covers",
+    )
+    .await?;
+    if attribute(driver, HR_APPROVED, "data-approval").await?.as_deref() != Some("current") {
+        bail!("a covering approval is not displayed as current: {approved_line}");
+    }
     let task = read_task(driver, &executed).await?;
     let approved = task
         .pointer("/human_review/entries/0/approved_tip")
         .and_then(Value::as_str)
         .context("the approval records no commit")?;
-    if approved != moved {
-        bail!("the approval records {approved}, the commit on screen was {moved}");
+    if approved != moved_again {
+        bail!("the approval records {approved}, the commit on screen was {moved_again}");
     }
     if !executed.worktree_path.join("pending-only.txt").is_file() {
         bail!("approving touched the uncommitted edits");
+    }
+
+    // The branch moves again, now after the approval. The panel flags the
+    // approval stale on its own cadence: the status line names the approved
+    // commit, the branch's tip now, and says stale, so it never keeps
+    // reading as if the current branch were approved. This is the assertion
+    // a hidden stale indicator fails.
+    git(
+        &executed.worktree_path,
+        &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "moved after the approval"],
+    )?;
+    let later = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    let stale_line = await_text(
+        driver,
+        HR_APPROVED,
+        |t| t.contains("stale") && t.contains(&approved[..12]) && t.contains(&later[..12]),
+        "the stale approval to be flagged",
+    )
+    .await?;
+    if attribute(driver, HR_APPROVED, "data-approval").await?.as_deref() != Some("stale") {
+        bail!("the stale status is not marked stale: {stale_line}");
+    }
+    if attribute(driver, HR_APPROVAL_STALE, "data-coverage").await?.as_deref() != Some("Moved") {
+        bail!("the stale approval does not report what the branch did");
+    }
+
+    // Renewing approves the branch as it is now: the stale flag disappears,
+    // the renewal becomes the current decision, and the earlier approval
+    // stays in the history without ever being shown as current again.
+    await_approval(driver, HR_APPROVE_AGAIN, "Approve the branch as it is now").await?;
+    click(driver, HR_APPROVE_AGAIN, "Approve the branch as it is now").await?;
+    await_absent_from_drawer(driver, HR_APPROVAL_STALE, "the stale flag after the renewal").await?;
+    let renewed = await_text(
+        driver,
+        HR_APPROVED,
+        |t| t.contains("Approved for") && t.contains(&later[..12]) && !t.contains("stale"),
+        "the renewed approval",
+    )
+    .await?;
+    if attribute(driver, HR_APPROVED, "data-approval").await?.as_deref() != Some("current") {
+        bail!("the renewed approval is not displayed as current: {renewed}");
+    }
+    let task = read_task(driver, &executed).await?;
+    let entries = task
+        .pointer("/human_review/entries")
+        .and_then(Value::as_array)
+        .context("the renewal left no review entries")?;
+    let kept = entries.first().and_then(|e| e.get("approved_tip")).and_then(Value::as_str);
+    let current = entries.last().and_then(|e| e.get("approved_tip")).and_then(Value::as_str);
+    if kept != Some(approved) {
+        bail!("the earlier approval did not stay in the history: the entries hold {entries:?}");
+    }
+    if current != Some(later.as_str()) {
+        bail!("the renewal did not record the branch as it is now: the entries hold {entries:?}");
     }
 
     // The board's Diff for the same Task names the same commit and the edits
@@ -1276,7 +1377,7 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
         .await
         .context("could not press the board's Diff")?;
     let heading = await_text(driver, "h2", |t| t.contains("commit"), "the board's Diff title").await?;
-    if !heading.contains(&moved[..12]) || !heading.contains("not approved") {
+    if !heading.contains(&later[..12]) || !heading.contains("not approved") {
         bail!("the board's Diff does not name the approved commit and the uncommitted edits: {heading}");
     }
     Ok(())

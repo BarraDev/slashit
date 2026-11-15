@@ -388,7 +388,9 @@ pub fn HumanReviewPanel(
     // changes no task record, so the answer above would go stale: an older
     // approval would keep looking current until the person tried something.
     // Asked on a cadence while the panel is shown, a moved branch is flagged
-    // on its own, and a decided panel learns the branch's commit again.
+    // on its own, and a decided panel learns the branch's commit again. The
+    // answer is read-only (it never exports the bookmark), so the cadence
+    // changes nothing but this panel's picture.
     {
         let ask = Closure::wrap(Box::new(ask_coverage) as Box<dyn Fn()>);
         let interval = web_sys::window().and_then(|w| {
@@ -413,6 +415,25 @@ pub fn HumanReviewPanel(
             if !viewed_tip.with_untracked(|v| viewed_matches(v.as_deref(), Some(&tip))) {
                 on_stale.run(());
             }
+        }
+    });
+    // A decided task whose approval no longer covers the branch offers
+    // approving the branch as it is now, and the person can only be shown
+    // that commit the same way: the tab follows it, keyed on the branch's
+    // commit alone, and read untracked, so a failed reload does not trigger
+    // another one.
+    Effect::new(move |_| {
+        if coverage
+            .with(|c| {
+                c.as_ref()
+                    .filter(|c| matches!(c.coverage, ApprovalCoverage::Moved | ApprovalCoverage::Unrecorded))
+                    .and_then(|c| c.branch_tip.clone())
+            })
+            .is_some_and(|tip| {
+                !viewed_tip.with_untracked(|v| viewed_matches(v.as_deref(), Some(tip.as_str())))
+            })
+        {
+            on_stale.run(());
         }
     });
     // Read at each use, so the controls follow both the availability answer and
@@ -615,6 +636,17 @@ pub fn HumanReviewPanel(
 
     let decision = Memo::new(move |_| {
         task.with(|t| t.as_ref().and_then(|t| t.human_review.current_decision().map(|e| e.decision)))
+    });
+    // Whether the last answer says the approval no longer covers the branch:
+    // while it does not, the approved status must not read as if the current
+    // branch were approved. An answer still being asked counts as current, so
+    // the status cannot flash stale while a read is in flight; the delivery
+    // checks the branch again before it publishes anything.
+    let approval_stale = Memo::new(move |_| {
+        coverage.with(|c| {
+            c.as_ref()
+                .is_some_and(|c| !matches!(c.coverage, ApprovalCoverage::Current | ApprovalCoverage::NotApplicable))
+        })
     });
     let in_review = Memo::new(move |_| task.with(|t| t.as_ref().is_some_and(|t| t.status == TaskStatus::HumanReview)));
     // The approved work is being integrated into a local branch, or already
@@ -874,15 +906,47 @@ pub fn HumanReviewPanel(
 
             // Approved: the decision, then delivery on its own line. The
             // commit the approval covers is named, so the decision always
-            // shows what it was about.
+            // shows what it was about. While the approval covers the branch
+            // the status reads as current; once it does not, the same line
+            // names both commits and says stale — a stale approval never
+            // keeps a green check as if the branch were approved. One
+            // persistent live region says both, so the change is announced.
             <Show when=move || decision.get() == Some(HumanReviewDecision::Approved)>
-                <p data-testid="human-review-approved" class="flex items-center gap-2 text-sm font-medium text-emerald-300">
-                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                    </svg>
+                <p
+                    data-testid="human-review-approved"
+                    role="status"
+                    data-approval=move || if approval_stale.get() { "stale" } else { "current" }
+                    class=move || if approval_stale.get() {
+                        "flex items-center gap-2 text-sm font-medium text-amber-200"
+                    } else {
+                        "flex items-center gap-2 text-sm font-medium text-emerald-300"
+                    }
+                >
+                    <Show when=move || approval_stale.get()>
+                        <svg class="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                        </svg>
+                    </Show>
+                    <Show when=move || !approval_stale.get()>
+                        <svg class="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                        </svg>
+                    </Show>
                     {move || {
-                        let tip = task.with(|t| t.as_ref().and_then(move |t| t.human_review.approved_tip().map(str::to_string)));
-                        approved_label(tip.as_deref())
+                        let stale = approval_stale.get();
+                        if stale {
+                            coverage.with(|c| {
+                                let (approved, current) = c
+                                    .as_ref()
+                                    .map_or((None, None), |c| (c.approved_tip.as_deref(), c.branch_tip.as_deref()));
+                                stale_heading(approved, current)
+                            })
+                        } else {
+                            let tip = task.with(|t| {
+                                t.as_ref().and_then(|t| t.human_review.approved_tip().map(str::to_string))
+                            });
+                            approved_label(tip.as_deref())
+                        }
                     }}
                 </p>
                 {move || coverage.get().filter(|c| !matches!(c.coverage, ApprovalCoverage::Current | ApprovalCoverage::NotApplicable)).map(|c| {
@@ -892,8 +956,9 @@ pub fn HumanReviewPanel(
                         .filter(|_| blocker.is_none());
                     let reason = c.reason.clone().unwrap_or_default();
                     view! {
+                        // The status line above already names both commits and
+                        // says stale; this box holds what to do about it.
                         <div data-testid="human-review-approval-stale" data-coverage=format!("{:?}", c.coverage) class="rounded-md border border-amber-500/20 bg-amber-500/[0.06] p-2 space-y-2">
-                            <p class="text-xs font-semibold text-amber-200">{stale_heading(c.approved_tip.as_deref(), c.branch_tip.as_deref())}</p>
                             <p class="text-xs text-white/70 whitespace-pre-wrap break-words">{reason}</p>
                             {blocker.map(|why| view! {
                                 <p data-testid="human-review-approve-again-unavailable" class="text-xs text-white/50">{why}</p>

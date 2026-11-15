@@ -9464,14 +9464,7 @@ pub(crate) async fn task_branch_tip(
     state: &crate::AppState,
     task_id: Uuid,
 ) -> Result<Option<String>, String> {
-    let branch = state
-        .task
-        .tasks
-        .read()
-        .await
-        .get(&task_id)
-        .and_then(|t| t.branch_name.clone())
-        .ok_or("This task has no branch recorded.")?;
+    let branch = task_branch(state, task_id).await?;
     let working_dir = resolve_repository_dir(state, task_id).await?;
     if is_jj_repo(&working_dir).await {
         run_cmd(
@@ -9483,6 +9476,63 @@ pub(crate) async fn task_branch_tip(
         .map_err(|e| format!("jj git export failed: {}", e))?;
     }
     git_branch_tip(&working_dir, &branch).await
+}
+
+/// The task's branch name, or an error when it records none.
+async fn task_branch(state: &crate::AppState, task_id: Uuid) -> Result<String, String> {
+    state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .and_then(|t| t.branch_name.clone())
+        .ok_or_else(|| "This task has no branch recorded.".to_string())
+}
+
+/// The tip of the task's branch, read without changing anything.
+///
+/// A question the panel may ask on a cadence while it is shown must not
+/// mutate the repository it watches, so this never runs `jj git export`: in a
+/// jj repository the bookmark is read through jj itself, whose answer is what
+/// the branch is now even before an export put it into Git's refs. `None`
+/// when the branch does not exist.
+pub(crate) async fn task_branch_tip_read_only(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<Option<String>, String> {
+    let branch = task_branch(state, task_id).await?;
+    let working_dir = resolve_repository_dir(state, task_id).await?;
+    if is_jj_repo(&working_dir).await {
+        jj_bookmark_tip(&working_dir, &branch).await
+    } else {
+        git_branch_tip(&working_dir, &branch).await
+    }
+}
+
+/// The commit the local bookmark `branch` names, read from jj alone and
+/// read-only: `--ignore-working-copy` also keeps the command from snapshotting
+/// the user's working copy. A name that matches no bookmark is `None`, not an
+/// error. `branch` has passed [`checked_task_branch`], whose character set
+/// cannot close the revset's quotes.
+async fn jj_bookmark_tip(working_dir: &str, branch: &str) -> Result<Option<String>, String> {
+    let branch = checked_task_branch(branch)?;
+    let tip = run_cmd(
+        "jj",
+        &[
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            &format!("bookmarks(exact:\"{branch}\")"),
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
+        working_dir,
+    )
+    .await
+    .map_err(|e| format!("Could not read the tip of branch `{branch}`: {e}"))?;
+    Ok((!tip.is_empty()).then_some(tip))
 }
 
 /// The `--git-dir` argument `git` needs in `working_dir`: the Git repository
@@ -12536,6 +12586,63 @@ mod tests {
                     &[&git_dir, "config", "branch.task-branch.merge"]
                 ),
                 "refs/heads/task-branch"
+            );
+        }
+
+        /// The read-only branch tip reads jj's bookmark, not Git's refs, so a
+        /// bookmark that moved since the last export is reported where it is
+        /// now — and nothing is exported by the read itself: the backing Git
+        /// repository never gains the branch. The panel may ask this on a
+        /// cadence, and a cadence must not export.
+        #[tokio::test]
+        async fn jj_bookmark_tip_is_read_without_an_export() {
+            let repo = NonColocatedJj::new("task-branch");
+            // Move the bookmark with jj alone. Git's refs in the backing
+            // repository were never exported in the first place, so this is
+            // the shape of a branch that moved since the last export.
+            jj_as_test_user(&repo.workspace, &["new", "-m", "moved on"]);
+            jj(
+                &repo.workspace,
+                &[
+                    "--ignore-working-copy",
+                    "bookmark",
+                    "set",
+                    "task-branch",
+                    "-r",
+                    "@-",
+                ],
+            );
+            let moved = jj(
+                &repo.workspace,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                    "-r",
+                    "task-branch",
+                ],
+            );
+            assert_ne!(moved, repo.task_sha, "the fixture must have moved the bookmark");
+
+            let tip = jj_bookmark_tip(repo.dir(), "task-branch").await.expect("the tip is read");
+            assert_eq!(tip.as_deref(), Some(moved.as_str()), "the tip is the bookmark, not Git's stale refs");
+            let git_dir = format!("--git-dir={}", repo.git_dir().display());
+            let refs = StdCommand::new("git")
+                .args([&git_dir, "for-each-ref", "refs/heads/task-branch"])
+                .current_dir(&repo.workspace)
+                .output()
+                .expect("for-each-ref");
+            assert!(
+                String::from_utf8_lossy(&refs.stdout).trim().is_empty(),
+                "the read must not export the bookmark into Git's refs"
+            );
+
+            // A branch the repository does not have is `None`, not an error.
+            assert_eq!(
+                jj_bookmark_tip(repo.dir(), "task-gone").await.expect("read"),
+                None
             );
         }
 

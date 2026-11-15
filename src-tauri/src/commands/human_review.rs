@@ -218,11 +218,13 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
         // Not approved yet: name the commit an approval would record now, so
         // the person can see it before deciding. A failed read is an error, so
         // the panel can say so and offer a retry; a branch that does not exist
-        // is `Ok(None)`, which the panel reports as a missing branch.
-        let branch_tip = crate::commands::pr::task_branch_tip(state, task_id).await?;
+        // is `Ok(None)`, which the panel reports as a missing branch. Read
+        // without touching the repository: this is asked again while the panel
+        // is shown, and a read must not export.
+        let branch_tip = crate::commands::pr::task_branch_tip_read_only(state, task_id).await?;
         return Ok(ApprovalStatus { branch_tip, ..none(ApprovalCoverage::NotApplicable) });
     }
-    let branch_tip = crate::commands::pr::task_branch_tip(state, task_id).await?;
+    let branch_tip = crate::commands::pr::task_branch_tip_read_only(state, task_id).await?;
     let refusal = match task.human_review.binds(true, branch_tip.as_deref()) {
         Ok(()) => return Ok(ApprovalStatus { branch_tip, ..none(ApprovalCoverage::Current) }),
         Err(refusal) => refusal,
