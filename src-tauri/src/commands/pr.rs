@@ -25,7 +25,7 @@ mod unconfirmed;
 pub use unconfirmed::*;
 
 /// Parse a GitHub PR URL into an ExternalRef::GithubPr
-fn parse_pr_url_to_ref(pr_url: &str) -> Option<ExternalRef> {
+pub(crate) fn parse_pr_url_to_ref(pr_url: &str) -> Option<ExternalRef> {
     let parts: Vec<&str> = pr_url.trim_end_matches('/').split('/').collect();
     let pull_idx = parts.iter().position(|&p| p == "pull")?;
     let gh_idx = parts.iter().position(|&p| p == "github.com")?;

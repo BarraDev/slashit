@@ -223,21 +223,25 @@ fn published_head(entry: Option<&crate::pr_status::PrStatusEntry>, now: chrono::
     }
 }
 
-/// The pull request the Task publishes to: the GitHub reference its `pr_url`
-/// names, or else its first one.
-fn published_key(task: &Task) -> Option<crate::pr_status::PrKey> {
-    let refs: Vec<(&str, &str, u32)> = task
-        .external_refs
-        .iter()
-        .filter_map(|r| match r {
-            crate::domain::ExternalRef::GithubPr { url, repo, number, .. } => Some((url.as_str(), repo.as_str(), *number)),
-            _ => None,
-        })
-        .collect();
-    refs.iter()
-        .find(|(url, _, _)| task.pr_url.as_deref() == Some(url))
-        .or(refs.first())
-        .map(|(_, repo, number)| crate::pr_status::PrKey::new(*repo, *number))
+/// The pull request the Task publishes to, as the status cache keys it. `None`
+/// when the Task has no pull request. The address is the Task's own `pr_url`,
+/// or its first GitHub reference when no `pr_url` is recorded. A recorded
+/// address whose reference is missing is read from the URL itself, so a Task
+/// linked by `pr_url` alone is still checked. An address that cannot be read
+/// is an error, which the panel reports as unverified.
+fn published_key(task: &Task) -> Option<Result<crate::pr_status::PrKey, String>> {
+    let address = task.authoritative_pr_url()?;
+    let referenced = task.external_refs.iter().find_map(|r| match r {
+        crate::domain::ExternalRef::GithubPr { url, repo, number, .. } if url == address => {
+            Some(crate::pr_status::PrKey::new(repo.as_str(), *number))
+        }
+        _ => None,
+    });
+    let key = referenced.or_else(|| match crate::commands::pr::parse_pr_url_to_ref(address)? {
+        crate::domain::ExternalRef::GithubPr { repo, number, .. } => Some(crate::pr_status::PrKey::new(repo, number)),
+        _ => None,
+    });
+    Some(key.ok_or_else(|| "the pull request's address cannot be read as a GitHub pull request".to_string()))
 }
 
 #[cfg(test)]
@@ -304,6 +308,27 @@ mod published_head_tests {
         old.fetched_at = Some(now - chrono::Duration::seconds(PUBLISHED_HEAD_FRESH_SECONDS));
         assert_eq!(published_head(Some(&old), now).head.as_deref(), Some(HEAD), "a head at the limit is still fresh");
     }
+
+    /// A Task linked by `pr_url` alone is still checked at the address it names,
+    /// and an address that is not a GitHub pull request is an error, not no pull request.
+    #[test]
+    fn a_task_linked_only_by_its_pr_url_is_checked_at_that_address() {
+        let mut task = crate::test_helpers::create_test_task_full(
+            "published",
+            uuid::Uuid::new_v4(),
+            crate::domain::TaskStatus::PrCreated,
+            0,
+        );
+        task.pr_url = Some("https://github.com/BarraDev/slashit/pull/355".to_string());
+        let key = published_key(&task).expect("a pull request is recorded").expect("its address is readable");
+        assert_eq!(key, crate::pr_status::PrKey::new("BarraDev/slashit", 355));
+
+        task.pr_url = Some("https://example.com/not-github".to_string());
+        assert!(published_key(&task).expect("a pull request is recorded").is_err());
+
+        task.pr_url = None;
+        assert!(published_key(&task).is_none(), "no pull request is recorded");
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -347,7 +372,10 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
     let task = current(state, task_id).await.ok_or("Task not found")?;
     let approved_tip = task.human_review.approved_tip().map(str::to_string);
     // Read from the status cache: no GitHub request and no repository access.
-    let published = published_key(&task).map(|key| published_head(state.pr_statuses.get(&key).as_ref(), chrono::Utc::now()));
+    let published = published_key(&task).map(|key| match key {
+        Ok(key) => published_head(state.pr_statuses.get(&key).as_ref(), chrono::Utc::now()),
+        Err(why) => PublishedHead { head: None, observed_at: None, unverified: Some(why) },
+    });
     let none = |coverage| ApprovalStatus {
         coverage,
         approved_tip: approved_tip.clone(),
