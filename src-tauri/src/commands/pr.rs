@@ -9533,10 +9533,16 @@ pub(crate) async fn task_branch_tip_read_only(
 /// export does not write the stale bookmark back over Git's commit. A
 /// non-colocated repository has no Git writer, so its jj bookmark is the answer.
 async fn branch_tip_read_only(working_dir: &str, branch: &str) -> Result<Option<String>, String> {
-    if is_jj_repo(working_dir).await && !jj_repo_is_colocated(working_dir).await {
-        jj_bookmark_tip(working_dir, branch).await
-    } else {
+    if !is_jj_repo(working_dir).await {
+        return git_branch_tip(working_dir, branch).await;
+    }
+    // A conflicted bookmark has no tip in either shape, so it is refused before
+    // Git's ref is returned: jj can leave Git's ref on one side of the conflict.
+    let by_jj = jj_bookmark_tip(working_dir, branch).await?;
+    if jj_repo_is_colocated(working_dir).await {
         git_branch_tip(working_dir, branch).await
+    } else {
+        Ok(by_jj)
     }
 }
 
@@ -12851,6 +12857,34 @@ mod tests {
 
             let tip = branch_tip_read_only(repo.dir(), "task-branch").await.expect("the tip is read");
             assert_eq!(tip.as_deref(), Some(repo.task_sha.as_str()));
+        }
+
+        /// A conflicted bookmark in a colocated repository has no tip, even
+        /// though Git's ref still names one of its commits.
+        #[tokio::test]
+        async fn colocated_tip_refuses_a_conflicted_bookmark() {
+            let repo = ColocatedJj::new("task-branch");
+            let base = repo.task_sha.clone();
+            jj_as_test_user(&repo.root, &["new", "-r", &base, "-m", "left"]);
+            let left = jj(&repo.root, &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "@"]);
+            jj_as_test_user(&repo.root, &["new", "-r", &base, "-m", "right"]);
+            let right = jj(&repo.root, &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "@"]);
+            let before = jj(&repo.root, &["op", "log", "--no-graph", "-n", "1", "-T", "self.id()"]);
+            jj_as_test_user(&repo.root, &["bookmark", "set", "task-branch", "-r", &left]);
+            jj_as_test_user(
+                &repo.root,
+                &["--ignore-working-copy", "bookmark", "set", "task-branch", "-r", &right, "--at-op", &before],
+            );
+            let named = jj(
+                &repo.root,
+                &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id ++ \"\\n\"", "-r", "bookmarks(exact:\"task-branch\")"],
+            );
+            assert_eq!(named.lines().count(), 2, "the fixture must have conflicted the bookmark: {named}");
+
+            let err = branch_tip_read_only(repo.dir(), "task-branch")
+                .await
+                .expect_err("a conflicted bookmark has no tip");
+            assert!(err.contains("conflicted"), "{err}");
         }
 
         /// A non-colocated jj repository has no Git writer, so its bookmark is

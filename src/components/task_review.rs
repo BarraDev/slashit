@@ -317,7 +317,12 @@ enum CoverageView {
     Unknown,
 }
 
-fn coverage_view(status: Option<&ApprovalStatus>, has_branch: bool) -> CoverageView {
+fn coverage_view(status: Option<&ApprovalStatus>, has_branch: bool, approved_now: Option<&str>) -> CoverageView {
+    // An answer names the approval it was read for. After a renewal, the answer
+    // for the earlier approval says nothing about the new one.
+    if status.is_some_and(|s| s.approved_tip.as_deref() != approved_now) {
+        return CoverageView::Unknown;
+    }
     match status.map(|s| s.coverage) {
         Some(ApprovalCoverage::Current) => CoverageView::Current,
         // Only a task without a branch has nothing to bind the approval to.
@@ -752,8 +757,12 @@ pub fn HumanReviewPanel(
     // it as stale; a missing or failed read shows it as unverified. The
     // delivery checks the branch again before it publishes anything.
     let approval_view = Memo::new(move |_| {
-        let has_branch = task.with(|t| t.as_ref().is_some_and(|t| t.branch_name.is_some()));
-        coverage.with(|c| coverage_view(c.as_ref(), has_branch))
+        let (has_branch, approved) = task.with(|t| {
+            t.as_ref().map_or((false, None), |t| {
+                (t.branch_name.is_some(), t.human_review.approved_tip().map(str::to_string))
+            })
+        });
+        coverage.with(|c| coverage_view(c.as_ref(), has_branch, approved.as_deref()))
     });
     let in_review = Memo::new(move |_| task.with(|t| t.as_ref().is_some_and(|t| t.status == TaskStatus::HumanReview)));
     // The approved work is being integrated into a local branch, or already
@@ -1646,9 +1655,23 @@ mod tests {
         assert!(reads.start(true).is_some());
     }
 
+    /// The view for an answer read for the current approval.
     fn view(coverage: Option<ApprovalCoverage>, has_branch: bool) -> CoverageView {
-        let status = coverage.map(|c| answer(c, None));
-        coverage_view(status.as_ref(), has_branch)
+        let approved = "a".repeat(40);
+        let status = coverage.map(|c| ApprovalStatus { approved_tip: Some(approved.clone()), ..answer(c, None) });
+        coverage_view(status.as_ref(), has_branch, Some(&approved))
+    }
+
+    /// An answer read for an earlier approval says nothing about a renewed one,
+    /// even when it reads as current or stale.
+    #[test]
+    fn an_answer_for_an_earlier_approval_is_unknown_for_the_renewed_one() {
+        let (earlier, renewed) = ("a".repeat(40), "b".repeat(40));
+        for coverage in [ApprovalCoverage::Current, ApprovalCoverage::Moved] {
+            let status = ApprovalStatus { approved_tip: Some(earlier.clone()), ..answer(coverage, None) };
+            assert_eq!(coverage_view(Some(&status), true, Some(&renewed)), CoverageView::Unknown, "{coverage:?}");
+            assert_ne!(coverage_view(Some(&status), true, Some(&earlier)), CoverageView::Unknown, "{coverage:?}");
+        }
     }
 
     /// CR4: an unknown or failed read is never the current approval. The sequence
