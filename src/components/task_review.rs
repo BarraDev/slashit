@@ -34,22 +34,25 @@ const VISIBLE_FINDINGS: usize = 8;
 /// person tried something.
 const COVERAGE_POLL_MS: i32 = 5_000;
 
-/// The localStorage key the acceptance harness sets to hold this cadence for
+/// The window property the acceptance harness sets to hold this cadence for
 /// one step of its journey. It proves that approving a commit the branch has
 /// left is refused, which needs the branch to move after the panel read it
 /// and before the person clicks; without a hold, a poll landing between the
 /// move and the click would learn the move first and approve it, so whether
-/// the refusal was proven would be a race. While the key is present the panel
-/// asks nothing on its own and publishes no answer, so what a person is shown
-/// is frozen. Production never sets the key.
-const COVERAGE_POLL_HOLD_KEY: &str = "slashit-coverage-poll-hold";
+/// the refusal was proven would be a race. While it is set the panel asks
+/// nothing on its own and publishes no answer, so what a person is shown is
+/// frozen. Production never sets it.
+///
+/// It lives on the page, not in localStorage: a value written to storage would
+/// survive a restart and freeze the approval display in a profile that is no
+/// longer under test. A page load clears it.
+const COVERAGE_POLL_HOLD: &str = "__slashitCoveragePollHold";
 
 /// Whether the coverage cadence is being held by the acceptance harness.
 fn coverage_poll_held() -> bool {
     web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|s| s.get_item(COVERAGE_POLL_HOLD_KEY).ok().flatten())
-        .is_some()
+        .and_then(|w| js_sys::Reflect::get(w.as_ref(), &COVERAGE_POLL_HOLD.into()).ok())
+        .is_some_and(|held| held.is_truthy())
 }
 
 /// Where the pull request for approved changes stands.
@@ -268,6 +271,64 @@ fn displayed_tip(status: Option<&ApprovalStatus>) -> Option<String> {
         .and_then(|s| s.branch_tip.clone())
 }
 
+/// The coverage reads the panel has started, and whether the latest one is still
+/// running. Only the latest read may publish, because an older answer describes
+/// a branch state the panel has since asked about again. A cadence tick starts
+/// nothing while the latest read runs: otherwise a read that outlasts the tick
+/// would be superseded by every tick and never shown.
+#[derive(Debug, Default)]
+struct CoverageReads {
+    started: u32,
+    latest_running: bool,
+}
+
+impl CoverageReads {
+    /// Starts a read and returns its number, or `None` when a cadence tick finds
+    /// the latest read still running.
+    fn start(&mut self, cadence: bool) -> Option<u32> {
+        if cadence && self.latest_running {
+            return None;
+        }
+        self.started += 1;
+        self.latest_running = true;
+        Some(self.started)
+    }
+
+    /// Whether the answer to `read` may be published. Only the latest read
+    /// finishes the running one, so a superseded answer cannot release a read
+    /// that is still running.
+    fn finish(&mut self, read: u32) -> bool {
+        if read != self.started {
+            return false;
+        }
+        self.latest_running = false;
+        true
+    }
+}
+
+/// What the panel may say about an approval, read from the latest coverage
+/// answer. Only a read that names the approval current says current. A missing
+/// read is unknown, never current, and a stale answer from before the approval
+/// is unknown too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverageView {
+    Current,
+    Stale,
+    Unknown,
+}
+
+fn coverage_view(status: Option<&ApprovalStatus>, has_branch: bool) -> CoverageView {
+    match status.map(|s| s.coverage) {
+        Some(ApprovalCoverage::Current) => CoverageView::Current,
+        // Only a task without a branch has nothing to bind the approval to.
+        Some(ApprovalCoverage::NotApplicable) if !has_branch => CoverageView::Current,
+        Some(
+            ApprovalCoverage::Moved | ApprovalCoverage::Unrecorded | ApprovalCoverage::BranchMissing,
+        ) => CoverageView::Stale,
+        Some(ApprovalCoverage::NotApplicable) | None => CoverageView::Unknown,
+    }
+}
+
 /// Whether the branch has no commit because the repository does not have it.
 /// A read error is not this: it is shown as an error, with a retry.
 fn branch_not_found(status: Option<&ApprovalStatus>) -> bool {
@@ -323,6 +384,15 @@ fn stale_heading(approved: Option<&str>, current: Option<&str>) -> String {
     }
 }
 
+/// The heading when the branch could not be checked against the approval. It
+/// names the approved commit but never says the approval is current.
+fn unverified_heading(approved: Option<&str>) -> String {
+    match approved {
+        Some(approved) => format!("Approved for {}; not verified against the branch", short(approved)),
+        None => "Approved; not verified against the branch".to_string(),
+    }
+}
+
 /// The decision section for a task in Human Review, and what became of an
 /// approval once the task has moved on to its pull request.
 #[component]
@@ -363,22 +433,27 @@ pub fn HumanReviewPanel(
     // Kept apart from `error`, which an action clears: a failed read clears
     // itself when a later read succeeds.
     let coverage_error = RwSignal::new(None::<String>);
-    let asked = StoredValue::new(0u32);
+    let reads = StoredValue::new(CoverageReads::default());
     // Asks what the branch is now. Only the latest question's answer is kept.
-    let ask_coverage = move || {
+    // `cadence` is the poll's tick: it starts nothing while a read runs.
+    let ask_coverage_read = move |cadence: bool| {
         // A held cadence asks nothing: the panel keeps what it showed when
         // the hold began, so an acceptance step can move the branch and click
         // without the panel having read the move.
         if coverage_poll_held() {
             return;
         }
-        let ask = asked.try_update_value(|n| { *n += 1; *n }).unwrap_or(0);
+        let Some(read) = reads.try_update_value(|r| r.start(cadence)).flatten() else {
+            return;
+        };
         spawn_local(async move {
             let answer = get_approval_status(task_id.to_string()).await;
-            if asked.try_get_value() != Some(ask) {
+            // Clears the running read only when it is the latest, so an
+            // answer that is superseded still publishes nothing.
+            if !reads.try_update_value(|r| r.finish(read)).unwrap_or(false) {
                 return;
             }
-            // An ask that was in flight when the hold began may have read the
+            // A read that was in flight when the hold began may have read the
             // branch after the hold began, so it must not publish either.
             if coverage_poll_held() {
                 return;
@@ -409,6 +484,7 @@ pub fn HumanReviewPanel(
             }
         });
     };
+    let ask_coverage = move || ask_coverage_read(false);
     Effect::new(move |_| {
         task.track();
         ask_coverage();
@@ -421,7 +497,7 @@ pub fn HumanReviewPanel(
     // answer is read-only (it never exports the bookmark), so the cadence
     // changes nothing but this panel's picture.
     {
-        let ask = Closure::wrap(Box::new(ask_coverage) as Box<dyn Fn()>);
+        let ask = Closure::wrap(Box::new(move || ask_coverage_read(true)) as Box<dyn Fn()>);
         let interval = web_sys::window().and_then(|w| {
             w.set_interval_with_callback_and_timeout_and_arguments_0(
                 ask.as_ref().unchecked_ref(),
@@ -671,16 +747,13 @@ pub fn HumanReviewPanel(
     let decision = Memo::new(move |_| {
         task.with(|t| t.as_ref().and_then(|t| t.human_review.current_decision().map(|e| e.decision)))
     });
-    // Whether the last answer says the approval no longer covers the branch:
-    // while it does not, the approved status must not read as if the current
-    // branch were approved. An answer still being asked counts as current, so
-    // the status cannot flash stale while a read is in flight; the delivery
-    // checks the branch again before it publishes anything.
-    let approval_stale = Memo::new(move |_| {
-        coverage.with(|c| {
-            c.as_ref()
-                .is_some_and(|c| !matches!(c.coverage, ApprovalCoverage::Current | ApprovalCoverage::NotApplicable))
-        })
+    // What the approved status may claim, from the latest answer. Only a read
+    // that names the approval current shows it as current; a stale answer shows
+    // it as stale; a missing or failed read shows it as unverified. The
+    // delivery checks the branch again before it publishes anything.
+    let approval_view = Memo::new(move |_| {
+        let has_branch = task.with(|t| t.as_ref().is_some_and(|t| t.branch_name.is_some()));
+        coverage.with(|c| coverage_view(c.as_ref(), has_branch))
     });
     let in_review = Memo::new(move |_| task.with(|t| t.as_ref().is_some_and(|t| t.status == TaskStatus::HumanReview)));
     // The approved work is being integrated into a local branch, or already
@@ -949,37 +1022,40 @@ pub fn HumanReviewPanel(
                 <p
                     data-testid="human-review-approved"
                     role="status"
-                    data-approval=move || if approval_stale.get() { "stale" } else { "current" }
-                    class=move || if approval_stale.get() {
-                        "flex items-center gap-2 text-sm font-medium text-amber-200"
-                    } else {
+                    data-approval=move || match approval_view.get() {
+                        CoverageView::Current => "current",
+                        CoverageView::Stale => "stale",
+                        CoverageView::Unknown => "unknown",
+                    }
+                    class=move || if approval_view.get() == CoverageView::Current {
                         "flex items-center gap-2 text-sm font-medium text-emerald-300"
+                    } else {
+                        "flex items-center gap-2 text-sm font-medium text-amber-200"
                     }
                 >
-                    <Show when=move || approval_stale.get()>
-                        <svg class="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
-                        </svg>
-                    </Show>
-                    <Show when=move || !approval_stale.get()>
+                    <Show when=move || approval_view.get() == CoverageView::Current>
                         <svg class="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
                         </svg>
                     </Show>
+                    <Show when=move || approval_view.get() != CoverageView::Current>
+                        <svg class="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                        </svg>
+                    </Show>
                     {move || {
-                        let stale = approval_stale.get();
-                        if stale {
-                            coverage.with(|c| {
+                        let tip = task.with(|t| {
+                            t.as_ref().and_then(|t| t.human_review.approved_tip().map(str::to_string))
+                        });
+                        match approval_view.get() {
+                            CoverageView::Stale => coverage.with(|c| {
                                 let (approved, current) = c
                                     .as_ref()
                                     .map_or((None, None), |c| (c.approved_tip.as_deref(), c.branch_tip.as_deref()));
                                 stale_heading(approved, current)
-                            })
-                        } else {
-                            let tip = task.with(|t| {
-                                t.as_ref().and_then(|t| t.human_review.approved_tip().map(str::to_string))
-                            });
-                            approved_label(tip.as_deref())
+                            }),
+                            CoverageView::Unknown => unverified_heading(tip.as_deref()),
+                            CoverageView::Current => approved_label(tip.as_deref()),
                         }
                     }}
                 </p>
@@ -1515,5 +1591,102 @@ mod tests {
         assert!(!viewed_matches(Some(&a), Some(&b)));
         // The tab shows a commit but none is offered to approve.
         assert!(!viewed_matches(Some(&a), None));
+    }
+
+    /// CR3: a read longer than the cadence is still published. Every tick
+    /// during it starts nothing, so the answer is not superseded.
+    #[test]
+    fn a_read_longer_than_the_cadence_is_published() {
+        let mut reads = CoverageReads::default();
+        let read = reads.start(false).expect("the read starts");
+        for _ in 0..5 {
+            assert_eq!(reads.start(true), None, "a tick must not start over a running read");
+        }
+        assert!(reads.finish(read), "the only read's answer is published");
+        assert!(reads.start(true).is_some(), "the cadence resumes once the read finished");
+    }
+
+    /// CR3: a task change during a read supersedes it, and only the newer answer
+    /// is published, whichever completes first.
+    #[test]
+    fn a_newer_read_supersedes_an_older_one_in_either_completion_order() {
+        let mut reads = CoverageReads::default();
+        let older = reads.start(true).unwrap();
+        let newer = reads.start(false).unwrap();
+        assert!(reads.finish(newer), "the latest answer publishes first");
+        assert!(!reads.finish(older), "the superseded answer arrives late and publishes nothing");
+
+        let mut reads = CoverageReads::default();
+        let older = reads.start(true).unwrap();
+        let newer = reads.start(false).unwrap();
+        assert!(!reads.finish(older), "the superseded answer arrives first and publishes nothing");
+        assert!(reads.finish(newer));
+    }
+
+    /// CR3: a superseded read that finishes must not release the cadence while
+    /// the latest read still runs.
+    #[test]
+    fn a_superseded_read_does_not_release_a_running_latest_read() {
+        let mut reads = CoverageReads::default();
+        let older = reads.start(true).unwrap();
+        let newer = reads.start(false).unwrap();
+        assert!(!reads.finish(older));
+        assert_eq!(reads.start(true), None, "the latest read is still running");
+        assert!(reads.finish(newer));
+        assert!(reads.start(true).is_some());
+    }
+
+    /// CR3: a failed read is the latest answer too, so it clears the running
+    /// read like any other, and the next tick asks again.
+    #[test]
+    fn a_failed_read_clears_the_running_read() {
+        let mut reads = CoverageReads::default();
+        let read = reads.start(true).unwrap();
+        assert!(reads.finish(read));
+        assert!(reads.start(true).is_some());
+    }
+
+    fn view(coverage: Option<ApprovalCoverage>, has_branch: bool) -> CoverageView {
+        let status = coverage.map(|c| answer(c, None));
+        coverage_view(status.as_ref(), has_branch)
+    }
+
+    /// CR4: an unknown or failed read is never the current approval. The sequence
+    /// the panel goes through: unknown, current, moved, failed after moved,
+    /// failed after current, recovered.
+    #[test]
+    fn coverage_states_are_current_stale_or_unknown_and_never_current_by_default() {
+        assert_eq!(view(None, true), CoverageView::Unknown, "before any read");
+        assert_eq!(view(Some(ApprovalCoverage::Current), true), CoverageView::Current);
+        assert_eq!(view(Some(ApprovalCoverage::Moved), true), CoverageView::Stale);
+        // A failed read clears the answer, so the view is unknown, not current.
+        assert_eq!(view(None, true), CoverageView::Unknown, "a failed read after a moved branch");
+        assert_eq!(view(None, true), CoverageView::Unknown, "a failed read after a current branch");
+        assert_eq!(view(Some(ApprovalCoverage::Current), true), CoverageView::Current, "recovered");
+    }
+
+    #[test]
+    fn stale_answers_are_stale_and_an_unrecorded_approval_is_too() {
+        for coverage in [ApprovalCoverage::Moved, ApprovalCoverage::Unrecorded, ApprovalCoverage::BranchMissing] {
+            assert_eq!(view(Some(coverage), true), CoverageView::Stale, "{coverage:?}");
+        }
+    }
+
+    /// A pre-approval answer for a branch names no approval, so it does not show
+    /// the approval as current. Only a task without a branch has nothing to bind.
+    #[test]
+    fn an_undecided_answer_does_not_verify_a_new_approval() {
+        assert_eq!(view(Some(ApprovalCoverage::NotApplicable), true), CoverageView::Unknown);
+        assert_eq!(view(Some(ApprovalCoverage::NotApplicable), false), CoverageView::Current);
+    }
+
+    #[test]
+    fn an_unverified_heading_names_the_commit_but_never_says_current() {
+        let approved = "a".repeat(40);
+        let heading = unverified_heading(Some(&approved));
+        assert!(heading.contains(&approved[..12]), "{heading}");
+        assert!(heading.contains("not verified"), "{heading}");
+        assert!(!heading.contains("current"), "{heading}");
+        assert!(unverified_heading(None).contains("not verified"));
     }
 }

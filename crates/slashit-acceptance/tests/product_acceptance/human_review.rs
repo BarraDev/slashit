@@ -202,24 +202,24 @@ pub(super) async fn click(driver: &WebDriver, selector: &str, what: &str) -> Res
         .with_context(|| format!("could not press {what}"))
 }
 
-/// The localStorage key the Human Review panel reads to hold its coverage
-/// cadence (`src/components/task_review.rs`): while it is present the panel
-/// asks nothing on the cadence and publishes no answer, so what a person is
-/// shown is frozen. Held for exactly the one step of
-/// [`changes_scope`] that needs the panel not to learn a branch move on its
-/// own, so that step's refusal is proven rather than raced against.
-const COVERAGE_POLL_HOLD: &str = "slashit-coverage-poll-hold";
+/// The window property the Human Review panel reads to hold its coverage
+/// cadence (`src/components/task_review.rs`): while it is set the panel asks
+/// nothing on the cadence and publishes no answer, so what a person is shown
+/// is frozen. Held for exactly the one step of [`changes_scope`] that needs the
+/// panel not to learn a branch move on its own, so that step's refusal is
+/// proven rather than raced against. It is page-scoped, so a reload clears it.
+const COVERAGE_POLL_HOLD: &str = "__slashitCoveragePollHold";
 
 async fn hold_coverage_poll(driver: &WebDriver) -> Result<()> {
     page(
         driver,
-        "localStorage.setItem(arguments[0], '1'); return true;",
+        "window[arguments[0]] = true; return true;",
         vec![Value::String(COVERAGE_POLL_HOLD.to_owned())],
     )
     .await?;
     if page(
         driver,
-        "return localStorage.getItem(arguments[0]) === '1';",
+        "return window[arguments[0]] === true;",
         vec![Value::String(COVERAGE_POLL_HOLD.to_owned())],
     )
     .await?
@@ -233,7 +233,7 @@ async fn hold_coverage_poll(driver: &WebDriver) -> Result<()> {
 async fn release_coverage_poll(driver: &WebDriver) -> Result<()> {
     page(
         driver,
-        "localStorage.removeItem(arguments[0]); return true;",
+        "delete window[arguments[0]]; return true;",
         vec![Value::String(COVERAGE_POLL_HOLD.to_owned())],
     )
     .await?;
@@ -304,6 +304,38 @@ async fn await_gone(driver: &WebDriver, selector: &str, what: &str) -> Result<()
         tokio::time::sleep(POLL).await;
     }
     Ok(())
+}
+
+/// Saves a PNG of the window to `SLASHIT_HUMAN_REVIEW_SCREENSHOT_DIR/<name>.png`
+/// when that variable is set, as visual evidence. It asserts nothing and does
+/// nothing when the variable is unset.
+async fn capture_evidence(driver: &WebDriver, name: &str) -> Result<()> {
+    let Some(dir) = std::env::var_os("SLASHIT_HUMAN_REVIEW_SCREENSHOT_DIR") else {
+        return Ok(());
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+    driver
+        .screenshot(&dir.join(format!("{name}.png")))
+        .await
+        .with_context(|| format!("could not save the screenshot {name}"))
+}
+
+/// Waits until the approved status says `expected`. The panel reaches
+/// `current` only after its own read of the branch, so a check made right after
+/// the approval would read the answer from before it.
+async fn await_data_approval(driver: &WebDriver, expected: &str, what: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let found = attribute(driver, HR_APPROVED, "data-approval").await?;
+        if found.as_deref() == Some(expected) {
+            return Ok(());
+        }
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("{what}: the approved status is {found:?}, not {expected:?}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 pub(super) async fn open_reviewed_drawer(driver: &WebDriver, executed: &ExecutedTask) -> Result<()> {
@@ -1342,9 +1374,8 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
         "the approval to name the commit it covers",
     )
     .await?;
-    if attribute(driver, HR_APPROVED, "data-approval").await?.as_deref() != Some("current") {
-        bail!("a covering approval is not displayed as current: {approved_line}");
-    }
+    await_data_approval(driver, "current", &format!("a covering approval, shown as: {approved_line}")).await?;
+    capture_evidence(driver, &format!("A-current-approval-of-{}", &moved_again[..12])).await?;
     let task = read_task(driver, &executed).await?;
     let approved = task
         .pointer("/human_review/entries/0/approved_tip")
@@ -1374,9 +1405,8 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
         "the stale approval to be flagged",
     )
     .await?;
-    if attribute(driver, HR_APPROVED, "data-approval").await?.as_deref() != Some("stale") {
-        bail!("the stale status is not marked stale: {stale_line}");
-    }
+    await_data_approval(driver, "stale", &format!("the stale status, shown as: {stale_line}")).await?;
+    capture_evidence(driver, &format!("B-stale-approved-{}-branch-now-{}", &approved[..12], &later[..12])).await?;
     if attribute(driver, HR_APPROVAL_STALE, "data-coverage").await?.as_deref() != Some("Moved") {
         bail!("the stale approval does not report what the branch did");
     }
@@ -1394,9 +1424,8 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
         "the renewed approval",
     )
     .await?;
-    if attribute(driver, HR_APPROVED, "data-approval").await?.as_deref() != Some("current") {
-        bail!("the renewed approval is not displayed as current: {renewed}");
-    }
+    await_data_approval(driver, "current", &format!("the renewed approval, shown as: {renewed}")).await?;
+    capture_evidence(driver, &format!("C-renewed-approval-of-{}", &later[..12])).await?;
     let task = read_task(driver, &executed).await?;
     let entries = task
         .pointer("/human_review/entries")

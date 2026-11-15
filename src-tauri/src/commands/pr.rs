@@ -255,14 +255,34 @@ fn jj_exact_bookmark_revset(branch: &str) -> String {
     format!("exactly(bookmarks(exact:\"{branch}\"), 1)")
 }
 
+/// Whether `working_dir` is a jj repository that owns its branches. A Git
+/// repository nested strictly inside the jj workspace is Git's: `jj root`
+/// still finds the outer workspace, but a bookmark of the same name there is
+/// a different branch.
 async fn is_jj_repo(working_dir: &str) -> bool {
-    crate::host_process::tokio_command(program("jj"))
+    let in_jj = crate::host_process::tokio_command(program("jj"))
         .args(["root"])
         .current_dir(working_dir)
         .output()
         .await
         .map(|output| output.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    in_jj && !matches!(git_and_jj_roots(working_dir).await, Some((git, jj)) if git != jj && git.starts_with(&jj))
+}
+
+/// Git's top level and the jj workspace root for `working_dir`, both
+/// canonical. `None` when either is not found. Equal roots mean a colocated
+/// repository; a Git top level inside the jj root means a nested Git repository.
+async fn git_and_jj_roots(working_dir: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let git_top = run_cmd("git", &["rev-parse", "--show-toplevel"], working_dir).await.ok()?;
+    let jj_root = run_cmd("jj", &["--ignore-working-copy", "root"], working_dir).await.ok()?;
+    Some((std::fs::canonicalize(git_top).ok()?, std::fs::canonicalize(jj_root).ok()?))
+}
+
+/// Whether the jj repository at `working_dir` is colocated: one root holds both
+/// `.jj` and Git's working tree, so Git writers move the same branches.
+async fn jj_repo_is_colocated(working_dir: &str) -> bool {
+    matches!(git_and_jj_roots(working_dir).await, Some((git, jj)) if git == jj)
 }
 
 async fn build_pr_push_recovery_plan(
@@ -9493,20 +9513,30 @@ async fn task_branch(state: &crate::AppState, task_id: Uuid) -> Result<String, S
 /// The tip of the task's branch, read without changing anything.
 ///
 /// A question the panel may ask on a cadence while it is shown must not
-/// mutate the repository it watches, so this never runs `jj git export`: in a
-/// jj repository the bookmark is read through jj itself, whose answer is what
-/// the branch is now even before an export put it into Git's refs. `None`
-/// when the branch does not exist.
+/// mutate the repository it watches, so this never runs `jj git export` or
+/// `jj git import`. `None` when the branch does not exist.
 pub(crate) async fn task_branch_tip_read_only(
     state: &crate::AppState,
     task_id: Uuid,
 ) -> Result<Option<String>, String> {
     let branch = task_branch(state, task_id).await?;
     let working_dir = resolve_repository_dir(state, task_id).await?;
-    if is_jj_repo(&working_dir).await {
-        jj_bookmark_tip(&working_dir, &branch).await
+    branch_tip_read_only(&working_dir, &branch).await
+}
+
+/// The tip of `branch` in `working_dir`, read without changing anything.
+///
+/// In a colocated repository Git's ref is the answer. Workers move branches
+/// through Git, and jj imports that move only on its next mutating command, so
+/// the bookmark can still name the older commit. The mutating read
+/// ([`task_branch_tip`]) also answers from Git's ref after its export, and the
+/// export does not write the stale bookmark back over Git's commit. A
+/// non-colocated repository has no Git writer, so its jj bookmark is the answer.
+async fn branch_tip_read_only(working_dir: &str, branch: &str) -> Result<Option<String>, String> {
+    if is_jj_repo(working_dir).await && !jj_repo_is_colocated(working_dir).await {
+        jj_bookmark_tip(working_dir, branch).await
     } else {
-        git_branch_tip(&working_dir, &branch).await
+        git_branch_tip(working_dir, branch).await
     }
 }
 
@@ -12730,6 +12760,126 @@ mod tests {
                 !err.contains(&left) && !err.contains(&right),
                 "the refusal must not paste commit ids together: {err}"
             );
+        }
+
+        /// A colocated jj repository: one root holds `.jj` and Git's working
+        /// tree, and a linked Git worktree stands in for a Worker's checkout.
+        /// One task commit under `branch`, exported to Git.
+        struct ColocatedJj {
+            _tmp: tempfile::TempDir,
+            root: PathBuf,
+            worktree: PathBuf,
+            task_sha: String,
+        }
+
+        impl ColocatedJj {
+            fn new(branch: &str) -> Self {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let root = tmp.path().join("repo");
+                let worktree = tmp.path().join("worker");
+                jj(tmp.path(), &["git", "init", "--colocate", root.to_str().unwrap()]);
+                std::fs::write(root.join("taskfile.txt"), "task work").unwrap();
+                jj_as_test_user(&root, &["commit", "-m", "task commit"]);
+                jj(&root, &["bookmark", "create", branch, "-r", "@-"]);
+                let task_sha = jj(
+                    &root,
+                    &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", &jj_exact_bookmark_revset(branch)],
+                );
+                git(&root, &["worktree", "add", "-q", worktree.to_str().unwrap(), branch]);
+                assert!(root.join(".git").is_dir(), "the fixture must be colocated");
+                ColocatedJj { _tmp: tmp, root, worktree, task_sha }
+            }
+
+            fn dir(&self) -> &str {
+                self.root.to_str().unwrap()
+            }
+
+            /// What a Worker does: commit through Git in its own checkout.
+            fn worker_commits(&self, message: &str) -> String {
+                git(&self.worktree, &["commit", "-q", "--allow-empty", "-m", message]);
+                git(&self.worktree, &["rev-parse", "HEAD"])
+            }
+
+            fn bookmark(&self, branch: &str) -> String {
+                jj(
+                    &self.root,
+                    &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", &jj_exact_bookmark_revset(branch)],
+                )
+            }
+        }
+
+        /// CR2: a branch that Git moved is read where Git has it, although no
+        /// jj command has imported the move yet. The read imports nothing.
+        #[tokio::test]
+        async fn colocated_tip_follows_a_branch_a_git_worker_moved() {
+            let repo = ColocatedJj::new("task-branch");
+            let moved = repo.worker_commits("worker commit");
+            assert_ne!(moved, repo.task_sha);
+            assert_eq!(repo.bookmark("task-branch"), repo.task_sha, "the fixture must leave jj's bookmark behind Git");
+
+            let tip = branch_tip_read_only(repo.dir(), "task-branch").await.expect("the tip is read");
+            assert_eq!(tip.as_deref(), Some(moved.as_str()), "the tip is Git's commit, not the stale bookmark");
+            assert_eq!(repo.bookmark("task-branch"), repo.task_sha, "the read must not import the move into jj");
+        }
+
+        /// The read gives the commit the approval's mutating read gives. That read
+        /// exports first, and the export must leave Git's commit in place rather
+        /// than write the stale bookmark back over it.
+        #[tokio::test]
+        async fn colocated_read_agrees_with_the_export_that_precedes_an_approval() {
+            let repo = ColocatedJj::new("task-branch");
+            let moved = repo.worker_commits("worker commit");
+            let read = branch_tip_read_only(repo.dir(), "task-branch").await.expect("the tip is read");
+
+            jj(&repo.root, &["--ignore-working-copy", "git", "export"]);
+            let mutating = git_branch_tip(repo.dir(), "task-branch").await.expect("the tip is read");
+            assert_eq!(
+                mutating.as_deref(),
+                Some(moved.as_str()),
+                "the export must not write the stale bookmark back over Git's commit"
+            );
+            assert_eq!(read.as_deref(), Some(moved.as_str()));
+        }
+
+        /// Git's ref decides in a colocated repository even when it moved
+        /// backwards: an import would move the bookmark back too.
+        #[tokio::test]
+        async fn colocated_tip_follows_a_branch_git_moved_backwards() {
+            let repo = ColocatedJj::new("task-branch");
+            repo.worker_commits("worker commit");
+            git(&repo.worktree, &["reset", "-q", "--hard", &repo.task_sha]);
+
+            let tip = branch_tip_read_only(repo.dir(), "task-branch").await.expect("the tip is read");
+            assert_eq!(tip.as_deref(), Some(repo.task_sha.as_str()));
+        }
+
+        /// A non-colocated jj repository has no Git writer, so its bookmark is
+        /// the branch.
+        #[tokio::test]
+        async fn non_colocated_tip_is_the_jj_bookmark() {
+            let repo = NonColocatedJj::new("task-branch");
+            let tip = branch_tip_read_only(repo.dir(), "task-branch").await.expect("the tip is read");
+            assert_eq!(tip.as_deref(), Some(repo.task_sha.as_str()));
+        }
+
+        /// CR1: a Git repository nested inside an unrelated jj workspace is read
+        /// as Git. `jj root` finds the outer workspace, and its bookmark of the
+        /// same name names a different commit.
+        #[tokio::test]
+        async fn nested_git_repository_is_read_as_git_not_the_outer_bookmark() {
+            let repo = NonColocatedJj::new("task-branch");
+            let inner = repo.workspace.join("inner");
+            git(&repo.workspace, &["init", "-q", "-b", "main", inner.to_str().unwrap()]);
+            git(&inner, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+            git(&inner, &["checkout", "-q", "-b", "task-branch"]);
+            git(&inner, &["commit", "-q", "--allow-empty", "-m", "inner task commit"]);
+            let inner_sha = git(&inner, &["rev-parse", "HEAD"]);
+            assert_ne!(inner_sha, repo.task_sha, "the fixture must give the two branches different commits");
+
+            let tip = branch_tip_read_only(inner.to_str().unwrap(), "task-branch")
+                .await
+                .expect("the tip is read");
+            assert_eq!(tip.as_deref(), Some(inner_sha.as_str()), "the inner Git branch, not the outer bookmark");
         }
 
         #[tokio::test]
