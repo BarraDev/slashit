@@ -1415,7 +1415,21 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
     // the renewal becomes the current decision, and the earlier approval
     // stays in the history without ever being shown as current again.
     await_approval(driver, HR_APPROVE_AGAIN, "Approve the branch as it is now").await?;
+    // The renewal's own coverage read is the window in which the panel still
+    // holds the answer for the earlier approval. The cadence is held through
+    // the renewal, so that answer stays on screen until the held step ends. The
+    // panel must not show the earlier approval's details beside the renewal.
+    hold_coverage_poll(driver).await?;
     click(driver, HR_APPROVE_AGAIN, "Approve the branch as it is now").await?;
+    await_data_approval(driver, "unknown", "the renewal before the branch is read again").await?;
+    if count(driver, HR_APPROVAL_STALE).await? != 0 {
+        bail!("the earlier approval's stale details are shown beside the renewal");
+    }
+    if count(driver, HR_APPROVE_AGAIN).await? != 0 {
+        bail!("the renewal control is still offered for the earlier approval");
+    }
+    capture_evidence(driver, &format!("C0-renewal-pending-unverified-of-{}", &later[..12])).await?;
+    release_coverage_poll(driver).await?;
     await_absent_from_drawer(driver, HR_APPROVAL_STALE, "the stale flag after the renewal").await?;
     let renewed = await_text(
         driver,
@@ -1456,4 +1470,67 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
         bail!("the board's Diff does not name the approved commit and the uncommitted edits: {heading}");
     }
     Ok(())
+}
+
+const HR_COMMIT_ERROR: &str = "[data-testid=\"human-review-commit-error\"]";
+const HR_COMMIT_RETRY: &str = "[data-testid=\"human-review-commit-retry\"]";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_is_unverified_while_the_branch_cannot_be_read_and_recovers_on_retry() {
+    let context = TestContext::new("human_review_unverified").expect("harness setup");
+    let outcome = unverified_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn unverified_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let (agent, _gh) = install_fakes(context, &root)?;
+    context.set_child_env(fake_agent::WRITE_OWN_FILE_VAR, "1");
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+    let session = context.start_session("human-review-unverified").await?;
+    let outcome = unverified(session.driver(), &agent, &repository).await;
+    context.close_session(session, "human-review-unverified", &outcome).await?;
+    outcome
+}
+
+/// The Project's repository becomes unreadable after the approval. The panel
+/// must not keep the approval current, must not show stale details, and must
+/// offer a retry. Once the repository reads again, the approval is current.
+async fn unverified(driver: &WebDriver, agent: &FakeAgent, repository: &GitFixture) -> Result<()> {
+    release_coverage_poll(driver).await?;
+    let executed = execute_one_task(driver, agent, repository).await?;
+    open_reviewed_drawer(driver, &executed).await?;
+    await_approval(driver, HR_APPROVE, "Approve the commit on screen").await?;
+    click(driver, HR_APPROVE, "Approve the commit on screen").await?;
+    await_data_approval(driver, "current", "the approval before the repository is unreadable").await?;
+
+    // Every coverage read now runs in a directory that does not exist, so
+    // each one fails. The repository is restored before anything is reported.
+    let path = repository.path.clone();
+    let aside = path.with_file_name("fixture-repo-unreadable");
+    std::fs::rename(&path, &aside).context("could not make the repository unreadable")?;
+    let checked = unverified_while_unreadable(driver).await;
+    let restored = std::fs::rename(&aside, &path).context("could not restore the repository");
+    restored?;
+    checked?;
+
+    await_data_approval(driver, "current", "the approval once the repository reads again").await?;
+    capture_evidence(driver, "E-current-after-the-branch-reads-again").await
+}
+
+async fn unverified_while_unreadable(driver: &WebDriver) -> Result<()> {
+    let error = await_text(driver, HR_COMMIT_ERROR, |t| t.contains("could not be read"), "the unreadable branch to be reported").await?;
+    await_data_approval(driver, "unknown", &format!("the approval while the branch is unreadable, shown as: {error}")).await?;
+    if count(driver, HR_APPROVAL_STALE).await? != 0 {
+        bail!("stale details are shown for a branch that could not be read");
+    }
+    let class = attribute(driver, HR_APPROVED, "class").await?.unwrap_or_default();
+    if class.contains("emerald") {
+        bail!("an approval that could not be checked is styled as current: {class}");
+    }
+    capture_evidence(driver, "D-unverified-while-the-branch-cannot-be-read").await?;
+    // Asking again while the repository is still unreadable must not turn the
+    // approval current.
+    click(driver, HR_COMMIT_RETRY, "Ask again about the branch").await?;
+    await_data_approval(driver, "unknown", "the approval after asking again while unreadable").await
 }

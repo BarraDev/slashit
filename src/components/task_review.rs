@@ -34,6 +34,16 @@ const VISIBLE_FINDINGS: usize = 8;
 /// person tried something.
 const COVERAGE_POLL_MS: i32 = 5_000;
 
+/// How long one coverage read may take before the panel stops trusting the
+/// last answer. The backend reads refs locally, and the storage probes bound
+/// their git questions at ten seconds too. The backend's own subprocess calls
+/// have no timeout, so a read that outlasts this bound may still be running.
+const COVERAGE_READ_MS: u32 = 10_000;
+
+/// Shown in place of the last answer once a read outlasts its bound.
+const COVERAGE_TIMED_OUT: &str =
+    "The branch's current commit did not answer in time, so it cannot be approved yet.";
+
 /// The window property the acceptance harness sets to hold this cadence for
 /// one step of its journey. It proves that approving a commit the branch has
 /// left is refused, which needs the branch to move after the panel read it
@@ -46,10 +56,19 @@ const COVERAGE_POLL_MS: i32 = 5_000;
 /// It lives on the page, not in localStorage: a value written to storage would
 /// survive a restart and freeze the approval display in a profile that is no
 /// longer under test. A page load clears it.
+///
+/// Only a build made with `SLASHIT_ACCEPTANCE_BUILD` set reads it. That build
+/// is `scripts/build-acceptance-app.sh`. Any other build reads the flag as a
+/// compile-time `None`, so the seam is inert there and no script in the page
+/// can hold the cadence.
 const COVERAGE_POLL_HOLD: &str = "__slashitCoveragePollHold";
 
-/// Whether the coverage cadence is being held by the acceptance harness.
+/// Whether the coverage cadence is being held by the acceptance harness. Always
+/// false outside an acceptance build, because the flag is decided at compile time.
 fn coverage_poll_held() -> bool {
+    if option_env!("SLASHIT_ACCEPTANCE_BUILD").is_none() {
+        return false;
+    }
     web_sys::window()
         .and_then(|w| js_sys::Reflect::get(w.as_ref(), &COVERAGE_POLL_HOLD.into()).ok())
         .is_some_and(|held| held.is_truthy())
@@ -304,6 +323,18 @@ impl CoverageReads {
         self.latest_running = false;
         true
     }
+
+    /// Gives up on `read` because it outlasted its bound. Returns whether it was
+    /// still the running latest read. Its late answer then publishes nothing,
+    /// and the next cadence tick asks again.
+    fn abandon(&mut self, read: u32) -> bool {
+        if read != self.started || !self.latest_running {
+            return false;
+        }
+        self.started += 1;
+        self.latest_running = false;
+        true
+    }
 }
 
 /// What the panel may say about an approval, read from the latest coverage
@@ -452,6 +483,17 @@ pub fn HumanReviewPanel(
             return;
         };
         spawn_local(async move {
+            // A read that outlasts its bound stops being trusted: the last
+            // answer may describe a branch that has since moved, and nothing
+            // says the next one is coming. The timer is owned here, so it is
+            // cancelled when the read finishes and never fires for a read
+            // that completed.
+            let _bound = gloo_timers::callback::Timeout::new(COVERAGE_READ_MS, move || {
+                if reads.try_update_value(|r| r.abandon(read)).unwrap_or(false) {
+                    coverage.try_set(None);
+                    coverage_error.try_set(Some(COVERAGE_TIMED_OUT.to_string()));
+                }
+            });
             let answer = get_approval_status(task_id.to_string()).await;
             // Clears the running read only when it is the latest, so an
             // answer that is superseded still publishes nothing.
@@ -1068,7 +1110,10 @@ pub fn HumanReviewPanel(
                         }
                     }}
                 </p>
-                {move || coverage.get().filter(|c| !matches!(c.coverage, ApprovalCoverage::Current | ApprovalCoverage::NotApplicable)).map(|c| {
+                // Gated on the same view as the status line: an answer for an
+                // earlier approval must not put its reason or its renewal
+                // control beside a newer approval.
+                {move || (approval_view.get() == CoverageView::Stale).then(|| coverage.get()).flatten().map(|c| {
                     let blocker = task.with(|t| t.as_ref().and_then(renewal_blocker));
                     let tip = c.branch_tip.clone()
                         .filter(|_| matches!(c.coverage, ApprovalCoverage::Moved | ApprovalCoverage::Unrecorded))
@@ -1653,6 +1698,38 @@ mod tests {
         let read = reads.start(true).unwrap();
         assert!(reads.finish(read));
         assert!(reads.start(true).is_some());
+    }
+
+    /// A read that outlasts its bound is abandoned, so a hung request cannot
+    /// keep the cadence waiting. Its late answer publishes nothing, and the
+    /// next tick asks again.
+    #[test]
+    fn an_abandoned_read_publishes_nothing_and_the_cadence_retries() {
+        let mut reads = CoverageReads::default();
+        let hung = reads.start(true).unwrap();
+        assert_eq!(reads.start(true), None, "the hung read holds the cadence until its bound");
+        assert!(reads.abandon(hung), "the latest running read is abandoned at its bound");
+        // Before any retry: the window between the bound and the next tick is
+        // where a late answer could otherwise still be published.
+        assert!(!reads.finish(hung), "the hung read's answer, if it arrives late, publishes nothing");
+        assert!(reads.start(true).is_some(), "the next tick asks again");
+    }
+
+    /// The bound of a read that already finished, or was superseded, abandons
+    /// nothing: a stale timer must not discard a newer answer.
+    #[test]
+    fn a_bound_for_a_finished_or_superseded_read_abandons_nothing() {
+        let mut reads = CoverageReads::default();
+        let older = reads.start(true).unwrap();
+        let newer = reads.start(false).unwrap();
+        assert!(!reads.abandon(older), "a superseded read is not abandoned");
+        assert!(reads.abandon(newer), "the latest running read is abandoned");
+
+        let mut reads = CoverageReads::default();
+        let read = reads.start(true).unwrap();
+        assert!(reads.finish(read));
+        assert!(!reads.abandon(read), "a finished read has nothing to abandon");
+        assert!(reads.start(true).is_some(), "a finished read leaves the cadence free");
     }
 
     /// The view for an answer read for the current approval.

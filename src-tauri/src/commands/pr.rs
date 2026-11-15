@@ -12848,15 +12848,23 @@ mod tests {
         }
 
         /// Git's ref decides in a colocated repository even when it moved
-        /// backwards: an import would move the bookmark back too.
+        /// backwards. jj first imports the Worker's commit into its bookmark, so
+        /// the bookmark and Git now disagree, and only Git's ref names the
+        /// commit the branch holds. A read that answered from the bookmark
+        /// would return the Worker's commit instead.
         #[tokio::test]
         async fn colocated_tip_follows_a_branch_git_moved_backwards() {
             let repo = ColocatedJj::new("task-branch");
-            repo.worker_commits("worker commit");
+            let moved = repo.worker_commits("worker commit");
+            // An ordinary jj command imports Git's move into the bookmark.
+            jj(&repo.root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+            assert_eq!(repo.bookmark("task-branch"), moved, "the fixture must import the move into jj");
             git(&repo.worktree, &["reset", "-q", "--hard", &repo.task_sha]);
+            assert_ne!(repo.bookmark("task-branch"), repo.task_sha, "the bookmark must disagree with Git");
 
             let tip = branch_tip_read_only(repo.dir(), "task-branch").await.expect("the tip is read");
-            assert_eq!(tip.as_deref(), Some(repo.task_sha.as_str()));
+            assert_eq!(tip.as_deref(), Some(repo.task_sha.as_str()), "Git's ref, not the bookmark");
+            assert_eq!(repo.bookmark("task-branch"), moved, "the read must not move the bookmark");
         }
 
         /// A conflicted bookmark in a colocated repository has no tip, even
