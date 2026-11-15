@@ -344,6 +344,10 @@ pub struct ApprovalStatus {
     /// It may differ from `approved_tip` even while `coverage` is `Current`,
     /// because another clone can move the pull request without moving the branch.
     pub published: Option<PublishedHead>,
+    /// The pull request address the Task had when this answer was read, so the
+    /// panel can tell an answer for a link it no longer shows (none, or another
+    /// pull request) from the current one.
+    pub pull_request: Option<String>,
     /// What a person can act on, when the approval does not cover the branch.
     pub reason: Option<String>,
 }
@@ -384,6 +388,7 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
         rewritten: None,
         reason: None,
         published: published.clone(),
+        pull_request: task.authoritative_pr_url().map(str::to_string),
     };
     if task.branch_name.is_none() {
         return Ok(none(ApprovalCoverage::NotApplicable));
@@ -2059,6 +2064,11 @@ mod tests {
         assert_eq!(status.coverage, ApprovalCoverage::NotApplicable);
         assert_eq!(status.approved_tip, None);
         assert!(status.published.is_some(), "the linked pull request is reported, not hidden");
+        assert_eq!(
+            status.pull_request.as_deref(),
+            Some("https://github.com/BarraDev/slashit/pull/7"),
+            "the answer names the pull request it was read for, so a later link change is seen"
+        );
     }
 
     // ---- Approval is bound to the commit that was approved ----

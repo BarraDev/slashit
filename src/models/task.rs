@@ -187,6 +187,18 @@ pub struct Task {
 }
 
 impl Task {
+    /// The Task's pull request address, derived as the backend derives it
+    /// (`authoritative_pr_url`). An approval answer is tagged with it, so a
+    /// link that changed after the answer was read makes the answer unknown.
+    pub fn authoritative_pr_url(&self) -> Option<&str> {
+        self.pr_url.as_deref().or_else(|| {
+            self.external_refs.iter().find_map(|r| match r {
+                ExternalRef::GithubPr { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+        })
+    }
+
     /// Whether a person completed this task locally: approved changes
     /// finished without a pull request. Done alone does not say that the
     /// branch was merged, and this says that it was not.

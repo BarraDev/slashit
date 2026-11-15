@@ -149,6 +149,8 @@ pub struct ApprovalStatus {
     pub rewritten: Option<bool>,
     pub reason: Option<String>,
     pub published: Option<PublishedHead>,
+    /// The pull request address the Task had when the answer was read.
+    pub pull_request: Option<String>,
 }
 
 pub async fn get_approval_status(task_id: String) -> Result<ApprovalStatus, String> {

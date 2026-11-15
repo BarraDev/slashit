@@ -356,10 +356,19 @@ enum CoverageView {
     NoCommit,
 }
 
-fn coverage_view(status: Option<&ApprovalStatus>, has_branch: bool, approved_now: Option<&str>) -> CoverageView {
+fn coverage_view(
+    status: Option<&ApprovalStatus>,
+    has_branch: bool,
+    approved_now: Option<&str>,
+    pull_request_now: Option<&str>,
+) -> CoverageView {
     // An answer names the approval it was read for. After a renewal, the answer
-    // for the earlier approval says nothing about the new one.
-    if status.is_some_and(|s| s.approved_tip.as_deref() != approved_now) {
+    // for the earlier approval says nothing about the new one. The same holds
+    // for the pull request: a link added, removed or replaced after the answer
+    // was read leaves that answer about a different Task state.
+    if status.is_some_and(|s| {
+        s.approved_tip.as_deref() != approved_now || s.pull_request.as_deref() != pull_request_now
+    }) {
         return CoverageView::Unknown;
     }
     match status.map(|s| s.coverage) {
@@ -889,12 +898,16 @@ pub fn HumanReviewPanel(
     // it as stale; a missing or failed read shows it as unverified. The
     // delivery checks the branch again before it publishes anything.
     let approval_view = Memo::new(move |_| {
-        let (has_branch, approved) = task.with(|t| {
-            t.as_ref().map_or((false, None), |t| {
-                (t.branch_name.is_some(), t.human_review.approved_tip().map(str::to_string))
+        let (has_branch, approved, pull_request) = task.with(|t| {
+            t.as_ref().map_or((false, None, None), |t| {
+                (
+                    t.branch_name.is_some(),
+                    t.human_review.approved_tip().map(str::to_string),
+                    t.authoritative_pr_url().map(str::to_string),
+                )
             })
         });
-        coverage.with(|c| coverage_view(c.as_ref(), has_branch, approved.as_deref()))
+        coverage.with(|c| coverage_view(c.as_ref(), has_branch, approved.as_deref(), pull_request.as_deref()))
     });
     let in_review = Memo::new(move |_| task.with(|t| t.as_ref().is_some_and(|t| t.status == TaskStatus::HumanReview)));
     // The approved work is being integrated into a local branch, or already
@@ -1666,6 +1679,7 @@ mod tests {
             rewritten: None,
             reason: None,
             published: None,
+            pull_request: None,
         }
     }
 
@@ -1862,7 +1876,7 @@ mod tests {
     fn view(coverage: Option<ApprovalCoverage>, has_branch: bool) -> CoverageView {
         let approved = "a".repeat(40);
         let status = coverage.map(|c| ApprovalStatus { approved_tip: Some(approved.clone()), ..answer(c, None) });
-        coverage_view(status.as_ref(), has_branch, Some(&approved))
+        coverage_view(status.as_ref(), has_branch, Some(&approved), None)
     }
 
     /// An answer read for an earlier approval says nothing about a renewed one,
@@ -1872,9 +1886,68 @@ mod tests {
         let (earlier, renewed) = ("a".repeat(40), "b".repeat(40));
         for coverage in [ApprovalCoverage::Current, ApprovalCoverage::Moved] {
             let status = ApprovalStatus { approved_tip: Some(earlier.clone()), ..answer(coverage, None) };
-            assert_eq!(coverage_view(Some(&status), true, Some(&renewed)), CoverageView::Unknown, "{coverage:?}");
-            assert_ne!(coverage_view(Some(&status), true, Some(&earlier)), CoverageView::Unknown, "{coverage:?}");
+            assert_eq!(coverage_view(Some(&status), true, Some(&renewed), None), CoverageView::Unknown, "{coverage:?}");
+            assert_ne!(coverage_view(Some(&status), true, Some(&earlier), None), CoverageView::Unknown, "{coverage:?}");
         }
+    }
+
+    /// An answer names the pull request it was read for. Once the Task links,
+    /// unlinks or replaces its pull request, that answer says nothing about the
+    /// Task as it now is, and the view is unknown until a read names the new
+    /// state. The approval itself is the same in every case.
+    #[test]
+    fn an_answer_for_another_pull_request_link_is_unknown_for_the_current_one() {
+        let approved = "a".repeat(40);
+        let (pr_a, pr_b) = ("https://github.com/o/r/pull/1", "https://github.com/o/r/pull/2");
+        let read_for = |pull_request: Option<&str>| ApprovalStatus {
+            approved_tip: Some(approved.clone()),
+            pull_request: pull_request.map(str::to_string),
+            ..answer(ApprovalCoverage::Current, Some(&approved))
+        };
+        let view_now = |status: &ApprovalStatus, now: Option<&str>| {
+            coverage_view(Some(status), true, Some(&approved), now)
+        };
+
+        // No pull request → linked.
+        assert_eq!(view_now(&read_for(None), Some(pr_a)), CoverageView::Unknown, "linked after a no-PR answer");
+        // Linked → unlinked.
+        assert_eq!(view_now(&read_for(Some(pr_a)), None), CoverageView::Unknown, "unlinked");
+        // Linked A → linked B.
+        assert_eq!(view_now(&read_for(Some(pr_a)), Some(pr_b)), CoverageView::Unknown, "replaced");
+        // The same link is still read as before.
+        assert_eq!(view_now(&read_for(Some(pr_a)), Some(pr_a)), CoverageView::Current);
+        assert_eq!(view_now(&read_for(None), None), CoverageView::Current);
+    }
+
+    /// A task without a branch has no commit to bind, so its approval is shown
+    /// the same way with or without a pull request: it is current without one,
+    /// and a linked pull request is never covered. Linking after the no-PR
+    /// answer is unknown until the read says which of these holds.
+    #[test]
+    fn a_branchless_approval_keeps_its_meaning_across_a_pull_request_link() {
+        let approved = "a".repeat(40);
+        let pr = "https://github.com/o/r/pull/1";
+        let branchless = |pull_request: Option<&str>| ApprovalStatus {
+            approved_tip: Some(approved.clone()),
+            pull_request: pull_request.map(str::to_string),
+            ..answer(ApprovalCoverage::NotApplicable, None)
+        };
+        assert_eq!(coverage_view(Some(&branchless(None)), false, Some(&approved), None), CoverageView::Current);
+        assert_eq!(coverage_view(Some(&branchless(None)), false, Some(&approved), Some(pr)), CoverageView::Unknown);
+        // Read after the link: the answer carries the pull request's state.
+        let linked = ApprovalStatus {
+            published: Some(crate::services::human_review_service::PublishedHead {
+                head: None,
+                observed_at: None,
+                unverified: Some("GitHub has not answered about this pull request yet.".to_string()),
+            }),
+            ..branchless(Some(pr))
+        };
+        assert_eq!(
+            coverage_view(Some(&linked), false, Some(&approved), Some(pr)),
+            CoverageView::NoCommit,
+            "a linked pull request is never covered by a branchless approval"
+        );
     }
 
     /// CR4: an unknown or failed read is never the current approval. The sequence
@@ -1912,7 +1985,7 @@ mod tests {
     #[test]
     fn a_published_head_must_be_the_approved_commit_to_read_as_current() {
         let (approved, moved) = ("a".repeat(40), "b".repeat(40));
-        let view_of = |status: &ApprovalStatus| coverage_view(Some(status), true, Some(&approved));
+        let view_of = |status: &ApprovalStatus| coverage_view(Some(status), true, Some(&approved), None);
         assert_eq!(view_of(&published_answer(&approved, Some(&approved), None)), CoverageView::Current);
         assert_eq!(view_of(&published_answer(&approved, Some(&moved), None)), CoverageView::PublishedMoved);
         assert_eq!(
@@ -1922,7 +1995,7 @@ mod tests {
         // The renewed approval's view must not borrow the earlier answer's head.
         let renewed = "c".repeat(40);
         assert_eq!(
-            coverage_view(Some(&published_answer(&approved, Some(&moved), None)), true, Some(&renewed)),
+            coverage_view(Some(&published_answer(&approved, Some(&moved), None)), true, Some(&renewed), None),
             CoverageView::Unknown,
         );
         // No pull request means the branch alone decides, as before.
@@ -1947,9 +2020,9 @@ mod tests {
             published,
             ..answer(ApprovalCoverage::NotApplicable, None)
         };
-        assert_eq!(coverage_view(Some(&branchless(None)), false, None), CoverageView::Current, "no pull request");
-        assert_eq!(coverage_view(Some(&branchless(Some(known))), false, None), CoverageView::NoCommit);
-        assert_eq!(coverage_view(Some(&branchless(Some(unknown))), false, None), CoverageView::NoCommit);
+        assert_eq!(coverage_view(Some(&branchless(None)), false, None, None), CoverageView::Current, "no pull request");
+        assert_eq!(coverage_view(Some(&branchless(Some(known))), false, None, None), CoverageView::NoCommit);
+        assert_eq!(coverage_view(Some(&branchless(Some(unknown))), false, None, None), CoverageView::NoCommit);
     }
 
     /// The copy for an approval with no commit beside a linked pull request says
