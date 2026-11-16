@@ -3562,7 +3562,9 @@ async fn delivered_against_remote(
 /// tracked reply with the item's current public reply.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncPrRepliesResult {
-    /// Items where we created a new reply on GitHub.
+    /// Items where GitHub confirmed a new reply in this run. A reply counted here
+    /// can still have its outcome unsaved; that failure is reported in `errors`,
+    /// and the reply is held after a restart rather than posted again.
     pub replied: u32,
     /// Items whose `reply_comment_id` we filled in by querying the PR thread
     /// (via `in_reply_to_id` matching). Only identified, never edited.
@@ -3979,14 +3981,11 @@ where
                     // Recorded as uncertain before the POST: if the process
                     // dies after the POST, the saved record still holds the
                     // reply. If the record cannot be saved, nothing is posted.
-                    let Some(comment_id) = item.comment_id else {
+                    // The comment was found uniquely above, so its kind is known.
+                    let Some(key) = item.comment_id.and_then(|id| {
+                        pr_level_key(&updated_plan, &key_repository, key_pull_request, id)
+                    }) else {
                         continue;
-                    };
-                    let key = ReplyKey {
-                        host: GITHUB_HOST,
-                        repository: &key_repository,
-                        pull_request: key_pull_request,
-                        comment_id,
                     };
                     let was_uncertain = updated_plan.items[orig_idx].reply_uncertain;
                     let records_before = records.clone();
@@ -4023,13 +4022,12 @@ where
                         updated_plan.items[orig_idx].reply_comment_id = reply_id;
                     }
                     updated_plan.items[orig_idx].pr_reply_text = Some(body);
-                    if let (true, Some(comment_id)) = (pr_level, item.comment_id) {
-                        let key = ReplyKey {
-                            host: GITHUB_HOST,
-                            repository: &key_repository,
-                            pull_request: key_pull_request,
-                            comment_id,
-                        };
+                    if let (true, Some(key)) = (
+                        pr_level,
+                        item.comment_id.and_then(|id| {
+                            pr_level_key(&updated_plan, &key_repository, key_pull_request, id)
+                        }),
+                    ) {
                         reply_history::record_confirmed(&mut records, &key, reply_id);
                     }
                     // The outcome is saved now, not only at the end of Sync. If
@@ -4081,17 +4079,36 @@ fn pull_request_identity(pr_url: &str) -> Option<(String, u64)> {
 /// The items of `plan` that a record describes: PR-level replies, with the
 /// index of each item and its comment id. An inline comment is answered in its
 /// own thread and is looked up on GitHub, so it has no record.
-fn pr_level_items(plan: &PrReviewPlan) -> Vec<(usize, u64)> {
+fn pr_level_items(plan: &PrReviewPlan) -> Vec<(usize, u64, PrCommentKind)> {
     plan.items
         .iter()
         .enumerate()
         .filter_map(|(idx, item)| {
             let comment_id = item.comment_id?;
-            plan.inline_reply_target(Some(comment_id))
-                .is_none()
-                .then_some((idx, comment_id))
+            // A number that names more than one comment has no identity a record
+            // can hold. Such an item is never posted (see `approved_fix_identity`).
+            let comment = plan.comment_for(comment_id)?;
+            (comment.kind != PrCommentKind::Inline).then(|| (idx, comment_id, comment.kind.clone()))
         })
         .collect()
+}
+
+/// The record key of the PR-level reply to `comment_id` on the pull request
+/// `repository` `pull_request`, when the plan names that comment uniquely.
+fn pr_level_key<'a>(
+    plan: &PrReviewPlan,
+    repository: &'a str,
+    pull_request: u64,
+    comment_id: u64,
+) -> Option<ReplyKey<'a>> {
+    let comment = plan.comment_for(comment_id)?;
+    Some(ReplyKey {
+        host: GITHUB_HOST,
+        repository,
+        pull_request,
+        comment_id,
+        kind: comment.kind.clone(),
+    })
 }
 
 /// Settles a plan's PR-level reply flags from the Task's records: an uncertain
@@ -4102,18 +4119,19 @@ fn apply_pr_reply_records(plan: &mut PrReviewPlan, records: &[PrReplyRecord]) {
     let Some((repository, pull_request)) = pull_request_identity(&plan.pr_url) else {
         return;
     };
-    for (idx, comment_id) in pr_level_items(plan) {
+    for (idx, comment_id, kind) in pr_level_items(plan) {
         let key = ReplyKey {
             host: GITHUB_HOST,
             repository: &repository,
             pull_request,
             comment_id,
+            kind,
         };
         let Some(record) = reply_history::find(records, &key) else {
             continue;
         };
         let item = &mut plan.items[idx];
-        match record.state {
+        match reply_history::settled_state(record) {
             reply_history::PrReplyState::Uncertain => item.reply_uncertain = true,
             reply_history::PrReplyState::Confirmed => {
                 item.reply_posted = true;
@@ -4132,13 +4150,14 @@ fn import_legacy_pr_reply_records(records: &mut Vec<PrReplyRecord>, plan: &PrRev
     let Some((repository, pull_request)) = pull_request_identity(&plan.pr_url) else {
         return;
     };
-    for (idx, comment_id) in pr_level_items(plan) {
+    for (idx, comment_id, kind) in pr_level_items(plan) {
         let item = &plan.items[idx];
         let key = ReplyKey {
             host: GITHUB_HOST,
             repository: &repository,
             pull_request,
             comment_id,
+            kind,
         };
         reply_history::import_legacy(
             records,
@@ -29052,6 +29071,91 @@ mod tests {
                 assert_eq!(call_count(&log, "pr comment"), 1, "{:?}", gh_writes(&log));
             }
 
+            /// The record before a PR-level POST and its rollback both cannot be
+            /// saved: nothing is posted, neither memory nor the file keeps the
+            /// flag, and a later save and Sync treat the reply as never attempted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_pr_level_record_whose_rollback_also_fails_holds_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-77";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+
+                // The baseline is on disk before any write is made to fail.
+                save_review_plan_on_task(&state.task.tasks, &state.storage, task.id, plan.clone())
+                    .await
+                    .unwrap();
+                // Every write fails, so the record save and its rollback both do.
+                let fault = slashit_durable_fs::fault::fail_every(
+                    slashit_durable_fs::Stage::Replace,
+                    std::io::ErrorKind::Other,
+                );
+                let approved = approve_without_duplicate_risk(&plan);
+                let (failed, updated) =
+                    sync_persisting(&state, &task, &worktree, plan, &approved)
+                        .await
+                        .expect("sync reports per item");
+                drop(fault);
+
+                assert_eq!(call_count(&log, "pr comment"), 0, "{:?}", gh_writes(&log));
+                assert!(
+                    failed.errors.iter().any(|e| e.contains("could not record")),
+                    "{failed:?}"
+                );
+                assert!(
+                    !updated.items[0].reply_posted && !updated.items[0].reply_uncertain,
+                    "{:?}",
+                    updated.items[0]
+                );
+                // Shared memory holds no unposted flag and no record for it.
+                {
+                    let tasks = state.task.tasks.read().await;
+                    let held = tasks.get(&task.id).expect("the Task is in memory");
+                    assert!(
+                        !held.pr_review_plan.as_ref().unwrap().items[0].reply_uncertain,
+                        "{:?}",
+                        held.pr_review_plan
+                    );
+                    assert!(held.pr_reply_records.is_empty(), "{:?}", held.pr_reply_records);
+                }
+                // The file was not replaced, so it holds no flag either.
+                let on_disk = stored_plan_after_restart(&state, &task).await;
+                assert!(!on_disk.items[0].reply_uncertain, "{:?}", on_disk.items[0]);
+
+                // A later unrelated save succeeds and carries no flag.
+                save_review_plan_on_task(&state.task.tasks, &state.storage, task.id, updated)
+                    .await
+                    .unwrap();
+                let stored = stored_plan_after_restart(&state, &task).await;
+                assert!(!stored.items[0].reply_uncertain, "{:?}", stored.items[0]);
+                let persisted = state
+                    .storage
+                    .load_project_tasks(task.project_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|t| t.id == task.id)
+                    .unwrap();
+                assert!(persisted.pr_reply_records.is_empty(), "{:?}", persisted.pr_reply_records);
+
+                // Sync offers the reply and posts it once.
+                let approved = approve_without_duplicate_risk(&stored);
+                let (synced, _) = sync_persisting(&state, &task, &worktree, stored, &approved)
+                    .await
+                    .unwrap();
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert_eq!(synced.held_uncertain, 0, "{synced:?}");
+                assert_eq!(call_count(&log, "pr comment"), 1, "{:?}", gh_writes(&log));
+            }
+
             /// A PR-level reply that posted while its outcome could not be saved
             /// is reported as not recorded, is not posted again, and after a
             /// restart is held for a person to check rather than reposted.
@@ -34818,6 +34922,40 @@ mod review_plan_provenance {
             "{:?}",
             items[0]
         );
+    }
+
+    /// A PR-level reply recorded for a review comment must not settle a
+    /// conversation comment with the same number on the same pull request.
+    #[test]
+    fn reply_records_do_not_cross_resource_types() {
+        // Review comment 42 is the one answered; the plan holds a Conversation 42.
+        let key = |comment_id| ReplyKey {
+            host: GITHUB_HOST,
+            repository: "o/r",
+            pull_request: 1,
+            comment_id,
+            kind: PrCommentKind::Review,
+        };
+        let conversation_plan = || {
+            identity_plan(
+                vec![identity_comment(Some(42), PrCommentKind::Conversation)],
+                vec![identity_fix(Some(42))],
+            )
+        };
+
+        // Review comment 42 was answered and GitHub confirmed it.
+        let mut confirmed = Vec::new();
+        reply_history::record_confirmed(&mut confirmed, &key(42), Some(900));
+        let mut plan = conversation_plan();
+        apply_pr_reply_records(&mut plan, &confirmed);
+        assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+
+        // Review comment 42 has an uncertain POST.
+        let mut uncertain = Vec::new();
+        reply_history::record_attempt(&mut uncertain, &key(42));
+        let mut plan = conversation_plan();
+        apply_pr_reply_records(&mut plan, &uncertain);
+        assert!(!plan.items[0].reply_uncertain, "{:?}", plan.items[0]);
     }
 
     /// A number the prior plan repeats names no comment, so nothing is carried

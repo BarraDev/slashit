@@ -220,6 +220,7 @@ fn full_task(project_id: Uuid) -> Task {
         comment_id: 2,
         state: crate::domain::pr_reply_history::PrReplyState::Confirmed,
         reply_id: Some(3),
+        kind: Some(crate::domain::task::PrCommentKind::Review),
     }];
     task.pr_publication = Some(crate::domain::publication::PrPublication::pending(
         Uuid::new_v4(),
