@@ -25,9 +25,10 @@
 # A public reply is never sent anywhere. `gh pr comment` and the threaded
 # `gh api -X POST .../replies` store the exact body they were given under
 # `posts/<sequence>.body`, and the call's target under `posts/<sequence>.target`,
-# and then print an id. `gh api user` reports a fixed account, and the inline
-# comments of a pull request are listed as empty, so no reply that SlashIt did
-# not post is ever adopted.
+# and then print an id. `gh api user` reports a fixed account. The REST lists of
+# reviews, comments and review threads are empty unless a journey scripts them
+# (`FakeGh::script_read`), so no reply that SlashIt did not post is adopted by
+# default.
 set -e
 
 dir="$SLASHIT_FAKE_GH_DIR"
@@ -75,6 +76,15 @@ publish_post() {
     printf '%s' "$1" > "$dir/posts/$position.body.partial"
     printf '%s' "$2" > "$dir/posts/$position.target"
     mv "$dir/posts/$position.body.partial" "$dir/posts/$position.body"
+}
+
+# Answers a REST list read with the scripted file `$1`, or with an empty list.
+scripted_read() {
+    if [ -f "$dir/$1" ]; then
+        cat "$dir/$1"
+    else
+        printf '[]'
+    fi
 }
 
 case "$1 $2" in
@@ -149,15 +159,12 @@ case "$1 $2" in
         ;;
     "api --paginate")
         case "$3" in
-            repos/*/pulls/*/comments*)
-                # No inline comment is listed, so a threaded reply is never adopted.
-                printf '[]'
-                ;;
-            # The reads Analyze makes before triage. The pull request has no
-            # reviews or conversation comments, so each list is empty.
-            repos/*/pulls/*/reviews*|repos/*/issues/*/comments*)
-                printf '[]'
-                ;;
+            # The REST lists Analyze reads. Each is `[]` unless a journey scripted
+            # it (FakeGh::script_read), so an unscripted inline list lists no
+            # comment and a threaded reply is never adopted.
+            repos/*/pulls/*/comments*) scripted_read "pull-comments.json" ;;
+            repos/*/pulls/*/reviews*) scripted_read "pull-reviews.json" ;;
+            repos/*/issues/*/comments*) scripted_read "issue-comments.json" ;;
             *)
                 number=$(printf '%s' "$3" | sed -n 's#.*/pulls/\([0-9][0-9]*\)/commits$#\1#p')
                 if [ -z "$number" ] || [ ! -f "$dir/pr-commits/$number" ]; then
@@ -169,8 +176,13 @@ case "$1 $2" in
         esac
         ;;
     "api graphql")
-        # The review threads of the pull request: none, so none is resolved or outdated.
-        printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+        # The review threads of the pull request: none unless scripted, so none is
+        # resolved or outdated.
+        if [ -f "$dir/review-threads.json" ]; then
+            cat "$dir/review-threads.json"
+        else
+            printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+        fi
         ;;
     "api user")
         printf 'slashit-acceptance-reviewer\n'

@@ -53,6 +53,33 @@ pub struct Post {
     pub body: String,
 }
 
+/// A GitHub read that Analyze makes and a journey can script with
+/// [`FakeGh::script_read`]. Unscripted, each REST list is empty and no review
+/// thread is resolved.
+#[derive(Debug, Clone, Copy)]
+pub enum ScriptedRead {
+    /// `repos/<repo>/pulls/<n>/reviews`: the reviews, as a REST list.
+    PullReviews,
+    /// `repos/<repo>/pulls/<n>/comments`: the inline review comments.
+    PullComments,
+    /// `repos/<repo>/issues/<n>/comments`: the conversation comments.
+    IssueComments,
+    /// The `reviewThreads` GraphQL answer, one page.
+    ReviewThreads,
+}
+
+impl ScriptedRead {
+    /// The file under the fixture's directory the `gh` fixture reads for this read.
+    fn file(self) -> &'static str {
+        match self {
+            Self::PullReviews => "pull-reviews.json",
+            Self::PullComments => "pull-comments.json",
+            Self::IssueComments => "issue-comments.json",
+            Self::ReviewThreads => "review-threads.json",
+        }
+    }
+}
+
 pub struct FakeGh {
     dir: PathBuf,
 }
@@ -164,6 +191,12 @@ impl FakeGh {
         std::fs::create_dir_all(&directory)
             .with_context(|| format!("could not create {}", directory.display()))?;
         self.replace(&format!("pr-commits/{number}"), &format!("{}\n", commits.join("\n")))
+    }
+
+    /// Make `read` answer with `answer`: a JSON list for a REST read, the whole
+    /// GraphQL answer for the review threads.
+    pub fn script_read(&self, read: ScriptedRead, answer: &serde_json::Value) -> Result<()> {
+        self.replace(read.file(), &answer.to_string())
     }
 
     /// Write `name` under the fixture's directory whole, so a `gh` running at

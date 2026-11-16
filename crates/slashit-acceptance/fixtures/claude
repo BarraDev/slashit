@@ -278,6 +278,12 @@ elif [ -n "$is_run" ] && grep -q '"current_message"' "$prompt_file" 2>/dev/null;
         fi
         result="{\"type\":\"delegate_to_task\",\"text\":\"The existing Task is the right execution boundary.\",\"target_task_id\":\"$target\",\"request\":\"Add the approved marker.\"}"
     fi
+elif [ -n "$is_run" ] && grep -q '^# PR Review Triage$' "$prompt_file" 2>/dev/null &&
+    [ -r "$SLASHIT_FAKE_AGENT_MARKERS/.review-triage/answer" ]; then
+    # A triage run answers with the review plan its journey scripted, as the
+    # model answers with the single-line JSON its prompt asks for. Each batch
+    # keeps only the items for its own comments, so one script serves both.
+    result=$(cat "$SLASHIT_FAKE_AGENT_MARKERS/.review-triage/answer")
 elif [ -n "$is_run" ] && grep -q '"approved_request"' "$prompt_file" 2>/dev/null; then
     result="fake Worker completed approved work"
 fi

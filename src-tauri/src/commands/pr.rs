@@ -27850,14 +27850,25 @@ mod tests {
                 .await;
                 // The POST stores the reply, then fails; the listing shows it from then on.
                 let stored = log.with_extension("stored");
+                // The stored reply carries the text that was POSTed, as GitHub lists it.
+                let body = outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply");
+                let listing = log.with_extension("listing");
+                let reply = serde_json::json!([{
+                    "id": 777,
+                    "in_reply_to_id": 1,
+                    "user": {"login": "slashit-fixture"},
+                    "body": body,
+                    "created_at": "2026-01-01T00:00:00Z",
+                }]);
+                std::fs::write(&listing, reply.to_string()).unwrap();
                 let script = format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'api user --jq .login'*) echo slashit-fixture ;;\n  *'-X POST'*) touch {stored:?}; echo 'connection reset' >&2; exit 1 ;;\n  *'--paginate'*) if [ -f {stored:?} ]; then printf '%s' '[{{\"id\":777,\"in_reply_to_id\":1,\"user\":{{\"login\":\"slashit-fixture\"}},\"created_at\":\"2026-01-01T00:00:00Z\"}}]'; else printf '%s' '[]'; fi ;;\n  *) echo 4242 ;;\nesac\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'api user --jq .login'*) echo slashit-fixture ;;\n  *'-X POST'*) touch {stored:?}; echo 'connection reset' >&2; exit 1 ;;\n  *'--paginate'*) if [ -f {stored:?} ]; then cat {listing:?}; else printf '%s' '[]'; fi ;;\n  *) echo 4242 ;;\nesac\n",
                 );
                 write_executable(&claude.gh, &script);
                 let dir = worktree.to_str().unwrap().to_string();
                 let approved = vec![ApprovedPublicReply {
                     comment_id: 1,
-                    body: outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply"),
+                    body,
                     accept_possible_duplicate: false,
                 }];
 

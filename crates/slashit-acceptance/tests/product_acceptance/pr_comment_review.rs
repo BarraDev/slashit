@@ -18,20 +18,20 @@ use super::human_review::{approve_and_open_the_pull_request, click, install_fake
 use super::*;
 use slashit_acceptance::fake_gh::FakeGh;
 
-const MODAL: &str = "[data-testid=\"pr-review-modal\"]";
-const MENU_ANALYZE: &str = "[data-testid=\"task-menu-analyze-pr\"]";
-const ITEM: &str = "[data-testid=\"pr-review-item\"]";
-const ITEM_APPROVE: &str = "[data-testid=\"pr-review-item-approve\"]";
-const REPLY: &str = "[data-testid=\"pr-review-reply\"]";
-const REPLY_SELECT: &str = "[data-testid=\"pr-review-reply-select\"]";
+pub(super) const MODAL: &str = "[data-testid=\"pr-review-modal\"]";
+pub(super) const MENU_ANALYZE: &str = "[data-testid=\"task-menu-analyze-pr\"]";
+pub(super) const ITEM: &str = "[data-testid=\"pr-review-item\"]";
+pub(super) const ITEM_APPROVE: &str = "[data-testid=\"pr-review-item-approve\"]";
+pub(super) const REPLY: &str = "[data-testid=\"pr-review-reply\"]";
+pub(super) const REPLY_SELECT: &str = "[data-testid=\"pr-review-reply-select\"]";
 const REPLY_TEXT: &str = "[data-testid=\"pr-review-reply-text\"]";
 const DUPLICATE: &str = "[data-testid=\"pr-review-reply-duplicate\"]";
 const NO_REPLY: &str = "[data-testid=\"pr-review-no-reply\"]";
 const NO_REPLY_ITEM: &str = "[data-testid=\"pr-review-no-reply-item\"]";
-const POST: &str = "[data-testid=\"pr-review-post-replies\"]";
+pub(super) const POST: &str = "[data-testid=\"pr-review-post-replies\"]";
 const APPLY: &str = "[data-testid=\"pr-review-apply\"]";
-const ERROR: &str = "[data-testid=\"pr-review-error\"]";
-const CLOSE: &str = "[data-testid=\"pr-review-close\"]";
+pub(super) const ERROR: &str = "[data-testid=\"pr-review-error\"]";
+pub(super) const CLOSE: &str = "[data-testid=\"pr-review-close\"]";
 const UNRECORDED: &str = "[data-testid=\"pr-review-unrecorded\"]";
 const UNRECORDED_ITEM: &str = "[data-testid=\"pr-review-unrecorded-item\"]";
 
@@ -58,8 +58,8 @@ const MESSAGE_SUMMARY: &str = "Clarify the error message";
 const MESSAGE_REASONING: &str = "INTERNAL-REASONING-MESSAGE: the message is already clear enough.";
 
 /// The pull request the approval opened, as the fake `gh` numbers it.
-const PR_NUMBER: &str = "1";
-const REPOSITORY: &str = "slashit-acceptance/fixture";
+pub(super) const PR_NUMBER: &str = "1";
+pub(super) const REPOSITORY: &str = "slashit-acceptance/fixture";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_public_reply_is_posted_only_as_the_person_approved_its_exact_text() {
@@ -531,7 +531,7 @@ async fn reopened(driver: &WebDriver, gh: &FakeGh, executed: &ExecutedTask, root
     Ok(())
 }
 
-async fn open_dialog(driver: &WebDriver, executed: &ExecutedTask) -> Result<()> {
+pub(super) async fn open_dialog(driver: &WebDriver, executed: &ExecutedTask) -> Result<()> {
     await_card(driver, &executed.title).await?;
     open_card_menu(driver, &executed.title).await?;
     click(driver, MENU_ANALYZE, "Analyze PR comments").await?;
@@ -541,7 +541,7 @@ async fn open_dialog(driver: &WebDriver, executed: &ExecutedTask) -> Result<()> 
 
 /// Whether a recorded `gh` call wrote to the pull request: a PR-level comment
 /// or any API call that is not a read.
-fn publishes(args: &[String]) -> bool {
+pub(super) fn publishes(args: &[String]) -> bool {
     let is_comment = args.first().map(String::as_str) == Some("pr") && args.get(1).map(String::as_str) == Some("comment");
     let is_write = args.first().map(String::as_str) == Some("api") && args.iter().any(|a| a == "-X");
     is_comment || is_write
@@ -576,7 +576,7 @@ fn record_apply_approval(root: &Path, task_id: &str, comment: u64) -> Result<()>
         .with_context(|| format!("could not write {}", file.display()))
 }
 
-fn board_plan(root: &Path, task_id: &str) -> Result<Value> {
+pub(super) fn board_plan(root: &Path, task_id: &str) -> Result<Value> {
     let file = board_holding(root, task_id)?;
     let document: toml::Value = std::fs::read_to_string(&file)?.parse()?;
     let record = task_record(&document, task_id).context("the task is missing from its board")?;
@@ -612,7 +612,7 @@ async fn await_card(driver: &WebDriver, title: &str) -> Result<()> {
     }
 }
 
-fn item_part(comment: u64, part: &str) -> String {
+pub(super) fn item_part(comment: u64, part: &str) -> String {
     format!("{ITEM}[data-comment-id=\"{comment}\"] {part}")
 }
 
@@ -634,15 +634,15 @@ async fn reply_text(driver: &WebDriver, comment: u64) -> Result<String> {
         .to_string())
 }
 
-async fn is_checked(driver: &WebDriver, selector: &str) -> Result<bool> {
+pub(super) async fn is_checked(driver: &WebDriver, selector: &str) -> Result<bool> {
     Ok(ui::visible(driver, selector).await?.is_selected().await?)
 }
 
-async fn disabled(driver: &WebDriver, selector: &str) -> Result<bool> {
+pub(super) async fn disabled(driver: &WebDriver, selector: &str) -> Result<bool> {
     Ok(!ui::visible(driver, selector).await?.is_enabled().await?)
 }
 
-async fn await_count(driver: &WebDriver, selector: &str, expected: usize) -> Result<()> {
+pub(super) async fn await_count(driver: &WebDriver, selector: &str, expected: usize) -> Result<()> {
     let started = Instant::now();
     loop {
         let found = count(driver, selector).await?;
