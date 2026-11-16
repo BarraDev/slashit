@@ -258,8 +258,6 @@ pub struct SyncPrRepliesResult {
     #[serde(default)]
     pub discovered: u32,
     #[serde(default)]
-    pub rewritten: u32,
-    #[serde(default)]
     pub unmatched: u32,
     #[serde(default)]
     pub errors: Vec<String>,

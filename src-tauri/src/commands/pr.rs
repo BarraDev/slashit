@@ -3440,18 +3440,14 @@ async fn delivered_against_remote(
 /// Result of `sync_pr_review_replies` — counts the three operations Sync can
 /// perform on each item: post a missing reply, discover the GitHub ID of a
 /// reply we already posted but never tracked, and rewrite the body of a
-/// tracked reply with the current `build_reply_body` output.
+/// tracked reply with the item's current public reply.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncPrRepliesResult {
     /// Items where we created a new reply on GitHub.
     pub replied: u32,
     /// Items whose `reply_comment_id` we filled in by querying the PR thread
-    /// (via `in_reply_to_id` matching). These also get patched in the same
-    /// pass, so they're counted in `rewritten` as well.
+    /// (via `in_reply_to_id` matching). Only identified, never edited.
     pub discovered: u32,
-    /// Items whose existing GitHub reply was overwritten with the current body
-    /// (legacy `[SlashIt agent —]` format → first-person, signature-free).
-    pub rewritten: u32,
     /// Items with `reply_posted=true` whose reply we couldn't locate on GitHub
     /// (e.g. PR-level fallback comment with no `in_reply_to_id`). Reported so
     /// the user knows which ones still need manual cleanup.
@@ -3565,7 +3561,7 @@ pub async fn sync_pr_review_replies_inner(
         .await
 }
 
-/// Posts or edits a reply only for an item the person approved in `approved`,
+/// Posts a reply only for an item the person approved in `approved`,
 /// and only with the exact text they were shown: a mismatch refuses the whole
 /// call before any GitHub write. Returns the updated plan with `reply_posted`
 /// flipped on whatever succeeded.
@@ -3639,7 +3635,15 @@ where
                 reply.comment_id
             ));
         };
-        if outgoing_reply_text(&updated_plan, item) != reply.body {
+        // No public reply, no approval: the reasoning is never offered as one.
+        let Some(outgoing) = outgoing_reply_text(&updated_plan, item) else {
+            return Err(format!(
+                "comment {} has no public reply prepared, so nothing was posted. The \
+                 fix's reasoning is internal and is not posted as a reply.",
+                reply.comment_id
+            ));
+        };
+        if outgoing != reply.body {
             return Err(format!(
                 "the reply to comment {} changed after you reviewed it. Nothing was posted; \
                  review the new text and approve it again.",
@@ -3663,7 +3667,6 @@ where
         .collect();
 
     let mut discovered = 0u32;
-    let mut rewritten = 0u32;
     let mut unmatched = 0u32;
 
     // The same rule Apply's reply pass uses, asked once for the whole plan.
@@ -3687,14 +3690,41 @@ where
             fix_pending += 1;
             continue;
         }
-        // Up-to-date items are left alone: a reply we posted in the current
-        // signature-free format has `pr_reply_text=Some(_)`. Anything else is
-        // either missing (Case A) or legacy (Case B/C → discover + rewrite).
-        if item.reply_posted && item.pr_reply_text.is_some() {
+        let label = item
+            .comment_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+
+        // A posted reply whose public text is recorded is up to date. One posted
+        // before public drafts were recorded has no text this plan can publish,
+        // so it is only identified on GitHub. That is a read: it is never edited.
+        if item.reply_posted {
+            if item.pr_reply_text.is_none() && item.reply_comment_id.is_none() {
+                let Some(original_id) = updated_plan.inline_reply_target(item.comment_id) else {
+                    unmatched += 1;
+                    continue;
+                };
+                // Discovery only adopts a reply written by this account.
+                let discovered_id = match authenticated_login.as_deref() {
+                    // Fail closed: with no verified account, no reply is ours.
+                    None => Ok(None),
+                    Some(expected) => {
+                        discover_reply_comment_id(&repo, &number, original_id, expected).await
+                    }
+                };
+                match discovered_id {
+                    Ok(Some(found_id)) => {
+                        updated_plan.items[orig_idx].reply_comment_id = Some(found_id);
+                        discovered += 1;
+                    }
+                    Ok(None) => unmatched += 1,
+                    Err(e) => errors.push(format!("comment {} (discover): {}", label, e)),
+                }
+            }
             continue;
         }
-        // Nothing is posted or edited unless the person approved this exact
-        // text. Discovery below only reads GitHub.
+
+        // Nothing is posted unless the person approved this exact text.
         let Some(approval) = approved
             .iter()
             .find(|a| Some(a.comment_id) == item.comment_id)
@@ -3702,11 +3732,12 @@ where
             awaiting_approval += 1;
             continue;
         };
-        let label = item
-            .comment_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "<none>".to_string());
-        let body = build_reply_body(&item);
+        let Some(body) = public_reply_body(&item) else {
+            errors.push(format!(
+                "comment {label}: no public reply is prepared, so nothing was posted."
+            ));
+            continue;
+        };
 
         // Case A: no reply on GitHub yet — POST a new one.
         if !item.reply_posted {
@@ -3768,7 +3799,12 @@ where
                         ));
                         continue;
                     }
-                    let outgoing = outgoing_reply_text(&updated_plan, &item);
+                    let Some(outgoing) = outgoing_reply_text(&updated_plan, &item) else {
+                        errors.push(format!(
+                            "comment {label}: no public reply is prepared, so nothing was posted."
+                        ));
+                        continue;
+                    };
                     // Recorded as uncertain before the POST: if the process
                     // dies after the POST, the saved record still holds the
                     // reply. If the record cannot be saved, nothing is posted.
@@ -3812,59 +3848,12 @@ where
             continue;
         }
 
-        // Case B: reply exists but we don't have its GitHub id — try to find it
-        // by walking the PR's inline comments and matching `in_reply_to_id` to
-        // our original comment. No text heuristics. If we still can't find it,
-        // the reply was likely a PR-level fallback comment — count as unmatched.
-        if updated_plan.items[orig_idx].reply_comment_id.is_none() {
-            let Some(original_id) = updated_plan.inline_reply_target(item.comment_id) else {
-                unmatched += 1;
-                continue;
-            };
-            // Discovery only adopts a reply written by this account.
-            let discovered_id = match authenticated_login.as_deref() {
-                // Fail closed: with no verified account, no reply is ours.
-                None => Ok(None),
-                Some(expected) => {
-                    discover_reply_comment_id(&repo, &number, original_id, expected).await
-                }
-            };
-            match discovered_id {
-                Ok(Some(found_id)) => {
-                    updated_plan.items[orig_idx].reply_comment_id = Some(found_id);
-                    discovered += 1;
-                }
-                Ok(None) => {
-                    unmatched += 1;
-                    continue;
-                }
-                Err(e) => {
-                    errors.push(format!("comment {} (discover): {}", label, e));
-                    continue;
-                }
-            }
-        }
-
-        // Case C: we now have a reply_comment_id — PATCH the body. Idempotent:
-        // if GitHub already holds the current body, nothing changes server-side.
-        let Some(reply_id) = updated_plan.items[orig_idx].reply_comment_id else {
-            unmatched += 1;
-            continue;
-        };
-        match patch_pr_inline_reply(&repo, reply_id, &body).await {
-            Ok(()) => {
-                rewritten += 1;
-                updated_plan.items[orig_idx].pr_reply_text = Some(body);
-            }
-            Err(e) => errors.push(format!("comment {} (rewrite): {}", label, e)),
-        }
     }
 
     Ok((
         SyncPrRepliesResult {
             replied,
             discovered,
-            rewritten,
             unmatched,
             errors,
             fix_pending,
@@ -4976,8 +4965,8 @@ fetches fails — added an i18n string for the partial-failure state too.
 }
 
 /// Extracts the content between `<pr_reply>` and `</pr_reply>` tags from the
-/// agent's free-form output. Returns `None` if the block is missing or empty
-/// so the caller can fall back to the triage `reasoning`.
+/// agent's free-form output. Returns `None` if the block is missing or empty,
+/// and the item then has no public reply: the triage `reasoning` is never used.
 fn extract_pr_reply(agent_output: &str) -> Option<String> {
     let start = agent_output.find("<pr_reply>")? + "<pr_reply>".len();
     let rest = &agent_output[start..];
@@ -4986,25 +4975,20 @@ fn extract_pr_reply(agent_output: &str) -> Option<String> {
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
-/// Builds the body we post on GitHub as the reply to the original review
-/// comment. Prefers the agent's `<pr_reply>` text (first-person, written for
-/// the reviewer). Falls back to the triage `reasoning`, which the analysis
-/// prompt already asks to be reply-friendly. No signature, no labels, no
-/// "Agent notes:" — the human is the apparent author.
-fn build_reply_body(item: &PrReviewItem) -> String {
-    slashit_review_content::reply_body(
-        item.pr_reply_text.as_deref(),
-        &item.reasoning,
-        &item.summary,
-    )
+/// The public reply we post on GitHub for an item: the text the fix agent wrote
+/// for the reviewer (`<pr_reply>`), or `None` when it wrote none. The triage
+/// reasoning is the person's internal assessment, so it is never published as
+/// a fallback; an item without a public reply cannot be posted.
+fn public_reply_body(item: &PrReviewItem) -> Option<String> {
+    slashit_review_content::public_reply(item.pr_reply_text.as_deref())
 }
 
-/// The exact text Sync publishes for an item, and the text the person approves:
-/// a PR-level reply carries the line that names its comment, a threaded one
-/// does not.
-fn outgoing_reply_text(plan: &PrReviewPlan, item: &PrReviewItem) -> String {
-    let body = build_reply_body(item);
-    match item.comment_id.and_then(|id| plan.comment_for(id)) {
+/// The exact text Sync publishes for an item, and the text the person approves,
+/// or `None` when the item has no public reply. A PR-level reply carries the
+/// line that names its comment, a threaded one does not.
+fn outgoing_reply_text(plan: &PrReviewPlan, item: &PrReviewItem) -> Option<String> {
+    let body = public_reply_body(item)?;
+    Some(match item.comment_id.and_then(|id| plan.comment_for(id)) {
         Some(comment) if plan.inline_reply_target(item.comment_id).is_none() => {
             slashit_review_content::pr_level_reply_text(
                 comment.url.as_deref(),
@@ -5013,11 +4997,11 @@ fn outgoing_reply_text(plan: &PrReviewPlan, item: &PrReviewItem) -> String {
             )
         }
         _ => body,
-    }
+    })
 }
 
 /// Posts a reply on the PR. Returns the GitHub comment ID of the created
-/// reply so the caller can persist it on the item for future PATCH-edit.
+/// reply so the caller can persist it on the item.
 /// `Ok(None)` is only for a posted non-inline reply (`gh pr comment`, which
 /// doesn't surface a JSON id).
 ///
@@ -5168,18 +5152,6 @@ async fn discover_reply_comment_id(
         }
     }
     Ok(best.map(|(id, _)| id))
-}
-
-/// PATCHes the body of an existing inline PR review comment via the GitHub
-/// API. Used by Sync replies to rewrite legacy `[SlashIt agent —]`-style
-/// replies with the current first-person, signature-free body.
-async fn patch_pr_inline_reply(repo: &str, comment_id: u64, body: &str) -> Result<(), String> {
-    let endpoint = format!("repos/{}/pulls/comments/{}", repo, comment_id);
-    let body_arg = format!("body={}", body);
-    run_cmd_no_cwd("gh", &["api", "-X", "PATCH", &endpoint, "-f", &body_arg])
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("gh PATCH failed: {}", e))
 }
 
 /// Resolve once a `watch` channel is genuinely asked to cancel (`true`
@@ -24233,7 +24205,7 @@ mod tests {
                          \x20 exec sleep 300\n\
                          fi\n\
                          printf 'fixed\\n' > \"review-fix-$n.txt\"\n\
-                         printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s-fixture\",\"result\":\"fixed it\"}}\\n'\n\
+                         printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s-fixture\",\"result\":\"fixed it <pr_reply>Fixed it.</pr_reply>\"}}\\n'\n\
                          exit 0\n",
                         counter = counter,
                         blocked = blocked_pidfile,
@@ -24471,7 +24443,7 @@ mod tests {
                          printf '%s\\n' \"$n\" > {runs:?}\n\
                          {before_fix}\n\
                          {edit}\n\
-                         printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s-fixture\",\"result\":\"fixed it\"}}\\n'\n\
+                         printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s-fixture\",\"result\":\"fixed it <pr_reply>Fixed it.</pr_reply>\"}}\\n'\n\
                          exit 0\n",
                         runs = runs,
                     );
@@ -26747,9 +26719,10 @@ mod tests {
                     .iter()
                     .filter(|i| i.approved && matches!(i.decision, PrReviewDecision::Fix))
                     .filter_map(|i| {
-                        i.comment_id.map(|comment_id| ApprovedPublicReply {
-                            comment_id,
-                            body: outgoing_reply_text(plan, i),
+                        // Only a reply the panel offers can be approved.
+                        Some(ApprovedPublicReply {
+                            comment_id: i.comment_id?,
+                            body: outgoing_reply_text(plan, i)?,
                             accept_possible_duplicate: i.reply_uncertain,
                         })
                     })
@@ -26826,7 +26799,8 @@ mod tests {
                     "no unnamed PR-level fallback"
                 );
                 assert!(
-                    !plan.items[0].reply_posted && plan.items[0].pr_reply_text.is_none(),
+                    !plan.items[0].reply_posted
+                        && plan.items[0].pr_reply_text.as_deref() == Some("Fixed it."),
                     "{:?}",
                     plan.items[0]
                 );
@@ -26999,10 +26973,11 @@ mod tests {
                 let (state, tmp) = build_test_state().await;
                 let (task, mut plan) =
                     delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
-                // A legacy reply: posted, its GitHub id never tracked — the
-                // shape Sync would otherwise resolve by discovery.
+                // A legacy reply: posted before public drafts were recorded, its
+                // GitHub id never tracked — the shape Sync resolves by discovery.
                 plan.items[0].reply_posted = true;
                 plan.items[0].reply_comment_id = None;
+                plan.items[0].pr_reply_text = None;
 
                 let log = tmp.path().join("gh.log");
                 let script = format!(
@@ -27013,13 +26988,8 @@ mod tests {
                 let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
 
                 assert_eq!(
-                    (
-                        synced.replied,
-                        synced.discovered,
-                        synced.rewritten,
-                        synced.unmatched
-                    ),
-                    (0, 0, 0, 1),
+                    (synced.replied, synced.discovered, synced.unmatched),
+                    (0, 0, 1),
                     "{synced:?}"
                 );
                 assert_eq!(
@@ -27334,7 +27304,7 @@ mod tests {
                     |_| {},
                 )
                 .await;
-                let shown = outgoing_reply_text(&plan, &plan.items[0]);
+                let shown = outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply");
                 let approved = vec![ApprovedPublicReply {
                     comment_id: 1,
                     body: shown.clone(),
@@ -27391,7 +27361,7 @@ mod tests {
 
                 let unknown = vec![ApprovedPublicReply {
                     comment_id: 999,
-                    body: outgoing_reply_text(&plan, &plan.items[0]),
+                    body: outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply"),
                     accept_possible_duplicate: false,
                 }];
                 let err = sync_pr_review_replies_inner(task.clone(), dir.clone(), plan.clone(), &unknown)
@@ -27460,7 +27430,7 @@ mod tests {
                 let dir = worktree.to_str().unwrap().to_string();
                 let approved = vec![ApprovedPublicReply {
                     comment_id: 1,
-                    body: outgoing_reply_text(&plan, &plan.items[0]),
+                    body: outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply"),
                     accept_possible_duplicate: false,
                 }];
 
@@ -27507,7 +27477,7 @@ mod tests {
                 );
                 write_executable(&claude.gh, &script);
                 let dir = worktree.to_str().unwrap().to_string();
-                let body = outgoing_reply_text(&plan, &plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply");
                 let plain = vec![ApprovedPublicReply { comment_id: 1, body: body.clone(), accept_possible_duplicate: false }];
                 let accepted = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: true }];
 
@@ -27590,7 +27560,7 @@ mod tests {
                     |_| {},
                 )
                 .await;
-                let body = outgoing_reply_text(&plan, &plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply");
                 let approved = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: false }];
                 let dir = worktree.to_str().unwrap().to_string();
 
@@ -27629,7 +27599,7 @@ mod tests {
                 )
                 .await;
                 let dir = worktree.to_str().unwrap().to_string();
-                let body = outgoing_reply_text(&plan, &plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply");
                 let plain = vec![ApprovedPublicReply { comment_id: 1, body: body.clone(), accept_possible_duplicate: false }];
                 let stored: Stored = Default::default();
 
@@ -27693,7 +27663,7 @@ mod tests {
                 );
                 write_executable(&claude.gh, &script);
                 let dir = worktree.to_str().unwrap().to_string();
-                let body = outgoing_reply_text(&plan, &plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply");
                 let plain = vec![ApprovedPublicReply { comment_id: 1, body: body.clone(), accept_possible_duplicate: false }];
                 let stored: Stored = Default::default();
 
@@ -27752,7 +27722,7 @@ mod tests {
                 )
                 .await;
                 let dir = worktree.to_str().unwrap().to_string();
-                let body = outgoing_reply_text(&plan, &plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply");
                 let plain = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: false }];
                 let stored: Stored = Default::default();
                 let saves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -27790,7 +27760,7 @@ mod tests {
                 )
                 .await;
                 let dir = worktree.to_str().unwrap().to_string();
-                let body = outgoing_reply_text(&plan, &plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply");
                 let plain = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: false }];
                 let stored: Stored = Default::default();
 
@@ -27825,10 +27795,14 @@ mod tests {
                     |_| {},
                 )
                 .await;
+                // The fixture's agent writes no `<pr_reply>`; the item gets one
+                // here, because only a public reply can be approved.
+                let mut plan = plan;
+                plan.items[0].pr_reply_text = Some("Fixed it.".to_string());
                 let dir = worktree.to_str().unwrap().to_string();
                 let bare = vec![ApprovedPublicReply {
                     comment_id: 1,
-                    body: build_reply_body(&plan.items[0]),
+                    body: "Fixed it.".to_string(),
                     accept_possible_duplicate: false,
                 }];
                 assert!(
@@ -27841,13 +27815,54 @@ mod tests {
 
                 let full = vec![ApprovedPublicReply {
                     comment_id: 1,
-                    body: outgoing_reply_text(&plan, &plan.items[0]),
+                    body: outgoing_reply_text(&plan, &plan.items[0]).expect("a public reply"),
                     accept_possible_duplicate: false,
                 }];
                 let (result, _) = sync_pr_review_replies_inner(task, dir, plan, &full).await.unwrap();
                 assert_eq!(result.replied, 1, "{result:?}");
                 let posted = std::fs::read_to_string(&log).unwrap_or_default();
                 assert!(posted.contains(&format!("Re {url}")), "the posted text names the comment: {posted}");
+            }
+
+            /// The triage reasoning is internal: a fix with no public reply cannot
+            /// be approved with its reasoning, and posts nothing. The completed
+            /// fix stands without a reply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_without_a_public_reply_is_never_posted_as_its_reasoning() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/406#issuecomment-2";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |p| {
+                        p.items[0].pr_reply_text = None;
+                        p.items[0].reasoning = "Internal triage reasoning.".to_string();
+                    },
+                )
+                .await;
+                let dir = worktree.to_str().unwrap().to_string();
+
+                let forged = vec![ApprovedPublicReply {
+                    comment_id: 1,
+                    body: "Internal triage reasoning.".to_string(),
+                    accept_possible_duplicate: false,
+                }];
+                let err = sync_pr_review_replies_inner(task.clone(), dir.clone(), plan.clone(), &forged)
+                    .await
+                    .unwrap_err();
+                assert!(err.contains("no public reply"), "{err}");
+                assert_eq!(call_count(&log, "pr comment"), 0, "a refused approval posts nothing");
+                assert_eq!(call_count(&log, "-X POST"), 0, "a refused approval posts nothing");
+                assert!(plan.items[0].fix_done && plan.items[0].fix_commit.is_some());
+
+                let (result, _) = sync_pr_review_replies_inner(task, dir, plan, &[]).await.unwrap();
+                assert_eq!(result.replied, 0, "{result:?}");
+                assert_eq!(result.awaiting_approval, 1, "{result:?}");
             }
 
             /// Sync refuses an approved fix whose comment has no id, before any

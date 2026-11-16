@@ -84,16 +84,16 @@ pub fn fixed_content_is_current(
     }
 }
 
-/// The text a reply to a review comment publishes: the reply the fix agent
-/// wrote, else the triage reasoning, else the summary, trimmed. The backend
-/// posts it and the frontend shows it for approval, so both use this one rule.
-pub fn reply_body(pr_reply_text: Option<&str>, reasoning: &str, summary: &str) -> String {
-    [pr_reply_text.unwrap_or(""), reasoning, summary]
-        .into_iter()
+/// The public reply to a review comment: the text the fix agent wrote for the
+/// reviewer, trimmed, or `None` when it wrote none. The triage reasoning and
+/// the summary are internal analysis, so they are never a fallback here. The
+/// backend posts this text and the frontend shows it for approval, so both use
+/// this one rule.
+pub fn public_reply(pr_reply_text: Option<&str>) -> Option<String> {
+    pr_reply_text
         .map(str::trim)
-        .find(|s| !s.is_empty())
-        .unwrap_or("")
-        .to_string()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// The full text a reply to a PR-level comment publishes: a line naming the
@@ -112,11 +112,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_reply_body_prefers_the_agent_text_then_reasoning_then_summary() {
-        assert_eq!(reply_body(Some("  wrote it  "), "why", "what"), "wrote it");
-        assert_eq!(reply_body(Some("  "), " why ", "what"), "why");
-        assert_eq!(reply_body(None, "", " what "), "what");
-        assert_eq!(reply_body(None, " ", " "), "");
+    fn a_public_reply_is_only_the_text_the_fix_agent_wrote() {
+        assert_eq!(public_reply(Some("  wrote it  ")), Some("wrote it".to_string()));
+        assert_eq!(public_reply(Some("  ")), None);
+        assert_eq!(public_reply(None), None);
     }
 
     #[test]

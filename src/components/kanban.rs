@@ -1245,23 +1245,22 @@ fn PrReviewModal(
         });
     };
 
-    // The replies Sync may post, each with the exact text it would post:
-    // missing replies, and legacy replies to be rewritten
-    // (`reply_posted=true` but `pr_reply_text=None`). A reply is owed only for
-    // a fix whose commit was seen on the PR branch. The backend makes the
-    // final check on whatever is approved here.
+    // The replies Sync may post, each with the exact text it would post. A
+    // reply is owed only for an approved fix with a public reply the fix agent
+    // wrote, not yet posted, whose commit was seen on the PR branch. The
+    // triage reasoning is internal and is never offered as a reply. The backend
+    // makes the final check on whatever is approved here.
     let owed_replies = move || plan.get()
         .map(|p| p.items.iter()
             .filter(|i| i.approved
                 && matches!(i.decision, PrReviewDecisionKind::Fix)
                 && i.fix_done
-                && (if i.reply_posted {
-                    i.pr_reply_text.is_none()
-                } else {
-                    i.fix_commit.is_some() && !i.fix_uncommitted
-                }))
-            .filter_map(|i| i.comment_id.map(|id| {
-                let body = slashit_review_content::reply_body(i.pr_reply_text.as_deref(), &i.reasoning, &i.summary);
+                && !i.reply_posted
+                && i.fix_commit.is_some()
+                && !i.fix_uncommitted)
+            .filter_map(|i| {
+                let id = i.comment_id?;
+                let body = slashit_review_content::public_reply(i.pr_reply_text.as_deref())?;
                 // The same text the backend publishes: a PR-level reply names its comment.
                 let mut same_id = p.comments.iter().filter(|c| c.id == Some(id));
                 let text = match (same_id.next(), same_id.next()) {
@@ -1270,8 +1269,20 @@ fn PrReviewModal(
                     }
                     _ => body,
                 };
-                (id, i.summary.clone(), text, i.reply_uncertain)
-            }))
+                Some((id, i.summary.clone(), text, i.reply_uncertain))
+            })
+            .collect::<Vec<_>>())
+        .unwrap_or_default();
+    // Approved fixes that have no public reply. Nothing can be selected for
+    // them: the reasoning is the person's internal assessment, not a reply.
+    let fixes_without_reply = move || plan.get()
+        .map(|p| p.items.iter()
+            .filter(|i| i.approved
+                && matches!(i.decision, PrReviewDecisionKind::Fix)
+                && i.fix_done
+                && !i.reply_posted
+                && slashit_review_content::public_reply(i.pr_reply_text.as_deref()).is_none())
+            .map(|i| i.summary.clone())
             .collect::<Vec<_>>())
         .unwrap_or_default();
     // Replies the person selected, each with the text they saw when selecting
@@ -1315,14 +1326,14 @@ fn PrReviewModal(
                     approved_replies.set(Vec::new());
                     let mut parts: Vec<String> = Vec::new();
                     if result.replied > 0 { parts.push(format!("Posted {} new", result.replied)); }
-                    if result.rewritten > 0 { parts.push(format!("Rewrote {} ({} via discovery)", result.rewritten, result.discovered)); }
+                    if result.discovered > 0 { parts.push(format!("Found {} existing", result.discovered)); }
                     if result.unmatched > 0 { parts.push(format!("{} could not be located on GitHub", result.unmatched)); }
                     if result.fix_pending > 0 { parts.push(format!("{} still need a fix", result.fix_pending)); }
                     if result.awaiting_approval > 0 { parts.push(format!("{} not selected, not posted", result.awaiting_approval)); }
                     if result.held_uncertain > 0 { parts.push(format!("{} held: may already be on GitHub", result.held_uncertain)); }
                     if !result.errors.is_empty() { parts.push(format!("{} errors", result.errors.len())); }
                     let msg = if parts.is_empty() { "Nothing to sync".to_string() } else { parts.join(", ") };
-                    let did_work = result.replied > 0 || result.rewritten > 0;
+                    let did_work = result.replied > 0;
                     if result.errors.is_empty() && did_work {
                         toast::success(msg);
                     } else if !result.errors.is_empty() {
@@ -1658,6 +1669,19 @@ fn PrReviewModal(
                                     }
                                 }
                             />
+                        </section>
+                    </Show>
+                    <Show when=move || !fixes_without_reply().is_empty()>
+                        <section class="px-5 py-3 border-t border-white/10 space-y-2" aria-label="Fixes without a public reply">
+                            <p class="text-xs font-semibold text-white/80">"No public reply is prepared for these fixes"</p>
+                            <p class="text-xs text-white/70">"Their triage reasoning is internal and is not posted as a reply, so none of them can be selected."</p>
+                            <ul class="text-xs text-white/70 list-disc pl-5">
+                                <For
+                                    each=fixes_without_reply
+                                    key=|s| s.clone()
+                                    children=move |s: String| view! { <li>{s}</li> }
+                                />
+                            </ul>
                         </section>
                     </Show>
                     <div class=move || format!(
