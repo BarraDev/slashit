@@ -5867,6 +5867,7 @@ impl TaskExecutor {
                 tools: ToolAccess::Full {
                     auto_approve: Vec::new(),
                     permission_mode: Some("auto".to_string()),
+                    denied_tools: Vec::new(),
                 },
                 max_turns: Some(50),
                 max_budget_usd: None,
@@ -7849,6 +7850,7 @@ impl TaskExecutor {
                                         tools: ToolAccess::Full {
                                             auto_approve: Vec::new(),
                                             permission_mode: Some("auto".to_string()),
+                                            denied_tools: Vec::new(),
                                         },
                                         max_turns: Some(20),
                                         max_budget_usd: None,

@@ -5184,6 +5184,13 @@ async fn wait_for_cancel(rx: &mut tokio::sync::watch::Receiver<bool>) {
 /// (see `ClaudeRunner::start_leased`), and its customizations are isolated.
 /// Its prompt carries the approved item text framed as untrusted data (see
 /// `build_review_fix_prompt`); that framing is not a security boundary.
+/// Permission rules denied to the PR apply run, the only PR helper that can
+/// edit. Apply writes its fix and its `<pr_reply>` block as text, so it needs
+/// neither GitHub nor a network client. A rule matches the command's shape:
+/// it stops the direct forms, not every way to run a command (see
+/// `agents/AGENTS.md`). Publication stays with Sync, which checks approval.
+const APPLY_DENIED_TOOLS: &[&str] = &["Bash(gh:*)", "Bash(curl:*)", "Bash(wget:*)"];
+
 fn pr_helper_run_config(
     prompt: String,
     working_dir: String,
@@ -5194,6 +5201,7 @@ fn pr_helper_run_config(
         ToolAccess::Full {
             auto_approve: Vec::new(),
             permission_mode: Some("auto".to_string()),
+            denied_tools: APPLY_DENIED_TOOLS.iter().map(|t| t.to_string()).collect(),
         }
     } else {
         ToolAccess::ReadOnly
@@ -11102,9 +11110,15 @@ mod tests {
             ToolAccess::Full {
                 auto_approve,
                 permission_mode,
+                denied_tools,
             } => {
                 assert!(auto_approve.is_empty(), "Auto takes no pre-approval list: {auto_approve:?}");
                 assert_eq!(permission_mode.as_deref(), Some("auto"));
+                assert_eq!(
+                    denied_tools.iter().map(String::as_str).collect::<Vec<_>>(),
+                    APPLY_DENIED_TOOLS,
+                    "the apply run denies GitHub and HTTP client commands"
+                );
             }
             other => panic!("the apply helper must be able to edit, got {other:?}"),
         }

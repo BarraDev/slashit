@@ -446,9 +446,16 @@ pub enum ToolAccess {
     /// `auto_approve` becomes `--allowedTools`: it is an approval list, not
     /// a restriction. `permission_mode: None` passes
     /// `--dangerously-skip-permissions`, which approves every tool.
+    ///
+    /// `denied_tools` becomes `--disallowedTools`: permission rules such as
+    /// `Bash(gh:*)`. In a live probe (Claude Code 2.1.325, `auto` mode) a
+    /// matching call was refused without reaching the classifier. A rule
+    /// matches the command's shape, though, so it restricts the commands it
+    /// names and is not a boundary around the run. See `agents/AGENTS.md`.
     Full {
         auto_approve: Vec<String>,
         permission_mode: Option<String>,
+        denied_tools: Vec<String>,
     },
 }
 
@@ -814,7 +821,7 @@ pub fn claude_args(
             push("--restricted");
             true
         }
-        ToolAccess::Full { auto_approve, permission_mode } => {
+        ToolAccess::Full { auto_approve, permission_mode, denied_tools } => {
             // Under `auto` the classifier decides each call, so an approval
             // list would pre-approve tools it should review. Without the list,
             // a session that silently fell back to Manual denies every call
@@ -829,6 +836,10 @@ pub fn claude_args(
                     push(mode);
                 }
                 None => push("--dangerously-skip-permissions"),
+            }
+            if !denied_tools.is_empty() {
+                push("--disallowedTools");
+                push(&denied_tools.join(","));
             }
             config.disable_mcp
         }
@@ -2090,6 +2101,7 @@ mod lease_launch_tests {
             tools: ToolAccess::Full {
                 auto_approve: vec!["Read".to_string(), "Edit".to_string()],
                 permission_mode: None,
+                denied_tools: Vec::new(),
             },
             max_turns: Some(3),
             max_budget_usd: None,
@@ -2236,7 +2248,7 @@ mod args_tests {
 
     #[test]
     fn a_run_with_additional_dirs_asks_the_cli_for_their_instruction_files() {
-        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None ,denied_tools: Vec::new(),});
         cfg.additional_dirs = vec![std::path::PathBuf::from(".")];
         assert_eq!(
             additional_dirs_instruction_env(&cfg),
@@ -2246,7 +2258,7 @@ mod args_tests {
 
     #[test]
     fn a_run_without_additional_dirs_leaves_the_instruction_environment_alone() {
-        let cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        let cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None ,denied_tools: Vec::new(),});
         assert_eq!(additional_dirs_instruction_env(&cfg), None);
     }
 
@@ -2256,7 +2268,7 @@ mod args_tests {
     /// it to another value.
     #[test]
     fn an_isolated_run_with_additional_dirs_pins_their_instruction_variable() {
-        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None ,denied_tools: Vec::new(),});
         cfg.isolate_customizations = true;
         cfg.additional_dirs = vec![std::path::PathBuf::from(".")];
         let (_, settings) = isolated_args_and_settings(&cfg);
@@ -2265,7 +2277,7 @@ mod args_tests {
 
     #[test]
     fn an_isolated_run_without_additional_dirs_does_not_pin_the_instruction_variable() {
-        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None });
+        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None ,denied_tools: Vec::new(),});
         cfg.isolate_customizations = true;
         let (_, settings) = isolated_args_and_settings(&cfg);
         assert!(settings["env"].get(ADDITIONAL_DIRS_CLAUDE_MD_ENV).is_none(), "{settings}");
@@ -2334,6 +2346,7 @@ mod args_tests {
         let args = args(&config(ToolAccess::Full {
             auto_approve: vec!["Read".into(), "Edit".into(), "Bash".into()],
             permission_mode: None,
+            denied_tools: Vec::new(),
         }));
         assert!(!args.iter().any(|a| a == "--tools" || a == "--restricted"), "{args:?}");
         assert_eq!(value_of(&args, "--allowedTools"), Some("Read,Edit,Bash"));
@@ -2346,9 +2359,30 @@ mod args_tests {
         let args = args(&config(ToolAccess::Full {
             auto_approve: Vec::new(),
             permission_mode: Some("acceptEdits".into()),
+            denied_tools: Vec::new(),
         }));
         assert_eq!(value_of(&args, "--permission-mode"), Some("acceptEdits"));
         assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions" || a == "--allowedTools"));
+    }
+
+    #[test]
+    fn full_access_passes_its_denied_tools_as_one_disallowed_list_under_auto() {
+        let denied = vec!["Bash(gh:*)".to_string(), "Bash(curl:*)".to_string()];
+        let denying = args(&config(ToolAccess::Full {
+            auto_approve: Vec::new(),
+            permission_mode: Some("auto".into()),
+            denied_tools: denied,
+        }));
+        assert_eq!(value_of(&denying, "--permission-mode"), Some("auto"));
+        assert_eq!(value_of(&denying, "--disallowedTools"), Some("Bash(gh:*),Bash(curl:*)"));
+        assert!(!denying.iter().any(|a| a == "--tools" || a == "--restricted"), "{denying:?}");
+
+        let plain = args(&config(ToolAccess::Full {
+            auto_approve: Vec::new(),
+            permission_mode: Some("auto".into()),
+            denied_tools: Vec::new(),
+        }));
+        assert!(!plain.iter().any(|a| a == "--disallowedTools"), "{plain:?}");
     }
 
     #[test]
@@ -2365,7 +2399,7 @@ mod args_tests {
     /// argument carries any of the prompt's text.
     #[test]
     fn the_prompt_is_not_passed_in_argv() {
-        let full = ToolAccess::Full { auto_approve: vec!["Read".into()], permission_mode: None };
+        let full = ToolAccess::Full { auto_approve: vec!["Read".into()], permission_mode: None ,denied_tools: Vec::new(),};
         for tools in [ToolAccess::ReadOnly, full] {
             let mut cfg = config(tools);
             cfg.prompt = "PROMPT-LINE-ONE\n--tools Bash\n".into();
@@ -2391,7 +2425,7 @@ mod launch_policy_tests {
         ClaudeRunConfig {
             prompt: String::new(),
             working_dir: ".".into(),
-            tools: ToolAccess::Full { auto_approve, permission_mode: Some("auto".into()) },
+            tools: ToolAccess::Full { auto_approve, permission_mode: Some("auto".into()) ,denied_tools: Vec::new(),},
             max_turns: None,
             max_budget_usd: None,
             session_id: None,
@@ -3042,6 +3076,7 @@ mod tests {
                 tools: ToolAccess::Full {
                     auto_approve: vec!["Read".to_string(), "Edit".to_string()],
                     permission_mode: None,
+                    denied_tools: Vec::new(),
                 },
                 max_turns: Some(50),
                 max_budget_usd: None,
@@ -3209,6 +3244,7 @@ mod tests {
         ToolAccess::Full {
             auto_approve: vec!["Read".to_string(), "Edit".to_string(), "Bash".to_string()],
             permission_mode: None,
+            denied_tools: Vec::new(),
         }
     }
 
@@ -4270,7 +4306,7 @@ mod mode_mismatch_tests {
         ClaudeRunConfig {
             prompt: "hello".to_string(),
             working_dir: dir.path().to_string_lossy().into_owned(),
-            tools: ToolAccess::Full { auto_approve: Vec::new(), permission_mode: Some("auto".into()) },
+            tools: ToolAccess::Full { auto_approve: Vec::new(), permission_mode: Some("auto".into()) ,denied_tools: Vec::new(),},
             max_turns: None,
             max_budget_usd: None,
             session_id: None,
@@ -4347,7 +4383,7 @@ mod child_environment_tests {
         let config = ClaudeRunConfig {
             prompt: "hello".to_string(),
             working_dir: dir.path().to_string_lossy().into_owned(),
-            tools: ToolAccess::Full { auto_approve: Vec::new(), permission_mode: Some("auto".into()) },
+            tools: ToolAccess::Full { auto_approve: Vec::new(), permission_mode: Some("auto".into()) ,denied_tools: Vec::new(),},
             max_turns: None,
             max_budget_usd: None,
             session_id: None,
