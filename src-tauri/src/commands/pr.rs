@@ -1127,6 +1127,17 @@ pub async fn analyze_pr_comments(
     // Triage runs `ToolAccess::ReadOnly` (see `run_claude_pr_helper(.., false, ..)`).
     let (_lease, cancel_rx) =
         begin_pr_helper(&state, task_uuid, PrHelperPurpose::Inspection).await?;
+    // The snapshot the carry-forward and the final save use is read under the
+    // helper lease. A Sync or Apply that recorded a reply or fix during the
+    // fetch above is in it; the earlier clone would be written back over it.
+    let prior_plan = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .and_then(|t| t.pr_review_plan.clone())
+        .filter(|p| p.pr_url == pr_url);
     let (mut items, raw_output) =
         triage_pr_comments(&task, &pr_url, &working_dir, &comments, cancel_rx).await?;
     eprintln!("[pr-review] parsed {} items", items.len());
@@ -1454,7 +1465,7 @@ pub async fn discuss_pr_review_questions(
     // Discuss saves the whole plan it was sent, so a copy that predates a Sync
     // would clear that reply record. Refused before the agent runs.
     if let Some(stored) = task.pr_review_plan.as_ref() {
-        refuse_stale_reply_records(stored, &plan)?;
+        refuse_stale_delivery_records(stored, &plan)?;
     }
     let merged = discuss_pr_review_questions_inner(task, working_dir, plan, cancel_rx).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, merged.clone()).await?;
@@ -1746,18 +1757,25 @@ fn review_content(plan: &PrReviewPlan) -> PrReviewPlan {
     content
 }
 
-/// Refuses a sent plan whose reply records differ from the stored plan's: a
-/// reply Sync posted or recorded after the copy was loaded is not in the copy.
-fn refuse_stale_reply_records(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Result<(), String> {
+/// Refuses a sent plan whose delivery or publication records differ from the
+/// stored plan's. Apply and Sync write these records under the Task lifecycle
+/// lease, so a copy taken before either ran does not carry them. Saving such a
+/// copy would restore a fix Sync cleared, clear a reply Sync recorded, or make
+/// Apply repeat a delivered fix or skip an undone one. Both sides are read
+/// through the lifecycle backfill that the browser and Apply already apply on
+/// load, so a legacy plan backfilled on the client is the same plan.
+fn refuse_stale_delivery_records(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Result<(), String> {
+    let stored = delivery_view(stored);
+    let sent = delivery_view(sent);
     let differs = sent.items.len() != stored.items.len()
         || sent
             .items
             .iter()
             .zip(&stored.items)
-            .any(|(sent_item, stored_item)| reply_record(sent_item) != reply_record(stored_item));
+            .any(|(sent_item, stored_item)| delivery_record(sent_item) != delivery_record(stored_item));
     if differs {
         return Err(
-            "A reply to this review was posted or recorded after this review plan was \
+            "A fix or reply for this review was posted or recorded after this review plan was \
              loaded. Reload the review, then try again. Nothing was changed."
                 .to_string(),
         );
@@ -1765,10 +1783,37 @@ fn refuse_stale_reply_records(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Res
     Ok(())
 }
 
-/// The reply state only Sync writes: whether a reply was posted, whether a
-/// PR-level POST may have landed, and the GitHub id of the reply.
-fn reply_record(item: &PrReviewItem) -> (bool, bool, Option<u64>) {
-    (item.reply_posted, item.reply_uncertain, item.reply_comment_id)
+fn delivery_view(plan: &PrReviewPlan) -> PrReviewPlan {
+    let mut view = plan.clone();
+    view.backfill_lifecycle_from_last_apply();
+    view
+}
+
+/// The delivery and publication state only Apply and Sync write: whether a
+/// fix is done and uncommitted, the commit and effect that prove it, whether a
+/// reply was posted, whether a PR-level POST may have landed, and the GitHub
+/// id of the reply. A copy's own decision, approval and note are not here.
+#[derive(PartialEq)]
+struct DeliveryRecord<'a> {
+    fix_done: bool,
+    fix_uncommitted: bool,
+    fix_commit: Option<&'a str>,
+    fix_effect: Option<&'a crate::domain::task::FixEffect>,
+    reply_posted: bool,
+    reply_uncertain: bool,
+    reply_comment_id: Option<u64>,
+}
+
+fn delivery_record(item: &PrReviewItem) -> DeliveryRecord<'_> {
+    DeliveryRecord {
+        fix_done: item.fix_done,
+        fix_uncommitted: item.fix_uncommitted,
+        fix_commit: item.fix_commit.as_deref(),
+        fix_effect: item.fix_effect.as_ref(),
+        reply_posted: item.reply_posted,
+        reply_uncertain: item.reply_uncertain,
+        reply_comment_id: item.reply_comment_id,
+    }
 }
 
 /// Why an approved fix has no comment this plan can act on.
@@ -1822,11 +1867,12 @@ fn stored_plan_for_apply<'a>(
                 .to_string(),
         );
     }
-    // A reply Sync posted or recorded after this copy was loaded is not in the
-    // copy. Apply saves its whole plan at the end, so the stale copy would
-    // clear that record and offer the reply again. Refused before any work, so
-    // no fix or reply is lost by the refusal.
-    refuse_stale_reply_records(stored, sent)?;
+    // A fix or reply that Apply or Sync recorded after this copy was loaded is
+    // not in the copy. Apply saves its whole plan at the end, so the stale copy
+    // would clear that record (a reply offered again, a delivered fix repeated,
+    // or a cleared commit restored). Refused before any work, so no fix or reply
+    // is lost by the refusal.
+    refuse_stale_delivery_records(stored, sent)?;
     // The approved items Apply runs come from the sent plan, and the client
     // may approve an item the stored plan left unapproved. Each approved Fix
     // is checked against the stored item at the same position (the content
@@ -10127,6 +10173,48 @@ mod tests {
         assert!(on_disk.items[1].reply_posted);
         assert_eq!(on_disk.items[1].reply_comment_id, Some(77));
         assert_eq!(on_disk.items[1].fix_commit.as_deref(), Some("c0ffee1"));
+    }
+
+    /// An Apply copy taken after the fix was recorded, and a Sync that later
+    /// cleared the unprovable fix, must not let the copy restore the commit
+    /// after a restart. The stored record read back from disk is unchanged.
+    #[tokio::test]
+    async fn a_stale_copy_cannot_restore_a_cleared_fix_after_restart() {
+        let (task, mut fixed) = crate::test_helpers::create_test_pr_review_setup();
+        let (task_id, project_id) = (task.id, task.project_id);
+        let (storage, _tmp) = review_plan_storage();
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+
+        fixed.items[0].fix_done = true;
+        fixed.items[0].fix_commit = Some("c0ffee1".to_string());
+        fixed.items[0].fix_effect = Some(crate::domain::task::FixEffect {
+            before_tree: "before".to_string(),
+            after_tree: "after".to_string(),
+        });
+        save_review_plan_on_task(&tasks, &storage, task_id, fixed.clone())
+            .await
+            .expect("apply saves its fix");
+        let browser_copy = fixed.clone();
+
+        let mut cleared = fixed.clone();
+        cleared.items[0].fix_commit = None;
+        cleared.items[0].fix_effect = None;
+        save_review_plan_on_task(&tasks, &storage, task_id, cleared)
+            .await
+            .expect("sync clears the unprovable fix");
+
+        drop(tasks);
+        let on_disk = storage
+            .load_project_tasks(project_id)
+            .expect("reload tasks")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .and_then(|t| t.pr_review_plan)
+            .expect("plan on disk");
+        assert!(stored_plan_for_apply(Some(&on_disk), &browser_copy).is_err());
+        assert_eq!(on_disk.items[0].fix_commit, None);
+        assert_eq!(on_disk.items[0].fix_effect, None);
+        assert!(on_disk.items[0].fix_done);
     }
 
     #[tokio::test]
@@ -33457,10 +33545,103 @@ mod review_plan_provenance {
         let mut sent = stored.clone();
         sent.items[0].approved = false;
         sent.items[0].decision = PrReviewDecision::Skip;
-        sent.items[1].fix_done = true;
         sent.items[1].last_error = Some("earlier failure".to_string());
         sent.last_apply = None;
         assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &sent).is_ok());
+    }
+
+    /// The stored plan after Apply made and recorded item 0's fix.
+    fn delivered_fix_plan() -> (Task, PrReviewPlan) {
+        let (task, mut stored) = analyzed_plan_with_items();
+        stored.items[0].fix_done = true;
+        stored.items[0].fix_commit = Some("c0ffee1".to_string());
+        stored.items[0].fix_effect = Some(crate::domain::task::FixEffect {
+            before_tree: "before".to_string(),
+            after_tree: "after".to_string(),
+        });
+        let mut task = task;
+        task.pr_review_plan = Some(stored.clone());
+        (task, stored)
+    }
+
+    #[test]
+    fn a_copy_that_disagrees_on_a_recorded_fix_field_is_refused() {
+        let (task, stored) = delivered_fix_plan();
+        let cases: Vec<(&str, fn(&mut PrReviewPlan))> = vec![
+            ("fix_commit replaced", |p| p.items[0].fix_commit = Some("0ldcommit".into())),
+            ("fix_commit forgotten", |p| p.items[0].fix_commit = None),
+            ("fix_effect replaced", |p| p.items[0].fix_effect.as_mut().unwrap().after_tree = "other".into()),
+            ("fix_effect forgotten", |p| p.items[0].fix_effect = None),
+            ("fix_done cleared (would re-run the agent)", |p| p.items[0].fix_done = false),
+            ("fix_uncommitted set", |p| p.items[0].fix_uncommitted = true),
+        ];
+        for (name, mutate) in cases {
+            let mut sent = stored.clone();
+            mutate(&mut sent);
+            assert!(
+                stored_plan_for_apply(task.pr_review_plan.as_ref(), &sent).is_err(),
+                "{name}: a copy that disagrees on a delivery field must be refused"
+            );
+            assert!(
+                refuse_stale_delivery_records(&stored, &sent).is_err(),
+                "{name}: Discuss saves the whole copy too, so it must refuse the same copy"
+            );
+        }
+        assert_eq!(task.pr_review_plan.as_ref(), Some(&stored), "stored plan untouched");
+        assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &stored).is_ok());
+    }
+
+    /// A copy that marks an undone fix as done would make Apply skip the agent
+    /// and treat the fix as delivered, so it is refused too.
+    #[test]
+    fn a_copy_that_marks_an_undone_fix_as_done_is_refused() {
+        let (task, stored) = analyzed_plan_with_items();
+        let mut sent = stored.clone();
+        sent.items[0].fix_done = true;
+        assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &sent).is_err());
+    }
+
+    /// Sync cleared a fix it could never prove (its commit and effect are gone)
+    /// so the next Apply makes it again. A copy taken before that must not
+    /// put the commit back and make Apply treat the fix as delivered.
+    #[test]
+    fn a_copy_cannot_restore_a_fix_commit_that_sync_cleared() {
+        let (mut task, delivered) = delivered_fix_plan();
+        let mut cleared = delivered.clone();
+        cleared.items[0].fix_commit = None;
+        cleared.items[0].fix_effect = None;
+        task.pr_review_plan = Some(cleared.clone());
+        assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &delivered).is_err());
+        assert_eq!(task.pr_review_plan.as_ref().unwrap().items[0].fix_commit, None);
+    }
+
+    /// A copy the browser backfilled on load from `last_apply` is the same plan
+    /// as the stored one, not a stale copy, so it must still be accepted.
+    #[test]
+    fn a_browser_backfilled_legacy_copy_is_accepted() {
+        let (task, mut legacy) = analyzed_plan_with_items();
+        legacy.last_apply = Some(PrReviewApplyResult {
+            applied_at: chrono::Utc::now() + chrono::Duration::seconds(1),
+            agent_summary: String::new(),
+            fixed_ids: vec![101],
+            skipped_ids: Vec::new(),
+            pushed: false,
+            push_branch: None,
+            replies_posted: 0,
+            reply_errors: Vec::new(),
+            dry_run: false,
+            failed_ids: Vec::new(),
+            fix_errors: Vec::new(),
+            push_error: None,
+            auto_reply: None,
+        });
+        legacy.items[0].fix_done = false;
+        let mut task = task;
+        task.pr_review_plan = Some(legacy.clone());
+        let mut backfilled = legacy.clone();
+        backfilled.backfill_lifecycle_from_last_apply();
+        assert!(backfilled.items[0].fix_done, "the fixture must exercise the backfill");
+        assert!(stored_plan_for_apply(Some(&legacy), &backfilled).is_ok());
     }
 
     #[test]
@@ -33469,9 +33650,9 @@ mod review_plan_provenance {
         let mut synced = stored.clone();
         synced.items[1].reply_posted = true;
         synced.items[1].reply_comment_id = Some(77);
-        let err = refuse_stale_reply_records(&synced, &stored).unwrap_err();
+        let err = refuse_stale_delivery_records(&synced, &stored).unwrap_err();
         assert!(err.contains("posted or recorded"), "{err}");
-        assert!(refuse_stale_reply_records(&synced, &synced.clone()).is_ok());
+        assert!(refuse_stale_delivery_records(&synced, &synced.clone()).is_ok());
     }
 
     #[test]
