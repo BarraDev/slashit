@@ -532,6 +532,9 @@ pub struct PrReviewItem {
     pub fix_effect: Option<FixEffect>,
     #[serde(default)]
     pub reply_posted: bool,
+    /// Mirrors the backend: a PR-level reply may already be on GitHub.
+    #[serde(default)]
+    pub reply_uncertain: bool,
     #[serde(default)]
     pub last_agent_summary: Option<String>,
     #[serde(default)]

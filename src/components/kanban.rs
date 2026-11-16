@@ -16,7 +16,7 @@ use crate::components::task_live::{activity_from_event, changes_task_record, Act
 use crate::models::AgentEvent;
 use crate::services::task_run_service::{get_live_runs, listen_agent_events_with_ready};
 use crate::components::markdown::render_safe_markdown;
-use crate::services::{reorder_task, queue_service, promoted_message, run_queued_task, RunNowOutcome,get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
+use crate::services::{reorder_task, queue_service, promoted_message, run_queued_task, RunNowOutcome,get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, ApprovedPublicReply, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
 
@@ -196,7 +196,6 @@ pub fn Kanban(
     let pr_review_applying = RwSignal::new(false);
     let pr_review_error = RwSignal::new(None::<String>);
     let pr_review_auto_push = RwSignal::new(crate::services::PR_REVIEW_AUTO_PUSH_DEFAULT);
-    let pr_review_auto_reply = RwSignal::new(true);
     let pr_review_dry_run = RwSignal::new(false);
     let pr_review_last_apply = RwSignal::new(None::<PrReviewApplyResult>);
     // Per-item live status fed by `pr-review-progress` Tauri events keyed by
@@ -734,7 +733,6 @@ pub fn Kanban(
                 applying=pr_review_applying
                 error=pr_review_error
                 auto_push=pr_review_auto_push
-                auto_reply=pr_review_auto_reply
                 dry_run=pr_review_dry_run
                 last_apply=pr_review_last_apply
                 item_status=pr_review_item_status
@@ -1057,7 +1055,6 @@ fn PrReviewModal(
     applying: RwSignal<bool>,
     error: RwSignal<Option<String>>,
     auto_push: RwSignal<bool>,
-    auto_reply: RwSignal<bool>,
     dry_run: RwSignal<bool>,
     last_apply: RwSignal<Option<PrReviewApplyResult>>,
     item_status: RwSignal<std::collections::HashMap<u64, PrItemStatus>>,
@@ -1164,7 +1161,6 @@ fn PrReviewModal(
 
         let opts = AddressPrReviewOptions {
             auto_push: auto_push.get(),
-            auto_reply: auto_reply.get(),
             dry_run: dry_run.get(),
         };
         // Clear the prior preview/report and any stale error so the user
@@ -1249,44 +1245,75 @@ fn PrReviewModal(
         });
     };
 
-    // Count of items Sync would act on: missing replies (POST) plus legacy
-    // replies that need to be located on GitHub and rewritten to the
-    // signature-free format (`reply_posted=true` but `pr_reply_text=None`).
-    // Items with `pr_reply_text=Some(_)` are already in the new format.
-    let deferred_reply_count = move || plan.get()
+    // The replies Sync may post, each with the exact text it would post:
+    // missing replies, and legacy replies to be rewritten
+    // (`reply_posted=true` but `pr_reply_text=None`). A reply is owed only for
+    // a fix whose commit was seen on the PR branch. The backend makes the
+    // final check on whatever is approved here.
+    let owed_replies = move || plan.get()
         .map(|p| p.items.iter()
             .filter(|i| i.approved
                 && matches!(i.decision, PrReviewDecisionKind::Fix)
                 && i.fix_done
-                // A reply is owed only for a fix whose commit was seen on the
-                // PR branch; an undelivered fix waits for Apply, not Sync.
                 && (if i.reply_posted {
                     i.pr_reply_text.is_none()
                 } else {
                     i.fix_commit.is_some() && !i.fix_uncommitted
                 }))
-            .count())
-        .unwrap_or(0);
+            .filter_map(|i| i.comment_id.map(|id| (
+                id,
+                i.summary.clone(),
+                slashit_review_content::reply_body(i.pr_reply_text.as_deref(), &i.reasoning, &i.summary),
+                i.reply_uncertain,
+            )))
+            .collect::<Vec<_>>())
+        .unwrap_or_default();
+    // Replies the person selected, each with the text they saw when selecting
+    // it and whether a duplicate was accepted. Nothing is selected by default,
+    // and approving a fix never selects a reply.
+    let approved_replies = RwSignal::new(Vec::<(u64, String, bool)>::new());
 
     let on_sync_replies = move |_| {
         let Some(task_value) = task.get() else { return; };
-        if deferred_reply_count() == 0 {
-            toast::error("Nothing to sync — every fixed item already has a reply in the current format".to_string());
+        let selected = approved_replies.get();
+        if selected.is_empty() {
+            toast::error("Select at least one reply to post".to_string());
             return;
         }
+        // A selection posts only the text the person saw. If the text changed
+        // since, nothing is sent: the stale selection is dropped and the rest
+        // stay selected.
+        let current = owed_replies();
+        let still_current = |s: &(u64, String, bool)| current.iter().any(|r| r.0 == s.0 && r.2 == s.1);
+        if !selected.iter().all(|s| still_current(s)) {
+            approved_replies.update(|v| v.retain(|s| still_current(s)));
+            toast::error("A reply changed after you selected it. Review the new text and select it again. Nothing was posted.".to_string());
+            return;
+        }
+        let approved: Vec<ApprovedPublicReply> = selected
+            .into_iter()
+            .map(|(comment_id, body, accept_possible_duplicate)| ApprovedPublicReply {
+                comment_id,
+                body,
+                accept_possible_duplicate,
+            })
+            .collect();
         // Reuse the `applying` lock for the modal-busy treatment; sync is a
         // short, gh-only catch-up but conceptually the same exclusive operation.
         error.set(None);
         applying.set(true);
         let task_id = task_value.id.to_string();
         spawn_local(async move {
-            match sync_pr_review_replies(task_id.clone()).await {
+            match sync_pr_review_replies(task_id.clone(), approved).await {
                 Ok(result) => {
+                    approved_replies.set(Vec::new());
                     let mut parts: Vec<String> = Vec::new();
                     if result.replied > 0 { parts.push(format!("Posted {} new", result.replied)); }
                     if result.rewritten > 0 { parts.push(format!("Rewrote {} ({} via discovery)", result.rewritten, result.discovered)); }
                     if result.unmatched > 0 { parts.push(format!("{} could not be located on GitHub", result.unmatched)); }
                     if result.fix_pending > 0 { parts.push(format!("{} still need a fix", result.fix_pending)); }
+                    if result.awaiting_approval > 0 { parts.push(format!("{} not selected, not posted", result.awaiting_approval)); }
+                    if result.held_uncertain > 0 { parts.push(format!("{} held: may already be on GitHub", result.held_uncertain)); }
                     if !result.errors.is_empty() { parts.push(format!("{} errors", result.errors.len())); }
                     let msg = if parts.is_empty() { "Nothing to sync".to_string() } else { parts.join(", ") };
                     let did_work = result.replied > 0 || result.rewritten > 0;
@@ -1583,6 +1610,50 @@ fn PrReviewModal(
                         </Show>
                     </div>
 
+                    <Show when=move || !owed_replies().is_empty()>
+                        <section class="px-5 py-3 border-t border-white/10 space-y-3 max-h-72 overflow-y-auto" aria-label="Replies waiting for approval">
+                            <div class="text-xs text-white/70 space-y-1">
+                                <p class="font-semibold text-white/80">"Replies waiting for your approval"</p>
+                                <p>"A reply is posted on GitHub only if you select it and press Post. Approving a fix does not approve its reply."</p>
+                            </div>
+                            <For
+                                each=owed_replies
+                                key=|r| r.0
+                                children=move |(id, _, _, _): (u64, String, String, bool)| {
+                                    let current = move || owed_replies().into_iter().find(|r| r.0 == id);
+                                    view! {
+                                        <div class="rounded-lg border border-white/10 p-2 space-y-2">
+                                            <label class="flex items-center gap-2 text-xs text-white/80 cursor-pointer">
+                                                <input
+                                                    type="checkbox"
+                                                    class="accent-yellow-500 disabled:cursor-not-allowed"
+                                                    prop:checked=move || approved_replies.get().iter().any(|s| s.0 == id)
+                                                    on:change=move |ev| {
+                                                        let on = event_target_checked(&ev);
+                                                        let Some(row) = current() else { return; };
+                                                        approved_replies.update(|v| {
+                                                            v.retain(|s| s.0 != id);
+                                                            if on { v.push((id, row.2.clone(), row.3)); }
+                                                        });
+                                                    }
+                                                    disabled=move || busy()
+                                                />
+                                                {move || current().map(|r| format!("Comment {}: {}", id, r.1)).unwrap_or_default()}
+                                            </label>
+                                            <pre class="whitespace-pre-wrap break-words text-xs text-white/80 bg-black/30 rounded p-2 m-0">
+                                                {move || current().map(|r| r.2).unwrap_or_default()}
+                                            </pre>
+                                            <Show when=move || current().is_some_and(|r| r.3)>
+                                                <p class="text-xs text-amber-200">
+                                                    "An earlier attempt may already have posted this PR-level reply. Selecting it accepts a possible duplicate."
+                                                </p>
+                                            </Show>
+                                        </div>
+                                    }
+                                }
+                            />
+                        </section>
+                    </Show>
                     <div class=move || format!(
                         "flex items-center justify-between gap-3 px-5 py-3 border-t border-white/10 bg-white/[0.02] {}",
                         if busy() { "opacity-60" } else { "" },
@@ -1597,16 +1668,6 @@ fn PrReviewModal(
                                     disabled=move || busy()
                                 />
                                 "Auto-push branch"
-                            </label>
-                            <label class="flex items-center gap-1.5 cursor-pointer">
-                                <input
-                                    type="checkbox"
-                                    class="accent-yellow-500 disabled:cursor-not-allowed"
-                                    prop:checked=move || auto_reply.get()
-                                    on:change=move |ev| auto_reply.set(event_target_checked(&ev))
-                                    disabled=move || busy()
-                                />
-                                "Auto-reply on PR"
                             </label>
                             <label
                                 class="flex items-center gap-1.5 cursor-pointer"
@@ -1650,20 +1711,20 @@ fn PrReviewModal(
                             </button>
                             <button
                                 class=move || {
-                                    if deferred_reply_count() > 0 {
-                                        "px-3 py-1.5 rounded-lg text-xs text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 transition-colors disabled:opacity-40"
-                                    } else {
+                                    if approved_replies.get().is_empty() {
                                         "px-3 py-1.5 rounded-lg text-xs text-white/40 border border-white/10 cursor-not-allowed"
+                                    } else {
+                                        "px-3 py-1.5 rounded-lg text-xs text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 transition-colors disabled:opacity-40"
                                     }
                                 }
                                 on:click=on_sync_replies
-                                disabled=move || busy() || deferred_reply_count() == 0
-                                title="Post deferred replies on GitHub for items that were fixed but never replied to. No agent run, no push. Enabled when at least one fixed item has no reply yet."
+                                disabled=move || busy() || approved_replies.get().is_empty()
+                                title="Post only the replies selected in the panel above, with the exact text shown there. No agent run, no push."
                             >
                                 {move || {
-                                    let n = deferred_reply_count();
-                                    if n == 0 { "Sync replies".to_string() }
-                                    else { format!("Sync {} replies", n) }
+                                    let n = approved_replies.get().len();
+                                    if n == 0 { "Post selected replies".to_string() }
+                                    else { format!("Post {} selected", n) }
                                 }}
                             </button>
                             <button

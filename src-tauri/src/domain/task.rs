@@ -1825,6 +1825,11 @@ pub struct PrReviewItem {
     /// failed reply leaves the item visibly pending in the "Sync replies" path.
     #[serde(default)]
     pub reply_posted: bool,
+    /// Set when a PR-level reply's POST failed after it may have reached
+    /// GitHub. A PR-level reply has no id to look up, so Sync posts it again
+    /// only after the person accepts the duplicate risk. Cleared on success.
+    #[serde(default)]
+    pub reply_uncertain: bool,
     /// Agent's per-item report from the run that set `fix_done=true`. Reused
     /// as the body of a deferred reply when the agent does not need to run
     /// again (already fixed, only the reply is missing).
@@ -1908,9 +1913,10 @@ pub struct PrReviewApplyResult {
     /// disk; this records why.
     #[serde(default)]
     pub push_error: Option<String>,
-    /// Whether this apply ran with `auto_reply=true` — `Some(true)`/`Some(false)`
-    /// for any apply recorded since this field existed, `None` for a result
-    /// persisted before it did. Needed to distinguish "reply attempted and
+    /// Whether this apply published replies itself. Applies from this change on
+    /// never do, so they record `Some(false)`; an older apply may have recorded
+    /// `Some(true)`, and `None` marks a result persisted before this field
+    /// existed. Needed to distinguish "reply attempted and
     /// succeeded" from "reply intentionally never attempted" when backfilling
     /// `reply_posted` from `fixed_ids` — collapsing the missing-historical-value
     /// case to `false` would make backfill treat "we don't actually know" the

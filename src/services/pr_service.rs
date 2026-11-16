@@ -221,7 +221,6 @@ pub struct AddressPrReviewOptions {
     /// Absent means off, the same as the backend reads it.
     #[serde(default)]
     pub auto_push: bool,
-    pub auto_reply: bool,
     #[serde(default)]
     pub dry_run: bool,
 }
@@ -266,10 +265,30 @@ pub struct SyncPrRepliesResult {
     pub errors: Vec<String>,
     #[serde(default)]
     pub fix_pending: u32,
+    #[serde(default)]
+    pub awaiting_approval: u32,
+    #[serde(default)]
+    pub held_uncertain: u32,
 }
 
-pub async fn sync_pr_review_replies(task_id: String) -> Result<SyncPrRepliesResult, String> {
-    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskId": task_id })).unwrap();
+/// A reply the person approved, with the exact text they were shown.
+/// Mirrors `commands::pr::ApprovedPublicReply`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ApprovedPublicReply {
+    pub comment_id: u64,
+    pub body: String,
+    pub accept_possible_duplicate: bool,
+}
+
+pub async fn sync_pr_review_replies(
+    task_id: String,
+    approved: Vec<ApprovedPublicReply>,
+) -> Result<SyncPrRepliesResult, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "taskId": task_id,
+        "approved": approved,
+    }))
+    .unwrap();
     let response = invoke("sync_pr_review_replies", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
@@ -383,8 +402,7 @@ mod tests {
 
     #[test]
     fn options_without_auto_push_deserialize_as_off() {
-        let options: AddressPrReviewOptions =
-            serde_json::from_str(r#"{"auto_reply":true}"#).unwrap();
+        let options: AddressPrReviewOptions = serde_json::from_str("{}").unwrap();
         assert!(!options.auto_push);
         assert!(!options.dry_run);
     }
@@ -392,7 +410,7 @@ mod tests {
     #[test]
     fn an_explicit_auto_push_is_kept() {
         let options: AddressPrReviewOptions =
-            serde_json::from_str(r#"{"auto_push":true,"auto_reply":false}"#).unwrap();
+            serde_json::from_str(r#"{"auto_push":true}"#).unwrap();
         assert!(options.auto_push);
     }
 }

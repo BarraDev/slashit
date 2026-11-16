@@ -755,6 +755,7 @@ mod orchestration {
                 fix_commit: Some(commit.to_string()),
                 fix_effect: Some(effect),
                 reply_posted: false,
+                reply_uncertain: false,
                 last_agent_summary: Some("done".into()),
                 last_error: None,
                 pr_reply_text: None,

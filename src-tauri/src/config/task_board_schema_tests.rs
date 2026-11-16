@@ -296,6 +296,7 @@ fn full_task(project_id: Uuid) -> Task {
             fix_commit: Some(commit('8')),
             fix_effect: Some(FixEffect { before_tree: commit('9'), after_tree: commit('0') }),
             reply_posted: true,
+            reply_uncertain: false,
             last_agent_summary: Some("agent".into()),
             last_error: Some("error".into()),
             pr_reply_text: Some("reply".into()),

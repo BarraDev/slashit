@@ -848,6 +848,15 @@ every review-body finding has a recorded disposition, stated in the pull request
   that reviewer did not review says so in the pull request.
 
 A thread that is resolved without one of these dispositions does not count.
+
+A reviewer's acknowledgement also satisfies the disposition for a thread, and
+needs no redundant reply, when all of these hold: the original finding is
+identifiable; the correcting commit exists on the pull request branch; source
+or test evidence supports the correction; the reviewer explicitly acknowledges
+that fix; and the thread is resolved. The acknowledgement covers the reviewed
+correction only, not later heads, and it does not renew a Human Review
+approval. The five dispositions above keep their meanings.
+
 An unresolved finding that would change behavior, persistence or authorization
 blocks the merge.
 

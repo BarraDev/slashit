@@ -84,9 +84,29 @@ pub fn fixed_content_is_current(
     }
 }
 
+/// The text a reply to a review comment publishes: the reply the fix agent
+/// wrote, else the triage reasoning, else the summary, trimmed. The backend
+/// posts it and the frontend shows it for approval, so both use this one rule.
+pub fn reply_body(pr_reply_text: Option<&str>, reasoning: &str, summary: &str) -> String {
+    [pr_reply_text.unwrap_or(""), reasoning, summary]
+        .into_iter()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reply_body_prefers_the_agent_text_then_reasoning_then_summary() {
+        assert_eq!(reply_body(Some("  wrote it  "), "why", "what"), "wrote it");
+        assert_eq!(reply_body(Some("  "), " why ", "what"), "why");
+        assert_eq!(reply_body(None, "", " what "), "what");
+        assert_eq!(reply_body(None, " ", " "), "");
+    }
 
     #[test]
     fn the_fingerprint_is_a_known_value() {

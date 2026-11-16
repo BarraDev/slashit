@@ -1569,7 +1569,6 @@ pub struct AddressPrReviewOptions {
     /// is by branch name, not pinned to a reviewed commit.
     #[serde(default)]
     pub auto_push: bool,
-    pub auto_reply: bool,
     /// When true, the agent runs read-only and describes what it would do, but
     /// no edits, commit, push, or PR replies are performed. Result is
     /// saved on the task with `pushed=false`, `replies_posted=0`, and
@@ -2293,15 +2292,13 @@ pub async fn address_pr_review_inner(
     }
     let total = approved_indices.len();
     eprintln!(
-        "[pr-review] applying {} approved items per-item (auto_push={}, auto_reply={}, dry_run={})",
-        total, options.auto_push, options.auto_reply, options.dry_run,
+        "[pr-review] applying {} approved items per-item (auto_push={}, dry_run={})",
+        total, options.auto_push, options.dry_run,
     );
 
-    let (reply_repo, reply_number) = if options.dry_run {
-        (String::new(), String::new())
-    } else {
-        parse_pr_url(&pr_url)?
-    };
+    if !options.dry_run {
+        parse_pr_url(&pr_url)?;
+    }
 
     // Nothing is edited, committed, pushed or replied to for a plan the PR
     // head has moved away from.
@@ -2363,8 +2360,6 @@ pub async fn address_pr_review_inner(
     // foreign edit must not.
     let mut dirt_refused = false;
     let mut failed_leftovers: Vec<crate::domain::task::FixEffect> = Vec::new();
-    let mut replies_posted = 0u32;
-    let mut reply_errors: Vec<String> = Vec::new();
 
     for (loop_idx, &orig_idx) in approved_indices.iter().enumerate() {
         // A lifecycle transition may have asked this whole apply flow to end
@@ -3129,24 +3124,16 @@ pub async fn address_pr_review_inner(
         }
     }
 
-    // --- Reply delivery pass ----------------------------------------------
+    // --- Delivery check -----------------------------------------------------
     //
-    // A fix is delivered, and its reply may say so, only when the commit that
-    // carries it is contained in the pull request's branch on `origin` as
-    // `origin` reports it now. That is decided once for the whole pass by
-    // [`settle_delivery`], the rule Sync replies uses too. Neither a push
-    // that succeeded, a clean checkout, nothing left to commit nor a branch
-    // that is not ahead of its tracking ref is evidence of it (#96). The pass
-    // runs once, after every commit and push this apply is going to attempt
-    // has resolved, over every approved item -- not just the ones this apply
-    // fixed -- so it also posts the reply an earlier apply left owing once its
-    // fix is finally on the remote. `reply_posted` makes it idempotent across
-    // applies. Disabled for a dry run (no real side effects) and when this
-    // flow was cancelled before its commit (the same `cancelled` the commit
-    // and push above follow). Because an item still owing delivery is not in
-    // `reply_errors`, `backfill_lifecycle_from_last_apply` must not read its
-    // absence there as a posted reply; it skips every item with a recorded
-    // commit or an undelivered fix.
+    // Apply publishes no reply. A fix is delivered, and so may be described to
+    // the reviewer, only when the commit that carries it is contained in the
+    // pull request's branch on `origin` as `origin` reports it now. That is
+    // decided by [`settle_delivery`], the rule Sync replies uses too (#96),
+    // and it is evaluated only to report a push problem: the reply itself is
+    // proposed in the plan and posted later, only after the person approves
+    // its exact text (see `sync_pr_review_replies_inner`). Disabled for a dry
+    // run and when this flow was cancelled before its commit.
     if !options.dry_run && !cancelled {
         let delivered = settle_delivery(&working_dir, &task, &mut updated_plan).await;
         if let Some(why) = delivered.unavailable.as_ref() {
@@ -3155,63 +3142,6 @@ pub async fn address_pr_review_inner(
                     "whether the fixes reached the pull request's branch could not be confirmed, \
                      so no reply says they are fixed: {why}"
                 ));
-            }
-        }
-        if options.auto_reply {
-            for (loop_idx, &orig_idx) in approved_indices.iter().enumerate() {
-                let item = updated_plan.items[orig_idx].clone();
-                if item.reply_posted || !delivered.indices.contains(&orig_idx) {
-                    continue;
-                }
-                let current = loop_idx + 1;
-                let label = item
-                    .comment_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "<none>".to_string());
-                let body = build_reply_body(&item);
-                progress(PrReviewProgress {
-                    task_id: task_id_str.clone(),
-                    kind: "reply_started".to_string(),
-                    current: Some(current),
-                    total: Some(total),
-                    comment_id: item.comment_id,
-                    message: None,
-                });
-                match post_pr_reply(
-                    &reply_repo,
-                    &reply_number,
-                    updated_plan.inline_reply_target(item.comment_id),
-                    &body,
-                )
-                .await
-                {
-                    Ok(reply_id) => {
-                        replies_posted += 1;
-                        updated_plan.items[orig_idx].reply_posted = true;
-                        if reply_id.is_some() {
-                            updated_plan.items[orig_idx].reply_comment_id = reply_id;
-                        }
-                        progress(PrReviewProgress {
-                            task_id: task_id_str.clone(),
-                            kind: "reply_done".to_string(),
-                            current: Some(current),
-                            total: Some(total),
-                            comment_id: item.comment_id,
-                            message: None,
-                        });
-                    }
-                    Err(e) => {
-                        reply_errors.push(format!("comment {}: {}", label, e));
-                        progress(PrReviewProgress {
-                            task_id: task_id_str.clone(),
-                            kind: "reply_failed".to_string(),
-                            current: Some(current),
-                            total: Some(total),
-                            comment_id: item.comment_id,
-                            message: Some(e),
-                        });
-                    }
-                }
             }
         }
     }
@@ -3230,16 +3160,14 @@ pub async fn address_pr_review_inner(
         skipped_ids,
         pushed,
         push_branch: push_branch_name,
-        replies_posted,
-        reply_errors,
+        replies_posted: 0,
+        reply_errors: Vec::new(),
         dry_run: options.dry_run,
         failed_ids,
         fix_errors,
         push_error,
-        // A freshly-run apply always knows whether replies were requested —
-        // only a result persisted before this field existed deserializes to
-        // `None` (see `PrReviewApplyResult::auto_reply`).
-        auto_reply: Some(options.auto_reply),
+        // Apply never publishes replies; see `PrReviewApplyResult::auto_reply`.
+        auto_reply: Some(false),
     };
 
     progress(PrReviewProgress {
@@ -3513,21 +3441,39 @@ pub struct SyncPrRepliesResult {
     /// (see #79) — the user must run Apply for them. Carried back so the UI
     /// can warn instead of silently dropping.
     pub fix_pending: u32,
+    /// Owed replies left unposted because the person did not approve them.
+    #[serde(default)]
+    pub awaiting_approval: u32,
+    /// PR-level replies held because an earlier attempt may have posted them.
+    #[serde(default)]
+    pub held_uncertain: u32,
 }
 
-/// Catch-up reply pass: post replies for items where `fix_done=true`,
-/// `fix_uncommitted=false` (the fix is actually delivered — see #79) and
-/// `reply_posted=false`, without invoking the agent and without pushing.
+/// A reply the person approved for publication, as they saw its text. Sync
+/// posts it only while the plan still produces exactly `body` for the comment.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ApprovedPublicReply {
+    pub comment_id: u64,
+    pub body: String,
+    /// Set only after an earlier PR-level POST may have posted this reply. The
+    /// person accepts that Sync may create a duplicate.
+    #[serde(default)]
+    pub accept_possible_duplicate: bool,
+}
+
+/// Publishes the replies the person approved, and nothing else. Apply never
+/// posts a reply; the owed replies are shown with their exact text, and only
+/// approved ones are posted, without invoking the agent and without pushing.
 ///
-/// This is the recovery path for partial runs: when the agent fixed something
-/// but the GitHub reply step failed (rate limit, transient API error, the user
-/// closed the modal mid-run, etc.), the user can click "Sync replies" to walk
-/// the plan and post only the deferred replies.
+/// This is also the recovery path for partial runs: a fix whose reply was not
+/// posted is offered again, and a threaded reply already on GitHub is adopted
+/// rather than posted twice.
 #[tauri::command]
 pub async fn sync_pr_review_replies(
     _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
+    approved: Vec<ApprovedPublicReply>,
 ) -> Result<SyncPrRepliesResult, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     // The checkout when the task still has one; the repository otherwise,
@@ -3547,21 +3493,22 @@ pub async fn sync_pr_review_replies(
         .ok_or_else(|| "Task has no PR review plan to sync".to_string())?;
     plan.backfill_lifecycle_from_last_apply();
 
-    let (result, updated_plan) = sync_pr_review_replies_inner(task, working_dir, plan).await?;
+    let (result, updated_plan) =
+        sync_pr_review_replies_inner(task, working_dir, plan, &approved).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
 }
 
-/// Core logic of `sync_pr_review_replies` extracted for testability. Walks
-/// the plan's approved Fix items, posts a reply for each one with
-/// `fix_done=true && !fix_uncommitted && reply_posted=false` (see #79 —
-/// `fix_uncommitted` is excluded so this never claims a fix is done before
-/// it has actually reached the pull request), and returns the updated plan
-/// with `reply_posted` flipped on whatever succeeded.
+/// Core logic of `sync_pr_review_replies` extracted for testability. Posts or
+/// edits a reply only for an item the person approved in `approved`, and only
+/// with the exact text they were shown: a mismatch refuses the whole call
+/// before any GitHub write. Returns the updated plan with `reply_posted`
+/// flipped on whatever succeeded.
 pub async fn sync_pr_review_replies_inner(
     task: Task,
     working_dir: String,
     plan: PrReviewPlan,
+    approved: &[ApprovedPublicReply],
 ) -> Result<(SyncPrRepliesResult, PrReviewPlan), String> {
     let pr_url = pr_url_for_task(&task)?;
     let (repo, number) = parse_pr_url(&pr_url)?;
@@ -3594,9 +3541,42 @@ pub async fn sync_pr_review_replies_inner(
         }
     }
 
+    // Every approval is checked before the first GitHub write, so a stale or
+    // mismatched text refuses the whole call with nothing posted: the text
+    // posted is the text the person was shown, byte for byte.
+    let mut approved_ids = std::collections::HashSet::new();
+    for reply in approved {
+        if !approved_ids.insert(reply.comment_id) {
+            return Err(format!(
+                "comment {} is approved more than once. Nothing was posted.",
+                reply.comment_id
+            ));
+        }
+        let Some(item) = updated_plan.items.iter().find(|i| {
+            i.comment_id == Some(reply.comment_id)
+                && i.approved
+                && matches!(i.decision, PrReviewDecision::Fix)
+        }) else {
+            return Err(format!(
+                "comment {} is not an approved fix in this plan. Nothing was posted; \
+                 reload the review and approve again.",
+                reply.comment_id
+            ));
+        };
+        if build_reply_body(item) != reply.body {
+            return Err(format!(
+                "the reply to comment {} changed after you reviewed it. Nothing was posted; \
+                 review the new text and approve it again.",
+                reply.comment_id
+            ));
+        }
+    }
+
     let mut replied = 0u32;
     let mut errors: Vec<String> = Vec::new();
     let mut fix_pending = 0u32;
+    let mut awaiting_approval = 0u32;
+    let mut held_uncertain = 0u32;
 
     let approved_indices: Vec<usize> = updated_plan
         .items
@@ -3637,6 +3617,15 @@ pub async fn sync_pr_review_replies_inner(
         if item.reply_posted && item.pr_reply_text.is_some() {
             continue;
         }
+        // Nothing is posted or edited unless the person approved this exact
+        // text. Discovery below only reads GitHub.
+        let Some(approval) = approved
+            .iter()
+            .find(|a| Some(a.comment_id) == item.comment_id)
+        else {
+            awaiting_approval += 1;
+            continue;
+        };
         let label = item
             .comment_id
             .map(|id| id.to_string())
@@ -3646,6 +3635,7 @@ pub async fn sync_pr_review_replies_inner(
         // Case A: no reply on GitHub yet — POST a new one.
         if !item.reply_posted {
             let target = updated_plan.inline_reply_target(item.comment_id);
+            let pr_level = target.is_none();
             let posted = match target {
                 // A valid inline comment is answered only in its own thread.
                 // Look for a reply first: an earlier POST may have succeeded
@@ -3683,6 +3673,18 @@ pub async fn sync_pr_review_replies_inner(
                 // answers, which must be exactly one. The stored text stays
                 // the bare reply.
                 None => {
+                    // A PR-level reply has no id to look up, so an earlier POST
+                    // that may have landed is never repeated without the person
+                    // accepting that risk.
+                    if item.reply_uncertain && !approval.accept_possible_duplicate {
+                        held_uncertain += 1;
+                        errors.push(format!(
+                            "comment {label}: an earlier attempt to post this PR-level reply \
+                             may have reached GitHub, so it was not posted again. Check the \
+                             pull request, then approve it again to accept the duplicate risk."
+                        ));
+                        continue;
+                    }
                     let original = item.comment_id.and_then(|id| updated_plan.comment_for(id));
                     let Some(original) = original else {
                         errors.push(format!(
@@ -3702,12 +3704,21 @@ pub async fn sync_pr_review_replies_inner(
                 Ok(reply_id) => {
                     replied += 1;
                     updated_plan.items[orig_idx].reply_posted = true;
+                    updated_plan.items[orig_idx].reply_uncertain = false;
                     if reply_id.is_some() {
                         updated_plan.items[orig_idx].reply_comment_id = reply_id;
                     }
                     updated_plan.items[orig_idx].pr_reply_text = Some(body);
                 }
-                Err(e) => errors.push(format!("comment {}: {}", label, e)),
+                Err(e) => {
+                    // A threaded reply is looked up before the next POST, so
+                    // only a PR-level failure, which cannot be looked up, is
+                    // recorded as possibly posted.
+                    if pr_level {
+                        updated_plan.items[orig_idx].reply_uncertain = true;
+                    }
+                    errors.push(format!("comment {}: {}", label, e));
+                }
             }
             continue;
         }
@@ -3768,6 +3779,8 @@ pub async fn sync_pr_review_replies_inner(
             unmatched,
             errors,
             fix_pending,
+            awaiting_approval,
+            held_uncertain,
         },
         updated_plan,
     ))
@@ -3977,6 +3990,10 @@ async fn fetch_pr_review_data(
             updated_at: created_at,
         });
     }
+    // Our own replies answer findings already listed, so they are not findings
+    // of their own (R4). With the account unknown, nothing is filtered and the
+    // replies stay visible: analysis fails open, while Sync fails closed.
+    let our_login = gh_authenticated_login().await;
     for c in gh_pr_view_list(&json, "comments")? {
         let body = c
             .get("body")
@@ -3985,6 +4002,10 @@ async fn fetch_pr_review_data(
             .trim()
             .to_string();
         if body.is_empty() {
+            continue;
+        }
+        let author_login = c.pointer("/author/login").and_then(|v| v.as_str());
+        if is_our_account(our_login.as_deref(), author_login) && is_sync_pr_level_reply(&body) {
             continue;
         }
         let id = c
@@ -4039,6 +4060,14 @@ async fn fetch_pr_review_data(
             continue;
         }
         if id.is_some_and(|id| non_actionable.contains(&id)) {
+            continue;
+        }
+        // A reply in a thread answers a finding already listed; when our own
+        // account wrote it, it is not a new finding (R4).
+        let author_login = c.pointer("/user/login").and_then(|v| v.as_str());
+        if c.get("in_reply_to_id").is_some_and(|v| !v.is_null())
+            && is_our_account(our_login.as_deref(), author_login)
+        {
             continue;
         }
         let author = c
@@ -4656,6 +4685,7 @@ fn parse_review_items(output: &str, batch: &[PrReviewComment]) -> Vec<PrReviewIt
             fix_done: false,
             fix_uncommitted: false,
             reply_posted: false,
+            reply_uncertain: false,
             last_agent_summary: None,
             last_error: None,
             pr_reply_text: None,
@@ -4873,19 +4903,11 @@ fn extract_pr_reply(agent_output: &str) -> Option<String> {
 /// prompt already asks to be reply-friendly. No signature, no labels, no
 /// "Agent notes:" — the human is the apparent author.
 fn build_reply_body(item: &PrReviewItem) -> String {
-    if let Some(text) = item
-        .pr_reply_text
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return text.to_string();
-    }
-    let reasoning = item.reasoning.trim();
-    if !reasoning.is_empty() {
-        return reasoning.to_string();
-    }
-    item.summary.trim().to_string()
+    slashit_review_content::reply_body(
+        item.pr_reply_text.as_deref(),
+        &item.reasoning,
+        &item.summary,
+    )
 }
 
 /// Posts a reply on the PR. Returns the GitHub comment ID of the created
@@ -4976,6 +4998,22 @@ async fn gh_authenticated_login() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Whether `author` is the account this `gh` posts as. An unknown account on
+/// either side is never ours.
+fn is_our_account(our_login: Option<&str>, author: Option<&str>) -> bool {
+    match (our_login, author) {
+        (Some(ours), Some(author)) => ours.eq_ignore_ascii_case(author.trim()),
+        _ => false,
+    }
+}
+
+/// Whether a PR-level comment is a reply Sync posted: its first line names the
+/// comment it answers (see `sync_pr_review_replies_inner`).
+fn is_sync_pr_level_reply(body: &str) -> bool {
+    let first = body.lines().next().unwrap_or("");
+    first.starts_with("Re https://") || first.starts_with("Re the comment by @")
 }
 
 /// Walks the PR's inline review comments and returns the id of *our* reply:
@@ -11139,6 +11177,7 @@ mod tests {
             fix_done: false,
             fix_uncommitted: false,
             reply_posted: false,
+            reply_uncertain: false,
             last_agent_summary: None,
             last_error: None,
             pr_reply_text: None,
@@ -11225,6 +11264,7 @@ mod tests {
         PrReviewItem {
             fix_done: true,
             reply_posted: true,
+            reply_uncertain: false,
             pr_reply_text: Some("addressed the original wording".to_string()),
             reply_comment_id: Some(555),
             ..fresh_item(cid)
@@ -23558,6 +23598,7 @@ mod tests {
                         fix_done: false,
                         fix_uncommitted: false,
                         reply_posted: false,
+                        reply_uncertain: false,
                         last_agent_summary: None,
                         last_error: None,
                         pr_reply_text: None,
@@ -23571,7 +23612,6 @@ mod tests {
                 };
                 let options = AddressPrReviewOptions {
                     auto_push: false,
-                    auto_reply: false,
                     dry_run: false,
                 };
 
@@ -24079,6 +24119,7 @@ mod tests {
                     fix_done: false,
                     fix_uncommitted: false,
                     reply_posted: false,
+                    reply_uncertain: false,
                     last_agent_summary: None,
                     last_error: None,
                     pr_reply_text: None,
@@ -24136,7 +24177,6 @@ mod tests {
                 };
                 let options = AddressPrReviewOptions {
                     auto_push: true,
-                    auto_reply: false,
                     dry_run: false,
                 };
 
@@ -24409,7 +24449,6 @@ mod tests {
                 plan: PrReviewPlan,
                 worktree: &Path,
                 jj: PathBuf,
-                auto_reply: bool,
             ) -> (PrReviewApplyResult, PrReviewPlan) {
                 // Fixes on disk that no commit holds yet are always protected by a durable
                 // scope record in the Task. A plan that owes a commit is applied to a Task
@@ -24430,7 +24469,7 @@ mod tests {
                         awaiting_commit: true,
                     });
                 }
-                apply_observed(&task, plan, worktree, jj, auto_reply, no_progress())
+                apply_observed(&task, plan, worktree, jj, no_progress())
                     .await
                     .expect("the apply flow reports per step, not as a command error")
             }
@@ -24466,11 +24505,10 @@ mod tests {
                 plan: PrReviewPlan,
                 worktree: &Path,
                 jj: PathBuf,
-                auto_reply: bool,
                 progress: ProgressSink,
             ) -> Result<(PrReviewApplyResult, PrReviewPlan), String> {
                 let (_ledger_root, ledger) = detached_ledger(task);
-                apply_observed_on(&ledger, task, plan, worktree, jj, auto_reply, progress).await
+                apply_observed_on(&ledger, task, plan, worktree, jj, progress).await
             }
 
             /// [`apply_observed`] over a caller's ledger, so a record one apply
@@ -24481,13 +24519,11 @@ mod tests {
                 mut plan: PrReviewPlan,
                 worktree: &Path,
                 jj: PathBuf,
-                auto_reply: bool,
                 progress: ProgressSink,
             ) -> Result<(PrReviewApplyResult, PrReviewPlan), String> {
                 plan.backfill_lifecycle_from_last_apply();
                 let options = AddressPrReviewOptions {
                     auto_push: true,
-                    auto_reply,
                     dry_run: false,
                 };
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -24514,7 +24550,7 @@ mod tests {
                 jj: PathBuf,
             ) -> PrReviewApplyResult {
                 let (task, plan) = task_with_one_fix(state, repo, worktree).await;
-                let (result, _plan) = apply(&task, plan, worktree, jj, false).await;
+                let (result, _plan) = apply(&task, plan, worktree, jj).await;
                 assert_eq!(result.fixed_ids, vec![1], "{result:?}");
                 result
             }
@@ -24581,7 +24617,7 @@ mod tests {
                 let (mut task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
                 task.status = TaskStatus::HumanReview;
 
-                let (result, _plan) = apply(&task, plan, &worktree, no_jj, false).await;
+                let (result, _plan) = apply(&task, plan, &worktree, no_jj).await;
 
                 assert!(
                     !result.pushed,
@@ -24631,7 +24667,6 @@ mod tests {
                 });
                 let options = AddressPrReviewOptions {
                     auto_push: true,
-                    auto_reply: false,
                     dry_run: false,
                 };
                 let (result, _plan) = test_programs::scope(
@@ -24676,7 +24711,7 @@ mod tests {
                     chrono::Utc::now(),
                 );
 
-                let (result, _plan) = apply(&task, plan, &worktree, no_jj, false).await;
+                let (result, _plan) = apply(&task, plan, &worktree, no_jj).await;
 
                 assert!(result.pushed, "{:?}", result.push_error);
                 assert!(
@@ -24868,7 +24903,7 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed, "{first:?}");
                 assert!(plan.items[0].fix_done, "the fix is on disk");
 
@@ -24888,7 +24923,7 @@ mod tests {
                     apply_scope: true,
                     awaiting_commit: true,
                 });
-                let (second, _plan) = apply(&persisted, plan, &worktree, no_jj, false).await;
+                let (second, _plan) = apply(&persisted, plan, &worktree, no_jj).await;
 
                 assert_eq!(claude.runs(), 1, "the fix is not made again");
                 assert!(second.pushed, "{:?}", second.push_error);
@@ -24954,7 +24989,7 @@ mod tests {
                 let tip = git(&worktree, &["rev-parse", "task-branch"]);
 
                 let error =
-                    apply_observed(&task, plan.clone(), &worktree, no_jj, false, no_progress())
+                    apply_observed(&task, plan.clone(), &worktree, no_jj, no_progress())
                         .await
                         .expect_err("unexplained edits refuse the apply");
 
@@ -24991,7 +25026,7 @@ mod tests {
                     .expect("the analysis fingerprint matches the dirty checkout");
 
                 let outcome =
-                    apply_observed(&task, plan, &worktree, no_jj, false, no_progress()).await;
+                    apply_observed(&task, plan, &worktree, no_jj, no_progress()).await;
 
                 assert!(outcome.is_err(), "{outcome:?}");
                 assert_eq!(claude.runs(), 0, "no fix agent ran");
@@ -25018,7 +25053,7 @@ mod tests {
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
                 let (result, _plan) =
-                    apply(&task, with_item(plan, 2), &worktree, no_jj, false).await;
+                    apply(&task, with_item(plan, 2), &worktree, no_jj).await;
 
                 assert_eq!(
                     claude.runs(),
@@ -25061,7 +25096,6 @@ mod tests {
                     plan,
                     &worktree,
                     no_jj,
-                    false,
                     no_progress(),
                 )
                 .await
@@ -25109,7 +25143,7 @@ mod tests {
                     let tip = git(&worktree, &["rev-parse", "task-branch"]);
 
                     let outcome =
-                        apply_observed(&task, plan, &worktree, no_jj, false, no_progress()).await;
+                        apply_observed(&task, plan, &worktree, no_jj, no_progress()).await;
 
                     let error = outcome.expect_err(label);
                     assert!(
@@ -25148,7 +25182,7 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply_on_board(&state, &task, plan, &worktree, no_jj.clone(), true, false).await;
+                let (first, plan) = apply_on_board(&state, &task, plan, &worktree, no_jj.clone(), true).await;
                 assert!(!first.pushed, "{first:?}");
                 assert!(
                     worktree.join("review-fix-1.txt").exists(),
@@ -25157,7 +25191,7 @@ mod tests {
                 std::fs::remove_file(&hook).unwrap();
 
                 let (second, plan) =
-                    apply_on_board(&state, &task, with_item(plan, 2), &worktree, no_jj, true, false).await;
+                    apply_on_board(&state, &task, with_item(plan, 2), &worktree, no_jj, true).await;
 
                 assert_eq!(claude.runs(), 2, "only the new item ran an agent");
                 assert!(second.pushed, "{:?}", second.push_error);
@@ -25197,7 +25231,7 @@ mod tests {
                 });
 
                 let (result, plan) =
-                    apply_observed(&task, with_item(plan, 2), &worktree, no_jj, false, progress)
+                    apply_observed(&task, with_item(plan, 2), &worktree, no_jj, progress)
                         .await
                         .expect("the apply reports per step");
 
@@ -25229,13 +25263,13 @@ mod tests {
                 let (state, tmp) = build_test_state().await;
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed, "{first:?}");
                 std::fs::remove_file(&hook).unwrap();
                 let tip = git(&worktree, &["rev-parse", "task-branch"]);
                 std::fs::write(worktree.join("review-fix-1.txt"), "someone else\n").unwrap();
 
-                let error = apply_observed(&task, plan, &worktree, no_jj, false, no_progress())
+                let error = apply_observed(&task, plan, &worktree, no_jj, no_progress())
                     .await
                     .expect_err("an edit no fix made refuses the apply");
 
@@ -25319,7 +25353,6 @@ mod tests {
                     with_item(with_item(plan, 2), 3),
                     &worktree,
                     no_jj,
-                    false,
                     progress,
                 )
                 .await
@@ -25364,7 +25397,6 @@ mod tests {
                     with_item(with_item(plan, 2), 3),
                     &worktree,
                     no_jj,
-                    false,
                     progress,
                 )
                 .await
@@ -25389,7 +25421,7 @@ mod tests {
                 let (state, tmp) = build_test_state().await;
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed, "{first:?}");
                 std::fs::remove_file(&hook).unwrap();
                 let tip = git(&worktree, &["rev-parse", "task-branch"]);
@@ -25400,7 +25432,7 @@ mod tests {
                     }
                 });
 
-                let (second, plan) = apply_observed(&task, plan, &worktree, no_jj, false, progress)
+                let (second, plan) = apply_observed(&task, plan, &worktree, no_jj, progress)
                     .await
                     .expect("the apply reports per step");
 
@@ -25429,7 +25461,6 @@ mod tests {
                 plan.backfill_lifecycle_from_last_apply();
                 let options = AddressPrReviewOptions {
                     auto_push: false,
-                    auto_reply: false,
                     dry_run: true,
                 };
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -25463,12 +25494,12 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(first.pushed, "{:?}", first.push_error);
                 let tip = git(&worktree, &["rev-parse", "task-branch"]);
 
                 let (second, _plan) =
-                    apply(&task, with_item(plan, 2), &worktree, no_jj, false).await;
+                    apply(&task, with_item(plan, 2), &worktree, no_jj).await;
 
                 assert_eq!(second.failed_ids, vec![2], "{second:?}");
                 assert!(second.fixed_ids.is_empty(), "{second:?}");
@@ -25577,7 +25608,6 @@ mod tests {
                         with_second_item(plan, comment_id),
                         &worktree,
                         tmp.path().join("no-such-jj"),
-                        false,
                     )
                     .await;
                     drop(claude);
@@ -25607,7 +25637,7 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply_on_board(&state, &task, plan, &worktree, no_jj.clone(), true, false).await;
+                let (first, plan) = apply_on_board(&state, &task, plan, &worktree, no_jj.clone(), true).await;
                 assert!(!first.pushed, "{first:?}");
                 assert!(
                     plan.items[0].fix_done && plan.items[0].fix_uncommitted,
@@ -25623,7 +25653,6 @@ mod tests {
                     &worktree,
                     no_jj,
                     true,
-                    false,
                 )
                 .await;
 
@@ -25656,7 +25685,6 @@ mod tests {
                     with_second_item(plan, Some(2)),
                     &worktree,
                     no_jj.clone(),
-                    false,
                     no_progress(),
                 )
                 .await
@@ -25681,7 +25709,6 @@ mod tests {
                     plan,
                     &worktree,
                     no_jj,
-                    false,
                     no_progress(),
                 )
                 .await
@@ -25724,7 +25751,7 @@ mod tests {
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
                 let (first, plan) =
-                    apply_on_board(&state, &task, plan, &worktree, no_jj.clone(), true, false).await;
+                    apply_on_board(&state, &task, plan, &worktree, no_jj.clone(), true).await;
                 assert!(!first.pushed, "{first:?}");
                 assert!(worktree.join("review-fix-1.txt").exists(), "the first fix is owed a commit");
                 std::fs::remove_file(&hook).unwrap();
@@ -25738,7 +25765,6 @@ mod tests {
                     unrelated,
                     &worktree,
                     no_jj,
-                    false,
                     no_progress(),
                 )
                 .await
@@ -25779,7 +25805,6 @@ mod tests {
                     plan,
                     &worktree,
                     no_jj.clone(),
-                    false,
                     no_progress(),
                 )
                 .await
@@ -25803,7 +25828,6 @@ mod tests {
                     plan,
                     &worktree,
                     no_jj,
-                    false,
                     no_progress(),
                 )
                 .await
@@ -25845,11 +25869,11 @@ mod tests {
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
                 let plan = with_second_item(plan, Some(2));
 
-                let (first, plan) = apply_on_board(&state, &task, plan, &worktree, no_jj.clone(), true, false).await;
+                let (first, plan) = apply_on_board(&state, &task, plan, &worktree, no_jj.clone(), true).await;
                 assert!(!first.pushed, "{first:?}");
                 assert_eq!(claude.runs(), 2, "A failed, then B ran: {first:?}");
 
-                let (second, _plan) = apply_on_board(&state, &task, plan, &worktree, no_jj, true, false).await;
+                let (second, _plan) = apply_on_board(&state, &task, plan, &worktree, no_jj, true).await;
                 assert_eq!(claude.runs(), 3, "only A runs again: {second:?}");
                 assert!(second.pushed, "{:?}", second.push_error);
                 assert_eq!(
@@ -25885,12 +25909,12 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed, "{first:?}");
                 assert_eq!(claude.runs(), 1, "{first:?}");
 
                 let error =
-                    match apply_observed(&task, plan, &worktree, no_jj, false, no_progress()).await
+                    match apply_observed(&task, plan, &worktree, no_jj, no_progress()).await
                     {
                         Err(error) => error,
                         Ok((second, _)) => panic!("the leftover must refuse the rerun: {second:?}"),
@@ -25940,7 +25964,7 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (result, _plan) = apply(&task, plan, &worktree, no_jj, false).await;
+                let (result, _plan) = apply(&task, plan, &worktree, no_jj).await;
                 assert_eq!(claude.runs(), 1, "{result:?}");
                 assert!(result.pushed, "{:?}", result.push_error);
                 assert_eq!(
@@ -25985,7 +26009,6 @@ mod tests {
                     with_second_item(plan, None),
                     &worktree,
                     no_jj.clone(),
-                    false,
                     no_progress(),
                 )
                 .await
@@ -26000,7 +26023,6 @@ mod tests {
                     plan,
                     &worktree,
                     no_jj.clone(),
-                    false,
                     no_progress(),
                 )
                 .await
@@ -26039,7 +26061,7 @@ mod tests {
                 .await
                 .expect("a clean checkout on the Task branch resolves");
                 let (second, plan) =
-                    apply_observed_on(&ledger, &task, plan, &worktree, no_jj, false, no_progress())
+                    apply_observed_on(&ledger, &task, plan, &worktree, no_jj, no_progress())
                         .await
                         .expect("the apply reports per step");
 
@@ -26095,7 +26117,6 @@ mod tests {
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
                 let options = AddressPrReviewOptions {
                     auto_push: true,
-                    auto_reply: false,
                     dry_run: false,
                 };
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -26153,14 +26174,13 @@ mod tests {
                 let (state, tmp) = build_test_state().await;
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
-                let (_first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (_first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(plan.items[0].fix_uncommitted, "{:?}", plan.items[0]);
                 std::fs::remove_file(&hook).unwrap();
                 let tip = git(&worktree, &["rev-parse", "task-branch"]);
 
                 let options = AddressPrReviewOptions {
                     auto_push: true,
-                    auto_reply: false,
                     dry_run: false,
                 };
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -26210,12 +26230,12 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(first.pushed, "{:?}", first.push_error);
                 let tip = git(&worktree, &["rev-parse", "task-branch"]);
                 std::fs::write(worktree.join("stray.txt"), "a local edit\n").unwrap();
 
-                let (second, _plan) = apply(&task, plan, &worktree, no_jj, false).await;
+                let (second, _plan) = apply(&task, plan, &worktree, no_jj).await;
 
                 assert_eq!(claude.runs(), 1, "the fix is not made again");
                 assert!(!second.pushed, "{second:?}");
@@ -26246,19 +26266,16 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(first.pushed, "{:?}", first.push_error);
-                assert_eq!(first.replies_posted, 1);
+                assert_eq!(first.replies_posted, 0, "apply publishes no reply");
                 reject_commits(&repo);
 
                 let (second, plan) =
-                    apply(&task, with_item(plan, 2), &worktree, no_jj.clone(), true).await;
+                    apply(&task, with_item(plan, 2), &worktree, no_jj.clone()).await;
 
                 assert_eq!(second.fixed_ids, vec![2], "{second:?}");
-                assert_eq!(
-                    second.replies_posted, 0,
-                    "the undelivered fix's reply is not posted"
-                );
+                assert_eq!(second.replies_posted, 0, "{second:?}");
                 assert!(
                     plan.items[1].fix_done && plan.items[1].fix_uncommitted,
                     "{:?}",
@@ -26266,27 +26283,31 @@ mod tests {
                 );
                 assert!(!plan.items[1].reply_posted, "{:?}", plan.items[1]);
                 assert!(
-                    plan.items[0].reply_posted,
-                    "the earlier item's delivered reply is untouched"
+                    !plan.items[0].reply_posted,
+                    "the delivered fix's reply waits for approval in Sync, not Apply"
                 );
                 let error = second.push_error.as_deref().unwrap_or_default();
                 assert!(error.contains("could not be committed"), "{error:?}");
 
-                // Once the checkout accepts commits again, the deferred
-                // reply is posted -- once, not a second time for the item
-                // that was already delivered and replied.
+                // Once the checkout accepts commits again, the next apply
+                // delivers the deferred fix. Sync then offers both delivered
+                // fixes, and posts each reply once.
                 std::fs::remove_file(repo.checkout.join(".git/hooks/pre-commit")).unwrap();
-                let (third, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                let (third, plan) = apply(&task, plan, &worktree, no_jj).await;
                 assert!(third.pushed, "{:?}", third.push_error);
-                assert_eq!(
-                    third.replies_posted, 1,
-                    "only the newly-delivered item's reply is posted"
-                );
+                assert_eq!(third.replies_posted, 0, "apply publishes no reply");
+                // The second fix's comment must be in the plan for Sync to name it.
+                let mut plan = plan;
+                plan.comments.push(comment(2));
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 2, "{synced:?}");
                 assert!(
-                    plan.items[1].reply_posted && !plan.items[1].fix_uncommitted,
+                    plan.items[0].reply_posted && plan.items[1].reply_posted,
                     "{:?}",
-                    plan.items[1]
+                    plan.items
                 );
+                let (again, _plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(again.replied, 0, "no reply is posted twice: {again:?}");
             }
 
             /// A fix that changes nothing leaves no scope record behind. It owes
@@ -26307,7 +26328,6 @@ mod tests {
                     plan,
                     &worktree,
                     tmp.path().join("no-such-jj"),
-                    true,
                     no_progress(),
                 )
                 .await
@@ -26330,7 +26350,7 @@ mod tests {
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
                 let (result, plan) =
-                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj")).await;
 
                 assert_eq!(result.replies_posted, 0, "{result:?}");
                 assert!(!result.pushed);
@@ -26374,13 +26394,13 @@ mod tests {
 
                 // (2) The apply fixes and answers from A.
                 let (result, applied) =
-                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj")).await;
                 assert_eq!(
                     (result.fixed_ids.clone(), result.replies_posted),
-                    (vec![1], 1),
+                    (vec![1], 0),
                     "{result:?}"
                 );
-                assert!(applied.items[0].fix_done && applied.items[0].reply_posted);
+                assert!(applied.items[0].fix_done && !applied.items[0].reply_posted);
 
                 // (3) While it ran, the reviewer changed the comment to B. GitHub
                 // stamped that 100 seconds ago: after the analysis, before
@@ -26429,7 +26449,7 @@ mod tests {
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
                 let (result, plan) =
-                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj")).await;
 
                 assert_eq!(result.replies_posted, 0, "{result:?}");
                 assert!(!result.pushed, "{:?}", result.push_error);
@@ -26461,29 +26481,24 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed && first.replies_posted == 0, "{first:?}");
                 let head_after_first = git(&worktree, &["rev-parse", "HEAD"]);
 
-                // Sync runs the same backfill as the real command first.
+                // Sync runs the same backfill as the real command first. It
+                // offers nothing for a fix the remote does not hold yet.
                 let mut for_sync = plan;
                 for_sync.backfill_lifecycle_from_last_apply();
-                let (synced, plan) = sync_pr_review_replies_inner(
-                    task.clone(),
-                    worktree.to_str().unwrap().to_string(),
-                    for_sync,
-                )
-                .await
-                .unwrap();
+                let (synced, plan) = sync_plan(&task, &worktree, for_sync).await.unwrap();
                 assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
                 assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
 
                 std::fs::remove_file(hook).unwrap();
-                let (second, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                let (second, plan) = apply(&task, plan, &worktree, no_jj).await;
                 assert!(second.pushed, "{:?}", second.push_error);
-                assert_eq!(second.replies_posted, 1, "{second:?}");
+                assert_eq!(second.replies_posted, 0, "apply publishes no reply: {second:?}");
                 assert!(
-                    plan.items[0].reply_posted && !plan.items[0].fix_uncommitted,
+                    !plan.items[0].reply_posted && !plan.items[0].fix_uncommitted,
                     "{:?}",
                     plan.items[0]
                 );
@@ -26495,22 +26510,17 @@ mod tests {
                 assert_eq!(
                     git(&repo.remote, &["rev-parse", "refs/heads/task-branch"]),
                     head_after_first,
-                    "the reply follows the push of the commit that holds the fix"
+                    "the reply is offered after the push of the commit that holds the fix"
                 );
 
-                let mut for_sync = plan;
-                for_sync.backfill_lifecycle_from_last_apply();
-                let (synced, _plan) = sync_pr_review_replies_inner(
-                    task.clone(),
-                    worktree.to_str().unwrap().to_string(),
-                    for_sync,
-                )
-                .await
-                .unwrap();
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert!(plan.items[0].reply_posted, "{:?}", plan.items[0]);
+                let (again, _plan) = sync_plan(&task, &worktree, plan).await.unwrap();
                 assert_eq!(
-                    (synced.replied, synced.fix_pending),
+                    (again.replied, again.fix_pending),
                     (0, 0),
-                    "no duplicate reply: {synced:?}"
+                    "no duplicate reply: {again:?}"
                 );
             }
 
@@ -26539,10 +26549,26 @@ mod tests {
             ) -> (Task, PrReviewPlan) {
                 let (task, plan) = task_with_one_fix(state, repo, worktree).await;
                 let (first, mut plan) =
-                    apply(&task, plan, worktree, tmp.join("no-such-jj"), false).await;
+                    apply(&task, plan, worktree, tmp.join("no-such-jj")).await;
                 assert!(first.pushed && first.replies_posted == 0, "{first:?}");
                 plan.backfill_lifecycle_from_last_apply();
                 (task, plan)
+            }
+
+            /// Approves every reply the plan would post, each with the text it
+            /// holds now: what the person sees in the approval panel.
+            fn approve_all_owed(plan: &PrReviewPlan) -> Vec<ApprovedPublicReply> {
+                plan.items
+                    .iter()
+                    .filter(|i| i.approved && matches!(i.decision, PrReviewDecision::Fix))
+                    .filter_map(|i| {
+                        i.comment_id.map(|comment_id| ApprovedPublicReply {
+                            comment_id,
+                            body: build_reply_body(i),
+                            accept_possible_duplicate: i.reply_uncertain,
+                        })
+                    })
+                    .collect()
             }
 
             async fn sync_plan(
@@ -26550,10 +26576,12 @@ mod tests {
                 worktree: &Path,
                 plan: PrReviewPlan,
             ) -> Result<(SyncPrRepliesResult, PrReviewPlan), String> {
+                let approved = approve_all_owed(&plan);
                 sync_pr_review_replies_inner(
                     task.clone(),
                     worktree.to_str().unwrap().to_string(),
                     plan,
+                    &approved,
                 )
                 .await
             }
@@ -26906,7 +26934,7 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, mut plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, mut plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed, "{first:?}");
                 assert_eq!(
                     repo.remote_has_branch("task-branch"),
@@ -26920,13 +26948,7 @@ mod tests {
 
                 let mut for_sync = plan.clone();
                 for_sync.backfill_lifecycle_from_last_apply();
-                let (synced, synced_plan) = sync_pr_review_replies_inner(
-                    task.clone(),
-                    worktree.to_str().unwrap().to_string(),
-                    for_sync,
-                )
-                .await
-                .unwrap();
+                let (synced, synced_plan) = sync_plan(&task, &worktree, for_sync).await.unwrap();
                 assert_eq!(
                     synced.replied, 0,
                     "Sync posted a fixed reply for an unpushed fix: {synced:?}"
@@ -26937,7 +26959,7 @@ mod tests {
                     synced_plan.items[0]
                 );
 
-                let (second, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                let (second, plan) = apply(&task, plan, &worktree, no_jj).await;
                 assert_eq!(
                     second.replies_posted, 0,
                     "Apply posted a fixed reply for an unpushed fix: {second:?}"
@@ -26960,7 +26982,7 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed && first.replies_posted == 0, "{first:?}");
                 assert!(plan.items[0].fix_done && plan.items[0].fix_uncommitted);
                 // The edits vanish: cleanup after a failure, a recreated checkout.
@@ -26969,7 +26991,7 @@ mod tests {
                 assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
                 std::fs::remove_file(&hook).unwrap();
 
-                let (second, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let (second, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert_eq!(
                     second.replies_posted, 0,
                     "a fix that exists nowhere was reported fixed: {second:?}"
@@ -26992,13 +27014,7 @@ mod tests {
                 assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
                 assert!(!remote_branch_has_file(&repo, "review-fix-1.txt"));
 
-                let (synced, _plan) = sync_pr_review_replies_inner(
-                    task,
-                    worktree.to_str().unwrap().to_string(),
-                    plan,
-                )
-                .await
-                .unwrap();
+                let (synced, _plan) = sync_plan(&task, &worktree, plan).await.unwrap();
                 assert_eq!(synced.replied, 0, "{synced:?}");
             }
 
@@ -27008,10 +27024,12 @@ mod tests {
                 worktree: &Path,
                 plan: PrReviewPlan,
             ) -> (SyncPrRepliesResult, PrReviewPlan) {
+                let approved = approve_all_owed(&plan);
                 sync_pr_review_replies_inner(
                     task.clone(),
                     worktree.to_str().unwrap().to_string(),
                     plan,
+                    &approved,
                 )
                 .await
                 .expect("sync reports per item, not as a command error")
@@ -27051,7 +27069,7 @@ mod tests {
                 let worktree = task_checkout_for_review(repo, false);
                 let no_jj = repo.checkout.join("no-such-jj");
                 let (task, plan) = task_with_one_fix(state, repo, &worktree).await;
-                let (first, mut plan) = apply(&task, plan, &worktree, no_jj, false).await;
+                let (first, mut plan) = apply(&task, plan, &worktree, no_jj).await;
                 assert!(
                     first.pushed && plan.items[0].fix_done && !plan.items[0].fix_uncommitted,
                     "{first:?}"
@@ -27082,6 +27100,256 @@ mod tests {
                     .collect()
             }
 
+            /// A fake `gh` that answers like the default one and logs every call,
+            /// for a test that must see what Apply itself sends.
+            fn logging_default_gh(claude: &EditingClaude, log: &Path) {
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'--paginate'*) echo '[]' ;;\n  *) echo 4242 ;;\nesac\n",
+                );
+                write_executable(&claude.gh, &script);
+            }
+
+            /// R1: Apply of a delivered fix publishes nothing. The fix and its
+            /// proposed reply are kept for review; no GitHub write happens.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn apply_of_a_delivered_fix_publishes_no_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let log = repo.checkout.parent().unwrap().join("apply-gh.log");
+                logging_default_gh(&claude, &log);
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (result, plan) =
+                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj")).await;
+
+                assert!(result.pushed && !plan.items[0].fix_uncommitted, "{result:?}");
+                assert_eq!(result.replies_posted, 0, "{result:?}");
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+                assert_eq!(approve_all_owed(&plan).len(), 1, "the reply stays owed for review");
+                let calls = std::fs::read_to_string(&log).unwrap_or_default();
+                assert_eq!(call_count(&log, "-X POST"), 0, "{calls}");
+                assert_eq!(call_count(&log, "pr comment"), 0, "{calls}");
+            }
+
+            /// R2: Sync posts exactly the text the person approved, once.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_posts_the_exact_approved_text_once() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Inline, None)],
+                    |_| {},
+                )
+                .await;
+                let shown = build_reply_body(&plan.items[0]);
+                let approved = vec![ApprovedPublicReply {
+                    comment_id: 1,
+                    body: shown.clone(),
+                    accept_possible_duplicate: false,
+                }];
+
+                let (result, plan) = sync_pr_review_replies_inner(
+                    task.clone(),
+                    worktree.to_str().unwrap().to_string(),
+                    plan,
+                    &approved,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(result.replied, 1, "{result:?}");
+                assert!(plan.items[0].reply_posted, "{:?}", plan.items[0]);
+                let writes = gh_writes(&log);
+                assert_eq!(writes.len(), 1, "{writes:?}");
+                assert!(
+                    writes[0].contains(&format!("body={shown}")),
+                    "the posted text is not the approved text: {writes:?}"
+                );
+            }
+
+            /// R2: a reply whose text changed after approval is refused as a
+            /// whole, and nothing is posted; an unapproved reply is never posted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_refuses_changed_or_unapproved_text_and_posts_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Inline, None)],
+                    |_| {},
+                )
+                .await;
+                let dir = worktree.to_str().unwrap().to_string();
+
+                let stale = vec![ApprovedPublicReply {
+                    comment_id: 1,
+                    body: "wording the person never saw".to_string(),
+                    accept_possible_duplicate: false,
+                }];
+                let err = sync_pr_review_replies_inner(task.clone(), dir.clone(), plan.clone(), &stale)
+                    .await
+                    .err()
+                    .expect("a changed text is refused");
+                assert!(err.contains("changed after you reviewed it"), "{err}");
+
+                let unknown = vec![ApprovedPublicReply {
+                    comment_id: 999,
+                    body: build_reply_body(&plan.items[0]),
+                    accept_possible_duplicate: false,
+                }];
+                let err = sync_pr_review_replies_inner(task.clone(), dir.clone(), plan.clone(), &unknown)
+                    .await
+                    .err()
+                    .expect("an unapproved comment is refused");
+                assert!(err.contains("not an approved fix"), "{err}");
+
+                assert!(gh_writes(&log).is_empty(), "{:?}", gh_writes(&log));
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+            }
+
+            /// R2: with no reply approved, Sync posts nothing and reports the
+            /// owed reply as awaiting approval.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_with_no_approval_posts_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Inline, None)],
+                    |_| {},
+                )
+                .await;
+
+                let (result, plan) = sync_pr_review_replies_inner(
+                    task.clone(),
+                    worktree.to_str().unwrap().to_string(),
+                    plan,
+                    &[],
+                )
+                .await
+                .unwrap();
+
+                assert_eq!((result.replied, result.awaiting_approval), (0, 1), "{result:?}");
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+                assert!(gh_writes(&log).is_empty(), "{:?}", gh_writes(&log));
+            }
+
+            /// R3: a threaded POST that fails after GitHub stored the reply is
+            /// found by the next Sync, which adopts it instead of posting again.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_ambiguous_threaded_post_is_adopted_not_repeated() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Inline, None)],
+                    |_| {},
+                )
+                .await;
+                // The POST stores the reply, then fails; the listing shows it from then on.
+                let stored = log.with_extension("stored");
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'api user --jq .login'*) echo slashit-fixture ;;\n  *'-X POST'*) touch {stored:?}; echo 'connection reset' >&2; exit 1 ;;\n  *'--paginate'*) if [ -f {stored:?} ]; then printf '%s' '[{{\"id\":777,\"in_reply_to_id\":1,\"user\":{{\"login\":\"slashit-fixture\"}},\"created_at\":\"2026-01-01T00:00:00Z\"}}]'; else printf '%s' '[]'; fi ;;\n  *) echo 4242 ;;\nesac\n",
+                );
+                write_executable(&claude.gh, &script);
+                let dir = worktree.to_str().unwrap().to_string();
+                let approved = vec![ApprovedPublicReply {
+                    comment_id: 1,
+                    body: build_reply_body(&plan.items[0]),
+                    accept_possible_duplicate: false,
+                }];
+
+                let (first, plan) = sync_pr_review_replies_inner(task.clone(), dir.clone(), plan, &approved)
+                    .await
+                    .unwrap();
+                assert_eq!(first.replied, 0, "{first:?}");
+                assert_eq!(first.errors.len(), 1, "{first:?}");
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+
+                let (second, plan) = sync_pr_review_replies_inner(task.clone(), dir, plan, &approved)
+                    .await
+                    .unwrap();
+                assert_eq!((second.replied, second.discovered), (0, 1), "{second:?}");
+                assert!(
+                    plan.items[0].reply_posted && plan.items[0].reply_comment_id == Some(777),
+                    "{:?}",
+                    plan.items[0]
+                );
+                assert_eq!(call_count(&log, "-X POST"), 1, "{:?}", std::fs::read_to_string(&log));
+            }
+
+            /// R3: a PR-level reply whose POST failed may already be on GitHub.
+            /// It is not posted again without the person accepting that risk.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_ambiguous_pr_level_post_is_held_until_the_duplicate_risk_is_accepted() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-1";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+                // The first PR-level POST fails after it may have landed; later ones succeed.
+                let attempted = log.with_extension("attempted");
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'api user --jq .login'*) echo slashit-fixture ;;\n  *'pr comment'*) if [ -f {attempted:?} ]; then echo done; else touch {attempted:?}; echo 'timeout' >&2; exit 1; fi ;;\n  *'--paginate'*) printf '%s' '[]' ;;\n  *) echo 4242 ;;\nesac\n",
+                );
+                write_executable(&claude.gh, &script);
+                let dir = worktree.to_str().unwrap().to_string();
+                let body = build_reply_body(&plan.items[0]);
+                let plain = vec![ApprovedPublicReply { comment_id: 1, body: body.clone(), accept_possible_duplicate: false }];
+                let accepted = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: true }];
+
+                let (first, plan) = sync_pr_review_replies_inner(task.clone(), dir.clone(), plan, &plain)
+                    .await
+                    .unwrap();
+                assert_eq!(first.errors.len(), 1, "{first:?}");
+                assert!(plan.items[0].reply_uncertain && !plan.items[0].reply_posted, "{:?}", plan.items[0]);
+
+                let (held, plan) = sync_pr_review_replies_inner(task.clone(), dir.clone(), plan, &plain)
+                    .await
+                    .unwrap();
+                assert_eq!((held.replied, held.held_uncertain), (0, 1), "{held:?}");
+                assert_eq!(call_count(&log, "pr comment"), 1, "not retried without acceptance");
+
+                let (retried, plan) = sync_pr_review_replies_inner(task.clone(), dir, plan, &accepted)
+                    .await
+                    .unwrap();
+                assert_eq!(retried.replied, 1, "{retried:?}");
+                assert!(
+                    plan.items[0].reply_posted && !plan.items[0].reply_uncertain,
+                    "{:?}",
+                    plan.items[0]
+                );
+                assert_eq!(call_count(&log, "pr comment"), 2, "accepted retry posts once");
+            }
+
             /// Sync refuses an approved fix whose comment has no id, before any
             /// forge call, and names the item.
             #[tokio::test(flavor = "multi_thread")]
@@ -27103,6 +27371,7 @@ mod tests {
                     task,
                     worktree.to_str().unwrap().to_string(),
                     plan.clone(),
+                    &approve_all_owed(&plan),
                 )
                 .await
                 .expect_err("an item without identity is refused");
@@ -27138,6 +27407,7 @@ mod tests {
                     task,
                     worktree.to_str().unwrap().to_string(),
                     plan.clone(),
+                    &approve_all_owed(&plan),
                 )
                 .await
                 .expect_err("a repeated number is refused");
@@ -27261,12 +27531,10 @@ mod tests {
                 mut plan: PrReviewPlan,
                 worktree: &Path,
                 jj: PathBuf,
-                auto_reply: bool,
             ) -> (PrReviewApplyResult, PrReviewPlan) {
                 plan.backfill_lifecycle_from_last_apply();
                 let options = AddressPrReviewOptions {
                     auto_push: false,
-                    auto_reply,
                     dry_run: false,
                 };
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -27296,12 +27564,10 @@ mod tests {
                 worktree: &Path,
                 jj: PathBuf,
                 auto_push: bool,
-                auto_reply: bool,
             ) -> (PrReviewApplyResult, PrReviewPlan) {
                 plan.backfill_lifecycle_from_last_apply();
                 let options = AddressPrReviewOptions {
                     auto_push,
-                    auto_reply,
                     dry_run: false,
                 };
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -27402,7 +27668,7 @@ mod tests {
                 );
 
                 let (result, plan) =
-                    apply_without_push(&task, plan, &worktree, tmp.path().join("no-such-jj"), true)
+                    apply_without_push(&task, plan, &worktree, tmp.path().join("no-such-jj"))
                         .await;
 
                 let tip = git(&worktree, &["rev-parse", "task-branch"]);
@@ -27432,7 +27698,7 @@ mod tests {
             /// its fix, `origin` holds that exact commit, and the reply is
             /// posted.
             #[tokio::test(flavor = "multi_thread")]
-            async fn a_pushed_fix_records_its_commit_and_is_replied_to() {
+            async fn a_pushed_fix_records_its_commit_and_its_reply_waits_for_sync() {
                 let _guard = PATH_LOCK.lock().await;
                 let repo = RepoFixture::new();
                 let worktree = task_checkout_for_review(&repo, false);
@@ -27441,13 +27707,19 @@ mod tests {
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
                 let (result, plan) =
-                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj")).await;
 
                 let tip = git(&worktree, &["rev-parse", "task-branch"]);
-                assert!(result.pushed && result.replies_posted == 1, "{result:?}");
+                assert!(result.pushed && result.replies_posted == 0, "{result:?}");
                 assert_eq!(plan.items[0].fix_commit.as_deref(), Some(tip.as_str()));
                 assert_eq!(repo.remote_has_branch("task-branch"), Some(tip));
-                assert!(plan.items[0].reply_posted && !plan.items[0].fix_uncommitted);
+                assert!(!plan.items[0].reply_posted && !plan.items[0].fix_uncommitted);
+
+                // Sync offers the delivered fix's reply, and posts it once the
+                // person has approved it (Sync takes every owed reply here).
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert!(plan.items[0].reply_posted, "{:?}", plan.items[0]);
             }
 
             /// One commit carries several fixes: every item records that same
@@ -27466,12 +27738,11 @@ mod tests {
                     with_item(plan, 2),
                     &worktree,
                     tmp.path().join("no-such-jj"),
-                    true,
                 )
                 .await;
 
                 let tip = git(&worktree, &["rev-parse", "task-branch"]);
-                assert_eq!(result.replies_posted, 2, "{result:?}");
+                assert_eq!(result.replies_posted, 0, "{result:?}");
                 assert_eq!(
                     git(
                         &worktree,
@@ -27481,7 +27752,7 @@ mod tests {
                 );
                 for item in &plan.items {
                     assert_eq!(item.fix_commit.as_deref(), Some(tip.as_str()), "{item:?}");
-                    assert!(item.reply_posted && !item.fix_uncommitted, "{item:?}");
+                    assert!(!item.reply_posted && !item.fix_uncommitted, "{item:?}");
                 }
             }
 
@@ -27505,7 +27776,6 @@ mod tests {
                     with_item(plan, 2),
                     &worktree,
                     tmp.path().join("no-such-jj"),
-                    true,
                 )
                 .await;
 
@@ -27515,8 +27785,8 @@ mod tests {
                     "the agent's own outcome stands: {result:?}"
                 );
                 assert!(result.failed_ids.is_empty(), "{result:?}");
-                assert_eq!(result.replies_posted, 1, "{result:?}");
-                assert!(plan.items[0].fix_commit.is_some() && plan.items[0].reply_posted);
+                assert_eq!(result.replies_posted, 0, "{result:?}");
+                assert!(plan.items[0].fix_commit.is_some() && !plan.items[0].reply_posted);
                 assert!(
                     plan.items[1].fix_done && plan.items[1].fix_commit.is_none(),
                     "{:?}",
@@ -27558,7 +27828,6 @@ mod tests {
                     with_item(plan, 2),
                     &worktree,
                     no_jj.clone(),
-                    true,
                     no_progress(),
                 )
                 .await
@@ -27576,7 +27845,6 @@ mod tests {
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 let options = AddressPrReviewOptions {
                     auto_push: true,
-                    auto_reply: true,
                     dry_run: false,
                 };
                 let (second, plan) = test_programs::scope(
@@ -27623,7 +27891,7 @@ mod tests {
                     |_| {},
                 )
                 .await;
-                assert_eq!(result.replies_posted, 2, "{result:?}");
+                assert_eq!(result.replies_posted, 0, "{result:?}");
                 for item in &plan.items {
                     assert_eq!(item.fix_commit.as_deref(), Some(tip.as_str()), "{item:?}");
                 }
@@ -27640,9 +27908,9 @@ mod tests {
                     |w| std::fs::remove_file(w.join("b.txt")).unwrap(),
                 )
                 .await;
-                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert_eq!(result.replies_posted, 0, "{result:?}");
                 assert_eq!(plan.items[0].fix_commit.as_deref(), Some(tip.as_str()));
-                assert!(plan.items[0].reply_posted);
+                assert!(!plan.items[0].reply_posted);
                 assert_eq!(plan.items[1].fix_commit, None, "{:?}", plan.items[1]);
                 assert!(!plan.items[1].reply_posted && plan.items[1].fix_uncommitted);
             }
@@ -27658,7 +27926,7 @@ mod tests {
                     |_| {},
                 )
                 .await;
-                assert_eq!(result.replies_posted, 2, "{result:?}");
+                assert_eq!(result.replies_posted, 0, "{result:?}");
                 for item in &plan.items {
                     assert_eq!(item.fix_commit.as_deref(), Some(tip.as_str()), "{item:?}");
                 }
@@ -27678,7 +27946,7 @@ mod tests {
                     },
                 )
                 .await;
-                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert_eq!(result.replies_posted, 0, "{result:?}");
                 assert!(plan.items[0].fix_commit.is_some() && plan.items[1].fix_commit.is_none());
             }
 
@@ -27693,7 +27961,7 @@ mod tests {
                     |_| {},
                 )
                 .await;
-                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert_eq!(result.replies_posted, 0, "{result:?}");
                 assert_eq!(
                     plan.items[0].fix_commit, None,
                     "A's line no longer exists: {:?}",
@@ -27719,25 +27987,25 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
                 // Item 1 is committed, its push fails.
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed, "{first:?}");
                 std::fs::remove_file(hook).unwrap();
 
                 // Item 2's agent changes nothing; item 1's commit is still pushed.
                 let (second, plan) =
-                    apply(&task, with_item(plan, 2), &worktree, no_jj.clone(), true).await;
+                    apply(&task, with_item(plan, 2), &worktree, no_jj.clone()).await;
                 assert!(second.pushed, "{:?}", second.push_error);
                 assert_eq!(second.push_error, None);
                 assert!(second.failed_ids.is_empty(), "{second:?}");
-                assert_eq!(second.replies_posted, 1, "only item 1's reply: {second:?}");
+                assert_eq!(second.replies_posted, 0, "apply publishes no reply: {second:?}");
                 assert!(plan.items[1].fix_commit.is_none() && !plan.items[1].reply_posted);
 
                 // Not stuck: the next apply runs item 2's agent again.
                 let runs = claude.runs();
-                let (third, _plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                let (third, _plan) = apply(&task, plan, &worktree, no_jj).await;
                 assert_eq!(claude.runs(), runs + 1, "the unproven fix is made again");
                 assert_eq!(
-                    third.replies_posted, 1,
+                    third.replies_posted, 0,
                     "and delivered this time: {third:?}"
                 );
             }
@@ -27764,7 +28032,7 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(first.pushed, "{:?}", first.push_error);
                 let c1 = git(&worktree, &["rev-parse", "task-branch"]);
                 assert_eq!(plan.items[0].fix_commit.as_deref(), Some(c1.as_str()));
@@ -27786,7 +28054,7 @@ mod tests {
                 );
                 let (synced, _) = sync(&task, &worktree, plan.clone()).await;
                 let (_, synced_plan) = sync(&task, &worktree, plan.clone()).await;
-                let (applied, applied_plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                let (applied, applied_plan) = apply(&task, plan, &worktree, no_jj).await;
                 (
                     synced.replied as usize,
                     synced_plan,
@@ -27822,9 +28090,9 @@ mod tests {
                     ),
                 ] {
                     let (synced, _, applied, plan) = delivered_then_c2(c2).await;
-                    assert_eq!((synced, applied), (1, 1), "{label}");
+                    assert_eq!((synced, applied), (1, 0), "{label}");
                     assert!(
-                        plan.items[0].reply_posted && !plan.items[0].fix_uncommitted,
+                        !plan.items[0].reply_posted && !plan.items[0].fix_uncommitted,
                         "{label}"
                     );
                 }
@@ -27890,14 +28158,14 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
                 let (_first, plan) =
-                    apply_on_board(&state, &task, with_item(plan, 2), &worktree, no_jj.clone(), false, false)
+                    apply_on_board(&state, &task, with_item(plan, 2), &worktree, no_jj.clone(), false)
                         .await;
                 // Item 2's edits (review-fix-2.txt) are discarded.
                 std::fs::remove_file(worktree.join("review-fix-2.txt")).unwrap();
                 git(&worktree, &["reset", "-q"]);
                 std::fs::remove_file(hook).unwrap();
 
-                let (second, plan) = apply_on_board(&state, &task, plan, &worktree, no_jj, false, false).await;
+                let (second, plan) = apply_on_board(&state, &task, plan, &worktree, no_jj, false).await;
 
                 let tip = git(&worktree, &["rev-parse", "task-branch"]);
                 assert!(!second.pushed, "{second:?}");
@@ -27918,7 +28186,7 @@ mod tests {
                 let (state, tmp) = build_test_state().await;
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(first.pushed, "{:?}", first.push_error);
 
                 let mut unlinked = task.clone();
@@ -27926,7 +28194,7 @@ mod tests {
                     .external_refs
                     .push(parse_pr_url_to_ref(task.pr_url.as_deref().unwrap()).unwrap());
                 unlinked.pr_url = None;
-                let (second, plan) = apply(&unlinked, plan, &worktree, no_jj, true).await;
+                let (second, plan) = apply(&unlinked, plan, &worktree, no_jj).await;
                 assert_eq!(second.replies_posted, 0, "{second:?}");
                 let (synced, _plan) = sync(&unlinked, &worktree, plan).await;
                 assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
@@ -27945,7 +28213,7 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (result, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                let (result, plan) = apply(&task, plan, &worktree, no_jj).await;
 
                 assert_eq!(
                     result.replies_posted, 0,
@@ -27971,7 +28239,7 @@ mod tests {
                 let (state, tmp) = build_test_state().await;
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed, "{first:?}");
                 let recorded = plan.items[0].fix_commit.clone().expect("committed");
                 git(&worktree, &["commit", "-q", "--amend", "-m", "amended"]);
@@ -27981,7 +28249,7 @@ mod tests {
                 // The remote has no such branch yet, so it cannot be asked
                 // about the commit; the push of the amended branch cannot
                 // deliver the recorded one either.
-                let (second, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let (second, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert_eq!(second.replies_posted, 0, "{second:?}");
                 assert!(
                     plan.items[0].fix_commit.is_none() && plan.items[0].fix_effect.is_none(),
@@ -27990,9 +28258,9 @@ mod tests {
                 );
 
                 let runs = claude.runs();
-                let (third, _plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                let (third, _plan) = apply(&task, plan, &worktree, no_jj).await;
                 assert_eq!(claude.runs(), runs + 1, "the fix is made again");
-                assert_eq!(third.replies_posted, 1, "{third:?}");
+                assert_eq!(third.replies_posted, 0, "{third:?}");
             }
 
             /// A remote branch that is definitely absent is different from a
@@ -28009,13 +28277,13 @@ mod tests {
                 let (state, tmp) = build_test_state().await;
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed, "{first:?}");
                 let recorded = plan.items[0].fix_commit.clone().expect("committed");
 
                 git(&worktree, &["commit", "-q", "--amend", "-m", "amended"]);
                 assert_ne!(git(&worktree, &["rev-parse", "task-branch"]), recorded);
-                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj, true).await;
+                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj).await;
 
                 assert_eq!(second.replies_posted, 0, "{second:?}");
                 assert!(
@@ -28041,7 +28309,7 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 let commit = git(&worktree, &["rev-parse", "task-branch"]);
                 assert!(!first.pushed && first.replies_posted == 0, "{first:?}");
                 assert_eq!(plan.items[0].fix_commit.as_deref(), Some(commit.as_str()));
@@ -28055,13 +28323,13 @@ mod tests {
                 let (synced, plan) = sync(&task, &worktree, plan).await;
                 assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
                 let (second, plan) =
-                    apply_without_push(&task, plan, &worktree, no_jj.clone(), true).await;
+                    apply_without_push(&task, plan, &worktree, no_jj.clone()).await;
                 assert_eq!(second.replies_posted, 0, "{second:?}");
 
                 std::fs::remove_file(hook).unwrap();
-                let (third, plan) = apply(&task, restarted(&plan), &worktree, no_jj, true).await;
+                let (third, plan) = apply(&task, restarted(&plan), &worktree, no_jj).await;
                 assert!(third.pushed, "{:?}", third.push_error);
-                assert_eq!(third.replies_posted, 1, "{third:?}");
+                assert_eq!(third.replies_posted, 0, "{third:?}");
                 assert_eq!(
                     claude.runs(),
                     1,
@@ -28072,7 +28340,7 @@ mod tests {
                     commit,
                     "and not committed again"
                 );
-                assert!(plan.items[0].reply_posted && !plan.items[0].fix_uncommitted);
+                assert!(!plan.items[0].reply_posted && !plan.items[0].fix_uncommitted);
             }
 
             /// `origin`'s branch moved to a commit that is not the fix: not
@@ -28089,11 +28357,11 @@ mod tests {
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
                 let (first, plan) =
-                    apply_without_push(&task, plan, &worktree, no_jj.clone(), true).await;
+                    apply_without_push(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!first.pushed && first.replies_posted == 0, "{first:?}");
                 let unrelated = push_an_unrelated_commit(&worktree);
 
-                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj, true).await;
+                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj).await;
                 assert_eq!(second.replies_posted, 0, "{second:?}");
                 let (synced, plan) = sync(&task, &worktree, plan).await;
                 assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
@@ -28113,7 +28381,7 @@ mod tests {
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
                 let (first, plan) =
-                    apply_without_push(&task, plan, &worktree, tmp.path().join("no-such-jj"), true)
+                    apply_without_push(&task, plan, &worktree, tmp.path().join("no-such-jj"))
                         .await;
                 assert_eq!(first.replies_posted, 0);
                 let fix = git(&worktree, &["rev-parse", "task-branch"]);
@@ -28157,7 +28425,7 @@ mod tests {
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(first.pushed, "{:?}", first.push_error);
                 let commit = git(&worktree, &["rev-parse", "task-branch"]);
                 assert!(
@@ -28176,7 +28444,7 @@ mod tests {
 
                 // The branch diverged, so a plain push is refused and the
                 // refusal is reported rather than answered with a reply.
-                let (second, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let (second, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(!second.pushed && second.push_error.is_some(), "{second:?}");
                 assert_eq!(second.replies_posted, 0, "{second:?}");
 
@@ -28185,8 +28453,8 @@ mod tests {
                     &worktree,
                     &["push", "-q", "--force", "origin", "task-branch"],
                 );
-                let (third, plan) = apply(&task, plan, &worktree, no_jj, true).await;
-                assert_eq!(third.replies_posted, 1, "{third:?}");
+                let (third, plan) = apply(&task, plan, &worktree, no_jj).await;
+                assert_eq!(third.replies_posted, 0, "{third:?}");
                 assert_eq!(repo.remote_has_branch("task-branch"), Some(commit));
                 assert!(!plan.items[0].fix_uncommitted);
             }
@@ -28202,14 +28470,14 @@ mod tests {
                 let (state, tmp) = build_test_state().await;
                 let no_jj = tmp.path().join("no-such-jj");
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
-                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone()).await;
                 assert!(first.pushed, "{:?}", first.push_error);
 
                 git(
                     &worktree,
                     &["remote", "set-url", "origin", "/nonexistent/remote.git"],
                 );
-                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj, true).await;
+                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj).await;
 
                 assert_eq!(second.replies_posted, 0, "{second:?}");
                 let error = second.push_error.as_deref().unwrap_or_default();
@@ -28238,7 +28506,7 @@ mod tests {
                 let text = comment(1);
                 plan.comments = vec![text.clone()];
 
-                let (first, plan) = apply_without_push(&task, plan, &worktree, no_jj, true).await;
+                let (first, plan) = apply_without_push(&task, plan, &worktree, no_jj).await;
                 assert_eq!(first.fixed_ids, vec![1]);
                 let next = reanalyze(&plan, vec![text]);
                 assert!(
@@ -28274,8 +28542,8 @@ mod tests {
                 };
                 plan.comments = vec![text_a.clone()];
 
-                let (first, applied) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
-                assert_eq!(first.replies_posted, 1, "{first:?}");
+                let (first, applied) = apply(&task, plan, &worktree, no_jj.clone()).await;
+                assert_eq!(first.replies_posted, 0, "{first:?}");
                 let old_commit = applied.items[0].fix_commit.clone().expect("recorded");
 
                 let text_b = PrReviewComment {
@@ -28295,9 +28563,9 @@ mod tests {
                 let (synced, next) = sync(&task, &worktree, next).await;
                 assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
 
-                let (second, next) = apply(&task, next, &worktree, no_jj, true).await;
+                let (second, next) = apply(&task, next, &worktree, no_jj).await;
                 assert_eq!(claude.runs(), 2, "the new wording is fixed afresh");
-                assert_eq!(second.replies_posted, 1, "{second:?}");
+                assert_eq!(second.replies_posted, 0, "{second:?}");
                 let new_commit = next.items[0].fix_commit.clone().expect("recorded");
                 assert_ne!(new_commit, old_commit);
                 assert_eq!(repo.remote_has_branch("task-branch"), Some(new_commit));
@@ -28318,7 +28586,7 @@ mod tests {
                 plan.items[0].fix_done = true;
 
                 let (result, plan) =
-                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+                    apply(&task, plan, &worktree, tmp.path().join("no-such-jj")).await;
 
                 assert_eq!(claude.runs(), 1);
                 assert_eq!(result.replies_posted, 0, "{result:?}");
@@ -31922,7 +32190,6 @@ mod review_plan_provenance {
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let options = AddressPrReviewOptions {
             auto_push: true,
-            auto_reply: true,
             dry_run: false,
         };
 
@@ -31991,7 +32258,7 @@ mod review_plan_provenance {
         crate::test_helpers::FakeProgram::install(
             "gh",
             &format!(
-                "case \"$*\" in\n  \"pr view\"*) printf '%s' '{pr_view}' ;;\n  \"api graphql\"*) printf '%s' '{threads}' ;;\n  *\"/reviews?\"*) printf '%s' '{reviews}' ;;\n  *\"/issues/\"*\"/comments?\"*) printf '%s' '{conversation}' ;;\n  *\"/pulls/\"*\"/comments?\"*) printf '%s' '{inline}' ;;\n  *) exit 1 ;;\nesac"
+                "case \"$*\" in\n  \"pr view\"*) printf '%s' '{pr_view}' ;;\n  \"api graphql\"*) printf '%s' '{threads}' ;;\n  \"api user\"*) printf '%s' 'slashit-fixture' ;;\n  *\"/reviews?\"*) printf '%s' '{reviews}' ;;\n  *\"/issues/\"*\"/comments?\"*) printf '%s' '{conversation}' ;;\n  *\"/pulls/\"*\"/comments?\"*) printf '%s' '{inline}' ;;\n  *) exit 1 ;;\nesac"
             ),
         )
         .await
@@ -32013,6 +32280,39 @@ mod review_plan_provenance {
     fn inline_comment(id: u64, body: &str) -> serde_json::Value {
         serde_json::json!({ "id": id, "body": body, "path": "src/lib.rs", "line": 3,
             "html_url": "https://github.com/o/r/pull/1#r", "user": { "login": "rev" } })
+    }
+
+    /// R4: our own reply to a finding (in its thread, or sent at PR level by
+    /// Sync) is not a new finding; the finding it answers stays.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn our_own_replies_are_not_new_findings() {
+        let own_thread_reply = serde_json::json!({
+            "id": 15, "body": "Fixed in abc1234", "path": "src/lib.rs", "line": 3,
+            "html_url": "https://github.com/o/r/pull/1#r15", "in_reply_to_id": 11,
+            "user": { "login": "slashit-fixture" }
+        });
+        let pr = pr_view_json(serde_json::json!({
+            "comments": [{
+                "id": "IC_9",
+                "body": "Re https://github.com/o/r/pull/1#issuecomment-9\n\nFixed in abc1234",
+                "author": { "login": "slashit-fixture" }
+            }],
+        }));
+        let inline = format!("[{},{}]", inline_comment(11, "fix this"), own_thread_reply);
+        let _gh = fake_gh_reads_with(&pr, "[]", "[]", &inline, &open_threads()).await;
+
+        let (_, _, comments) = fetch_pr_review_data(PR_URL).await.expect("review is read");
+        let inline_ids: Vec<Option<u64>> = comments
+            .iter()
+            .filter(|c| c.kind == PrCommentKind::Inline)
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(inline_ids, vec![Some(11)], "{comments:?}");
+        assert!(
+            comments.iter().all(|c| !c.body.starts_with("Re https://")),
+            "{comments:?}"
+        );
     }
 
     fn open_threads() -> String {
@@ -32090,6 +32390,7 @@ mod review_plan_provenance {
             fix_commit: None,
             fix_effect: None,
             reply_posted: false,
+            reply_uncertain: false,
             last_agent_summary: None,
             last_error: None,
             pr_reply_text: None,
@@ -32246,6 +32547,7 @@ mod review_plan_provenance {
             vec![PrReviewItem {
                 fix_done: true,
                 reply_posted: true,
+                reply_uncertain: false,
                 ..identity_fix(Some(5))
             }],
         );
@@ -32271,6 +32573,7 @@ mod review_plan_provenance {
             vec![PrReviewItem {
                 fix_done: true,
                 reply_posted: true,
+                reply_uncertain: false,
                 ..identity_fix(Some(5))
             }],
         );
@@ -32293,6 +32596,7 @@ mod review_plan_provenance {
             vec![PrReviewItem {
                 fix_done: true,
                 reply_posted: true,
+                reply_uncertain: false,
                 ..identity_fix(Some(5))
             }],
         );
