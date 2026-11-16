@@ -1454,18 +1454,21 @@ pub async fn discuss_pr_review_questions(
 ) -> Result<PrReviewPlan, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
-    let task = {
-        let tasks = state.task.tasks.read().await;
-        tasks.get(&task_uuid).cloned().ok_or("Task not found")?
-    };
 
     // Discuss runs `ToolAccess::ReadOnly` (see `run_claude_pr_helper(.., false, ..)`).
     let (_lease, cancel_rx) =
         begin_pr_helper(&state, task_uuid, PrHelperPurpose::Inspection).await?;
-    // Discuss saves the whole plan it was sent, so a copy that predates a Sync
-    // would clear that reply record. Refused before the agent runs.
+    // Read under the lease, so a Sync or Apply that finished after the frontend
+    // loaded the plan is in the stored plan the copy is checked against.
+    let task = {
+        let tasks = state.task.tasks.read().await;
+        tasks.get(&task_uuid).cloned().ok_or("Task not found")?
+    };
+    // Discuss saves the whole plan it was sent. A copy from before another
+    // analysis, a Sync or an Apply would overwrite what that run recorded, so
+    // it is refused before the agent runs.
     if let Some(stored) = task.pr_review_plan.as_ref() {
-        refuse_stale_delivery_records(stored, &plan)?;
+        refuse_stale_copy_for_discuss(stored, &plan)?;
     }
     let merged = discuss_pr_review_questions_inner(task, working_dir, plan, cancel_rx).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, merged.clone()).await?;
@@ -1767,7 +1770,11 @@ fn review_content(plan: &PrReviewPlan) -> PrReviewPlan {
 fn refuse_stale_delivery_records(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Result<(), String> {
     let stored = delivery_view(stored);
     let sent = delivery_view(sent);
+    // The last Apply's record and the fixed-content fingerprints are written by
+    // Apply and read back by the backfill, so a stale copy must not replace them.
     let differs = sent.items.len() != stored.items.len()
+        || sent.last_apply != stored.last_apply
+        || sent.fixed_content != stored.fixed_content
         || sent
             .items
             .iter()
@@ -1816,6 +1823,40 @@ fn delivery_record(item: &PrReviewItem) -> DeliveryRecord<'_> {
     }
 }
 
+/// Refuses a sent plan that is not the stored analysis: another analysis ran
+/// (its head, time or checkout provenance differs), or the comments and fix
+/// instructions differ. Apply and Discuss both save the plan they are sent, so
+/// both need this.
+fn refuse_stale_analysis(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Result<(), String> {
+    if sent.analyzed_head_oid != stored.analyzed_head_oid
+        || sent.analyzed_at != stored.analyzed_at
+        || sent.analyzed_worktree_oid != stored.analyzed_worktree_oid
+        || sent.analyzed_worktree_fingerprint != stored.analyzed_worktree_fingerprint
+    {
+        return Err(
+            "The review plan being applied is not the one stored for this Task. Re-analyze \
+             the PR comments, then apply again. Nothing was changed."
+                .to_string(),
+        );
+    }
+    if review_content(sent) != review_content(stored) {
+        return Err(
+            "The review plan being applied differs from the one stored for this Task in its \
+             comments or fix instructions. Re-analyze the PR comments, then apply again. \
+             Nothing was changed."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The whole-copy check Discuss needs, since Discuss saves the copy it is sent:
+/// the copy must be the stored analysis and carry the stored delivery records.
+fn refuse_stale_copy_for_discuss(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Result<(), String> {
+    refuse_stale_analysis(stored, sent)?;
+    refuse_stale_delivery_records(stored, sent)
+}
+
 /// Why an approved fix has no comment this plan can act on.
 enum IdentityFault {
     /// The item names no comment, or one the plan does not hold.
@@ -1848,25 +1889,7 @@ fn stored_plan_for_apply<'a>(
                 .to_string(),
         );
     };
-    if sent.analyzed_head_oid != stored.analyzed_head_oid
-        || sent.analyzed_at != stored.analyzed_at
-        || sent.analyzed_worktree_oid != stored.analyzed_worktree_oid
-        || sent.analyzed_worktree_fingerprint != stored.analyzed_worktree_fingerprint
-    {
-        return Err(
-            "The review plan being applied is not the one stored for this Task. Re-analyze \
-             the PR comments, then apply again. Nothing was changed."
-                .to_string(),
-        );
-    }
-    if review_content(sent) != review_content(stored) {
-        return Err(
-            "The review plan being applied differs from the one stored for this Task in its \
-             comments or fix instructions. Re-analyze the PR comments, then apply again. \
-             Nothing was changed."
-                .to_string(),
-        );
-    }
+    refuse_stale_analysis(stored, sent)?;
     // A fix or reply that Apply or Sync recorded after this copy was loaded is
     // not in the copy. Apply saves its whole plan at the end, so the stale copy
     // would clear that record (a reply offered again, a delivered fix repeated,
@@ -33613,6 +33636,63 @@ mod review_plan_provenance {
         task.pr_review_plan = Some(cleared.clone());
         assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &delivered).is_err());
         assert_eq!(task.pr_review_plan.as_ref().unwrap().items[0].fix_commit, None);
+    }
+
+    /// An Apply record and its fixed-content fingerprints are Apply's own
+    /// output. A copy taken before a later run must not roll them back, which
+    /// would drop that run's failures and let a fixed comment look unfixed.
+    #[test]
+    fn a_copy_cannot_roll_back_the_last_apply_or_fixed_content() {
+        let (mut task, mut stored) = delivered_fix_plan();
+        stored.last_apply = Some(apply_record(&["comment 101: the agent failed"]));
+        stored.fixed_content = vec![crate::domain::task::FixedContent {
+            comment_id: 101,
+            fingerprint: "b".to_string(),
+        }];
+        task.pr_review_plan = Some(stored.clone());
+        let mut older = stored.clone();
+        older.last_apply = Some(apply_record(&[]));
+        assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &older).is_err());
+        let mut without = stored.clone();
+        without.last_apply = None;
+        assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &without).is_err());
+        let mut other_fingerprint = stored.clone();
+        other_fingerprint.fixed_content[0].fingerprint = "a".to_string();
+        assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &other_fingerprint).is_err());
+        assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &stored).is_ok());
+    }
+
+    /// Discuss saves the copy it is sent. A copy taken before another analysis
+    /// would put that analysis's comments and head back, so it is refused.
+    #[test]
+    fn a_discuss_copy_from_before_a_reanalysis_is_refused() {
+        let (_task, stored) = analyzed_plan_with_items();
+        let mut older = stored.clone();
+        older.analyzed_at = stored.analyzed_at.map(|t| t - chrono::Duration::seconds(5));
+        assert!(refuse_stale_copy_for_discuss(&stored, &older).is_err());
+        let mut reworded = stored.clone();
+        reworded.comments[0].body = "something else".to_string();
+        assert!(refuse_stale_copy_for_discuss(&stored, &reworded).is_err());
+        assert!(refuse_stale_copy_for_discuss(&stored, &stored.clone()).is_ok());
+    }
+
+    /// The Apply record a test plan carries: `fix_errors` names what failed.
+    fn apply_record(fix_errors: &[&str]) -> PrReviewApplyResult {
+        PrReviewApplyResult {
+            applied_at: chrono::Utc::now(),
+            agent_summary: String::new(),
+            fixed_ids: Vec::new(),
+            skipped_ids: Vec::new(),
+            pushed: false,
+            push_branch: None,
+            replies_posted: 0,
+            reply_errors: Vec::new(),
+            dry_run: false,
+            failed_ids: Vec::new(),
+            fix_errors: fix_errors.iter().map(|s| s.to_string()).collect(),
+            push_error: None,
+            auto_reply: Some(false),
+        }
     }
 
     /// A copy the browser backfilled on load from `last_apply` is the same plan
