@@ -51,7 +51,7 @@ pub const RATE_LIMIT_BACKOFF_CAP: Duration = Duration::from_secs(3600);
 pub const FAILING_NAMES_KEPT: usize = 3;
 
 /// The fields one status query asks for.
-const FIELDS: &str = "state,statusCheckRollup,reviewDecision,mergeable,mergeCommit";
+const FIELDS: &str = "state,statusCheckRollup,reviewDecision,mergeable,mergeCommit,headRefOid";
 
 /// A pull request, as GitHub identifies it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -86,6 +86,11 @@ pub struct PrStatus {
     /// base, so it is recorded with the merged state and nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_commit: Option<String>,
+    /// The full commit GitHub reports as the pull request's head when it was
+    /// read. A Task's approval is checked against it; a branch another clone
+    /// pushed to is visible here and nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,7 +279,7 @@ fn summarize_checks(rollup: Option<&Value>) -> (ChecksState, Vec<String>, u32) {
     (state, failing, count)
 }
 
-/// Read what `gh pr view --json state,statusCheckRollup,reviewDecision,mergeable,mergeCommit`
+/// Read what `gh pr view --json state,statusCheckRollup,reviewDecision,mergeable,mergeCommit,headRefOid`
 /// printed.
 pub fn parse_pr_status(json: &Value) -> PrStatus {
     let (checks, failing_checks, failing_check_count) = summarize_checks(json.get("statusCheckRollup"));
@@ -287,6 +292,11 @@ pub fn parse_pr_status(json: &Value) -> PrStatus {
         .and_then(Value::as_str)
         .filter(|oid| state == PrState::Merged && crate::worktree::restack::is_full_object_id(oid))
         .map(str::to_string);
+    let head_oid = json
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .filter(|oid| crate::worktree::restack::is_full_object_id(oid))
+        .map(str::to_string);
     PrStatus {
         state,
         checks,
@@ -295,6 +305,7 @@ pub fn parse_pr_status(json: &Value) -> PrStatus {
         review_decision: json.get("reviewDecision").and_then(Value::as_str).and_then(ReviewDecision::from_gh),
         mergeable: json.get("mergeable").and_then(Value::as_str).and_then(Mergeability::from_gh),
         merge_commit,
+        head_oid,
     }
 }
 
@@ -1027,6 +1038,7 @@ mod tests {
                 review_decision: Some(ReviewDecision::ChangesRequested),
                 mergeable: Some(Mergeability::Conflicting),
                 merge_commit: None,
+                head_oid: None,
             }
         );
 
@@ -1041,6 +1053,21 @@ mod tests {
         assert_eq!(odd.checks, ChecksState::Unknown);
         assert_eq!(odd.review_decision, None);
         assert_eq!(odd.mergeable, None);
+    }
+
+    /// The head is read from every answer, and only when it is a full object ID.
+    /// An answer without one leaves the head unknown rather than guessed.
+    #[test]
+    fn a_head_is_read_from_any_answer_and_only_when_it_is_a_full_id() {
+        let head = "0123456789abcdef0123456789abcdef01234567";
+        let open = parse_pr_status(&json!({ "state": "OPEN", "headRefOid": head }));
+        assert_eq!(open.head_oid.as_deref(), Some(head));
+
+        let short = parse_pr_status(&json!({ "state": "OPEN", "headRefOid": "0123456" }));
+        assert_eq!(short.head_oid, None, "an abbreviated head cannot be checked");
+
+        let missing = parse_pr_status(&json!({ "state": "OPEN" }));
+        assert_eq!(missing.head_oid, None, "an answer without a head reads no head");
     }
 
     /// The merge commit is read only from a merged answer, and only when it is
@@ -1086,6 +1113,7 @@ mod tests {
                 review_decision: Some(ReviewDecision::ReviewRequired),
                 mergeable: Some(Mergeability::Mergeable),
                 merge_commit: None,
+                head_oid: None,
             }),
             fetched_at: Some(at),
             attempted_at: at,
@@ -1319,7 +1347,7 @@ mod tests {
     }
 
     fn status(state: PrState, checks: ChecksState) -> PrStatus {
-        PrStatus { state, checks, failing_checks: vec![], failing_check_count: 0, review_decision: None, mergeable: None , merge_commit: None}
+        PrStatus { state, checks, failing_checks: vec![], failing_check_count: 0, review_decision: None, mergeable: None , merge_commit: None, head_oid: None}
     }
 
     #[test]

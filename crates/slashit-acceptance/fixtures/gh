@@ -18,7 +18,9 @@
 # prints instead of its default (the pull request's state and base, as GitHub
 # would list it); and `pr-commits/<number>` holds the commit ids `gh api
 # --paginate repos/{owner}/{repo}/pulls/<number>/commits --jq .[].sha` prints,
-# one per line.
+# one per line. `pr-heads/<number>` is the commit the pull request was opened
+# at, which the default `pr view` answer reports as `headRefOid`; a scripted
+# `pr-view` answer reports only what the journey writes into it.
 set -e
 
 dir="$SLASHIT_FAKE_GH_DIR"
@@ -87,6 +89,11 @@ case "$1 $2" in
         count=$(ls "$dir/prs" | wc -l)
         url="$repository/pull/$((count + 1))"
         printf '%s' "$url" > "$dir/prs/$head"
+        # The head GitHub would report: the branch's commit where the pull
+        # request was opened, read from the repository `gh` runs in.
+        mkdir -p "$dir/pr-heads"
+        head_oid=$(git rev-parse --verify --quiet "refs/heads/$head^{commit}" 2>/dev/null || true)
+        printf '%s' "$head_oid" > "$dir/pr-heads/$((count + 1))"
         printf '%s\n' "$url"
         ;;
     "pr view")
@@ -99,7 +106,16 @@ case "$1 $2" in
         elif [ -f "$dir/pr-view.json" ]; then
             cat "$dir/pr-view.json"
         else
-            printf '{"state":"OPEN","number":1,"mergeable":"MERGEABLE","reviewDecision":"","statusCheckRollup":[],"baseRefName":"main","isCrossRepository":false}'
+            # The head recorded when the pull request was opened, if there is one.
+            head_oid=""
+            if [ -f "$dir/pr-heads/$number" ]; then
+                head_oid=$(cat "$dir/pr-heads/$number")
+            fi
+            head_field=""
+            if [ -n "$head_oid" ]; then
+                head_field=",\"headRefOid\":\"$head_oid\""
+            fi
+            printf '{"state":"OPEN","number":1,"mergeable":"MERGEABLE","reviewDecision":"","statusCheckRollup":[],"baseRefName":"main","isCrossRepository":false%s}' "$head_field"
         fi
         ;;
     "issue view")

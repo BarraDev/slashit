@@ -127,15 +127,30 @@ pub enum ApprovalCoverage {
     BranchMissing,
 }
 
+/// Mirrors the backend `PublishedHead`: the head of the task's pull request as
+/// the status poll last read it, and when.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PublishedHead {
+    pub head: Option<String>,
+    /// RFC 3339, in UTC.
+    pub observed_at: Option<String>,
+    pub unverified: Option<String>,
+}
+
 /// Mirrors the backend `ApprovalStatus`: whether the approval still covers
-/// the task's branch as it is now.
+/// the task's branch as it is now, and what the published pull request shows.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ApprovalStatus {
     pub coverage: ApprovalCoverage,
     pub approved_tip: Option<String>,
     pub branch_tip: Option<String>,
-    pub rewritten: bool,
+    /// For a moved branch: whether the approved commit was replaced. `None` when
+    /// Git could not answer.
+    pub rewritten: Option<bool>,
     pub reason: Option<String>,
+    pub published: Option<PublishedHead>,
+    /// The pull request address the Task had when the answer was read.
+    pub pull_request: Option<String>,
 }
 
 pub async fn get_approval_status(task_id: String) -> Result<ApprovalStatus, String> {

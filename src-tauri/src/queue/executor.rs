@@ -10677,6 +10677,7 @@ mod tests {
             review_decision: None,
             mergeable: None,
             merge_commit: None,
+            head_oid: None,
         }
     }
 
