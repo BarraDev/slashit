@@ -1410,6 +1410,10 @@ fn carry_forward_reanalysis_lifecycle(
         if prev_item.reply_posted {
             item.reply_posted = true;
         }
+        // A PR-level POST that may have landed stays held until the person accepts it.
+        if prev_item.reply_uncertain {
+            item.reply_uncertain = true;
+        }
         if item.last_error.is_none() {
             item.last_error = prev_item.last_error.clone();
         }
@@ -1447,6 +1451,11 @@ pub async fn discuss_pr_review_questions(
     // Discuss runs `ToolAccess::ReadOnly` (see `run_claude_pr_helper(.., false, ..)`).
     let (_lease, cancel_rx) =
         begin_pr_helper(&state, task_uuid, PrHelperPurpose::Inspection).await?;
+    // Discuss saves the whole plan it was sent, so a copy that predates a Sync
+    // would clear that reply record. Refused before the agent runs.
+    if let Some(stored) = task.pr_review_plan.as_ref() {
+        refuse_stale_reply_records(stored, &plan)?;
+    }
     let merged = discuss_pr_review_questions_inner(task, working_dir, plan, cancel_rx).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, merged.clone()).await?;
     Ok(merged)
@@ -1737,6 +1746,25 @@ fn review_content(plan: &PrReviewPlan) -> PrReviewPlan {
     content
 }
 
+/// Refuses a sent plan whose reply records differ from the stored plan's: a
+/// reply Sync posted or recorded after the copy was loaded is not in the copy.
+fn refuse_stale_reply_records(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Result<(), String> {
+    let differs = sent.items.len() != stored.items.len()
+        || sent
+            .items
+            .iter()
+            .zip(&stored.items)
+            .any(|(sent_item, stored_item)| reply_record(sent_item) != reply_record(stored_item));
+    if differs {
+        return Err(
+            "A reply to this review was posted or recorded after this review plan was \
+             loaded. Reload the review, then try again. Nothing was changed."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// The reply state only Sync writes: whether a reply was posted, whether a
 /// PR-level POST may have landed, and the GitHub id of the reply.
 fn reply_record(item: &PrReviewItem) -> (bool, bool, Option<u64>) {
@@ -1798,18 +1826,7 @@ fn stored_plan_for_apply<'a>(
     // copy. Apply saves its whole plan at the end, so the stale copy would
     // clear that record and offer the reply again. Refused before any work, so
     // no fix or reply is lost by the refusal.
-    if sent
-        .items
-        .iter()
-        .zip(&stored.items)
-        .any(|(sent_item, stored_item)| reply_record(sent_item) != reply_record(stored_item))
-    {
-        return Err(
-            "A reply to this review was posted or recorded after this review plan was \
-             loaded. Reload the review, then apply again. Nothing was changed."
-                .to_string(),
-        );
-    }
+    refuse_stale_reply_records(stored, sent)?;
     // The approved items Apply runs come from the sent plan, and the client
     // may approve an item the stored plan left unapproved. Each approved Fix
     // is checked against the stored item at the same position (the content
@@ -11459,6 +11476,27 @@ mod tests {
             "reply_comment_id must survive re-analysis so Sync can PATCH instead of duplicate",
         );
         assert_eq!(items[0].last_agent_summary.as_deref(), Some("agent report"));
+    }
+
+    #[test]
+    fn re_analysis_keeps_a_held_pr_level_reply() {
+        let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
+        let prev_item = PrReviewItem {
+            reply_posted: false,
+            reply_uncertain: true,
+            ..fixed_and_replied(42)
+        };
+        let prior = prior_plan(
+            vec![prev_item],
+            vec![text.clone()],
+            Some("2024-06-01T00:00:00Z"),
+            vec![fixed_from(&text)],
+        );
+        let mut items = vec![fresh_item(42)];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &[text]);
+
+        assert!(items[0].reply_uncertain, "a held PR-level reply must stay held");
     }
 
     #[test]
@@ -33423,6 +33461,17 @@ mod review_plan_provenance {
         sent.items[1].last_error = Some("earlier failure".to_string());
         sent.last_apply = None;
         assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &sent).is_ok());
+    }
+
+    #[test]
+    fn a_stale_discuss_copy_is_refused_before_it_saves() {
+        let (_task, stored) = analyzed_plan_with_items();
+        let mut synced = stored.clone();
+        synced.items[1].reply_posted = true;
+        synced.items[1].reply_comment_id = Some(77);
+        let err = refuse_stale_reply_records(&synced, &stored).unwrap_err();
+        assert!(err.contains("posted or recorded"), "{err}");
+        assert!(refuse_stale_reply_records(&synced, &synced.clone()).is_ok());
     }
 
     #[test]
