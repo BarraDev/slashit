@@ -213,6 +213,14 @@ fn full_task(project_id: Uuid) -> Task {
     });
     task.base_commit = Some(commit('d'));
     task.branch_origin = Some(BranchOrigin::DefaultBase { branch: Some("main".into()) });
+    task.pr_reply_records = vec![crate::domain::pr_reply_history::PrReplyRecord {
+        host: "github.com".into(),
+        repository: "barradev/slashit".into(),
+        pull_request: 1,
+        comment_id: 2,
+        state: crate::domain::pr_reply_history::PrReplyState::Confirmed,
+        reply_id: Some(3),
+    }];
     task.pr_publication = Some(crate::domain::publication::PrPublication::pending(
         Uuid::new_v4(),
         commit('e'),

@@ -334,6 +334,13 @@ pub struct Task {
     #[serde(default)]
     pub pr_review_plan: Option<PrReviewPlan>,
 
+    /// Durable record of the PR-level replies this Task's review sent or may
+    /// have sent. It is kept apart from `pr_review_plan` because a re-analysis
+    /// replaces the plan and must not erase these facts. See
+    /// [`super::pr_reply_history`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pr_reply_records: Vec<super::pr_reply_history::PrReplyRecord>,
+
     /// Milestones nothing else on the record keeps, oldest first: runs, AI
     /// reviews, delivery, moves. Each is appended in the durable write of the
     /// transition it describes. Mostly history, but the next run and review
@@ -1057,6 +1064,7 @@ impl Task {
             pending_republish: None,
             pr_create_unconfirmed: None,
             pr_publication: None,
+            pr_reply_records: Vec::new(),
             local_integration: None,
             cleanup_in_flight: false,
             pr_review_plan: None,

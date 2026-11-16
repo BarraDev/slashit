@@ -1005,6 +1005,7 @@ pub fn create_test_task(title: &str) -> Task {
         pending_republish: None,
         pr_create_unconfirmed: None,
         pr_publication: None,
+        pr_reply_records: Vec::new(),
         local_integration: None,
         cleanup_in_flight: false,
         position: 0,

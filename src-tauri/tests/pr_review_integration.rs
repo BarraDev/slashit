@@ -64,9 +64,10 @@ async fn sync_with_approvals(
         working_dir,
         plan,
         approved,
-        |_record| async { Ok(()) },
+        |_plan, _records| async { Ok(()) },
     )
     .await
+    .map(|(result, plan, _)| (result, plan))
 }
 
 /// The approval a person gives for one inline reply: the exact text shown.
