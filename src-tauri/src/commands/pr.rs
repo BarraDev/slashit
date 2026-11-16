@@ -3493,23 +3493,56 @@ pub async fn sync_pr_review_replies(
         .ok_or_else(|| "Task has no PR review plan to sync".to_string())?;
     plan.backfill_lifecycle_from_last_apply();
 
-    let (result, updated_plan) =
-        sync_pr_review_replies_inner(task, working_dir, plan, &approved).await?;
+    let tasks = &state.task.tasks;
+    let storage = &state.storage;
+    let (result, updated_plan) = sync_pr_review_replies_persisting(
+        task,
+        working_dir,
+        plan,
+        &approved,
+        move |snapshot| async move {
+            save_review_plan_on_task(tasks, storage, task_uuid, snapshot).await
+        },
+    )
+    .await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
 }
 
-/// Core logic of `sync_pr_review_replies` extracted for testability. Posts or
-/// edits a reply only for an item the person approved in `approved`, and only
-/// with the exact text they were shown: a mismatch refuses the whole call
-/// before any GitHub write. Returns the updated plan with `reply_posted`
-/// flipped on whatever succeeded.
+/// Core logic of `sync_pr_review_replies` without a store, for tests that do
+/// not exercise persistence.
+#[cfg(test)]
 pub async fn sync_pr_review_replies_inner(
     task: Task,
     working_dir: String,
     plan: PrReviewPlan,
     approved: &[ApprovedPublicReply],
 ) -> Result<(SyncPrRepliesResult, PrReviewPlan), String> {
+    sync_pr_review_replies_persisting(task, working_dir, plan, approved, |_| async { Ok(()) })
+        .await
+}
+
+/// Posts or edits a reply only for an item the person approved in `approved`,
+/// and only with the exact text they were shown: a mismatch refuses the whole
+/// call before any GitHub write. Returns the updated plan with `reply_posted`
+/// flipped on whatever succeeded.
+///
+/// `persist` stores a snapshot of the plan. A PR-level reply is recorded as
+/// uncertain before its POST, so a crash after the POST leaves that record
+/// behind and the next Sync holds the reply. If the record cannot be saved,
+/// the POST is not issued. The outcome is recorded again after a successful
+/// POST.
+pub async fn sync_pr_review_replies_persisting<Persist, Saved>(
+    task: Task,
+    working_dir: String,
+    plan: PrReviewPlan,
+    approved: &[ApprovedPublicReply],
+    persist: Persist,
+) -> Result<(SyncPrRepliesResult, PrReviewPlan), String>
+where
+    Persist: Fn(PrReviewPlan) -> Saved,
+    Saved: std::future::Future<Output = Result<(), String>> + Send,
+{
     let pr_url = pr_url_for_task(&task)?;
     let (repo, number) = parse_pr_url(&pr_url)?;
     let mut updated_plan = plan;
@@ -3697,6 +3730,17 @@ pub async fn sync_pr_review_replies_inner(
                         Some(url) => format!("Re {url}"),
                         None => format!("Re the comment by @{}", original.author),
                     };
+                    // Recorded as uncertain before the POST: if the process
+                    // dies after the POST, the saved record still holds the
+                    // reply. If the record cannot be saved, nothing is posted.
+                    updated_plan.items[orig_idx].reply_uncertain = true;
+                    if let Err(e) = persist(updated_plan.clone()).await {
+                        errors.push(format!(
+                            "comment {label}: could not record this PR-level reply before \
+                             posting it, so nothing was posted: {e}"
+                        ));
+                        continue;
+                    }
                     post_pr_reply(&repo, &number, None, &format!("{named}\n\n{body}")).await
                 }
             };
@@ -3709,6 +3753,12 @@ pub async fn sync_pr_review_replies_inner(
                         updated_plan.items[orig_idx].reply_comment_id = reply_id;
                     }
                     updated_plan.items[orig_idx].pr_reply_text = Some(body);
+                    // The outcome is saved now, not only at the end of Sync.
+                    if let Err(e) = persist(updated_plan.clone()).await {
+                        errors.push(format!(
+                            "comment {label}: the reply was posted, but recording it failed: {e}"
+                        ));
+                    }
                 }
                 Err(e) => {
                     // A threaded reply is looked up before the next POST, so
@@ -27348,6 +27398,278 @@ mod tests {
                     plan.items[0]
                 );
                 assert_eq!(call_count(&log, "pr comment"), 2, "accepted retry posts once");
+            }
+
+            /// The plan snapshots that reached the store, in order.
+            type Stored = std::sync::Arc<std::sync::Mutex<Vec<PrReviewPlan>>>;
+
+            async fn save_snapshot(stored: Stored, plan: PrReviewPlan) -> Result<(), String> {
+                stored.lock().unwrap().push(plan);
+                Ok(())
+            }
+
+            /// Saves a snapshot, signals it, and never returns: the process stops
+            /// after the record and before the POST.
+            async fn save_then_stop(
+                stored: Stored,
+                reached: std::sync::Arc<tokio::sync::Notify>,
+                plan: PrReviewPlan,
+            ) -> Result<(), String> {
+                stored.lock().unwrap().push(plan);
+                reached.notify_one();
+                std::future::pending().await
+            }
+
+            /// Saves the first snapshot and fails every later one.
+            async fn save_first_only(
+                stored: Stored,
+                saves: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                plan: PrReviewPlan,
+            ) -> Result<(), String> {
+                if saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    stored.lock().unwrap().push(plan);
+                    Ok(())
+                } else {
+                    Err("simulated write failure".to_string())
+                }
+            }
+
+            fn last_stored(stored: &Stored) -> PrReviewPlan {
+                stored.lock().unwrap().last().cloned().expect("a stored snapshot")
+            }
+
+            /// R3: a PR-level reply is recorded before its POST. A record that
+            /// cannot be saved means nothing is posted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_pr_level_reply_is_not_posted_when_its_record_cannot_be_saved() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-1";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+                let body = build_reply_body(&plan.items[0]);
+                let approved = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: false }];
+                let dir = worktree.to_str().unwrap().to_string();
+
+                let (result, plan) = sync_pr_review_replies_persisting(
+                    task,
+                    dir,
+                    plan,
+                    &approved,
+                    |_| async { Err::<(), String>("disk full".to_string()) },
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(result.replied, 0, "{result:?}");
+                assert!(result.errors.iter().any(|e| e.contains("nothing was posted")), "{result:?}");
+                assert_eq!(call_count(&log, "pr comment"), 0, "no POST without a saved record");
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+            }
+
+            /// R3: a process that stops after the record and before the POST
+            /// leaves a record that holds the reply. Restarting does not post it
+            /// until the person accepts the duplicate risk.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_recorded_pr_level_reply_survives_a_stop_before_its_post() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-1";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+                let dir = worktree.to_str().unwrap().to_string();
+                let body = build_reply_body(&plan.items[0]);
+                let plain = vec![ApprovedPublicReply { comment_id: 1, body: body.clone(), accept_possible_duplicate: false }];
+                let stored: Stored = Default::default();
+
+                // Stopped at a known point, so the test does not race a timer.
+                let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+                let interrupted = tokio::spawn({
+                    let (task, dir, plan, plain) = (task.clone(), dir.clone(), plan.clone(), plain.clone());
+                    let (stored, reached) = (stored.clone(), reached.clone());
+                    async move {
+                        sync_pr_review_replies_persisting(task, dir, plan, &plain, move |p| {
+                            save_then_stop(stored.clone(), reached.clone(), p)
+                        })
+                        .await
+                    }
+                });
+                reached.notified().await;
+                interrupted.abort();
+                assert!(interrupted.await.unwrap_err().is_cancelled());
+                assert_eq!(call_count(&log, "pr comment"), 0, "stopped before the POST");
+
+                let saved = last_stored(&stored);
+                assert!(saved.items[0].reply_uncertain && !saved.items[0].reply_posted, "{:?}", saved.items[0]);
+
+                let (held, restarted) =
+                    sync_pr_review_replies_inner(task.clone(), dir.clone(), saved.clone(), &plain)
+                        .await
+                        .unwrap();
+                assert_eq!((held.replied, held.held_uncertain), (0, 1), "{held:?}");
+                assert_eq!(call_count(&log, "pr comment"), 0, "not retried without acceptance");
+
+                let accepted = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: true }];
+                let (retried, _) = sync_pr_review_replies_inner(task, dir, restarted, &accepted)
+                    .await
+                    .unwrap();
+                assert_eq!(retried.replied, 1, "{retried:?}");
+                assert_eq!(call_count(&log, "pr comment"), 1, "the accepted retry posts once");
+            }
+
+            /// R3: a PR-level POST that may have landed. The record saved before
+            /// it survives, and after a restart the reply is held. An approval
+            /// for changed text or another comment is refused.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_ambiguous_pr_level_post_is_held_after_restart_from_the_record() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-1";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+                // The first PR-level POST fails after it may have landed.
+                let attempted = log.with_extension("attempted");
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}}]' ;;\n  *'api user --jq .login'*) echo slashit-fixture ;;\n  *'pr comment'*) if [ -f {attempted:?} ]; then echo done; else touch {attempted:?}; echo 'timeout' >&2; exit 1; fi ;;\n  *'--paginate'*) printf '%s' '[]' ;;\n  *) echo 4242 ;;\nesac\n",
+                );
+                write_executable(&claude.gh, &script);
+                let dir = worktree.to_str().unwrap().to_string();
+                let body = build_reply_body(&plan.items[0]);
+                let plain = vec![ApprovedPublicReply { comment_id: 1, body: body.clone(), accept_possible_duplicate: false }];
+                let stored: Stored = Default::default();
+
+                let (first, _) = sync_pr_review_replies_persisting(task.clone(), dir.clone(), plan, &plain, |p| {
+                    save_snapshot(stored.clone(), p)
+                })
+                .await
+                .unwrap();
+                assert_eq!(first.errors.len(), 1, "{first:?}");
+
+                // Restart from the saved record, not from the plan Sync returned.
+                let saved = last_stored(&stored);
+                assert!(saved.items[0].reply_uncertain && !saved.items[0].reply_posted, "{:?}", saved.items[0]);
+                let (held, restarted) =
+                    sync_pr_review_replies_inner(task.clone(), dir.clone(), saved, &plain).await.unwrap();
+                assert_eq!((held.replied, held.held_uncertain), (0, 1), "{held:?}");
+
+                let edited = vec![ApprovedPublicReply {
+                    comment_id: 1,
+                    body: format!("{body} (edited)"),
+                    accept_possible_duplicate: true,
+                }];
+                assert!(
+                    sync_pr_review_replies_inner(task.clone(), dir.clone(), restarted.clone(), &edited).await.is_err(),
+                    "changed text must not reuse the earlier acceptance"
+                );
+                let other_target = vec![ApprovedPublicReply { comment_id: 2, body: body.clone(), accept_possible_duplicate: true }];
+                assert!(
+                    sync_pr_review_replies_inner(task.clone(), dir.clone(), restarted.clone(), &other_target).await.is_err(),
+                    "another comment must not reuse the earlier acceptance"
+                );
+                assert_eq!(call_count(&log, "pr comment"), 1, "refused approvals post nothing");
+
+                let accepted = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: true }];
+                let (retried, _) = sync_pr_review_replies_inner(task, dir, restarted, &accepted).await.unwrap();
+                assert_eq!(retried.replied, 1, "{retried:?}");
+                assert_eq!(call_count(&log, "pr comment"), 2, "the accepted retry posts once");
+            }
+
+            /// R3: the POST succeeded but its outcome could not be saved. The
+            /// record from before the POST still holds the reply, so a restart
+            /// does not post it again.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_posted_pr_level_reply_whose_outcome_was_not_saved_is_held_after_restart() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-1";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+                let dir = worktree.to_str().unwrap().to_string();
+                let body = build_reply_body(&plan.items[0]);
+                let plain = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: false }];
+                let stored: Stored = Default::default();
+                let saves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+                let (result, _) = sync_pr_review_replies_persisting(task.clone(), dir.clone(), plan, &plain, |p| {
+                    save_first_only(stored.clone(), saves.clone(), p)
+                })
+                .await
+                .unwrap();
+                assert_eq!(result.replied, 1, "{result:?}");
+                assert!(result.errors.iter().any(|e| e.contains("recording it failed")), "{result:?}");
+                assert_eq!(call_count(&log, "pr comment"), 1);
+
+                let saved = last_stored(&stored);
+                let (held, _) = sync_pr_review_replies_inner(task, dir, saved, &plain).await.unwrap();
+                assert_eq!((held.replied, held.held_uncertain), (0, 1), "{held:?}");
+                assert_eq!(call_count(&log, "pr comment"), 1, "not posted again");
+            }
+
+            /// R3: a PR-level reply is recorded before and after a successful
+            /// POST. The saved outcome is the one the store keeps.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_successful_pr_level_reply_is_recorded_before_and_after_its_post() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-1";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+                let dir = worktree.to_str().unwrap().to_string();
+                let body = build_reply_body(&plan.items[0]);
+                let plain = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: false }];
+                let stored: Stored = Default::default();
+
+                let (result, _) = sync_pr_review_replies_persisting(task, dir, plan, &plain, |p| {
+                    save_snapshot(stored.clone(), p)
+                })
+                .await
+                .unwrap();
+                assert_eq!(result.replied, 1, "{result:?}");
+                assert_eq!(stored.lock().unwrap().len(), 2, "one record before the POST, one after");
+                let saved = last_stored(&stored);
+                assert!(saved.items[0].reply_posted && !saved.items[0].reply_uncertain, "{:?}", saved.items[0]);
+                assert!(saved.items[0].pr_reply_text.is_some(), "{:?}", saved.items[0]);
+                assert_eq!(call_count(&log, "pr comment"), 1);
             }
 
             /// Sync refuses an approved fix whose comment has no id, before any
