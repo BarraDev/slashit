@@ -473,25 +473,34 @@ pub fn Kanban(
         last_apply: pr_review_last_apply,
         auto_push: pr_review_auto_push,
         selected_replies: pr_review_selected_replies,
+        generation: RwSignal::new(0_u64),
     };
     let on_analyze_pr_comments = Callback::new({
         move |task: Task| {
             if !pr_review_dialog.open(task.clone()) {
                 return;
             }
+            let Some(opening) = pr_review_dialog.opening() else {
+                return;
+            };
             spawn_local(async move {
                 match analyze_pr_comments(task.id.to_string()).await {
                     Ok(plan) => {
-                        pr_review_recorded.set(plan.approved_fix_ids());
-                        pr_review_plan.set(Some(plan));
-                        pr_review_error.set(None);
+                        if pr_review_dialog.shows(opening) {
+                            pr_review_dialog.adopt_plan(opening, plan);
+                            pr_review_error.set(None);
+                        }
                     }
                     Err(e) => {
-                        pr_review_plan.set(None);
-                        pr_review_error.set(Some(format!("Failed to analyze PR comments: {}", e)));
+                        if pr_review_dialog.shows(opening) {
+                            pr_review_plan.set(None);
+                            pr_review_error.set(Some(format!("Failed to analyze PR comments: {}", e)));
+                        }
                     }
                 }
-                pr_review_loading.set(false);
+                if pr_review_dialog.shows(opening) {
+                    pr_review_loading.set(false);
+                }
             });
         }
     });
@@ -745,6 +754,7 @@ pub fn Kanban(
                 recorded=pr_review_recorded
                 approved_replies=pr_review_selected_replies
                 set_tasks=set_tasks_signal
+                dialog=pr_review_dialog
             />
 
             <PrCandidatesModal
@@ -1019,12 +1029,70 @@ struct PrReviewDialog {
     /// whether a duplicate was accepted. A selection belongs to one opening, so
     /// `open` clears it; the backend still checks each text before posting.
     selected_replies: RwSignal<Vec<(u64, String, bool)>>,
+    /// Advanced by every `open`. An asynchronous operation records the opening
+    /// it started from, and may change the dialog only while that one is shown.
+    generation: RwSignal<u64>,
+}
+
+/// The opening an asynchronous PR-review operation started from: the dialog's
+/// generation at that time and the Task it showed then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReviewOpening {
+    generation: u64,
+    task_id: Uuid,
+}
+
+impl PrReviewDialog {
+    /// The opening the dialog shows now, or `None` when it shows no Task.
+    /// Uses the `try_` reads: a result can finish after the board that owns
+    /// these signals was disposed (for example, on a project switch), and a
+    /// plain read would panic there. A disposed dialog shows nothing.
+    fn opening(self) -> Option<ReviewOpening> {
+        let task_id = self
+            .task
+            .try_with_untracked(|t| t.as_ref().map(|t| t.id))??;
+        Some(ReviewOpening {
+            generation: self.generation.try_get_untracked()?,
+            task_id,
+        })
+    }
+
+    /// Whether an operation that began at `opening` may still change the
+    /// dialog. Only the same opening of the same Task qualifies: a result from
+    /// an earlier opening must not overwrite another Task's plan, approvals,
+    /// selections or errors. The Task's board record is updated separately.
+    fn shows(self, opening: ReviewOpening) -> bool {
+        self.opening() == Some(opening)
+    }
+
+    /// Adopts the plan an operation of `opening` returned, and reports whether
+    /// it did. A plan from an earlier opening is dropped, nothing else changes.
+    fn adopt_plan(self, opening: ReviewOpening, plan: PrReviewPlan) -> bool {
+        if !self.shows(opening) {
+            return false;
+        }
+        self.recorded.set(plan.approved_fix_ids());
+        self.plan.set(Some(plan));
+        true
+    }
+
+    /// Clears the replies selected for posting after a Sync that began at
+    /// `opening`, but only while that opening is shown.
+    fn release_selected_replies(self, opening: ReviewOpening) -> bool {
+        if !self.shows(opening) {
+            return false;
+        }
+        self.selected_replies.set(Vec::new());
+        true
+    }
 }
 
 impl PrReviewDialog {
     /// Prepares and shows the dialog for `task`. Returns `true` when no usable
     /// plan is cached, so the caller must analyze the task's comments.
     fn open(self, task: Task) -> bool {
+        // Every operation started before this opening is now stale.
+        self.generation.update(|g| *g += 1);
         // Auto-push is a choice for one dialog opening. Every opening starts
         // from the default, so enabling it for one Task never reaches another,
         // or the same Task on a later opening. Nothing else resets it while
@@ -1081,6 +1149,7 @@ fn PrReviewModal(
     recorded: RwSignal<Vec<u64>>,
     approved_replies: RwSignal<Vec<(u64, String, bool)>>,
     set_tasks: WriteSignal<Vec<Task>>,
+    dialog: PrReviewDialog,
 ) -> impl IntoView {
     let show_raw_comments = RwSignal::new(false);
     // Default true once an apply has happened — focus on what's new since.
@@ -1134,6 +1203,7 @@ fn PrReviewModal(
     let trigger_analyze = move |force: bool| {
         let Some(task_value) = task.get() else { return; };
         if busy() { return; }
+        let Some(opening) = dialog.opening() else { return; };
         if !force {
             let cached = task_value.pr_review_plan.clone()
                 .filter(|p| !p.comments.is_empty() || !p.items.is_empty());
@@ -1156,23 +1226,29 @@ fn PrReviewModal(
         spawn_local(async move {
             match analyze_pr_comments(task_value.id.to_string()).await {
                 Ok(mut p) => {
-                    p.backfill_lifecycle_from_last_apply();
-                    show_only_new.set(p.last_apply.is_some());
-                    recorded.set(p.approved_fix_ids());
-                    plan.set(Some(p));
-                    error.set(None);
+                    if dialog.shows(opening) {
+                        p.backfill_lifecycle_from_last_apply();
+                        show_only_new.set(p.last_apply.is_some());
+                        dialog.adopt_plan(opening, p);
+                        error.set(None);
+                    }
                 }
                 Err(e) => {
-                    plan.set(None);
-                    error.set(Some(format!("Failed to analyze PR comments: {}", e)));
+                    if dialog.shows(opening) {
+                        plan.set(None);
+                        error.set(Some(format!("Failed to analyze PR comments: {}", e)));
+                    }
                 }
             }
-            loading.set(false);
+            if dialog.shows(opening) {
+                loading.set(false);
+            }
         });
     };
 
     let on_apply = move |_| {
         let Some(task_value) = task.get() else { return; };
+        let Some(opening) = dialog.opening() else { return; };
         let Some(current_plan) = plan.get() else {
             toast::error("No plan loaded".to_string());
             return;
@@ -1203,7 +1279,9 @@ fn PrReviewModal(
                     let replies = result.replies_posted;
                     let errs = result.reply_errors.len();
                     let was_dry_run = result.dry_run;
-                    last_apply.set(Some(result));
+                    if dialog.shows(opening) {
+                        last_apply.set(Some(result));
+                    }
                     let mut msg = if was_dry_run {
                         String::from("Dry-run complete. ")
                     } else {
@@ -1221,8 +1299,7 @@ fn PrReviewModal(
                     spawn_local(async move {
                         if let Ok(Some(updated)) = refresh_task_pr_state(task_id_inner).await {
                             if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
-                                recorded.set(refreshed_plan.approved_fix_ids());
-                                plan.set(Some(refreshed_plan));
+                                dialog.adopt_plan(opening, refreshed_plan);
                             }
                             set_tasks.update(|tasks| {
                                 if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
@@ -1234,7 +1311,9 @@ fn PrReviewModal(
                 }
                 Err(e) => {
                     let msg = format!("Failed to apply PR fixes: {}", e);
-                    error.set(Some(msg.clone()));
+                    if dialog.shows(opening) {
+                        error.set(Some(msg.clone()));
+                    }
                     toast::error(msg);
                 }
             }
@@ -1244,6 +1323,7 @@ fn PrReviewModal(
 
     let on_discuss = move |_| {
         let Some(task_value) = task.get() else { return; };
+        let Some(opening) = dialog.opening() else { return; };
         let Some(current_plan) = plan.get() else { return; };
         if pending_discussion_count() == 0 {
             toast::error("Add a note to at least one Question item first".to_string());
@@ -1255,14 +1335,17 @@ fn PrReviewModal(
         spawn_local(async move {
             match discuss_pr_review_questions(task_id, current_plan).await {
                 Ok(updated) => {
-                    recorded.set(updated.approved_fix_ids());
-                    plan.set(Some(updated));
-                    error.set(None);
+                    if dialog.shows(opening) {
+                        dialog.adopt_plan(opening, updated);
+                        error.set(None);
+                    }
                     toast::success("Agent re-evaluated the questions".to_string());
                 }
                 Err(e) => {
                     let msg = format!("Failed to discuss: {}", e);
-                    error.set(Some(msg.clone()));
+                    if dialog.shows(opening) {
+                        error.set(Some(msg.clone()));
+                    }
                     toast::error(msg);
                 }
             }
@@ -1319,6 +1402,7 @@ fn PrReviewModal(
     // fix never selects a reply.
     let on_sync_replies = move |_| {
         let Some(task_value) = task.get() else { return; };
+        let Some(opening) = dialog.opening() else { return; };
         let selected = approved_replies.get();
         if selected.is_empty() {
             toast::error("Select at least one reply to post".to_string());
@@ -1350,7 +1434,9 @@ fn PrReviewModal(
         spawn_local(async move {
             match sync_pr_review_replies(task_id.clone(), approved).await {
                 Ok(result) => {
-                    approved_replies.set(Vec::new());
+                    // Cleared only for the opening that made the selection: another
+                    // Task's selections must survive this result.
+                    dialog.release_selected_replies(opening);
                     let mut parts: Vec<String> = Vec::new();
                     if result.replied > 0 { parts.push(format!("Posted {} new", result.replied)); }
                     if result.discovered > 0 { parts.push(format!("Found {} existing", result.discovered)); }
@@ -1366,7 +1452,9 @@ fn PrReviewModal(
                     } else if !result.errors.is_empty() {
                         let detail = result.errors.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
                         let final_msg = format!("{}: {}", msg, detail);
-                        error.set(Some(final_msg.clone()));
+                        if dialog.shows(opening) {
+                            error.set(Some(final_msg.clone()));
+                        }
                         toast::error(final_msg);
                     } else {
                         toast::success(msg);
@@ -1376,8 +1464,7 @@ fn PrReviewModal(
                     spawn_local(async move {
                         if let Ok(Some(updated)) = refresh_task_pr_state(task_id_inner).await {
                             if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
-                                recorded.set(refreshed_plan.approved_fix_ids());
-                                plan.set(Some(refreshed_plan));
+                                dialog.adopt_plan(opening, refreshed_plan);
                             }
                             set_tasks.update(|tasks| {
                                 if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
@@ -1389,7 +1476,9 @@ fn PrReviewModal(
                 }
                 Err(e) => {
                     let msg = format!("Failed to sync replies: {}", e);
-                    error.set(Some(msg.clone()));
+                    if dialog.shows(opening) {
+                        error.set(Some(msg.clone()));
+                    }
                     toast::error(msg);
                 }
             }
@@ -3241,7 +3330,129 @@ mod tests {
             last_apply: RwSignal::new(None),
             auto_push: RwSignal::new(PR_REVIEW_AUTO_PUSH_DEFAULT),
             selected_replies: RwSignal::new(Vec::new()),
+            generation: RwSignal::new(0),
         })
+    }
+
+    /// A Task whose cached plan is for the pull request numbered `pr_number`.
+    fn task_with_plan_for_pr(id: u128, pr_number: u32) -> Task {
+        let mut task = task_with_cached_plan(id);
+        if let Some(plan) = task.pr_review_plan.as_mut() {
+            plan.pr_url = format!("https://github.com/BarraDev/slashit/pull/{pr_number}");
+        }
+        task
+    }
+
+    /// A Sync, apply or analysis of Task A is still in flight when Task B is
+    /// opened. A's results arrive afterwards, in the order the test chooses.
+    #[test]
+    fn a_result_for_task_a_does_not_replace_task_b_after_b_is_opened() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = task_with_plan_for_pr(1, 101);
+        let task_b = task_with_plan_for_pr(2, 202);
+        assert!(!dialog.open(task_a.clone()), "A has a cached plan");
+        let opening_a = dialog.opening().expect("A is shown");
+        dialog.show.set(false);
+
+        assert!(!dialog.open(task_b.clone()), "B has a cached plan");
+        let opening_b = dialog.opening().expect("B is shown");
+        dialog
+            .selected_replies
+            .set(vec![(7, "Fixed it.".to_string(), false)]);
+
+        // A's refresh completes now.
+        let a_plan = task_a.pr_review_plan.clone().expect("A has a plan");
+        assert!(
+            !dialog.adopt_plan(opening_a, a_plan),
+            "A's result must not be adopted into B's modal"
+        );
+        assert!(
+            !dialog.release_selected_replies(opening_a),
+            "A's Sync must not clear B's selection"
+        );
+
+        let shown = dialog.plan.get_untracked().expect("B's plan is still shown");
+        assert_eq!(shown.pr_url, "https://github.com/BarraDev/slashit/pull/202");
+        assert_eq!(dialog.recorded.get_untracked(), shown.approved_fix_ids());
+        assert_eq!(
+            dialog.selected_replies.get_untracked(),
+            vec![(7, "Fixed it.".to_string(), false)],
+            "B keeps its own selection"
+        );
+        assert_eq!(dialog.opening(), Some(opening_b));
+        assert!(dialog.shows(opening_b) && !dialog.shows(opening_a));
+    }
+
+    /// The same opening still shown: the result is adopted. Without this the
+    /// refusal above could be a dialog that never adopts anything.
+    #[test]
+    fn a_result_for_the_task_still_shown_is_adopted() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = task_with_plan_for_pr(1, 101);
+        assert!(!dialog.open(task_a.clone()));
+        let opening_a = dialog.opening().expect("A is shown");
+
+        let refreshed = task_with_plan_for_pr(1, 303).pr_review_plan.expect("a plan");
+        assert!(dialog.adopt_plan(opening_a, refreshed));
+        assert_eq!(
+            dialog.plan.get_untracked().map(|p| p.pr_url),
+            Some("https://github.com/BarraDev/slashit/pull/303".to_string())
+        );
+        assert!(dialog.release_selected_replies(opening_a));
+    }
+
+    /// Reopening the same Task is a new opening: a result that began at the
+    /// earlier opening no longer lands, even though the Task is the same.
+    #[test]
+    fn a_result_from_an_earlier_opening_of_the_same_task_is_refused() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = task_with_plan_for_pr(1, 101);
+        assert!(!dialog.open(task_a.clone()));
+        let first = dialog.opening().expect("shown");
+        dialog.show.set(false);
+        assert!(!dialog.open(task_a.clone()));
+        assert!(!dialog.shows(first));
+        let stale = task_with_plan_for_pr(1, 999).pr_review_plan.expect("a plan");
+        assert!(!dialog.adopt_plan(first, stale));
+    }
+
+    /// A result for a Task after the dialog was closed and nothing else opened is
+    /// still that Task's: it is adopted, so a closed dialog reopens with it.
+    #[test]
+    fn a_result_while_the_dialog_is_closed_still_belongs_to_the_same_opening() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = task_with_plan_for_pr(1, 101);
+        assert!(!dialog.open(task_a.clone()));
+        let opening_a = dialog.opening().expect("shown");
+        dialog.show.set(false);
+        let refreshed = task_with_plan_for_pr(1, 404).pr_review_plan.expect("a plan");
+        assert!(dialog.adopt_plan(opening_a, refreshed));
+    }
+
+    /// A Task with no opening shown has no operation to scope to.
+    #[test]
+    fn no_opening_exists_before_any_task_is_shown() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        assert_eq!(dialog.opening(), None);
+    }
+
+    /// A result that finishes after the board holding the dialog was disposed
+    /// (a project switch) must neither panic nor change anything.
+    #[test]
+    fn a_disposed_dialog_shows_nothing_and_does_not_panic() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        assert!(!dialog.open(task_with_cached_plan(1)));
+        let opening = dialog.opening().expect("shown before disposal");
+        drop(owner);
+        assert_eq!(dialog.opening(), None);
+        assert!(!dialog.shows(opening));
+        assert!(!dialog.release_selected_replies(opening));
     }
 
     /// A Task whose PR-review plan is cached, so opening it does not analyze.

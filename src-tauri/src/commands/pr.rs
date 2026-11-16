@@ -1091,7 +1091,7 @@ pub async fn analyze_pr_comments(
     // is refreshing comments, not switching contexts, so `last_apply` and the
     // per-item lifecycle flags should carry over for items whose `comment_id`
     // survives the re-fetch.
-    let prior_plan = task.pr_review_plan.clone().filter(|p| p.pr_url == pr_url);
+    let prior_plan = task.pr_review_plan.clone().filter(|p| same_pull_request(&p.pr_url, &pr_url));
 
     eprintln!(
         "[pr-review] analyze {} for task {}",
@@ -1137,7 +1137,7 @@ pub async fn analyze_pr_comments(
         .await
         .get(&task_uuid)
         .and_then(|t| t.pr_review_plan.clone())
-        .filter(|p| p.pr_url == pr_url);
+        .filter(|p| same_pull_request(&p.pr_url, &pr_url));
     let (mut items, raw_output) =
         triage_pr_comments(&task, &pr_url, &working_dir, &comments, cancel_rx).await?;
     eprintln!("[pr-review] parsed {} items", items.len());
@@ -1397,6 +1397,12 @@ fn carry_forward_reanalysis_lifecycle(
         let Some(fresh) = comments.iter().find(|c| c.id == Some(cid)) else {
             continue;
         };
+        // A PR-level POST that may have landed stays held until the person
+        // accepts it. It is kept whatever the edit did to the text: the edit
+        // changes what a fix was made from, not whether the POST reached GitHub.
+        if prev_item.reply_uncertain {
+            item.reply_uncertain = true;
+        }
         let fixed_text_unchanged = fixed_content
             .iter()
             .find(|f| f.comment_id == cid)
@@ -1420,10 +1426,6 @@ fn carry_forward_reanalysis_lifecycle(
         }
         if prev_item.reply_posted {
             item.reply_posted = true;
-        }
-        // A PR-level POST that may have landed stays held until the person accepts it.
-        if prev_item.reply_uncertain {
-            item.reply_uncertain = true;
         }
         if item.last_error.is_none() {
             item.last_error = prev_item.last_error.clone();
@@ -1486,6 +1488,9 @@ pub async fn discuss_pr_review_questions_inner(
     plan: PrReviewPlan,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<PrReviewPlan, String> {
+    // Discuss saves the plan it is sent, so a plan for another pull request
+    // would be re-discussed and stored under this Task's link.
+    refuse_other_pull_request(&plan.pr_url, &pr_url_for_task(&task)?)?;
     let pending: Vec<&PrReviewItem> = plan
         .items
         .iter()
@@ -1947,6 +1952,9 @@ async fn check_apply_preflight(
     branch: Option<&str>,
 ) -> Result<(), String> {
     let stored = stored_plan_for_apply(stored, sent)?;
+    // Before the checkout or GitHub is read: the head comparison below uses
+    // the Task's pull request, so it cannot tell that the plan is another one.
+    refuse_other_pull_request(&stored.pr_url, pr_url)?;
     check_plan_matches_worktree(stored, working_dir, branch).await?;
     let current_head = current_pr_head_oid(pr_url).await?;
     check_plan_matches_pr_head(stored, &current_head)
@@ -3425,7 +3433,7 @@ async fn settle_delivery(
         return settled;
     };
     match own_pr_url_for_branch(working_dir, branch).await {
-        Ok(Some(head_url)) if head_url == pr_url => {}
+        Ok(Some(head_url)) if same_pull_request(&head_url, pr_url) => {}
         Ok(_) => {
             settled.unavailable = Some(
                 "the recorded pull request is not this repository's pull request for the task \
@@ -3637,7 +3645,9 @@ pub async fn sync_pr_review_replies(
         },
     )
     .await?;
-    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan)
+        .await
+        .map_err(|e| final_save_error(result.replied, e))?;
     Ok(result)
 }
 
@@ -3676,6 +3686,9 @@ where
     Saved: std::future::Future<Output = Result<(), String>> + Send,
 {
     let pr_url = pr_url_for_task(&task)?;
+    // Before any call to GitHub or Git: a plan for another pull request must
+    // not reach that pull request, and its stored copy is left as it is.
+    refuse_other_pull_request(&plan.pr_url, &pr_url)?;
     let (repo, number) = parse_pr_url(&pr_url)?;
     let mut updated_plan = plan;
 
@@ -3929,11 +3942,22 @@ where
                     // Recorded as uncertain before the POST: if the process
                     // dies after the POST, the saved record still holds the
                     // reply. If the record cannot be saved, nothing is posted.
+                    let was_uncertain = updated_plan.items[orig_idx].reply_uncertain;
                     updated_plan.items[orig_idx].reply_uncertain = true;
                     if let Err(e) = persist(updated_plan.clone()).await {
+                        // No POST happens, so the flag must not stay: it would
+                        // hold a reply that was never sent, and every later save
+                        // would carry it. An earlier uncertainty is kept.
+                        updated_plan.items[orig_idx].reply_uncertain = was_uncertain;
+                        let cleared = persist(updated_plan.clone()).await;
                         errors.push(format!(
                             "comment {label}: could not record this PR-level reply before \
-                             posting it, so nothing was posted: {e}"
+                             posting it, so nothing was posted: {e}{}",
+                            if cleared.is_ok() {
+                                ""
+                            } else {
+                                " The unsent record could not be cleared either, so the reply may be held until a person checks GitHub."
+                            }
                         ));
                         continue;
                     }
@@ -3985,6 +4009,72 @@ where
     ))
 }
 
+/// The repository and number a pull request URL names, whatever its spelling
+/// (the case of the repository, a trailing slash, a path after the number).
+fn pull_request_identity(pr_url: &str) -> Option<(String, u64)> {
+    let (repo, number) = parse_pr_url(pr_url).ok()?;
+    Some((repo.to_ascii_lowercase(), number.parse().ok()?))
+}
+
+/// Whether two pull request URLs name the same pull request. Compared by
+/// repository and number, because the same pull request can be written in
+/// more than one way and a plan must never follow a different one.
+fn same_pull_request(a: &str, b: &str) -> bool {
+    matches!(
+        (pull_request_identity(a), pull_request_identity(b)),
+        (Some(x), Some(y)) if x == y
+    )
+}
+
+/// Refuses a review plan made for a pull request other than the one the Task
+/// is linked to now. A relink leaves the old plan on the Task, and its
+/// comments, fixes and approvals belong to the other pull request.
+fn refuse_other_pull_request(plan_pr_url: &str, task_pr_url: &str) -> Result<(), String> {
+    if same_pull_request(plan_pr_url, task_pr_url) {
+        return Ok(());
+    }
+    Err(format!(
+        "This review plan was made for pull request {} but the Task is linked to pull request \
+         {}. Nothing was posted or changed. Re-analyze the PR comments for the linked pull request.",
+        pr_identity_label(plan_pr_url),
+        pr_identity_label(task_pr_url),
+    ))
+}
+
+/// A pull request as a person reads it in a message: `owner/repo#number`. The
+/// URL is task data that may carry anything, so only the characters a GitHub
+/// name can hold are kept.
+fn pr_identity_label(pr_url: &str) -> String {
+    match parse_pr_url(pr_url) {
+        Ok((repo, number)) => {
+            let repo: String = repo
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+                .collect();
+            format!("{repo}#{number}")
+        }
+        Err(_) => "<unrecognized pull request URL>".to_string(),
+    }
+}
+
+/// The error a Sync returns when its final save fails after it posted replies.
+/// The replies stay recorded in memory, so a repeated Sync in this session
+/// does not post them again, but the review on screen does not show them yet.
+fn final_save_error(replies_posted: u32, save_error: String) -> String {
+    if replies_posted == 0 {
+        return save_error;
+    }
+    let posted = if replies_posted == 1 {
+        "1 reply was posted".to_string()
+    } else {
+        format!("{replies_posted} replies were posted")
+    };
+    format!(
+        "{save_error} {posted} to GitHub in this run before the save failed. Reload the review \
+         before acting on it."
+    )
+}
+
 fn pr_url_for_task(task: &Task) -> Result<String, String> {
     task.authoritative_pr_url()
         .map(str::to_string)
@@ -4016,8 +4106,12 @@ fn pr_log_label(pr_url: &str) -> String {
 /// This used to mutate the task under a write guard, drop it, take a fresh read
 /// guard to build the snapshot, and discard the save error, returning `()` so
 /// that no caller could see the failure. Now the whole transaction runs under
-/// one write guard and the in-memory value is committed only after the write is
-/// accepted, so a plan the caller was told about is a plan a restart will find.
+/// one write guard. The in-memory value is committed even when the write fails,
+/// because the plan can record work already done outside this process (replies
+/// posted to GitHub); the error is still returned, so no caller reports a durable
+/// save that did not happen. Callers that need a value gone from memory after a
+/// failed write must save a corrected plan again (see the pre-POST rollback in
+/// `sync_pr_review_replies_persisting`).
 async fn save_review_plan_on_task(
     tasks: &Tasks,
     storage: &Storage,
@@ -11688,6 +11782,109 @@ mod tests {
         assert!(items[0].reply_uncertain, "a held PR-level reply must stay held");
     }
 
+    /// The same comment, edited after the fix: the fix made from the old
+    /// wording no longer carries, but the uncertain POST still does, because
+    /// an edit does not say whether the earlier reply reached GitHub.
+    #[test]
+    fn re_analysis_keeps_a_held_reply_when_its_comment_was_edited() {
+        let before = comment_text(42, "old wording", Some("2024-05-30T00:00:00Z"));
+        let prev_item = PrReviewItem {
+            reply_posted: false,
+            reply_uncertain: true,
+            ..fixed_and_replied(42)
+        };
+        let prior = prior_plan(
+            vec![prev_item],
+            vec![before.clone()],
+            Some("2024-06-01T00:00:00Z"),
+            vec![fixed_from(&before)],
+        );
+        let edited = comment_text(42, "new wording", Some("2024-06-02T00:00:00Z"));
+        let mut items = vec![fresh_item(42)];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &[edited]);
+
+        assert!(
+            items[0].reply_uncertain,
+            "an edit must not erase a possibly-posted PR-level reply: {:?}",
+            items[0]
+        );
+        assert!(!items[0].fix_done, "the fix was made from the old wording");
+    }
+
+    /// The uncertain record survives a save and a load, as it does across a
+    /// restart, and still holds the edited comment's reply.
+    #[test]
+    fn a_held_reply_survives_a_restart_and_an_edit() {
+        let before = comment_text(42, "old wording", Some("2024-05-30T00:00:00Z"));
+        let prev_item = PrReviewItem {
+            reply_posted: false,
+            reply_uncertain: true,
+            ..fixed_and_replied(42)
+        };
+        let prior = prior_plan(
+            vec![prev_item],
+            vec![before.clone()],
+            Some("2024-06-01T00:00:00Z"),
+            vec![fixed_from(&before)],
+        );
+        let restored: PrReviewPlan =
+            serde_json::from_str(&serde_json::to_string(&prior).unwrap()).unwrap();
+        let edited = comment_text(42, "new wording", Some("2024-06-02T00:00:00Z"));
+        let mut items = vec![fresh_item(42)];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &restored, &[edited]);
+
+        assert!(items[0].reply_uncertain, "{:?}", items[0]);
+    }
+
+    /// A different comment never inherits the uncertain record.
+    #[test]
+    fn a_held_reply_is_not_carried_to_a_different_comment() {
+        let before = comment_text(42, "old wording", Some("2024-05-30T00:00:00Z"));
+        let prev_item = PrReviewItem {
+            reply_posted: false,
+            reply_uncertain: true,
+            ..fixed_and_replied(42)
+        };
+        let prior = prior_plan(
+            vec![prev_item],
+            vec![before.clone()],
+            Some("2024-06-01T00:00:00Z"),
+            vec![fixed_from(&before)],
+        );
+        let other = comment_text(43, "old wording", Some("2024-05-30T00:00:00Z"));
+        let mut items = vec![fresh_item(43)];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &[other]);
+
+        assert!(!items[0].reply_uncertain, "{:?}", items[0]);
+    }
+
+    /// When the prior plan names one comment number twice, no record can be
+    /// tied to a single comment, so none is carried, edited or not.
+    #[test]
+    fn a_held_reply_is_not_carried_when_the_comment_identity_is_ambiguous() {
+        let before = comment_text(42, "old wording", Some("2024-05-30T00:00:00Z"));
+        let held = PrReviewItem {
+            reply_posted: false,
+            reply_uncertain: true,
+            ..fixed_and_replied(42)
+        };
+        let prior = prior_plan(
+            vec![held.clone(), held],
+            vec![before.clone(), before.clone()],
+            Some("2024-06-01T00:00:00Z"),
+            vec![fixed_from(&before)],
+        );
+        let edited = comment_text(42, "new wording", Some("2024-06-02T00:00:00Z"));
+        let mut items = vec![fresh_item(42)];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &[edited]);
+
+        assert!(!items[0].reply_uncertain, "{:?}", items[0]);
+    }
+
     #[test]
     fn carry_forward_reanalysis_lifecycle_does_not_overwrite_freshly_parsed_values() {
         // The merge must stay non-destructive even if the fresh re-parse
@@ -11730,6 +11927,44 @@ mod tests {
             items[0].pr_reply_text, None,
             "unrelated comment_id must not merge"
         );
+    }
+
+    #[test]
+    fn a_pull_request_is_one_identity_whatever_its_spelling() {
+        let canonical = "https://github.com/testorg/testrepo/pull/405";
+        assert!(same_pull_request(canonical, "https://github.com/TestOrg/TestRepo/pull/405/"));
+        assert!(same_pull_request(canonical, "https://github.com/testorg/testrepo/pull/405/files"));
+        assert!(!same_pull_request(canonical, "https://github.com/testorg/testrepo/pull/406"));
+        assert!(!same_pull_request(canonical, "https://github.com/testorg/other/pull/405"));
+        assert!(!same_pull_request(canonical, "not a pull request"));
+        assert!(!same_pull_request("", ""), "an unidentified plan is never the same PR");
+    }
+
+    #[test]
+    fn a_plan_for_another_pull_request_is_refused_with_a_clear_message() {
+        let linked = "https://github.com/testorg/testrepo/pull/406";
+        assert!(refuse_other_pull_request(linked, linked).is_ok());
+        let err = refuse_other_pull_request("https://github.com/testorg/testrepo/pull/405", linked)
+            .unwrap_err();
+        assert!(err.contains("testorg/testrepo#405"), "{err}");
+        assert!(err.contains("testorg/testrepo#406"), "{err}");
+        assert!(err.contains("Nothing was posted"), "{err}");
+    }
+
+    #[test]
+    fn a_stored_url_cannot_put_control_characters_into_the_refusal() {
+        let hostile = "https://github.com/evil\u{1b}[2J/repo/pull/7";
+        let err = refuse_other_pull_request(hostile, "https://github.com/a/b/pull/8").unwrap_err();
+        assert!(!err.chars().any(|c| c.is_control()), "{err:?}");
+    }
+
+    #[test]
+    fn a_failed_final_save_says_how_many_replies_were_already_posted() {
+        assert_eq!(final_save_error(0, "save failed".to_string()), "save failed");
+        let one = final_save_error(1, "save failed".to_string());
+        assert!(one.contains("1 reply was posted to GitHub"), "{one}");
+        let many = final_save_error(3, "save failed".to_string());
+        assert!(many.contains("3 replies were posted to GitHub"), "{many}");
     }
 
     /// Edited before the analysis the apply used: that text is what the fix
@@ -28454,6 +28689,373 @@ mod tests {
                 );
             }
 
+            /// Approves every reply the plan would post, without accepting the
+            /// duplicate risk of a reply that may already be on GitHub. A test
+            /// accepts that risk only when it means to.
+            fn approve_without_duplicate_risk(plan: &PrReviewPlan) -> Vec<ApprovedPublicReply> {
+                approve_all_owed(plan)
+                    .into_iter()
+                    .map(|a| ApprovedPublicReply {
+                        accept_possible_duplicate: false,
+                        ..a
+                    })
+                    .collect()
+            }
+
+            /// Sync through the real persistence helper, as the command does.
+            async fn sync_persisting(
+                state: &crate::AppState,
+                task: &Task,
+                worktree: &Path,
+                plan: PrReviewPlan,
+                approved: &[ApprovedPublicReply],
+            ) -> Result<(SyncPrRepliesResult, PrReviewPlan), String> {
+                let persist = |snap: PrReviewPlan| {
+                    save_review_plan_on_task(&state.task.tasks, &state.storage, task.id, snap)
+                };
+                sync_pr_review_replies_persisting(
+                    task.clone(),
+                    worktree.to_str().unwrap().to_string(),
+                    plan,
+                    approved,
+                    persist,
+                )
+                .await
+            }
+
+            /// The Task's plan as the file holds it: what a restart would load.
+            async fn stored_plan_after_restart(state: &crate::AppState, task: &Task) -> PrReviewPlan {
+                state
+                    .storage
+                    .load_project_tasks(task.project_id)
+                    .expect("the Task board loads")
+                    .into_iter()
+                    .find(|t| t.id == task.id)
+                    .and_then(|t| t.pr_review_plan)
+                    .expect("the plan was saved")
+            }
+
+            /// A PR-level reply's record cannot be saved: nothing is posted, and
+            /// the record does not stay behind as a possibly-posted reply, so
+            /// the next save and the next Sync treat the reply as never attempted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_pr_level_reply_whose_record_fails_is_neither_posted_nor_held() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-77";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+
+                // The first save of the operation is the record before the POST.
+                let fault = slashit_durable_fs::fault::fail_at(
+                    slashit_durable_fs::Stage::Replace,
+                    std::io::ErrorKind::Other,
+                );
+                let approved = approve_without_duplicate_risk(&plan);
+                let (failed, updated) =
+                    sync_persisting(&state, &task, &worktree, plan, &approved)
+                        .await
+                        .expect("sync reports per item");
+                drop(fault);
+
+                // The cleared record reached the file, not only memory.
+                let on_disk = stored_plan_after_restart(&state, &task).await;
+                assert!(!on_disk.items[0].reply_uncertain, "{:?}", on_disk.items[0]);
+                assert_eq!(call_count(&log, "pr comment"), 0, "{:?}", gh_writes(&log));
+                assert!(
+                    failed.errors.iter().any(|e| e.contains("could not record")),
+                    "{failed:?}"
+                );
+                assert!(
+                    !updated.items[0].reply_posted && !updated.items[0].reply_uncertain,
+                    "a reply that was never posted must not read as possibly posted: {:?}",
+                    updated.items[0]
+                );
+
+                // The save Sync makes at its end records what is true.
+                save_review_plan_on_task(&state.task.tasks, &state.storage, task.id, updated)
+                    .await
+                    .unwrap();
+                let stored = stored_plan_after_restart(&state, &task).await;
+                assert!(!stored.items[0].reply_uncertain, "{:?}", stored.items[0]);
+
+                // After a restart the reply is offered and posted once, not held.
+                let approved = approve_without_duplicate_risk(&stored);
+                let (synced, _) = sync_persisting(&state, &task, &worktree, stored, &approved)
+                    .await
+                    .unwrap();
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert_eq!(synced.held_uncertain, 0, "{synced:?}");
+                assert_eq!(call_count(&log, "pr comment"), 1, "{:?}", gh_writes(&log));
+            }
+
+            /// A PR-level reply that posted while its outcome could not be saved
+            /// is reported as not recorded, is not posted again, and after a
+            /// restart is held for a person to check rather than reposted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_posted_pr_level_reply_whose_outcome_is_not_saved_is_held_after_restart() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-77";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+
+                // Save 1 (the record before the POST) lands; save 2 (the outcome) fails.
+                let fault = slashit_durable_fs::fault::fail_after(
+                    slashit_durable_fs::Stage::Replace,
+                    std::io::ErrorKind::Other,
+                    1,
+                );
+                let approved = approve_without_duplicate_risk(&plan);
+                let (first, updated) = sync_persisting(&state, &task, &worktree, plan, &approved)
+                    .await
+                    .unwrap();
+                drop(fault);
+
+                assert_eq!(call_count(&log, "pr comment"), 1, "{:?}", gh_writes(&log));
+                assert!(
+                    first.errors.iter().any(|e| e.contains("recording it failed")),
+                    "the outcome is reported as unrecorded: {first:?}"
+                );
+
+                // In this run the posted reply is known, so it is not posted again.
+                let approved = approve_without_duplicate_risk(&updated);
+                let (again, _) = sync_persisting(&state, &task, &worktree, updated, &approved)
+                    .await
+                    .unwrap();
+                assert_eq!(again.replied, 0, "{again:?}");
+                assert_eq!(call_count(&log, "pr comment"), 1, "{:?}", gh_writes(&log));
+
+                // After a restart the file holds the record before the POST, so the
+                // reply is held until a person decides, and nothing is posted.
+                let stored = stored_plan_after_restart(&state, &task).await;
+                assert!(
+                    stored.items[0].reply_uncertain && !stored.items[0].reply_posted,
+                    "{:?}",
+                    stored.items[0]
+                );
+                let approved = approve_without_duplicate_risk(&stored);
+                let (after_restart, _) = sync_persisting(&state, &task, &worktree, stored, &approved)
+                    .await
+                    .unwrap();
+                assert_eq!(after_restart.replied, 0, "{after_restart:?}");
+                assert_eq!(after_restart.held_uncertain, 1, "{after_restart:?}");
+                assert_eq!(call_count(&log, "pr comment"), 1, "{:?}", gh_writes(&log));
+            }
+
+            /// A plan made for PR 405 is never published to a Task that a later
+            /// link moved to PR 406: nothing is posted, and the stored plan is
+            /// left as it was.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_refuses_a_plan_for_another_pull_request_and_posts_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (mut task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Inline, None)],
+                    |_| {},
+                )
+                .await;
+                task.pr_url = Some("https://github.com/testorg/testrepo/pull/406".to_string());
+                // The branch now belongs to PR 406, so the delivery check cannot
+                // be what refuses the publication: only the identity check can.
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/testorg/testrepo/pull/406\",\"isCrossRepository\":false}}]' ;;\n  *'--paginate'*) echo '[]' ;;\n  *) echo 4242 ;;\nesac\n"
+                );
+                write_executable(&claude.gh, &script);
+                let before = serde_json::to_string(&plan).unwrap();
+
+                let approved = approve_without_duplicate_risk(&plan);
+                let err = sync_persisting(&state, &task, &worktree, plan.clone(), &approved)
+                    .await
+                    .expect_err("a plan for another pull request is refused");
+
+                assert!(err.contains("#405") && err.contains("#406"), "{err}");
+                assert!(gh_writes(&log).is_empty(), "{:?}", gh_writes(&log));
+                assert_eq!(serde_json::to_string(&plan).unwrap(), before);
+            }
+
+            /// The same pull request written with another spelling is the same
+            /// pull request: Sync proceeds and answers the comment once.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_accepts_the_same_pull_request_spelled_differently() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let (mut task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Inline, None)],
+                    |_| {},
+                )
+                .await;
+                task.pr_url = Some("https://github.com/TestOrg/TestRepo/pull/405/".to_string());
+
+                let approved = approve_without_duplicate_risk(&plan);
+                let (synced, _) = sync_persisting(&state, &task, &worktree, plan, &approved)
+                    .await
+                    .unwrap();
+
+                assert_eq!(synced.replied, 1, "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 1, "{:?}", gh_writes(&log));
+            }
+
+            /// Apply's preflight refuses a stored plan made for another pull
+            /// request before the checkout or GitHub is consulted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn apply_preflight_refuses_a_plan_made_for_another_pull_request() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let (state, _tmp) = build_test_state().await;
+                let (_task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let err = check_apply_preflight(
+                    Some(&plan),
+                    &plan,
+                    "https://github.com/testorg/testrepo/pull/406",
+                    worktree.to_str().unwrap(),
+                    Some("task-branch"),
+                )
+                .await
+                .expect_err("a plan for another pull request is refused");
+
+                assert!(err.contains("#405") && err.contains("#406"), "{err}");
+            }
+
+            /// Discuss refuses a plan made for another pull request before its
+            /// agent runs, so nothing is re-discussed or saved under this Task.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discuss_refuses_a_plan_made_for_another_pull_request_before_any_agent_runs() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let (state, _tmp) = build_test_state().await;
+                let (mut task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                task.pr_url = Some("https://github.com/testorg/testrepo/pull/406".to_string());
+                let (_cancel, cancel_rx) = tokio::sync::watch::channel(false);
+
+                let err = discuss_pr_review_questions_inner(
+                    task,
+                    worktree.to_str().unwrap().to_string(),
+                    plan,
+                    cancel_rx,
+                )
+                .await
+                .expect_err("a plan for another pull request is refused");
+
+                assert!(err.contains("#405") && err.contains("#406"), "{err}");
+            }
+
+            /// An uncertain PR-level reply whose comment was edited: re-analysis
+            /// carries the record, a new Apply of the edited comment does not
+            /// clear it, and Sync holds the reply until a person accepts the
+            /// duplicate risk, then posts it once.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_uncertain_reply_survives_an_edit_and_a_new_apply_until_accepted() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-77";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+
+                // An earlier POST may have reached GitHub: the record says so.
+                let mut stored = plan.clone();
+                stored.items[0].reply_posted = false;
+                stored.items[0].reply_uncertain = true;
+                save_review_plan_on_task(&state.task.tasks, &state.storage, task.id, stored.clone())
+                    .await
+                    .unwrap();
+
+                // The comment is edited, and re-analysis carries the record over.
+                let mut edited = stored.comments.clone();
+                edited[0].body = "please fix it differently".to_string();
+                edited[0].updated_at = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
+                let mut fresh = stored.items[0].clone();
+                fresh.fix_done = false;
+                fresh.fix_uncommitted = false;
+                fresh.fix_commit = None;
+                fresh.fix_effect = None;
+                fresh.reply_posted = false;
+                fresh.reply_uncertain = false;
+                fresh.pr_reply_text = None;
+                fresh.reply_comment_id = None;
+                let mut items = vec![fresh];
+                let fixed_content =
+                    carry_forward_reanalysis_lifecycle(&mut items, &stored, &edited);
+                let reanalyzed = PrReviewPlan {
+                    comments: edited,
+                    items,
+                    fixed_content,
+                    ..stored.clone()
+                };
+                assert!(reanalyzed.items[0].reply_uncertain, "{:?}", reanalyzed.items[0]);
+                assert!(!reanalyzed.items[0].fix_done, "the edited wording needs its own fix");
+
+                // A new Apply of the edited comment makes its own fix; the record stays.
+                let (applied, applied_plan) = apply(
+                    &task,
+                    reanalyzed,
+                    &worktree,
+                    tmp.path().join("no-such-jj"),
+                )
+                .await;
+                assert!(applied.pushed, "{applied:?}");
+                assert!(applied_plan.items[0].fix_done, "{:?}", applied_plan.items[0]);
+                assert!(
+                    applied_plan.items[0].reply_uncertain,
+                    "a new fix must not clear the uncertain reply: {:?}",
+                    applied_plan.items[0]
+                );
+
+                // Sync holds the reply until the person accepts the duplicate risk.
+                let approved = approve_without_duplicate_risk(&applied_plan);
+                let (held, held_plan) =
+                    sync_persisting(&state, &task, &worktree, applied_plan.clone(), &approved)
+                        .await
+                        .unwrap();
+                assert_eq!(held.replied, 0, "{held:?}");
+                assert_eq!(held.held_uncertain, 1, "{held:?}");
+                assert_eq!(call_count(&log, "pr comment"), 0, "{:?}", gh_writes(&log));
+
+                let accepted: Vec<ApprovedPublicReply> = approve_all_owed(&held_plan);
+                let (posted, _) = sync_persisting(&state, &task, &worktree, held_plan, &accepted)
+                    .await
+                    .unwrap();
+                assert_eq!(posted.replied, 1, "{posted:?}");
+                assert_eq!(call_count(&log, "pr comment"), 1, "{:?}", gh_writes(&log));
+            }
+
             /// A fix whose delivery is not confirmed gets no reply.
             #[tokio::test(flavor = "multi_thread")]
             async fn sync_does_not_claim_a_fix_that_delivery_does_not_confirm() {
@@ -33810,10 +34412,15 @@ mod review_plan_provenance {
         sent: &PrReviewPlan,
         dir: &tempfile::TempDir,
     ) -> Result<(), String> {
+        // The pull request Apply checks is the Task's own, as `address_pr_review`
+        // takes it; the stored plan was made for that same pull request.
+        let pr_url = task
+            .authoritative_pr_url()
+            .expect("the fixture Task is linked to a pull request");
         check_apply_preflight(
             task.pr_review_plan.as_ref(),
             sent,
-            PR_URL,
+            pr_url,
             dir.path().to_str().unwrap(),
             Some(FIXTURE_BRANCH),
         )
