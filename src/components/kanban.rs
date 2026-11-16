@@ -1381,6 +1381,7 @@ fn PrReviewModal(
             >
                 <div
                     class="w-full max-w-6xl max-h-[90vh] bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl overflow-hidden flex flex-col"
+                    data-testid="pr-review-modal"
                     on:click=move |e| e.stop_propagation()
                 >
                     <div class="flex items-start justify-between px-5 py-4 border-b border-white/10 gap-4">
@@ -1447,7 +1448,7 @@ fn PrReviewModal(
                             }
                         >
                             {move || error.get().map(|msg| view! {
-                                <div class="px-3 py-2 rounded-md border border-red-500/30 bg-red-500/10 text-xs text-red-200 flex items-start gap-2">
+                                <div class="px-3 py-2 rounded-md border border-red-500/30 bg-red-500/10 text-xs text-red-200 flex items-start gap-2" data-testid="pr-review-error">
                                     <div class="flex-1 whitespace-pre-wrap break-words font-mono">{msg}</div>
                                     <button
                                         class="flex-shrink-0 -mr-1 p-1 rounded hover:bg-red-500/15 text-red-300/70 hover:text-red-200 transition-colors"
@@ -1639,11 +1640,12 @@ fn PrReviewModal(
                                 children=move |(id, _, _, _): (u64, String, String, bool)| {
                                     let current = move || owed_replies().into_iter().find(|r| r.0 == id);
                                     view! {
-                                        <div class="rounded-lg border border-white/10 p-2 space-y-2">
+                                        <div class="rounded-lg border border-white/10 p-2 space-y-2" data-testid="pr-review-reply" data-comment-id=id.to_string()>
                                             <label class="flex items-center gap-2 text-xs text-white/80 cursor-pointer">
                                                 <input
                                                     type="checkbox"
                                                     class="accent-yellow-500 disabled:cursor-not-allowed"
+                                                    data-testid="pr-review-reply-select"
                                                     prop:checked=move || approved_replies.get().iter().any(|s| s.0 == id)
                                                     on:change=move |ev| {
                                                         let on = event_target_checked(&ev);
@@ -1657,11 +1659,11 @@ fn PrReviewModal(
                                                 />
                                                 {move || current().map(|r| format!("Comment {}: {}", id, r.1)).unwrap_or_default()}
                                             </label>
-                                            <pre class="whitespace-pre-wrap break-words text-xs text-white/80 bg-black/30 rounded p-2 m-0">
+                                            <pre class="whitespace-pre-wrap break-words text-xs text-white/80 bg-black/30 rounded p-2 m-0" data-testid="pr-review-reply-text">
                                                 {move || current().map(|r| r.2).unwrap_or_default()}
                                             </pre>
                                             <Show when=move || current().is_some_and(|r| r.3)>
-                                                <p class="text-xs text-amber-200">
+                                                <p class="text-xs text-amber-200" data-testid="pr-review-reply-duplicate">
                                                     "An earlier attempt may already have posted this PR-level reply. Selecting it accepts a possible duplicate."
                                                 </p>
                                             </Show>
@@ -1672,14 +1674,14 @@ fn PrReviewModal(
                         </section>
                     </Show>
                     <Show when=move || !fixes_without_reply().is_empty()>
-                        <section class="px-5 py-3 border-t border-white/10 space-y-2" aria-label="Fixes without a public reply">
+                        <section class="px-5 py-3 border-t border-white/10 space-y-2" aria-label="Fixes without a public reply" data-testid="pr-review-no-reply">
                             <p class="text-xs font-semibold text-white/80">"No public reply is prepared for these fixes"</p>
                             <p class="text-xs text-white/70">"Their triage reasoning is internal and is not posted as a reply, so none of them can be selected."</p>
                             <ul class="text-xs text-white/70 list-disc pl-5">
                                 <For
                                     each=fixes_without_reply
                                     key=|s| s.clone()
-                                    children=move |s: String| view! { <li>{s}</li> }
+                                    children=move |s: String| view! { <li data-testid="pr-review-no-reply-item">{s}</li> }
                                 />
                             </ul>
                         </section>
@@ -1747,6 +1749,7 @@ fn PrReviewModal(
                                         "px-3 py-1.5 rounded-lg text-xs text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 transition-colors disabled:opacity-40"
                                     }
                                 }
+                                data-testid="pr-review-post-replies"
                                 on:click=on_sync_replies
                                 disabled=move || busy() || approved_replies.get().is_empty()
                                 title="Post only the replies selected in the panel above, with the exact text shown there. No agent run, no push."
@@ -1769,11 +1772,13 @@ fn PrReviewModal(
                                 class="px-3 py-1.5 rounded-lg text-xs text-white/60 hover:bg-white/10 transition-colors disabled:opacity-40"
                                 on:click=move |_| show.set(false)
                                 disabled=move || applying.get() || discussing.get()
+                                data-testid="pr-review-close"
                             >
                                 "Close"
                             </button>
                             <button
                                 class="px-4 py-1.5 rounded-lg text-sm bg-yellow-500 text-black font-medium hover:bg-yellow-400 transition-colors disabled:opacity-40 disabled:hover:bg-yellow-500"
+                                data-testid="pr-review-apply"
                                 on:click=on_apply
                                 disabled=move || loading.get() || applying.get() || discussing.get() || approved_fix_count() == 0
                             >
@@ -1906,11 +1911,12 @@ fn render_review_item(
     };
 
     view! {
-        <div class=format!("rounded-lg border {} p-3 space-y-2", decision_class)>
+        <div class=format!("rounded-lg border {} p-3 space-y-2", decision_class) data-testid="pr-review-item" data-comment-id=comment_id.map(|id| id.to_string())>
             <div class="flex items-start gap-3">
                 <input
                     type="checkbox"
                     class="mt-1 accent-yellow-500 disabled:cursor-not-allowed"
+                    data-testid="pr-review-item-approve"
                     prop:checked=approved_init
                     on:change=toggle_approved
                     disabled=move || busy.get()
@@ -2041,14 +2047,14 @@ fn render_review_item(
 
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
                 <label class="block">
-                    <span class="text-[10px] uppercase tracking-wide text-white/40">"Reply / reasoning"</span>
+                    <span class="text-[10px] uppercase tracking-wide text-white/40">"Internal reasoning (never posted)"</span>
                     <textarea
                         class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50 disabled:opacity-60 disabled:cursor-not-allowed"
                         rows="2"
                         on:input=on_reasoning_input
                         prop:value=reasoning
                         disabled=move || busy.get()
-                        placeholder="What you would tell the reviewer. Posted as the PR reply when auto-reply is on."
+                        placeholder="Your internal assessment. It is never posted to GitHub. Public replies are approved separately, in the replies list."
                     ></textarea>
                 </label>
 

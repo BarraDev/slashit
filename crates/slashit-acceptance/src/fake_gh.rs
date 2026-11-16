@@ -45,6 +45,14 @@ const DELAY_VIEW: &str = "delay-view";
 /// refusal (`HTTP 422`), which is what proves that nothing was opened.
 pub const CREATE_FAILURE: &str = "creating the pull request was scripted to fail";
 
+/// One public reply the fake received: the exact text and its destination,
+/// `PR-LEVEL <number>` for `gh pr comment` or `POST <endpoint>` for a threaded reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Post {
+    pub target: String,
+    pub body: String,
+}
+
 pub struct FakeGh {
     dir: PathBuf,
 }
@@ -208,6 +216,32 @@ impl FakeGh {
         }
         numbered.sort_by_key(|(n, _)| *n);
         Ok(numbered.into_iter().map(|(_, args)| args).collect())
+    }
+
+    /// Every public reply the fake was asked to post, in start order: the
+    /// exact body and where it was sent. Only `gh pr comment` and the threaded
+    /// reply POST are recorded, so this is the complete list of public writes.
+    pub fn posts(&self) -> Result<Vec<Post>> {
+        let directory = self.dir.join("posts");
+        let mut numbered = Vec::new();
+        match std::fs::read_dir(&directory) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let Some(number) = name.strip_suffix(".body").and_then(|n| n.parse::<u32>().ok()) else {
+                        continue;
+                    };
+                    let body = std::fs::read_to_string(entry.path())?;
+                    let target = std::fs::read_to_string(directory.join(format!("{number}.target")))?;
+                    numbered.push((number, Post { target, body }));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        numbered.sort_by_key(|(n, _)| *n);
+        Ok(numbered.into_iter().map(|(_, post)| post).collect())
     }
 
     /// How many times `gh pr create` was run, failed or not.

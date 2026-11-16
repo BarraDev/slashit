@@ -21,6 +21,13 @@
 # one per line. `pr-heads/<number>` is the commit the pull request was opened
 # at, which the default `pr view` answer reports as `headRefOid`; a scripted
 # `pr-view` answer reports only what the journey writes into it.
+#
+# A public reply is never sent anywhere. `gh pr comment` and the threaded
+# `gh api -X POST .../replies` store the exact body they were given under
+# `posts/<sequence>.body`, and the call's target under `posts/<sequence>.target`,
+# and then print an id. `gh api user` reports a fixed account, and the inline
+# comments of a pull request are listed as empty, so no reply that SlashIt did
+# not post is ever adopted.
 set -e
 
 dir="$SLASHIT_FAKE_GH_DIR"
@@ -129,12 +136,60 @@ case "$1 $2" in
         fi
         ;;
     "api --paginate")
-        number=$(printf '%s' "$3" | sed -n 's#.*/pulls/\([0-9][0-9]*\)/commits$#\1#p')
-        if [ -z "$number" ] || [ ! -f "$dir/pr-commits/$number" ]; then
-            echo "fake gh: no commits scripted for $3" >&2
+        case "$3" in
+            repos/*/pulls/*/comments*)
+                # No inline comment is listed, so a threaded reply is never adopted.
+                printf '[]'
+                ;;
+            *)
+                number=$(printf '%s' "$3" | sed -n 's#.*/pulls/\([0-9][0-9]*\)/commits$#\1#p')
+                if [ -z "$number" ] || [ ! -f "$dir/pr-commits/$number" ]; then
+                    echo "fake gh: no commits scripted for $3" >&2
+                    exit 1
+                fi
+                cat "$dir/pr-commits/$number"
+                ;;
+        esac
+        ;;
+    "api user")
+        printf 'slashit-acceptance-reviewer\n'
+        ;;
+    "api -X")
+        # `api -X POST repos/.../comments/<id>/replies -f body=<text> --jq .id`
+        if [ "$3" != "POST" ]; then
+            echo "fake gh: unsupported api method $3" >&2
             exit 1
         fi
-        cat "$dir/pr-commits/$number"
+        body=""
+        for arg in "$@"; do
+            case "$arg" in
+                body=*) body="${arg#body=}" ;;
+            esac
+        done
+        mkdir -p "$dir/posts"
+        printf '%s' "$body" > "$dir/posts/$position.body"
+        printf 'POST %s' "$4" > "$dir/posts/$position.target"
+        printf '%s\n' "$((7000 + position))"
+        ;;
+    "pr comment")
+        # `pr comment <number> --repo <repo> --body <text>`
+        number="$3"
+        body=""
+        take_body=""
+        for arg in "$@"; do
+            if [ -n "$take_body" ]; then
+                body="$arg"
+                take_body=""
+                continue
+            fi
+            if [ "$arg" = "--body" ]; then
+                take_body="yes"
+            fi
+        done
+        mkdir -p "$dir/posts"
+        printf '%s' "$body" > "$dir/posts/$position.body"
+        printf 'PR-LEVEL %s' "$number" > "$dir/posts/$position.target"
+        printf '%s\n' "$repository/pull/$number#issuecomment-$((7000 + position))"
         ;;
     "repo view")
         case "$*" in

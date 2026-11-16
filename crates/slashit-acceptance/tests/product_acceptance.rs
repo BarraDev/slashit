@@ -81,6 +81,8 @@ mod orphans;
 mod pr_status;
 #[path = "product_acceptance/pr_recovery.rs"]
 mod pr_recovery;
+#[path = "product_acceptance/pr_comment_review.rs"]
+mod pr_comment_review;
 #[path = "product_acceptance/project_rail.rs"]
 mod project_rail;
 #[path = "product_acceptance/portable_import.rs"]
