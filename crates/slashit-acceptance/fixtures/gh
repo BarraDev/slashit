@@ -67,6 +67,16 @@ done
 
 repository="https://github.com/slashit-acceptance/fixture"
 
+# Records a public write as `posts/<sequence>.body` and `.target`. The journey
+# reads a record as soon as its `.body` exists, so the target is written first
+# and the complete body is renamed into place last: a half-written record is
+# never visible.
+publish_post() {
+    printf '%s' "$1" > "$dir/posts/$position.body.partial"
+    printf '%s' "$2" > "$dir/posts/$position.target"
+    mv "$dir/posts/$position.body.partial" "$dir/posts/$position.body"
+}
+
 case "$1 $2" in
     "pr list")
         if [ -n "$head" ] && [ -f "$dir/pr-list/$head.json" ]; then
@@ -122,7 +132,9 @@ case "$1 $2" in
             if [ -n "$head_oid" ]; then
                 head_field=",\"headRefOid\":\"$head_oid\""
             fi
-            printf '{"state":"OPEN","number":1,"mergeable":"MERGEABLE","reviewDecision":"","statusCheckRollup":[],"baseRefName":"main","isCrossRepository":false%s}' "$head_field"
+            # The review and comment lists are present and empty: a pull request
+            # with no review, which Analyze reads in full.
+            printf '{"state":"OPEN","number":1,"mergeable":"MERGEABLE","reviewDecision":"","statusCheckRollup":[],"reviews":[],"comments":[],"baseRefName":"main","isCrossRepository":false%s}' "$head_field"
         fi
         ;;
     "issue view")
@@ -141,6 +153,11 @@ case "$1 $2" in
                 # No inline comment is listed, so a threaded reply is never adopted.
                 printf '[]'
                 ;;
+            # The reads Analyze makes before triage. The pull request has no
+            # reviews or conversation comments, so each list is empty.
+            repos/*/pulls/*/reviews*|repos/*/issues/*/comments*)
+                printf '[]'
+                ;;
             *)
                 number=$(printf '%s' "$3" | sed -n 's#.*/pulls/\([0-9][0-9]*\)/commits$#\1#p')
                 if [ -z "$number" ] || [ ! -f "$dir/pr-commits/$number" ]; then
@@ -150,6 +167,10 @@ case "$1 $2" in
                 cat "$dir/pr-commits/$number"
                 ;;
         esac
+        ;;
+    "api graphql")
+        # The review threads of the pull request: none, so none is resolved or outdated.
+        printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
         ;;
     "api user")
         printf 'slashit-acceptance-reviewer\n'
@@ -167,8 +188,7 @@ case "$1 $2" in
             esac
         done
         mkdir -p "$dir/posts"
-        printf '%s' "$body" > "$dir/posts/$position.body"
-        printf 'POST %s' "$4" > "$dir/posts/$position.target"
+        publish_post "$body" "POST $4"
         printf '%s\n' "$((7000 + position))"
         ;;
     "pr comment")
@@ -187,8 +207,7 @@ case "$1 $2" in
             fi
         done
         mkdir -p "$dir/posts"
-        printf '%s' "$body" > "$dir/posts/$position.body"
-        printf 'PR-LEVEL %s' "$number" > "$dir/posts/$position.target"
+        publish_post "$body" "PR-LEVEL $number"
         printf '%s\n' "$repository/pull/$number#issuecomment-$((7000 + position))"
         ;;
     "repo view")

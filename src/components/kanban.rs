@@ -197,6 +197,7 @@ pub fn Kanban(
     let pr_review_applying = RwSignal::new(false);
     let pr_review_error = RwSignal::new(None::<String>);
     let pr_review_auto_push = RwSignal::new(crate::services::PR_REVIEW_AUTO_PUSH_DEFAULT);
+    let pr_review_selected_replies = RwSignal::new(Vec::<(u64, String, bool)>::new());
     let pr_review_dry_run = RwSignal::new(false);
     let pr_review_last_apply = RwSignal::new(None::<PrReviewApplyResult>);
     // Per-item live status fed by `pr-review-progress` Tauri events keyed by
@@ -471,6 +472,7 @@ pub fn Kanban(
         error: pr_review_error,
         last_apply: pr_review_last_apply,
         auto_push: pr_review_auto_push,
+        selected_replies: pr_review_selected_replies,
     };
     let on_analyze_pr_comments = Callback::new({
         move |task: Task| {
@@ -741,6 +743,7 @@ pub fn Kanban(
                 item_status=pr_review_item_status
                 overall_progress=pr_review_overall
                 recorded=pr_review_recorded
+                approved_replies=pr_review_selected_replies
                 set_tasks=set_tasks_signal
             />
 
@@ -1012,6 +1015,10 @@ struct PrReviewDialog {
     error: RwSignal<Option<String>>,
     last_apply: RwSignal<Option<PrReviewApplyResult>>,
     auto_push: RwSignal<bool>,
+    /// The replies selected for posting, each with the text the person saw and
+    /// whether a duplicate was accepted. A selection belongs to one opening, so
+    /// `open` clears it; the backend still checks each text before posting.
+    selected_replies: RwSignal<Vec<(u64, String, bool)>>,
 }
 
 impl PrReviewDialog {
@@ -1024,6 +1031,9 @@ impl PrReviewDialog {
         // the dialog is open.
         self.auto_push
             .set(crate::services::PR_REVIEW_AUTO_PUSH_DEFAULT);
+        // Reply selections follow the same rule: a Task A selection must not
+        // leave Task B's Post button enabled.
+        self.selected_replies.set(Vec::new());
         self.task.set(Some(task.clone()));
         self.error.set(None);
         self.last_apply.set(task.pr_review_plan.as_ref().and_then(|p| p.last_apply.clone()));
@@ -1069,6 +1079,7 @@ fn PrReviewModal(
     item_status: RwSignal<std::collections::HashMap<u64, PrItemStatus>>,
     overall_progress: RwSignal<Option<(usize, usize)>>,
     recorded: RwSignal<Vec<u64>>,
+    approved_replies: RwSignal<Vec<(u64, String, bool)>>,
     set_tasks: WriteSignal<Vec<Task>>,
 ) -> impl IntoView {
     let show_raw_comments = RwSignal::new(false);
@@ -1303,11 +1314,9 @@ fn PrReviewModal(
             .map(|i| i.summary.clone())
             .collect::<Vec<_>>())
         .unwrap_or_default();
-    // Replies the person selected, each with the text they saw when selecting
-    // it and whether a duplicate was accepted. Nothing is selected by default,
-    // and approving a fix never selects a reply.
-    let approved_replies = RwSignal::new(Vec::<(u64, String, bool)>::new());
-
+    // Replies the person selected (`approved_replies`, owned by the dialog so a
+    // new opening clears it). Nothing is selected by default, and approving a
+    // fix never selects a reply.
     let on_sync_replies = move |_| {
         let Some(task_value) = task.get() else { return; };
         let selected = approved_replies.get();
@@ -3231,6 +3240,7 @@ mod tests {
             error: RwSignal::new(None),
             last_apply: RwSignal::new(None),
             auto_push: RwSignal::new(PR_REVIEW_AUTO_PUSH_DEFAULT),
+            selected_replies: RwSignal::new(Vec::new()),
         })
     }
 
@@ -3284,6 +3294,28 @@ mod tests {
         assert!(
             !dialog.auto_push.get_untracked(),
             "reopening task A opens with Auto-push off"
+        );
+    }
+
+    /// A reply selected for Task A must not stay selected, and keep Post enabled,
+    /// once Task B's dialog opens.
+    #[test]
+    fn a_reply_selected_for_one_task_is_not_selected_when_another_task_opens() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = column_task(1, "a");
+        let task_b = column_task(2, "b");
+
+        assert!(dialog.open(task_a), "task A is analyzed");
+        dialog
+            .selected_replies
+            .set(vec![(7, "Fixed it.".to_string(), false)]);
+        dialog.show.set(false);
+
+        assert!(dialog.open(task_b), "task B is analyzed");
+        assert!(
+            dialog.selected_replies.get_untracked().is_empty(),
+            "task A's selection must not carry over to task B"
         );
     }
 

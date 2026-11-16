@@ -3554,7 +3554,9 @@ pub struct SyncPrRepliesResult {
     /// Owed replies left unposted because the person did not approve them.
     #[serde(default)]
     pub awaiting_approval: u32,
-    /// PR-level replies held because an earlier attempt may have posted them.
+    /// Replies held, not posted: a PR-level reply an earlier attempt may have
+    /// posted, or a threaded reply whose thread already holds this account's
+    /// other text (or several copies of the approved text).
     #[serde(default)]
     pub held_uncertain: u32,
 }
@@ -3800,14 +3802,14 @@ where
                     continue;
                 };
                 // Discovery only adopts a reply written by this account.
-                let discovered_id = match authenticated_login.as_deref() {
+                let own = match authenticated_login.as_deref() {
                     // Fail closed: with no verified account, no reply is ours.
-                    None => Ok(None),
+                    None => Ok(Vec::new()),
                     Some(expected) => {
-                        discover_reply_comment_id(&repo, &number, original_id, expected).await
+                        discover_own_replies(&repo, &number, original_id, expected).await
                     }
                 };
-                match discovered_id {
+                match own.map(|own| latest_own_reply(&own)) {
                     Ok(Some(found_id)) => {
                         updated_plan.items[orig_idx].reply_comment_id = Some(found_id);
                         discovered += 1;
@@ -3846,16 +3848,16 @@ where
                     // No adoption without a verified author: failing closed
                     // also refuses to post blind, which could duplicate a
                     // reply whose response was lost.
-                    let discovered_id = match authenticated_login.as_deref() {
+                    let own = match authenticated_login.as_deref() {
                         None => Err("the GitHub account that posts replies could not be \
                                      determined, so an existing reply could not be verified"
                             .to_string()),
                         Some(expected) => {
-                            discover_reply_comment_id(&repo, &number, original_id, expected).await
+                            discover_own_replies(&repo, &number, original_id, expected).await
                         }
                     };
-                    match discovered_id {
-                        Ok(Some(found_id)) => {
+                    match own.map(|own| classify_existing_reply(&own, &body)) {
+                        Ok(ExistingReply::Matched(found_id)) => {
                             discovered += 1;
                             let it = &mut updated_plan.items[orig_idx];
                             it.reply_posted = true;
@@ -3863,7 +3865,31 @@ where
                             it.pr_reply_text = Some(body);
                             continue;
                         }
-                        Ok(None) => {}
+                        Ok(ExistingReply::Absent) => {}
+                        // Held, not adopted, not rewritten, not posted again: a
+                        // person decides what happens on GitHub.
+                        Ok(ExistingReply::Differs(ids)) => {
+                            held_uncertain += 1;
+                            errors.push(format!(
+                                "comment {label}: this account already replied on the thread \
+                                 (comment {}) with text other than the approved reply. Nothing \
+                                 was posted or changed. Decide on GitHub whether that reply \
+                                 stands.",
+                                join_ids(&ids)
+                            ));
+                            continue;
+                        }
+                        Ok(ExistingReply::Ambiguous(ids)) => {
+                            held_uncertain += 1;
+                            errors.push(format!(
+                                "comment {label}: {} replies by this account (comments {}) already \
+                                 have the approved text, so the delivery cannot be told apart. \
+                                 Nothing was posted or changed.",
+                                ids.len(),
+                                join_ids(&ids)
+                            ));
+                            continue;
+                        }
                         Err(e) => {
                             errors.push(format!("comment {} (discover): {}", label, e));
                             continue;
@@ -5201,35 +5227,77 @@ fn is_sync_pr_level_reply(body: &str) -> bool {
     first.starts_with("Re https://") || first.starts_with("Re the comment by @")
 }
 
-/// Walks the PR's inline review comments and returns the id of *our* reply:
-/// one whose `in_reply_to_id` matches `original_comment_id` and whose author
-/// is `expected_login`. The author check is what keeps a reply another person
-/// left on the same thread from being adopted as ours and rewritten. Among
-/// the matching replies the most recently created wins. A comment without a
-/// `user.login`, or written by anyone else, is never a candidate. Returns
-/// `Ok(None)` when no candidate survives — the original reply may have been a
-/// PR-level fallback (no `in_reply_to_id`), it was deleted, or none of the
-/// replies on the thread is provably ours.
-async fn discover_reply_comment_id(
+/// A reply on a thread that the account `gh` posts as wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnReply {
+    id: u64,
+    body: String,
+    created: chrono::DateTime<chrono::Utc>,
+}
+
+/// What a thread already holds from the posting account, judged against the
+/// approved text. Only `Matched` is adopted as this item's delivery.
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingReply {
+    /// The account has not replied on this thread.
+    Absent,
+    /// Exactly one of the account's replies has the approved text.
+    Matched(u64),
+    /// The account replied, but none of its replies has the approved text.
+    /// Adopting one would record a draft GitHub never received, and posting
+    /// another could duplicate it, so the thread is left as it is. Newest first.
+    Differs(Vec<u64>),
+    /// Several replies have the approved text, so none can be told apart as
+    /// the delivery.
+    Ambiguous(Vec<u64>),
+}
+
+/// Judges the account's replies on one thread against the approved text. The
+/// body must match exactly: a reply with other wording is never adopted as the
+/// delivery of this draft.
+fn classify_existing_reply(own: &[OwnReply], approved: &str) -> ExistingReply {
+    let mut newest_first: Vec<&OwnReply> = own.iter().collect();
+    newest_first.sort_by_key(|r| std::cmp::Reverse(r.created));
+    let exact: Vec<u64> = newest_first
+        .iter()
+        .filter(|r| r.body == approved)
+        .map(|r| r.id)
+        .collect();
+    match exact.as_slice() {
+        [] if newest_first.is_empty() => ExistingReply::Absent,
+        [] => ExistingReply::Differs(newest_first.iter().map(|r| r.id).collect()),
+        [only] => ExistingReply::Matched(*only),
+        _ => ExistingReply::Ambiguous(exact),
+    }
+}
+
+/// The most recent of the account's replies, for a legacy item whose text is
+/// not recorded: it can only be identified, not verified, so it takes the last.
+fn latest_own_reply(own: &[OwnReply]) -> Option<u64> {
+    own.iter().max_by_key(|r| r.created).map(|r| r.id)
+}
+
+fn join_ids(ids: &[u64]) -> String {
+    ids.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+}
+
+/// Every reply on the thread of `original_comment_id` that `expected_login`
+/// wrote, read across all pages `gh --paginate` prints. Another person's reply
+/// is never returned. A reply without an id is an error, not skipped: skipping
+/// it could hide an existing reply and lead to a duplicate POST.
+async fn discover_own_replies(
     repo: &str,
     number: &str,
     original_comment_id: u64,
     expected_login: &str,
-) -> Result<Option<u64>, String> {
+) -> Result<Vec<OwnReply>, String> {
     let endpoint = format!("repos/{}/pulls/{}/comments?per_page=100", repo, number);
-    let raw = run_cmd_no_cwd("gh", &["api", "--paginate", &endpoint])
-        .await
-        .map_err(|e| format!("gh api list failed: {}", e))?;
-    let arr: Vec<serde_json::Value> =
-        serde_json::from_str(&raw).map_err(|e| format!("gh api returned non-JSON: {}", e))?;
-
-    let mut best: Option<(u64, chrono::DateTime<chrono::Utc>)> = None;
-    for c in arr {
-        let in_reply_to = c.get("in_reply_to_id").and_then(|v| v.as_u64());
-        if in_reply_to != Some(original_comment_id) {
+    let comments = gh_api_list(&endpoint, "inline review comments").await?;
+    let mut own = Vec::new();
+    for c in comments {
+        if c.get("in_reply_to_id").and_then(|v| v.as_u64()) != Some(original_comment_id) {
             continue;
         }
-        // Only a reply written by the expected account is a candidate.
         let author = c
             .get("user")
             .and_then(|u| u.get("login"))
@@ -5239,14 +5307,15 @@ async fn discover_reply_comment_id(
             continue;
         }
         let Some(id) = c.get("id").and_then(|v| v.as_u64()) else {
-            continue;
+            return Err("a reply by this account has no id, so the thread cannot be read".into());
         };
-        let created = parse_gh_ts(c.get("created_at")).unwrap_or_else(chrono::Utc::now);
-        if best.as_ref().is_none_or(|(_, t)| created > *t) {
-            best = Some((id, created));
-        }
+        own.push(OwnReply {
+            id,
+            body: c.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            created: parse_gh_ts(c.get("created_at")).unwrap_or_else(chrono::Utc::now),
+        });
     }
-    Ok(best.map(|(id, _)| id))
+    Ok(own)
 }
 
 /// Resolve once a `watch` channel is genuinely asked to cancel (`true`
@@ -26988,7 +27057,7 @@ mod tests {
                     &claude,
                     &log,
                     "echo 1",
-                    r#"[{"id":901,"in_reply_to_id":1,"user":{"login":"slashit-fixture"},"created_at":"2026-01-01T00:00:00Z"}]"#,
+                    r#"[{"id":901,"in_reply_to_id":1,"user":{"login":"slashit-fixture"},"body":"Fixed it.","created_at":"2026-01-01T00:00:00Z"}]"#,
                 );
 
                 let (_synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
@@ -26999,6 +27068,113 @@ mod tests {
                     "{:?}",
                     plan.items[0]
                 );
+            }
+
+            /// A thread where this account already wrote other text is held:
+            /// the approved reply is neither adopted nor posted, and the other
+            /// reply is left as it is.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_own_reply_with_other_text_is_held_not_adopted_or_posted() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) =
+                    delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(
+                    &claude,
+                    &log,
+                    "echo 777",
+                    r#"[{"id":901,"in_reply_to_id":1,"user":{"login":"slashit-fixture"},"body":"I will investigate.","created_at":"2026-01-01T00:00:00Z"}]"#,
+                );
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!((synced.replied, synced.held_uncertain), (0, 1), "{synced:?}");
+                assert!(
+                    synced.errors.iter().any(|e| e.contains("comment 901")),
+                    "the existing reply is named: {:?}",
+                    synced.errors
+                );
+                assert_eq!(call_count(&log, "-X POST"), 0, "no duplicate POST");
+                assert_eq!(call_count(&log, "-X PATCH"), 0, "the existing reply is not rewritten");
+                assert!(
+                    !plan.items[0].reply_posted && plan.items[0].reply_comment_id.is_none(),
+                    "{:?}",
+                    plan.items[0]
+                );
+            }
+
+            /// Two copies of the approved reply on one thread: neither is
+            /// chosen as the delivery, and nothing is posted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn two_own_copies_of_the_approved_reply_are_held_as_ambiguous() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) =
+                    delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(
+                    &claude,
+                    &log,
+                    "echo 777",
+                    r#"[{"id":901,"in_reply_to_id":1,"user":{"login":"slashit-fixture"},"body":"Fixed it.","created_at":"2026-01-01T00:00:00Z"},{"id":902,"in_reply_to_id":1,"user":{"login":"slashit-fixture"},"body":"Fixed it.","created_at":"2026-01-02T00:00:00Z"}]"#,
+                );
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!((synced.replied, synced.held_uncertain), (0, 1), "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 0);
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+            }
+
+            /// The approved reply is found on a later page of the thread and
+            /// adopted, not posted again.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_reply_on_a_later_page_is_adopted_not_posted_again() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) =
+                    delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(
+                    &claude,
+                    &log,
+                    "echo 777",
+                    r#"[{"id":5,"in_reply_to_id":7,"user":{"login":"someone-else"},"body":"x"}][{"id":901,"in_reply_to_id":1,"user":{"login":"slashit-fixture"},"body":"Fixed it.","created_at":"2026-01-01T00:00:00Z"}]"#,
+                );
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!((synced.replied, synced.discovered), (0, 1), "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 0);
+                assert_eq!(plan.items[0].reply_comment_id, Some(901), "{:?}", plan.items[0]);
+            }
+
+            /// An unreadable thread stops the reply: nothing is posted on a
+            /// guess, and the error is reported.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_unreadable_thread_posts_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) =
+                    delivered_unanswered_fix(&state, &repo, &worktree, tmp.path()).await;
+                let log = tmp.path().join("gh.log");
+                sync_gh(&claude, &log, "echo 777", "not json");
+
+                let (synced, plan) = sync_plan(&task, &worktree, plan).await.unwrap();
+                assert_eq!(synced.replied, 0, "{synced:?}");
+                assert!(!synced.errors.is_empty(), "{synced:?}");
+                assert_eq!(call_count(&log, "-X POST"), 0);
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
             }
 
             /// The authenticated login is what the `gh` in use reports for
@@ -27028,7 +27204,7 @@ mod tests {
             /// newer reply sits on the same thread, and never a comment that
             /// is not a reply.
             #[tokio::test(flavor = "multi_thread")]
-            async fn discovery_adopts_our_latest_reply_even_when_another_user_replied_later() {
+            async fn discovery_returns_only_our_replies_even_when_another_user_replied_later() {
                 let _guard = PATH_LOCK.lock().await;
                 let comments = r#"[
                     {"id":333,"body":"not a reply"},
@@ -27051,14 +27227,18 @@ mod tests {
                     ],
                 );
 
-                let found = discover_reply_comment_id("owner/repo", "42", 99, "slashit-fixture")
+                let own = discover_own_replies("owner/repo", "42", 99, "slashit-fixture")
                     .await
-                    .expect("discovery asks, it does not fail");
-                assert_eq!(found, Some(111), "another user's newer reply is not ours");
-                let caseless = discover_reply_comment_id("owner/repo", "42", 99, "SLaShIt-FiXtUrE")
+                    .expect("discovery reads the thread");
+                assert_eq!(
+                    own.iter().map(|r| r.id).collect::<Vec<_>>(),
+                    vec![111],
+                    "another user's reply is not ours"
+                );
+                let caseless = discover_own_replies("owner/repo", "42", 99, "SLaShIt-FiXtUrE")
                     .await
-                    .expect("discovery asks, it does not fail");
-                assert_eq!(caseless, Some(111), "the author check ignores ASCII case");
+                    .expect("discovery reads the thread");
+                assert_eq!(caseless.len(), 1, "the author check ignores ASCII case");
             }
 
             /// A reply written only by someone else is never adopted as ours.
@@ -27084,10 +27264,10 @@ mod tests {
                     ],
                 );
 
-                let found = discover_reply_comment_id("owner/repo", "42", 99, "slashit-fixture")
+                let own = discover_own_replies("owner/repo", "42", 99, "slashit-fixture")
                     .await
-                    .expect("discovery asks, it does not fail");
-                assert_eq!(found, None, "someone else's reply is not ours");
+                    .expect("discovery reads the thread");
+                assert!(own.is_empty(), "someone else's reply is not ours: {own:?}");
             }
 
             /// A candidate whose JSON carries no `user.login` is not a match.
@@ -27113,10 +27293,97 @@ mod tests {
                     ],
                 );
 
-                let found = discover_reply_comment_id("owner/repo", "42", 99, "slashit-fixture")
+                let own = discover_own_replies("owner/repo", "42", 99, "slashit-fixture")
                     .await
-                    .expect("discovery asks, it does not fail");
-                assert_eq!(found, None, "a reply with no known author is not ours");
+                    .expect("discovery reads the thread");
+                assert!(own.is_empty(), "a reply with no known author is not ours: {own:?}");
+            }
+
+            /// `gh api --paginate` prints one JSON array per page, back to back.
+            /// A matching reply on the second page is found, so Sync cannot
+            /// miss the delivery and post a duplicate.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discovery_reads_every_page_and_finds_a_reply_on_a_later_page() {
+                let _guard = PATH_LOCK.lock().await;
+                let pages = r#"[{"id":5,"in_reply_to_id":7,"user":{"login":"someone-else"},"body":"x"}][{"id":901,"in_reply_to_id":99,"user":{"login":"slashit-fixture"},"body":"Fixed it.","created_at":"2026-01-01T00:00:00Z"}]"#;
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[(
+                        "api --paginate repos/owner/repo/pulls/42/comments?per_page=100".to_string(),
+                        format!("printf '{pages}'"),
+                    )],
+                );
+
+                let own = discover_own_replies("owner/repo", "42", 99, "slashit-fixture")
+                    .await
+                    .expect("every page is read");
+                assert_eq!(
+                    classify_existing_reply(&own, "Fixed it."),
+                    ExistingReply::Matched(901),
+                    "{own:?}"
+                );
+            }
+
+            /// A page that cannot be read is an error, never an empty thread:
+            /// an empty answer would look like no reply and permit a POST.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discovery_fails_closed_on_an_unreadable_answer() {
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup_answering(
+                    "unused",
+                    "{}",
+                    &[(
+                        "api --paginate repos/owner/repo/pulls/42/comments?per_page=100".to_string(),
+                        "printf '[{\"id\":1'".to_string(),
+                    )],
+                );
+
+                assert!(discover_own_replies("owner/repo", "42", 99, "slashit-fixture")
+                    .await
+                    .is_err());
+            }
+
+            /// The exact approved text is required: other wording is `Differs`,
+            /// one exact copy is `Matched`, several are `Ambiguous`, and an
+            /// empty thread is `Absent`.
+            #[test]
+            fn an_existing_reply_is_matched_only_on_its_exact_body() {
+                let reply = |id: u64, body: &str, secs: i64| OwnReply {
+                    id,
+                    body: body.to_string(),
+                    created: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+                };
+                assert_eq!(classify_existing_reply(&[], "Fixed it."), ExistingReply::Absent);
+                assert_eq!(
+                    classify_existing_reply(&[reply(1, "I will investigate.", 10)], "Fixed it."),
+                    ExistingReply::Differs(vec![1]),
+                    "a different message is never adopted"
+                );
+                assert_eq!(
+                    classify_existing_reply(
+                        &[reply(1, "Fixed it. ", 10), reply(2, "Fixed it.", 20)],
+                        "Fixed it."
+                    ),
+                    ExistingReply::Matched(2),
+                    "trailing whitespace is a different body"
+                );
+                assert_eq!(
+                    classify_existing_reply(
+                        &[reply(1, "Fixed it.", 10), reply(2, "Fixed it.", 20)],
+                        "Fixed it."
+                    ),
+                    ExistingReply::Ambiguous(vec![2, 1]),
+                    "two copies cannot be told apart"
+                );
+                assert_eq!(
+                    classify_existing_reply(
+                        &[reply(1, "Other.", 10), reply(2, "Fixed it.", 20)],
+                        "Fixed it."
+                    ),
+                    ExistingReply::Matched(2),
+                    "an unrelated reply beside the exact one does not block it"
+                );
             }
 
             /// With no authenticated login, Sync adopts no reply: each item
