@@ -32,12 +32,17 @@ const POST: &str = "[data-testid=\"pr-review-post-replies\"]";
 const APPLY: &str = "[data-testid=\"pr-review-apply\"]";
 const ERROR: &str = "[data-testid=\"pr-review-error\"]";
 const CLOSE: &str = "[data-testid=\"pr-review-close\"]";
+const UNRECORDED: &str = "[data-testid=\"pr-review-unrecorded\"]";
+const UNRECORDED_ITEM: &str = "[data-testid=\"pr-review-unrecorded-item\"]";
 
-/// The five comments of the seeded review. Inline comments are answered in
+/// The six comments of the seeded review. Inline comments are answered in
 /// their own thread; the others are answered at PR level.
 const THREAD_RENAME: u64 = 1001;
 const THREAD_TEST: u64 = 1002;
 const THREAD_MESSAGE: u64 = 1003;
+/// A contributor's fix that an earlier Apply delivered. Re-analysis leaves a
+/// non-collaborator's approval unset, so the stored plan does not record it.
+const THREAD_RETRY: u64 = 1004;
 const PR_CHANGELOG: u64 = 900;
 const PR_DOCS: u64 = 901;
 
@@ -45,6 +50,8 @@ const RENAME_REPLY: &str = "Renamed the helper to say what it does.";
 const TEST_REPLY: &str = "Added the test for empty input.";
 const CHANGELOG_REPLY: &str = "Added a changelog entry under Unreleased.";
 const DOCS_REPLY: &str = "Updated the docs for the new flag.";
+const RETRY_REPLY: &str = "Bounded the retry loop at three attempts.";
+const RETRY_SUMMARY: &str = "Bound the retry loop";
 const MESSAGE_SUMMARY: &str = "Clarify the error message";
 /// Internal reasoning for the fix that has no public reply. It must never be
 /// shown as a reply or posted.
@@ -83,7 +90,12 @@ async fn journey(context: &TestContext) -> Result<()> {
     context.close_session(session, "review", &outcome).await?;
     outcome?;
 
-    // Launch three: nothing approved before the restart is carried over.
+    // Between launches, the stored plan records the approval of the contributor's
+    // fix, as Apply does. The journey cannot run Apply on this seeded plan (it has
+    // no checkout provenance), so the record is written directly.
+    record_apply_approval(&root, &executed.id, THREAD_RETRY)?;
+
+    // Launch three: the restart shows what the stored plan records, and nothing else.
     let session = context.start_session("reopened").await?;
     let outcome = reopened(session.driver(), &gh, &executed, &root).await;
     context.close_session(session, "reopened", &outcome).await?;
@@ -171,6 +183,9 @@ fn plan_json(pr_url: &str, commit: &str, effect: &Value) -> Value {
         }
         item
     };
+    // Delivered by an earlier Apply, but not approved in the stored plan.
+    let mut retry = item(THREAD_RETRY, RETRY_SUMMARY, "Internal: the loop has no limit.", Some(RETRY_REPLY), false);
+    retry["approved"] = json!(false);
     json!({
         "generated_at": "2026-11-16T10:00:00Z",
         "pr_url": pr_url,
@@ -179,6 +194,7 @@ fn plan_json(pr_url: &str, commit: &str, effect: &Value) -> Value {
             comment(THREAD_RENAME, "inline", "reviewer-one", "MEMBER", "Rename this helper.", Some(("src/lib.rs", 10))),
             comment(THREAD_TEST, "inline", "reviewer-one", "MEMBER", "Please add a test for empty input.", Some(("src/lib.rs", 20))),
             comment(THREAD_MESSAGE, "inline", "reviewer-two", "CONTRIBUTOR", "The error message is unclear.", Some(("src/lib.rs", 30))),
+            comment(THREAD_RETRY, "inline", "reviewer-three", "CONTRIBUTOR", "Please bound the retry loop.", Some(("src/lib.rs", 40))),
             comment(PR_CHANGELOG, "conversation", "reviewer-two", "CONTRIBUTOR", "Could you add a changelog entry?", None),
             comment(PR_DOCS, "conversation", "reviewer-two", "CONTRIBUTOR", "Please update the docs.", None),
         ],
@@ -186,6 +202,7 @@ fn plan_json(pr_url: &str, commit: &str, effect: &Value) -> Value {
             item(THREAD_RENAME, "Rename the helper", "Internal: the old name is misleading.", Some(RENAME_REPLY), false),
             item(THREAD_TEST, "Add the empty-input test", "Internal: the case is not covered yet.", Some(TEST_REPLY), false),
             item(THREAD_MESSAGE, MESSAGE_SUMMARY, MESSAGE_REASONING, None, false),
+            retry,
             item(PR_CHANGELOG, "Add a changelog entry", "Internal: the project keeps one.", Some(CHANGELOG_REPLY), false),
             item(PR_DOCS, "Update the docs", "Internal: the flag is documented elsewhere.", Some(DOCS_REPLY), true),
         ],
@@ -224,11 +241,16 @@ fn rev(directory: &Path, spec: &str) -> Result<String> {
 /// person makes move anything.
 async fn review(driver: &WebDriver, gh: &FakeGh, executed: &ExecutedTask, root: &Path) -> Result<()> {
     open_dialog(driver, executed).await?;
-    await_count(driver, ITEM, 5).await?;
+    await_count(driver, ITEM, 6).await?;
     for comment in [THREAD_RENAME, THREAD_TEST, THREAD_MESSAGE, PR_CHANGELOG, PR_DOCS] {
         if !is_checked(driver, &item_part(comment, ITEM_APPROVE)).await? {
             bail!("the approved fix for comment {comment} is shown unapproved");
         }
+    }
+    // The contributor's fix is delivered but not approved in the stored plan,
+    // so its checkbox starts unticked and no reply is offered for it.
+    if is_checked(driver, &item_part(THREAD_RETRY, ITEM_APPROVE)).await? {
+        bail!("the fix for comment {THREAD_RETRY} is shown approved, but the stored plan does not record it");
     }
     // Approved fixes offer their replies, every reply unchecked. The reasoning
     // for a fix with no public reply is never offered as one.
@@ -244,7 +266,7 @@ async fn review(driver: &WebDriver, gh: &FakeGh, executed: &ExecutedTask, root: 
             bail!("approving the fix for comment {comment} selected its reply");
         }
     }
-    if count(driver, &reply_part(THREAD_MESSAGE, REPLY)).await? != 0 {
+    if count(driver, &reply_row(THREAD_MESSAGE)).await? != 0 {
         bail!("the fix with no public reply is offered as a reply");
     }
     await_count(driver, NO_REPLY_ITEM, 1).await?;
@@ -320,7 +342,7 @@ async fn review(driver: &WebDriver, gh: &FakeGh, executed: &ExecutedTask, root: 
     if first[0].body != RENAME_REPLY || first[0].target != format!("POST repos/{REPOSITORY}/pulls/{PR_NUMBER}/comments/{THREAD_RENAME}/replies") {
         bail!("the first public write is {first:?}, not the one reply selected");
     }
-    await_count(driver, &reply_part(THREAD_RENAME, REPLY), 0).await?;
+    await_count(driver, &reply_row(THREAD_RENAME), 0).await?;
 
     // Posting one reply keeps the other approvals, which the stored plan holds.
     await_count(driver, REPLY, 3).await?;
@@ -357,7 +379,7 @@ async fn review(driver: &WebDriver, gh: &FakeGh, executed: &ExecutedTask, root: 
     if !second[1].body.ends_with(DOCS_REPLY) || second[1].body == DOCS_REPLY {
         bail!("the PR-level reply does not carry the naming line: {:?}", second[1].body);
     }
-    await_count(driver, &reply_part(PR_DOCS, REPLY), 0).await?;
+    await_count(driver, &reply_row(PR_DOCS), 0).await?;
 
     // Apply never publishes a reply, whatever happens to it. This plan has no
     // checkout provenance, so Apply refuses it before any edit or reply. It must
@@ -396,19 +418,74 @@ async fn review(driver: &WebDriver, gh: &FakeGh, executed: &ExecutedTask, root: 
     if gh.posts()?.len() != 2 {
         bail!("reopening the dialog posted a reply");
     }
+
+    // Ticking Approve for the contributor's fix changes only the browser. Its
+    // reply is not offered, Post stays disabled, and a forged Sync is refused.
+    click(driver, &item_part(THREAD_RETRY, ITEM_APPROVE), "the approval of the contributor's fix").await?;
+    if count(driver, &reply_row(THREAD_RETRY)).await? != 0 {
+        bail!("a fix ticked here but not recorded in the stored plan is offered a reply");
+    }
+    await_count(driver, UNRECORDED_ITEM, 1).await?;
+    let unrecorded = text_of(driver, UNRECORDED_ITEM).await?.unwrap_or_default();
+    if !unrecorded.contains(RETRY_SUMMARY) {
+        bail!("the fix whose approval is not recorded is not named: {unrecorded:?}");
+    }
+    // Post cannot select this reply, so the bypass is tested at the command boundary.
+    let refused = ui::invoke_expecting_refusal(
+        driver,
+        "sync_pr_review_replies",
+        json!({
+            "taskId": executed.id,
+            "approved": [{ "comment_id": THREAD_RETRY, "body": RETRY_REPLY, "accept_possible_duplicate": false }],
+        }),
+    )
+    .await?;
+    if !refused.contains("has no approved fix in the stored review plan") {
+        bail!("an unrecorded approval was refused for another reason: {refused}");
+    }
+    if gh.posts()?.len() != 2 {
+        bail!("an unrecorded approval posted a reply: {:?}", gh.posts()?);
+    }
+
+    // Closing discards the browser-only approval: reopening starts from the stored plan.
+    click(driver, CLOSE, "Close").await?;
+    await_gone(driver, MODAL, "the dialog after Close").await?;
+    open_dialog(driver, executed).await?;
+    await_count(driver, ITEM, 6).await?;
+    if is_checked(driver, &item_part(THREAD_RETRY, ITEM_APPROVE)).await? {
+        bail!("reopening the dialog kept an approval the stored plan does not record");
+    }
+    await_count(driver, UNRECORDED, 0).await?;
+    if count(driver, &reply_row(THREAD_RETRY)).await? != 0 {
+        bail!("reopening the dialog offers a reply for an approval the stored plan does not record");
+    }
+    if gh.posts()?.len() != 2 {
+        bail!("reopening the dialog posted a reply: {:?}", gh.posts()?);
+    }
     Ok(())
 }
 
-/// After a restart the dialog approves nothing by itself and posts nothing on
-/// open. The persisted plan records which replies were published and no others.
+/// After a restart the dialog shows what the stored plan records and nothing
+/// else: it selects nothing and posts nothing on open. A reply is offered once
+/// the stored plan records its approval, and it is posted only when selected.
+/// The persisted plan records which replies were published and no others.
 async fn reopened(driver: &WebDriver, gh: &FakeGh, executed: &ExecutedTask, root: &Path) -> Result<()> {
     open_dialog(driver, executed).await?;
-    await_count(driver, ITEM, 5).await?;
-    await_count(driver, REPLY, 2).await?;
-    for comment in [THREAD_TEST, PR_CHANGELOG] {
+    await_count(driver, ITEM, 6).await?;
+    // Pending: the two replies from the first launch, and the contributor's fix
+    // now that its approval is recorded.
+    await_count(driver, REPLY, 3).await?;
+    if !is_checked(driver, &item_part(THREAD_RETRY, ITEM_APPROVE)).await? {
+        bail!("the approval of comment {THREAD_RETRY} is not shown after the stored plan recorded it");
+    }
+    for comment in [THREAD_TEST, PR_CHANGELOG, THREAD_RETRY] {
         if is_checked(driver, &reply_part(comment, REPLY_SELECT)).await? {
             bail!("a restart selected the reply to comment {comment}");
         }
+    }
+    let shown = reply_text(driver, THREAD_RETRY).await?;
+    if shown != RETRY_REPLY {
+        bail!("the newly offered reply shows {shown:?}, not the text the fix wrote");
     }
     if !disabled(driver, POST).await? {
         bail!("Post is enabled after a restart with nothing selected");
@@ -416,6 +493,18 @@ async fn reopened(driver: &WebDriver, gh: &FakeGh, executed: &ExecutedTask, root
     if gh.posts()?.len() != 2 {
         bail!("a restart changed the public replies: {:?}", gh.posts()?);
     }
+
+    // The newly offered reply is posted only when selected, and with the text shown.
+    click(driver, &reply_part(THREAD_RETRY, REPLY_SELECT), "the selection of the recorded reply").await?;
+    await_text(driver, POST, |t| t.contains("Post 1 selected"), "the count of selected replies").await?;
+    click(driver, POST, "Post selected replies").await?;
+    await_posts(gh, 3).await?;
+    let third = gh.posts()?;
+    let target = format!("POST repos/{REPOSITORY}/pulls/{PR_NUMBER}/comments/{THREAD_RETRY}/replies");
+    if third[2].body != RETRY_REPLY || third[2].target != target {
+        bail!("the reply written after its approval was recorded is {:?}, not the text shown", third[2]);
+    }
+    await_count(driver, &reply_row(THREAD_RETRY), 0).await?;
     let plan = board_plan(root, &executed.id)?;
     let posted: Vec<(u64, bool)> = plan["items"]
         .as_array()
@@ -432,6 +521,7 @@ async fn reopened(driver: &WebDriver, gh: &FakeGh, executed: &ExecutedTask, root
         (THREAD_RENAME, true),
         (THREAD_TEST, false),
         (THREAD_MESSAGE, false),
+        (THREAD_RETRY, true),
         (PR_CHANGELOG, false),
         (PR_DOCS, true),
     ];
@@ -455,6 +545,35 @@ fn publishes(args: &[String]) -> bool {
     let is_comment = args.first().map(String::as_str) == Some("pr") && args.get(1).map(String::as_str) == Some("comment");
     let is_write = args.first().map(String::as_str) == Some("api") && args.iter().any(|a| a == "-X");
     is_comment || is_write
+}
+
+/// Records a person's approval of one fix in the stored plan, which is what Apply
+/// does when it runs that fix. Written while the app is closed, so the next
+/// launch loads it from the board.
+fn record_apply_approval(root: &Path, task_id: &str, comment: u64) -> Result<()> {
+    let file = board_holding(root, task_id)?;
+    let mut document: toml::Value = std::fs::read_to_string(&file)?.parse()?;
+    let task = document
+        .get_mut("tasks")
+        .and_then(toml::Value::as_array_mut)
+        .context("the board has no task list")?
+        .iter_mut()
+        .find(|t| t.get("id").and_then(toml::Value::as_str) == Some(task_id))
+        .context("the task is missing from its board")?;
+    let items = task
+        .get_mut("pr_review_plan")
+        .and_then(|plan| plan.get_mut("items"))
+        .and_then(toml::Value::as_array_mut)
+        .context("the stored plan has no items")?;
+    let item = items
+        .iter_mut()
+        .find(|i| i.get("comment_id").and_then(toml::Value::as_integer) == i64::try_from(comment).ok())
+        .context("the stored plan has no such item")?;
+    item.as_table_mut()
+        .context("the stored item is not a table")?
+        .insert("approved".to_string(), toml::Value::Boolean(true));
+    std::fs::write(&file, toml::to_string(&document)?)
+        .with_context(|| format!("could not write {}", file.display()))
 }
 
 fn board_plan(root: &Path, task_id: &str) -> Result<Value> {
@@ -499,6 +618,12 @@ fn item_part(comment: u64, part: &str) -> String {
 
 fn reply_part(comment: u64, part: &str) -> String {
     format!("{REPLY}[data-comment-id=\"{comment}\"] {part}")
+}
+
+/// The reply row of a comment. `reply_part(comment, REPLY)` would search inside
+/// the row for a row, and so could never find one.
+fn reply_row(comment: u64) -> String {
+    format!("{REPLY}[data-comment-id=\"{comment}\"]")
 }
 
 async fn reply_text(driver: &WebDriver, comment: u64) -> Result<String> {

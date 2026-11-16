@@ -1678,6 +1678,7 @@ pub async fn address_pr_review(
     plan.backfill_lifecycle_from_last_apply();
     // A dry run is the same flag that makes every provider call below
     // read-only and skips the commit, push and replies; anything else can edit.
+    let dry_run = options.dry_run;
     let (result, updated_plan) = address_pr_review_inner(
         task,
         working_dir,
@@ -1688,7 +1689,11 @@ pub async fn address_pr_review(
         crate::review_fix_residue::Ledger::of(&state),
     )
     .await?;
-    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
+    // A dry run is a preview. Saving its plan would persist the approvals the
+    // browser sent, which only a real Apply or Discuss may record.
+    if !dry_run {
+        save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
+    }
     Ok(result)
 }
 
@@ -3715,9 +3720,13 @@ where
                 && i.approved
                 && matches!(i.decision, PrReviewDecision::Fix)
         }) else {
+            // Apply and Discuss are the paths that record a fix approval; a box
+            // ticked in the dialog alone never reaches the stored plan, so
+            // reloading would not change the answer.
             return Err(format!(
-                "comment {} is not an approved fix in this plan. Nothing was posted; \
-                 reload the review and approve again.",
+                "comment {} has no approved fix in the stored review plan. Nothing was \
+                 posted. Ticking Approve in the dialog does not record the approval; Apply \
+                 records it, and the reply can be selected after that.",
                 reply.comment_id
             ));
         };
@@ -27517,7 +27526,9 @@ mod tests {
                     .await
                     .err()
                     .expect("an unapproved comment is refused");
-                assert!(err.contains("not an approved fix"), "{err}");
+                assert!(err.contains("has no approved fix in the stored review plan"), "{err}");
+                assert!(err.contains("Ticking Approve") && err.contains("Apply"), "{err}");
+                assert!(!err.contains("reload"), "{err}");
 
                 assert!(gh_writes(&log).is_empty(), "{:?}", gh_writes(&log));
                 assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);

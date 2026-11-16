@@ -192,6 +192,7 @@ pub fn Kanban(
     let show_pr_review_modal = RwSignal::new(false);
     let pr_review_task = RwSignal::new(None::<Task>);
     let pr_review_plan = RwSignal::new(None::<PrReviewPlan>);
+    let pr_review_recorded = RwSignal::new(Vec::<u64>::new());
     let pr_review_loading = RwSignal::new(false);
     let pr_review_applying = RwSignal::new(false);
     let pr_review_error = RwSignal::new(None::<String>);
@@ -465,6 +466,7 @@ pub fn Kanban(
         show: show_pr_review_modal,
         task: pr_review_task,
         plan: pr_review_plan,
+        recorded: pr_review_recorded,
         loading: pr_review_loading,
         error: pr_review_error,
         last_apply: pr_review_last_apply,
@@ -478,6 +480,7 @@ pub fn Kanban(
             spawn_local(async move {
                 match analyze_pr_comments(task.id.to_string()).await {
                     Ok(plan) => {
+                        pr_review_recorded.set(plan.approved_fix_ids());
                         pr_review_plan.set(Some(plan));
                         pr_review_error.set(None);
                     }
@@ -737,6 +740,7 @@ pub fn Kanban(
                 last_apply=pr_review_last_apply
                 item_status=pr_review_item_status
                 overall_progress=pr_review_overall
+                recorded=pr_review_recorded
                 set_tasks=set_tasks_signal
             />
 
@@ -1000,6 +1004,10 @@ struct PrReviewDialog {
     show: RwSignal<bool>,
     task: RwSignal<Option<Task>>,
     plan: RwSignal<Option<PrReviewPlan>>,
+    /// The Fix comments the stored plan approves, as the backend last returned
+    /// them. Replies are offered only for these, never for a checkbox ticked
+    /// since (see `PrReviewPlan::approved_fix_ids`).
+    recorded: RwSignal<Vec<u64>>,
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
     last_apply: RwSignal<Option<PrReviewApplyResult>>,
@@ -1034,6 +1042,7 @@ impl PrReviewDialog {
             // landed, so the badges would lie otherwise.
             let mut cached = task.pr_review_plan.clone().expect("checked above");
             cached.backfill_lifecycle_from_last_apply();
+            self.recorded.set(cached.approved_fix_ids());
             self.plan.set(Some(cached));
             self.loading.set(false);
             self.show.set(true);
@@ -1059,6 +1068,7 @@ fn PrReviewModal(
     last_apply: RwSignal<Option<PrReviewApplyResult>>,
     item_status: RwSignal<std::collections::HashMap<u64, PrItemStatus>>,
     overall_progress: RwSignal<Option<(usize, usize)>>,
+    recorded: RwSignal<Vec<u64>>,
     set_tasks: WriteSignal<Vec<Task>>,
 ) -> impl IntoView {
     let show_raw_comments = RwSignal::new(false);
@@ -1123,6 +1133,7 @@ fn PrReviewModal(
                 cached.backfill_lifecycle_from_last_apply();
                 last_apply.set(cached.last_apply.clone());
                 show_only_new.set(cached.last_apply.is_some());
+                recorded.set(cached.approved_fix_ids());
                 plan.set(Some(cached));
                 error.set(None);
                 return;
@@ -1136,6 +1147,7 @@ fn PrReviewModal(
                 Ok(mut p) => {
                     p.backfill_lifecycle_from_last_apply();
                     show_only_new.set(p.last_apply.is_some());
+                    recorded.set(p.approved_fix_ids());
                     plan.set(Some(p));
                     error.set(None);
                 }
@@ -1198,6 +1210,7 @@ fn PrReviewModal(
                     spawn_local(async move {
                         if let Ok(Some(updated)) = refresh_task_pr_state(task_id_inner).await {
                             if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
+                                recorded.set(refreshed_plan.approved_fix_ids());
                                 plan.set(Some(refreshed_plan));
                             }
                             set_tasks.update(|tasks| {
@@ -1231,6 +1244,7 @@ fn PrReviewModal(
         spawn_local(async move {
             match discuss_pr_review_questions(task_id, current_plan).await {
                 Ok(updated) => {
+                    recorded.set(updated.approved_fix_ids());
                     plan.set(Some(updated));
                     error.set(None);
                     toast::success("Agent re-evaluated the questions".to_string());
@@ -1252,12 +1266,7 @@ fn PrReviewModal(
     // makes the final check on whatever is approved here.
     let owed_replies = move || plan.get()
         .map(|p| p.items.iter()
-            .filter(|i| i.approved
-                && matches!(i.decision, PrReviewDecisionKind::Fix)
-                && i.fix_done
-                && !i.reply_posted
-                && i.fix_commit.is_some()
-                && !i.fix_uncommitted)
+            .filter(|i| recorded.with(|r| reply_offered(i, r)))
             .filter_map(|i| {
                 let id = i.comment_id?;
                 let body = slashit_review_content::public_reply(i.pr_reply_text.as_deref())?;
@@ -1282,6 +1291,15 @@ fn PrReviewModal(
                 && i.fix_done
                 && !i.reply_posted
                 && slashit_review_content::public_reply(i.pr_reply_text.as_deref()).is_none())
+            .map(|i| i.summary.clone())
+            .collect::<Vec<_>>())
+        .unwrap_or_default();
+    // Approved fixes whose reply is ready except for the approval record. The
+    // checkbox alone does not record it, so no reply is offered for them yet.
+    let replies_awaiting_record = move || plan.get()
+        .map(|p| p.items.iter()
+            .filter(|i| delivered_reply_fix(i)
+                && i.comment_id.is_some_and(|id| recorded.with(|r| !r.contains(&id))))
             .map(|i| i.summary.clone())
             .collect::<Vec<_>>())
         .unwrap_or_default();
@@ -1349,6 +1367,7 @@ fn PrReviewModal(
                     spawn_local(async move {
                         if let Ok(Some(updated)) = refresh_task_pr_state(task_id_inner).await {
                             if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
+                                recorded.set(refreshed_plan.approved_fix_ids());
                                 plan.set(Some(refreshed_plan));
                             }
                             set_tasks.update(|tasks| {
@@ -1686,6 +1705,19 @@ fn PrReviewModal(
                             </ul>
                         </section>
                     </Show>
+                    <Show when=move || !replies_awaiting_record().is_empty()>
+                        <section class="px-5 py-3 border-t border-white/10 space-y-2" aria-label="Approved fixes not yet recorded" data-testid="pr-review-unrecorded">
+                            <p class="text-xs font-semibold text-amber-200">"Approved here, but not recorded yet"</p>
+                            <p class="text-xs text-white/70">"These replies cannot be selected until the stored review plan records your approval. Ticking Approve here does not record it. Apply records it, and for a fix already on the PR branch it does not make the fix again."</p>
+                            <ul class="text-xs text-white/70 list-disc pl-5">
+                                <For
+                                    each=replies_awaiting_record
+                                    key=|s| s.clone()
+                                    children=move |s: String| view! { <li data-testid="pr-review-unrecorded-item">{s}</li> }
+                                />
+                            </ul>
+                        </section>
+                    </Show>
                     <div class=move || format!(
                         "flex items-center justify-between gap-3 px-5 py-3 border-t border-white/10 bg-white/[0.02] {}",
                         if busy() { "opacity-60" } else { "" },
@@ -1813,6 +1845,25 @@ fn approved_after_decision_change(
     approved: bool,
 ) -> bool {
     is_fix && (from_collaborator || (was_fix && approved))
+}
+
+/// An approved Fix whose public reply is ready to offer: the fix is delivered
+/// to the PR branch and the reply text is prepared. Whether the approval is
+/// recorded in the stored plan is checked by the caller.
+fn delivered_reply_fix(i: &PrReviewItem) -> bool {
+    i.approved
+        && matches!(i.decision, PrReviewDecisionKind::Fix)
+        && i.fix_done
+        && !i.reply_posted
+        && i.fix_commit.is_some()
+        && !i.fix_uncommitted
+        && slashit_review_content::public_reply(i.pr_reply_text.as_deref()).is_some()
+}
+
+/// Whether an approved Fix's reply may be selected: it is delivered and its
+/// approval is in `recorded`, the stored plan's approvals as last loaded.
+fn reply_offered(i: &PrReviewItem, recorded: &[u64]) -> bool {
+    delivered_reply_fix(i) && i.comment_id.is_some_and(|id| recorded.contains(&id))
 }
 
 /// Tooltip of the "Fix not delivered" badge, for a Fix whose change is not on
@@ -3158,7 +3209,9 @@ fn KanbanTaskCard(
 #[cfg(test)]
 mod tests {
     use super::approved_after_decision_change;
+    use super::{delivered_reply_fix, reply_offered};
     use super::next_card_id;
+    use crate::models::task::{PrReviewItem, PrReviewPlan};
     use super::{awaiting_delivery, offers_pr_sync};
     use super::PrReviewDialog;
     use crate::models::{HumanReviewDecision, HumanReviewEntry, Task, TaskStatus};
@@ -3173,6 +3226,7 @@ mod tests {
             show: RwSignal::new(false),
             task: RwSignal::new(None),
             plan: RwSignal::new(None),
+            recorded: RwSignal::new(Vec::new()),
             loading: RwSignal::new(false),
             error: RwSignal::new(None),
             last_apply: RwSignal::new(None),
@@ -3252,6 +3306,65 @@ mod tests {
             !dialog.auto_push.get_untracked(),
             "the cached-plan opening starts with Auto-push off"
         );
+    }
+
+    /// A plan item as the backend returns it; lifecycle fields start unset.
+    fn review_item(comment_id: u64, decision: &str, approved: bool) -> PrReviewItem {
+        serde_json::from_value(serde_json::json!({
+            "comment_id": comment_id, "summary": "s", "decision": decision,
+            "reasoning": "r", "proposed_change": "p", "approved": approved,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_reply_is_offered_only_for_an_approved_delivered_fix_with_text() {
+        let mut item = review_item(7, "fix", true);
+        item.fix_done = true;
+        item.fix_commit = Some("a".repeat(40));
+        item.pr_reply_text = Some("Renamed the helper.".to_string());
+        assert!(delivered_reply_fix(&item));
+
+        let unticked = PrReviewItem { approved: false, ..item.clone() };
+        assert!(!delivered_reply_fix(&unticked), "an unticked fix offers no reply");
+        let uncommitted = PrReviewItem { fix_uncommitted: true, ..item.clone() };
+        assert!(!delivered_reply_fix(&uncommitted), "a fix not yet on the branch offers no reply");
+        let undelivered = PrReviewItem { fix_commit: None, ..item.clone() };
+        assert!(!delivered_reply_fix(&undelivered));
+        let no_text = PrReviewItem { pr_reply_text: None, ..item.clone() };
+        assert!(!delivered_reply_fix(&no_text), "internal reasoning is never a reply");
+        let posted = PrReviewItem { reply_posted: true, ..item.clone() };
+        assert!(!delivered_reply_fix(&posted));
+    }
+
+    #[test]
+    fn a_delivered_reply_waits_for_its_approval_to_be_recorded() {
+        let mut item = review_item(7, "fix", true);
+        item.fix_done = true;
+        item.fix_commit = Some("a".repeat(40));
+        item.pr_reply_text = Some("Renamed the helper.".to_string());
+        assert!(!reply_offered(&item, &[]), "a browser-only tick is not offered");
+        assert!(reply_offered(&item, &[7]), "a recorded approval is offered");
+        assert!(!reply_offered(&item, &[8]), "another comment's approval does not offer this reply");
+    }
+
+    #[test]
+    fn the_recorded_approvals_are_the_approved_fixes_and_nothing_else() {
+        let mut plan: PrReviewPlan = serde_json::from_value(serde_json::json!({
+            "generated_at": "2026-01-01T00:00:00Z",
+            "pr_url": "https://github.com/BarraDev/slashit/pull/1",
+            "review_decision": null,
+            "comments": [],
+            "items": [],
+            "raw_plan": ""
+        }))
+        .unwrap();
+        plan.items = vec![
+            review_item(7, "fix", true),
+            review_item(8, "skip", true),
+            review_item(9, "fix", false),
+        ];
+        assert_eq!(plan.approved_fix_ids(), vec![7]);
     }
 
     fn column_task(id: u128, title: &str) -> Task {
