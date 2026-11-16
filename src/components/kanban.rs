@@ -1260,12 +1260,18 @@ fn PrReviewModal(
                 } else {
                     i.fix_commit.is_some() && !i.fix_uncommitted
                 }))
-            .filter_map(|i| i.comment_id.map(|id| (
-                id,
-                i.summary.clone(),
-                slashit_review_content::reply_body(i.pr_reply_text.as_deref(), &i.reasoning, &i.summary),
-                i.reply_uncertain,
-            )))
+            .filter_map(|i| i.comment_id.map(|id| {
+                let body = slashit_review_content::reply_body(i.pr_reply_text.as_deref(), &i.reasoning, &i.summary);
+                // The same text the backend publishes: a PR-level reply names its comment.
+                let mut same_id = p.comments.iter().filter(|c| c.id == Some(id));
+                let text = match (same_id.next(), same_id.next()) {
+                    (Some(c), None) if !matches!(c.kind, PrCommentKind::Inline) => {
+                        slashit_review_content::pr_level_reply_text(c.url.as_deref(), &c.author, &body)
+                    }
+                    _ => body,
+                };
+                (id, i.summary.clone(), text, i.reply_uncertain)
+            }))
             .collect::<Vec<_>>())
         .unwrap_or_default();
     // Replies the person selected, each with the text they saw when selecting

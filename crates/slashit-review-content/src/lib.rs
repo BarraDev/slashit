@@ -96,6 +96,17 @@ pub fn reply_body(pr_reply_text: Option<&str>, reasoning: &str, summary: &str) -
         .to_string()
 }
 
+/// The full text a reply to a PR-level comment publishes: a line naming the
+/// comment it answers, then the reply. A threaded reply publishes `reply_body`
+/// alone. Backend and frontend both use this, so the approval shows what is posted.
+pub fn pr_level_reply_text(comment_url: Option<&str>, author: &str, reply: &str) -> String {
+    let named = match comment_url {
+        Some(url) => format!("Re {url}"),
+        None => format!("Re the comment by @{author}"),
+    };
+    format!("{named}\n\n{reply}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +117,13 @@ mod tests {
         assert_eq!(reply_body(Some("  "), " why ", "what"), "why");
         assert_eq!(reply_body(None, "", " what "), "what");
         assert_eq!(reply_body(None, " ", " "), "");
+    }
+
+    #[test]
+    fn a_pr_level_reply_names_the_comment_it_answers() {
+        let url = "https://github.com/o/r/pull/1#issuecomment-9";
+        assert_eq!(pr_level_reply_text(Some(url), "rev", "fixed"), format!("Re {url}\n\nfixed"));
+        assert_eq!(pr_level_reply_text(None, "rev", "fixed"), "Re the comment by @rev\n\nfixed");
     }
 
     #[test]

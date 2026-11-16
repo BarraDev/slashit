@@ -3476,6 +3476,9 @@ pub async fn sync_pr_review_replies(
     approved: Vec<ApprovedPublicReply>,
 ) -> Result<SyncPrRepliesResult, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    // Held for the whole publication, so Apply, Analyze and another Sync cannot
+    // overlap it, and the plan read below is the plan this call updates.
+    let _lease = state.task_lifecycle_locks.acquire(task_uuid).await?;
     // The checkout when the task still has one; the repository otherwise,
     // which holds the same remote-tracking refs and is only asked where the
     // pull request's branch is, never to run work.
@@ -3596,7 +3599,7 @@ where
                 reply.comment_id
             ));
         };
-        if build_reply_body(item) != reply.body {
+        if outgoing_reply_text(&updated_plan, item) != reply.body {
             return Err(format!(
                 "the reply to comment {} changed after you reviewed it. Nothing was posted; \
                  review the new text and approve it again.",
@@ -3718,18 +3721,14 @@ where
                         ));
                         continue;
                     }
-                    let original = item.comment_id.and_then(|id| updated_plan.comment_for(id));
-                    let Some(original) = original else {
+                    if item.comment_id.and_then(|id| updated_plan.comment_for(id)).is_none() {
                         errors.push(format!(
                             "comment {label}: the plan does not identify the comment this \
                              reply answers, so nothing was posted. Re-analyze the PR comments."
                         ));
                         continue;
-                    };
-                    let named = match original.url.as_deref() {
-                        Some(url) => format!("Re {url}"),
-                        None => format!("Re the comment by @{}", original.author),
-                    };
+                    }
+                    let outgoing = outgoing_reply_text(&updated_plan, &item);
                     // Recorded as uncertain before the POST: if the process
                     // dies after the POST, the saved record still holds the
                     // reply. If the record cannot be saved, nothing is posted.
@@ -3741,7 +3740,7 @@ where
                         ));
                         continue;
                     }
-                    post_pr_reply(&repo, &number, None, &format!("{named}\n\n{body}")).await
+                    post_pr_reply(&repo, &number, None, &outgoing).await
                 }
             };
             match posted {
@@ -4958,6 +4957,23 @@ fn build_reply_body(item: &PrReviewItem) -> String {
         &item.reasoning,
         &item.summary,
     )
+}
+
+/// The exact text Sync publishes for an item, and the text the person approves:
+/// a PR-level reply carries the line that names its comment, a threaded one
+/// does not.
+fn outgoing_reply_text(plan: &PrReviewPlan, item: &PrReviewItem) -> String {
+    let body = build_reply_body(item);
+    match item.comment_id.and_then(|id| plan.comment_for(id)) {
+        Some(comment) if plan.inline_reply_target(item.comment_id).is_none() => {
+            slashit_review_content::pr_level_reply_text(
+                comment.url.as_deref(),
+                &comment.author,
+                &body,
+            )
+        }
+        _ => body,
+    }
 }
 
 /// Posts a reply on the PR. Returns the GitHub comment ID of the created
@@ -26614,7 +26630,7 @@ mod tests {
                     .filter_map(|i| {
                         i.comment_id.map(|comment_id| ApprovedPublicReply {
                             comment_id,
-                            body: build_reply_body(i),
+                            body: outgoing_reply_text(plan, i),
                             accept_possible_duplicate: i.reply_uncertain,
                         })
                     })
@@ -27199,7 +27215,7 @@ mod tests {
                     |_| {},
                 )
                 .await;
-                let shown = build_reply_body(&plan.items[0]);
+                let shown = outgoing_reply_text(&plan, &plan.items[0]);
                 let approved = vec![ApprovedPublicReply {
                     comment_id: 1,
                     body: shown.clone(),
@@ -27256,7 +27272,7 @@ mod tests {
 
                 let unknown = vec![ApprovedPublicReply {
                     comment_id: 999,
-                    body: build_reply_body(&plan.items[0]),
+                    body: outgoing_reply_text(&plan, &plan.items[0]),
                     accept_possible_duplicate: false,
                 }];
                 let err = sync_pr_review_replies_inner(task.clone(), dir.clone(), plan.clone(), &unknown)
@@ -27325,7 +27341,7 @@ mod tests {
                 let dir = worktree.to_str().unwrap().to_string();
                 let approved = vec![ApprovedPublicReply {
                     comment_id: 1,
-                    body: build_reply_body(&plan.items[0]),
+                    body: outgoing_reply_text(&plan, &plan.items[0]),
                     accept_possible_duplicate: false,
                 }];
 
@@ -27372,7 +27388,7 @@ mod tests {
                 );
                 write_executable(&claude.gh, &script);
                 let dir = worktree.to_str().unwrap().to_string();
-                let body = build_reply_body(&plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]);
                 let plain = vec![ApprovedPublicReply { comment_id: 1, body: body.clone(), accept_possible_duplicate: false }];
                 let accepted = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: true }];
 
@@ -27455,7 +27471,7 @@ mod tests {
                     |_| {},
                 )
                 .await;
-                let body = build_reply_body(&plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]);
                 let approved = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: false }];
                 let dir = worktree.to_str().unwrap().to_string();
 
@@ -27494,7 +27510,7 @@ mod tests {
                 )
                 .await;
                 let dir = worktree.to_str().unwrap().to_string();
-                let body = build_reply_body(&plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]);
                 let plain = vec![ApprovedPublicReply { comment_id: 1, body: body.clone(), accept_possible_duplicate: false }];
                 let stored: Stored = Default::default();
 
@@ -27558,7 +27574,7 @@ mod tests {
                 );
                 write_executable(&claude.gh, &script);
                 let dir = worktree.to_str().unwrap().to_string();
-                let body = build_reply_body(&plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]);
                 let plain = vec![ApprovedPublicReply { comment_id: 1, body: body.clone(), accept_possible_duplicate: false }];
                 let stored: Stored = Default::default();
 
@@ -27617,7 +27633,7 @@ mod tests {
                 )
                 .await;
                 let dir = worktree.to_str().unwrap().to_string();
-                let body = build_reply_body(&plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]);
                 let plain = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: false }];
                 let stored: Stored = Default::default();
                 let saves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -27655,7 +27671,7 @@ mod tests {
                 )
                 .await;
                 let dir = worktree.to_str().unwrap().to_string();
-                let body = build_reply_body(&plan.items[0]);
+                let body = outgoing_reply_text(&plan, &plan.items[0]);
                 let plain = vec![ApprovedPublicReply { comment_id: 1, body, accept_possible_duplicate: false }];
                 let stored: Stored = Default::default();
 
@@ -27670,6 +27686,49 @@ mod tests {
                 assert!(saved.items[0].reply_posted && !saved.items[0].reply_uncertain, "{:?}", saved.items[0]);
                 assert!(saved.items[0].pr_reply_text.is_some(), "{:?}", saved.items[0]);
                 assert_eq!(call_count(&log, "pr comment"), 1);
+            }
+
+            /// R2: the approval of a PR-level reply is the full text Sync posts,
+            /// including the line that names the comment. The bare reply is refused,
+            /// and the approved full text is what reaches GitHub.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_pr_level_approval_must_match_the_full_posted_text() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let claude = EditingClaude::install("");
+                let (state, _tmp) = build_test_state().await;
+                let url = "https://github.com/testorg/testrepo/pull/405#issuecomment-1";
+                let (task, plan, worktree, log) = delivered_fix_with_logging_gh(
+                    &claude,
+                    &state,
+                    &repo,
+                    vec![sync_comment(Some(1), PrCommentKind::Conversation, Some(url))],
+                    |_| {},
+                )
+                .await;
+                let dir = worktree.to_str().unwrap().to_string();
+                let bare = vec![ApprovedPublicReply {
+                    comment_id: 1,
+                    body: build_reply_body(&plan.items[0]),
+                    accept_possible_duplicate: false,
+                }];
+                assert!(
+                    sync_pr_review_replies_inner(task.clone(), dir.clone(), plan.clone(), &bare)
+                        .await
+                        .is_err(),
+                    "the bare reply is not what would be posted"
+                );
+                assert_eq!(call_count(&log, "pr comment"), 0, "refused approval posts nothing");
+
+                let full = vec![ApprovedPublicReply {
+                    comment_id: 1,
+                    body: outgoing_reply_text(&plan, &plan.items[0]),
+                    accept_possible_duplicate: false,
+                }];
+                let (result, _) = sync_pr_review_replies_inner(task, dir, plan, &full).await.unwrap();
+                assert_eq!(result.replied, 1, "{result:?}");
+                let posted = std::fs::read_to_string(&log).unwrap_or_default();
+                assert!(posted.contains(&format!("Re {url}")), "the posted text names the comment: {posted}");
             }
 
             /// Sync refuses an approved fix whose comment has no id, before any
