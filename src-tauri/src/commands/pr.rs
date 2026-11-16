@@ -1729,11 +1729,18 @@ fn review_content(plan: &PrReviewPlan) -> PrReviewPlan {
         item.fix_commit = None;
         item.fix_effect = None;
         item.reply_posted = false;
+        item.reply_uncertain = false;
         item.last_agent_summary = None;
         item.last_error = None;
         item.reply_comment_id = None;
     }
     content
+}
+
+/// The reply state only Sync writes: whether a reply was posted, whether a
+/// PR-level POST may have landed, and the GitHub id of the reply.
+fn reply_record(item: &PrReviewItem) -> (bool, bool, Option<u64>) {
+    (item.reply_posted, item.reply_uncertain, item.reply_comment_id)
 }
 
 /// Why an approved fix has no comment this plan can act on.
@@ -1784,6 +1791,22 @@ fn stored_plan_for_apply<'a>(
             "The review plan being applied differs from the one stored for this Task in its \
              comments or fix instructions. Re-analyze the PR comments, then apply again. \
              Nothing was changed."
+                .to_string(),
+        );
+    }
+    // A reply Sync posted or recorded after this copy was loaded is not in the
+    // copy. Apply saves its whole plan at the end, so the stale copy would
+    // clear that record and offer the reply again. Refused before any work, so
+    // no fix or reply is lost by the refusal.
+    if sent
+        .items
+        .iter()
+        .zip(&stored.items)
+        .any(|(sent_item, stored_item)| reply_record(sent_item) != reply_record(stored_item))
+    {
+        return Err(
+            "A reply to this review was posted or recorded after this review plan was \
+             loaded. Reload the review, then apply again. Nothing was changed."
                 .to_string(),
         );
     }
@@ -3461,6 +3484,22 @@ pub struct ApprovedPublicReply {
     pub accept_possible_duplicate: bool,
 }
 
+/// Sync refuses while an Apply, Analyze, Discuss or PR side-effect flow owns
+/// the Task. Each of those saves the whole plan when it finishes, so a Sync
+/// that ran alongside one would have its reply record overwritten by that
+/// save. Called with the lifecycle lease held: a helper's registration is made
+/// under the same lease, so the answer is settled.
+fn refuse_sync_while_pr_helper_runs(state: &crate::AppState, task_id: Uuid) -> Result<(), String> {
+    match state.executor.get() {
+        Some(executor) if executor.pr_helper_owns(task_id) => Err(
+            "Another pull request operation is running for this Task. Nothing was posted; \
+             try again when it finishes."
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Publishes the replies the person approved, and nothing else. Apply never
 /// posts a reply; the owed replies are shown with their exact text, and only
 /// approved ones are posted, without invoking the agent and without pushing.
@@ -3479,6 +3518,7 @@ pub async fn sync_pr_review_replies(
     // Held for the whole publication, so Apply, Analyze and another Sync cannot
     // overlap it, and the plan read below is the plan this call updates.
     let _lease = state.task_lifecycle_locks.acquire(task_uuid).await?;
+    refuse_sync_while_pr_helper_runs(&state, task_uuid)?;
     // The checkout when the task still has one; the repository otherwise,
     // which holds the same remote-tracking refs and is only asked where the
     // pull request's branch is, never to run work.
@@ -10056,6 +10096,48 @@ mod tests {
             stored.pr_review_plan.as_ref().map(|p| p.raw_plan.as_str()),
             Some("v1")
         );
+    }
+
+    /// Sync records a reply after an Apply run has saved its fix, and a browser
+    /// copy taken before Sync is then refused. The plan is read back from disk,
+    /// as after a restart: the reply record and the fix's delivery state hold.
+    #[tokio::test]
+    async fn a_stale_apply_copy_cannot_clear_a_reply_sync_recorded() {
+        let (task, mut fixed) = crate::test_helpers::create_test_pr_review_setup();
+        let (task_id, project_id) = (task.id, task.project_id);
+        let (storage, _tmp) = review_plan_storage();
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+
+        fixed.items[1].fix_done = true;
+        fixed.items[1].fix_commit = Some("c0ffee1".to_string());
+        fixed.items[1].pr_reply_text = Some("Fixed.".to_string());
+        save_review_plan_on_task(&tasks, &storage, task_id, fixed.clone())
+            .await
+            .expect("apply saves its fix and draft");
+        // The browser takes its copy here, before Sync runs.
+        let browser_copy = fixed.clone();
+
+        let mut synced = fixed.clone();
+        synced.items[1].reply_posted = true;
+        synced.items[1].reply_comment_id = Some(77);
+        save_review_plan_on_task(&tasks, &storage, task_id, synced)
+            .await
+            .expect("sync records its reply");
+
+        // Restart: the in-memory map is discarded and the plan is read from disk.
+        drop(tasks);
+        let on_disk = storage
+            .load_project_tasks(project_id)
+            .expect("reload tasks")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .and_then(|t| t.pr_review_plan)
+            .expect("plan on disk");
+        let err = stored_plan_for_apply(Some(&on_disk), &browser_copy).unwrap_err();
+        assert!(err.contains("posted or recorded"), "{err}");
+        assert!(on_disk.items[1].reply_posted);
+        assert_eq!(on_disk.items[1].reply_comment_id, Some(77));
+        assert_eq!(on_disk.items[1].fix_commit.as_deref(), Some("c0ffee1"));
     }
 
     #[tokio::test]
@@ -21435,6 +21517,29 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
                 panic!("condition never became true within the poll budget");
+            }
+
+            /// Sync is refused while an Apply run owns the Task, so the Apply save
+            /// that ends that run cannot be overwritten, or overwrite a reply
+            /// record, from a Sync that overlapped it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_is_refused_while_an_apply_run_owns_the_task() {
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id = Uuid::new_v4();
+                let owner = match executor
+                    .try_begin_pr_helper(task_id, crate::queue::PrHelperPurpose::Editing)
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err(refusal) => panic!("the apply run is admitted: {refusal}"),
+                };
+                let refusal = refuse_sync_while_pr_helper_runs(&state, task_id)
+                    .expect_err("sync must not overlap the apply run");
+                assert!(refusal.contains("Nothing was posted"), "{refusal}");
+
+                drop(owner);
+                assert!(refuse_sync_while_pr_helper_runs(&state, task_id).is_ok());
             }
 
             /// RED (pre-unit): `run_claude_pr_helper` drew no admission
@@ -33300,10 +33405,28 @@ mod review_plan_provenance {
         sent.items[0].approved = false;
         sent.items[0].decision = PrReviewDecision::Skip;
         sent.items[1].fix_done = true;
-        sent.items[1].reply_posted = true;
         sent.items[1].last_error = Some("earlier failure".to_string());
         sent.last_apply = None;
         assert!(stored_plan_for_apply(task.pr_review_plan.as_ref(), &sent).is_ok());
+    }
+
+    #[test]
+    fn a_copy_that_lacks_a_reply_sync_recorded_is_refused() {
+        // Apply's draft is already in the copy, so Sync changes only the record.
+        let (_task, mut old) = analyzed_plan_with_items();
+        old.items[1].pr_reply_text = Some("Fixed in the new helper.".to_string());
+        let mut synced = old.clone();
+        synced.items[1].reply_posted = true;
+        synced.items[1].reply_comment_id = Some(77);
+        let err = stored_plan_for_apply(Some(&synced), &old).unwrap_err();
+        assert!(err.contains("posted or recorded"), "{err}");
+
+        let mut uncertain = old.clone();
+        uncertain.items[1].reply_uncertain = true;
+        let err = stored_plan_for_apply(Some(&uncertain), &old).unwrap_err();
+        assert!(err.contains("posted or recorded"), "{err}");
+
+        assert!(stored_plan_for_apply(Some(&synced), &synced.clone()).is_ok());
     }
 
     /// The command's pre-flight, with a fake `gh` answering the head read. A
