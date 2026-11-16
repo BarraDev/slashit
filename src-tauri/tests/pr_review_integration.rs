@@ -49,6 +49,36 @@ fn never_cancelled() -> tokio::sync::watch::Receiver<bool> {
     tokio::sync::watch::channel(false).1
 }
 
+/// Sync through the same persisting entry point the command uses, with a
+/// store that accepts every record. Whether a failed record stops the post is
+/// checked by the unit tests in `commands::pr`, not here.
+#[cfg(unix)]
+async fn sync_with_approvals(
+    task: slashit_ui_lib::domain::Task,
+    working_dir: String,
+    plan: PrReviewPlan,
+    approved: &[slashit_ui_lib::commands::pr::ApprovedPublicReply],
+) -> Result<(slashit_ui_lib::commands::pr::SyncPrRepliesResult, PrReviewPlan), String> {
+    slashit_ui_lib::commands::pr::sync_pr_review_replies_persisting(
+        task,
+        working_dir,
+        plan,
+        approved,
+        |_record| async { Ok(()) },
+    )
+    .await
+}
+
+/// The approval a person gives for one inline reply: the exact text shown.
+#[cfg(unix)]
+fn approve(comment_id: u64, body: &str) -> slashit_ui_lib::commands::pr::ApprovedPublicReply {
+    slashit_ui_lib::commands::pr::ApprovedPublicReply {
+        comment_id,
+        body: body.to_string(),
+        accept_possible_duplicate: false,
+    }
+}
+
 // PATH is process-global; serialize tests that mutate it.
 // `tokio::sync::Mutex` is await-safe so clippy doesn't flag the guard being
 // held across the async work inside each test.
@@ -336,7 +366,6 @@ async fn dry_run_invokes_claude_only_no_gh_no_push() {
 
     let opts = AddressPrReviewOptions {
         auto_push: true,   // must be ignored in dry-run
-        auto_reply: true,  // must be ignored in dry-run
         dry_run: true,
     };
 
@@ -395,14 +424,13 @@ async fn dry_run_invokes_claude_only_no_gh_no_push() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
+async fn full_apply_publishes_no_reply_and_leaves_it_for_sync() {
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("FIXED: item #0\nDONE");
     let (task, plan) = create_test_pr_review_setup();
 
     let opts = AddressPrReviewOptions {
         auto_push: true,
-        auto_reply: true,
         dry_run: false,
     };
 
@@ -429,27 +457,19 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
     assert_eq!(result.fixed_ids, vec![101]);
     assert_eq!(result.skipped_ids, vec![102]);
 
-    // gh should have been called once per approved Fix item (here, 1 fix).
-    // The mock returns ok on the inline `/replies` endpoint, so we expect
-    // exactly 1 invocation and no fallback to `pr comment`.
-    assert_eq!(
-        env.gh_invocations(),
-        1,
-        "gh should be called once per Fix item, got log:\n{}",
-        env.read_gh_log()
-    );
-    assert_eq!(result.replies_posted, 1);
+    // Apply publishes no reply. A reply goes out only through Sync, after the
+    // person approves its exact text, so no reply endpoint is reached here.
+    assert_eq!(result.replies_posted, 0);
     assert!(
         result.reply_errors.is_empty(),
         "no reply errors expected, got: {:?}",
         result.reply_errors
     );
-
-    // Verify the gh call hit the `/replies` endpoint with the right comment id.
+    assert!(!updated_plan.items[0].reply_posted, "Apply never records a reply as posted");
     let gh_log = env.read_gh_log();
     assert!(
-        gh_log.contains("repos/test-org/test-repo/pulls/42/comments/101/replies"),
-        "expected inline reply endpoint for comment 101, got:\n{}",
+        !gh_log.contains("/replies"),
+        "Apply reached a reply endpoint, got:\n{}",
         gh_log
     );
 
@@ -542,6 +562,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             fix_done: false,
             fix_uncommitted: false,
             reply_posted: false,
+            reply_uncertain: false,
             last_agent_summary: None,
             last_error: None,
             pr_reply_text: None,
@@ -560,6 +581,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             fix_done: false,
             fix_uncommitted: false,
             reply_posted: false,
+            reply_uncertain: false,
             last_agent_summary: None,
             last_error: None,
             pr_reply_text: None,
@@ -578,6 +600,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             fix_done: false,
             fix_uncommitted: false,
             reply_posted: false,
+            reply_uncertain: false,
             last_agent_summary: None,
             last_error: None,
             pr_reply_text: None,
@@ -699,7 +722,7 @@ async fn a_non_collaborator_fix_is_applied_only_after_the_user_approves_it() {
         .status()
         .expect("run git")
         .success());
-    let opts = AddressPrReviewOptions { auto_push: true, auto_reply: true, dry_run: false };
+    let opts = AddressPrReviewOptions { auto_push: true, dry_run: false };
     let ledger = env.ledger_for(&task);
     let err = address_pr_review_inner(
         task.clone(), env.working_dir_str(), merged.clone(), opts.clone(), no_progress(), never_cancelled(), ledger)
@@ -720,8 +743,11 @@ async fn a_non_collaborator_fix_is_applied_only_after_the_user_approves_it() {
     .expect("the approved fix is applied");
     assert_eq!(result.fixed_ids, vec![201]);
     assert_eq!(env.claude_invocations(), 2, "the apply agent ran once");
-    assert_eq!(result.replies_posted, 1, "auto-reply follows the approval");
-    assert!(env.read_gh_log().contains("pulls/42/comments/201/replies"));
+    assert_eq!(result.replies_posted, 0, "approving a fix publishes no reply");
+    assert!(
+        !env.read_gh_log().contains("/replies"),
+        "no reply endpoint was reached on approval"
+    );
 }
 
 #[cfg(unix)]
@@ -753,7 +779,6 @@ async fn empty_approved_set_returns_error_and_does_not_call_claude() {
 
     let opts = AddressPrReviewOptions {
         auto_push: false,
-        auto_reply: false,
         dry_run: false,
     };
 
@@ -813,6 +838,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             fix_done: false,
             fix_uncommitted: false,
             reply_posted: false,
+            reply_uncertain: false,
             last_agent_summary: None,
             last_error: None,
             pr_reply_text: None,
@@ -831,6 +857,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             fix_done: false,
             fix_uncommitted: false,
             reply_posted: false,
+            reply_uncertain: false,
             last_agent_summary: None,
             last_error: None,
             pr_reply_text: None,
@@ -868,7 +895,6 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
 
     let opts = AddressPrReviewOptions {
         auto_push: false,
-        auto_reply: false,
         dry_run: false,
     };
 
@@ -903,7 +929,7 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
     );
 
     // Progress events: 2 item_started, 2 item_succeeded, 1 all_done. No
-    // push/reply events because auto_push and auto_reply are false.
+    // push events because auto_push is false.
     let events = captured.lock().unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     assert_eq!(
@@ -923,8 +949,8 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pending() {
-    // Round 1: apply both items normally — both get fix_done + reply_posted.
+async fn rerunning_apply_does_not_make_a_delivered_fix_again() {
+    // Round 1: apply both items normally — both get fix_done, and no reply is posted.
     // Round 2: re-apply the SAME plan. Items should be detected as already
     // addressed; claude must not be invoked again and gh should not be called.
     let _guard = PATH_LOCK.lock().await;
@@ -933,7 +959,6 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
 
     let opts = AddressPrReviewOptions {
         auto_push: true,
-        auto_reply: true,
         dry_run: false,
     };
 
@@ -944,17 +969,17 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
             .await
             .expect("round 1 succeeds");
     assert_eq!(round1.fixed_ids, vec![301, 302]);
-    assert_eq!(round1.replies_posted, 2);
-    // Both items must be marked fix_done + reply_posted on the persisted plan.
+    assert_eq!(round1.replies_posted, 0, "Apply publishes no reply");
+    // Both fixes are recorded on the persisted plan; neither reply is posted.
     for it in plan_after_round1.items.iter().filter(|i| i.approved) {
         assert!(it.fix_done, "fix_done must be true after a successful round");
-        assert!(it.reply_posted, "reply_posted must be true after a successful reply");
+        assert!(!it.reply_posted, "Apply never marks a reply posted");
         assert!(it.last_agent_summary.is_some(), "summary must be cached on success");
     }
     let claude_calls_round1 = env.claude_invocations();
     let gh_calls_round1 = env.gh_invocations();
     assert_eq!(claude_calls_round1, 2, "round 1 should invoke claude per item");
-    assert_eq!(gh_calls_round1, 2, "round 1 should reply per item");
+    assert_eq!(gh_calls_round1, 0, "round 1 makes no gh call: Apply publishes no reply");
 
     // Round 2 — same task, the now-stamped plan
         let ledger = env.ledger_for(&task);
@@ -965,26 +990,20 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
     assert_eq!(env.claude_invocations(), claude_calls_round1,
         "round 2 must not call claude — both items already fix_done");
     assert_eq!(env.gh_invocations(), gh_calls_round1,
-        "round 2 must not call gh — both items already reply_posted");
+        "round 2 must not call gh: Apply publishes no reply");
     assert!(round2.fixed_ids.is_empty(), "no new fixes this round");
     assert_eq!(round2.replies_posted, 0);
-    assert!(
-        round2.agent_summary.contains("already addressed"),
-        "summary should call out skipped items, got: {}",
-        round2.agent_summary,
-    );
     for it in plan_after_round2.items.iter().filter(|i| i.approved) {
-        assert!(it.fix_done);
-        assert!(it.reply_posted);
+        assert!(it.fix_done, "a delivered fix stays delivered");
     }
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn rerunning_apply_with_only_replies_pending_skips_claude() {
-    // Manually stage a plan where item 1 has fix_done=true but reply_posted=false
-    // (the broken state we want to recover from). Re-applying should NOT call
-    // claude — only post the missing reply.
+async fn rerunning_apply_with_a_pending_reply_skips_claude_and_leaves_the_reply_to_sync() {
+    // A plan where item 0's fix is delivered but its reply was never posted.
+    // Re-applying must not call claude, and must not post the reply either: the
+    // reply waits for a person's approval through Sync.
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
     let (task, mut plan) = create_test_two_fix_setup();
@@ -997,39 +1016,50 @@ async fn rerunning_apply_with_only_replies_pending_skips_claude() {
     plan.items[0].fix_effect = Some(effect);
     plan.items[0].last_agent_summary = Some("prior round did the edit".to_string());
     plan.items[0].reply_posted = false;
+    plan.items[0].pr_reply_text = Some("Fixed in the new commit.".to_string());
     // Drop item 2 from approval so we focus on the reply-only path for item 1.
     plan.items[1].approved = false;
 
     let opts = AddressPrReviewOptions {
         auto_push: false,
-        auto_reply: true,
         dry_run: false,
     };
 
         let ledger = env.ledger_for(&task);
     let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
+        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
             .await
             .expect("recovery apply succeeds");
 
     assert_eq!(env.claude_invocations(), 0,
         "agent must not be invoked when the only pending step is a reply");
-    assert_eq!(env.gh_invocations(), 1, "exactly one gh call for the deferred reply");
+    assert_eq!(env.gh_invocations(), 0, "Apply posts no reply, deferred or not");
     assert!(result.fixed_ids.is_empty(), "no new fixes this round");
-    assert_eq!(result.replies_posted, 1);
-    assert!(updated_plan.items[0].reply_posted);
+    assert_eq!(result.replies_posted, 0);
+    assert!(!updated_plan.items[0].reply_posted, "the reply waits for approval");
     assert!(
         result.agent_summary.contains("fix already on disk"),
         "summary should note the reused fix, got: {}",
         result.agent_summary,
     );
+
+    // The person approves the exact text: Sync posts it, once.
+    let (synced, _) = sync_with_approvals(
+        task,
+        env.working_dir_str(),
+        updated_plan,
+        &[approve(301, "Fixed in the new commit.")],
+    )
+    .await
+    .expect("sync succeeds");
+    assert_eq!(synced.replied, 1, "{synced:?}");
+    assert_eq!(env.gh_invocations(), 1, "gh log:\n{}", env.read_gh_log());
+    assert!(env.read_gh_log().contains("pulls/42/comments/301/replies"));
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
-    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
-
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
     let (task, mut plan) = create_test_two_fix_setup();
@@ -1049,10 +1079,16 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
     plan.items[1].pr_reply_text = Some("already replied with the new format".to_string());
 
     let _ = env.working_dir_str(); // unused but keeps the mock PATH active
+    plan.items[0].pr_reply_text = Some("Fixed in the new commit.".to_string());
 
-    let (result, updated_plan) =
-        sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await
-            .expect("sync succeeds");
+    let (result, updated_plan) = sync_with_approvals(
+        task,
+        env.working_dir_str(),
+        plan,
+        &[approve(301, "Fixed in the new commit.")],
+    )
+    .await
+    .expect("sync succeeds");
 
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
     let gh_log = env.read_gh_log();
@@ -1063,7 +1099,6 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
     assert_eq!(env.gh_invocations(), 1, "sync should reply exactly once (only item 0)");
     assert_eq!(result.replied, 1);
     assert_eq!(result.discovered, 0);
-    assert_eq!(result.rewritten, 0);
     assert_eq!(result.unmatched, 0);
     assert_eq!(result.fix_pending, 0);
     assert!(result.errors.is_empty());
@@ -1073,9 +1108,7 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn sync_pr_review_replies_discovers_and_rewrites_a_legacy_reply() {
-    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
-
+async fn sync_pr_review_replies_discovers_a_legacy_reply_and_never_rewrites_it() {
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
     // Override the default mock `gh` with one that answers the calls this
@@ -1092,7 +1125,7 @@ async fn sync_pr_review_replies_discovers_and_rewrites_a_legacy_reply() {
     let (task, mut plan) = create_test_two_fix_setup();
     // Item 0 (comment 301): fixed, a reply was posted before `reply_comment_id`
     // was tracked (legacy `[SlashIt agent —]`-style reply) — no id, no
-    // `pr_reply_text`. Must be discovered via `in_reply_to_id`, then rewritten.
+    // `pr_reply_text`. Its id must be discovered via `in_reply_to_id`; it is never rewritten.
     plan.items[0].fix_done = true;
     plan.items[0].reply_posted = true;
     plan.items[0].reply_comment_id = None;
@@ -1100,28 +1133,33 @@ async fn sync_pr_review_replies_discovers_and_rewrites_a_legacy_reply() {
     // Item 1: leave fix_pending so it doesn't add noise to the gh call count.
 
     let (result, updated_plan) =
-        sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await
+        sync_with_approvals(task, env.working_dir_str(), plan, &[]).await
             .expect("sync succeeds");
 
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
     assert_eq!(result.discovered, 1, "the legacy reply's id should be discovered via in_reply_to_id");
-    assert_eq!(result.rewritten, 1, "the discovered reply should be rewritten to the current body");
-    assert_eq!(result.replied, 0);
+    assert_eq!(result.replied, 0, "nothing was approved, so nothing is posted");
     assert_eq!(result.unmatched, 0);
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     assert_eq!(
         updated_plan.items[0].reply_comment_id,
         Some(9001),
-        "discovered id must be persisted so a future sync can PATCH directly"
+        "the discovered id is persisted, so the reply is never looked up again"
     );
-    assert!(updated_plan.items[0].pr_reply_text.is_some(), "rewrite records the body it wrote");
+    assert!(
+        !env.read_gh_log().lines().any(|l| l == "PATCH"),
+        "a legacy reply is never rewritten: gh log:\n{}",
+        env.read_gh_log()
+    );
+    assert!(
+        updated_plan.items[0].pr_reply_text.is_none(),
+        "no body is recorded for a reply that was not rewritten"
+    );
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_pr_review_replies_adopts_no_reply_written_by_a_different_account() {
-    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
-
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
     // The account is verified (`gh api user` works), but the reply on the
@@ -1141,13 +1179,12 @@ async fn sync_pr_review_replies_adopts_no_reply_written_by_a_different_account()
     plan.items[0].pr_reply_text = None;
 
     let (result, updated_plan) =
-        sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await
+        sync_with_approvals(task, env.working_dir_str(), plan, &[]).await
             .expect("sync succeeds");
 
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
     assert_eq!(result.discovered, 0, "no reply by another account is ours to adopt");
     assert_eq!(result.unmatched, 1, "the item's own reply stays unaccounted for");
-    assert_eq!(result.rewritten, 0, "nothing was rewritten on somebody else's reply");
     assert_eq!(result.replied, 0);
     assert_eq!(env.gh_invocations(), 0, "no POST and no PATCH reached GitHub");
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
@@ -1158,8 +1195,6 @@ async fn sync_pr_review_replies_adopts_no_reply_written_by_a_different_account()
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_pr_review_replies_posts_no_reply_the_account_cannot_verify() {
-    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
-
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
     // The posting account cannot be verified: `gh api user` fails. With no
@@ -1178,10 +1213,17 @@ async fn sync_pr_review_replies_posts_no_reply_the_account_cannot_verify() {
     plan.items[0].fix_commit = Some(commit);
     plan.items[0].fix_effect = Some(effect);
     plan.items[0].reply_posted = false;
+    // The person has approved the reply, so only the unverified account stops it.
+    plan.items[0].pr_reply_text = Some("Fixed in the new commit.".to_string());
 
-    let (result, updated_plan) =
-        sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await
-            .expect("sync succeeds");
+    let (result, updated_plan) = sync_with_approvals(
+        task,
+        env.working_dir_str(),
+        plan,
+        &[approve(301, "Fixed in the new commit.")],
+    )
+    .await
+    .expect("sync succeeds");
 
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
     assert_eq!(result.replied, 0, "no reply was posted without a verified account");
@@ -1193,14 +1235,12 @@ async fn sync_pr_review_replies_posts_no_reply_the_account_cannot_verify() {
         result.errors[0],
     );
     assert!(!updated_plan.items[0].reply_posted, "nothing was marked posted");
-    assert!(updated_plan.items[0].pr_reply_text.is_none(), "no body was recorded");
+    assert_eq!(updated_plan.items[0].reply_comment_id, None, "no reply id was recorded");
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
-    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
-
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
     let (task, plan) = create_test_two_fix_setup();
@@ -1208,13 +1248,36 @@ async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
     // them as fix_pending without touching gh.
 
     let (result, _plan) =
-        sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await
+        sync_with_approvals(task, env.working_dir_str(), plan, &[]).await
             .expect("sync succeeds");
     assert_eq!(env.gh_invocations(), 0, "no replies posted when nothing is fix_done");
     assert_eq!(result.replied, 0);
     assert_eq!(result.fix_pending, 2);
     assert_eq!(result.discovered, 0);
-    assert_eq!(result.rewritten, 0);
+}
+
+/// A delivered fix whose reply the person has not approved is not posted: Sync
+/// publishes only the exact text it was given an approval for.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_posts_nothing_the_person_did_not_approve() {
+    let _guard = PATH_LOCK.lock().await;
+    let env = MockEnv::setup("not used");
+    let (task, mut plan) = create_test_two_fix_setup();
+    plan.items[0].fix_done = true;
+    let (commit, effect) = env.deliver_fix("fix-a.txt");
+    plan.items[0].fix_commit = Some(commit);
+    plan.items[0].fix_effect = Some(effect);
+    plan.items[0].pr_reply_text = Some("Fixed in the new commit.".to_string());
+
+    let (result, updated_plan) = sync_with_approvals(task, env.working_dir_str(), plan, &[])
+        .await
+        .expect("sync succeeds");
+
+    assert_eq!(result.replied, 0, "{result:?}");
+    assert_eq!(result.awaiting_approval, 1, "{result:?}");
+    assert!(!env.read_gh_log().contains("/replies"), "gh log:\n{}", env.read_gh_log());
+    assert!(!updated_plan.items[0].reply_posted, "nothing was marked posted");
 }
 
 /// A fix committed but not on `origin` has not reached the pull request, so
@@ -1223,8 +1286,6 @@ async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unpushed_fix_gets_no_reply_from_apply_or_sync() {
-    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
-
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("FIXED: item #0\nDONE");
     let status = std::process::Command::new("git")
@@ -1234,7 +1295,7 @@ async fn an_unpushed_fix_gets_no_reply_from_apply_or_sync() {
         .expect("run git");
     assert!(status.success());
     let (task, plan) = create_test_pr_review_setup();
-    let opts = AddressPrReviewOptions { auto_push: false, auto_reply: true, dry_run: false };
+    let opts = AddressPrReviewOptions { auto_push: false, dry_run: false };
 
         let ledger = env.ledger_for(&task);
     let (result, mut plan) =
@@ -1248,7 +1309,7 @@ async fn an_unpushed_fix_gets_no_reply_from_apply_or_sync() {
 
     plan.backfill_lifecycle_from_last_apply();
     assert!(!plan.items[0].reply_posted, "the backfill does not invent the reply");
-    let (synced, _plan) = sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await.expect("sync succeeds");
+    let (synced, _plan) = sync_with_approvals(task, env.working_dir_str(), plan, &[]).await.expect("sync succeeds");
     assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
     assert_eq!(env.gh_invocations(), 0, "gh log:\n{}", env.read_gh_log());
 }
@@ -1444,7 +1505,7 @@ async fn apply_reruns_the_fix_for_a_comment_edited_after_the_apply_that_fixed_it
     plan.comments[0].updated_at = Some(applied_at + chrono::Duration::seconds(60));
     // What `address_pr_review` does before every apply.
     plan.backfill_lifecycle_from_last_apply();
-    let opts = AddressPrReviewOptions { auto_push: false, auto_reply: false, dry_run: false };
+    let opts = AddressPrReviewOptions { auto_push: false, dry_run: false };
 
         let ledger = env.ledger_for(&task);
     let (result, _plan) =
