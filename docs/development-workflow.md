@@ -1308,8 +1308,11 @@ Three build modes exist. They do not share a binary path:
   the promoted CLI's `cli_sha256`, and for JJ the `change` id. A Git checkout
   (colocated JJ included) uses `git rev-parse HEAD`, so a detached HEAD works
   and a branch name is never an identity. A JJ-only workspace, which has no
-  `.git`, uses the commit id of `@` after JJ's working-copy snapshot; `dirty`
-  means `@` is not empty. A build whose source has no commit identity (an unborn
+  `.git`, records the commit id of `@-`, the checkpoint that the empty working-copy
+  commit `@` sits on, after JJ's working-copy snapshot. The `@` commit id changes
+  at the next edit or describe, so it is not the recorded identity: an operator
+  who adopts or checks such a build names `@-`. `dirty` means `@` is not empty. A
+  build whose source has no commit identity (an unborn
   HEAD, no VCS, a failing or conflicted `jj`) is refused before it starts; there
   is no `unknown` or HEAD fallback. A dirty source is refused too: uncommitted
   Git changes, or a non-empty JJ `@`. Commit the Git change, or describe the JJ
