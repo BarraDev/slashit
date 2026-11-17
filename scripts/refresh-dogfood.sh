@@ -91,10 +91,10 @@ running_commit=
 # Exit 4 is an environment mismatch: the instance is running but must not be trusted.
 if [ "$st" -eq 3 ] || [ "$st" -eq 4 ]; then
   running=unverifiable
-elif printf '%s\n' "$status_out" | grep -q '^instance: *running'; then
+elif grep -q '^instance: *running' <<<"$status_out"; then
   running=running
   running_commit=$(printf '%s\n' "$status_out" | awk '/^commit:/ { print $2; exit }')
-elif printf '%s\n' "$status_out" | grep -q '^instance: *stopped'; then
+elif grep -q '^instance: *stopped' <<<"$status_out"; then
   running=stopped
 fi
 

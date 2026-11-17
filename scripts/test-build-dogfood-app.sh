@@ -250,15 +250,15 @@ if [ "$st" -ne 0 ] && [[ "$out" == *"changed during the build"* ]] && [[ "$out" 
   ok "an untracked file created during the build is refused; the promoted pair and previous build are unchanged"
 else bad "a file created during the build was not refused cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
 
-# 10. A tracked file that was already dirty and is edited again during the build:
-#     HEAD and the porcelain status are unchanged, only the content digest moves.
+# 10. A dirty source is refused before anything is built or promoted: a verified
+#     build must name a commit that holds exactly what was built.
 echo dirty >"$main/f2"; git -C "$main" add f2; git -C "$main" commit -qm f2; echo dirty-before >>"$main/f2"
-out=$(main_build STUB_BUILD_ID=dirty-ok); st=$?
-if [ "$st" -eq 0 ] && grep -qx 'dirty=yes' "$main/target/dogfood/slashit-ui.frontend" &&
-  grep -qE '^source_digest=[0-9a-f]{64}$' "$main/target/dogfood/slashit-ui.frontend" &&
-  grep -qx "cli_sha256=$(sha256sum "$main/target/dogfood/slashit" | cut -d' ' -f1)" "$main/target/dogfood/slashit-ui.frontend"; then
-  ok "a dirty build records dirty=yes, the source digest and the CLI's sha256"
-else bad "dirty build provenance is wrong (exit $st)"; printf '%s\n' "$out" >&2; fi
+before=$(dog_sums)
+out=$(main_build STUB_BUILD_ID=dirty-refused); st=$?
+if [ "$st" -ne 0 ] && [[ "$out" == *"uncommitted changes"* ]] && [ "$(dog_sums)" = "$before" ]; then
+  ok "a dirty source is refused before any build; the promoted pair is unchanged"
+else bad "a dirty source was not refused cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
+git -C "$main" checkout -q -- f2
 before=$(dog_sums)
 out=$(main_build STUB_BUILD_ID=edited STUB_EDIT_DURING=f2); st=$?
 if [ "$st" -ne 0 ] && [[ "$out" == *"changed during the build"* ]] && [ "$(dog_sums)" = "$before" ]; then
@@ -346,33 +346,35 @@ else
   (cd "$jjm" && jj --quiet git init --no-colocate . && jj --quiet commit -m base) || bad "JJ fixture: init failed"
   jj_build() { (cd "${JJ_DIR:-$jjm}" && env PATH="$work/bin:$PATH" "$@" bash scripts/build-dogfood-app.sh) 2>&1; }
   jjid() { (cd "${JJ_DIR:-$jjm}" && jj log -r @ --no-graph -T "$1"); }
+  jjparent() { (cd "${JJ_DIR:-$jjm}" && jj log -r @- --no-graph -T commit_id); }
   jj_dog_sums() { (cd "$jjm/target/dogfood" && sha256sum slashit-ui slashit slashit-ui.frontend 2>&1); }
 
   # 15. The case the old script got wrong: no .git, so it recorded commit=unknown.
   jjside=$jjm/target/dogfood/slashit-ui.frontend
   out=$(jj_build STUB_BUILD_ID=jj-clean); st=$?
-  jj_commit=$(jjid commit_id); jj_change=$(jjid change_id)
+  jj_commit=$(jjparent); jj_change=$(jjid change_id)
   if [ ! -e "$jjm/.git" ] && [ "$st" -eq 0 ] && grep -qx "commit=$jj_commit" "$jjside" && grep -qx "change=$jj_change" "$jjside" &&
     grep -qx 'vcs=jj' "$jjside" && grep -qx 'dirty=no' "$jjside" && ! grep -q unknown "$jjside" &&
     grep -qx "sha256=$(sha256sum "$jjm/target/dogfood/slashit-ui" | cut -d' ' -f1)" "$jjside"; then
     ok "a JJ-only build records the concrete commit id and the change id, never unknown"
   else bad "JJ-only identity is wrong (exit $st)"; printf '%s\n' "$out" >&2; cat "$jjside" >&2; fi
-  clean_digest=$(sed -n 's/^source_digest=//p' "$jjside")
 
-  # 16. Uncommitted work is dirty=yes, changes the commit id and the digest.
+  # 16. Uncommitted work in a JJ working copy is refused before anything is built.
   echo wip >"$jjm/wip.txt"
+  before=$(jj_dog_sums)
   out=$(jj_build STUB_BUILD_ID=jj-dirty); st=$?
-  if [ "$st" -eq 0 ] && grep -qx 'dirty=yes' "$jjside" && grep -qx "commit=$(jjid commit_id)" "$jjside" &&
-    [ "$(sed -n 's/^source_digest=//p' "$jjside")" != "$clean_digest" ] && ! grep -qx "commit=$jj_commit" "$jjside"; then
-    ok "a JJ working copy with uncommitted files is recorded dirty with a different commit id and digest"
-  else bad "JJ dirty build provenance is wrong (exit $st)"; printf '%s\n' "$out" >&2; cat "$jjside" >&2; fi
+  if [ "$st" -ne 0 ] && [[ "$out" == *"uncommitted changes"* ]] && [ "$(jj_dog_sums)" = "$before" ]; then
+    ok "a JJ working copy with uncommitted files is refused before any build; the promoted pair is unchanged"
+  else bad "a dirty JJ working copy was not refused cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
+  rm -f "$jjm/wip.txt"
 
-  # 17. Edits during the build (a new file, then an edit of an already-dirty one) are refused.
+  # 17. Edits during the build (a new file, then a file created during the build) are refused.
   before=$(jj_dog_sums)
   out=$(jj_build STUB_BUILD_ID=jj-edit STUB_EDIT_DURING=wip.txt); st=$?
   if [ "$st" -ne 0 ] && [[ "$out" == *"changed during the build"* ]] && [ "$(jj_dog_sums)" = "$before" ]; then
-    ok "an edit to a dirty file during a JJ build is refused; the promoted pair is unchanged"
+    ok "an edit to the tree during a JJ build is refused; the promoted pair is unchanged"
   else bad "JJ edit during the build was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+  rm -f "$jjm/wip.txt"
   out=$(jj_build STUB_BUILD_ID=jj-touch STUB_TOUCH_DURING=1); st=$?
   if [ "$st" -ne 0 ] && [[ "$out" == *"changed during the build"* ]] && [[ "$out" == *"during-build.txt"* ]] && [ "$(jj_dog_sums)" = "$before" ]; then
     ok "a file created during a JJ build is refused; the promoted pair is unchanged"
@@ -394,7 +396,7 @@ else
   else bad "linked JJ workspace did not contend the primary's lock (exit $st)"; printf '%s\n' "$out" >&2; fi
   : >"$hold/go"; wait "$jj_first"
   out=$(JJ_DIR=$jjl jj_build STUB_BUILD_ID=jj-linked); st=$?
-  if [ "$st" -eq 0 ] && [ ! -e "$jjl/target/dogfood" ] && grep -qx "commit=$(JJ_DIR=$jjl jjid commit_id)" "$jjside" &&
+  if [ "$st" -eq 0 ] && [ ! -e "$jjl/target/dogfood" ] && grep -qx "commit=$(JJ_DIR=$jjl jjparent)" "$jjside" &&
     grep -qx "change=$(JJ_DIR=$jjl jjid change_id)" "$jjside" &&
     grep -qx "sha256=$(sha256sum "$jjm/target/dogfood/slashit-ui" | cut -d' ' -f1)" "$jjside"; then
     ok "a linked JJ workspace promotes into the primary workspace's target/dogfood with its own commit and change id"

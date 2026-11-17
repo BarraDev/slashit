@@ -554,6 +554,8 @@ binary_commit() { # SHA
   [ "$FRONTEND_MODE" = embedded ] && [ -n "$1" ] && [ "$SIDE_SHA" = "$1" ] || return 1
   case $SIDE_COMMIT in *[!0-9a-f]* | '') return 1 ;; esac
   [ "${#SIDE_COMMIT}" -eq 40 ] || return 1
+  # A build from a dirty source (older builds promoted those) names no commit that holds it.
+  [ "$(sed -n 's/^dirty=//p' "$BINARY.frontend" 2>/dev/null | head -n 1)" = no ] || return 1
   BINARY_COMMIT=$SIDE_COMMIT
 }
 

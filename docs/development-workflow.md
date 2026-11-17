@@ -1311,7 +1311,10 @@ Three build modes exist. They do not share a binary path:
   `.git`, uses the commit id of `@` after JJ's working-copy snapshot; `dirty`
   means `@` is not empty. A build whose source has no commit identity (an unborn
   HEAD, no VCS, a failing or conflicted `jj`) is refused before it starts; there
-  is no `unknown` or HEAD fallback. The identity is read again after the build
+  is no `unknown` or HEAD fallback. A dirty source is refused too: uncommitted
+  Git changes, or a non-empty JJ `@`. Commit the Git change, or describe the JJ
+  change and run `jj new`, then build; so every promoted sidecar has `dirty=no`.
+  The identity is read again after the build
   and any difference, including an edit to an already-dirty file, refuses
   promotion. The binary is hashed from the staged copy that is renamed into
   place, and re-hashed just before the rename. `target/dogfood/.build.lock` is

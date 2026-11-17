@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=181
+EXPECTED_TOTAL=182
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -260,7 +260,7 @@ git -C "$repo" add provenance.txt
 git -C "$repo" commit -q -m provenance
 commit_id=$(git -C "$repo" rev-parse HEAD)
 # The sidecar names the commit the stub was "built" from, as the build script's does.
-echo "commit=$commit_id" >>"$bin_dir/slashit-ui.frontend"
+printf "commit=%s\ndirty=no\n" "$commit_id" >>"$bin_dir/slashit-ui.frontend"
 
 # Application state that a restart must preserve.
 printf 'settings v1\n' >"$state/config/slashit-app/settings.toml"
@@ -715,7 +715,7 @@ sv SLASHIT_DOGFOOD_BINARY="$sel/slashit-ui" start >/dev/null 2>&1 || bad "select
 # --version, but leaves a marker if it is ever started as the instance.
 { head -n 1 "$bin_dir/slashit-ui"; echo '[ "${1:-}" = --version ] || touch "$SLASHIT_TEST_STUB_DIR/new-build-ran"'; tail -n +2 "$bin_dir/slashit-ui"; } >"$sel/new"
 chmod +x "$sel/new"; touch -d '2000-01-01 00:00:00' "$sel/new"
-printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\n' "$(sha256sum <"$sel/new" | cut -d' ' -f1)" "$commit_id" >"$sel/new.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$(sha256sum <"$sel/new" | cut -d' ' -f1)" "$commit_id" >"$sel/new.frontend"
 # As the build script does, the replaced pair is kept in previous/. The stub is a
 # script, so /proc/<pid>/exe names bash: the rollback copy is what proves out.
 mkdir -p "$sel/previous"; cp -p "$sel/slashit-ui" "$sel/slashit-ui.frontend" "$sel/previous/"
@@ -760,7 +760,7 @@ pre=$(stub_pid)
 mkdir -p "$nos/previous"; cp -p "$nos/slashit-ui" "$nos/previous/"
 { head -n 1 "$bin_dir/slashit-ui"; echo '# newer build'; tail -n +2 "$bin_dir/slashit-ui"; } >"$nos/new"
 chmod +x "$nos/new"; touch -d '2000-01-01 00:00:00' "$nos/new"
-printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\n' "$(sha256sum <"$nos/new" | cut -d' ' -f1)" "$commit_id" >"$nos/slashit-ui.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$(sha256sum <"$nos/new" | cut -d' ' -f1)" "$commit_id" >"$nos/slashit-ui.frontend"
 mv "$nos/new" "$nos/slashit-ui"
 out=$(sv SLASHIT_DOGFOOD_BINARY="$nos/slashit-ui" restart 2>&1); st=$?
 if [ "$st" -eq 1 ] && [[ "$out" == *"no frontend sidecar matches"* ]] && [ -n "$pre" ] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null; then
@@ -980,13 +980,21 @@ cp "$bin_dir/slashit-ui" "$fe/slashit-ui"
 touch -d '2000-01-01 00:00:00' "$fe/slashit-ui"
 fe_sha=$(sha256sum "$fe/slashit-ui" | cut -d' ' -f1)
 fe_dead=http://127.0.0.1:9/
-printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=no\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
 
 out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start 2>&1)
 expect pass "an embedded build starts with no dev server answering" "$out" $?
 out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" verify 2>&1); st=$?
 if [ "$st" -eq 0 ] && [[ "$out" == *"frontend:       embedded in the binary"* ]]; then ok "verify reports the embedded frontend, not a server"
 else bad "verify did not report the embedded frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# A sidecar from a dirty source names a commit that does not hold what was built:
+# refused even with a matching sha256, so it can never become the state writer.
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=yes\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
+out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start 2>&1); st=$?
+if [ "$st" -ne 0 ] && [ ! -e "$fe/state-writer" ] && [ ! -s "$fe/supervisor/state-writer" ]; then ok "a sidecar with dirty=yes is refused before start, and records no writer"
+else bad "a dirty sidecar was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=no\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
 cleanup_instances
 
 printf 'mode=embedded\nsha256=0000000000000000000000000000000000000000000000000000000000000000\n' >"$fe/slashit-ui.frontend"
@@ -1000,7 +1008,7 @@ expect fail "a development build without its dev server is refused, not started 
 cleanup_instances
 # A running instance whose frontend record is then lost (a development build
 # now, with no server) must be reported as degraded, not healthy.
-printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=no\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
 sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start >/dev/null 2>&1 || bad "degraded-verify fixture: start failed"
 rm -f "$fe/slashit-ui.frontend"
 out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" verify 2>&1); st=$?
@@ -1029,7 +1037,7 @@ if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
     out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" start 2>&1)
     expect fail "a development build is refused even when its dev server answers: it has no verified commit" "$out" $? "never taken as the commit of a built executable"
     # A running instance that lost its sidecar is reported against the dev server.
-    printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
+    printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=no\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
     sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" start >/dev/null 2>&1 || bad "ready-dev-server fixture: start failed"
     rm -f "$fe/slashit-ui.frontend"
     out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" verify 2>&1)

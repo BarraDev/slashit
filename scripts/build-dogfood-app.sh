@@ -35,12 +35,16 @@
 #   - Git checkout (a `.git` exists, colocated JJ included): `git rev-parse HEAD`
 #     (a detached HEAD is fine; a branch name is never an identity), plus a
 #     digest of the status, the diff against HEAD and every untracked file.
-#   - JJ-only workspace (`.jj` without `.git`): the commit id of `@` after JJ's
-#     working-copy snapshot, with the change id recorded separately. The snapshot
-#     is content-addressed, so the commit id covers uncommitted edits too; `dirty`
-#     means `@` is not empty.
+#   - JJ-only workspace (`.jj` without `.git`): the commit id of `@-`, the checkpoint
+#     the empty working-copy commit `@` sits on (`@` is the build source only when
+#     empty; a non-empty `@` is refused as dirty). The change id is recorded
+#     separately and is never identity.
 #   - Anything else, an unborn HEAD, a conflicted `@` or a failing VCS command:
 #     the build is refused before it starts. There is no HEAD or `unknown` fallback.
+#   - A dirty source (uncommitted Git changes, or a non-empty JJ `@`) is refused
+#     too: a verified build must name a commit that holds exactly what was built.
+#     A dirty JJ `@` gets a new commit id at the next snapshot, so it cannot prove
+#     ancestry later.
 # Known gap, accepted: comparing identity before and after cannot see a source
 # edit that is made during the build and reverted before it ends. Closing it would
 # mean building from an immutable export in a scratch directory, which gives up
@@ -116,8 +120,12 @@ jj_identity() {
   line=$("${jj[@]}" --no-pager --color=never log -r @ --no-graph \
     -T 'commit_id ++ " " ++ change_id ++ " " ++ if(conflict, "conflict", if(empty, "clean", "dirty"))') ||
     { echo "jj could not read the working-copy commit" >&2; return 1; }
-  read -r commit change state <<<"$line"
+  read -r _ change state <<<"$line"
   [ "$state" != conflict ] || { echo "the working-copy commit has conflicts" >&2; return 1; }
+  # The identity is @-, the checkpoint @ sits on. An empty @ gets a new commit id at
+  # the next edit or describe, so recording it would strand the writer record.
+  commit=$("${jj[@]}" --no-pager --color=never log -r @- --no-graph -T commit_id) ||
+    { echo "jj could not read the parent of the working-copy commit" >&2; return 1; }
   changed=$("${jj[@]}" --no-pager --color=never diff --summary -r @) || return 1
   printf 'vcs=jj\ncommit=%s\nchange=%s\ndirty=%s\nchanged=%s\ndigest=%s\n' "$commit" "$change" \
     "$([ "$state" = dirty ] && echo yes || echo no)" "$(printf '%s' "$changed" | tr '\n' ';')" \
@@ -136,6 +144,8 @@ id_field() { sed -n "s/^$2=//p" <<<"$1" | head -n 1; }
 src_id=$(source_identity) ||
   fail "cannot establish the source identity of $root (see above); nothing is built or promoted"
 src_commit=$(id_field "$src_id" commit)
+[ "$(id_field "$src_id" dirty)" = no ] ||
+  fail "the source has uncommitted changes ($(id_field "$src_id" changed)); a verified dogfood build needs a clean source. Commit it (Git), or describe the change and run jj new (JJ), then build again. Nothing is built or promoted"
 
 echo "==> trunk build (release-style frontend into dist/)"
 trunk build 9>&- || fail "trunk build failed; see above"
