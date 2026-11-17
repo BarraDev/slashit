@@ -35,6 +35,11 @@ struct LiveRunsContext(RwSignal<LiveRuns>);
 #[derive(Clone, Copy)]
 struct AttentionHighlight(RwSignal<Option<(Uuid, u32)>>);
 
+/// A Task another page asks the board to open: its Project and its id. The
+/// board of that Project opens the drawer and clears the request.
+#[derive(Clone, Copy)]
+pub struct OpenTaskRequest(pub RwSignal<Option<(String, Uuid)>>);
+
 /// How long a card stays outlined after "Needs you" pointed at it.
 const HIGHLIGHT_MS: u64 = 2_500;
 
@@ -321,6 +326,19 @@ pub fn Kanban(
 
     // The task whose drawer is open, if any.
     let drawer_task = RwSignal::new(None::<Uuid>);
+
+    // A Task the Issues page asked to open. Only the board of its Project takes it.
+    if let Some(OpenTaskRequest(request)) = use_context::<OpenTaskRequest>() {
+        let board_project = project_id.clone();
+        Effect::new(move |_| {
+            if let Some((project, id)) = request.get() {
+                if project == board_project {
+                    drawer_task.set(Some(id));
+                    request.set(None);
+                }
+            }
+        });
+    }
 
     // The card the header just pointed at, briefly outlined. The counter
     // makes a second press on the same card a fresh cue.

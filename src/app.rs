@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-use crate::components::{provide_updater_context, setup_keyboard_shortcuts, AppLayout, QuitDialog, UpdateBanner};
+use crate::components::{provide_updater_context, setup_keyboard_shortcuts, AppLayout, OpenTaskRequest, QuitDialog, UpdateBanner};
 use crate::pages::*;
 use crate::services::get_project;
 use leptos::prelude::*;
@@ -125,6 +125,19 @@ pub fn App() -> impl IntoView {
         move |page: String| {
             persist_page(&page);
             set_current_page.set(page);
+        }
+    });
+
+    // A Task the Issues page asks to open: its Project becomes the selected one,
+    // the board is shown, and the board opens the Task's drawer.
+    let open_task = RwSignal::new(None::<(String, uuid::Uuid)>);
+    provide_context(OpenTaskRequest(open_task));
+    Effect::new(move |_| {
+        if let Some((project, _)) = open_task.get() {
+            if selected_project.get_untracked() != project {
+                set_selected_project.set(project);
+            }
+            on_navigate.run("dashboard".to_string());
         }
     });
 

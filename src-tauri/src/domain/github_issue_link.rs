@@ -5,6 +5,8 @@
 //! Every function here refuses rather than repairs. The network read that
 //! confirms the Issue is in `commands::github`; nothing here asks GitHub.
 
+use uuid::Uuid;
+
 use crate::domain::{ExternalRef, Task};
 
 const ORIGIN: &str = "https://github.com/";
@@ -117,6 +119,25 @@ pub fn duplicate_issue_refusal(task: &Task, reference: &ExternalRef) -> Option<S
     (same_url || holds_issue(task, &issue)).then(|| already_linked_message(&issue))
 }
 
+/// The refusal for creating a Task for an Issue that a Task of `project_id`
+/// already links. A second Task would duplicate the Issue; the person links the
+/// existing Task instead. Other Projects do not count.
+pub fn project_issue_refusal<'a>(
+    tasks: impl IntoIterator<Item = &'a Task>,
+    project_id: Uuid,
+    issue: &IssueAddress,
+) -> Option<String> {
+    tasks
+        .into_iter()
+        .any(|t| t.project_id == project_id && holds_issue(t, issue))
+        .then(|| {
+            format!(
+                "Issue #{} in {} is already linked to a Task in this Project. Link that Task instead of creating another.",
+                issue.number, issue.repo
+            )
+        })
+}
+
 /// The refusal for a repeated link, shared by every check that makes it.
 pub fn already_linked_message(issue: &IssueAddress) -> String {
     format!(
@@ -167,6 +188,34 @@ mod tests {
         assert_eq!(
             issue.url(),
             "https://github.com/Owner-1/Repo.name/issues/42"
+        );
+    }
+
+    #[test]
+    fn creating_a_second_task_for_a_linked_issue_is_refused_within_the_project_only() {
+        let project = Uuid::new_v4();
+        let mut linked = create_test_task("linked");
+        linked.project_id = project;
+        attach_github_issue(
+            &mut linked,
+            &IssueAddress {
+                repo: "o/r".into(),
+                number: 4,
+            },
+            "OPEN",
+        )
+        .unwrap();
+        let issue = IssueAddress {
+            repo: "O/R".into(),
+            number: 4,
+        };
+        assert!(project_issue_refusal([&linked], project, &issue)
+            .unwrap()
+            .contains("#4"));
+        assert_eq!(project_issue_refusal([&linked], Uuid::new_v4(), &issue), None);
+        assert_eq!(
+            project_issue_refusal([&linked], project, &IssueAddress { repo: "o/r".into(), number: 5 }),
+            None
         );
     }
 

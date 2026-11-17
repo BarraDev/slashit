@@ -16,6 +16,7 @@ pub mod pty_service;
 pub mod tray_service;
 pub mod workflow_service;
 pub mod github_service;
+pub mod github_issue_cache;
 pub mod opener_service;
 pub mod state_service;
 pub mod storage_usage_service;

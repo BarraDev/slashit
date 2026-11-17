@@ -566,7 +566,6 @@ pub fn run() {
             get_issues,
             get_issue,
             create_task_from_issue,
-            import_github_issues,
             get_prs,
             get_pr,
             generate_changelog,

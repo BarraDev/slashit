@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::models::github::{GithubIssue, PullRequest};
+use crate::services::project_service;
 use crate::models::Task;
 use wasm_bindgen::prelude::*;
 
@@ -9,11 +10,15 @@ extern "C" {
     async fn invoke(cmd: &str, args: JsValue) -> JsValue;
 }
 
-pub async fn get_issues(repo: String) -> Result<Vec<GithubIssue>, String> {
+/// The Issues page must see a refusal (gh missing, not signed in, GitHub
+/// unreachable) as an error, not as a request that never answers, so it goes
+/// through the checked invocation rather than the trapping one.
+pub async fn get_issues(repo: String, state: &str) -> Result<Vec<GithubIssue>, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "repo": repo,
+        "state": state,
     })).unwrap();
-    let response = invoke("get_issues", args).await;
+    let response = project_service::invoke_checked("get_issues", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
@@ -35,7 +40,7 @@ pub async fn create_task_from_issue(
         "issueNumber": issue_number,
         "projectId": project_id,
     })).unwrap();
-    let response = invoke("create_task_from_issue", args).await;
+    let response = project_service::invoke_checked("create_task_from_issue", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
