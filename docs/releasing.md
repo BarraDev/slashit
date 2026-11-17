@@ -68,7 +68,11 @@ and a manifest with the SHA-256 of each original and of the content about to
 replace it, including whether `Cargo.lock` existed. A normal or rolled-back run
 removes it. If the process was killed without a chance to clean up, the journal
 stays and every mode refuses to run until you run
-`scripts/release-bump.sh --recover`. It first checks every file. A file still
+`scripts/release-bump.sh --recover`. A run killed before the journal was in
+place leaves no journal, only staged copies named `<file>.bump.XXXXXX` beside the
+managed files and possibly an unfinished `.release-bump-journal.tmp/`; `--recover`
+removes them, and so does the next `--apply`. The journal and these copies are
+git-ignored. It first checks every file. A file still
 holding its original is left alone, and one holding exactly what the run wrote
 is restored (a `Cargo.lock` that did not exist is deleted). If any file holds
 something else, such as an edit made after the crash or a deletion, it changes

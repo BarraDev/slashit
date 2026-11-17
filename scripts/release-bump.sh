@@ -21,7 +21,9 @@
 #       .release-bump-journal/ in the repository root: a copy of every original
 #       file and a manifest with the SHA-256 of each original and of the content
 #       about to replace it. A run killed without a chance to clean up (SIGKILL,
-#       power loss) leaves it. While it exists every mode refuses to run. --recover
+#       power loss) leaves it. While it exists every mode refuses to run. A kill
+#       before the journal is in place leaves only staged copies (<file>.bump.XXXXXX),
+#       which --recover and the next --apply remove. --recover
 #       first checks every file: one still holding its original is left alone, one
 #       holding exactly what the run wrote is restored, and anything else (an edit
 #       made after the crash, a deleted file) makes it refuse, change nothing, and
