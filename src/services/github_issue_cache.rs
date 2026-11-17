@@ -68,6 +68,17 @@ impl CacheKey {
     }
 }
 
+/// The most Issues one listing asks GitHub for. Keep in step with
+/// `ISSUE_LIST_LIMIT` in src-tauri/src/commands/github.rs.
+pub const LISTING_LIMIT: usize = 100;
+
+/// Whether a listing of `count` Issues reached the limit, so that GitHub may
+/// hold more Issues than the page shows. A count is never the repository's
+/// total.
+pub fn is_incomplete(count: usize) -> bool {
+    count >= LISTING_LIMIT
+}
+
 /// One loaded listing and when GitHub last answered for it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CachedIssues {
@@ -163,6 +174,14 @@ mod tests {
     fn each_filter_asks_gh_for_its_own_state() {
         let states: Vec<&str> = IssueFilter::ALL.iter().map(|f| f.gh_state()).collect();
         assert_eq!(states, ["open", "closed", "all"]);
+    }
+
+    #[test]
+    fn a_listing_that_reaches_the_limit_is_flagged_as_possibly_incomplete() {
+        assert!(!is_incomplete(LISTING_LIMIT - 1));
+        assert!(is_incomplete(LISTING_LIMIT));
+        assert!(is_incomplete(LISTING_LIMIT + 1));
+        assert_eq!(LISTING_LIMIT, 100);
     }
 
     #[test]

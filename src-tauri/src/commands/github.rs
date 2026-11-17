@@ -80,6 +80,11 @@ const ISSUE_FIELDS: &str = "number,title,body,state,labels,assignees,comments,cr
 /// closed Issue is only listed when the caller asked for closed Issues.
 const ISSUE_LIST_STATES: [&str; 3] = ["open", "closed", "all"];
 
+/// The most Issues one `gh issue list` asks for. A full page may hide more
+/// Issues, so the frontend says so. Keep in step with `LISTING_LIMIT` in
+/// src/services/github_issue_cache.rs.
+const ISSUE_LIST_LIMIT: &str = "100";
+
 /// Read one Issue as `gh issue list` or `gh issue view` answered it.
 ///
 /// Labels, assignees and the comment count come from GitHub's answer, since
@@ -182,7 +187,7 @@ pub async fn get_issues(repo: String, state: String) -> Result<Vec<GithubIssue>,
         "--json",
         ISSUE_FIELDS,
         "--limit",
-        "50",
+        ISSUE_LIST_LIMIT,
     ])
     .await?;
     issues_from_json(&json)
@@ -843,6 +848,11 @@ mod issue_create_tests {
         closed["state"] = serde_json::json!("CLOSED");
         let listed = issues_from_json(&serde_json::json!([closed])).expect("a list");
         assert_eq!(listed[0].state, "CLOSED");
+    }
+
+    #[test]
+    fn the_issue_list_asks_gh_for_one_hundred_issues() {
+        assert_eq!(ISSUE_LIST_LIMIT.parse::<usize>(), Ok(100));
     }
 
     #[tokio::test]

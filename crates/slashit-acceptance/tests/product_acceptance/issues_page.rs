@@ -280,8 +280,13 @@ async fn browse_link_create(driver: &WebDriver, gh: &FakeGh, repository: &GitFix
     click(driver, REFRESH, "the Refresh button").await?;
     await_count(driver, ALERT, 0).await?;
     await_count(driver, ROW, 1).await?;
-    if list_asks(gh, "closed")? < 3 {
-        bail!("Refresh after the failure did not ask GitHub again: {:?}", gh.invocations()?);
+    // The alert clears when Refresh starts, before the fake `gh` records its call.
+    let started = Instant::now();
+    while list_asks(gh, "closed")? < 3 {
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("Refresh after the failure did not ask GitHub again: {:?}", gh.invocations()?);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // Open the linked Task from its Issue: its board opens the Task's drawer.
@@ -312,6 +317,91 @@ async fn browse_link_create(driver: &WebDriver, gh: &FakeGh, repository: &GitFix
     if !linked_to_three {
         bail!("the created Task does not link Issue 3: {created}");
     }
+
+    open_task_in_other_project(driver, &project_id).await
+}
+
+/// A Task in another Project is linked from the Issues page and opened there.
+/// The page switches the selected Project and the drawer opens on that board.
+async fn open_task_in_other_project(driver: &WebDriver, project_id: &str) -> Result<()> {
+    let listed = ui::invoke(driver, "list_projects", json!({})).await?;
+    let repository_id = listed
+        .as_array()
+        .context("list_projects did not answer with a list")?
+        .iter()
+        .find(|p| p["id"] == json!(project_id))
+        .and_then(|p| p["repository_id"].as_str())
+        .context("the first Project has no repository")?
+        .to_string();
+    let other_project = created_id(
+        ui::invoke(
+            driver,
+            "create_project",
+            json!({ "name": "Acceptance Other Project", "repositoryId": repository_id, "agentType": "claude_code" }),
+        )
+        .await?,
+        "create_project",
+    )?;
+    let title = "Task in the other Project";
+    let other_task = created_id(
+        ui::invoke(
+            driver,
+            "create_task",
+            json!({ "params": {
+                "projectId": other_project,
+                "title": title,
+                "description": "Never runs.",
+                "model": "default",
+                "reviewerModel": "sonnet",
+                "planningMode": false,
+                "dependencies": [],
+                "category": Value::Null,
+                "priority": Value::Null,
+                "complexity": Value::Null,
+                "impact": Value::Null,
+                "securitySeverity": Value::Null,
+                "githubIssueUrl": Value::Null,
+                "gitlabIssueUrl": Value::Null,
+                "linearTicketId": Value::Null,
+            } }),
+        )
+        .await?,
+        "create_task",
+    )?;
+
+    // The drawer of the first Project's Task covers the navigation; close it first.
+    click(driver, "[data-testid=\"task-drawer-close\"]", "the Task drawer's close button").await?;
+    await_count(driver, DRAWER, 0).await?;
+
+    // Back on the Issues page the first Project is selected. Choose the other
+    // Project as the destination, then link its Task to Issue 7.
+    ui::visible(driver, "[data-testid=\"nav-agent\"]").await?.click().await?;
+    ui::visible(driver, "[data-testid=\"nav-github_issues\"]").await?.click().await?;
+    await_count(driver, ROW, 2).await?;
+    click_row(driver, 0, "the first Issue").await?;
+    let other_option = format!("[data-testid=\"issue-project-select\"] option[value=\"{other_project}\"]");
+    await_count(driver, &other_option, 1).await?;
+    let project_select = driver
+        .find(By::Css("[data-testid=\"issue-project-select\"]"))
+        .await
+        .context("the Project choice is not shown")?;
+    SelectElement::new(&project_select).await?.select_by_value(&other_project).await?;
+    click(driver, MODE_EXISTING, "the link-to-an-existing-Task choice").await?;
+    let task_option = format!("{TASK_SELECT} option[value=\"{other_task}\"]");
+    await_count(driver, &task_option, 1).await?;
+    let select = driver
+        .find(By::Css(TASK_SELECT))
+        .await
+        .context("the Task choice is not shown")?;
+    SelectElement::new(&select).await?.select_by_value(&other_task).await?;
+    click(driver, LINK_EXISTING, "the Link to the existing Task button").await?;
+    await_text_containing(driver, LINKED, title).await?;
+    expect_task_count(driver, &other_project, 1).await?;
+
+    // The other Project's board opens the drawer of its Task.
+    click(driver, OPEN_TASK, "the Open Task button").await?;
+    await_text_containing(driver, DRAWER, title).await?;
+    screenshot(driver, "issues-open-task-other-project.png").await?;
     Ok(())
 }
 

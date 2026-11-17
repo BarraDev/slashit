@@ -478,6 +478,12 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                 {move || format!("{} {}", issues.with(|l| l.len()), listing_name(filter.get()))}
                             </span>
                         </div>
+                        // A full page may hide more Issues; the count is not the repository's total.
+                        {move || github_issue_cache::is_incomplete(issues.with(|l| l.len())).then(|| view! {
+                            <p data-testid="issues-incomplete" role="status" class="px-3 py-2 border-b border-white/10 text-xs text-yellow-300/80">
+                                {format!("GitHub returned the first {} Issues for this listing. More may exist, so this list may be incomplete.", github_issue_cache::LISTING_LIMIT)}
+                            </p>
+                        })}
                         <div class="flex-1 overflow-y-auto p-2 space-y-2">
                             <For
                                 each=move || issues.get()
