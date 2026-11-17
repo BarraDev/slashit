@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=191
+EXPECTED_TOTAL=196
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -784,6 +784,72 @@ fi
 cleanup_instances
 rm -f "$state/supervisor/instance"
 
+echo "== the requested target is the build a launch runs (SLASHIT_DOGFOOD_EXPECT_COMMIT)"
+sv stop >/dev/null 2>&1; cleanup_instances
+seed_writer "$state"
+other=$(printf 'a%.0s' $(seq 40))
+writer_sum=$(sha256sum <"$state/supervisor/state-writer")
+out=$(sv SLASHIT_DOGFOOD_EXPECT_COMMIT="$other" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"not the requested target $other"* ]] && [ -z "$(stub_pid)" ] &&
+  [ "$(sha256sum <"$state/supervisor/state-writer")" = "$writer_sum" ]; then
+  ok "a start for another target is refused before anything is spawned; the state writer is unchanged"
+else bad "a start for another target was not refused before spawning (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(sv SLASHIT_DOGFOOD_EXPECT_COMMIT="$commit_id" start 2>&1); expect pass "a start for the build's own commit still succeeds" "$out" $?
+
+# A build promoted for another commit after the target was checked, but before the
+# restart's launch copy, must be refused while the running instance is still up.
+u=$(git -C "$repo" commit-tree "$(git -C "$repo" rev-parse "$commit_id^{tree}")" -p "$commit_id" -m "promoted build")
+pre=$(stub_pid)
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$stub_sha" "$u" >"$bin_dir/slashit-ui.frontend"
+out=$(sv SLASHIT_DOGFOOD_EXPECT_COMMIT="$commit_id" restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"not the requested target $commit_id"* ]] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null; then
+  ok "a restart whose launch copy is another commit is refused before the stop; the instance keeps running"
+else bad "a promoted build for another commit was not refused before the stop (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2; fi
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$stub_sha" "$commit_id" >"$bin_dir/slashit-ui.frontend"
+sv stop >/dev/null 2>&1; cleanup_instances
+
+echo "== a build promoted during a restart's stop cannot fail the restart"
+sv start >/dev/null 2>&1 || bad "stop-promotion fixture: start failed"
+promote=$work/promote-dirty.sh
+cat >"$promote" <<PROMOTE
+#!/usr/bin/env bash
+# Runs during the stop: promotes a build that a fresh launch would refuse (dirty source).
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=yes\n' "\$(sha256sum <"$bin_dir/slashit-ui" | cut -d' ' -f1)" "$commit_id" >"$bin_dir/slashit-ui.frontend"
+PROMOTE
+chmod +x "$promote"
+pre=$(stub_pid); sums_before=$(state_sums)
+out=$(sv SLASHIT_TEST_QUIT_RUN="$promote" restart 2>&1); st=$?
+post=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$post" ] && [ "$post" != "$pre" ] && [ "$(record_sha)" = "$stub_sha" ] && [ "$sums_before" = "$(state_sums)" ]; then
+  ok "a build promoted during the stop is not the one restarted: the validated copy starts, state unchanged"
+else bad "a promotion during the stop failed the restart (exit $st, pid '$pre' now '$post')"; printf '%s\n' "$out" >&2; fi
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$stub_sha" "$commit_id" >"$bin_dir/slashit-ui.frontend"
+sv stop >/dev/null 2>&1; cleanup_instances
+
+echo "== a recovery copy with incomplete provenance is refused before the stop"
+prov="$work/prov"
+mkdir -p "$prov/previous"
+cp "$bin_dir/slashit-ui" "$prov/slashit-ui"; touch -d '2000-01-01 00:00:00' "$prov/slashit-ui"
+old_sha=$(sha256sum <"$prov/slashit-ui" | cut -d' ' -f1)
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$old_sha" "$commit_id" >"$prov/slashit-ui.frontend"
+seed_writer "$state"
+sv SLASHIT_DOGFOOD_BINARY="$prov/slashit-ui" start >/dev/null 2>&1 || bad "provenance fixture: start failed"
+# The running copy is kept in previous/ with a dirty sidecar; the promoted build is clean.
+cp -p "$prov/slashit-ui" "$prov/previous/slashit-ui"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=yes\n' "$old_sha" "$commit_id" >"$prov/previous/slashit-ui.frontend"
+{ cat "$prov/slashit-ui"; echo '# promoted build'; } >"$prov/new"; chmod +x "$prov/new"; touch -d '2000-01-01 00:00:00' "$prov/new"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$(sha256sum <"$prov/new" | cut -d' ' -f1)" "$commit_id" >"$prov/new.frontend"
+mv "$prov/new" "$prov/slashit-ui"; mv "$prov/new.frontend" "$prov/slashit-ui.frontend"
+pre=$(stub_pid); sums_before=$(state_sums)
+# The backup is blocked, so a restart would stop the instance and then need the recovery copy.
+out=$(sv SLASHIT_DOGFOOD_BINARY="$prov/slashit-ui" SLASHIT_TEST_QUIT_BLOCK="$state/supervisor/backup" restart 2>&1); st=$?
+unblock_backup
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not name a verified clean commit"* ]] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null &&
+  [ "$sums_before" = "$(state_sums)" ]; then
+  ok "a recovery copy with a dirty sidecar is refused before the stop; the instance keeps running"
+else bad "an incomplete recovery copy was not refused before the stop (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2; fi
+sv stop >/dev/null 2>&1; cleanup_instances
+
 echo "== an empty required data root is backed up as an empty directory"
 aside=$work/data-aside
 mkdir -p "$aside"; mv "$state/data/slashit-app" "$aside/"; mkdir -p "$state/data/slashit-app"
@@ -994,11 +1060,17 @@ if [ "$st" -eq 0 ] && [[ "$out" == *"frontend:       embedded in the binary"* ]]
 else bad "verify did not report the embedded frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 # A sidecar from a dirty source names a commit that does not hold what was built:
-# refused even with a matching sha256, so it can never become the state writer.
+# refused even with a matching sha256, so it can never become the state writer. The
+# instance is stopped first, so the refusal can only come from the dirty gate, not
+# from "already answers". The writer checked is the one the supervisor really uses.
+sv stop >/dev/null 2>&1
+writer_sum=$(sha256sum <"$state/supervisor/state-writer")
 printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=yes\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
 out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start 2>&1); st=$?
-if [ "$st" -ne 0 ] && [ ! -e "$fe/state-writer" ] && [ ! -s "$fe/supervisor/state-writer" ]; then ok "a sidecar with dirty=yes is refused before start, and records no writer"
-else bad "a dirty sidecar was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+if [ "$st" -eq 1 ] && [[ "$out" == *"built from a dirty source (dirty=yes"* ]] && [ -z "$(stub_pid)" ] &&
+  [ "$(sha256sum <"$state/supervisor/state-writer")" = "$writer_sum" ]; then
+  ok "a sidecar with dirty=yes is refused for its dirty source, starts nothing, and leaves the state writer unchanged"
+else bad "a dirty sidecar was not refused for dirty provenance (exit $st)"; printf '%s\n' "$out" >&2; fi
 printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=no\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
 cleanup_instances
 
@@ -2079,7 +2151,7 @@ expect fail "a build without its frontend sidecar is refused" "$out" $st "develo
 sed -i 's/^dirty=no$/dirty=yes/' "$bin_dir/slashit-ui.frontend"
 out=$(sv start 2>&1); st=$?
 restore_stub
-expect fail "a dirty build cannot become the state writer" "$out" $st "has no verified sidecar naming its commit"
+expect fail "a dirty build cannot become the state writer" "$out" $st "built from a dirty source (dirty=yes"
 if ! compgen -G "$state/supervisor/launch.*" >/dev/null; then
   ok "refused dirty and sidecar-less launches leave no copy"
 else

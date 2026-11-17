@@ -137,6 +137,10 @@
 #   SLASHIT_DOGFOOD_START_TIMEOUT  seconds to wait for the control socket
 #   SLASHIT_DOGFOOD_STOP_TIMEOUT   seconds to wait for a graceful quit
 #   SLASHIT_DOGFOOD_FORCE_TIMEOUT  seconds between SIGTERM and SIGKILL
+#   SLASHIT_DOGFOOD_EXPECT_COMMIT  the commit a start or restart must launch
+#                                   (refresh-dogfood.sh sets it to its target). A
+#                                   launch copy of any other commit is refused
+#                                   before anything is stopped or started.
 #   SLASHIT_DOGFOOD_CLI_TIMEOUT    seconds before a CLI call (--version, ping,
 #                                   quit) is abandoned
 #
@@ -252,6 +256,11 @@ INSTANCE_LOG=$SUP_DIR/instance.log
 LOCK=$SUP_DIR/lifecycle.lock
 SOCKET=$RUNTIME_BASE/slashit-app/slashit.sock
 ENDPOINT=unix:$SOCKET
+# The commit the caller requires the launched build to be (refresh-dogfood.sh passes
+# its target). It is checked on the private launch copy before anything is stopped.
+EXPECT_COMMIT=${SLASHIT_DOGFOOD_EXPECT_COMMIT:-}
+# Set when restart has already validated its launch copy; start then reuses that copy.
+PREVALIDATED=0
 
 # The declared environment ---------------------------------------------------
 declare_config=$STATE_BASE/config
@@ -812,8 +821,11 @@ PROVENANCE_MARK=provenance=verified-sidecar
 state_writer_gate() {
   local writer
   LAUNCH_COMMIT=unknown
-  binary_commit "$LAUNCH_SHA" "$LAUNCH_EXEC" ||
+  if ! binary_commit "$LAUNCH_SHA" "$LAUNCH_EXEC"; then
+    [ "$(sed -n 's/^dirty=//p' "$LAUNCH_EXEC.frontend" 2>/dev/null | head -n 1)" != yes ] ||
+      refuse "$BINARY was built from a dirty source (dirty=yes in $BINARY.frontend), so its commit does not hold what was built. Nothing was started. Commit or describe the source, then build it with scripts/build-dogfood-app.sh"
     refuse "$BINARY has no verified sidecar naming its commit ($BINARY.frontend: $FRONTEND_MODE, commit '${SIDE_COMMIT:-none}'), so the build it came from is unknown. A checkout HEAD is never taken as the commit of a built executable, so this build can neither be checked against nor recorded as the writer of the state under $STATE_BASE. Nothing was started. Build it with scripts/build-dogfood-app.sh"
+  fi
   LAUNCH_COMMIT=$BINARY_COMMIT
   if [ ! -e "$STATE_WRITER" ]; then
     has_persistent_state || return 0
@@ -1010,6 +1022,11 @@ launch_gates() {
     *) frontend_ready || refuse "this is a development build, which loads $DEV_URL, and nothing answers there; start \`trunk serve\` on port 1420, or build a self-contained binary with scripts/build-dogfood-app.sh" ;;
   esac
   state_writer_gate
+  # The requested target was checked by the caller before this copy was taken, so a
+  # promotion in between must be refused here, before anything is stopped.
+  if [ -n "$EXPECT_COMMIT" ] && [ "$LAUNCH_COMMIT" != "$EXPECT_COMMIT" ]; then
+    refuse "the build that would launch is $LAUNCH_COMMIT, not the requested target $EXPECT_COMMIT: $BINARY changed after the target was checked. Nothing was stopped or started"
+  fi
 }
 
 # A start that fails after its spawn must not leave the child running untracked.
@@ -1081,8 +1098,10 @@ cmd_start() {
     unverifiable) refuse "the launch record names pid $REC_PID, which $REC_WHY; a launch will not start beside a process it cannot identify (see \`$SELF status\`)" ;;
   esac
 
-  # Provenance gates: the CLI first (it verifies the instance), then the binary.
-  launch_gates
+  # Provenance gates: the CLI first (it verifies the instance), then the binary. A
+  # restart already ran them on the copy it will start, before it stopped anything;
+  # running them again would prune that copy and check a binary that may have changed.
+  [ "$PREVALIDATED" = 1 ] || launch_gates
   command -v setsid >/dev/null 2>&1 || refuse "setsid is required to detach the instance"
 
   mkdir -p "$STATE_BASE/config" "$STATE_BASE/data" "$STATE_BASE/cache" "$SUP_DIR" 2>/dev/null
@@ -1510,6 +1529,14 @@ capture_running_executable() {
       rm -f "$dir/slashit-ui"
       refuse "no frontend sidecar matches the running executable (sha256 $sha), so its commit is unverifiable and a failed restart could not start it again; the instance was not stopped"
     fi
+    # The start that would run this copy after a failed backup applies the full launch
+    # provenance: a verified clean commit, which the state writer must name. Checked
+    # here, before the stop, so a copy that could not start is refused while it runs.
+    if ! binary_commit "$sha" "$dir/slashit-ui" || [ "$BINARY_COMMIT" != "$(sed -n 's/^commit=//p' "$STATE_WRITER" 2>/dev/null | head -n 1)" ] ||
+      ! grep -qx "$PROVENANCE_MARK" "$STATE_WRITER" 2>/dev/null; then
+      rm -f "$dir/slashit-ui" "$dir/slashit-ui.frontend"
+      refuse "the sidecar of the running executable (sha256 $sha) does not name a verified clean commit that the state writer records, so a failed restart could not start it again; the instance was not stopped"
+    fi
     RECOVER_BIN=$dir/slashit-ui
     return 0
   done
@@ -1529,6 +1556,9 @@ restart_recover() { # message
   [ -n "$RECOVER_BIN" ] && [ -x "$RECOVER_BIN" ] ||
     fail "the restart did not complete ($1); no proven copy of the previous executable exists, so nothing was started"
   BINARY=$RECOVER_BIN
+  # Recovery starts the executable that was running, not the requested target, so
+  # the target expectation does not apply to it, and its launch copy is checked afresh.
+  EXPECT_COMMIT= PREVALIDATED=0
   note "starting the captured previous executable $BINARY again; this restart wrote nothing, but the state was not verified"
   cmd_start
   fail "the restart did not complete ($1), but the instance was started again on the captured previous executable"
@@ -1547,6 +1577,10 @@ cmd_restart() {
   # A restart whose start could not succeed, or whose backup cannot be written,
   # must not stop the instance first.
   launch_gates
+  # The copy these gates validated is the one the start after the stop runs. A
+  # build promoted during the stop cannot replace it, and nothing is re-checked
+  # against a path that may have changed.
+  PREVALIDATED=1
   precheck_backup_room
   capture_running_executable
   note "controlled restart of pid $pid on $ENDPOINT"
