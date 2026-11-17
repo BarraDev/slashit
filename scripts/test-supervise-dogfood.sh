@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=182
+EXPECTED_TOTAL=191
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -118,6 +118,9 @@ cleanup_all() {
   for rec in "${foreign_pids[@]+"${foreign_pids[@]}"}"; do
     signal_owned KILL "$rec" || true
   done
+  # A launch copy is left read-only when its launch never reaches the exec path
+  # of the supervisor; restore the owner's write bit so the tree can be removed.
+  chmod -R u+w "$work" 2>/dev/null
   rm -rf "$work"
 }
 
@@ -686,6 +689,8 @@ running_exe() { # the script the running stub instance was exec'd from
   local pid; pid=$(stub_pid); [ -n "$pid" ] || return 1
   tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | sed -n 2p
 }
+# The sha256 the launch record captured for the running instance (the copy it execs).
+record_sha() { awk -F '\t' '$1 == "sha256" { print $2 }' "$state/supervisor/instance" 2>/dev/null; }
 
 echo "== a backup that fails after the stop starts the captured executable again, over unchanged state"
 sv verify >/dev/null 2>&1 || sv start >/dev/null 2>&1 || bad "post-stop fixture: start failed"
@@ -696,8 +701,8 @@ unblock_backup
 exe=$(running_exe); new_pid=$(stub_pid)
 if [ "$st" -eq 1 ] && [ "$blocked" = yes ] && [[ "$out" == *"captured previous executable"* ]] &&
   [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] && sv verify >/dev/null 2>&1 &&
-  [ "$exe" = "$state/supervisor/recover/slashit-ui" ] &&
-  cmp -s "$exe" "$bin_dir/slashit-ui" && [ "$sums_before" = "$(state_sums)" ] && [ "$(backup_count)" = "$n_before" ]; then
+  [[ "$exe" == "$state/supervisor/launch."*/slashit-ui ]] && [ "$(record_sha)" = "$stub_sha" ] &&
+  [ "$sums_before" = "$(state_sums)" ] && [ "$(backup_count)" = "$n_before" ]; then
   ok "a backup blocked after the stop (a file in its place) restarts the captured copy, leaves the state checksums unchanged and keeps no partial backup"
 else
   bad "a backup failure after the stop did not recover as required (exit $st, blocked $blocked, exe '$exe')"; printf '%s\n' "$out" >&2
@@ -725,8 +730,8 @@ out=$(sv SLASHIT_DOGFOOD_BINARY="$sel/slashit-ui" SLASHIT_TEST_QUIT_BLOCK="$stat
 unblock_backup
 exe=$(running_exe)
 rec_bin=$(awk -F '\t' '$1 == "binary" { print $2 }' "$state/supervisor/instance" 2>/dev/null)
-if [ "$st" -eq 1 ] && [ "$exe" = "$state/supervisor/recover/slashit-ui" ] && [ "$rec_bin" = "$exe" ] &&
-  [ "$(sha256sum <"$exe" | cut -d' ' -f1)" = "$old_sha" ] && [ ! -e "$stub_dir/new-build-ran" ] &&
+if [ "$st" -eq 1 ] && [[ "$exe" == "$state/supervisor/launch."*/slashit-ui ]] && [ "$rec_bin" = "$state/supervisor/recover/slashit-ui" ] &&
+  [ "$(record_sha)" = "$old_sha" ] && [ ! -e "$stub_dir/new-build-ran" ] &&
   [ "$sums_before" = "$(state_sums)" ]; then
   ok "with a new build already promoted, recovery runs the captured old executable (sha256 proven) and never the new one"
 else
@@ -2003,6 +2008,112 @@ if [ "$st" -eq 0 ] && grep -qxF "STATE_BASE       $state" <<<"$out"; then
   ok "a trailing slash on the isolated state base is kept, in normalized form"
 else
   bad "a trailing slash on the isolated state base was not normalized (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+echo "== launch copy: what runs is the copy that was checked"
+# A verified start executes a private copy whose sha256 is the proven one, and
+# the copy is removed once the start is verified.
+cleanup_instances
+out=$(sv start 2>&1); st=$?
+if [ "$st" -eq 0 ] && [ "$(record_sha)" = "$stub_sha" ] && ! compgen -G "$state/supervisor/launch.*" >/dev/null; then
+  ok "a verified start executes a copy with the proven sha256 and removes the copy once verified"
+else
+  bad "a verified start did not execute a proven copy (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+# The publisher and torn-copy stand-in: a `cp` shim that runs the real copy and
+# then acts once (FAULT_FLAG) on the supervisor's copy of the source binary.
+fault_shim=$work/shim-fault
+mkdir -p "$fault_shim"
+cat >"$fault_shim/cp" <<'SHIM'
+#!/usr/bin/env bash
+/usr/bin/cp "$@" || exit $?
+[ -n "${FAULT_MODE:-}" ] && [ ! -e "$FAULT_FLAG" ] && [ "${1:-}" = -- ] && [ "${2:-}" = "$FAULT_SRC" ] || exit 0
+: >"$FAULT_FLAG"
+case $FAULT_MODE in
+  swap) /usr/bin/cp -- "$FAULT_NEW" "$FAULT_SRC.next" && /usr/bin/mv -f -T "$FAULT_SRC.next" "$FAULT_SRC" ;;
+  corrupt) printf 'torn\n' >>"$3" ;;
+esac
+exit 0
+SHIM
+chmod +x "$fault_shim/cp"
+cp -p "$bin_dir/slashit-ui" "$work/slashit-ui.orig"
+cp -p "$bin_dir/slashit-ui.frontend" "$work/slashit-ui.frontend.orig"
+restore_stub() {
+  cp -p "$work/slashit-ui.orig" "$bin_dir/slashit-ui"
+  cp -p "$work/slashit-ui.frontend.orig" "$bin_dir/slashit-ui.frontend"
+}
+
+# A build promoted over the source after its copy is not the one started.
+printf '%s\n' '#!/usr/bin/env bash' '[ "${1:-}" = --version ] && { echo "slashit-ui 9.9.9-promoted"; exit 0; }' \
+  'touch "$SLASHIT_TEST_STUB_DIR/promoted-ran"' 'exit 1' >"$work/promoted-build"
+chmod +x "$work/promoted-build"
+rm -f "$stub_dir/promoted-ran"
+out=$(sv PATH="$fault_shim:$PATH" FAULT_MODE=swap FAULT_SRC="$bin_dir/slashit-ui" FAULT_NEW="$work/promoted-build" \
+  FAULT_FLAG="$work/fault-swap" start 2>&1); st=$?
+cleanup_instances
+if [ "$st" -eq 0 ] && [ -e "$work/fault-swap" ] && cmp -s "$bin_dir/slashit-ui" "$work/promoted-build" &&
+  [ "$(record_sha)" = "$stub_sha" ] && [ ! -e "$stub_dir/promoted-ran" ]; then
+  ok "a build promoted over the source after its copy never runs; the copied, checked build starts"
+else
+  bad "a promoted build replaced the checked copy (exit $st)"; printf '%s\n' "$out" >&2
+fi
+restore_stub
+
+# A copy whose bytes differ from the sidecar's sha256 is refused, and no copy is kept.
+out=$(sv PATH="$fault_shim:$PATH" FAULT_MODE=corrupt FAULT_SRC="$bin_dir/slashit-ui" FAULT_FLAG="$work/fault-corrupt" start 2>&1); st=$?
+[ -e "$work/fault-corrupt" ] || bad "the corrupt-copy fault did not fire"
+expect fail "a torn launch copy is refused against its sidecar" "$out" $st "does not match the binary's sha256"
+if ! compgen -G "$state/supervisor/launch.*" >/dev/null; then
+  ok "a refused launch removes its copy"
+else
+  bad "a refused launch left a copy behind"
+fi
+
+# A build with no frontend sidecar, and a dirty build, are refused before any start.
+mv "$bin_dir/slashit-ui.frontend" "$work/sidecar.aside"
+out=$(sv start 2>&1); st=$?
+cp -p "$work/sidecar.aside" "$bin_dir/slashit-ui.frontend"
+expect fail "a build without its frontend sidecar is refused" "$out" $st "development build"
+sed -i 's/^dirty=no$/dirty=yes/' "$bin_dir/slashit-ui.frontend"
+out=$(sv start 2>&1); st=$?
+restore_stub
+expect fail "a dirty build cannot become the state writer" "$out" $st "has no verified sidecar naming its commit"
+if ! compgen -G "$state/supervisor/launch.*" >/dev/null; then
+  ok "refused dirty and sidecar-less launches leave no copy"
+else
+  bad "a refused launch left a copy behind after the sidecar cases"
+fi
+
+# A failure before the exec never promotes the writer: an unchanged writer
+# record and no prepared temporary file are the evidence.
+writer="$state/supervisor/state-writer"
+setsid_shim=$work/shim-setsid
+mkdir -p "$setsid_shim"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$setsid_shim/setsid"
+chmod +x "$setsid_shim/setsid"
+writer_before=$(cat "$writer")
+out=$(sv PATH="$setsid_shim:$PATH" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"setsid failed"* ]] && [ "$(cat "$writer")" = "$writer_before" ] &&
+  ! compgen -G "$writer.tmp.*" >/dev/null && ! compgen -G "$state/supervisor/launch.*" >/dev/null; then
+  ok "a start whose spawn fails before any child leaves the writer and its temporary file unchanged"
+else
+  bad "a failed spawn changed the writer or left files (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+# A child that cannot promote the writer dies before its exec; the writer stays.
+mv_shim=$work/shim-mv
+mkdir -p "$mv_shim"
+printf '%s\n' '#!/usr/bin/env bash' 'case " $* " in *" $SHIM_WRITER "*) exit 1 ;; esac' 'exec /usr/bin/mv "$@"' >"$mv_shim/mv"
+chmod +x "$mv_shim/mv"
+writer_before=$(cat "$writer")
+out=$(sv PATH="$mv_shim:$PATH" SHIM_WRITER="$writer" start 2>&1); st=$?
+cleanup_instances
+if [ "$st" -eq 1 ] && [ "$(cat "$writer")" = "$writer_before" ] && ! compgen -G "$writer.tmp.*" >/dev/null; then
+  ok "a child that fails before its exec leaves the writer unchanged and removes its prepared record"
+else
+  bad "a child that failed before its exec changed the writer or left files (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
 echo
