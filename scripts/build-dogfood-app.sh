@@ -36,13 +36,26 @@ fail() {
 
 cargo_binary=target/debug/slashit-ui
 cargo_cli=target/debug/slashit
-promoted=target/dogfood
+# The artifact root is the one scripts/supervise-dogfood.sh launches from: the
+# checkout that owns the common .git directory, so a build in a linked worktree
+# promotes where the supervisor looks. Without git, this checkout.
+common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=
+if [ -n "$common" ] && [ "$(basename "$common")" = .git ]; then
+  promoted=$(dirname "$common")/target/dogfood
+else
+  promoted=$root/target/dogfood
+fi
 binary=$promoted/slashit-ui
 cli=$promoted/slashit
 sidecar=$binary.frontend
 
 grep -Eq '"beforeBuildCommand": *"trunk build"' src-tauri/tauri.conf.json ||
   fail "src-tauri/tauri.conf.json no longer runs \`trunk build\`; update this script to match"
+
+# Provenance is read before the build: the sidecar names the source the binary
+# was built from. The same reads after the build must agree, or nothing is promoted.
+src_commit=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)
+src_status=$(git -C "$root" status --porcelain 2>/dev/null || true)
 
 echo "==> trunk build (release-style frontend into dist/)"
 trunk build || fail "trunk build failed; see above"
@@ -60,6 +73,10 @@ wasm=$(find dist -maxdepth 1 -name '*_bg.wasm' -printf '%f\n' | head -n 1)
 grep -a -q -F "$wasm" "$cargo_binary" ||
   fail "$cargo_binary does not contain $wasm: the frontend is not embedded (a development build?); nothing is promoted"
 [ -x "$cargo_cli" ] || fail "$cargo_cli is missing after the build"
+end_commit=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)
+end_status=$(git -C "$root" status --porcelain 2>/dev/null || true)
+[ "$end_commit" = "$src_commit" ] && [ "$end_status" = "$src_status" ] ||
+  fail "the source changed during the build (HEAD $src_commit before, $end_commit after; status before: [$src_status], after: [$end_status]); nothing is promoted, the previous build is untouched"
 
 # Promotion: copy to a temporary name beside the destination, then rename. A
 # rename replaces the directory entry and leaves a running executable intact.
@@ -99,12 +116,33 @@ publish "$cargo_cli" "$cli"
 sha=$(sha256sum "$binary" | cut -d' ' -f1)
 side_tmp=$(mktemp "$sidecar.tmp.XXXXXX") ||
   fail "cannot create a temporary file beside $sidecar"
+# Provenance: the source commit this binary was built from, and whether the
+# working tree had uncommitted changes. The supervisor reads only the keys it
+# knows; these two are for the refresh command and for a human reading the file.
+commit=$src_commit
+dirty=no
+[ -n "$src_status" ] && dirty=yes
 {
   echo "mode=embedded"
   echo "sha256=$sha"
   echo "wasm=$wasm"
+  echo "commit=$commit"
+  echo "dirty=$dirty"
 } >"$side_tmp" && chmod 644 "$side_tmp" && mv -f -- "$side_tmp" "$sidecar" ||
   { rm -f -- "$side_tmp"; fail "cannot write the sidecar $sidecar"; }
 promoted_ok=1
-rm -rf -- "$backup"
+
+# Keep the replaced pair as the single rollback candidate in $promoted/previous,
+# but only when it is self-consistent: its sidecar's sha256 must name its binary.
+# An inconsistent or absent previous pair is not kept. The directory is replaced
+# on each promotion, never accumulated, because a debug binary is about 180 MB.
+old_sha=$(sed -n 's/^sha256=//p' "$backup/${sidecar##*/}" 2>/dev/null | head -n 1) || old_sha=
+old_bin=$(sha256sum "$backup/${binary##*/}" 2>/dev/null | cut -d' ' -f1) || old_bin=
+if [ -n "$old_sha" ] && [ "$old_sha" = "$old_bin" ] &&
+  rm -rf -- "$promoted/previous" && mv -- "$backup" "$promoted/previous" 2>/dev/null; then
+  echo "==> previous verified pair kept in $promoted/previous (rollback candidate)"
+else
+  rm -rf -- "$backup"
+  echo "==> no verified previous pair to keep"
+fi
 echo "==> embedded frontend verified ($wasm); promoted to $binary and recorded in $sidecar"

@@ -100,7 +100,10 @@
 # The supervisor keeps its own files under $STATE_BASE/supervisor: the launch
 # record (a key<TAB>value file), the instance log, the lifecycle lock, and the
 # start/run/stop/restart verbs take an advisory flock on that directory, so
-# two lifecycle operations can never interleave.
+# two lifecycle operations can never interleave. It also keeps the state-writer
+# file: the commit and sha256 of the last build started over this state. Every
+# start, run and restart refuses a build whose commit does not descend from it,
+# whether or not an instance is running.
 #
 # Which state files a restart must preserve, and therefore backs up, is the
 # compared snapshot: regular files under the STATE_ROOTS directories (SlashIt's
@@ -227,6 +230,7 @@ fi
 
 SUP_DIR=$STATE_BASE/supervisor
 RECORD=$SUP_DIR/instance
+STATE_WRITER=$SUP_DIR/state-writer
 CHILD_PID=$SUP_DIR/child.pid
 INSTANCE_LOG=$SUP_DIR/instance.log
 LOCK=$SUP_DIR/lifecycle.lock
@@ -522,10 +526,17 @@ signal_target() { # SIGNAL
   kill -"$1" "$TARGET_PID" 2>/dev/null
 }
 
-# Provenance: the commit of the checkout the binary was built in, resolved
-# through that checkout's own .git. The value is recorded at launch time.
+# Provenance: the commit the binary was built from. A verified embedded sidecar
+# names it (scripts/build-dogfood-app.sh records the commit it built); a binary
+# without one falls back to the HEAD of the checkout it sits in. The value is
+# recorded at launch time.
 binary_commit() {
   local dir=$1 top commit
+  frontend_mode
+  if [ "$FRONTEND_MODE" = embedded ]; then
+    commit=$(sed -n 's/^commit=//p' "$BINARY.frontend" 2>/dev/null | head -n 1)
+    case $commit in '' | unknown) ;; *) printf '%s\n' "$commit"; return 0 ;; esac
+  fi
   top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
   commit=$(git -C "$top" rev-parse HEAD 2>/dev/null) || return 1
   printf '%s\n' "$commit"
@@ -696,6 +707,7 @@ BINARY           ${BINARY:-"unresolved (no workspace checkout resolved; set SLAS
 CLI              ${CLI_BIN:-"<no slashit CLI beside the binary; set SLASHIT_DOGFOOD_CLI>"}
 SOCKET           $SOCKET
 ENDPOINT         $ENDPOINT
+STATE_WRITER     $STATE_WRITER
 EOF
 }
 
@@ -755,6 +767,39 @@ frontend_report() {
   esac
 }
 
+# The last build that wrote state. The launch record is removed on stop, so it
+# cannot protect a stopped instance; this file stays with the state. It names the
+# commit and sha256 of the last build started over this state, and is replaced by
+# rename before every spawn. A launch whose commit does not descend from it is
+# refused, running or stopped: restoring an older executable does not make state
+# a newer one wrote safe for it, and no backward compatibility is assumed. A
+# build of unknown commit is refused once the file exists, and does not create it.
+LAUNCH_COMMIT=unknown
+state_writer_gate() {
+  local writer
+  LAUNCH_COMMIT=$(binary_commit "$(dirname "$BINARY")" 2>/dev/null) || LAUNCH_COMMIT=unknown
+  [ -n "$LAUNCH_COMMIT" ] || LAUNCH_COMMIT=unknown
+  [ -e "$STATE_WRITER" ] || return 0
+  writer=$(sed -n 's/^commit=//p' "$STATE_WRITER" 2>/dev/null | head -n 1)
+  [ -n "$writer" ] || refuse "$STATE_WRITER names no commit, so no build can be proven safe for this state"
+  [ "$writer" != "$LAUNCH_COMMIT" ] || return 0
+  [ "$LAUNCH_COMMIT" != unknown ] ||
+    refuse "the state was last written by commit $writer, and the commit of $BINARY is unknown; an older build must never run over newer state"
+  git -C "$(dirname "$BINARY")" merge-base --is-ancestor "$writer" "$LAUNCH_COMMIT" 2>/dev/null ||
+    refuse "commit $LAUNCH_COMMIT of $BINARY does not provably descend from commit $writer, the last build that wrote this state; an older build must never run over newer state. After a JJ rewrite (squash, rebase, amend): remove $STATE_WRITER only if no newer build has written this state (verified by the owner)"
+}
+
+write_state_writer() {
+  [ "$LAUNCH_COMMIT" != unknown ] || return 0
+  local tmp
+  tmp=$(mktemp "$STATE_WRITER.tmp.XXXXXX" 2>/dev/null) || return 1
+  printf 'commit=%s\nsha256=%s\nbinary=%s\nwritten_at=%s\n' \
+    "$LAUNCH_COMMIT" "$LAUNCH_SHA" "$BINARY" "$(date -u +%FT%TZ)" >"$tmp" &&
+    mv -f -T "$tmp" "$STATE_WRITER" && return 0
+  rm -f "$tmp"
+  return 1
+}
+
 launch_gates() {
   [ -n "$CLI_BIN" ] ||
     refuse "cannot verify the endpoint: no \`slashit\` CLI is available (it normally sits beside the binary; set SLASHIT_DOGFOOD_CLI) — a launch refuses an unverified control channel"
@@ -782,6 +827,7 @@ launch_gates() {
     invalid) refuse "$BINARY.frontend declares an unknown frontend mode" ;;
     *) frontend_ready || refuse "this is a development build, which loads $DEV_URL, and nothing answers there; start \`trunk serve\` on port 1420, or build a self-contained binary with scripts/build-dogfood-app.sh" ;;
   esac
+  state_writer_gate
 }
 
 # A start that fails after its spawn must not leave the child running untracked.
@@ -855,10 +901,10 @@ cmd_start() {
   mkdir -p "$RUNTIME_BASE" 2>/dev/null
   chmod 700 "$STATE_BASE" "$RUNTIME_BASE" 2>/dev/null
   rm -f "$CHILD_PID"
-  # The provenance lookup runs before the spawn, so no git call sits between the
-  # child's start and its provisional record.
-  local commit=unknown
-  commit=$(binary_commit "$(dirname "$BINARY")" 2>/dev/null) || commit=unknown
+  # The provenance lookup ran in launch_gates, before the spawn, so no git call
+  # sits between the child's start and its provisional record.
+  local commit=$LAUNCH_COMMIT
+  write_state_writer || refuse "cannot write $STATE_WRITER; nothing was started"
 
   {
     echo "=== $(date -u +%FT%TZ) start by $SELF (user $uid)"
@@ -979,8 +1025,8 @@ EOF
   mkdir -p "$STATE_BASE/config" "$STATE_BASE/data" "$STATE_BASE/cache" "$SUP_DIR" "$RUNTIME_BASE" 2>/dev/null
   chmod 700 "$STATE_BASE" "$RUNTIME_BASE" 2>/dev/null
 
-  local commit=unknown
-  commit=$(binary_commit "$(dirname "$BINARY")" 2>/dev/null) || commit=unknown
+  local commit=$LAUNCH_COMMIT
+  write_state_writer || refuse "cannot write $STATE_WRITER; nothing was started"
 
   {
     echo "=== $(date -u +%FT%TZ) run by $SELF for a service manager (user $uid)"

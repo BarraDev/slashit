@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=145
+EXPECTED_TOTAL=150
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -259,6 +259,8 @@ printf test >"$repo/provenance.txt"
 git -C "$repo" add provenance.txt
 git -C "$repo" commit -q -m provenance
 commit_id=$(git -C "$repo" rev-parse HEAD)
+# The sidecar names the commit the stub was "built" from, as the build script's does.
+echo "commit=$commit_id" >>"$bin_dir/slashit-ui.frontend"
 
 # Application state that a restart must preserve.
 printf 'settings v1\n' >"$state/config/slashit-app/settings.toml"
@@ -392,8 +394,8 @@ fi
 
 echo "== env"
 out=$(sv env 2>&1)
-if [ "$out" = "$(printf 'STATE_BASE       %s\nXDG_CONFIG_HOME  %s/config\nXDG_DATA_HOME    %s/data\nXDG_CACHE_HOME   %s/cache\nXDG_STATE_HOME   %s\nXDG_RUNTIME_DIR  %s\nGH_CONFIG_DIR    %s\nBINARY           %s\nCLI              %s\nSOCKET           %s\nENDPOINT         unix:%s\n' \
-  "$state" "$state" "$state" "$state" "$state" "$runtime" "$HOME/.config/gh" "$bin_dir/slashit-ui" "$stub_dir/slashit" "$socket" "$socket")" ]; then
+if [ "$out" = "$(printf 'STATE_BASE       %s\nXDG_CONFIG_HOME  %s/config\nXDG_DATA_HOME    %s/data\nXDG_CACHE_HOME   %s/cache\nXDG_STATE_HOME   %s\nXDG_RUNTIME_DIR  %s\nGH_CONFIG_DIR    %s\nBINARY           %s\nCLI              %s\nSOCKET           %s\nENDPOINT         unix:%s\nSTATE_WRITER     %s/supervisor/state-writer\n' \
+  "$state" "$state" "$state" "$state" "$state" "$runtime" "$HOME/.config/gh" "$bin_dir/slashit-ui" "$stub_dir/slashit" "$socket" "$socket" "$state")" ]; then
   ok "env prints the whole declared environment"
 else
   bad "env output does not match the declaration"; printf '%s\n' "$out" >&2
@@ -705,7 +707,7 @@ sv SLASHIT_DOGFOOD_BINARY="$sel/slashit-ui" start >/dev/null 2>&1 || bad "select
 # --version, but leaves a marker if it is ever started as the instance.
 { head -n 1 "$bin_dir/slashit-ui"; echo '[ "${1:-}" = --version ] || touch "$SLASHIT_TEST_STUB_DIR/new-build-ran"'; tail -n +2 "$bin_dir/slashit-ui"; } >"$sel/new"
 chmod +x "$sel/new"; touch -d '2000-01-01 00:00:00' "$sel/new"
-printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$(sha256sum <"$sel/new" | cut -d' ' -f1)" >"$sel/new.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\n' "$(sha256sum <"$sel/new" | cut -d' ' -f1)" "$commit_id" >"$sel/new.frontend"
 # As the build script does, the replaced pair is kept in previous/. The stub is a
 # script, so /proc/<pid>/exe names bash: the rollback copy is what proves out.
 mkdir -p "$sel/previous"; cp -p "$sel/slashit-ui" "$sel/slashit-ui.frontend" "$sel/previous/"
@@ -776,8 +778,50 @@ fi
 cleanup_instances
 rm -rf "$state/data/slashit-app"; mv "$aside/slashit-app" "$state/data/"
 rm -rf "$state/supervisor/backup/"*; rm -f "$state/supervisor/instance"
+echo "== the state-writer record refuses an older build, running or stopped"
+writer=$state/supervisor/state-writer
+sv start >/dev/null 2>&1 || bad "state-writer fixture: start failed"
+if grep -qx "commit=$commit_id" "$writer" && grep -qx "sha256=$(sha256sum <"$bin_dir/slashit-ui" | cut -d' ' -f1)" "$writer"; then
+  ok "a start records the commit and sha256 of the build it starts in the state-writer file"
+else bad "the state-writer file does not name the started build"; cat "$writer" >&2; fi
+cleanup_instances; rm -f "$state/supervisor/instance"
+# A newer build (a child commit) wrote this state; the instance is now stopped.
+printf 'newer\n' >"$repo/newer.txt"; git -C "$repo" add newer.txt; git -C "$repo" commit -q -m newer
+newer=$(git -C "$repo" rev-parse HEAD)
+printf 'commit=%s\nsha256=feed\n' "$newer" >"$writer"
+writer_sum=$(sha256sum <"$writer"); sums_before=$(state_sums)
+out=$(sv start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not provably descend from commit $newer"* ]] && [ -z "$(stub_pid)" ] &&
+  [ ! -e "$stub_dir/environ" ] && [ "$(sha256sum <"$writer")" = "$writer_sum" ] && [ "$sums_before" = "$(state_sums)" ]; then
+  ok "a stopped instance's state written by a newer commit refuses an older build: nothing runs, state and record unchanged"
+else bad "an older build was not refused over newer state (exit $st)"; printf '%s\n' "$out" >&2; fi
+# A JJ rewrite (squash, rebase, amend) also fails the descent rule; the refusal
+# names the file and the one condition under which removing it is safe.
+if [[ "$out" == *"remove $writer only if no newer build has written this state (verified by the owner)"* ]]; then
+  ok "the descent refusal names the state-writer file and when removing it is safe"
+else bad "the descent refusal gives no remedy naming $writer"; printf '%s\n' "$out" >&2; fi
+# The same build under its descendant commit is accepted and becomes the writer.
+fwd=$repo/target/forward
+git -C "$repo" commit -q --allow-empty -m newest; newest=$(git -C "$repo" rev-parse HEAD)
+mkdir -p "$fwd"; cp -p "$bin_dir/slashit-ui" "$fwd/slashit-ui"
+sed "s/^commit=.*/commit=$newest/" "$bin_dir/slashit-ui.frontend" >"$fwd/slashit-ui.frontend"
+out=$(sv SLASHIT_DOGFOOD_BINARY="$fwd/slashit-ui" start 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qx "commit=$newest" "$writer" && [ -n "$(stub_pid)" ]; then
+  ok "a build that descends from the state writer starts and becomes the new writer"
+else bad "a descendant build was refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+pre=$(stub_pid); sums_before=$(state_sums)
+out=$(sv restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not provably descend from commit $newest"* ]] && [ -n "$pre" ] &&
+  [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null && grep -qx "commit=$newest" "$writer" && [ "$sums_before" = "$(state_sums)" ]; then
+  ok "a restart onto an older build is refused before the stop; the newer instance keeps running and the state is unchanged"
+else bad "a restart onto an older build was not refused before the stop (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances; rm -f "$state/supervisor/instance" "$writer"
+rm -rf "$fwd"
+git -C "$repo" reset -q --hard "$commit_id"
+
 echo "== frontend mode: an embedded build needs no server; a development build needs its dev server"
-fe=$work/frontend
+# Inside the git checkout, so a development build (no sidecar) still has a commit.
+fe=$repo/target/frontend
 mkdir -p "$fe"
 cp "$bin_dir/slashit-ui" "$fe/slashit-ui"
 # Backdate the fixture binary: the stale-instance check compares whole-second
@@ -786,7 +830,7 @@ cp "$bin_dir/slashit-ui" "$fe/slashit-ui"
 touch -d '2000-01-01 00:00:00' "$fe/slashit-ui"
 fe_sha=$(sha256sum "$fe/slashit-ui" | cut -d' ' -f1)
 fe_dead=http://127.0.0.1:9/
-printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\n' "$fe_sha" >"$fe/slashit-ui.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
 
 out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start 2>&1)
 expect pass "an embedded build starts with no dev server answering" "$out" $?
@@ -806,7 +850,7 @@ expect fail "a development build without its dev server is refused, not started 
 cleanup_instances
 # A running instance whose frontend record is then lost (a development build
 # now, with no server) must be reported as degraded, not healthy.
-printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\n' "$fe_sha" >"$fe/slashit-ui.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
 sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start >/dev/null 2>&1 || bad "degraded-verify fixture: start failed"
 rm -f "$fe/slashit-ui.frontend"
 out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" verify 2>&1); st=$?

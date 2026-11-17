@@ -40,6 +40,9 @@ cat >"$work/bin/cargo" <<'STUB'
 mkdir -p target/debug
 case " $* " in
   *" tauri "*)
+    # Simulate source changes while the build runs: a commit, or a new file.
+    [ -z "${STUB_COMMIT_DURING:-}" ] || git commit -q --allow-empty -m during-build
+    [ -z "${STUB_TOUCH_DURING:-}" ] || : >during-build.txt
     if [ -n "${STUB_NO_EMBED:-}" ]; then printf 'no assets here\n' >target/debug/slashit-ui
     else printf 'ELF...dogfood_test_bg.wasm...%s\n' "${STUB_BUILD_ID:-}" >target/debug/slashit-ui; fi ;;
   *" -p slashit "*) printf '#!/bin/sh\necho cli\n' >target/debug/slashit; chmod +x target/debug/slashit ;;
@@ -79,6 +82,18 @@ now=$(sha256sum "$repo/target/dogfood/slashit-ui" | cut -d' ' -f1)
 if [ "$now" = "$want" ] && grep -qx "sha256=$want" "$repo/target/dogfood/slashit-ui.frontend"; then
   ok "a later overwrite of target/debug leaves the promoted binary and sidecar valid"
 else bad "promoted binary changed after a target/debug overwrite"; fi
+
+# 2b. Rollback candidate: a successful rebuild keeps the replaced pair, which
+#     was self-consistent, in target/dogfood/previous/ and records provenance.
+old_want=$want
+out=$(STUB_BUILD_ID=second run_build); st=$?
+want=$(sha256sum "$repo/target/dogfood/slashit-ui" 2>/dev/null | cut -d' ' -f1)
+if [ "$st" -eq 0 ] && [ "$want" != "$old_want" ] &&
+  [ "$(sha256sum "$repo/target/dogfood/previous/slashit-ui" 2>/dev/null | cut -d' ' -f1)" = "$old_want" ] &&
+  grep -qx "sha256=$old_want" "$repo/target/dogfood/previous/slashit-ui.frontend" &&
+  grep -qE '^commit=' "$repo/target/dogfood/slashit-ui.frontend" && grep -qE '^dirty=' "$repo/target/dogfood/slashit-ui.frontend"; then
+  ok "a successful rebuild keeps the replaced, verified pair as the rollback candidate, and the sidecar records provenance"
+else bad "previous verified pair was not kept (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 # The last promoted pair must stay consistent: the binary and the sidecar that
 # vouches for its sha256 are both the previous ones.
@@ -132,6 +147,50 @@ if [ "$st" -ne 0 ] && [[ "$out" == *"previous promoted pair is restored"* ]] &&
   [ -z "$(find "$repo/target/dogfood" -name '*.tmp.*' -print -quit)" ]; then
   ok "a failed sidecar promotion after the binary and CLI were replaced restores all three"
 else bad "partial promotion left the promoted pair inconsistent (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# 8. A build in a linked worktree promotes into the checkout that owns the common
+#    .git (where the supervisor launches from), and records the worktree's commit.
+main=$work/wt-main
+mkdir -p "$main/scripts" "$main/src-tauri"
+cp "$src_script" "$main/scripts/build-dogfood-app.sh"
+cp "$repo/src-tauri/tauri.conf.json" "$main/src-tauri/"
+printf 'target/\ndist/\n' >"$main/.gitignore"
+git -C "$main" init -q
+git -C "$main" config user.name "Build Test"; git -C "$main" config user.email build-test@example.invalid
+git -C "$main" add -A; git -C "$main" commit -qm base
+git -C "$main" worktree add -q "$work/wt-linked" -b linked 2>/dev/null
+echo change >"$work/wt-linked/f"; git -C "$work/wt-linked" add f; git -C "$work/wt-linked" commit -qm linked
+wt_head=$(git -C "$work/wt-linked" rev-parse HEAD)
+out=$(cd "$work/wt-linked" && env PATH="$work/bin:$PATH" bash scripts/build-dogfood-app.sh 2>&1); st=$?
+if [ "$st" -eq 0 ] && [ -x "$main/target/dogfood/slashit-ui" ] && [ ! -e "$work/wt-linked/target/dogfood" ] &&
+  grep -qx "commit=$wt_head" "$main/target/dogfood/slashit-ui.frontend" &&
+  grep -qx "sha256=$(sha256sum "$main/target/dogfood/slashit-ui" | cut -d' ' -f1)" "$main/target/dogfood/slashit-ui.frontend"; then
+  ok "a build in a linked worktree promotes into the main checkout's target/dogfood with the worktree's commit"
+else bad "linked-worktree build promoted to the wrong place (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# 9. Provenance: the sidecar names the commit the build started from, and the
+#    build is refused when HEAD or the working-tree status changes during it.
+main_build() { (cd "$main" && env PATH="$work/bin:$PATH" "$@" bash scripts/build-dogfood-app.sh) 2>&1; }
+pre_head=$(git -C "$main" rev-parse HEAD)
+out=$(main_build STUB_BUILD_ID=clean); st=$?
+if [ "$st" -eq 0 ] && grep -qx "commit=$pre_head" "$main/target/dogfood/slashit-ui.frontend" &&
+  grep -qx 'dirty=no' "$main/target/dogfood/slashit-ui.frontend" && [ -f "$main/target/dogfood/previous/slashit-ui" ]; then
+  ok "an unchanged source records the pre-build HEAD and dirty=no"
+else bad "clean build provenance is wrong (exit $st)"; printf '%s\n' "$out" >&2; fi
+dog_sums() { (cd "$main/target/dogfood" && sha256sum slashit-ui slashit slashit-ui.frontend previous/slashit-ui previous/slashit-ui.frontend 2>&1); }
+before=$(dog_sums); pre_head=$(git -C "$main" rev-parse HEAD)
+out=$(main_build STUB_BUILD_ID=moved STUB_COMMIT_DURING=1); st=$?
+post_head=$(git -C "$main" rev-parse HEAD)
+if [ "$st" -ne 0 ] && [ "$post_head" != "$pre_head" ] && [[ "$out" == *"$pre_head"* ]] && [[ "$out" == *"$post_head"* ]] &&
+  [[ "$out" == *"changed during the build"* ]] && [ "$(dog_sums)" = "$before" ]; then
+  ok "a commit during the build is refused, naming both commits; the promoted pair and previous build are unchanged"
+else bad "a commit during the build was not refused cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
+before=$(dog_sums)
+out=$(main_build STUB_BUILD_ID=touched STUB_TOUCH_DURING=1); st=$?
+rm -f "$main/during-build.txt"
+if [ "$st" -ne 0 ] && [[ "$out" == *"changed during the build"* ]] && [[ "$out" == *"during-build.txt"* ]] && [ "$(dog_sums)" = "$before" ]; then
+  ok "an untracked file created during the build is refused; the promoted pair and previous build are unchanged"
+else bad "a file created during the build was not refused cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 echo "$pass passed, $fails failed"
 [ "$fails" -eq 0 ]
