@@ -3,7 +3,8 @@
 # Hermetic test of scripts/release-bump.sh in disposable fixture repositories.
 # Cargo is a stub (SLASHIT_RELEASE_CARGO, kept so each run can pick its own stub),
 # so nothing is compiled and no lockfile is rewritten by a real resolver. A rename
-# failure is injected with a test-only mv shim first on PATH.
+# failure, or a SIGKILL just before or after one rename, is injected with a
+# test-only mv shim first on PATH.
 #
 # usage: scripts/test-release-bump.sh
 set -uo pipefail
@@ -48,13 +49,29 @@ cat >"$work/cargo-crash" <<'STUB'
 echo "written by cargo" >Cargo.lock
 kill -9 "$PPID"
 STUB
+# Writes Cargo.lock and succeeds.
+cat >"$work/cargo-write" <<'STUB'
+#!/usr/bin/env bash
+echo "written by cargo" >Cargo.lock
+STUB
+# Writes Cargo.lock; the --locked check that follows kills the bump script.
+cat >"$work/cargo-crash-locked" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *" --locked "*) kill -9 "$PPID"; exit 1 ;; esac
+echo "written by cargo" >Cargo.lock
+STUB
 chmod +x "$work"/cargo-*
-# A mv that fails only when the destination is $MV_FAIL_TARGET.
+# A mv that fails when the destination is $MV_FAIL_TARGET, and SIGKILLs its parent
+# (the script) $MV_KILL (before|after) renaming onto $MV_KILL_TARGET.
 mkdir "$work/shim"
 cat >"$work/shim/mv" <<'STUB'
 #!/usr/bin/env bash
 for last; do :; done
-[ "$last" = "$MV_FAIL_TARGET" ] && exit 1
+[ "$last" = "${MV_FAIL_TARGET-}" ] && exit 1
+if [ "$last" = "${MV_KILL_TARGET-}" ]; then
+  [ "$MV_KILL" = before ] && { kill -9 "$PPID"; exit 1; }
+  "$REAL_MV" "$@"; st=$?; kill -9 "$PPID"; exit "$st"
+fi
 exec "$REAL_MV" "$@"
 STUB
 chmod +x "$work/shim/mv"
@@ -115,6 +132,19 @@ repo=$work/repo
 make_repo "$repo" 0.0.3
 run() { # args...: run the script in the fixture with the stub cargo
   SLASHIT_RELEASE_CARGO=${CARGO_STUB:-$work/cargo-ok} bash "$src" "$@" "$repo" 2>&1
+}
+# Runs the script with the mv shim SIGKILLing it $1 (before|after) the rename onto
+# $2; the subshell keeps the shell's "Killed" notice out of the output.
+killed_at() { # before|after destination args...
+  local when=$1 dest=$2; shift 2
+  (PATH="$work/shim:$PATH" REAL_MV="$real_mv" MV_KILL="$when" MV_KILL_TARGET="$dest" run "$@") >/dev/null 2>&1
+}
+journal_left() { [ -d "$repo/.release-bump-journal" ]; }
+# Runs the hand-recovery command that --recover printed (in $out) for file $1.
+follow_instruction() { # path
+  local cmd
+  cmd=$(grep -E "^    (cp -p -- '[^']*' |rm -- )'$1'" <<<"$out")
+  [ -n "$cmd" ] && (cd "$repo" && eval "$cmd")
 }
 
 echo "== dry run is read-only and reports the bump"
@@ -199,7 +229,9 @@ done
 [ ! -e "$repo/Cargo.lock" ] && ok "a Cargo.lock that did not exist is not left behind" || bad "Cargo.lock was left behind"
 
 echo "== a signal during cargo restores everything and exits non-zero"
-for sig in TERM HUP; do
+# Job control, so the background run does not start with SIGINT ignored.
+set -m
+for sig in INT TERM HUP; do
   make_repo "$repo" 0.0.3
   printf 'original lock\n' >"$repo/Cargo.lock"
   before=$(digest "$repo")
@@ -214,27 +246,182 @@ for sig in TERM HUP; do
     ok "SIG$sig mid-cargo: exit $st, fixture digest unchanged, no journal left"
   else bad "SIG$sig did not restore (exit $st)"; cat "$work/sig.out" >&2; fi
 done
+set +m
 
-echo "== a crashed run leaves a journal that blocks the next run and --recover clears"
+echo "== a run killed inside cargo leaves a journal; --recover will not guess who changed Cargo.lock"
+for have in with without; do
+  make_repo "$repo" 0.0.3
+  [ "$have" = with ] && printf 'original lock\n' >"$repo/Cargo.lock"
+  before=$(digest "$repo")
+  (CARGO_STUB="$work/cargo-crash" run --apply 0.0.4) >/dev/null 2>&1
+  journal_left && [ "$before" != "$(digest "$repo")" ] &&
+    ok "$have Cargo.lock: a SIGKILLed run leaves the journal and changed files" || bad "$have Cargo.lock: the crash did not leave a journal"
+  crashed=$(digest "$repo")
+  if [ "$have" = with ]; then
+    out=$(run --apply 0.0.5); st=$?
+    if [ "$st" -eq 1 ] && [[ "$out" == *"--recover"* ]] && [ "$crashed" = "$(digest "$repo")" ]; then
+      ok "a later apply refuses and points to --recover without touching anything"
+    else bad "apply was not blocked by the journal (exit $st)"; printf '%s\n' "$out" >&2; fi
+    out=$(run --dry-run 0.0.4); st=$?
+    [ "$st" -eq 1 ] && ok "so does --dry-run" || bad "--dry-run ignored the journal (exit $st)"
+  fi
+  for attempt in first repeated; do
+    out=$(run --recover); st=$?
+    if [ "$st" -eq 1 ] && [[ "$out" == *"Cargo.lock differs from its original, and the run stopped before recording"* ]] &&
+      [ "$crashed" = "$(digest "$repo")" ]; then
+      ok "$have Cargo.lock, $attempt --recover: refuses the unrecorded Cargo.lock and changes nothing"
+    else bad "$have Cargo.lock, $attempt --recover did not refuse cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
+  done
+  follow_instruction Cargo.lock && out=$(run --recover); st=$?
+  if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then
+    ok "$have Cargo.lock: after the printed command for Cargo.lock, --recover restores the original fixture digest"
+  else bad "$have Cargo.lock: the printed instruction did not lead to recovery (exit $st)"; printf '%s\n' "$out" >&2; fi
+done
+out=$(run --recover); st=$?
+[ "$st" -eq 1 ] && ok "--recover with no journal refuses" || bad "--recover without a journal returned $st"
+
+echo "== an edit made after a SIGKILL is never overwritten by --recover"
+# Killed just after Cargo.toml is renamed: tauri.conf.json, package.json,
+# package-lock.json and Cargo.toml hold the new content, the crates the original.
+for change in edit-written delete-written edit-unreached; do
+  make_repo "$repo" 0.0.3
+  printf 'original lock\n' >"$repo/Cargo.lock"
+  before=$(digest "$repo")
+  killed_at after Cargo.toml --apply 0.0.4
+  case $change in
+    edit-written) f=package.json; sed -i 's/"name": "e2e"/"name": "operator"/' "$repo/$f"; want="$f differs from both" ;;
+    delete-written) f=package.json; rm -- "${repo:?}/package.json"; want="$f was deleted" ;;
+    edit-unreached) f=crates/b/Cargo.toml; printf '# operator\n' >>"$repo/$f"; want="$f differs from both" ;;
+  esac
+  edited=$(digest "$repo")
+  for attempt in first repeated; do
+    out=$(run --recover); st=$?
+    if [ "$st" -eq 1 ] && [[ "$out" == *"$want"* ]] && [[ "$out" == *"nothing was changed"* ]] && journal_left &&
+      [ "$edited" = "$(digest "$repo")" ]; then
+      ok "$change ($f), $attempt --recover: refuses, names the file, and the whole fixture digest is unchanged"
+    else bad "$change ($f), $attempt --recover overwrote or did not refuse (exit $st)"; printf '%s\n' "$out" >&2; fi
+  done
+  follow_instruction "$f" && out=$(run --recover); st=$?
+  if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then
+    ok "$change: after the printed command for $f, --recover restores the rest"
+  else bad "$change: the printed instruction did not lead to recovery (exit $st)"; printf '%s\n' "$out" >&2; fi
+done
+
+echo "== SIGKILL just before or just after each rename, then --recover"
+for f in src-tauri/tauri.conf.json package.json package-lock.json Cargo.toml src-tauri/Cargo.toml crates/a/Cargo.toml crates/b/Cargo.toml; do
+  for when in before after; do
+    make_repo "$repo" 0.0.3
+    printf 'original lock\n' >"$repo/Cargo.lock"
+    before=$(digest "$repo")
+    killed_at "$when" "$f" --apply 0.0.4
+    journal_left || bad "$when $f: no journal left"
+    out=$(run --recover); st=$?
+    if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then
+      ok "killed $when renaming $f: --recover restores the original fixture digest (no staged file left)"
+    else bad "killed $when renaming $f: not recovered (exit $st)"; printf '%s\n' "$out" >&2; fi
+  done
+done
+
+echo "== SIGKILL around the journal's own rename"
+make_repo "$repo" 0.0.3
+killed_at before .release-bump-journal --apply 0.0.4
+out=$(run --recover); st=$?
+v=$(grep -rl '0\.0\.4' "$repo" --include='*.json' --include='*.toml' | grep -v '\.bump\.' || true)
+if [ "$st" -eq 1 ] && [[ "$out" == *"nothing to recover"* ]] && [ -z "$v" ] && run --apply 0.0.4 >/dev/null; then
+  ok "killed before the journal exists: no managed file changed, and a new --apply succeeds"
+else bad "killed before the journal: unexpected state (exit $st, changed: ${v:-none})"; printf '%s\n' "$out" >&2; fi
 make_repo "$repo" 0.0.3
 printf 'original lock\n' >"$repo/Cargo.lock"
 before=$(digest "$repo")
-CARGO_STUB="$work/cargo-crash" run --apply 0.0.4 >/dev/null
-[ -d "$repo/.release-bump-journal" ] && [ "$before" != "$(digest "$repo")" ] &&
-  ok "a SIGKILLed run leaves the journal and changed files" || bad "the crash did not leave a journal"
-crashed=$(digest "$repo")
-out=$(run --apply 0.0.5); st=$?
-if [ "$st" -eq 1 ] && [[ "$out" == *"--recover"* ]] && [ "$crashed" = "$(digest "$repo")" ]; then
-  ok "a later apply refuses and points to --recover without touching anything"
-else bad "apply was not blocked by the journal (exit $st)"; printf '%s\n' "$out" >&2; fi
-out=$(run --dry-run 0.0.4); st=$?
-[ "$st" -eq 1 ] && ok "so does --dry-run" || bad "--dry-run ignored the journal (exit $st)"
+killed_at after .release-bump-journal --apply 0.0.4
 out=$(run --recover); st=$?
-if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then
-  ok "--recover restores the original fixture digest and removes the journal"
-else bad "--recover did not restore (exit $st)"; printf '%s\n' "$out" >&2; fi
+if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then ok "killed right after the journal is committed: --recover restores the original digest"
+else bad "killed after the journal commit: not recovered (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== Cargo.lock written by cargo: recorded, restored, and still protected"
+for when in before after; do
+  make_repo "$repo" 0.0.3
+  printf 'original lock\n' >"$repo/Cargo.lock"
+  before=$(digest "$repo")
+  CARGO_STUB="$work/cargo-write" killed_at "$when" .release-bump-journal/lock.post --apply 0.0.4
+  out=$(run --recover); st=$?
+  if [ "$when" = before ] && [ "$st" -eq 1 ] && [[ "$out" == *"Cargo.lock differs from its original, and the run stopped before recording"* ]]; then
+    ok "killed after cargo wrote Cargo.lock but before its hash was recorded: refused as ambiguous"
+  elif [ "$when" = after ] && [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then
+    ok "killed right after its hash was recorded: --recover restores the original Cargo.lock"
+  else bad "killed $when recording Cargo.lock: wrong outcome (exit $st)"; printf '%s\n' "$out" >&2; fi
+done
+make_repo "$repo" 0.0.3
+before=$(digest "$repo")
+(CARGO_STUB="$work/cargo-crash-locked" run --apply 0.0.4) >/dev/null 2>&1
 out=$(run --recover); st=$?
-[ "$st" -eq 1 ] && ok "--recover with no journal refuses" || bad "--recover without a journal returned $st"
+if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ] && [ ! -e "$repo/Cargo.lock" ]; then
+  ok "a Cargo.lock that cargo created, recorded before the crash, is removed by --recover"
+else bad "a recorded new Cargo.lock was not removed (exit $st)"; printf '%s\n' "$out" >&2; fi
+make_repo "$repo" 0.0.3
+printf 'original lock\n' >"$repo/Cargo.lock"
+(CARGO_STUB="$work/cargo-crash-locked" run --apply 0.0.4) >/dev/null 2>&1
+printf 'operator lock\n' >"$repo/Cargo.lock"
+edited=$(digest "$repo")
+out=$(run --recover); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"Cargo.lock differs from both"* ]] && [ "$edited" = "$(digest "$repo")" ]; then
+  ok "an edit to Cargo.lock after its hash was recorded is refused and kept"
+else bad "an edited recorded Cargo.lock was overwritten (exit $st)"; printf '%s\n' "$out" >&2; fi
+make_repo "$repo" 0.0.3
+out=$(CARGO_STUB="$work/cargo-write" run --apply 0.0.4); st=$?
+if [ "$st" -eq 0 ] && grep -q 'written by cargo' "$repo/Cargo.lock" && ! journal_left; then
+  ok "a successful apply keeps the Cargo.lock cargo generated"
+else bad "generated Cargo.lock was not kept (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== an incomplete or corrupt journal is refused and nothing changes"
+for damage in no-manifest no-end-line truncated bad-copy missing-copy bad-lock-post old-format outside-path; do
+  make_repo "$repo" 0.0.3
+  printf 'original lock\n' >"$repo/Cargo.lock"
+  if [ "$damage" = bad-lock-post ]; then (CARGO_STUB="$work/cargo-crash-locked" run --apply 0.0.4) >/dev/null 2>&1
+  else killed_at after Cargo.toml --apply 0.0.4; fi
+  j=${repo:?}/.release-bump-journal
+  case $damage in
+    no-manifest) rm -- "${j:?}/manifest" ;;
+    no-end-line) sed -i '$d' "$j/manifest" ;;
+    truncated) sed -i '4,$d' "$j/manifest" ;;
+    bad-copy) printf 'x\n' >>"$j/1" ;;
+    missing-copy) rm -- "${j:?}/2" ;;
+    bad-lock-post) printf 'garbage\n' >"$j/lock.post" ;;
+    old-format) sed -i '1s/.*/release-bump-journal 1/' "$j/manifest" ;;
+    outside-path) sed -i 's#\tpackage\.json\(\t\|$\)#\t../outside\1#' "$j/manifest" ;;
+  esac
+  damaged=$(digest "$repo")
+  out=$(run --recover); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"incomplete or corrupt"* ]] && [ "$damaged" = "$(digest "$repo")" ] && [ ! -e "$work/outside" ]; then
+    ok "$damage: --recover refuses and the whole fixture digest is unchanged"
+  else bad "$damage: --recover guessed (exit $st)"; printf '%s\n' "$out" >&2; fi
+done
+
+echo "== --recover killed partway through can be run again"
+for when in before after; do
+  make_repo "$repo" 0.0.3
+  printf 'original lock\n' >"$repo/Cargo.lock"
+  before=$(digest "$repo")
+  killed_at after Cargo.toml --apply 0.0.4
+  killed_at "$when" package.json --recover
+  if ! journal_left; then bad "killed $when restoring package.json: the first --recover was not interrupted"; continue; fi
+  out=$(run --recover); st=$?
+  if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then
+    ok "--recover killed $when restoring package.json: a second --recover finishes and the original digest is back"
+  else bad "--recover killed $when restoring package.json: second run failed (exit $st)"; printf '%s\n' "$out" >&2; fi
+done
+
+echo "== a signal during cargo does not overwrite an edit made meanwhile"
+make_repo "$repo" 0.0.3
+rm -f "$work/started"
+SLASHIT_RELEASE_CARGO="$work/cargo-sleep" bash "$src" --apply 0.0.4 "$repo" >"$work/sig.out" 2>&1 &
+pid=$!
+for _ in $(seq 100); do [ -e "$work/started" ] && break; sleep 0.1; done
+sed -i 's/"name": "e2e"/"name": "operator"/' "$repo/package.json"
+kill -TERM "$pid"; wait "$pid"; st=$?
+if [ "$st" -ne 0 ] && grep -q '"name": "operator"' "$repo/package.json" && grep -q 'package.json differs from both' "$work/sig.out" && journal_left; then
+  ok "SIGTERM rollback refuses to overwrite package.json edited during the run and keeps the journal"
+else bad "SIGTERM rollback overwrote an edit (exit $st)"; cat "$work/sig.out" >&2; fi
 
 echo "== a leftover committed journal (.done) is removed, not restored, and does not block"
 make_repo "$repo" 0.0.3

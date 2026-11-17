@@ -64,12 +64,25 @@ committing it.
 
 Crash recovery: before the first rename, `--apply` writes a journal,
 `.release-bump-journal/`, in the repository root: a copy of every original file
-and a manifest, including whether `Cargo.lock` existed. A normal or rolled-back
-run removes it. If the process was killed without a chance to clean up, the
-journal stays and every mode refuses to run until you run
-`scripts/release-bump.sh --recover`, which restores every file from it (deleting
-a `Cargo.lock` that did not exist) and removes it. The journal is not fsynced:
-it covers a killed process, not a power cut.
+and a manifest with the SHA-256 of each original and of the content about to
+replace it, including whether `Cargo.lock` existed. A normal or rolled-back run
+removes it. If the process was killed without a chance to clean up, the journal
+stays and every mode refuses to run until you run
+`scripts/release-bump.sh --recover`. It first checks every file. A file still
+holding its original is left alone, and one holding exactly what the run wrote
+is restored (a `Cargo.lock` that did not exist is deleted). If any file holds
+something else, such as an edit made after the crash or a deletion, it changes
+nothing and prints, for each such file, the command that puts its original back;
+run those, or keep your edits and remove the journal yourself, then reconcile
+the versions by hand. `Cargo.lock` is written by cargo, so its new hash is only
+recorded once `cargo metadata` returns; a run killed while cargo was running
+leaves a `Cargo.lock` that cannot be told apart from an edit, and `--recover`
+refuses it the same way. A journal that is missing its manifest, truncated or
+otherwise malformed is refused too. `--recover` can be killed and run again.
+
+The journal, the staged files, the restored files and the directories holding
+them are fsynced before the step that depends on them, which orders the writes
+for a power cut. That ordering has not been tested against a real power cut.
 
 The behavior above is what `scripts/test-release-bump.sh` checks, against
 disposable fixture repositories with a stub cargo. It has not been run against

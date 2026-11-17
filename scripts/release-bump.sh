@@ -18,11 +18,27 @@
 #       scripts/release-preflight.sh remains the gate before a tag exists.
 #   scripts/release-bump.sh --recover [repo-root]
 #       Crash recovery. Before the first rename, --apply writes the journal
-#       .release-bump-journal/ in the repository root (a copy of every original
-#       file and a manifest). A run killed without a chance to clean up (SIGKILL,
-#       power loss) leaves it. While it exists every mode refuses to run; --recover
-#       restores every file from it, deletes a Cargo.lock that did not exist, and
-#       then removes the journal. A successful or rolled-back run removes it itself.
+#       .release-bump-journal/ in the repository root: a copy of every original
+#       file and a manifest with the SHA-256 of each original and of the content
+#       about to replace it. A run killed without a chance to clean up (SIGKILL,
+#       power loss) leaves it. While it exists every mode refuses to run. --recover
+#       first checks every file: one still holding its original is left alone, one
+#       holding exactly what the run wrote is restored, and anything else (an edit
+#       made after the crash, a deleted file) makes it refuse, change nothing, and
+#       print how to finish by hand. Cargo.lock counts as written by the run only
+#       once its hash was recorded after cargo returned; before that a changed
+#       Cargo.lock is refused too. A missing, truncated or malformed journal is
+#       refused, never guessed at. Each restore is a rename, so an interrupted
+#       --recover can be run again. A successful or rolled-back run removes the
+#       journal itself.
+#
+# Durability: journal entries, staged files, restored files and the directories
+# holding them are fsynced (coreutils sync) before the step that relies on them.
+# This orders the writes for a power cut; it has not been tested against one.
+#
+# Signals: --apply traps SIGINT, SIGTERM and SIGHUP and rolls back (with the same
+# checks as --recover). --recover does not trap them; killing it at any point
+# leaves a state that running it again resolves.
 #
 # Files (the eleven listed in docs/releasing.md section 1, plus package-lock.json,
 # whose two root entries, "version" and packages[""].version, carry it too):
@@ -39,6 +55,7 @@ SELF=${0##*/}
 mode=${1:-}
 cargo_bin=${SLASHIT_RELEASE_CARGO:-cargo}
 journal=.release-bump-journal
+journal_format='release-bump-journal 2'
 
 usage() {
   echo "usage: $SELF --dry-run|--apply <X.Y.Z> [repo-root] | $SELF --recover [repo-root]" >&2
@@ -92,27 +109,119 @@ read_version() { # manifest file
 # Removes the journal in two steps so a kill cannot leave a manifest-less or
 # partly deleted journal: the rename is the commit point, the delete is cleanup.
 commit_journal() {
-  mv -- "$journal" "$journal.done" || { echo "$SELF: warning: could not retire $journal; remove it by hand" >&2; exit 1; }
+  mv -- "$journal" "$journal.done" && sync -- . ||
+    { echo "$SELF: warning: could not retire $journal; remove it by hand" >&2; exit 1; }
   rm -rf -- "$journal.done"
 }
 
-# Puts back every file listed in the journal manifest (also removing any staged
-# file left beside it). Succeeds only if every file was restored.
-restore_all() {
-  local rc=0 b p
-  while IFS=$'\t' read -r b p; do
-    [ -n "$p" ] || continue
-    if [ "$b" = - ]; then rm -f -- "$p" || rc=1; else cp -p -- "$journal/$b" "$p" || rc=1; fi
-    rm -f -- "$p".bump.*
-  done <"$journal/manifest"
-  return $rc
+# The SHA-256 of a file, "-" when it does not exist, "unreadable" when it cannot
+# be read (a directory, no permission): never equal to a recorded hash.
+hash_of() { # path
+  [ -e "$1" ] || [ -L "$1" ] || { echo -; return; }
+  local h
+  h=$(sha256sum <"$1" 2>/dev/null) || { echo unreadable; return; }
+  echo "${h%% *}"
+}
+
+bad_journal() { # reason
+  echo "$SELF: refusing: $journal is incomplete or corrupt ($1); nothing was changed." >&2
+  echo "  Recover by hand: compare each managed file with the originals kept in $journal, put back what you need, then remove $journal." >&2
+  return 1
+}
+
+# Reads the journal and decides, without changing anything, what recovery does with
+# each file: still the original (leave it), exactly what the run wrote (restore it),
+# or anything else (foreign: refuse). Cargo.lock is "what the run wrote" only if
+# its hash was recorded after cargo returned, or with $1 = trust-lock (an in-process
+# rollback whose own cargo child has exited). Fills todo (backup TAB path),
+# leftovers (staged files) and foreign (one line per file); fails, after saying
+# why, on a journal that is missing, truncated or malformed.
+classify() { # trust-lock|no
+  local b p o q s x line cur post lockpost="" n=0 count=""
+  todo=(); leftovers=(); foreign=()
+  [ -f "$journal/manifest" ] || { bad_journal "no manifest"; return 1; }
+  if [ -e "$journal/lock.post" ]; then
+    lockpost=$(cat -- "$journal/lock.post") && [[ $lockpost =~ ^[0-9a-f]{64}$ ]] ||
+      { bad_journal "lock.post is not a SHA-256"; return 1; }
+  fi
+  {
+    IFS= read -r line && [ "$line" = "$journal_format" ] || { bad_journal "unknown format '$line'"; return 1; }
+    while IFS=$'\t' read -r b p o q s x; do
+      if [ "$b" = end ] && [ -z "$o" ]; then count=$p; break; fi
+      n=$((n + 1))
+      [[ -z $x && -n $p && $p != /* && $p != -* && $p != *..* ]] &&
+        [[ $o =~ ^[0-9a-f]{64}$|^-$ && $q =~ ^[0-9a-f]{64}$|^-$ ]] &&
+        { [ "$q" != - ] || [ "$p" = Cargo.lock ]; } &&
+        { [ "$s" = - ] || [[ $s == "$p".bump.?????? ]]; } &&
+        if [ "$b" = - ]; then [ "$o" = - ] && [ "$p" = Cargo.lock ]; else [[ $b =~ ^[0-9]+$|^lock$ ]] && [ "$(hash_of "$journal/$b")" = "$o" ]; fi ||
+        { bad_journal "entry $n is malformed or its original copy does not match"; return 1; }
+      [ "$s" = - ] || leftovers+=("$s")
+      post=$q
+      [ "$p" = Cargo.lock ] && post=${lockpost:--}
+      cur=$(hash_of "$p")
+      if [ "$cur" = "$o" ]; then
+        continue
+      elif { [ "$post" != - ] && [ "$cur" = "$post" ]; } || { [ "$p" = Cargo.lock ] && [ "$1" = trust-lock ]; }; then
+        todo+=("$b"$'\t'"$p")
+      elif [ "$cur" = - ]; then
+        foreign+=("$p"$'\t'"$b"$'\t'"was deleted after the run stopped")
+      elif [ "$post" = - ]; then
+        foreign+=("$p"$'\t'"$b"$'\t'"differs from its original, and the run stopped before recording what cargo wrote, so a cargo change cannot be told from an edit")
+      else
+        foreign+=("$p"$'\t'"$b"$'\t'"differs from both its original and what the run wrote")
+      fi
+    done
+  } <"$journal/manifest"
+  [ -n "$count" ] && [ "$count" = "$n" ] || { bad_journal "manifest ends early"; return 1; }
+}
+
+# Explains a refusal caused by foreign files, with the commands to finish by hand.
+report_foreign() {
+  local e p b
+  echo "$SELF: refusing: automatic recovery would overwrite changes it did not make; nothing was changed." >&2
+  for e in "${foreign[@]}"; do echo "  ${e%%$'\t'*} ${e##*$'\t'}" >&2; done
+  echo "To finish by hand, either put back the original of each file above and run $SELF --recover again:" >&2
+  for e in "${foreign[@]}"; do
+    p=${e%%$'\t'*}; e=${e#*$'\t'}; b=${e%%$'\t'*}
+    if [ "$b" = - ]; then echo "    rm -- '$p'    # it did not exist before the run" >&2
+    else echo "    cp -p -- '$journal/$b' '$p'" >&2; fi
+  done
+  echo "or keep the tree as it is: remove $journal yourself and reconcile the versions by hand." >&2
+}
+
+# Restores every file in todo through a fsynced temporary and a rename, so a kill
+# leaves each file either as the run wrote it or as the original, then removes the
+# staged files. Succeeds only if every file was restored.
+restore_files() {
+  local e b p s
+  for e in "${todo[@]}"; do
+    b=${e%%$'\t'*}; p=${e#*$'\t'}
+    if [ "$b" = - ]; then
+      rm -f -- "$p" || return 1
+    else
+      cp -p -- "$journal/$b" "$p.release-bump-restore" && sync -- "$p.release-bump-restore" &&
+        mv -f -- "$p.release-bump-restore" "$p" || return 1
+    fi
+    sync -- "$(dirname -- "$p")" || return 1
+  done
+  for s in "${leftovers[@]}"; do rm -f -- "$s"; done
+}
+
+# Restores from the journal and removes it. Keeps it, after saying why, when the
+# journal is unreadable or a file changed outside the run.
+undo() { # trust-lock|no
+  classify "$1" || return 1
+  [ "${#foreign[@]}" -eq 0 ] || { report_foreign; return 1; }
+  restore_files && commit_journal
 }
 
 if [ "$mode" = --recover ]; then
-  [ -f "$journal/manifest" ] || refuse "no $journal/manifest here; nothing to recover"
-  restore_all || refuse "could not restore every file; the originals remain in $journal"
+  [ -e "$journal" ] || refuse "no $journal here; nothing to recover"
+  classify no || exit 1
+  [ "${#foreign[@]}" -eq 0 ] || { report_foreign; exit 1; }
+  restore_files || refuse "could not restore every file; the originals remain in $journal; run $SELF --recover again"
   commit_journal
-  echo "$SELF: restored every file from $journal and removed it"
+  echo "$SELF: restored ${#todo[@]} file(s) from $journal and removed it"
   exit 0
 fi
 [ ! -e "$journal.done" ] || rm -rf -- "$journal.done"
@@ -160,8 +269,9 @@ echo "  CHANGELOG.md                         curated section for $target present
 # original, then renamed into place whole), and each staged file is renamed over
 # its original. 3: cargo metadata refreshes Cargo.lock and every file is read back.
 # A failure or signal in phase 2 or 3 restores everything from the journal.
-# shortcut: the journal is not fsynced, so it covers a killed process, not a power
-# cut; add sync if that ever matters.
+# Every rename is preceded by a fsynced record of both the original and the new
+# content's hash, so wherever a crash falls each file is one of the two; no
+# journal update is needed between renames.
 declare -A staged=()
 cargo_pid=""
 lock_existed=no
@@ -173,9 +283,6 @@ discard_staged() {
   rm -rf -- "$journal.tmp"
 }
 
-# Restores from the journal and removes it, or keeps it for --recover.
-undo() { restore_all && commit_journal; }
-
 # A signal runs the same recovery as a failure, then exits 128+N.
 on_signal() { # status name
   trap '' INT TERM HUP
@@ -183,7 +290,7 @@ on_signal() { # status name
   if [ ! -d "$journal" ]; then
     discard_staged
     echo "$SELF: stopped by $2 before any file was changed" >&2
-  elif undo; then
+  elif undo trust-lock; then
     echo "$SELF: stopped by $2; every file restored, nothing left changed" >&2
   else
     echo "$SELF: stopped by $2; could not restore every file, run $SELF --recover" >&2
@@ -208,16 +315,16 @@ run_cargo() {
 rollback() { # reason
   trap '' INT TERM HUP
   local n=${#renamed[@]}
-  if undo; then
+  if undo trust-lock; then
     refuse "$1; restored $n file(s), nothing left changed: ${renamed[*]:-none}"
   fi
-  refuse "$1; could not restore every file, the originals are in $journal; run $SELF --recover"
+  refuse "$1; could not restore every file, $journal is kept; run $SELF --recover"
 }
 renamed=()
 
 # Phase 1: stage. A failure here has changed nothing yet.
 for f in "${files[@]}"; do
-  t=$(mktemp "$(dirname -- "$f")/$(basename -- "$f").bump.XXXXXX") ||
+  t=$(mktemp -- "$f.bump.XXXXXX") ||
     { discard_staged; refuse "cannot create a temporary file beside $f"; }
   staged[$f]=$t
   if [ "$f" = package-lock.json ]; then
@@ -239,23 +346,28 @@ for f in "${files[@]}"; do
   else ok=0; [ "$(read_version "$f" "$t")" = "$target" ] && ok=1; fi
   [ "$ok" = 1 ] || { discard_staged; refuse "cannot stage $f with version $target"; }
 done
+sync -- "${staged[@]}" || { discard_staged; refuse "cannot flush the staged files"; }
 
-# Phase 2: write the journal whole, then rename each staged file into place.
+# Phase 2: write the journal whole, then rename each staged file into place. A
+# manifest line is: backup copy, path, original hash, new hash, staged file ("-"
+# for none; Cargo.lock's new hash goes to lock.post once cargo has written it).
 jt=$journal.tmp
 rm -rf -- "$jt"
-mkdir -- "$jt" && : >"$jt/manifest" || { discard_staged; refuse "cannot create $jt"; }
+mkdir -- "$jt" && echo "$journal_format" >"$jt/manifest" || { discard_staged; refuse "cannot create $jt"; }
 for i in "${!files[@]}"; do
   f=${files[$i]}
-  cp -p -- "$f" "$jt/$i" && printf '%s\t%s\n' "$i" "$f" >>"$jt/manifest" ||
+  cp -p -- "$f" "$jt/$i" &&
+    printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$f" "$(hash_of "$jt/$i")" "$(hash_of "${staged[$f]}")" "${staged[$f]}" >>"$jt/manifest" ||
     { discard_staged; refuse "cannot back up $f"; }
 done
 if [ "$lock_existed" = yes ]; then
-  cp -p -- Cargo.lock "$jt/lock" && printf 'lock\tCargo.lock\n' >>"$jt/manifest" ||
+  cp -p -- Cargo.lock "$jt/lock" && printf 'lock\tCargo.lock\t%s\t-\t-\n' "$(hash_of "$jt/lock")" >>"$jt/manifest" ||
     { discard_staged; refuse "cannot back up Cargo.lock"; }
 else
-  printf -- '-\tCargo.lock\n' >>"$jt/manifest"
+  printf -- '-\tCargo.lock\t-\t-\t-\n' >>"$jt/manifest"
 fi
-mv -- "$jt" "$journal" || { discard_staged; refuse "cannot create $journal"; }
+printf 'end\t%s\n' $((${#files[@]} + 1)) >>"$jt/manifest" && sync -- "$jt"/* "$jt" &&
+  mv -- "$jt" "$journal" && sync -- . || { discard_staged; refuse "cannot create $journal"; }
 for f in "${files[@]}"; do
   mv -f -- "${staged[$f]}" "$f" || rollback "cannot rename the new $f into place"
   renamed+=("$f")
@@ -265,6 +377,12 @@ done
 # Phase 3: refresh Cargo.lock and read every file back.
 run_cargo metadata --format-version 1 ||
   rollback "cargo metadata failed; Cargo.lock is not refreshed"
+# Records what cargo wrote, so --recover can tell it from a later edit.
+if [ -e Cargo.lock ]; then
+  sync -- Cargo.lock . && hash_of Cargo.lock >"$journal/lock.post.tmp" && sync -- "$journal/lock.post.tmp" &&
+    mv -- "$journal/lock.post.tmp" "$journal/lock.post" && sync -- "$journal" ||
+    rollback "cannot record the refreshed Cargo.lock in $journal"
+fi
 for f in "${files[@]}"; do
   if [ "$f" = package-lock.json ]; then
     lock_agrees "$f" "$target" || rollback "$f does not carry $target in both root entries after the rewrite"
@@ -277,5 +395,8 @@ run_cargo metadata --locked --format-version 1 ||
   rollback "Cargo.lock does not match the manifests after the bump"
 
 trap '' INT TERM HUP
+declare -A dirs=()
+for f in "${files[@]}"; do dirs[$(dirname -- "$f")]=1; done
+sync -- "${!dirs[@]}" || rollback "cannot flush the renamed files"
 commit_journal
 echo "$SELF: all ${#files[@]} files and Cargo.lock now declare $target; nothing committed or tagged"
