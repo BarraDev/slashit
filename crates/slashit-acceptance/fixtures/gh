@@ -178,6 +178,12 @@ case "$1 $2" in
                 take_state="yes"
             fi
         done
+        # `fail-issue-list-<state>` makes that listing fail the way an unreachable
+        # or refusing GitHub does, with the error on stderr and no list.
+        if [ -f "$dir/fail-issue-list-$state" ]; then
+            echo "fake gh: HTTP 503: the Issue list was scripted to fail" >&2
+            exit 1
+        fi
         if [ -f "$dir/issue-list-$state.json" ]; then
             cat "$dir/issue-list-$state.json"
         else

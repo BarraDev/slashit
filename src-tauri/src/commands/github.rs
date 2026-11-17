@@ -72,8 +72,9 @@ async fn run_gh(args: &[&str]) -> Result<serde_json::Value, String> {
     serde_json::from_str(&stdout).map_err(|e| format!("Failed to parse gh output: {}", e))
 }
 
-/// The fields every Issue read asks `gh` for.
-const ISSUE_FIELDS: &str = "number,title,body,state,labels,assignees,comments,createdAt,updatedAt";
+/// The fields every Issue read asks `gh` for. `url` is the address GitHub
+/// reports, which a transferred Issue answers at its new home.
+const ISSUE_FIELDS: &str = "number,title,body,state,labels,assignees,comments,createdAt,updatedAt,url";
 
 /// The `gh issue list --state` values. The state is part of the query, so a
 /// closed Issue is only listed when the caller asked for closed Issues.
@@ -189,19 +190,40 @@ pub async fn get_issues(repo: String, state: String) -> Result<Vec<GithubIssue>,
 
 #[tauri::command]
 pub async fn get_issue(repo: String, number: i32) -> Result<GithubIssue, String> {
-    check_gh().await?;
+    issue_from_json(&view_issue(&repo, number).await?)
+}
 
-    let json = run_gh(&[
-        "issue",
-        "view",
-        &number.to_string(),
-        "--repo",
-        &repo,
-        "--json",
-        ISSUE_FIELDS,
-    ])
-    .await?;
-    issue_from_json(&json)
+/// `gh issue view` for one Issue, as GitHub answered it.
+async fn view_issue(repo: &str, number: i32) -> Result<serde_json::Value, String> {
+    check_gh().await?;
+    run_gh(&["issue", "view", &number.to_string(), "--repo", repo, "--json", ISSUE_FIELDS]).await
+}
+
+/// Refuse an answer that does not name the Issue asked for. An Issue
+/// transferred to another repository is answered at its new address, and it
+/// may have a new number there, so the address is compared as well as the
+/// number. `advice` tells the person what to do instead.
+fn check_issue_address(
+    json: &serde_json::Value,
+    repo: &str,
+    number: u32,
+    advice: &str,
+) -> Result<(), String> {
+    let url = json.get("url").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let Ok(home) = parse_issue_url(url) else {
+        return Err(format!("GitHub did not answer with issue #{number} in {repo}"));
+    };
+    if !home.repo.eq_ignore_ascii_case(repo) {
+        return Err(format!(
+            "GitHub reports issue #{number} in {repo} at {}. {advice}",
+            home.url()
+        ));
+    }
+    let answered = json.get("number").and_then(serde_json::Value::as_u64);
+    if home.number != number || answered != Some(u64::from(number)) {
+        return Err(format!("GitHub did not answer with issue #{number} in {repo}"));
+    }
+    Ok(())
 }
 
 /// Read one Issue from GitHub through `program` (the `gh` on `PATH` in
@@ -261,30 +283,7 @@ async fn read_issue_state_within(
 fn parse_issue_state(stdout: &[u8], repo: &str, number: u32) -> Result<String, String> {
     let json: serde_json::Value = serde_json::from_slice(stdout)
         .map_err(|e| format!("GitHub's answer could not be read: {e}"))?;
-    let answered_number = json.get("number").and_then(serde_json::Value::as_u64);
-    let url = json
-        .get("url")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let Ok(home) = parse_issue_url(url) else {
-        return Err(format!(
-            "GitHub did not answer with issue #{number} in {repo}"
-        ));
-    };
-    if answered_number != Some(u64::from(number)) {
-        return Err(format!(
-            "GitHub did not answer with issue #{number} in {repo}"
-        ));
-    }
-    // An Issue transferred to another repository is answered at its new
-    // address. Storing the typed address would name the wrong repository, so
-    // the caller is told the address GitHub reports instead.
-    if home.number != number || !home.repo.eq_ignore_ascii_case(repo) {
-        return Err(format!(
-            "GitHub reports issue #{number} in {repo} at {}. Link that address instead.",
-            home.url()
-        ));
-    }
+    check_issue_address(&json, repo, number, "Link that address instead.")?;
     match json.get("state").and_then(serde_json::Value::as_str) {
         Some(state @ ("OPEN" | "CLOSED")) => Ok(state.to_string()),
         _ => Err(format!(
@@ -318,10 +317,16 @@ pub async fn create_task_from_issue(
         }
     }
 
-    let issue = get_issue(repo.clone(), issue_number).await?;
-    if issue.number != issue_number {
-        return Err(format!("GitHub did not answer with issue #{issue_number} in {repo}"));
-    }
+    // The Task names the Issue as GitHub answers for it. A transferred Issue is
+    // refused, as linking refuses it, rather than stored under the typed repository.
+    let answer = view_issue(&repo, issue_number).await?;
+    check_issue_address(
+        &answer,
+        &repo,
+        address.number,
+        "No Task was created. Load that repository to create one from it.",
+    )?;
+    let issue = issue_from_json(&answer)?;
 
     // Map labels to category/priority
     let category = map_labels_to_category(&issue.labels);
@@ -642,6 +647,31 @@ mod issue_read_tests {
         assert!(refusal.contains("did not report the state"), "{refusal}");
         let unreadable = parse_issue_state(b"not json", "o/r", 7).unwrap_err();
         assert!(unreadable.contains("could not be read"), "{unreadable}");
+    }
+
+    /// Creating a Task reads the same canonical address as linking does: a
+    /// transferred Issue is refused with its new address and the advice given,
+    /// and the Issue at its typed address is accepted.
+    #[test]
+    fn a_created_task_takes_its_issue_identity_only_from_the_canonical_address() {
+        let moved = serde_json::json!({
+            "number": 12, "url": "https://github.com/new/repo/issues/12"
+        });
+        let refusal = check_issue_address(&moved, "old/repo", 7, "No Task was created.")
+            .unwrap_err();
+        assert!(refusal.contains("https://github.com/new/repo/issues/12"), "{refusal}");
+        assert!(refusal.contains("No Task was created."), "{refusal}");
+
+        let same = serde_json::json!({
+            "number": 7, "url": "https://github.com/Old/Repo/issues/7"
+        });
+        assert!(check_issue_address(&same, "old/repo", 7, "unused").is_ok());
+
+        let renumbered = serde_json::json!({
+            "number": 8, "url": "https://github.com/old/repo/issues/8"
+        });
+        let mismatch = check_issue_address(&renumbered, "old/repo", 7, "unused").unwrap_err();
+        assert!(mismatch.contains("did not answer with issue #7"), "{mismatch}");
     }
 
     #[cfg(unix)]

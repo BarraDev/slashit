@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 //! The Issues page: browse GitHub Issues by state, keep a listing across a
-//! visit elsewhere, link an existing Task, and create a Task from an Issue
-//! once, refusing the second attempt.
+//! visit elsewhere, keep the selected Issue's title in view, link an existing
+//! Task, refuse a second Task for a linked Issue, open that Task on its board,
+//! and recover from a failed listing.
 //!
 //! The fake `gh` answers `issue list` and `issue view` from files this journey
 //! scripts, so what the page shows is what the product asked GitHub for. The
@@ -13,19 +14,28 @@ use slashit_acceptance::fake_gh::FakeGh;
 use thirtyfour::components::SelectElement;
 
 const REPOSITORY: &str = "slashit-acceptance/fixture";
+const MOVED_REPOSITORY: &str = "slashit-acceptance/moved";
 const REPOSITORY_INPUT: &str = "#issues-repo";
 const ROW: &str = "[data-testid=\"issue-row\"]";
 const COUNT: &str = "[data-testid=\"issues-count\"]";
 const REFRESH: &str = "[data-testid=\"issues-refresh\"]";
+const LOAD: &str = "form button[type=\"submit\"]";
+const ALERT: &str = "[role=\"alert\"]";
 const DETAIL: &str = "[data-testid=\"issue-detail\"]";
+const DETAIL_BODY: &str = "[data-testid=\"issue-detail-body\"]";
 const LINKED: &str = "[data-testid=\"issue-linked-tasks\"]";
+const OPEN_TASK: &str = "[data-testid=\"issue-open-task\"]";
+const DRAWER: &str = "[data-testid=\"task-drawer\"]";
 const TASK_SELECT: &str = "[data-testid=\"issue-task-select\"]";
 const MODE_EXISTING: &str = "[data-testid=\"issue-mode-existing\"]";
 const MODE_NEW: &str = "[data-testid=\"issue-mode-new\"]";
 const LINK_EXISTING: &str = "[data-testid=\"issue-link-existing\"]";
 const CREATE: &str = "[data-testid=\"issue-create-task\"]";
-const CREATE_BLOCKED: &str = "[data-testid=\"issue-create-blocked\"]";
 const NOTICE: &str = "[data-testid=\"issue-notice\"]";
+
+/// The window size the owner reviewed, and a smaller desktop size.
+const REVIEWED_WINDOW: (u32, u32) = (1280, 800);
+const SMALL_WINDOW: (u32, u32) = (1024, 700);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_issues_page_filters_keeps_its_listing_and_links_or_creates_once() {
@@ -49,7 +59,8 @@ async fn issues_journey(context: &TestContext) -> Result<()> {
 }
 
 /// What GitHub answers: two open Issues, one closed, and the full view of each
-/// that a Task reads. Issue 7 has Markdown with a code block and a link.
+/// that a Task reads. Issue 7 has Markdown with a code block and a link. Issue
+/// 9 was transferred: GitHub answers for it at another repository.
 fn script_issues(gh: &FakeGh) -> Result<()> {
     let dir = gh.dir();
     let url = |n: u32| format!("https://github.com/{REPOSITORY}/issues/{n}");
@@ -72,10 +83,17 @@ fn script_issues(gh: &FakeGh) -> Result<()> {
         "assignees": [], "comments": [],
         "createdAt": "2026-10-01T09:30:00Z", "updatedAt": "2026-10-05T09:30:00Z"
     });
+    let transferred_nine = json!({
+        "number": 9, "url": format!("https://github.com/{MOVED_REPOSITORY}/issues/9"),
+        "title": "Moved elsewhere", "body": "", "state": "OPEN", "labels": [],
+        "assignees": [], "comments": [],
+        "createdAt": "2026-11-03T09:30:00Z", "updatedAt": "2026-11-03T09:30:00Z"
+    });
     std::fs::write(dir.join("issue-list-open.json"), json!([open_seven, open_eight]).to_string())?;
     std::fs::write(dir.join("issue-list-closed.json"), json!([closed_three]).to_string())?;
     std::fs::write(dir.join("issue-view-7.json"), open_seven.to_string())?;
     std::fs::write(dir.join("issue-view-3.json"), closed_three.to_string())?;
+    std::fs::write(dir.join("issue-view-9.json"), transferred_nine.to_string())?;
     Ok(())
 }
 
@@ -88,6 +106,11 @@ async fn browse_link_create(driver: &WebDriver, gh: &FakeGh, repository: &GitFix
     // lists Projects only as it mounts. This is also what a person would see after a restart.
     driver.refresh().await.context("could not reload the application window")?;
     ui::assert_frontend_is_real(driver).await?;
+    let (width, height) = REVIEWED_WINDOW;
+    driver
+        .set_window_rect(0, 0, width, height)
+        .await
+        .context("could not size the window")?;
 
     // Open Issues, load the repository: the open listing is what GitHub is asked for.
     ui::visible(driver, "[data-testid=\"nav-github_issues\"]").await?.click().await?;
@@ -137,10 +160,46 @@ async fn browse_link_create(driver: &WebDriver, gh: &FakeGh, repository: &GitFix
         bail!("returning to the Issues page asked GitHub again: {:?}", gh.invocations()?);
     }
 
-    // Link the existing Task to Issue 7, without creating anything.
-    click(driver, ROW, "the first Issue").await?;
+    // The title of each selected Issue is on screen at once, whatever the
+    // detail panel was scrolled to: the header is not part of the scrolling body.
+    click_row(driver, 0, "the first Issue").await?;
     ui::visible(driver, DETAIL).await?;
-    // The linking area belongs to the selected Issue. Its Project starts unchosen, so pick it.
+    await_title_in_view(driver, "Crash on empty input").await?;
+    scroll_detail_body(driver, 200).await?;
+    click_row(driver, 1, "the second Issue").await?;
+    await_title_in_view(driver, "Add dark theme").await?;
+    scroll_detail_body(driver, 200).await?;
+    click_row(driver, 0, "the first Issue").await?;
+    await_title_in_view(driver, "Crash on empty input").await?;
+
+    // A filter change clears the selection; the next Issue's title is in view too.
+    click(driver, "[data-testid=\"issues-filter-closed\"]", "the Closed filter").await?;
+    await_count(driver, ROW, 1).await?;
+    click_row(driver, 0, "the closed Issue").await?;
+    await_title_in_view(driver, "Old typo in README").await?;
+    click(driver, "[data-testid=\"issues-filter-open\"]", "the Open filter").await?;
+    await_count(driver, ROW, 2).await?;
+    click_row(driver, 0, "the first Issue").await?;
+    await_title_in_view(driver, "Crash on empty input").await?;
+
+    // The smaller desktop size: the same title stays in view after scrolling.
+    let (width, height) = SMALL_WINDOW;
+    driver
+        .set_window_rect(0, 0, width, height)
+        .await
+        .context("could not resize the window to the smaller desktop size")?;
+    await_title_in_view(driver, "Crash on empty input").await?;
+    scroll_detail_body(driver, 200).await?;
+    await_title_in_view(driver, "Crash on empty input").await?;
+    let (width, height) = REVIEWED_WINDOW;
+    driver
+        .set_window_rect(0, 0, width, height)
+        .await
+        .context("could not restore the reviewed window size")?;
+    await_title_in_view(driver, "Crash on empty input").await?;
+
+    // Link the existing Task to Issue 7, without creating anything. The
+    // linking area belongs to the selected Issue; its Project starts unchosen.
     let project_option = format!("[data-testid=\"issue-project-select\"] option[value=\"{project_id}\"]");
     await_count(driver, &project_option, 1).await?;
     let project_select = driver
@@ -158,14 +217,12 @@ async fn browse_link_create(driver: &WebDriver, gh: &FakeGh, repository: &GitFix
     click(driver, LINK_EXISTING, "the Link to the existing Task button").await?;
     await_text_containing(driver, LINKED, &title).await?;
     expect_task_count(driver, &project_id, 1).await?;
+    // The linked Task is shown with its action, and creating a second Task is not offered.
+    await_count(driver, OPEN_TASK, 1).await?;
+    await_count(driver, MODE_NEW, 0).await?;
     screenshot(driver, "issues-linked.png").await?;
 
-    // The Project already links Issue 7: creating a second Task is refused in
-    // the page, and the backend refuses it too, with the same reason.
-    click(driver, MODE_NEW, "the create-a-new-Task choice").await?;
-    ui::visible(driver, CREATE_BLOCKED)
-        .await
-        .context("the page does not explain why a second Task is refused")?;
+    // The backend refuses the same Issue again, both as a new Task and as a second link.
     let refusal = ui::invoke_expecting_refusal(
         driver,
         "create_task_from_issue",
@@ -175,17 +232,67 @@ async fn browse_link_create(driver: &WebDriver, gh: &FakeGh, repository: &GitFix
     if !refusal.contains("already linked") {
         bail!("the backend refusal does not say the Issue is linked: {refusal:?}");
     }
+    let refusal = ui::invoke_expecting_refusal(
+        driver,
+        "link_github_issue",
+        json!({ "taskId": task_id, "issueUrl": format!("https://github.com/{REPOSITORY}/issues/7") }),
+    )
+    .await?;
+    if !refusal.contains("already links") {
+        bail!("the backend refusal does not say the Task links the Issue: {refusal:?}");
+    }
+    expect_task_count(driver, &project_id, 1).await?;
+
+    // A transferred Issue is refused, naming its new address, and no Task is written.
+    let refusal = ui::invoke_expecting_refusal(
+        driver,
+        "create_task_from_issue",
+        json!({ "repo": REPOSITORY, "issueNumber": 9, "projectId": project_id }),
+    )
+    .await?;
+    let moved_address = format!("https://github.com/{MOVED_REPOSITORY}/issues/9");
+    if !refusal.contains(&moved_address) || !refusal.contains("No Task was created") {
+        bail!("the transferred Issue was not refused with its new address: {refusal:?}");
+    }
     expect_task_count(driver, &project_id, 1).await?;
 
     // Issue 3 is closed and unlinked: creating a Task from it works once.
     click(driver, "[data-testid=\"issues-filter-closed\"]", "the Closed filter").await?;
     await_count(driver, ROW, 1).await?;
-    click(driver, ROW, "the closed Issue").await?;
+    click_row(driver, 0, "the closed Issue").await?;
+    await_title_in_view(driver, "Old typo in README").await?;
     click(driver, MODE_NEW, "the create-a-new-Task choice").await?;
     click(driver, CREATE, "the Create Task button").await?;
     await_text_containing(driver, NOTICE, "Nothing was started.").await?;
     expect_task_count(driver, &project_id, 2).await?;
     screenshot(driver, "issues-created.png").await?;
+
+    // A failed listing: the loading state ends, the error is shown, the listing
+    // already on screen stays, no Task changes, and Refresh recovers.
+    std::fs::write(gh.dir().join("fail-issue-list-closed"), "")?;
+    click(driver, REFRESH, "the Refresh button").await?;
+    await_text_containing(driver, ALERT, "503").await?;
+    await_text(driver, LOAD, "Load Issues").await?;
+    await_count(driver, ROW, 1).await?;
+    expect_task_count(driver, &project_id, 2).await?;
+    screenshot(driver, "issues-listing-failed.png").await?;
+    std::fs::remove_file(gh.dir().join("fail-issue-list-closed"))?;
+    click(driver, REFRESH, "the Refresh button").await?;
+    await_count(driver, ALERT, 0).await?;
+    await_count(driver, ROW, 1).await?;
+    if list_asks(gh, "closed")? < 3 {
+        bail!("Refresh after the failure did not ask GitHub again: {:?}", gh.invocations()?);
+    }
+
+    // Open the linked Task from its Issue: its board opens the Task's drawer.
+    ui::visible(driver, "[data-testid=\"nav-agent\"]").await?.click().await?;
+    ui::visible(driver, "[data-testid=\"nav-github_issues\"]").await?.click().await?;
+    await_count(driver, ROW, 2).await?;
+    click_row(driver, 0, "the first Issue").await?;
+    await_text_containing(driver, LINKED, &title).await?;
+    click(driver, OPEN_TASK, "the Open Task button").await?;
+    await_text_containing(driver, DRAWER, &title).await?;
+    screenshot(driver, "issues-open-task.png").await?;
 
     let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
     let created = listed
@@ -206,6 +313,59 @@ async fn browse_link_create(driver: &WebDriver, gh: &FakeGh, repository: &GitFix
         bail!("the created Task does not link Issue 3: {created}");
     }
     Ok(())
+}
+
+/// Click the Issue row at `index` in the list, as a person would.
+async fn click_row(driver: &WebDriver, index: usize, what: &str) -> Result<()> {
+    let rows = driver
+        .find_all(By::Css(ROW))
+        .await
+        .with_context(|| format!("could not list the Issue rows for {what}"))?;
+    let row = rows
+        .get(index)
+        .with_context(|| format!("there is no row {index} for {what}"))?;
+    row.click().await.with_context(|| format!("could not click {what}"))
+}
+
+/// Scroll the selected Issue's body, the part below its header, down by `pixels`.
+async fn scroll_detail_body(driver: &WebDriver, pixels: u32) -> Result<()> {
+    let script = format!(
+        "const body = document.querySelector('{DETAIL_BODY}'); if (body) {{ body.scrollTop = {pixels}; }} return !!body;"
+    );
+    let found = driver.execute(&script, vec![]).await?.json().clone();
+    if found != json!(true) {
+        bail!("the Issue body is not shown, so it cannot be scrolled");
+    }
+    Ok(())
+}
+
+/// Wait until the selected Issue's title is the one named and lies fully
+/// inside the detail panel and the window.
+async fn await_title_in_view(driver: &WebDriver, title: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let shown = text_of(driver, "[data-testid=\"issue-detail\"] h2").await?.unwrap_or_default();
+        if shown.trim() == title && title_in_view(driver).await? {
+            return Ok(());
+        }
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("the title {title:?} is not fully in view (the title reads {shown:?})");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn title_in_view(driver: &WebDriver) -> Result<bool> {
+    let script = format!(
+        "const panel = document.querySelector('{DETAIL}');
+         const title = panel && panel.querySelector('h2');
+         if (!panel || !title) {{ return false; }}
+         const p = panel.getBoundingClientRect();
+         const t = title.getBoundingClientRect();
+         return t.top >= p.top && t.bottom <= p.bottom && t.top >= 0 && t.bottom <= window.innerHeight;"
+    );
+    let value = driver.execute(&script, vec![]).await?.json().clone();
+    Ok(value == json!(true))
 }
 
 /// Save a screenshot when `SLASHIT_ACCEPTANCE_SCREENSHOTS` names a directory,

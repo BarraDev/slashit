@@ -8,6 +8,7 @@
 
 use crate::components::markdown::render_safe_markdown;
 use crate::components::task_dependency::status_label;
+use crate::components::OpenTaskRequest;
 use crate::components::task_issue_links::tasks_linking_issue;
 use crate::models::github::GithubIssue;
 use crate::models::{Project, Task};
@@ -16,6 +17,7 @@ use crate::services::{github_service, link_github_issue, list_tasks, project_ser
 use chrono::{DateTime, Utc};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use uuid::Uuid;
 
 pub fn format_relative_time(dt: &chrono::DateTime<chrono::Utc>) -> String {
     let now = chrono::Utc::now();
@@ -81,6 +83,16 @@ enum LinkMode {
     New,
 }
 
+/// The choice the page offers. Once a Task of the Project links the Issue,
+/// creating another is not offered, whatever was chosen before.
+fn shown_mode(chosen: LinkMode, already_linked: bool) -> LinkMode {
+    if already_linked {
+        LinkMode::Existing
+    } else {
+        chosen
+    }
+}
+
 #[component]
 pub fn GithubIssues(project_id: String) -> impl IntoView {
     let initial_repo = get_persisted_repo();
@@ -111,6 +123,7 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
     let busy = RwSignal::new(false);
     let notice = RwSignal::new(None::<String>);
     let link_error = RwSignal::new(None::<String>);
+    let open_request = expect_context::<OpenTaskRequest>();
 
     let selected_issue = Memo::new(move |_| {
         let number = selected.get()?;
@@ -278,6 +291,11 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                 .cloned()
                 .collect::<Vec<Task>>()
         })
+    };
+
+    // The board of the destination Project opens the Task's drawer.
+    let open_task = move |task_id: Uuid| {
+        open_request.0.set(Some((destination.get_untracked(), task_id)));
     };
 
     let link_existing = move |number: i32| {
@@ -511,7 +529,7 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                     </div>
 
                     // Detail panel
-                    <div class="col-span-2 border border-white/10 rounded-xl bg-white/[0.02] overflow-hidden">
+                    <div class="col-span-2 border border-white/10 rounded-xl bg-white/[0.02] overflow-hidden flex flex-col min-h-0">
                         {move || match selected_issue.get() {
                             Some(issue) => {
                                 let number = issue.number;
@@ -525,8 +543,9 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                 let candidate_list = move || candidates(number);
                                 let url = issue_url(&shown_repo.get(), number);
                                 view! {
-                                    <div class="h-full overflow-y-auto" data-testid="issue-detail">
-                                        <div class="p-6 border-b border-white/10">
+                                    // The header stays above the scrolling body, so no scroll position can hide the title.
+                                    <div class="flex flex-col h-full min-h-0" data-testid="issue-detail">
+                                        <div class="p-6 border-b border-white/10 shrink-0">
                                             <div class="flex items-center gap-3 mb-3">
                                                 <span class=format!("px-3 py-1 text-sm rounded-full {}", state_class)>
                                                     {issue.state.clone()}
@@ -550,7 +569,7 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                             </dl>
                                         </div>
 
-                                        <div class="p-6 space-y-6">
+                                        <div class="flex-1 min-h-0 overflow-y-auto p-6 space-y-6" data-testid="issue-detail-body">
                                             {(!issue.labels.is_empty()).then(|| view! {
                                                 <div class="flex flex-wrap gap-2">
                                                     {issue.labels.iter().map(|label| view! {
@@ -569,18 +588,6 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                                     </div>
                                                 </div>
                                             })}
-
-                                            // Body: the safe Markdown renderer keeps no raw HTML, fetches no
-                                            // images and keeps only safe links. Long bodies and code blocks
-                                            // scroll inside this box.
-                                            <div>
-                                                <h3 class="text-xs font-medium text-white/40 uppercase tracking-wider mb-2">"Description"</h3>
-                                                <div
-                                                    data-testid="issue-body"
-                                                    class="prose prose-invert max-w-none text-sm text-white/70 bg-white/[0.02] p-4 rounded-lg border border-white/5 max-h-[40vh] overflow-auto break-words"
-                                                    inner_html=body
-                                                ></div>
-                                            </div>
 
                                             <div class="pt-6 border-t border-white/10 space-y-4">
                                                 <div class="flex items-center justify-between gap-3">
@@ -604,11 +611,22 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                                                 <div>
                                                                     <p class="text-sm text-white/50 mb-2">"Already linked in this Project:"</p>
                                                                     <ul class="space-y-1">
-                                                                        {list.iter().map(|task| view! {
-                                                                            <li class="text-sm text-white/80">
-                                                                                {task.title.clone()}
-                                                                                <span class="ml-2 text-xs text-white/40">{status_label(&task.status)}</span>
-                                                                            </li>
+                                                                        {list.iter().map(|task| {
+                                                                            let task_id = task.id;
+                                                                            view! {
+                                                                                <li class="flex flex-wrap items-center gap-2 text-sm text-white/80">
+                                                                                    <span>{task.title.clone()}</span>
+                                                                                    <span class="text-xs text-white/40">{status_label(&task.status)}</span>
+                                                                                    <button
+                                                                                        type="button"
+                                                                                        data-testid="issue-open-task"
+                                                                                        on:click=move |_| open_task(task_id)
+                                                                                        class="px-2 py-1 rounded-lg text-xs bg-white/5 text-white/80 hover:bg-white/10"
+                                                                                    >
+                                                                                        "Open Task"
+                                                                                    </button>
+                                                                                </li>
+                                                                            }
                                                                         }).collect::<Vec<_>>()}
                                                                     </ul>
                                                                 </div>
@@ -625,24 +643,27 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                                                 type="radio"
                                                                 name="issue-task-mode"
                                                                 data-testid="issue-mode-existing"
-                                                                prop:checked=move || mode.get() == LinkMode::Existing
+                                                                prop:checked=move || !linked_list().is_empty() || mode.get() == LinkMode::Existing
                                                                 on:change=move |_| mode.set(LinkMode::Existing)
                                                             />
-                                                            "Link to an existing Task"
+                                                            {move || if linked_list().is_empty() { "Link to an existing Task" } else { "Link another existing Task" }}
                                                         </label>
-                                                        <label class="flex items-center gap-2 cursor-pointer">
-                                                            <input
-                                                                type="radio"
-                                                                name="issue-task-mode"
-                                                                data-testid="issue-mode-new"
-                                                                prop:checked=move || mode.get() == LinkMode::New
-                                                                on:change=move |_| mode.set(LinkMode::New)
-                                                            />
-                                                            "Create a new Task"
-                                                        </label>
+                                                        // Offered only while no Task of this Project links the Issue.
+                                                        {move || linked_list().is_empty().then(|| view! {
+                                                            <label class="flex items-center gap-2 cursor-pointer">
+                                                                <input
+                                                                    type="radio"
+                                                                    name="issue-task-mode"
+                                                                    data-testid="issue-mode-new"
+                                                                    prop:checked=move || mode.get() == LinkMode::New
+                                                                    on:change=move |_| mode.set(LinkMode::New)
+                                                                />
+                                                                "Create a new Task"
+                                                            </label>
+                                                        })}
                                                     </div>
 
-                                                    {move || match mode.get() {
+                                                    {move || match shown_mode(mode.get(), !linked_list().is_empty()) {
                                                         LinkMode::Existing => {
                                                             let options = candidate_list();
                                                             let none_left = options.is_empty();
@@ -674,22 +695,16 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                                             }.into_any()
                                                         }
                                                         LinkMode::New => {
-                                                            let blocked = !linked_list().is_empty();
                                                             view! {
                                                                 <div class="space-y-2">
                                                                     <p class="text-sm text-white/50">
                                                                         "Creates one Task in Backlog from this Issue. It does not start an agent."
                                                                     </p>
-                                                                    {blocked.then(|| view! {
-                                                                        <p data-testid="issue-create-blocked" class="text-sm text-yellow-300">
-                                                                            "This Issue is already linked to a Task in this Project. Link that Task instead of creating another."
-                                                                        </p>
-                                                                    })}
                                                                     <button
                                                                         type="button"
                                                                         data-testid="issue-create-task"
                                                                         on:click=move |_| create_new(number)
-                                                                        disabled=move || busy.get() || blocked || destination.with(|d| d.is_empty())
+                                                                        disabled=move || busy.get() || destination.with(|d| d.is_empty())
                                                                         class="px-4 py-2 rounded-lg font-medium text-sm bg-yellow-500 hover:bg-yellow-600 text-black disabled:opacity-50 disabled:cursor-not-allowed"
                                                                     >
                                                                         {move || if busy.get() { "Working..." } else { "Create Task" }}
@@ -727,6 +742,18 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                                 {move || link_error.get().map(|e| view! {
                                                     <p data-testid="issue-link-error" role="alert" class="text-sm text-red-300 whitespace-pre-wrap break-words">{e}</p>
                                                 })}
+                                            </div>
+
+                                            // Body: the safe Markdown renderer keeps no raw HTML, fetches no
+                                            // images and keeps only safe links. Long bodies and code blocks
+                                            // scroll inside this box.
+                                            <div>
+                                                <h3 class="text-xs font-medium text-white/40 uppercase tracking-wider mb-2">"Description"</h3>
+                                                <div
+                                                    data-testid="issue-body"
+                                                    class="prose prose-invert max-w-none text-sm text-white/70 bg-white/[0.02] p-4 rounded-lg border border-white/5 max-h-[40vh] overflow-auto break-words"
+                                                    inner_html=body
+                                                ></div>
                                             </div>
                                         </div>
                                     </div>
@@ -783,6 +810,13 @@ mod tests {
         assert!(!is_repo_address("leptos-rs/"));
         assert!(!is_repo_address("a/b/c"));
         assert!(!is_repo_address("a /b"));
+    }
+
+    #[test]
+    fn creating_a_task_is_not_offered_once_the_issue_is_linked() {
+        assert_eq!(shown_mode(LinkMode::New, true), LinkMode::Existing);
+        assert_eq!(shown_mode(LinkMode::New, false), LinkMode::New);
+        assert_eq!(shown_mode(LinkMode::Existing, false), LinkMode::Existing);
     }
 
     #[test]
