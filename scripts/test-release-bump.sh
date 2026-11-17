@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MPL-2.0
 # Hermetic test of scripts/release-bump.sh in disposable fixture repositories.
-# Cargo is a stub (SLASHIT_RELEASE_CARGO), so nothing is compiled and no
-# lockfile is rewritten by a real resolver.
+# Cargo is a stub (SLASHIT_RELEASE_CARGO, kept so each run can pick its own stub),
+# so nothing is compiled and no lockfile is rewritten by a real resolver. A rename
+# failure is injected with a test-only mv shim first on PATH.
 #
 # usage: scripts/test-release-bump.sh
 set -uo pipefail
 export LC_ALL=C
 
 src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/release-bump.sh
-work=$(mktemp -d "${TMPDIR:-/tmp}/release-bump-test.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+work=$(mktemp -d "${TMPDIR:-/tmp}/release-bump-test.XXXXXX") || { echo "cannot create a temporary directory" >&2; exit 1; }
+# Every rm below runs on a path under $work, so $work must be a real directory.
+case $work in /?*/?*) [ -d "$work" ] || { echo "temporary directory $work is missing" >&2; exit 1; } ;;
+  *) echo "refusing to use '$work' as the temporary directory" >&2; exit 1 ;; esac
+trap 'rm -rf -- "$work"' EXIT
+real_mv=$(command -v mv)
 pass=0
 fails=0
 ok() { pass=$((pass + 1)); echo "ok   $1"; }
@@ -24,13 +29,42 @@ cat >"$work/cargo-fail" <<'STUB'
 #!/usr/bin/env bash
 exit 1
 STUB
-chmod +x "$work/cargo-ok" "$work/cargo-fail"
+# Writes Cargo.lock, then fails: the script must undo what cargo did.
+cat >"$work/cargo-lock-fail" <<'STUB'
+#!/usr/bin/env bash
+echo "written by cargo" >Cargo.lock
+exit 1
+STUB
+# Announces itself, then sleeps until killed.
+cat >"$work/cargo-sleep" <<STUB
+#!/usr/bin/env bash
+echo "written by cargo" >Cargo.lock
+: >"$work/started"
+exec sleep 30
+STUB
+# Kills its parent (the bump script) outright, so no trap runs.
+cat >"$work/cargo-crash" <<'STUB'
+#!/usr/bin/env bash
+echo "written by cargo" >Cargo.lock
+kill -9 "$PPID"
+STUB
+chmod +x "$work"/cargo-*
+# A mv that fails only when the destination is $MV_FAIL_TARGET.
+mkdir "$work/shim"
+cat >"$work/shim/mv" <<'STUB'
+#!/usr/bin/env bash
+for last; do :; done
+[ "$last" = "$MV_FAIL_TARGET" ] && exit 1
+exec "$REAL_MV" "$@"
+STUB
+chmod +x "$work/shim/mv"
 
 # A fixture repository at version $1, with a curated section for 0.0.4 and an
 # empty one for 0.0.5.
 make_repo() { # dir version
   local d=$1 v=$2
-  rm -rf "$d"
+  case $d in "$work"/?*) ;; *) echo "make_repo: $d is outside $work" >&2; exit 1 ;; esac
+  rm -rf -- "$d"
   mkdir -p "$d/src-tauri" "$d/crates/a" "$d/crates/b"
   printf '{\n  "productName": "x",\n  "version": "%s",\n  "identifier": "y"\n}\n' "$v" >"$d/src-tauri/tauri.conf.json"
   printf '{\n  "name": "e2e",\n  "version": "%s"\n}\n' "$v" >"$d/package.json"
@@ -136,15 +170,76 @@ else bad "cargo failure was not rolled back (exit $st)"; printf '%s\n' "$out" >&
 echo "== a rename failing partway through restores the files already renamed"
 make_repo "$repo" 0.0.3
 before=$(digest "$repo")
-out=$(SLASHIT_RELEASE_FAIL_RENAME=package-lock.json SLASHIT_RELEASE_CARGO="$work/cargo-ok" bash "$src" --apply 0.0.4 "$repo" 2>&1); st=$?
+out=$(PATH="$work/shim:$PATH" REAL_MV="$real_mv" MV_FAIL_TARGET=package-lock.json run --apply 0.0.4); st=$?
 if [ "$st" -eq 1 ] && [[ "$out" == *"restored 2 file(s)"* ]] && [ "$before" = "$(digest "$repo")" ]; then
   ok "a failed rename restores the two files renamed before it, and no staged file is left behind"
 else bad "rename failure was not rolled back (exit $st)"; printf '%s\n' "$out" >&2; fi
 
+echo "== package-lock.json: both root entries must agree"
+make_repo "$repo" 0.0.3
+sed -i '/^      "version": "0.0.3"/s/0\.0\.3/0.0.2/' "$repo/package-lock.json"
+before=$(digest "$repo")
+out=$(run --apply 0.0.4); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *'packages[""]'* ]] && grep -q '"version": "0.0.2"' "$repo/package-lock.json" && [ "$before" = "$(digest "$repo")" ]; then
+  ok "outer 0.0.3 with packages[\"\"] 0.0.2 is refused and no file changes"
+else bad "lock entries disagreeing were not refused cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(run --dry-run 0.0.4); st=$?
+[ "$st" -eq 1 ] && ok "--dry-run refuses it too" || bad "--dry-run accepted disagreeing lock entries (exit $st)"
+
+echo "== cargo that writes Cargo.lock and then fails"
+for have in with without; do
+  make_repo "$repo" 0.0.3
+  [ "$have" = with ] && printf 'original lock\n' >"$repo/Cargo.lock"
+  before=$(digest "$repo")
+  out=$(CARGO_STUB="$work/cargo-lock-fail" run --apply 0.0.4); st=$?
+  if [ "$st" -eq 1 ] && [ "$before" = "$(digest "$repo")" ]; then
+    ok "$have an existing Cargo.lock: the whole fixture digest is unchanged after the failure"
+  else bad "$have Cargo.lock: not restored (exit $st)"; printf '%s\n' "$out" >&2; fi
+done
+[ ! -e "$repo/Cargo.lock" ] && ok "a Cargo.lock that did not exist is not left behind" || bad "Cargo.lock was left behind"
+
+echo "== a signal during cargo restores everything and exits non-zero"
+for sig in TERM HUP; do
+  make_repo "$repo" 0.0.3
+  printf 'original lock\n' >"$repo/Cargo.lock"
+  before=$(digest "$repo")
+  rm -f "$work/started"
+  SLASHIT_RELEASE_CARGO="$work/cargo-sleep" bash "$src" --apply 0.0.4 "$repo" >"$work/sig.out" 2>&1 &
+  pid=$!
+  for _ in $(seq 100); do [ -e "$work/started" ] && break; sleep 0.1; done
+  [ -e "$work/started" ] || bad "SIG$sig: cargo stub never started"
+  [ "$before" != "$(digest "$repo")" ] || bad "SIG$sig: the bump had not started changing files"
+  kill -"$sig" "$pid"; wait "$pid"; st=$?
+  if [ "$st" -ne 0 ] && [ "$before" = "$(digest "$repo")" ] && grep -q "stopped by" "$work/sig.out"; then
+    ok "SIG$sig mid-cargo: exit $st, fixture digest unchanged, no journal left"
+  else bad "SIG$sig did not restore (exit $st)"; cat "$work/sig.out" >&2; fi
+done
+
+echo "== a crashed run leaves a journal that blocks the next run and --recover clears"
+make_repo "$repo" 0.0.3
+printf 'original lock\n' >"$repo/Cargo.lock"
+before=$(digest "$repo")
+CARGO_STUB="$work/cargo-crash" run --apply 0.0.4 >/dev/null
+[ -d "$repo/.release-bump-journal" ] && [ "$before" != "$(digest "$repo")" ] &&
+  ok "a SIGKILLed run leaves the journal and changed files" || bad "the crash did not leave a journal"
+crashed=$(digest "$repo")
+out=$(run --apply 0.0.5); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"--recover"* ]] && [ "$crashed" = "$(digest "$repo")" ]; then
+  ok "a later apply refuses and points to --recover without touching anything"
+else bad "apply was not blocked by the journal (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(run --dry-run 0.0.4); st=$?
+[ "$st" -eq 1 ] && ok "so does --dry-run" || bad "--dry-run ignored the journal (exit $st)"
+out=$(run --recover); st=$?
+if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then
+  ok "--recover restores the original fixture digest and removes the journal"
+else bad "--recover did not restore (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(run --recover); st=$?
+[ "$st" -eq 1 ] && ok "--recover with no journal refuses" || bad "--recover without a journal returned $st"
+
 echo "== a successful apply leaves no backup or staged file behind"
 make_repo "$repo" 0.0.3
 run --apply 0.0.4 >/dev/null; st=$?
-leftover=$(find "$repo" -name '*.bump.*' | wc -l)
+leftover=$(find "$repo" \( -name '*.bump.*' -o -name '.release-bump-journal*' \) | wc -l)
 if [ "$st" -eq 0 ] && [ "$leftover" -eq 0 ]; then ok "apply removes its temporary and backup files"
 else bad "apply left files behind (exit $st, $leftover)"; fi
 

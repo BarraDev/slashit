@@ -55,9 +55,21 @@ version, when the files already declare the target, or when `CHANGELOG.md` has
 no non-empty `## [<version>]` section. Once those checks pass it stages the new
 content of every file beside its original, renames each into place, and runs
 `cargo metadata` to refresh `Cargo.lock`. If any step after the first rename
-fails, it restores every file it had changed from a backup and exits 1, naming
-how many files it restored. It never commits, tags, pushes or publishes, so the
-rest of this document still applies. Review the diff before committing it.
+fails, or SIGINT, SIGTERM or SIGHUP arrives, it restores every file it had
+changed and exits non-zero (1 for a failure, 128 plus the signal number for a
+signal). It also refuses unless both version entries of `package-lock.json`
+(the top-level one and `packages[""]`) agree. It never commits, tags, pushes or
+publishes, so the rest of this document still applies. Review the diff before
+committing it.
+
+Crash recovery: before the first rename, `--apply` writes a journal,
+`.release-bump-journal/`, in the repository root: a copy of every original file
+and a manifest, including whether `Cargo.lock` existed. A normal or rolled-back
+run removes it. If the process was killed without a chance to clean up, the
+journal stays and every mode refuses to run until you run
+`scripts/release-bump.sh --recover`, which restores every file from it (deleting
+a `Cargo.lock` that did not exist) and removes it. The journal is not fsynced:
+it covers a killed process, not a power cut.
 
 The behavior above is what `scripts/test-release-bump.sh` checks, against
 disposable fixture repositories with a stub cargo. It has not been run against
