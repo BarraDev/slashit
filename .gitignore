@@ -35,3 +35,9 @@ Thumbs.db
 # Per-session handoff notes (kept locally, not part of the repo)
 HANDOFF_*.md
 /handoff-queue/
+/.release-bump.lock
+# Crash residue of an interrupted release-bump run: the journal (with copies of the
+# original manifests) and staged copies. They are never meant for a commit.
+/.release-bump-journal*/
+*.release-bump-stage.??????
+*.release-bump-restore

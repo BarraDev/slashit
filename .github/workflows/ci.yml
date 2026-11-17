@@ -156,6 +156,16 @@ jobs:
       - name: Release description takes only its own version's section
         run: scripts/test-release-notes.sh
 
+      # The version bump rewrites every version manifest and Cargo.lock, and it
+      # recovers an interrupted run. Its suite works in disposable fixture
+      # repositories with a stub cargo, so nothing is compiled and no real lockfile
+      # is resolved. Every process it starts carries a marker, so it signals only
+      # its own processes. It needs only bash, flock and coreutils.
+      - name: Release version bump and crash recovery
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: scripts/test-release-bump.sh
+
       # A Windows runner runs a step in PowerShell unless the step names
       # `shell:`. A step with POSIX syntax and no `shell:` fails only there, after
       # the rest of its job has run, so every workflow is checked here.

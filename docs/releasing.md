@@ -40,7 +40,87 @@ Tauri reads its own.
 preflight job checks every file above against it, so a build whose installer
 and whose `slashit --version` disagree cannot get out.
 
-Then refresh the lockfile, which records workspace member versions:
+`scripts/release-bump.sh` makes this change in one step. It also rewrites the
+root entries of `package-lock.json`, which carry the version too. Run it from
+the repository root, after the CHANGELOG section for the version is written
+(see [Version links](#version-links-in-changelogmd)):
+
+```bash
+scripts/release-bump.sh --dry-run 0.0.4   # read-only: shows the current versions and the plan
+scripts/release-bump.sh --apply 0.0.4     # rewrites the files, refreshes Cargo.lock
+```
+
+`--apply` refuses, and changes nothing, when the files disagree on the current
+version, when the files already declare the target, or when `CHANGELOG.md` has
+no non-empty `## [<version>]` section. Once those checks pass it stages the new
+content of every file beside its original, renames each into place, and runs
+`cargo metadata` to refresh `Cargo.lock`. If any step after the first rename
+fails, or SIGINT, SIGTERM or SIGHUP arrives, it restores every file it had
+changed and exits non-zero (1 for a failure, 128 plus the signal number for a
+signal). It also refuses unless both version entries of `package-lock.json`
+(the top-level one and `packages[""]`) agree. It never commits, tags, pushes or
+publishes, so the rest of this document still applies. Review the diff before
+committing it.
+
+Crash recovery: before the first rename, `--apply` writes a journal,
+`.release-bump-journal/`, in the repository root: a copy of every original file
+and a manifest with the SHA-256 of each original and of the content about to
+replace it, including whether `Cargo.lock` existed. A normal or rolled-back run
+removes it. If the process was killed without a chance to clean up, the journal
+stays and every mode refuses to run until you run
+`scripts/release-bump.sh --recover`. A run killed before the journal was in
+place leaves no journal, only staged copies named `<file>.release-bump-stage.XXXXXX`
+beside the managed files, possibly a restore copy `<file>.release-bump-restore`, and
+possibly an unfinished `.release-bump-journal.tmp/`. `--recover` removes them, and so
+does the next `--apply` once its checks pass; each removal is printed. These names
+are specific to the tool, and the journal and these copies are git-ignored. It first
+checks every file. A file still
+holding its original is left alone, and one holding exactly what the run wrote
+is restored (a `Cargo.lock` that did not exist is deleted). If any file holds
+something else, such as an edit made after the crash or a deletion, it changes
+nothing and prints, for each such file, the command that puts its original back;
+run those, or keep your edits and remove the journal yourself, then reconcile
+the versions by hand. `Cargo.lock` is written by cargo, so its new hash is only
+recorded once `cargo metadata` returns; a run killed while cargo was running
+leaves a `Cargo.lock` that cannot be told apart from an edit, and `--recover`
+refuses it the same way. A journal that is missing its manifest, truncated or
+otherwise malformed is refused too. `--recover` can be killed and run again.
+
+A killed `--apply` can leave `cargo metadata` running, and it can still rewrite
+`Cargo.lock`. So `--apply` holds an exclusive `flock` on
+`.release-bump-journal/writer.lock` on a descriptor that cargo and its children
+(rustc included) inherit, and the kernel keeps the lock until the last of them
+exits. `--recover` checks that lock before it reads the journal and, while any holder is
+alive, refuses and changes nothing; `fuser -v .release-bump-journal/writer.lock`
+names the holder. A lock file nobody holds does not block it. The check names no
+process, so a reused PID cannot fool it. It does not cover a child that closes
+the inherited descriptor and keeps writing; cargo and rustc keep it. The tool
+needs `flock(1)` (util-linux, Linux; macOS does not ship it), and the lock is
+advisory, so it may not hold on a network filesystem.
+
+Every run that changes files first takes an exclusive `flock` on `.release-bump.lock`
+in the repository root, before it looks at the journal, and holds it until it exits.
+The lock sits beside the journal because each run recreates the journal's
+directory, and the file must never be removed, and it is git-ignored, so `git clean -fX` would
+delete it: do not run that while a release is in progress. Deleting it while a
+run holds it defeats the lock, and no check can see that. A second `--apply` or
+`--recover` is refused while one runs, and so is `--dry-run` (which only probes the lock briefly and writes nothing); the cargo of a SIGKILLed run keeps this lock too, so a new run
+is refused until it exits.
+
+`--dry-run` changes nothing, not even a leftover `.release-bump-journal.done`
+from a run that committed but was stopped before deleting it; `--apply` removes
+that leftover.
+
+The journal, the staged files, the restored files and the directories holding
+them are fsynced before the step that depends on them, which orders the writes
+for a power cut. That ordering has not been tested against a real power cut.
+
+The behavior above is what `scripts/test-release-bump.sh` checks, against
+disposable fixture repositories with a stub cargo. It has not been run against
+a real release bump.
+
+Without the tool, bump the eleven files by hand and then refresh the lockfile,
+which records workspace member versions:
 
 ```bash
 cargo check --workspace
