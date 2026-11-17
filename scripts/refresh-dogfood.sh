@@ -19,7 +19,9 @@
 #       build is not the target's verified build, and only when this checkout's
 #       HEAD is the target. Before starting anything it checks that the promoted
 #       build's sidecar names the target commit and the binary's sha256. Then runs
-#       `supervise-dogfood.sh restart` (no --force), or `start` when stopped.
+#       `supervise-dogfood.sh restart` (no --force), or `start` when stopped, with
+#       SLASHIT_DOGFOOD_EXPECT_COMMIT set to the target: the supervisor refuses any
+#       other build before it stops or starts anything.
 #       Does nothing when the target is already the running commit.
 #
 # The artifact root (the promoted binary, its sidecar and previous/) is the one
@@ -64,7 +66,8 @@ field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
 # The supervisor is the one authority for where the build lives and where the
 # state is; refresh never derives either itself.
 sup_env=$("$sup" env 2>/dev/null)
-envf() { printf '%s\n' "$sup_env" | awk -v k="$1" '$1 == k { print $2; exit }'; }
+# The value is everything after the key and its padding, so a path may contain spaces.
+envf() { printf '%s\n' "$sup_env" | awk -v k="$1" '$1 == k { sub(/^[^ ]+ +/, ""); print; exit }'; }
 binary=$(envf BINARY)
 case $binary in /*) ;; *) echo "$SELF: the supervisor cannot resolve the dogfood binary ('$binary')" >&2; exit 2 ;; esac
 sidecar=$binary.frontend
@@ -83,18 +86,18 @@ if [ "$built_mode" = embedded ] && [ -n "$actual_sha" ] && [ "$actual_sha" = "$b
   built_verified=yes
 fi
 
-# The running instance, from the supervisor's own status. Exit 3 is unverifiable.
+# The running instance, from the supervisor's own status. Only exit 0 verifies it.
+# Any other status (1: a stale record or a degraded frontend, 3: unverifiable,
+# 4: environment mismatch) can print a commit, but the text is not evidence of
+# what runs, so it is never read as the running commit.
 st=0
 status_out=$("$sup" status 2>&1) || st=$?
 running=unverifiable
 running_commit=
-# Exit 4 is an environment mismatch: the instance is running but must not be trusted.
-if [ "$st" -eq 3 ] || [ "$st" -eq 4 ]; then
-  running=unverifiable
-elif grep -q '^instance: *running' <<<"$status_out"; then
+if [ "$st" -eq 0 ] && grep -q '^instance: *running' <<<"$status_out"; then
   running=running
   running_commit=$(printf '%s\n' "$status_out" | awk '/^commit:/ { print $2; exit }')
-elif grep -q '^instance: *stopped' <<<"$status_out"; then
+elif [ "$st" -eq 0 ] && grep -q '^instance: *stopped' <<<"$status_out"; then
   running=stopped
 fi
 
@@ -129,6 +132,7 @@ report() {
   echo "target commit:    $(short "$target") ($ref)"
   echo "pending changes:  $pending uncommitted path(s)"
   echo "running:          $running${running_commit:+ at $(short "$running_commit")}"
+  [ "$st" -eq 0 ] || echo "supervisor status: exit $st; its output is not evidence of the running commit"
   echo "forward only:     $forward (target descends from the running commit)"
   echo "state writer:     $(short "$writer_commit") forward=$state_forward (target descends from the last build that wrote the state)"
   echo "artifact:         $binary"
@@ -181,9 +185,12 @@ if [ "$(field "$sidecar" mode)" != embedded ] || [ -z "$now_sha" ] || [ "$now_sh
   exit 1
 fi
 
+# The supervisor checks the copy it launches against this commit before it stops
+# or starts anything, so a build promoted after the check above cannot be launched
+# under this target's name.
 if [ "$running" = stopped ]; then
-  "$sup" start || { echo "$SELF: the start did not complete; see the supervisor's message above" >&2; exit 1; }
+  SLASHIT_DOGFOOD_EXPECT_COMMIT=$target "$sup" start || { echo "$SELF: the start did not complete; see the supervisor's message above" >&2; exit 1; }
 else
-  "$sup" restart || { echo "$SELF: the restart did not complete; see the supervisor's message above" >&2; exit 1; }
+  SLASHIT_DOGFOOD_EXPECT_COMMIT=$target "$sup" restart || { echo "$SELF: the restart did not complete; see the supervisor's message above" >&2; exit 1; }
 fi
 echo "$SELF: refreshed to ${target:0:12}"

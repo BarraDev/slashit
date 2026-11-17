@@ -37,8 +37,8 @@ cat >"$work/sup" <<STUB
 case "\$1" in
   status) cat "\$STUB_STATUS"; exit "\${STUB_STATUS_RC:-0}" ;;
   env) printf 'STATE_BASE       %s\nBINARY           %s\nSTATE_WRITER     %s\n' "$work/state" "$repo/target/dogfood/slashit-ui" "$work/state/supervisor/state-writer" ;;
-  restart) echo restart >>"$calls"; exit "\${STUB_RESTART_RC:-0}" ;;
-  start) echo start >>"$calls"; exit 0 ;;
+  restart) echo restart >>"$calls"; printf '%s\n' "\${SLASHIT_DOGFOOD_EXPECT_COMMIT-unset}" >>"$work/expect"; exit "\${STUB_RESTART_RC:-0}" ;;
+  start) echo start >>"$calls"; printf '%s\n' "\${SLASHIT_DOGFOOD_EXPECT_COMMIT-unset}" >>"$work/expect"; exit 0 ;;
   *) echo "stub sup: \$*" >&2; exit 2 ;;
 esac
 STUB
@@ -219,6 +219,44 @@ if [ "$art_main" = "$d/main/target/dogfood/slashit-ui" ] && [ "$art_linked" = "$
   [ "$sup_main" = "$art_main" ] && [ "$sup_linked" = "$art_main" ] && [ "$state_seen" = "$d/state" ]; then
   ok "refresh and the supervisor resolve one artifact path from the main checkout and from a linked worktree (state confined to the test)"
 else bad "artifact paths differ: refresh main '$art_main', linked '$art_linked'; supervisor main '$sup_main', linked '$sup_linked'; state '$state_seen'"; fi
+
+echo "== paths with spaces are read whole from the supervisor's env"
+spaced="$work/with space"
+mkdir -p "$spaced/state/supervisor/backup/20260101-000000" "$spaced/bin"
+cat >"$work/sup-spaces" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  status) cat "\$STUB_STATUS"; exit 0 ;;
+  env) printf 'STATE_BASE       %s\nBINARY           %s\nSTATE_WRITER     %s\n' "$spaced/state" "$spaced/bin/slashit-ui" "$spaced/state/supervisor/state-writer" ;;
+  *) exit 2 ;;
+esac
+STUB
+chmod +x "$work/sup-spaces"
+printf 'commit=%s\nsha256=x\n' "$old" >"$spaced/state/supervisor/state-writer"
+status_stopped; reset
+out=$(export SLASHIT_REFRESH_SUPERVISOR=$work/sup-spaces; run --check); st=$?
+if [[ "$out" == *"artifact:         $spaced/bin/slashit-ui"* ]] &&
+  [[ "$out" == *"latest backup:    $spaced/state/supervisor/backup/20260101-000000"* ]] &&
+  [[ "$out" == *"state writer:     ${old:0:12} forward=yes"* ]]; then
+  ok "artifact, state base and state-writer paths containing spaces are read whole"
+else bad "a path with spaces was truncated (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== a status that exits 1 is not a verified running instance"
+status_running "$old"; reset
+out=$(export STUB_STATUS_RC=1; run --apply "$new"); st=$?
+if [ "$st" -ne 0 ] && [ ! -f "$calls" ]; then ok "a stale launch record (status exit 1) names a commit, but refresh does not restart over it"
+else bad "a status exit 1 with a stale commit was accepted (exit $st)"; printf '%s\n' "$out" >&2; fi
+head_now=$(git -C "$repo" rev-parse HEAD)
+status_running "$head_now"; reset
+out=$(export STUB_STATUS_RC=1; run --apply); st=$?
+if [ "$st" -ne 0 ] && [[ "$out" != *"nothing to do"* ]] && [ ! -f "$calls" ]; then ok "a status exit 1 is never reported as the target already running"
+else bad "a status exit 1 with the target commit reported success (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== the target is handed to the supervisor as its expected commit"
+status_stopped; reset; rm -f "$work/expect"
+out=$(run --apply); st=$?
+if [ "$st" -eq 0 ] && [ "$(cat "$work/expect" 2>/dev/null)" = "$(git -C "$repo" rev-parse HEAD)" ]; then ok "start receives the requested target as SLASHIT_DOGFOOD_EXPECT_COMMIT"
+else bad "the supervisor did not receive the expected commit (exit $st, got '$(cat "$work/expect" 2>/dev/null)')"; printf '%s\n' "$out" >&2; fi
 
 echo
 echo "$pass passed, $fails failed"
