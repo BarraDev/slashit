@@ -177,14 +177,177 @@ pub enum ApprovalCoverage {
     BranchMissing,
 }
 
+/// The head of the Task's published pull request, as the status poll last
+/// read it. It is read from memory: asking GitHub is the poll's job, never a
+/// question the panel's cadence asks. The approval is not renewed by it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PublishedHead {
+    /// The head commit GitHub reported at `observed_at`. `None` when the latest
+    /// attempt gave none, so an older head is never offered as current.
+    pub head: Option<String>,
+    /// When `head` was read from GitHub.
+    pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Why the head is not known: the latest attempt failed, or none has
+    /// succeeded yet.
+    pub unverified: Option<String>,
+}
+
+/// How old GitHub's answer about the head may be before it is no longer
+/// trusted as the head now. A poll that has not answered for two intervals may
+/// have missed a push, so the head is then unverified rather than current.
+const PUBLISHED_HEAD_FRESH_SECONDS: i64 = 2 * crate::pr_status::POLL_INTERVAL.as_secs() as i64;
+
+/// The published head as the cache holds it at `now`. Only the latest attempt
+/// counts: a failed attempt makes the head unknown even when an earlier one
+/// read it, and so does an answer older than [`PUBLISHED_HEAD_FRESH_SECONDS`].
+fn published_head(entry: Option<&crate::pr_status::PrStatusEntry>, now: chrono::DateTime<chrono::Utc>) -> PublishedHead {
+    let unknown = |why: String| PublishedHead { head: None, observed_at: None, unverified: Some(why) };
+    let Some(entry) = entry else {
+        return unknown("GitHub has not answered about this pull request yet.".to_string());
+    };
+    if let Some(error) = &entry.error {
+        return unknown(format!("GitHub could not be asked: {error}."));
+    }
+    match entry.status.as_ref().and_then(|s| s.head_oid.clone()) {
+        Some(head) => match entry.fetched_at {
+            Some(at) if (now - at).num_seconds() <= PUBLISHED_HEAD_FRESH_SECONDS => {
+                PublishedHead { head: Some(head), observed_at: Some(at), unverified: None }
+            }
+            Some(_) => unknown(format!(
+                "GitHub's last answer about the pull request's head is more than {} minutes old.",
+                PUBLISHED_HEAD_FRESH_SECONDS / 60
+            )),
+            None => unknown("GitHub's answer about the pull request's head has no read time.".to_string()),
+        },
+        None => unknown("GitHub's answer did not name the pull request's head commit.".to_string()),
+    }
+}
+
+/// The pull request the Task publishes to, as the status cache keys it. `None`
+/// when the Task has no pull request. The address is the Task's own `pr_url`,
+/// or its first GitHub reference when no `pr_url` is recorded. A recorded
+/// address whose reference is missing is read from the URL itself, so a Task
+/// linked by `pr_url` alone is still checked. An address that cannot be read
+/// is an error, which the panel reports as unverified.
+fn published_key(task: &Task) -> Option<Result<crate::pr_status::PrKey, String>> {
+    let address = task.authoritative_pr_url()?;
+    let referenced = task.external_refs.iter().find_map(|r| match r {
+        crate::domain::ExternalRef::GithubPr { url, repo, number, .. } if url == address => {
+            Some(crate::pr_status::PrKey::new(repo.as_str(), *number))
+        }
+        _ => None,
+    });
+    let key = referenced.or_else(|| match crate::commands::pr::parse_pr_url_to_ref(address)? {
+        crate::domain::ExternalRef::GithubPr { repo, number, .. } => Some(crate::pr_status::PrKey::new(repo, number)),
+        _ => None,
+    });
+    Some(key.ok_or_else(|| "the pull request's address cannot be read as a GitHub pull request".to_string()))
+}
+
+#[cfg(test)]
+mod published_head_tests {
+    use super::*;
+    use crate::pr_status::{parse_pr_status, PrFetchError, PrFetchErrorKind, PrStatus, PrStatusEntry};
+    use serde_json::json;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn entry(status: Option<PrStatus>, error: Option<PrFetchError>) -> PrStatusEntry {
+        PrStatusEntry {
+            repo: "o/r".into(),
+            number: 9,
+            status,
+            fetched_at: Some(chrono::Utc::now()),
+            attempted_at: chrono::Utc::now(),
+            error,
+        }
+    }
+
+    fn read_head(head: &str) -> PrStatus {
+        parse_pr_status(&json!({ "state": "OPEN", "headRefOid": head }))
+    }
+
+    #[test]
+    fn a_head_the_latest_attempt_read_is_the_published_head() {
+        let read = published_head(Some(&entry(Some(read_head(HEAD)), None)), chrono::Utc::now());
+        assert_eq!(read.head.as_deref(), Some(HEAD));
+        assert!(read.observed_at.is_some());
+        assert_eq!(read.unverified, None);
+    }
+
+    #[test]
+    fn no_answer_or_an_abbreviated_head_is_unverified_never_a_head() {
+        let none = published_head(None, chrono::Utc::now());
+        assert_eq!(none.head, None);
+        assert!(none.unverified.is_some_and(|w| w.contains("not answered")));
+
+        let abbreviated = published_head(Some(&entry(Some(read_head("0123456")), None)), chrono::Utc::now());
+        assert_eq!(abbreviated.head, None, "an abbreviated head cannot be checked against a commit");
+        assert!(abbreviated.unverified.is_some());
+    }
+
+    #[test]
+    fn a_failed_latest_attempt_hides_the_head_an_earlier_one_read() {
+        let error = PrFetchError { kind: PrFetchErrorKind::Timeout, message: "took too long".into() };
+        let failed = published_head(Some(&entry(Some(read_head(HEAD)), Some(error))), chrono::Utc::now());
+        assert_eq!(failed.head, None, "an earlier head says nothing about the pull request now");
+        assert!(failed.unverified.is_some_and(|w| w.contains("took too long")));
+    }
+
+    /// A head read long ago may have been overtaken by a push nobody has seen,
+    /// so it is unverified once the poll has been silent for two intervals.
+    #[test]
+    fn a_head_older_than_two_poll_intervals_is_unverified_not_current() {
+        let now = chrono::Utc::now();
+        let mut old = entry(Some(read_head(HEAD)), None);
+        old.fetched_at = Some(now - chrono::Duration::seconds(PUBLISHED_HEAD_FRESH_SECONDS + 1));
+        let stale = published_head(Some(&old), now);
+        assert_eq!(stale.head, None, "an old head is not the head now");
+        assert!(stale.unverified.is_some_and(|w| w.contains("more than")));
+
+        old.fetched_at = Some(now - chrono::Duration::seconds(PUBLISHED_HEAD_FRESH_SECONDS));
+        assert_eq!(published_head(Some(&old), now).head.as_deref(), Some(HEAD), "a head at the limit is still fresh");
+    }
+
+    /// A Task linked by `pr_url` alone is still checked at the address it names,
+    /// and an address that is not a GitHub pull request is an error, not no pull request.
+    #[test]
+    fn a_task_linked_only_by_its_pr_url_is_checked_at_that_address() {
+        let mut task = crate::test_helpers::create_test_task_full(
+            "published",
+            uuid::Uuid::new_v4(),
+            crate::domain::TaskStatus::PrCreated,
+            0,
+        );
+        task.pr_url = Some("https://github.com/BarraDev/slashit/pull/355".to_string());
+        let key = published_key(&task).expect("a pull request is recorded").expect("its address is readable");
+        assert_eq!(key, crate::pr_status::PrKey::new("BarraDev/slashit", 355));
+
+        task.pr_url = Some("https://example.com/not-github".to_string());
+        assert!(published_key(&task).expect("a pull request is recorded").is_err());
+
+        task.pr_url = None;
+        assert!(published_key(&task).is_none(), "no pull request is recorded");
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ApprovalStatus {
     pub coverage: ApprovalCoverage,
     pub approved_tip: Option<String>,
     /// The branch's tip now: the commit approving again would cover.
     pub branch_tip: Option<String>,
-    /// For `Moved`: the approved commit is no longer on the branch.
-    pub rewritten: bool,
+    /// For `Moved`: whether the approved commit is no longer on the branch. `None`
+    /// when Git could not answer, which is not the same as a branch that only moved on.
+    pub rewritten: Option<bool>,
+    /// The published pull request's head, when the Task has a pull request.
+    /// It may differ from `approved_tip` even while `coverage` is `Current`,
+    /// because another clone can move the pull request without moving the branch.
+    pub published: Option<PublishedHead>,
+    /// The pull request address the Task had when this answer was read, so the
+    /// panel can tell an answer for a link it no longer shows (none, or another
+    /// pull request) from the current one.
+    pub pull_request: Option<String>,
     /// What a person can act on, when the approval does not cover the branch.
     pub reason: Option<String>,
 }
@@ -198,18 +361,34 @@ pub async fn get_approval_status(
     task_id: String,
 ) -> Result<ApprovalStatus, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    approval_status(&state, task_id).await
+    // The whole answer is bounded, both Git reads in it. A stopped read drops
+    // its queries, and each query's child is killed with it.
+    tokio::time::timeout(crate::commands::pr::COVERAGE_READ_BOUND, approval_status(&state, task_id))
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "Reading the approval's coverage took longer than {} seconds and was stopped.",
+                crate::commands::pr::COVERAGE_READ_BOUND.as_secs()
+            ))
+        })
 }
 
 pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> Result<ApprovalStatus, String> {
     let task = current(state, task_id).await.ok_or("Task not found")?;
     let approved_tip = task.human_review.approved_tip().map(str::to_string);
+    // Read from the status cache: no GitHub request and no repository access.
+    let published = published_key(&task).map(|key| match key {
+        Ok(key) => published_head(state.pr_statuses.get(&key).as_ref(), chrono::Utc::now()),
+        Err(why) => PublishedHead { head: None, observed_at: None, unverified: Some(why) },
+    });
     let none = |coverage| ApprovalStatus {
         coverage,
         approved_tip: approved_tip.clone(),
         branch_tip: None,
-        rewritten: false,
+        rewritten: None,
         reason: None,
+        published: published.clone(),
+        pull_request: task.authoritative_pr_url().map(str::to_string),
     };
     if task.branch_name.is_none() {
         return Ok(none(ApprovalCoverage::NotApplicable));
@@ -218,11 +397,13 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
         // Not approved yet: name the commit an approval would record now, so
         // the person can see it before deciding. A failed read is an error, so
         // the panel can say so and offer a retry; a branch that does not exist
-        // is `Ok(None)`, which the panel reports as a missing branch.
-        let branch_tip = crate::commands::pr::task_branch_tip(state, task_id).await?;
+        // is `Ok(None)`, which the panel reports as a missing branch. Read
+        // without touching the repository: this is asked again while the panel
+        // is shown, and a read must not export.
+        let branch_tip = crate::commands::pr::task_branch_tip_read_only(state, task_id).await?;
         return Ok(ApprovalStatus { branch_tip, ..none(ApprovalCoverage::NotApplicable) });
     }
-    let branch_tip = crate::commands::pr::task_branch_tip(state, task_id).await?;
+    let branch_tip = crate::commands::pr::task_branch_tip_read_only(state, task_id).await?;
     let refusal = match task.human_review.binds(true, branch_tip.as_deref()) {
         Ok(()) => return Ok(ApprovalStatus { branch_tip, ..none(ApprovalCoverage::Current) }),
         Err(refusal) => refusal,
@@ -232,18 +413,20 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
         crate::domain::task::ApprovalBindingRefusal::Moved { .. } => ApprovalCoverage::Moved,
         crate::domain::task::ApprovalBindingRefusal::BranchMissing { .. } => ApprovalCoverage::BranchMissing,
     };
-    let mut rewritten = false;
+    let mut rewritten = None;
     if let (ApprovalCoverage::Moved, Some(approved), Some(tip), Ok(repo)) = (
         coverage,
         approved_tip.as_deref(),
         branch_tip.as_deref(),
         crate::commands::integration::repo_path_of(state, task.project_id).await,
     ) {
-        // Only a definite answer from Git says the approved commit is gone.
-        rewritten = matches!(
-            crate::worktree::restack::is_ancestor(std::path::Path::new(&repo), approved, tip).await,
-            Ok(false)
-        );
+        // Only a definite answer from Git says whether the approved commit is
+        // gone; a failed query leaves it unknown. The query is read-only and
+        // killed if the read is stopped (see get_approval_status).
+        rewritten = crate::commands::pr::commit_is_ancestor_read_only(&repo, approved, tip)
+            .await
+            .ok()
+            .map(|is_ancestor| !is_ancestor);
     }
     Ok(ApprovalStatus { branch_tip, rewritten, reason: Some(refusal.to_string()), ..none(coverage) })
 }
@@ -1238,6 +1421,33 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// jj with a fixed identity, for the commits these tests make with jj.
+    fn jj(dir: &std::path::Path, args: &[&str]) -> String {
+        let mut all = vec!["--config", "user.name=Test", "--config", "user.email=test@example.com"];
+        all.extend_from_slice(args);
+        let out = std::process::Command::new("jj")
+            .args(&all)
+            .current_dir(dir)
+            .output()
+            .expect("run jj");
+        assert!(out.status.success(), "jj {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The commit `refs/heads/<branch>` names in the backing Git directory of
+    /// a jj workspace, if it is there at all.
+    fn git_ref_at(git_dir: &std::path::Path, branch: &str, cwd: &std::path::Path) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(git_dir)
+            .args(["for-each-ref", "--format=%(objectname)", &format!("refs/heads/{branch}")])
+            .current_dir(cwd)
+            .output()
+            .expect("for-each-ref");
+        let listed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!listed.is_empty()).then_some(listed)
+    }
+
     /// A project whose repository has no remote, a Task Checkout of its own
     /// with committed work, and a task in Human Review that owns both.
     struct Local {
@@ -1816,7 +2026,164 @@ mod tests {
         assert_eq!(task.human_review.approved_tip(), None);
     }
 
+    /// A Task that never had a branch can be moved into Human Review, approved and
+    /// linked to a pull request, each by the command that does it. Its approval then
+    /// names no commit, and the status still reports the pull request it is linked to.
+    #[tokio::test]
+    async fn a_branchless_task_linked_to_a_pull_request_has_no_commit_to_cover_it() {
+        use tauri::Manager;
+        let (tmp, state) = test_state().await;
+        let (_repo, project_id, _base) = repo_and_project(&state, &tmp).await;
+        let mut task = create_test_task_full("never run", project_id, TaskStatus::Backlog, 0);
+        task.branch_name = None;
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+
+        crate::commands::task::set_task_status(&state, task_id, TaskStatus::HumanReview, None)
+            .await
+            .expect("a Backlog task can be moved into Human Review");
+        approve_shown(&state, task_id, false).await.expect("approved without a branch");
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        crate::commands::task::link_pr(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            "https://github.com/BarraDev/slashit/pull/7".to_string(),
+        )
+        .await
+        .expect("a pull request can be linked by URL");
+
+        let state = app.state::<crate::AppState>();
+        let linked = on_disk(&state, project_id, task_id);
+        assert!(linked.human_review.is_approved(), "the approval is recorded");
+        assert_eq!(linked.human_review.approved_tip(), None, "no commit was bound to it");
+        let status = approval_status(&state, task_id).await.expect("the status is read");
+        assert_eq!(status.coverage, ApprovalCoverage::NotApplicable);
+        assert_eq!(status.approved_tip, None);
+        assert!(status.published.is_some(), "the linked pull request is reported, not hidden");
+        assert_eq!(
+            status.pull_request.as_deref(),
+            Some("https://github.com/BarraDev/slashit/pull/7"),
+            "the answer names the pull request it was read for, so a later link change is seen"
+        );
+    }
+
     // ---- Approval is bound to the commit that was approved ----
+
+    /// A pull request pushed to by another clone, seen the way the status poll
+    /// sees it. Clone A approves commit A and pushes it. Another clone then pushes
+    /// B to the same branch, and clone A never fetches. The branch still names
+    /// A, so the local answer alone says the approval is current. Only GitHub's
+    /// answer, through the status poll, names B. When GitHub cannot answer, the
+    /// head is unverified, and the next answer restores it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_request_pushed_to_by_another_clone_is_seen_only_through_the_status_poll() {
+        use crate::domain::ExternalRef;
+        use crate::pr_status::{PrKey, PrStatuses};
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut local = local_project().await;
+        local.approve().await;
+        let approved = local.tip();
+        let root = local._tmp.path().to_path_buf();
+
+        // Clone A, the Task checkout's repository, publishes its branch.
+        let remote = root.join("remote.git");
+        git(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git(&local.repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&local.repo, &["push", "-q", "origin", &local.branch]);
+
+        // Another clone pushes B to the pull request's branch.
+        let other = root.join("other");
+        git(&root, &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        git(&other, &["config", "user.email", "test@example.com"]);
+        git(&other, &["config", "user.name", "Test"]);
+        git(&other, &["checkout", "-q", &local.branch]);
+        std::fs::write(other.join("pushed.txt"), "from another clone\n").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-q", "-m", "pushed by another clone"]);
+        git(&other, &["push", "-q", "origin", &local.branch]);
+        let head = git(&other, &["rev-parse", "HEAD"]);
+        assert_ne!(head, approved);
+        assert_eq!(
+            git(&local.repo, &["rev-parse", &format!("refs/remotes/origin/{}", local.branch)]),
+            approved,
+            "clone A has not fetched: its remote-tracking ref still names A"
+        );
+
+        // The Task's pull request, and a fake `gh` that answers for it.
+        let key = PrKey::new("o/r", 9);
+        {
+            let mut tasks = local.state.task.tasks.write().await;
+            let task = tasks.get_mut(&local.task_id).unwrap();
+            let url = "https://github.com/o/r/pull/9".to_string();
+            task.pr_url = Some(url.clone());
+            task.external_refs.push(ExternalRef::GithubPr {
+                url,
+                repo: "o/r".into(),
+                number: 9,
+                state: Some("OPEN".into()),
+                merge_commit: None,
+            });
+        }
+        let dir = root.join("gh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let answer = serde_json::json!({
+            "state": "OPEN",
+            "headRefOid": head,
+            "statusCheckRollup": [],
+            "reviewDecision": "",
+            "mergeable": "MERGEABLE",
+        });
+        std::fs::write(dir.join("answer.json"), answer.to_string()).unwrap();
+        let gh = dir.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nd=\"$(dirname \"$0\")\"\nif [ -f \"$d/fail\" ]; then echo 'connection reset' >&2; exit 1; fi\ncat \"$d/answer.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        local.state.pr_statuses = std::sync::Arc::new(PrStatuses::with_program(gh, std::time::Duration::from_secs(20)));
+        let published = |status: &ApprovalStatus| status.published.clone().expect("the pull request is recorded");
+
+        // Before the poll has asked, nothing says what the pull request is.
+        let before = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(before.coverage, ApprovalCoverage::Current, "the local branch alone reads current");
+        assert_eq!(published(&before).head, None);
+        assert!(published(&before).unverified.is_some());
+
+        // The poll asks GitHub: the head is B, while the approval and the branch stay at A.
+        local.state.pr_statuses.refresh(&key).await.expect("GitHub answers");
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::Current);
+        assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()));
+        assert_eq!(published(&status).head.as_deref(), Some(head.as_str()));
+        assert!(published(&status).observed_at.is_some());
+        assert_eq!(published(&status).unverified, None);
+
+        // GitHub cannot answer: the head is unverified, and the last head is not offered.
+        std::fs::write(dir.join("fail"), "").unwrap();
+        assert!(local.state.pr_statuses.refresh(&key).await.is_err());
+        let failed = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(published(&failed).head, None, "a failed answer never keeps the earlier head as current");
+        assert!(published(&failed).unverified.is_some_and(|why| why.contains("could not be asked")));
+
+        // GitHub answers again.
+        std::fs::remove_file(dir.join("fail")).unwrap();
+        local.state.pr_statuses.refresh(&key).await.expect("GitHub answers again");
+        assert_eq!(published(&approval_status(&local.state, local.task_id).await.unwrap()).head.as_deref(), Some(head.as_str()));
+
+        // Nothing was fetched or moved to make that observation.
+        assert_eq!(local.tip(), approved);
+        assert_eq!(
+            git(&local.repo, &["rev-parse", &format!("refs/remotes/origin/{}", local.branch)]),
+            approved
+        );
+    }
 
     impl Local {
         fn tip(&self) -> String {
@@ -1894,7 +2261,7 @@ mod tests {
         let later = local.advance();
         let status = approval_status(&local.state, local.task_id).await.unwrap();
         assert_eq!(status.coverage, ApprovalCoverage::Moved);
-        assert!(!status.rewritten);
+        assert_eq!(status.rewritten, Some(false));
         assert_eq!(status.branch_tip.as_deref(), Some(later.as_str()));
         assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()));
 
@@ -1909,6 +2276,55 @@ mod tests {
         assert_eq!(approval_status(&local.state, local.task_id).await.unwrap().coverage, ApprovalCoverage::Current);
         let done = local.complete().await.expect("the renewed approval completes it");
         assert_eq!(done.status, TaskStatus::Done);
+    }
+
+    /// The stale-approval requirement, proven end to end: approve commit A,
+    /// let the branch move to B outside SlashIt, and record what the state
+    /// reports. The approval is reported stale, named by both commits, and an
+    /// earlier approval stays in the history but is never shown as current:
+    /// when the branch moves again, it is the later approval that is reported.
+    #[tokio::test]
+    async fn an_approval_older_than_the_branch_is_reported_stale_with_both_commits() {
+        let local = local_project().await;
+        let shown = local.tip();
+        local.approve().await;
+        let approved = shown.clone();
+
+        // The branch moved outside SlashIt: no task record changed.
+        let moved = local.advance();
+        assert_ne!(approved, moved);
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::Moved);
+        assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()), "the approval covers A, and says so");
+        assert_eq!(status.branch_tip.as_deref(), Some(moved.as_str()), "the branch is at B, and that is reported");
+        assert_eq!(status.rewritten, Some(false), "A is still on the branch");
+        let reason = status.reason.clone().unwrap_or_default();
+        assert!(reason.contains(&approved[..12]) && reason.contains(&moved[..12]), "{reason}");
+
+        // Approving the branch as it is now makes that approval the current
+        // one; the earlier approval stays in the history.
+        approve_again(&local.state, local.task_id, &moved).await.expect("approved");
+        let task = local.on_disk();
+        assert_eq!(task.human_review.approved_tip(), Some(moved.as_str()), "the renewed approval is the current one");
+        assert!(
+            task.human_review.entries.iter().any(|e| e.approved_tip.as_deref() == Some(approved.as_str())),
+            "the earlier approval is kept in the history"
+        );
+        assert_eq!(approval_status(&local.state, local.task_id).await.unwrap().coverage, ApprovalCoverage::Current);
+
+        // The branch moves again: the renewed approval is the one reported
+        // stale; the first is never shown as current.
+        std::fs::write(local.worktree.join("yet_later.txt"), "yet later\n").unwrap();
+        git(&local.worktree, &["add", "."]);
+        git(&local.worktree, &["commit", "-q", "-m", "moved again"]);
+        let later = local.tip();
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::Moved);
+        assert_eq!(status.approved_tip.as_deref(), Some(moved.as_str()));
+        assert_ne!(status.approved_tip.as_deref(), Some(approved.as_str()), "an earlier approval is never the current one");
+        assert_eq!(status.branch_tip.as_deref(), Some(later.as_str()));
+        let reason = status.reason.clone().unwrap_or_default();
+        assert!(reason.contains(&moved[..12]) && reason.contains(&later[..12]), "{reason}");
     }
 
     /// The race the drawer can lose: the person is shown one commit, the
@@ -1982,8 +2398,110 @@ mod tests {
         local.approve().await;
         let rewritten = local.rewrite();
         let status = approval_status(&local.state, local.task_id).await.unwrap();
-        assert_eq!((status.coverage, status.rewritten), (ApprovalCoverage::Moved, true));
+        assert_eq!((status.coverage, status.rewritten), (ApprovalCoverage::Moved, Some(true)));
         approve_again(&local.state, local.task_id, &rewritten).await.expect("approved");
+    }
+
+    /// The read-only read answers in a jj repository too, where the branch's
+    /// commit now comes from the bookmark rather than from Git's refs. An
+    /// approval made through the export path recorded what the export had put
+    /// into Git's refs; when the bookmark moves with jj alone afterwards, a
+    /// stale approval must be reported against the bookmark's commit. Against
+    /// Git's stale ref it would not even be stale, and the approval would
+    /// read as current over changes nobody reviewed.
+    #[tokio::test]
+    async fn a_stale_approval_in_a_jj_repository_is_reported_against_the_bookmark() {
+        let (tmp, state) = test_state().await;
+        // A non-colocated jj workspace: `git` cannot discover its backing
+        // repository from the workspace, so a ref read there is a read of the
+        // bookmark's export, never of something git can reach on its own.
+        let ws = tmp.path().join(format!("jj-{}", Uuid::new_v4()));
+        jj(tmp.path(), &["git", "init", "--no-colocate", ws.to_str().unwrap()]);
+        std::fs::write(ws.join("README.md"), "base\n").unwrap();
+        jj(&ws, &["commit", "-m", "task commit"]);
+        jj(&ws, &["bookmark", "create", "task-branch", "-r", "@-"]);
+        let approved = jj(&ws, &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "task-branch"]);
+
+        // A project whose repository is that workspace, and a task in Human
+        // Review whose branch is the bookmark.
+        let repository_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        state.repository.repositories.write().await.insert(
+            repository_id,
+            crate::domain::Repository {
+                id: repository_id,
+                local_path: ws.to_str().unwrap().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        state.project.projects.write().await.insert(
+            project_id,
+            crate::domain::Project {
+                id: project_id,
+                name: "jj".to_string(),
+                repository_id: Some(repository_id),
+                scope: crate::domain::project::ProjectScope::Standalone,
+                state_location: crate::config::paths::StateLocation::External,
+                base: Some(crate::domain::project::ProjectBase::LocalBranch {
+                    branch: "task-branch".to_string(),
+                }),
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                agent_config: crate::domain::AgentConfig {
+                    agent_type: crate::domain::AgentType::ClaudeCode,
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        let mut task = create_test_task_full("stale in jj", project_id, TaskStatus::HumanReview, 0);
+        task.branch_name = Some("task-branch".to_string());
+        task.human_review.record_arrival();
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+
+        // The approval is made through the export path, as a delivery would
+        // read the branch: it records the commit the export put into Git's
+        // refs.
+        approve_shown(&state, task_id, false).await.expect("approved");
+        assert_eq!(on_disk(&state, project_id, task_id).human_review.approved_tip(), Some(approved.as_str()));
+
+        // The bookmark moves with jj alone, as a person working in jj does,
+        // and the export that recorded the approval does not happen again:
+        // Git's refs still hold the approved commit.
+        jj(&ws, &["--ignore-working-copy", "new", "-m", "moved on"]);
+        jj(&ws, &["--ignore-working-copy", "bookmark", "set", "task-branch", "-r", "@-"]);
+        let moved = jj(&ws, &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "task-branch"]);
+        assert_ne!(moved, approved, "the fixture must have moved the bookmark");
+        let git_dir = ws.join(".jj/repo/store/git");
+        assert_eq!(
+            git_ref_at(&git_dir, "task-branch", tmp.path()),
+            Some(approved.clone()),
+            "the fixture must have left Git's ref at the approved commit"
+        );
+
+        // The read-only status answers the bookmark's commit, so the approval
+        // is reported stale against the branch as it is now — and the read
+        // exports nothing, being one the panel may ask on a cadence.
+        let status = approval_status(&state, task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::Moved);
+        assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()), "the approval covers what it recorded");
+        assert_eq!(status.branch_tip.as_deref(), Some(moved.as_str()), "the branch is where the bookmark is now");
+        assert_eq!(status.rewritten, Some(false), "the approved commit is still on the branch");
+        let reason = status.reason.clone().unwrap_or_default();
+        assert!(reason.contains(&approved[..12]) && reason.contains(&moved[..12]), "{reason}");
+        assert_eq!(
+            git_ref_at(&git_dir, "task-branch", tmp.path()),
+            Some(approved),
+            "the read must not export the bookmark into Git's refs"
+        );
     }
 
     #[tokio::test]

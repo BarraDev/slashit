@@ -18,7 +18,17 @@
 # prints instead of its default (the pull request's state and base, as GitHub
 # would list it); and `pr-commits/<number>` holds the commit ids `gh api
 # --paginate repos/{owner}/{repo}/pulls/<number>/commits --jq .[].sha` prints,
-# one per line.
+# one per line. `pr-heads/<number>` is the commit the pull request was opened
+# at, which the default `pr view` answer reports as `headRefOid`; a scripted
+# `pr-view` answer reports only what the journey writes into it.
+#
+# A public reply is never sent anywhere. `gh pr comment` and the threaded
+# `gh api -X POST .../replies` store the exact body they were given under
+# `posts/<sequence>.body`, and the call's target under `posts/<sequence>.target`,
+# and then print an id. `gh api user` reports a fixed account. The REST lists of
+# reviews, comments and review threads are empty unless a journey scripts them
+# (`FakeGh::script_read`), so no reply that SlashIt did not post is adopted by
+# default.
 set -e
 
 dir="$SLASHIT_FAKE_GH_DIR"
@@ -58,6 +68,25 @@ done
 
 repository="https://github.com/slashit-acceptance/fixture"
 
+# Records a public write as `posts/<sequence>.body` and `.target`. The journey
+# reads a record as soon as its `.body` exists, so the target is written first
+# and the complete body is renamed into place last: a half-written record is
+# never visible.
+publish_post() {
+    printf '%s' "$1" > "$dir/posts/$position.body.partial"
+    printf '%s' "$2" > "$dir/posts/$position.target"
+    mv "$dir/posts/$position.body.partial" "$dir/posts/$position.body"
+}
+
+# Answers a REST list read with the scripted file `$1`, or with an empty list.
+scripted_read() {
+    if [ -f "$dir/$1" ]; then
+        cat "$dir/$1"
+    else
+        printf '[]'
+    fi
+}
+
 case "$1 $2" in
     "pr list")
         if [ -n "$head" ] && [ -f "$dir/pr-list/$head.json" ]; then
@@ -87,6 +116,11 @@ case "$1 $2" in
         count=$(ls "$dir/prs" | wc -l)
         url="$repository/pull/$((count + 1))"
         printf '%s' "$url" > "$dir/prs/$head"
+        # The head GitHub would report: the branch's commit where the pull
+        # request was opened, read from the repository `gh` runs in.
+        mkdir -p "$dir/pr-heads"
+        head_oid=$(git rev-parse --verify --quiet "refs/heads/$head^{commit}" 2>/dev/null || true)
+        printf '%s' "$head_oid" > "$dir/pr-heads/$((count + 1))"
         printf '%s\n' "$url"
         ;;
     "pr view")
@@ -99,26 +133,127 @@ case "$1 $2" in
         elif [ -f "$dir/pr-view.json" ]; then
             cat "$dir/pr-view.json"
         else
-            printf '{"state":"OPEN","number":1,"mergeable":"MERGEABLE","reviewDecision":"","statusCheckRollup":[],"baseRefName":"main","isCrossRepository":false}'
+            # The head recorded when the pull request was opened, if there is one.
+            head_oid=""
+            if [ -f "$dir/pr-heads/$number" ]; then
+                head_oid=$(cat "$dir/pr-heads/$number")
+            fi
+            head_field=""
+            if [ -n "$head_oid" ]; then
+                head_field=",\"headRefOid\":\"$head_oid\""
+            fi
+            # The review and comment lists are present and empty: a pull request
+            # with no review, which Analyze reads in full.
+            printf '{"state":"OPEN","number":1,"mergeable":"MERGEABLE","reviewDecision":"","statusCheckRollup":[],"reviews":[],"comments":[],"baseRefName":"main","isCrossRepository":false%s}' "$head_field"
         fi
         ;;
     "issue view")
         # `issue-view-<number>.json` is what `issue view <number>` prints; by
-        # default the Issue is open at the fixture repository's own address.
+        # default the Issue is open at the fixture repository's own address,
+        # with the fields a Task created from it reads.
         number="$3"
         if [ -f "$dir/issue-view-$number.json" ]; then
             cat "$dir/issue-view-$number.json"
         else
-            printf '{"number":%s,"state":"OPEN","url":"%s/issues/%s"}' "$number" "$repository" "$number"
+            printf '{"number":%s,"title":"Fixture issue %s","body":"","state":"OPEN","labels":[],"assignees":[],"comments":[],"createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z","url":"%s/issues/%s"}' "$number" "$number" "$repository" "$number"
+        fi
+        ;;
+    "auth status")
+        # The Issues page checks the sign-in before it reads. The fake is always signed in.
+        printf 'github.com\n  Logged in to github.com account acceptance\n'
+        ;;
+    "issue list")
+        # `issue-list-<state>.json` is what `issue list --state <state>` prints,
+        # where <state> is the word after `--state`. A state with no file lists
+        # nothing, so a journey must script every state it asks for.
+        state=""
+        take_state=""
+        for arg in "$@"; do
+            if [ -n "$take_state" ]; then
+                state="$arg"
+                take_state=""
+                continue
+            fi
+            if [ "$arg" = "--state" ]; then
+                take_state="yes"
+            fi
+        done
+        # `fail-issue-list-<state>` makes that listing fail the way an unreachable
+        # or refusing GitHub does, with the error on stderr and no list.
+        if [ -f "$dir/fail-issue-list-$state" ]; then
+            echo "fake gh: HTTP 503: the Issue list was scripted to fail" >&2
+            exit 1
+        fi
+        if [ -f "$dir/issue-list-$state.json" ]; then
+            cat "$dir/issue-list-$state.json"
+        else
+            printf '[]'
         fi
         ;;
     "api --paginate")
-        number=$(printf '%s' "$3" | sed -n 's#.*/pulls/\([0-9][0-9]*\)/commits$#\1#p')
-        if [ -z "$number" ] || [ ! -f "$dir/pr-commits/$number" ]; then
-            echo "fake gh: no commits scripted for $3" >&2
+        case "$3" in
+            # The REST lists Analyze reads. Each is `[]` unless a journey scripted
+            # it (FakeGh::script_read), so an unscripted inline list lists no
+            # comment and a threaded reply is never adopted.
+            repos/*/pulls/*/comments*) scripted_read "pull-comments.json" ;;
+            repos/*/pulls/*/reviews*) scripted_read "pull-reviews.json" ;;
+            repos/*/issues/*/comments*) scripted_read "issue-comments.json" ;;
+            *)
+                number=$(printf '%s' "$3" | sed -n 's#.*/pulls/\([0-9][0-9]*\)/commits$#\1#p')
+                if [ -z "$number" ] || [ ! -f "$dir/pr-commits/$number" ]; then
+                    echo "fake gh: no commits scripted for $3" >&2
+                    exit 1
+                fi
+                cat "$dir/pr-commits/$number"
+                ;;
+        esac
+        ;;
+    "api graphql")
+        # The review threads of the pull request: none unless scripted, so none is
+        # resolved or outdated.
+        if [ -f "$dir/review-threads.json" ]; then
+            cat "$dir/review-threads.json"
+        else
+            printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}'
+        fi
+        ;;
+    "api user")
+        printf 'slashit-acceptance-reviewer\n'
+        ;;
+    "api -X")
+        # `api -X POST repos/.../comments/<id>/replies -f body=<text> --jq .id`
+        if [ "$3" != "POST" ]; then
+            echo "fake gh: unsupported api method $3" >&2
             exit 1
         fi
-        cat "$dir/pr-commits/$number"
+        body=""
+        for arg in "$@"; do
+            case "$arg" in
+                body=*) body="${arg#body=}" ;;
+            esac
+        done
+        mkdir -p "$dir/posts"
+        publish_post "$body" "POST $4"
+        printf '%s\n' "$((7000 + position))"
+        ;;
+    "pr comment")
+        # `pr comment <number> --repo <repo> --body <text>`
+        number="$3"
+        body=""
+        take_body=""
+        for arg in "$@"; do
+            if [ -n "$take_body" ]; then
+                body="$arg"
+                take_body=""
+                continue
+            fi
+            if [ "$arg" = "--body" ]; then
+                take_body="yes"
+            fi
+        done
+        mkdir -p "$dir/posts"
+        publish_post "$body" "PR-LEVEL $number"
+        printf '%s\n' "$repository/pull/$number#issuecomment-$((7000 + position))"
         ;;
     "repo view")
         case "$*" in

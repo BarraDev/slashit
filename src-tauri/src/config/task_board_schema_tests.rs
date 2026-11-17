@@ -213,6 +213,15 @@ fn full_task(project_id: Uuid) -> Task {
     });
     task.base_commit = Some(commit('d'));
     task.branch_origin = Some(BranchOrigin::DefaultBase { branch: Some("main".into()) });
+    task.pr_reply_records = vec![crate::domain::pr_reply_history::PrReplyRecord {
+        host: "github.com".into(),
+        repository: "barradev/slashit".into(),
+        pull_request: 1,
+        comment_id: 2,
+        state: crate::domain::pr_reply_history::PrReplyState::Confirmed,
+        reply_id: Some(3),
+        kind: Some(crate::domain::task::PrCommentKind::Review),
+    }];
     task.pr_publication = Some(crate::domain::publication::PrPublication::pending(
         Uuid::new_v4(),
         commit('e'),
@@ -296,6 +305,7 @@ fn full_task(project_id: Uuid) -> Task {
             fix_commit: Some(commit('8')),
             fix_effect: Some(FixEffect { before_tree: commit('9'), after_tree: commit('0') }),
             reply_posted: true,
+            reply_uncertain: false,
             last_agent_summary: Some("agent".into()),
             last_error: Some("error".into()),
             pr_reply_text: Some("reply".into()),

@@ -59,6 +59,8 @@ mod conversation_history;
 mod developer_tools;
 #[path = "product_acceptance/github_issue_link.rs"]
 mod github_issue_link;
+#[path = "product_acceptance/issues_page.rs"]
+mod issues_page;
 #[path = "product_acceptance/human_review.rs"]
 mod human_review;
 #[path = "product_acceptance/local_first.rs"]
@@ -81,6 +83,10 @@ mod orphans;
 mod pr_status;
 #[path = "product_acceptance/pr_recovery.rs"]
 mod pr_recovery;
+#[path = "product_acceptance/pr_comment_review.rs"]
+mod pr_comment_review;
+#[path = "product_acceptance/pr_comment_analyze.rs"]
+mod pr_comment_analyze;
 #[path = "product_acceptance/project_rail.rs"]
 mod project_rail;
 #[path = "product_acceptance/portable_import.rs"]

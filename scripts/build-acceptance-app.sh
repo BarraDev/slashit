@@ -59,6 +59,11 @@ fail() {
 binary=target/debug/slashit-ui
 stamp=target/acceptance-app.stamp
 
+# The frontend keeps its acceptance-only test seams (the coverage poll hold in
+# src/components/task_review.rs) only in a build that sets this variable. A
+# production or development build never sets it, so the seams are compiled out.
+export SLASHIT_ACCEPTANCE_BUILD=1
+
 # Step 1 replaces the configured beforeBuildCommand, so it must stay the same
 # command. If the configuration changes, this script must change with it.
 grep -Eq '"beforeBuildCommand": *"trunk build"' src-tauri/tauri.conf.json ||

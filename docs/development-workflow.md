@@ -758,13 +758,32 @@ before creating it; reshaping a published stack is expensive.
 **Durable text.** PR titles and bodies, commit messages, and source comments
 are read long after the work ends. Describe the problem, the change, and how
 it was verified. Do not include internal work-tracking labels, session
-narration, temporary verification SHAs, private report paths, or AI
+narration, SHAs other than the current head, private report paths, or AI
 attribution. See "No AI Attribution" in `AGENTS.md`.
+
+**Pull request description.** It holds a durable change summary, the guarantees
+the change makes, the verification of its exact head, and its material
+limitations. It does not hold review histories, review dispositions, or test
+counts, which a later head makes stale. Keep the description current with the
+head it describes.
 
 **Review findings.** Where practical, fix a review finding in the PR that
 introduced the problem rather than in a follow-up PR, as a corrective child
 change (section 5). Do not post transient agent-status comments; reply to
 review threads with what changed.
+
+Investigate a review claim before changing code (section 18, step 5). A
+hypothetical issue is actionable when its execution conditions are feasible and
+sufficient evidence demonstrates the defect. A test whose premise is invalid or
+unreachable is not proof of a defect. Correct a verified defect within the
+pull request's relevant scope, without a fixed limit on review rounds. Do not
+change code only to satisfy a reviewer's preference.
+
+Record each disposition where it belongs. An inline finding is dispositioned in
+its original thread. An outside-diff finding, which GitHub cannot attach to a
+line, is dispositioned in a concise pull request conversation comment that links
+to the review it came from. Neither the description nor those comments repeat
+review histories or old test counts.
 
 **Evidence.** Hosted CI is evidence, not complete proof. For example, it does not run
 tests marked `#[ignore]`, such as the PTY tests. Run the relevant
@@ -823,9 +842,13 @@ owner's decision (`AGENTS.md`, Authorization).
   positive is dismissed in the code scanning alert with a factual reason;
   do not rewrite otherwise-correct code, including test code, just to turn
   the check green.
-- CodeRabbit. It is advisory and is governed by section 18. A rate-limited or
-  skipped review is NOT REVIEWED, not a passed review, and the pull request
-  must say so.
+- CodeRabbit. It is advisory and is governed by section 18. It is not a merge
+  gate, and a new head does not by itself require a new review. A review counts
+  only for the commit it names. A rate-limited, skipped, or outdated review is
+  NOT REVIEWED, not a passed review, and the pull request must say so.
+
+Neither advisory check replaces the enforced gates above or the owner's
+approval.
 
 **Asynchronous and periodic.** Review the repository's Security tab weekly or
 once per development round:
@@ -844,10 +867,20 @@ every review-body finding has a recorded disposition, stated in the pull request
 - INVALID: why the finding does not apply.
 - ACCEPTED: the limitation, and that the owner accepted it.
 - DEFERRED: the Issue or pull request that tracks it.
-- NOT REVIEWED: a reviewer that was skipped or rate-limited. A merge on a head
-  that reviewer did not review says so in the pull request.
+- NOT REVIEWED: a reviewer that was skipped, rate-limited, or reviewed only an
+  earlier commit. A merge on a head that reviewer did not review says so in the
+  pull request.
 
 A thread that is resolved without one of these dispositions does not count.
+
+A reviewer's acknowledgement also satisfies the disposition for a thread, and
+needs no redundant reply, when all of these hold: the original finding is
+identifiable; the correcting commit exists on the pull request branch; source
+or test evidence supports the correction; the reviewer explicitly acknowledges
+that fix; and the thread is resolved. The acknowledgement covers the reviewed
+correction only, not later heads, and it does not renew a Human Review
+approval. The five dispositions above keep their meanings.
+
 An unresolved finding that would change behavior, persistence or authorization
 blocks the merge.
 
@@ -1025,7 +1058,9 @@ is not a review. Neither is a "skipping" status.
    one `@coderabbitai review`. Post `full review` only when justified.
 7. **Verify the review.** Compare the review's `commit_id` with the PR head, as
    section 16 describes. A review of an older commit says nothing about the
-   head.
+   head, which stays NOT REVIEWED (section 14). Do not request a review after
+   each fix or documentation-only change; request one under step 6 or when the
+   owner asks.
 8. **Merge is the owner's decision** (section 14). The review verdict does not
    replace hosted CI or the owner's approval.
 

@@ -80,9 +80,11 @@ description as its prompt. EditTask can rewrite that title and description
 on a task that is already queued or in progress. Editing a queued task
 changes the prompt of its first run; editing an in-progress task does not
 change the run already executing, only a later run (a retry, a review or fix
-pass, or a restart after hydration requeues it). The agent is spawned with
-`--permission-mode auto` (not `--dangerously-skip-permissions`) and the full
-`Read,Edit,Write,Bash,Glob,Grep` tool set.
+pass, or a restart after hydration requeues it). A Claude Code agent is spawned
+with `--permission-mode auto`, with no `--tools` restriction, and never with
+`--dangerously-skip-permissions`. An OpenCode agent runs `opencode acp` under
+its own permission policy and receives none of Claude's CLI flags (see
+`src-tauri/src/agents/AGENTS.md`).
 
 A Task in Human Review is not moved by the control channel. `MoveTask` to any
 other status and `EnqueueTask` are refused for it, and nothing is written. Each

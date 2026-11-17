@@ -209,6 +209,7 @@ pub async fn import_jira_issues(
             pending_republish: None,
             pr_create_unconfirmed: None,
             pr_publication: None,
+            pr_reply_records: Vec::new(),
             local_integration: None,
             cleanup_in_flight: false,
             pr_review_plan: None,

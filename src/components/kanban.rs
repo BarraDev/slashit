@@ -16,7 +16,7 @@ use crate::components::task_live::{activity_from_event, changes_task_record, Act
 use crate::models::AgentEvent;
 use crate::services::task_run_service::{get_live_runs, listen_agent_events_with_ready};
 use crate::components::markdown::render_safe_markdown;
-use crate::services::{reorder_task, queue_service, promoted_message, run_queued_task, RunNowOutcome,get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
+use crate::services::{reorder_task, queue_service, promoted_message, run_queued_task, RunNowOutcome,get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, ApprovedPublicReply, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
 
@@ -34,6 +34,11 @@ struct LiveRunsContext(RwSignal<LiveRuns>);
 /// makes each press a new cue. Read by the cards.
 #[derive(Clone, Copy)]
 struct AttentionHighlight(RwSignal<Option<(Uuid, u32)>>);
+
+/// A Task another page asks the board to open: its Project and its id. The
+/// board of that Project opens the drawer and clears the request.
+#[derive(Clone, Copy)]
+pub struct OpenTaskRequest(pub RwSignal<Option<(String, Uuid)>>);
 
 /// How long a card stays outlined after "Needs you" pointed at it.
 const HIGHLIGHT_MS: u64 = 2_500;
@@ -192,11 +197,12 @@ pub fn Kanban(
     let show_pr_review_modal = RwSignal::new(false);
     let pr_review_task = RwSignal::new(None::<Task>);
     let pr_review_plan = RwSignal::new(None::<PrReviewPlan>);
+    let pr_review_recorded = RwSignal::new(Vec::<u64>::new());
     let pr_review_loading = RwSignal::new(false);
     let pr_review_applying = RwSignal::new(false);
     let pr_review_error = RwSignal::new(None::<String>);
     let pr_review_auto_push = RwSignal::new(crate::services::PR_REVIEW_AUTO_PUSH_DEFAULT);
-    let pr_review_auto_reply = RwSignal::new(true);
+    let pr_review_selected_replies = RwSignal::new(Vec::<(u64, String, bool)>::new());
     let pr_review_dry_run = RwSignal::new(false);
     let pr_review_last_apply = RwSignal::new(None::<PrReviewApplyResult>);
     // Per-item live status fed by `pr-review-progress` Tauri events keyed by
@@ -320,6 +326,19 @@ pub fn Kanban(
 
     // The task whose drawer is open, if any.
     let drawer_task = RwSignal::new(None::<Uuid>);
+
+    // A Task the Issues page asked to open. Only the board of its Project takes it.
+    if let Some(OpenTaskRequest(request)) = use_context::<OpenTaskRequest>() {
+        let board_project = project_id.clone();
+        Effect::new(move |_| {
+            if let Some((project, id)) = request.get() {
+                if project == board_project {
+                    drawer_task.set(Some(id));
+                    request.set(None);
+                }
+            }
+        });
+    }
 
     // The card the header just pointed at, briefly outlined. The counter
     // makes a second press on the same card a fresh cue.
@@ -466,28 +485,40 @@ pub fn Kanban(
         show: show_pr_review_modal,
         task: pr_review_task,
         plan: pr_review_plan,
+        recorded: pr_review_recorded,
         loading: pr_review_loading,
         error: pr_review_error,
         last_apply: pr_review_last_apply,
         auto_push: pr_review_auto_push,
+        selected_replies: pr_review_selected_replies,
+        generation: RwSignal::new(0_u64),
     };
     let on_analyze_pr_comments = Callback::new({
         move |task: Task| {
             if !pr_review_dialog.open(task.clone()) {
                 return;
             }
+            let Some(opening) = pr_review_dialog.opening() else {
+                return;
+            };
             spawn_local(async move {
                 match analyze_pr_comments(task.id.to_string()).await {
                     Ok(plan) => {
-                        pr_review_plan.set(Some(plan));
-                        pr_review_error.set(None);
+                        if pr_review_dialog.shows(opening) {
+                            pr_review_dialog.adopt_plan(opening, plan);
+                            pr_review_error.set(None);
+                        }
                     }
                     Err(e) => {
-                        pr_review_plan.set(None);
-                        pr_review_error.set(Some(format!("Failed to analyze PR comments: {}", e)));
+                        if pr_review_dialog.shows(opening) {
+                            pr_review_plan.set(None);
+                            pr_review_error.set(Some(format!("Failed to analyze PR comments: {}", e)));
+                        }
                     }
                 }
-                pr_review_loading.set(false);
+                if pr_review_dialog.shows(opening) {
+                    pr_review_loading.set(false);
+                }
             });
         }
     });
@@ -734,12 +765,14 @@ pub fn Kanban(
                 applying=pr_review_applying
                 error=pr_review_error
                 auto_push=pr_review_auto_push
-                auto_reply=pr_review_auto_reply
                 dry_run=pr_review_dry_run
                 last_apply=pr_review_last_apply
                 item_status=pr_review_item_status
                 overall_progress=pr_review_overall
+                recorded=pr_review_recorded
+                approved_replies=pr_review_selected_replies
                 set_tasks=set_tasks_signal
+                dialog=pr_review_dialog
             />
 
             <PrCandidatesModal
@@ -1002,22 +1035,91 @@ struct PrReviewDialog {
     show: RwSignal<bool>,
     task: RwSignal<Option<Task>>,
     plan: RwSignal<Option<PrReviewPlan>>,
+    /// The Fix comments the stored plan approves, as the backend last returned
+    /// them. Replies are offered only for these, never for a checkbox ticked
+    /// since (see `PrReviewPlan::approved_fix_ids`).
+    recorded: RwSignal<Vec<u64>>,
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
     last_apply: RwSignal<Option<PrReviewApplyResult>>,
     auto_push: RwSignal<bool>,
+    /// The replies selected for posting, each with the text the person saw and
+    /// whether a duplicate was accepted. A selection belongs to one opening, so
+    /// `open` clears it; the backend still checks each text before posting.
+    selected_replies: RwSignal<Vec<(u64, String, bool)>>,
+    /// Advanced by every `open`. An asynchronous operation records the opening
+    /// it started from, and may change the dialog only while that one is shown.
+    generation: RwSignal<u64>,
+}
+
+/// The opening an asynchronous PR-review operation started from: the dialog's
+/// generation at that time and the Task it showed then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReviewOpening {
+    generation: u64,
+    task_id: Uuid,
+}
+
+impl PrReviewDialog {
+    /// The opening the dialog shows now, or `None` when it shows no Task.
+    /// Uses the `try_` reads: a result can finish after the board that owns
+    /// these signals was disposed (for example, on a project switch), and a
+    /// plain read would panic there. A disposed dialog shows nothing.
+    fn opening(self) -> Option<ReviewOpening> {
+        let task_id = self
+            .task
+            .try_with_untracked(|t| t.as_ref().map(|t| t.id))??;
+        Some(ReviewOpening {
+            generation: self.generation.try_get_untracked()?,
+            task_id,
+        })
+    }
+
+    /// Whether an operation that began at `opening` may still change the
+    /// dialog. Only the same opening of the same Task qualifies: a result from
+    /// an earlier opening must not overwrite another Task's plan, approvals,
+    /// selections or errors. The Task's board record is updated separately.
+    fn shows(self, opening: ReviewOpening) -> bool {
+        self.opening() == Some(opening)
+    }
+
+    /// Adopts the plan an operation of `opening` returned, and reports whether
+    /// it did. A plan from an earlier opening is dropped, nothing else changes.
+    fn adopt_plan(self, opening: ReviewOpening, plan: PrReviewPlan) -> bool {
+        if !self.shows(opening) {
+            return false;
+        }
+        self.recorded.set(plan.approved_fix_ids());
+        self.plan.set(Some(plan));
+        true
+    }
+
+    /// Clears the replies selected for posting after a Sync that began at
+    /// `opening`, but only while that opening is shown.
+    fn release_selected_replies(self, opening: ReviewOpening) -> bool {
+        if !self.shows(opening) {
+            return false;
+        }
+        self.selected_replies.set(Vec::new());
+        true
+    }
 }
 
 impl PrReviewDialog {
     /// Prepares and shows the dialog for `task`. Returns `true` when no usable
     /// plan is cached, so the caller must analyze the task's comments.
     fn open(self, task: Task) -> bool {
+        // Every operation started before this opening is now stale.
+        self.generation.update(|g| *g += 1);
         // Auto-push is a choice for one dialog opening. Every opening starts
         // from the default, so enabling it for one Task never reaches another,
         // or the same Task on a later opening. Nothing else resets it while
         // the dialog is open.
         self.auto_push
             .set(crate::services::PR_REVIEW_AUTO_PUSH_DEFAULT);
+        // Reply selections follow the same rule: a Task A selection must not
+        // leave Task B's Post button enabled.
+        self.selected_replies.set(Vec::new());
         self.task.set(Some(task.clone()));
         self.error.set(None);
         self.last_apply.set(task.pr_review_plan.as_ref().and_then(|p| p.last_apply.clone()));
@@ -1036,6 +1138,7 @@ impl PrReviewDialog {
             // landed, so the badges would lie otherwise.
             let mut cached = task.pr_review_plan.clone().expect("checked above");
             cached.backfill_lifecycle_from_last_apply();
+            self.recorded.set(cached.approved_fix_ids());
             self.plan.set(Some(cached));
             self.loading.set(false);
             self.show.set(true);
@@ -1057,12 +1160,14 @@ fn PrReviewModal(
     applying: RwSignal<bool>,
     error: RwSignal<Option<String>>,
     auto_push: RwSignal<bool>,
-    auto_reply: RwSignal<bool>,
     dry_run: RwSignal<bool>,
     last_apply: RwSignal<Option<PrReviewApplyResult>>,
     item_status: RwSignal<std::collections::HashMap<u64, PrItemStatus>>,
     overall_progress: RwSignal<Option<(usize, usize)>>,
+    recorded: RwSignal<Vec<u64>>,
+    approved_replies: RwSignal<Vec<(u64, String, bool)>>,
     set_tasks: WriteSignal<Vec<Task>>,
+    dialog: PrReviewDialog,
 ) -> impl IntoView {
     let show_raw_comments = RwSignal::new(false);
     // Default true once an apply has happened — focus on what's new since.
@@ -1116,6 +1221,7 @@ fn PrReviewModal(
     let trigger_analyze = move |force: bool| {
         let Some(task_value) = task.get() else { return; };
         if busy() { return; }
+        let Some(opening) = dialog.opening() else { return; };
         if !force {
             let cached = task_value.pr_review_plan.clone()
                 .filter(|p| !p.comments.is_empty() || !p.items.is_empty());
@@ -1126,6 +1232,7 @@ fn PrReviewModal(
                 cached.backfill_lifecycle_from_last_apply();
                 last_apply.set(cached.last_apply.clone());
                 show_only_new.set(cached.last_apply.is_some());
+                recorded.set(cached.approved_fix_ids());
                 plan.set(Some(cached));
                 error.set(None);
                 return;
@@ -1137,22 +1244,29 @@ fn PrReviewModal(
         spawn_local(async move {
             match analyze_pr_comments(task_value.id.to_string()).await {
                 Ok(mut p) => {
-                    p.backfill_lifecycle_from_last_apply();
-                    show_only_new.set(p.last_apply.is_some());
-                    plan.set(Some(p));
-                    error.set(None);
+                    if dialog.shows(opening) {
+                        p.backfill_lifecycle_from_last_apply();
+                        show_only_new.set(p.last_apply.is_some());
+                        dialog.adopt_plan(opening, p);
+                        error.set(None);
+                    }
                 }
                 Err(e) => {
-                    plan.set(None);
-                    error.set(Some(format!("Failed to analyze PR comments: {}", e)));
+                    if dialog.shows(opening) {
+                        plan.set(None);
+                        error.set(Some(format!("Failed to analyze PR comments: {}", e)));
+                    }
                 }
             }
-            loading.set(false);
+            if dialog.shows(opening) {
+                loading.set(false);
+            }
         });
     };
 
     let on_apply = move |_| {
         let Some(task_value) = task.get() else { return; };
+        let Some(opening) = dialog.opening() else { return; };
         let Some(current_plan) = plan.get() else {
             toast::error("No plan loaded".to_string());
             return;
@@ -1164,7 +1278,6 @@ fn PrReviewModal(
 
         let opts = AddressPrReviewOptions {
             auto_push: auto_push.get(),
-            auto_reply: auto_reply.get(),
             dry_run: dry_run.get(),
         };
         // Clear the prior preview/report and any stale error so the user
@@ -1184,7 +1297,9 @@ fn PrReviewModal(
                     let replies = result.replies_posted;
                     let errs = result.reply_errors.len();
                     let was_dry_run = result.dry_run;
-                    last_apply.set(Some(result));
+                    if dialog.shows(opening) {
+                        last_apply.set(Some(result));
+                    }
                     let mut msg = if was_dry_run {
                         String::from("Dry-run complete. ")
                     } else {
@@ -1202,7 +1317,7 @@ fn PrReviewModal(
                     spawn_local(async move {
                         if let Ok(Some(updated)) = refresh_task_pr_state(task_id_inner).await {
                             if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
-                                plan.set(Some(refreshed_plan));
+                                dialog.adopt_plan(opening, refreshed_plan);
                             }
                             set_tasks.update(|tasks| {
                                 if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
@@ -1214,7 +1329,9 @@ fn PrReviewModal(
                 }
                 Err(e) => {
                     let msg = format!("Failed to apply PR fixes: {}", e);
-                    error.set(Some(msg.clone()));
+                    if dialog.shows(opening) {
+                        error.set(Some(msg.clone()));
+                    }
                     toast::error(msg);
                 }
             }
@@ -1224,6 +1341,7 @@ fn PrReviewModal(
 
     let on_discuss = move |_| {
         let Some(task_value) = task.get() else { return; };
+        let Some(opening) = dialog.opening() else { return; };
         let Some(current_plan) = plan.get() else { return; };
         if pending_discussion_count() == 0 {
             toast::error("Add a note to at least one Question item first".to_string());
@@ -1235,13 +1353,17 @@ fn PrReviewModal(
         spawn_local(async move {
             match discuss_pr_review_questions(task_id, current_plan).await {
                 Ok(updated) => {
-                    plan.set(Some(updated));
-                    error.set(None);
+                    if dialog.shows(opening) {
+                        dialog.adopt_plan(opening, updated);
+                        error.set(None);
+                    }
                     toast::success("Agent re-evaluated the questions".to_string());
                 }
                 Err(e) => {
                     let msg = format!("Failed to discuss: {}", e);
-                    error.set(Some(msg.clone()));
+                    if dialog.shows(opening) {
+                        error.set(Some(msg.clone()));
+                    }
                     toast::error(msg);
                 }
             }
@@ -1249,53 +1371,108 @@ fn PrReviewModal(
         });
     };
 
-    // Count of items Sync would act on: missing replies (POST) plus legacy
-    // replies that need to be located on GitHub and rewritten to the
-    // signature-free format (`reply_posted=true` but `pr_reply_text=None`).
-    // Items with `pr_reply_text=Some(_)` are already in the new format.
-    let deferred_reply_count = move || plan.get()
+    // The replies Sync may post, each with the exact text it would post. A
+    // reply is owed only for an approved fix with a public reply the fix agent
+    // wrote, not yet posted, whose commit was seen on the PR branch. The
+    // triage reasoning is internal and is never offered as a reply. The backend
+    // makes the final check on whatever is approved here.
+    let owed_replies = move || plan.get()
+        .map(|p| p.items.iter()
+            .filter(|i| recorded.with(|r| reply_offered(i, r)))
+            .filter_map(|i| {
+                let id = i.comment_id?;
+                let body = slashit_review_content::public_reply(i.pr_reply_text.as_deref())?;
+                // The same text the backend publishes: a PR-level reply names its comment.
+                let mut same_id = p.comments.iter().filter(|c| c.id == Some(id));
+                let text = match (same_id.next(), same_id.next()) {
+                    (Some(c), None) if !matches!(c.kind, PrCommentKind::Inline) => {
+                        slashit_review_content::pr_level_reply_text(c.url.as_deref(), &c.author, &body)
+                    }
+                    _ => body,
+                };
+                Some((id, i.summary.clone(), text, i.reply_uncertain))
+            })
+            .collect::<Vec<_>>())
+        .unwrap_or_default();
+    // Approved fixes that have no public reply. Nothing can be selected for
+    // them: the reasoning is the person's internal assessment, not a reply.
+    let fixes_without_reply = move || plan.get()
         .map(|p| p.items.iter()
             .filter(|i| i.approved
                 && matches!(i.decision, PrReviewDecisionKind::Fix)
                 && i.fix_done
-                // A reply is owed only for a fix whose commit was seen on the
-                // PR branch; an undelivered fix waits for Apply, not Sync.
-                && (if i.reply_posted {
-                    i.pr_reply_text.is_none()
-                } else {
-                    i.fix_commit.is_some() && !i.fix_uncommitted
-                }))
-            .count())
-        .unwrap_or(0);
-
+                && !i.reply_posted
+                && slashit_review_content::public_reply(i.pr_reply_text.as_deref()).is_none())
+            .map(|i| i.summary.clone())
+            .collect::<Vec<_>>())
+        .unwrap_or_default();
+    // Approved fixes whose reply is ready except for the approval record. The
+    // checkbox alone does not record it, so no reply is offered for them yet.
+    let replies_awaiting_record = move || plan.get()
+        .map(|p| p.items.iter()
+            .filter(|i| delivered_reply_fix(i)
+                && i.comment_id.is_some_and(|id| recorded.with(|r| !r.contains(&id))))
+            .map(|i| i.summary.clone())
+            .collect::<Vec<_>>())
+        .unwrap_or_default();
+    // Replies the person selected (`approved_replies`, owned by the dialog so a
+    // new opening clears it). Nothing is selected by default, and approving a
+    // fix never selects a reply.
     let on_sync_replies = move |_| {
         let Some(task_value) = task.get() else { return; };
-        if deferred_reply_count() == 0 {
-            toast::error("Nothing to sync — every fixed item already has a reply in the current format".to_string());
+        let Some(opening) = dialog.opening() else { return; };
+        let selected = approved_replies.get();
+        if selected.is_empty() {
+            toast::error("Select at least one reply to post".to_string());
             return;
         }
+        // A selection posts only the text the person saw. If the text changed
+        // since, nothing is sent: the stale selection is dropped and the rest
+        // stay selected.
+        let current = owed_replies();
+        let still_current = |s: &(u64, String, bool)| current.iter().any(|r| r.0 == s.0 && r.2 == s.1);
+        if !selected.iter().all(|s| still_current(s)) {
+            approved_replies.update(|v| v.retain(|s| still_current(s)));
+            toast::error("A reply changed after you selected it. Review the new text and select it again. Nothing was posted.".to_string());
+            return;
+        }
+        let approved: Vec<ApprovedPublicReply> = selected
+            .into_iter()
+            .map(|(comment_id, body, accept_possible_duplicate)| ApprovedPublicReply {
+                comment_id,
+                body,
+                accept_possible_duplicate,
+            })
+            .collect();
         // Reuse the `applying` lock for the modal-busy treatment; sync is a
         // short, gh-only catch-up but conceptually the same exclusive operation.
         error.set(None);
         applying.set(true);
         let task_id = task_value.id.to_string();
         spawn_local(async move {
-            match sync_pr_review_replies(task_id.clone()).await {
+            match sync_pr_review_replies(task_id.clone(), approved).await {
                 Ok(result) => {
+                    // Cleared only for the opening that made the selection: another
+                    // Task's selections must survive this result.
+                    dialog.release_selected_replies(opening);
                     let mut parts: Vec<String> = Vec::new();
                     if result.replied > 0 { parts.push(format!("Posted {} new", result.replied)); }
-                    if result.rewritten > 0 { parts.push(format!("Rewrote {} ({} via discovery)", result.rewritten, result.discovered)); }
+                    if result.discovered > 0 { parts.push(format!("Found {} existing", result.discovered)); }
                     if result.unmatched > 0 { parts.push(format!("{} could not be located on GitHub", result.unmatched)); }
                     if result.fix_pending > 0 { parts.push(format!("{} still need a fix", result.fix_pending)); }
+                    if result.awaiting_approval > 0 { parts.push(format!("{} not selected, not posted", result.awaiting_approval)); }
+                    if result.held_uncertain > 0 { parts.push(format!("{} held: may already be on GitHub", result.held_uncertain)); }
                     if !result.errors.is_empty() { parts.push(format!("{} errors", result.errors.len())); }
                     let msg = if parts.is_empty() { "Nothing to sync".to_string() } else { parts.join(", ") };
-                    let did_work = result.replied > 0 || result.rewritten > 0;
+                    let did_work = result.replied > 0;
                     if result.errors.is_empty() && did_work {
                         toast::success(msg);
                     } else if !result.errors.is_empty() {
                         let detail = result.errors.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
                         let final_msg = format!("{}: {}", msg, detail);
-                        error.set(Some(final_msg.clone()));
+                        if dialog.shows(opening) {
+                            error.set(Some(final_msg.clone()));
+                        }
                         toast::error(final_msg);
                     } else {
                         toast::success(msg);
@@ -1305,7 +1482,7 @@ fn PrReviewModal(
                     spawn_local(async move {
                         if let Ok(Some(updated)) = refresh_task_pr_state(task_id_inner).await {
                             if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
-                                plan.set(Some(refreshed_plan));
+                                dialog.adopt_plan(opening, refreshed_plan);
                             }
                             set_tasks.update(|tasks| {
                                 if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
@@ -1317,7 +1494,9 @@ fn PrReviewModal(
                 }
                 Err(e) => {
                     let msg = format!("Failed to sync replies: {}", e);
-                    error.set(Some(msg.clone()));
+                    if dialog.shows(opening) {
+                        error.set(Some(msg.clone()));
+                    }
                     toast::error(msg);
                 }
             }
@@ -1337,6 +1516,7 @@ fn PrReviewModal(
             >
                 <div
                     class="w-full max-w-6xl max-h-[90vh] bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl overflow-hidden flex flex-col"
+                    data-testid="pr-review-modal"
                     on:click=move |e| e.stop_propagation()
                 >
                     <div class="flex items-start justify-between px-5 py-4 border-b border-white/10 gap-4">
@@ -1403,7 +1583,7 @@ fn PrReviewModal(
                             }
                         >
                             {move || error.get().map(|msg| view! {
-                                <div class="px-3 py-2 rounded-md border border-red-500/30 bg-red-500/10 text-xs text-red-200 flex items-start gap-2">
+                                <div class="px-3 py-2 rounded-md border border-red-500/30 bg-red-500/10 text-xs text-red-200 flex items-start gap-2" data-testid="pr-review-error">
                                     <div class="flex-1 whitespace-pre-wrap break-words font-mono">{msg}</div>
                                     <button
                                         class="flex-shrink-0 -mr-1 p-1 rounded hover:bg-red-500/15 text-red-300/70 hover:text-red-200 transition-colors"
@@ -1583,6 +1763,77 @@ fn PrReviewModal(
                         </Show>
                     </div>
 
+                    <Show when=move || !owed_replies().is_empty()>
+                        <section class="px-5 py-3 border-t border-white/10 space-y-3 max-h-72 overflow-y-auto" aria-label="Replies waiting for approval">
+                            <div class="text-xs text-white/70 space-y-1">
+                                <p class="font-semibold text-white/80">"Replies waiting for your approval"</p>
+                                <p>"A reply is posted on GitHub only if you select it and press Post. Approving a fix does not approve its reply."</p>
+                            </div>
+                            <For
+                                each=owed_replies
+                                key=|r| r.0
+                                children=move |(id, _, _, _): (u64, String, String, bool)| {
+                                    let current = move || owed_replies().into_iter().find(|r| r.0 == id);
+                                    view! {
+                                        <div class="rounded-lg border border-white/10 p-2 space-y-2" data-testid="pr-review-reply" data-comment-id=id.to_string()>
+                                            <label class="flex items-center gap-2 text-xs text-white/80 cursor-pointer">
+                                                <input
+                                                    type="checkbox"
+                                                    class="accent-yellow-500 disabled:cursor-not-allowed"
+                                                    data-testid="pr-review-reply-select"
+                                                    prop:checked=move || approved_replies.get().iter().any(|s| s.0 == id)
+                                                    on:change=move |ev| {
+                                                        let on = event_target_checked(&ev);
+                                                        let Some(row) = current() else { return; };
+                                                        approved_replies.update(|v| {
+                                                            v.retain(|s| s.0 != id);
+                                                            if on { v.push((id, row.2.clone(), row.3)); }
+                                                        });
+                                                    }
+                                                    disabled=move || busy()
+                                                />
+                                                {move || current().map(|r| format!("Comment {}: {}", id, r.1)).unwrap_or_default()}
+                                            </label>
+                                            <pre class="whitespace-pre-wrap break-words text-xs text-white/80 bg-black/30 rounded p-2 m-0" data-testid="pr-review-reply-text">
+                                                {move || current().map(|r| r.2).unwrap_or_default()}
+                                            </pre>
+                                            <Show when=move || current().is_some_and(|r| r.3)>
+                                                <p class="text-xs text-amber-200" data-testid="pr-review-reply-duplicate">
+                                                    "An earlier attempt may already have posted this PR-level reply. Selecting it accepts a possible duplicate."
+                                                </p>
+                                            </Show>
+                                        </div>
+                                    }
+                                }
+                            />
+                        </section>
+                    </Show>
+                    <Show when=move || !fixes_without_reply().is_empty()>
+                        <section class="px-5 py-3 border-t border-white/10 space-y-2" aria-label="Fixes without a public reply" data-testid="pr-review-no-reply">
+                            <p class="text-xs font-semibold text-white/80">"No public reply is prepared for these fixes"</p>
+                            <p class="text-xs text-white/70">"Their triage reasoning is internal and is not posted as a reply, so none of them can be selected."</p>
+                            <ul class="text-xs text-white/70 list-disc pl-5">
+                                <For
+                                    each=fixes_without_reply
+                                    key=|s| s.clone()
+                                    children=move |s: String| view! { <li data-testid="pr-review-no-reply-item">{s}</li> }
+                                />
+                            </ul>
+                        </section>
+                    </Show>
+                    <Show when=move || !replies_awaiting_record().is_empty()>
+                        <section class="px-5 py-3 border-t border-white/10 space-y-2" aria-label="Approved fixes not yet recorded" data-testid="pr-review-unrecorded">
+                            <p class="text-xs font-semibold text-amber-200">"Approved here, but not recorded yet"</p>
+                            <p class="text-xs text-white/70">"These replies cannot be selected until the stored review plan records your approval. Ticking Approve here does not record it. Apply records it, and for a fix already on the PR branch it does not make the fix again."</p>
+                            <ul class="text-xs text-white/70 list-disc pl-5">
+                                <For
+                                    each=replies_awaiting_record
+                                    key=|s| s.clone()
+                                    children=move |s: String| view! { <li data-testid="pr-review-unrecorded-item">{s}</li> }
+                                />
+                            </ul>
+                        </section>
+                    </Show>
                     <div class=move || format!(
                         "flex items-center justify-between gap-3 px-5 py-3 border-t border-white/10 bg-white/[0.02] {}",
                         if busy() { "opacity-60" } else { "" },
@@ -1597,16 +1848,6 @@ fn PrReviewModal(
                                     disabled=move || busy()
                                 />
                                 "Auto-push branch"
-                            </label>
-                            <label class="flex items-center gap-1.5 cursor-pointer">
-                                <input
-                                    type="checkbox"
-                                    class="accent-yellow-500 disabled:cursor-not-allowed"
-                                    prop:checked=move || auto_reply.get()
-                                    on:change=move |ev| auto_reply.set(event_target_checked(&ev))
-                                    disabled=move || busy()
-                                />
-                                "Auto-reply on PR"
                             </label>
                             <label
                                 class="flex items-center gap-1.5 cursor-pointer"
@@ -1650,20 +1891,21 @@ fn PrReviewModal(
                             </button>
                             <button
                                 class=move || {
-                                    if deferred_reply_count() > 0 {
-                                        "px-3 py-1.5 rounded-lg text-xs text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 transition-colors disabled:opacity-40"
-                                    } else {
+                                    if approved_replies.get().is_empty() {
                                         "px-3 py-1.5 rounded-lg text-xs text-white/40 border border-white/10 cursor-not-allowed"
+                                    } else {
+                                        "px-3 py-1.5 rounded-lg text-xs text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 transition-colors disabled:opacity-40"
                                     }
                                 }
+                                data-testid="pr-review-post-replies"
                                 on:click=on_sync_replies
-                                disabled=move || busy() || deferred_reply_count() == 0
-                                title="Post deferred replies on GitHub for items that were fixed but never replied to. No agent run, no push. Enabled when at least one fixed item has no reply yet."
+                                disabled=move || busy() || approved_replies.get().is_empty()
+                                title="Post only the replies selected in the panel above, with the exact text shown there. No agent run, no push."
                             >
                                 {move || {
-                                    let n = deferred_reply_count();
-                                    if n == 0 { "Sync replies".to_string() }
-                                    else { format!("Sync {} replies", n) }
+                                    let n = approved_replies.get().len();
+                                    if n == 0 { "Post selected replies".to_string() }
+                                    else { format!("Post {} selected", n) }
                                 }}
                             </button>
                             <button
@@ -1678,11 +1920,13 @@ fn PrReviewModal(
                                 class="px-3 py-1.5 rounded-lg text-xs text-white/60 hover:bg-white/10 transition-colors disabled:opacity-40"
                                 on:click=move |_| show.set(false)
                                 disabled=move || applying.get() || discussing.get()
+                                data-testid="pr-review-close"
                             >
                                 "Close"
                             </button>
                             <button
                                 class="px-4 py-1.5 rounded-lg text-sm bg-yellow-500 text-black font-medium hover:bg-yellow-400 transition-colors disabled:opacity-40 disabled:hover:bg-yellow-500"
+                                data-testid="pr-review-apply"
                                 on:click=on_apply
                                 disabled=move || loading.get() || applying.get() || discussing.get() || approved_fix_count() == 0
                             >
@@ -1717,6 +1961,25 @@ fn approved_after_decision_change(
     approved: bool,
 ) -> bool {
     is_fix && (from_collaborator || (was_fix && approved))
+}
+
+/// An approved Fix whose public reply is ready to offer: the fix is delivered
+/// to the PR branch and the reply text is prepared. Whether the approval is
+/// recorded in the stored plan is checked by the caller.
+fn delivered_reply_fix(i: &PrReviewItem) -> bool {
+    i.approved
+        && matches!(i.decision, PrReviewDecisionKind::Fix)
+        && i.fix_done
+        && !i.reply_posted
+        && i.fix_commit.is_some()
+        && !i.fix_uncommitted
+        && slashit_review_content::public_reply(i.pr_reply_text.as_deref()).is_some()
+}
+
+/// Whether an approved Fix's reply may be selected: it is delivered and its
+/// approval is in `recorded`, the stored plan's approvals as last loaded.
+fn reply_offered(i: &PrReviewItem, recorded: &[u64]) -> bool {
+    delivered_reply_fix(i) && i.comment_id.is_some_and(|id| recorded.contains(&id))
 }
 
 /// Tooltip of the "Fix not delivered" badge, for a Fix whose change is not on
@@ -1815,11 +2078,12 @@ fn render_review_item(
     };
 
     view! {
-        <div class=format!("rounded-lg border {} p-3 space-y-2", decision_class)>
+        <div class=format!("rounded-lg border {} p-3 space-y-2", decision_class) data-testid="pr-review-item" data-comment-id=comment_id.map(|id| id.to_string())>
             <div class="flex items-start gap-3">
                 <input
                     type="checkbox"
                     class="mt-1 accent-yellow-500 disabled:cursor-not-allowed"
+                    data-testid="pr-review-item-approve"
                     prop:checked=approved_init
                     on:change=toggle_approved
                     disabled=move || busy.get()
@@ -1950,14 +2214,14 @@ fn render_review_item(
 
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
                 <label class="block">
-                    <span class="text-[10px] uppercase tracking-wide text-white/40">"Reply / reasoning"</span>
+                    <span class="text-[10px] uppercase tracking-wide text-white/40">"Internal reasoning (never posted)"</span>
                     <textarea
                         class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50 disabled:opacity-60 disabled:cursor-not-allowed"
                         rows="2"
                         on:input=on_reasoning_input
                         prop:value=reasoning
                         disabled=move || busy.get()
-                        placeholder="What you would tell the reviewer. Posted as the PR reply when auto-reply is on."
+                        placeholder="Your internal assessment. It is never posted to GitHub. Public replies are approved separately, in the replies list."
                     ></textarea>
                 </label>
 
@@ -3061,7 +3325,9 @@ fn KanbanTaskCard(
 #[cfg(test)]
 mod tests {
     use super::approved_after_decision_change;
+    use super::{delivered_reply_fix, reply_offered};
     use super::next_card_id;
+    use crate::models::task::{PrReviewItem, PrReviewPlan};
     use super::{awaiting_delivery, offers_pr_sync};
     use super::PrReviewDialog;
     use crate::models::{HumanReviewDecision, HumanReviewEntry, Task, TaskStatus};
@@ -3076,11 +3342,135 @@ mod tests {
             show: RwSignal::new(false),
             task: RwSignal::new(None),
             plan: RwSignal::new(None),
+            recorded: RwSignal::new(Vec::new()),
             loading: RwSignal::new(false),
             error: RwSignal::new(None),
             last_apply: RwSignal::new(None),
             auto_push: RwSignal::new(PR_REVIEW_AUTO_PUSH_DEFAULT),
+            selected_replies: RwSignal::new(Vec::new()),
+            generation: RwSignal::new(0),
         })
+    }
+
+    /// A Task whose cached plan is for the pull request numbered `pr_number`.
+    fn task_with_plan_for_pr(id: u128, pr_number: u32) -> Task {
+        let mut task = task_with_cached_plan(id);
+        if let Some(plan) = task.pr_review_plan.as_mut() {
+            plan.pr_url = format!("https://github.com/BarraDev/slashit/pull/{pr_number}");
+        }
+        task
+    }
+
+    /// A Sync, apply or analysis of Task A is still in flight when Task B is
+    /// opened. A's results arrive afterwards, in the order the test chooses.
+    #[test]
+    fn a_result_for_task_a_does_not_replace_task_b_after_b_is_opened() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = task_with_plan_for_pr(1, 101);
+        let task_b = task_with_plan_for_pr(2, 202);
+        assert!(!dialog.open(task_a.clone()), "A has a cached plan");
+        let opening_a = dialog.opening().expect("A is shown");
+        dialog.show.set(false);
+
+        assert!(!dialog.open(task_b.clone()), "B has a cached plan");
+        let opening_b = dialog.opening().expect("B is shown");
+        dialog
+            .selected_replies
+            .set(vec![(7, "Fixed it.".to_string(), false)]);
+
+        // A's refresh completes now.
+        let a_plan = task_a.pr_review_plan.clone().expect("A has a plan");
+        assert!(
+            !dialog.adopt_plan(opening_a, a_plan),
+            "A's result must not be adopted into B's modal"
+        );
+        assert!(
+            !dialog.release_selected_replies(opening_a),
+            "A's Sync must not clear B's selection"
+        );
+
+        let shown = dialog.plan.get_untracked().expect("B's plan is still shown");
+        assert_eq!(shown.pr_url, "https://github.com/BarraDev/slashit/pull/202");
+        assert_eq!(dialog.recorded.get_untracked(), shown.approved_fix_ids());
+        assert_eq!(
+            dialog.selected_replies.get_untracked(),
+            vec![(7, "Fixed it.".to_string(), false)],
+            "B keeps its own selection"
+        );
+        assert_eq!(dialog.opening(), Some(opening_b));
+        assert!(dialog.shows(opening_b) && !dialog.shows(opening_a));
+    }
+
+    /// The same opening still shown: the result is adopted. Without this the
+    /// refusal above could be a dialog that never adopts anything.
+    #[test]
+    fn a_result_for_the_task_still_shown_is_adopted() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = task_with_plan_for_pr(1, 101);
+        assert!(!dialog.open(task_a.clone()));
+        let opening_a = dialog.opening().expect("A is shown");
+
+        let refreshed = task_with_plan_for_pr(1, 303).pr_review_plan.expect("a plan");
+        assert!(dialog.adopt_plan(opening_a, refreshed));
+        assert_eq!(
+            dialog.plan.get_untracked().map(|p| p.pr_url),
+            Some("https://github.com/BarraDev/slashit/pull/303".to_string())
+        );
+        assert!(dialog.release_selected_replies(opening_a));
+    }
+
+    /// Reopening the same Task is a new opening: a result that began at the
+    /// earlier opening no longer lands, even though the Task is the same.
+    #[test]
+    fn a_result_from_an_earlier_opening_of_the_same_task_is_refused() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = task_with_plan_for_pr(1, 101);
+        assert!(!dialog.open(task_a.clone()));
+        let first = dialog.opening().expect("shown");
+        dialog.show.set(false);
+        assert!(!dialog.open(task_a.clone()));
+        assert!(!dialog.shows(first));
+        let stale = task_with_plan_for_pr(1, 999).pr_review_plan.expect("a plan");
+        assert!(!dialog.adopt_plan(first, stale));
+    }
+
+    /// A result for a Task after the dialog was closed and nothing else opened is
+    /// still that Task's: it is adopted, so a closed dialog reopens with it.
+    #[test]
+    fn a_result_while_the_dialog_is_closed_still_belongs_to_the_same_opening() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = task_with_plan_for_pr(1, 101);
+        assert!(!dialog.open(task_a.clone()));
+        let opening_a = dialog.opening().expect("shown");
+        dialog.show.set(false);
+        let refreshed = task_with_plan_for_pr(1, 404).pr_review_plan.expect("a plan");
+        assert!(dialog.adopt_plan(opening_a, refreshed));
+    }
+
+    /// A Task with no opening shown has no operation to scope to.
+    #[test]
+    fn no_opening_exists_before_any_task_is_shown() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        assert_eq!(dialog.opening(), None);
+    }
+
+    /// A result that finishes after the board holding the dialog was disposed
+    /// (a project switch) must neither panic nor change anything.
+    #[test]
+    fn a_disposed_dialog_shows_nothing_and_does_not_panic() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        assert!(!dialog.open(task_with_cached_plan(1)));
+        let opening = dialog.opening().expect("shown before disposal");
+        drop(owner);
+        assert_eq!(dialog.opening(), None);
+        assert!(!dialog.shows(opening));
+        assert!(!dialog.release_selected_replies(opening));
     }
 
     /// A Task whose PR-review plan is cached, so opening it does not analyze.
@@ -3136,6 +3526,28 @@ mod tests {
         );
     }
 
+    /// A reply selected for Task A must not stay selected, and keep Post enabled,
+    /// once Task B's dialog opens.
+    #[test]
+    fn a_reply_selected_for_one_task_is_not_selected_when_another_task_opens() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let task_a = column_task(1, "a");
+        let task_b = column_task(2, "b");
+
+        assert!(dialog.open(task_a), "task A is analyzed");
+        dialog
+            .selected_replies
+            .set(vec![(7, "Fixed it.".to_string(), false)]);
+        dialog.show.set(false);
+
+        assert!(dialog.open(task_b), "task B is analyzed");
+        assert!(
+            dialog.selected_replies.get_untracked().is_empty(),
+            "task A's selection must not carry over to task B"
+        );
+    }
+
     #[test]
     fn reopening_a_task_with_a_cached_plan_also_starts_with_auto_push_off() {
         let owner = Owner::new();
@@ -3155,6 +3567,65 @@ mod tests {
             !dialog.auto_push.get_untracked(),
             "the cached-plan opening starts with Auto-push off"
         );
+    }
+
+    /// A plan item as the backend returns it; lifecycle fields start unset.
+    fn review_item(comment_id: u64, decision: &str, approved: bool) -> PrReviewItem {
+        serde_json::from_value(serde_json::json!({
+            "comment_id": comment_id, "summary": "s", "decision": decision,
+            "reasoning": "r", "proposed_change": "p", "approved": approved,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_reply_is_offered_only_for_an_approved_delivered_fix_with_text() {
+        let mut item = review_item(7, "fix", true);
+        item.fix_done = true;
+        item.fix_commit = Some("a".repeat(40));
+        item.pr_reply_text = Some("Renamed the helper.".to_string());
+        assert!(delivered_reply_fix(&item));
+
+        let unticked = PrReviewItem { approved: false, ..item.clone() };
+        assert!(!delivered_reply_fix(&unticked), "an unticked fix offers no reply");
+        let uncommitted = PrReviewItem { fix_uncommitted: true, ..item.clone() };
+        assert!(!delivered_reply_fix(&uncommitted), "a fix not yet on the branch offers no reply");
+        let undelivered = PrReviewItem { fix_commit: None, ..item.clone() };
+        assert!(!delivered_reply_fix(&undelivered));
+        let no_text = PrReviewItem { pr_reply_text: None, ..item.clone() };
+        assert!(!delivered_reply_fix(&no_text), "internal reasoning is never a reply");
+        let posted = PrReviewItem { reply_posted: true, ..item.clone() };
+        assert!(!delivered_reply_fix(&posted));
+    }
+
+    #[test]
+    fn a_delivered_reply_waits_for_its_approval_to_be_recorded() {
+        let mut item = review_item(7, "fix", true);
+        item.fix_done = true;
+        item.fix_commit = Some("a".repeat(40));
+        item.pr_reply_text = Some("Renamed the helper.".to_string());
+        assert!(!reply_offered(&item, &[]), "a browser-only tick is not offered");
+        assert!(reply_offered(&item, &[7]), "a recorded approval is offered");
+        assert!(!reply_offered(&item, &[8]), "another comment's approval does not offer this reply");
+    }
+
+    #[test]
+    fn the_recorded_approvals_are_the_approved_fixes_and_nothing_else() {
+        let mut plan: PrReviewPlan = serde_json::from_value(serde_json::json!({
+            "generated_at": "2026-01-01T00:00:00Z",
+            "pr_url": "https://github.com/BarraDev/slashit/pull/1",
+            "review_decision": null,
+            "comments": [],
+            "items": [],
+            "raw_plan": ""
+        }))
+        .unwrap();
+        plan.items = vec![
+            review_item(7, "fix", true),
+            review_item(8, "skip", true),
+            review_item(9, "fix", false),
+        ];
+        assert_eq!(plan.approved_fix_ids(), vec![7]);
     }
 
     fn column_task(id: u128, title: &str) -> Task {

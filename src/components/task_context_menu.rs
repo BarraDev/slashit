@@ -390,6 +390,7 @@ pub fn TaskContextMenu(
                         has_pr.then(|| view! {
                             <button
                                 class="w-full px-3 py-2 text-left text-sm text-white/80 hover:bg-white/10 flex items-center gap-2 transition-colors"
+                                data-testid="task-menu-analyze-pr"
                                 on:click=on_analyze
                             >
                                 <svg class="w-4 h-4 text-white/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">

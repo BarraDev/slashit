@@ -25,6 +25,8 @@ pub(super) const HR_RETRY_PR: &str = "[data-testid=\"human-review-retry-pr\"]";
 const HR_PR_LINK: &str = "[data-testid=\"human-review-pr-link\"]";
 const HR_ITERATION: &str = "[data-testid=\"human-review-iteration\"]";
 const HR_HISTORY_ENTRY: &str = "[data-testid=\"human-review-history-entry\"]";
+const HR_APPROVAL_STALE: &str = "[data-testid=\"human-review-approval-stale\"]";
+const HR_APPROVE_AGAIN: &str = "[data-testid=\"human-review-approve-again\"]";
 const DRAWER_REVIEW_VERDICT: &str = "[data-testid=\"task-drawer-review-verdict\"]";
 const CLOSE_DIALOG: &str = "[data-testid=\"close-without-merge-dialog\"]";
 const CLOSE_CONSEQUENCES: &str = "[data-testid=\"close-without-merge-consequences\"]";
@@ -58,6 +60,20 @@ impl GitFixture {
         let push_url = push_url.to_str().context("the origin path is not UTF-8")?;
         git(&self.path, &["remote", "set-url", "origin", fake_gh::REPOSITORY_URL])?;
         git(&self.path, &["remote", "set-url", "--push", "origin", push_url])
+    }
+
+    /// Makes `origin` an scp-style GitHub address that SlashIt reads as GitHub,
+    /// while fetches and listings reach the local bare repository through the
+    /// `ssh` stand-in in `fixtures/ssh-to-local-origin`, the same arrangement
+    /// `stacked_tasks` uses. A delivery check needs to fetch the pull request's
+    /// branch, which an address rewrite would hide from the product's own
+    /// reading of `origin`.
+    pub(super) fn serve_github_from_origin(&self) -> Result<()> {
+        let origin = self.origin_path()?.to_str().context("the origin path is not UTF-8")?;
+        let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join("ssh-to-local-origin");
+        let shim = shim.to_str().context("the ssh stand-in's path is not UTF-8")?;
+        git(&self.path, &["remote", "set-url", "origin", "git@github.com:slashit-acceptance/fixture.git"])?;
+        git(&self.path, &["config", "core.sshCommand", &format!("'{shim}' '{origin}'")])
     }
 
     fn origin_path(&self) -> Result<&Path> {
@@ -118,6 +134,25 @@ fn review_entries(task: &Value) -> Vec<(String, Option<String>)> {
                     (
                         e.get("decision").and_then(Value::as_str).unwrap_or_default().to_string(),
                         e.get("feedback").and_then(Value::as_str).map(str::to_string),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Each decision with the commit it recorded, oldest first: the approval record
+/// as the product persists it.
+fn approval_record(task: &Value) -> Vec<(String, Option<String>)> {
+    task.pointer("/human_review/entries")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.get("decision").and_then(Value::as_str).unwrap_or_default().to_string(),
+                        e.get("approved_tip").and_then(Value::as_str).map(str::to_string),
                     )
                 })
                 .collect()
@@ -200,6 +235,44 @@ pub(super) async fn click(driver: &WebDriver, selector: &str, what: &str) -> Res
         .with_context(|| format!("could not press {what}"))
 }
 
+/// The window property the Human Review panel reads to hold its coverage
+/// cadence (`src/components/task_review.rs`): while it is set the panel asks
+/// nothing on the cadence and publishes no answer, so what a person is shown
+/// is frozen. Held for exactly the one step of [`changes_scope`] that needs the
+/// panel not to learn a branch move on its own, so that step's refusal is
+/// proven rather than raced against. It is page-scoped, so a reload clears it.
+const COVERAGE_POLL_HOLD: &str = "__slashitCoveragePollHold";
+
+async fn hold_coverage_poll(driver: &WebDriver) -> Result<()> {
+    page(
+        driver,
+        "window[arguments[0]] = true; return true;",
+        vec![Value::String(COVERAGE_POLL_HOLD.to_owned())],
+    )
+    .await?;
+    if page(
+        driver,
+        "return window[arguments[0]] === true;",
+        vec![Value::String(COVERAGE_POLL_HOLD.to_owned())],
+    )
+    .await?
+        != Value::Bool(true)
+    {
+        bail!("the coverage cadence could not be held");
+    }
+    Ok(())
+}
+
+async fn release_coverage_poll(driver: &WebDriver) -> Result<()> {
+    page(
+        driver,
+        "delete window[arguments[0]]; return true;",
+        vec![Value::String(COVERAGE_POLL_HOLD.to_owned())],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Wait until an approval control is shown and enabled, and return its label.
 ///
 /// The label is not readiness: the controls stay disabled until the commit to
@@ -266,6 +339,38 @@ async fn await_gone(driver: &WebDriver, selector: &str, what: &str) -> Result<()
     Ok(())
 }
 
+/// Saves a PNG of the window to `SLASHIT_HUMAN_REVIEW_SCREENSHOT_DIR/<name>.png`
+/// when that variable is set, as visual evidence. It asserts nothing and does
+/// nothing when the variable is unset.
+async fn capture_evidence(driver: &WebDriver, name: &str) -> Result<()> {
+    let Some(dir) = std::env::var_os("SLASHIT_HUMAN_REVIEW_SCREENSHOT_DIR") else {
+        return Ok(());
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+    driver
+        .screenshot(&dir.join(format!("{name}.png")))
+        .await
+        .with_context(|| format!("could not save the screenshot {name}"))
+}
+
+/// Waits until the approved status says `expected`. The panel reaches
+/// `current` only after its own read of the branch, so a check made right after
+/// the approval would read the answer from before it.
+async fn await_data_approval(driver: &WebDriver, expected: &str, what: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let found = attribute(driver, HR_APPROVED, "data-approval").await?;
+        if found.as_deref() == Some(expected) {
+            return Ok(());
+        }
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("{what}: the approved status is {found:?}, not {expected:?}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 pub(super) async fn open_reviewed_drawer(driver: &WebDriver, executed: &ExecutedTask) -> Result<()> {
     open_drawer(driver, &executed.id, &executed.title).await?;
     ui::visible(driver, HR_PANEL).await.context("the drawer shows no Human Review section")?;
@@ -313,7 +418,7 @@ async fn approve_journey(context: &TestContext) -> Result<()> {
     outcome
 }
 
-async fn approve_and_open_the_pull_request(
+pub(super) async fn approve_and_open_the_pull_request(
     driver: &WebDriver,
     agent: &FakeAgent,
     gh: &FakeGh,
@@ -933,7 +1038,7 @@ async fn move_to_done_from_the_menu(driver: &WebDriver, title: &str) -> Result<(
 /// Clicked from script: the button only becomes opaque on hover, and
 /// WebDriver refuses to click an element it considers invisible. The click
 /// still goes through the button's own handler.
-async fn open_card_menu(driver: &WebDriver, title: &str) -> Result<()> {
+pub(super) async fn open_card_menu(driver: &WebDriver, title: &str) -> Result<()> {
     let opened = page(
         driver,
         r#"
@@ -1199,6 +1304,9 @@ async fn changes_scope_journey(context: &TestContext) -> Result<()> {
 }
 
 async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFixture) -> Result<()> {
+    // A run of this journey that died while the cadence was held must not
+    // hold this one: the key is cleared before anything looks at the panel.
+    release_coverage_poll(driver).await?;
     let executed = execute_one_task(driver, agent, repository).await?;
     let branch = branch_of(&read_task(driver, &executed).await?)?;
     let tip = repository.branch_tip(&branch)?.context("the task branch is missing")?;
@@ -1231,36 +1339,152 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
     if !primary.contains(&work_file) || primary.contains("pending-only.txt") {
         bail!("the primary diff is not the committed content: {primary}");
     }
+    // The panel has read the branch before anything moves, so a later move is
+    // learned by the cadence, not by the panel's first ask.
+    await_text(driver, HR_CURRENT_COMMIT, |t| t.contains(&tip), "the panel to read the branch before it moves").await?;
 
-    // The branch moves after the tab was read. Approving is refused by the
-    // backend; once the panel knows the new commit, it also refuses while the
-    // tab still shows the old one, and reloads the tab.
+    // The branch moves outside SlashIt while the panel is deciding. The panel
+    // asks the branch's commit on a cadence, so it learns the move on its
+    // own: the commit it offers becomes the moved one, and the Changes tab
+    // follows it without anyone reopening anything.
     git(
         &executed.worktree_path,
         &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "moved"],
     )?;
     let moved = repository.branch_tip(&branch)?.context("the task branch is missing")?;
-    await_approval(driver, HR_APPROVE, "the approve action before the move is read").await?;
-    click(driver, HR_APPROVE, "Approve while the branch has moved").await?;
-    ui::visible(driver, HR_ERROR).await.context("a moved branch was approved or silently ignored")?;
     await_text(driver, HR_CURRENT_COMMIT, |t| t.contains(&moved), "the panel to read the moved branch").await?;
     // Nobody reopens the tab: it follows the branch, and approval waits for it.
     await_text(driver, REVIEW_COMMIT, |t| t == &moved[..12], "the Changes tab to follow the branch").await?;
     assert_not_offered(driver, HR_APPROVED, "an approval").await?;
 
-    // Decided on what is shown now.
+    // Approving while the branch has moved again: the person is shown
+    // `moved`, the branch is already at `moved_again`, and the click sends
+    // the commit on screen. The panel's cadence is held for exactly this
+    // step, so no ask of its own can land between the commit and the click
+    // and learn the newer move first: what is shown is provably `moved`,
+    // and the refusal is proven, not raced against.
+    hold_coverage_poll(driver).await?;
+    git(
+        &executed.worktree_path,
+        &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "moved again"],
+    )?;
+    let moved_again = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    assert_ne!(moved_again, moved, "the move must give the branch another commit");
+    await_approval(driver, HR_APPROVE, "Approve while the branch has moved").await?;
+    click(driver, HR_APPROVE, "Approve while the branch has moved").await?;
+    let refused =
+        await_text(driver, HR_ERROR, |t| t.contains("moved after it was shown"), "the refused approval").await?;
+    if !refused.contains("nothing was approved") {
+        bail!("the refusal does not say nothing was approved: {refused}");
+    }
+    // The cadence is released before the panel reads the branch again, so
+    // what this wait observes is the cadence, as a person's panel would.
+    release_coverage_poll(driver).await?;
+    // A refusal records nothing, and the panel then asks what the branch is
+    // now, so what is offered next is the branch as it is.
+    let task = read_task(driver, &executed).await?;
+    if task.pointer("/human_review/entries").and_then(Value::as_array).is_some_and(|e| !e.is_empty()) {
+        bail!("the refused approval was recorded: {task}");
+    }
+    assert_not_offered(driver, HR_APPROVED, "an approval that was refused").await?;
+    await_text(
+        driver,
+        HR_CURRENT_COMMIT,
+        |t| t.contains(&moved_again),
+        "the panel to read the branch after the refusal",
+    )
+    .await?;
+    await_text(driver, REVIEW_COMMIT, |t| t == &moved_again[..12], "the Changes tab to follow the refused branch").await?;
+
+    // Decided on what is shown now: the approval names the exact commit it
+    // covers.
+    await_approval(driver, HR_APPROVE, "the approve action on the moved branch").await?;
     click(driver, HR_APPROVE, "Approve the commit on screen").await?;
-    ui::visible(driver, HR_APPROVED).await.context("the drawer does not say Approved")?;
+    let approved_line = await_text(
+        driver,
+        HR_APPROVED,
+        |t| t.contains("Approved for") && t.contains(&moved_again[..12]) && !t.contains("stale"),
+        "the approval to name the commit it covers",
+    )
+    .await?;
+    await_data_approval(driver, "current", &format!("a covering approval, shown as: {approved_line}")).await?;
+    capture_evidence(driver, &format!("A-current-approval-of-{}", &moved_again[..12])).await?;
     let task = read_task(driver, &executed).await?;
     let approved = task
         .pointer("/human_review/entries/0/approved_tip")
         .and_then(Value::as_str)
         .context("the approval records no commit")?;
-    if approved != moved {
-        bail!("the approval records {approved}, the commit on screen was {moved}");
+    if approved != moved_again {
+        bail!("the approval records {approved}, the commit on screen was {moved_again}");
     }
     if !executed.worktree_path.join("pending-only.txt").is_file() {
         bail!("approving touched the uncommitted edits");
+    }
+
+    // The branch moves again, now after the approval. The panel flags the
+    // approval stale on its own cadence: the status line names the approved
+    // commit, the branch's tip now, and says stale, so it never keeps
+    // reading as if the current branch were approved. This is the assertion
+    // a hidden stale indicator fails.
+    git(
+        &executed.worktree_path,
+        &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-q", "-m", "moved after the approval"],
+    )?;
+    let later = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    let stale_line = await_text(
+        driver,
+        HR_APPROVED,
+        |t| t.contains("stale") && t.contains(&approved[..12]) && t.contains(&later[..12]),
+        "the stale approval to be flagged",
+    )
+    .await?;
+    await_data_approval(driver, "stale", &format!("the stale status, shown as: {stale_line}")).await?;
+    capture_evidence(driver, &format!("B-stale-approved-{}-branch-now-{}", &approved[..12], &later[..12])).await?;
+    if attribute(driver, HR_APPROVAL_STALE, "data-coverage").await?.as_deref() != Some("Moved") {
+        bail!("the stale approval does not report what the branch did");
+    }
+
+    // Renewing approves the branch as it is now: the stale flag disappears,
+    // the renewal becomes the current decision, and the earlier approval
+    // stays in the history without ever being shown as current again.
+    await_approval(driver, HR_APPROVE_AGAIN, "Approve the branch as it is now").await?;
+    // The renewal's own coverage read is the window in which the panel still
+    // holds the answer for the earlier approval. The cadence is held through
+    // the renewal, so that answer stays on screen until the held step ends. The
+    // panel must not show the earlier approval's details beside the renewal.
+    hold_coverage_poll(driver).await?;
+    click(driver, HR_APPROVE_AGAIN, "Approve the branch as it is now").await?;
+    await_data_approval(driver, "unknown", "the renewal before the branch is read again").await?;
+    if count(driver, HR_APPROVAL_STALE).await? != 0 {
+        bail!("the earlier approval's stale details are shown beside the renewal");
+    }
+    if count(driver, HR_APPROVE_AGAIN).await? != 0 {
+        bail!("the renewal control is still offered for the earlier approval");
+    }
+    capture_evidence(driver, &format!("C0-renewal-pending-unverified-of-{}", &later[..12])).await?;
+    release_coverage_poll(driver).await?;
+    await_absent_from_drawer(driver, HR_APPROVAL_STALE, "the stale flag after the renewal").await?;
+    let renewed = await_text(
+        driver,
+        HR_APPROVED,
+        |t| t.contains("Approved for") && t.contains(&later[..12]) && !t.contains("stale"),
+        "the renewed approval",
+    )
+    .await?;
+    await_data_approval(driver, "current", &format!("the renewed approval, shown as: {renewed}")).await?;
+    capture_evidence(driver, &format!("C-renewed-approval-of-{}", &later[..12])).await?;
+    let task = read_task(driver, &executed).await?;
+    let entries = task
+        .pointer("/human_review/entries")
+        .and_then(Value::as_array)
+        .context("the renewal left no review entries")?;
+    let kept = entries.first().and_then(|e| e.get("approved_tip")).and_then(Value::as_str);
+    let current = entries.last().and_then(|e| e.get("approved_tip")).and_then(Value::as_str);
+    if kept != Some(approved) {
+        bail!("the earlier approval did not stay in the history: the entries hold {entries:?}");
+    }
+    if current != Some(later.as_str()) {
+        bail!("the renewal did not record the branch as it is now: the entries hold {entries:?}");
     }
 
     // The board's Diff for the same Task names the same commit and the edits
@@ -1275,8 +1499,233 @@ async fn changes_scope(driver: &WebDriver, agent: &FakeAgent, repository: &GitFi
         .await
         .context("could not press the board's Diff")?;
     let heading = await_text(driver, "h2", |t| t.contains("commit"), "the board's Diff title").await?;
-    if !heading.contains(&moved[..12]) || !heading.contains("not approved") {
+    if !heading.contains(&later[..12]) || !heading.contains("not approved") {
         bail!("the board's Diff does not name the approved commit and the uncommitted edits: {heading}");
     }
     Ok(())
+}
+
+const HR_COMMIT_ERROR: &str = "[data-testid=\"human-review-commit-error\"]";
+const HR_COMMIT_RETRY: &str = "[data-testid=\"human-review-commit-retry\"]";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_is_unverified_while_the_branch_cannot_be_read_and_recovers_on_retry() {
+    let context = TestContext::new("human_review_unverified").expect("harness setup");
+    let outcome = unverified_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn unverified_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let (agent, _gh) = install_fakes(context, &root)?;
+    context.set_child_env(fake_agent::WRITE_OWN_FILE_VAR, "1");
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+    let session = context.start_session("human-review-unverified").await?;
+    let outcome = unverified(session.driver(), &agent, &repository).await;
+    context.close_session(session, "human-review-unverified", &outcome).await?;
+    outcome
+}
+
+/// The Project's repository becomes unreadable after the approval. The panel
+/// must not keep the approval current, must not show stale details, and must
+/// offer a retry. Once the repository reads again, the approval is current.
+async fn unverified(driver: &WebDriver, agent: &FakeAgent, repository: &GitFixture) -> Result<()> {
+    release_coverage_poll(driver).await?;
+    let executed = execute_one_task(driver, agent, repository).await?;
+    open_reviewed_drawer(driver, &executed).await?;
+    await_approval(driver, HR_APPROVE, "Approve the commit on screen").await?;
+    click(driver, HR_APPROVE, "Approve the commit on screen").await?;
+    await_data_approval(driver, "current", "the approval before the repository is unreadable").await?;
+
+    // Every coverage read now runs in a directory that does not exist, so
+    // each one fails. The repository is restored before anything is reported.
+    let path = repository.path.clone();
+    let aside = path.with_file_name("fixture-repo-unreadable");
+    std::fs::rename(&path, &aside).context("could not make the repository unreadable")?;
+    let checked = unverified_while_unreadable(driver).await;
+    let restored = std::fs::rename(&aside, &path).context("could not restore the repository");
+    restored?;
+    checked?;
+
+    await_data_approval(driver, "current", "the approval once the repository reads again").await?;
+    capture_evidence(driver, "E-current-after-the-branch-reads-again").await
+}
+
+async fn unverified_while_unreadable(driver: &WebDriver) -> Result<()> {
+    let error = await_text(driver, HR_COMMIT_ERROR, |t| t.contains("could not be read"), "the unreadable branch to be reported").await?;
+    await_data_approval(driver, "unknown", &format!("the approval while the branch is unreadable, shown as: {error}")).await?;
+    if count(driver, HR_APPROVAL_STALE).await? != 0 {
+        bail!("stale details are shown for a branch that could not be read");
+    }
+    let class = attribute(driver, HR_APPROVED, "class").await?.unwrap_or_default();
+    if class.contains("emerald") {
+        bail!("an approval that could not be checked is styled as current: {class}");
+    }
+    capture_evidence(driver, "D-unverified-while-the-branch-cannot-be-read").await?;
+    // Asking again while the repository is still unreadable must not turn the
+    // approval current.
+    click(driver, HR_COMMIT_RETRY, "Ask again about the branch").await?;
+    await_data_approval(driver, "unknown", "the approval after asking again while unreadable").await
+}
+
+// --- A published pull request that another clone moved ----------------------
+
+const DRAWER_PR_REFRESH: &str = "[data-testid=\"task-drawer-pr-refresh\"]";
+const HR_PUBLISHED: &str = "[data-testid=\"human-review-published\"]";
+const HR_STALE_BOX: &str = "[data-testid=\"human-review-approval-stale\"]";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pull_request_pushed_to_by_another_clone_is_not_shown_as_covered_by_the_approval() {
+    let context = TestContext::new("human_review_published_head").expect("harness setup");
+    let outcome = published_head_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn published_head_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let (agent, gh) = install_fakes(context, &root)?;
+    context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+    repository.point_origin_at_github()?;
+
+    let session = context.start_session("published-head").await?;
+    let outcome = published_head_moved(session.driver(), &agent, &gh, &repository, &root).await;
+    context.close_session(session, "published-head", &outcome).await?;
+    outcome
+}
+
+/// The pull request opens at the approved commit A, so the approval covers it.
+/// Another clone then pushes B to the same branch, and GitHub reports B. This
+/// clone never fetches, so the branch still names A. The panel must not keep
+/// showing the approval as covering the pull request, and when GitHub gives no
+/// head it must say the pull request is not verified.
+async fn published_head_moved(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    gh: &FakeGh,
+    repository: &GitFixture,
+    root: &Path,
+) -> Result<()> {
+    let (executed, _pr_url) = approve_and_open_the_pull_request(driver, agent, gh, repository).await?;
+    let task = read_task(driver, &executed).await?;
+    let branch = branch_of(&task)?;
+    let approved = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    let record_before = approval_record(&task);
+    if record_before != [("approved".to_string(), Some(approved.clone()))] {
+        bail!("the approval does not record the approved commit before the move: {record_before:?}");
+    }
+
+    open_reviewed_drawer(driver, &executed).await?;
+    await_data_approval(driver, "current", "the approval of a pull request opened at the approved commit").await?;
+    capture_evidence(driver, &format!("E-published-head-at-approved-{}", &approved[..12])).await?;
+    close_drawer(driver).await?;
+
+    // Another clone pushes B to the pull request's branch. Nothing here fetches it.
+    let moved = push_from_another_clone(repository, &branch, root)?;
+    if repository.origin_tip(&branch)?.as_deref() != Some(moved.as_str()) {
+        bail!("the other clone's push did not reach origin");
+    }
+    if repository.branch_tip(&branch)?.as_deref() != Some(approved.as_str()) {
+        bail!("the Task's own branch moved, but only the pull request should have");
+    }
+
+    // GitHub now reports B, and the drawer asks for it.
+    gh.script_pr_view(&pr_view_answer(Some(&moved)))?;
+    open_reviewed_drawer(driver, &executed).await?;
+    click(driver, DRAWER_PR_REFRESH, "Refresh the pull request's status").await?;
+    await_data_approval(driver, "published-moved", "the approval once GitHub reports another head").await?;
+    let shown = await_text(
+        driver,
+        HR_APPROVED,
+        |t| t.contains(&moved[..12]) && t.contains(&approved[..12]),
+        "the approval to name both commits",
+    )
+    .await?;
+    let class = attribute(driver, HR_APPROVED, "class").await?.unwrap_or_default();
+    if class.contains("emerald") {
+        bail!("the approval is styled as current while the pull request is at another commit: {shown}");
+    }
+    await_text(
+        driver,
+        HR_PUBLISHED,
+        |t| t.contains("require review") && t.contains(&moved[..12]) && t.contains(&approved[..12]),
+        "the note that changes after the approved commit need review, naming both commits",
+    )
+    .await?;
+
+    // The state above is settled before these are read. Renewal is offered only
+    // in the stale view, so both the renewal control and the box that holds it
+    // must be absent, while the branch and the approval record stay as they were.
+    let (renewals, stale_boxes) = (count(driver, HR_APPROVE_AGAIN).await?, count(driver, HR_STALE_BOX).await?);
+    if renewals != 0 || stale_boxes != 0 {
+        bail!(
+            "the stale approval box is shown while the pull request moved, \
+             with {renewals} renewal control(s) and {stale_boxes} stale box(es)"
+        );
+    }
+    if repository.branch_tip(&branch)?.as_deref() != Some(approved.as_str()) {
+        bail!("the Task's own branch moved while only the pull request should have");
+    }
+    let record_after = approval_record(&read_task(driver, &executed).await?);
+    if record_after != record_before {
+        bail!("the approval record changed while the pull request moved: {record_before:?} -> {record_after:?}");
+    }
+    capture_evidence(driver, &format!("F-published-head-{}-approval-{}", &moved[..12], &approved[..12])).await?;
+
+    // GitHub answers without a head: the pull request is unverified, not current.
+    gh.script_pr_view(&pr_view_answer(None))?;
+    click(driver, DRAWER_PR_REFRESH, "Refresh the pull request's status again").await?;
+    await_data_approval(driver, "published-unverified", "the approval once GitHub names no head").await?;
+    await_text(driver, HR_PUBLISHED, |t| t.contains("did not name"), "the reason the head is not verified").await?;
+    capture_evidence(driver, &format!("G-published-head-unverified-approval-{}", &approved[..12])).await?;
+    Ok(())
+}
+
+fn pr_view_answer(head: Option<&str>) -> Value {
+    let mut answer = json!({
+        "state": "OPEN",
+        "number": 1,
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "",
+        "statusCheckRollup": [],
+        "baseRefName": "main",
+        "isCrossRepository": false,
+    });
+    if let Some(head) = head {
+        answer["headRefOid"] = json!(head);
+    }
+    answer
+}
+
+/// Another clone of the fixture's origin commits to `branch` and pushes it, the
+/// way a collaborator would. It returns the commit it pushed. The Task's own
+/// checkout is not touched.
+fn push_from_another_clone(repository: &GitFixture, branch: &str, root: &Path) -> Result<String> {
+    let origin = repository.origin_path()?;
+    let origin = origin.to_str().context("the origin path is not UTF-8")?;
+    let clone = root.join("another-clone");
+    let clone_path = clone.to_str().context("the clone path is not UTF-8")?;
+    let run = |dir: &Path, args: &[&str]| -> Result<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .with_context(|| format!("could not run git {args:?}"))?;
+        if !output.status.success() {
+            bail!("git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    run(root, &["clone", "-q", origin, clone_path])?;
+    run(&clone, &["config", "user.email", "test@example.com"])?;
+    run(&clone, &["config", "user.name", "Test"])?;
+    run(&clone, &["checkout", "-q", branch])?;
+    std::fs::write(clone.join("pushed-elsewhere.txt"), "from another clone\n")?;
+    run(&clone, &["add", "."])?;
+    run(&clone, &["commit", "-q", "-m", "pushed from another clone"])?;
+    run(&clone, &["push", "-q", "origin", branch])?;
+    run(&clone, &["rev-parse", "HEAD"])
 }
