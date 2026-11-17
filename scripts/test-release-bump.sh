@@ -362,12 +362,30 @@ for f in src-tauri/tauri.conf.json package.json package-lock.json Cargo.toml src
   done
 done
 
+echo "== SIGKILL before the journal exists: staged copies are cleared by --recover and by a new --apply"
+stray() { find "$repo" \( -name '*.bump.??????' -o -name '.release-bump-journal.tmp' \) | wc -l; }
+make_repo "$repo" 0.0.3
+printf 'original lock\n' >"$repo/Cargo.lock"
+before=$(digest "$repo")
+killed_at before .release-bump-journal --apply 0.0.4
+strays=$(stray)
+out=$(run --recover); st=$?
+if [ "$strays" -gt 0 ] && [ "$st" -eq 0 ] && [ "$(stray)" -eq 0 ] && [[ "$out" == *"removed $strays staged file"* ]] && [ "$before" = "$(digest "$repo")" ]; then
+  ok "killed before the journal ($strays leftover(s)): --recover removes them and restores the original digest"
+else bad "killed before the journal: --recover left $(stray) leftover(s) (exit $st, expected $strays removed)"; printf '%s\n' "$out" >&2; fi
+make_repo "$repo" 0.0.3
+killed_at before .release-bump-journal --apply 0.0.4
+out=$(run --apply 0.0.4); st=$?
+if [ "$st" -eq 0 ] && [ "$(stray)" -eq 0 ] && [[ "$out" == *"removed"* ]] && grep -q '"version": "0.0.4"' "$repo/src-tauri/tauri.conf.json"; then
+  ok "a new --apply after a run killed before its journal clears the leftovers and completes"
+else bad "new --apply after a pre-journal kill: exit $st, left $(stray) leftover(s)"; printf '%s\n' "$out" >&2; fi
+
 echo "== SIGKILL around the journal's own rename"
 make_repo "$repo" 0.0.3
 killed_at before .release-bump-journal --apply 0.0.4
 out=$(run --recover); st=$?
 v=$(grep -rl '0\.0\.4' "$repo" --include='*.json' --include='*.toml' | grep -v '\.bump\.' || true)
-if [ "$st" -eq 1 ] && [[ "$out" == *"nothing to recover"* ]] && [ -z "$v" ] && run --apply 0.0.4 >/dev/null; then
+if [ "$st" -eq 0 ] && [ -z "$v" ] && run --apply 0.0.4 >/dev/null; then
   ok "killed before the journal exists: no managed file changed, and a new --apply succeeds"
 else bad "killed before the journal: unexpected state (exit $st, changed: ${v:-none})"; printf '%s\n' "$out" >&2; fi
 make_repo "$repo" 0.0.3

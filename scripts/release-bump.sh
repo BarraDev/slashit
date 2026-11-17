@@ -254,10 +254,33 @@ take_run_lock() {
     refuse "$root_lock was replaced while this run was starting; nothing was changed"
 }
 
+files=(src-tauri/tauri.conf.json package.json package-lock.json Cargo.toml src-tauri/Cargo.toml)
+for c in crates/*/Cargo.toml; do files+=("$c"); done
+
+# A run killed before its journal was in place leaves no journal, only the staged
+# copies beside each managed file (<file>.bump.XXXXXX) and an unfinished journal
+# directory. Removes them and prints how many. Called only under the run lock with
+# no journal present, so no live run can be writing them.
+sweep_stale() {
+  local f s n=0
+  if [ -e "$journal.tmp" ]; then rm -rf -- "$journal.tmp" && n=1; fi
+  for f in "${files[@]}"; do
+    for s in "$f".bump.??????; do
+      [ -e "$s" ] && rm -f -- "$s" && n=$((n + 1))
+    done
+  done
+  echo "$n"
+}
+
 if [ "$mode" = --recover ]; then
   have_flock
   take_run_lock
-  [ -e "$journal" ] || refuse "no $journal here; nothing to recover"
+  if [ ! -e "$journal" ]; then
+    n=$(sweep_stale)
+    [ "$n" -gt 0 ] || refuse "no $journal here; nothing to recover"
+    echo "$SELF: removed $n staged file(s) left by a run that stopped before its journal existed; nothing else to recover"
+    exit 0
+  fi
   { [ -f "$writer_lock" ] && exec 9<>"$writer_lock"; } 2>/dev/null || { bad_journal "no writer lock"; exit 1; }
   flock -n 9 ||
     refuse "a process of the interrupted run (cargo or a child of it) still holds $writer_lock and could still change Cargo.lock; nothing was changed. Wait for it to exit (fuser -v $writer_lock names it), then run $SELF --recover again"
@@ -281,9 +304,10 @@ else
 fi
 [ ! -e "$journal" ] ||
   refuse "$journal exists: an earlier run did not finish. Run $SELF --recover to restore the original files"
-
-files=(src-tauri/tauri.conf.json package.json package-lock.json Cargo.toml src-tauri/Cargo.toml)
-for c in crates/*/Cargo.toml; do files+=("$c"); done
+if [ "$mode" = --apply ]; then
+  n=$(sweep_stale)
+  [ "$n" -gt 0 ] && echo "$SELF: removed $n staged file(s) left by an earlier run that stopped before its journal existed"
+fi
 for f in "${files[@]}"; do [ -f "$f" ] || refuse "$f is missing"; done
 
 declare -A current=()
