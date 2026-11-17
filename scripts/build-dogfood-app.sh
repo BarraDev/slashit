@@ -241,11 +241,33 @@ promoted_ok=1
 # but only when it is self-consistent: its sidecar's sha256 must name its binary.
 # An inconsistent or absent previous pair is not kept. The directory is replaced
 # on each promotion, never accumulated, because a debug binary is about 180 MB.
+# The older candidate is removed only after the backup is in place. If the backup
+# cannot be moved, the older candidate is restored and the backup is kept, so a
+# failed retention never deletes the only copy of a verified pair.
+keep_previous() {
+  local aside=
+  if [ -e "$promoted/previous" ]; then
+    aside=$(mktemp -d "$promoted/.superseded.XXXXXX") || return 1
+    mv -T -- "$promoted/previous" "$aside/previous" || { rmdir -- "$aside"; return 1; }
+  fi
+  if mv -T -- "$backup" "$promoted/previous"; then
+    [ -n "$aside" ] && rm -rf -- "$aside"
+    return 0
+  fi
+  if [ -n "$aside" ]; then
+    if mv -T -- "$aside/previous" "$promoted/previous"; then rmdir -- "$aside"
+    else echo "build-dogfood-app: the older rollback candidate is kept at $aside/previous" >&2; fi
+  fi
+  return 1
+}
 old_sha=$(sed -n 's/^sha256=//p' "$backup/${sidecar##*/}" 2>/dev/null | head -n 1) || old_sha=
 old_bin=$(sha256sum "$backup/${binary##*/}" 2>/dev/null | cut -d' ' -f1) || old_bin=
-if [ -n "$old_sha" ] && [ "$old_sha" = "$old_bin" ] &&
-  rm -rf -- "$promoted/previous" && mv -- "$backup" "$promoted/previous" 2>/dev/null; then
-  echo "==> previous verified pair kept in $promoted/previous (rollback candidate)"
+if [ -n "$old_sha" ] && [ "$old_sha" = "$old_bin" ]; then
+  if keep_previous; then
+    echo "==> previous verified pair kept in $promoted/previous (rollback candidate)"
+  else
+    echo "build-dogfood-app: the new build is promoted, but the replaced pair was NOT kept as a rollback candidate; it is preserved at $backup (sha256 $old_bin)" >&2
+  fi
 else
   rm -rf -- "$backup"
   echo "==> no verified previous pair to keep"

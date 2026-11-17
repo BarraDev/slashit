@@ -103,6 +103,10 @@ cat >"$work/bin/mv" <<STUB
 #!/usr/bin/env bash
 if [ -n "\${STUB_MV_FAIL_CLI:-}" ] && [[ "\$*" == *".tmp."* ]] && [[ "\$*" == */slashit ]]; then exit 1; fi
 if [ -n "\${STUB_MV_FAIL_SIDE:-}" ] && [[ "\$*" == *".tmp."* ]] && [[ "\$*" == *.frontend ]]; then exit 1; fi
+# Rollback retention: fail the move of a kept backup into previous/ (the last
+# argument), or the move that sets the older previous/ aside (the source).
+if [ -n "\${STUB_MV_FAIL_RETAIN:-}" ] && [[ "\${@: -2:1}" == */.previous.* ]] && [[ "\${@: -1}" == */previous ]]; then exit 1; fi
+if [ -n "\${STUB_MV_FAIL_PREVIOUS_SRC:-}" ] && [[ "\${@: -2:1}" == */previous ]]; then exit 1; fi
 exec "$real_mv" "\$@"
 STUB
 # Stub sha256sum: when STUB_SWAP_AFTER_HASH is set, the first time a staged
@@ -205,6 +209,41 @@ if [ "$st" -ne 0 ] && [[ "$out" == *"previous promoted pair is restored"* ]] &&
   [ -z "$(find "$repo/target/dogfood" -name '*.tmp.*' -print -quit)" ]; then
   ok "a failed sidecar promotion after the binary and CLI were replaced restores all three"
 else bad "partial promotion left the promoted pair inconsistent (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# 7b. Rollback retention: the move that keeps the replaced pair as previous/
+#     fails. The new build stays promoted, the replaced pair survives in a
+#     backup directory the output names, the older candidate is still in
+#     previous/, and the output does not claim a kept rollback candidate.
+replaced=$(sha256sum "$repo/target/dogfood/slashit-ui" | cut -d' ' -f1)
+prior=$(sha256sum "$repo/target/dogfood/previous/slashit-ui" 2>/dev/null | cut -d' ' -f1)
+out=$(STUB_BUILD_ID=retain STUB_MV_FAIL_RETAIN=1 run_build); st=$?
+want=$(sha256sum "$repo/target/dogfood/slashit-ui" | cut -d' ' -f1)
+kept=$(find "$repo/target/dogfood" -maxdepth 1 -name '.previous.*' -print | head -n 1)
+if [ "$st" -eq 0 ] && [ "$want" != "$replaced" ] && promoted_pair_intact &&
+  [ -n "$kept" ] && [[ "$out" == *"$kept"* ]] &&
+  [ "$(sha256sum "$kept/slashit-ui" 2>/dev/null | cut -d' ' -f1)" = "$replaced" ] &&
+  grep -qx "sha256=$replaced" "$kept/slashit-ui.frontend" &&
+  [ "$(sha256sum "$repo/target/dogfood/previous/slashit-ui" 2>/dev/null | cut -d' ' -f1)" = "$prior" ] &&
+  [[ "$out" != *"previous verified pair kept"* ]]; then
+  ok "a failed rollback move keeps the replaced pair in a named backup, the older candidate stays, and no retention is claimed"
+else bad "a failed rollback move lost a verified pair or claimed retention (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# 7c. Rollback retention: setting the older candidate aside fails. Nothing is
+#     removed: the older candidate stays in previous/, and the replaced pair
+#     from this build is kept in a backup directory.
+replaced=$want
+prior=$(sha256sum "$repo/target/dogfood/previous/slashit-ui" 2>/dev/null | cut -d' ' -f1)
+out=$(STUB_BUILD_ID=aside STUB_MV_FAIL_PREVIOUS_SRC=1 run_build); st=$?
+want=$(sha256sum "$repo/target/dogfood/slashit-ui" | cut -d' ' -f1)
+kept=$(find "$repo/target/dogfood" -maxdepth 1 -name '.previous.*' -print |
+  while read -r d; do [ "$(sha256sum "$d/slashit-ui" 2>/dev/null | cut -d' ' -f1)" = "$replaced" ] && echo "$d"; done | head -n 1)
+if [ "$st" -eq 0 ] && [ "$want" != "$replaced" ] && promoted_pair_intact &&
+  [ -n "$kept" ] && [[ "$out" == *"$kept"* ]] &&
+  [ "$(sha256sum "$repo/target/dogfood/previous/slashit-ui" 2>/dev/null | cut -d' ' -f1)" = "$prior" ] &&
+  grep -qx "sha256=$prior" "$repo/target/dogfood/previous/slashit-ui.frontend" &&
+  [ -z "$(find "$repo/target/dogfood" -maxdepth 1 -name '.superseded.*' -print -quit)" ]; then
+  ok "a failed move-aside leaves the older candidate in previous/ and keeps the replaced pair"
+else bad "a failed move-aside removed or lost a verified pair (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 # 8. A build in a linked worktree promotes into the checkout that owns the common
 #    .git (where the supervisor launches from), and records the worktree's commit.
