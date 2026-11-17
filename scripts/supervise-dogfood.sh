@@ -65,6 +65,12 @@
 #       start again, and prove the compared state files are unchanged
 #       checksums before and after the restart. Exits 1 with a file list if
 #       the state diverged; that is a stop-and-investigate, not a warning.
+#       Before the stop it keeps a sha256-proven copy of the running executable;
+#       if the backup then fails, only that copy is started again. Restoring an
+#       executable does not make persisted state safe: an older build must never
+#       run over state a newer one has written, and no backward compatibility
+#       of state is assumed. A copy no frontend sidecar matches is refused before
+#       the stop unless the development server answers.
 #
 #   scripts/supervise-dogfood.sh env
 #       Print the declared environment and the resolved paths.
@@ -97,7 +103,8 @@
 # two lifecycle operations can never interleave.
 #
 # Which state files a restart must preserve, and therefore backs up, is the
-# compared snapshot: regular files under config/ and data/, excluding the
+# compared snapshot: regular files under the STATE_ROOTS directories (SlashIt's
+# own config and data, not other programs' files), excluding the
 # supervisor's own records, the regenerable cache, the instance's logs, the
 # terminal session records (rewritten at every startup by design), and
 # data/slashit-app/worktrees/ — the workspace and Task Checkouts under the
@@ -395,7 +402,9 @@ record_field() {
 # ignored, so a caller cannot report success over it. The rename is atomic
 # within the directory; no fsync is issued, so this claims no crash durability.
 # $1 state (provisional, verified or run), $2 pid, $3 "BOOT_ID START_TICKS" or
-# empty when the identity is not known, $4 the binary's commit.
+# empty when the identity is not known, $4 the binary's commit. The binary's
+# sha256 (LAUNCH_SHA, from launch_gates) is what a restart later uses to prove
+# which executable it may recover with.
 write_record() {
   local tmp=$RECORD.tmp.$$ boot= start=
   if [ -n "$3" ]; then boot=${3% *}; start=${3#* }; fi
@@ -404,6 +413,7 @@ write_record() {
     printf 'pid\t%s\n' "$2"
     printf 'binary\t%s\n' "$BINARY"
     printf 'commit\t%s\n' "$4"
+    printf 'sha256\t%s\n' "$LAUNCH_SHA"
     printf 'version\t%s\n' "$version_line"
     printf 'endpoint\t%s\n' "$ENDPOINT"
     printf 'started_at\t%s\n' "$(date -u +%FT%TZ)"
@@ -568,8 +578,8 @@ env_verdict() {
   return "$ENV_CHECK"
 }
 
-# Which state files a restart must preserve: regular files under config/ and
-# data/ of $STATE_BASE, excluding
+# Which state files a restart must preserve: regular files under STATE_ROOTS
+# of $STATE_BASE, excluding
 #   data/slashit-app/logs/                  logs are written during shutdown too
 #   data/slashit-app/pr-helper-logs/        same
 #   data/slashit-app/terminal_sessions.toml
@@ -607,13 +617,35 @@ PROTECTED_EXCLUDES=(
 # reload rewrites it. Everything else in the set is application state.
 UI_PREFERENCE_DIFF_RE='^[<>] [0-9a-f]{64}  data/[^/]+/(localstorage|storage)/'
 
+# The roots of the compared set: exactly the directories SlashIt itself writes.
+#   config/slashit-app          settings and configuration
+#   data/slashit-app            conversations, projects, provider leases, worktrees
+#   data/com.barradev.slashit-app
+#                               the app's own WebKit origin storage (UI preferences;
+#                               see UI_PREFERENCE_DIFF_RE)
+# Everything else under config/ and data/ belongs to other programs that share the
+# declared XDG directories (ChatGPT/Codex, opencode, browsers, gtk, jj, ...). Those
+# files change while those programs run, so they are never part of SlashIt's
+# restart invariant. A missing root is a failure (find errors), never an empty set.
+# The two SlashIt roots are required: a missing one fails the find, so the set is
+# refused. The WebKit root is optional, because a fresh instance creates it on its
+# first GUI start; it joins the set only when it exists.
+state_roots() { # BASE -> one root per line
+  printf '%s\n' config/slashit-app data/slashit-app
+  [ -d "$1/data/com.barradev.slashit-app" ] && printf '%s\n' data/com.barradev.slashit-app
+  return 0
+}
+
 # NUL-terminated paths of the compared set, relative to BASE. Fails when BASE
 # is not a directory or any part of the traversal fails.
 state_file_list() {
   [ -d "$1" ] || { echo "protected state: $1 is not a directory" >&2; return 1; }
+  local roots
+  roots=$(state_roots "$1") || return 1
   (
     cd "$1" || exit 1
-    find config data -type f "${PROTECTED_EXCLUDES[@]}" -print0
+    # shellcheck disable=SC2046 # roots are fixed relative paths without spaces
+    find $roots -type f "${PROTECTED_EXCLUDES[@]}" -print0
   )
 }
 
@@ -623,11 +655,13 @@ state_file_list() {
 # irrelevant. Every failure is reported on stderr and returns 1; an empty set
 # is a failure too, because it proves nothing about the state.
 state_snapshot() {
-  local base=$1 out sorted
+  local base=$1 out sorted roots
   [ -d "$base" ] || { echo "protected state: $base is not a directory" >&2; return 1; }
+  roots=$(state_roots "$base") || return 1
   out=$(
     cd "$base" || exit 1
-    find config data -type f "${PROTECTED_EXCLUDES[@]}" -exec sha256sum -- {} +
+    # shellcheck disable=SC2046 # see state_file_list
+    find $roots -type f "${PROTECTED_EXCLUDES[@]}" -exec sha256sum -- {} +
   ) || { echo "protected state: cannot read or checksum the compared files under $base (see the error above)" >&2; return 1; }
   [ -n "$out" ] || { echo "protected state: no compared files under $base, so there is no evidence to verify" >&2; return 1; }
   sorted=$(printf '%s\n' "$out" | LC_ALL=C sort) ||
@@ -737,6 +771,8 @@ launch_gates() {
     refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
   version_line=$(printf '%s\n' "$out" | head -n 1)
   [ -n "$version_line" ] || refuse "the binary answers --version with nothing; refusing it: $BINARY"
+  LAUNCH_SHA=$(sha256sum <"$BINARY" 2>/dev/null | cut -d' ' -f1)
+  [ -n "$LAUNCH_SHA" ] || refuse "cannot checksum the binary: $BINARY"
   # A launch must not start a GUI that cannot show its frontend. Refused here,
   # before any stop, so a restart does not take the running instance down first.
   frontend_mode
@@ -1122,6 +1158,13 @@ write_backup() {
   state_snapshot "$STATE_BASE" >/dev/null ||
     fail "the protected state under $STATE_BASE cannot be verified, so no backup was taken; the instance is stopped, start it deliberately after fixing the state"
   mkdir -p "$dir" || fail "cannot create the backup directory $dir"
+  # Every root of the compared set exists in the copy, an empty one included, so
+  # the copy has exactly the shape the verification below reads.
+  local roots root
+  roots=$(state_roots "$STATE_BASE") || { rm -rf "$dir"; fail "cannot list the protected roots; no backup was taken"; }
+  for root in $roots; do
+    mkdir -p "$dir/$root" || { rm -rf "$dir"; fail "cannot create $dir/$root for the backup"; }
+  done
   state_file_list "$STATE_BASE" >"$list" ||
     { rm -rf "$dir" "$list"; fail "cannot list the protected state under $STATE_BASE; no backup was taken"; }
   while IFS= read -r -d '' rel; do
@@ -1133,6 +1176,9 @@ write_backup() {
   rm -f "$list"
   state_snapshot "$STATE_BASE" >"$snap" ||
     { rm -rf "$dir"; fail "cannot take the protected-state manifest; no backup was kept"; }
+  for root in $roots; do
+    [ -d "$dir/$root" ] || fail "the backup copy under $dir lacks the root $root; it is kept for inspection"
+  done
   state_snapshot "$dir" >"$copy" ||
     fail "the backup copy under $dir cannot be verified against its manifest; it is kept for inspection"
   if ! cmp -s "$snap" "$copy"; then
@@ -1145,6 +1191,97 @@ write_backup() {
   printf '%s\n' "$stamp"
 }
 
+# Everything a backup needs that can be proven while the instance still runs:
+# the backup location is a writable directory and the disk holds a copy plus
+# headroom. Content is deliberately not compared here: SlashIt writes its own
+# state while it runs, so only the stopped instance's state is proven (by the
+# backup taken after the stop, and again after the start).
+precheck_backup_room() {
+  local probe need avail
+  mkdir -p "$SUP_DIR/backup" 2>/dev/null && [ -d "$SUP_DIR/backup" ] ||
+    refuse "the backup location $SUP_DIR/backup is not a directory, so no backup can be taken; the instance was not stopped"
+  probe=$SUP_DIR/backup/.writable.$$
+  : >"$probe" 2>/dev/null && rm -f -- "$probe" ||
+    refuse "cannot write under $SUP_DIR/backup, so no backup can be taken; the instance was not stopped"
+  local roots
+  roots=$(state_roots "$STATE_BASE") || refuse "cannot list the protected state; the instance was not stopped"
+  # pipefail is set: a failing find refuses here instead of counting as zero bytes.
+  need=$(cd "$STATE_BASE" && find $roots -type f "${PROTECTED_EXCLUDES[@]}" -printf '%s\n' 2>/dev/null |
+    awk '{ s += $1 } END { print s + 0 }') ||
+    refuse "cannot size the protected state under $STATE_BASE; the instance was not stopped"
+  avail=$(df -B1 --output=avail "$SUP_DIR/backup" 2>/dev/null | tail -n 1 | tr -d ' ')
+  case $avail in '' | *[!0-9]*) refuse "cannot read the free space under $SUP_DIR/backup; the instance was not stopped" ;; esac
+  [ "$avail" -ge $((2 * need + 67108864)) ] ||
+    refuse "$SUP_DIR/backup has $avail bytes free, less than two copies of the $need-byte protected set plus 64 MiB headroom; the instance was not stopped"
+}
+
+# Before a restart stops anything, it keeps a private copy of the executable the
+# instance is running, in $SUP_DIR/recover/. By the time a restart runs, $BINARY
+# may already be a newly promoted build, so the path proves nothing; recovery
+# starts only this copy. Its identity is proven by sha256: it must equal the
+# sha256 the launch record captured at start. The candidates are the kernel's
+# reference to the running image (/proc/<pid>/exe), the recorded binary path,
+# $BINARY, and the build script's rollback copy. A launch record without a
+# sha256 (an older supervisor started the instance) can only be proven through
+# /proc/<pid>/exe, read while the process identity is unchanged. The matching
+# frontend sidecar, if any, is copied beside it. Sets RECOVER_BIN, or refuses
+# (the instance is still running) when no candidate can be proven.
+RECOVER_BIN=
+capture_running_executable() {
+  local dir=$SUP_DIR/recover want cand tmp sha side
+  want=$(record_field sha256 2>/dev/null || true)
+  [ -n "$REC_PID" ] || want=
+  mkdir -p "$dir" 2>/dev/null ||
+    refuse "cannot create $dir for the recovery copy of the running executable; the instance was not stopped"
+  tmp=$(mktemp "$dir/.capture.XXXXXX" 2>/dev/null) ||
+    refuse "cannot write under $dir; the instance was not stopped"
+  for cand in "/proc/$TARGET_PID/exe" "$(record_field binary 2>/dev/null || true)" "$BINARY" "$(dirname "$BINARY")/previous/slashit-ui"; do
+    [ -n "$cand" ] || continue
+    [ -n "$want" ] || [ "$cand" = "/proc/$TARGET_PID/exe" ] || continue
+    [ "$(target_state)" = same ] || break
+    cp -p -- "$cand" "$tmp" 2>/dev/null || continue
+    [ "$(target_state)" = same ] || break
+    sha=$(sha256sum <"$tmp" 2>/dev/null | cut -d' ' -f1)
+    [ -n "$sha" ] || continue
+    if [ -n "$want" ]; then [ "$sha" = "$want" ] || continue
+    else [ "$sha" = "$(sha256sum <"$cand" 2>/dev/null | cut -d' ' -f1)" ] || continue; fi
+    chmod 555 "$tmp" && mv -f -T "$tmp" "$dir/slashit-ui" || break
+    rm -f "$dir/slashit-ui.frontend"
+    for side in "$BINARY.frontend" "$(dirname "$BINARY")/previous/slashit-ui.frontend"; do
+      if [ "$(sed -n 's/^sha256=//p' "$side" 2>/dev/null | head -n 1)" = "$sha" ]; then
+        cp -- "$side" "$dir/slashit-ui.frontend" 2>/dev/null || { rm -f "$dir/slashit-ui"; break 2; }
+        break
+      fi
+    done
+    # Recovery without a sidecar runs as a development build, which needs the dev server.
+    if [ ! -f "$dir/slashit-ui.frontend" ] && ! frontend_ready; then
+      rm -f "$dir/slashit-ui"
+      refuse "no frontend sidecar matches the running executable (sha256 $sha) and nothing answers on $DEV_URL, so a failed restart could not start it again; the instance was not stopped"
+    fi
+    RECOVER_BIN=$dir/slashit-ui
+    return 0
+  done
+  rm -f "$tmp"
+  refuse "cannot prove which executable pid $TARGET_PID is running${want:+ (launch sha256 $want)}, so a failed restart could not recover it; the instance was not stopped"
+}
+
+# The restart stopped the instance and then could not take its backup. The backup
+# only reads state, so this restart wrote nothing. Only the executable captured
+# before the stop is started again; the state is NOT re-verified here (that failure
+# is why we are recovering), so the message says so. Restoring an executable does
+# not make state safe by itself: an older build must never run over state a newer
+# one has written. The captured build is the one that was running over this very
+# state, so it is the only one recovery may start.
+restart_recover() { # message
+  echo "$SELF: the restart stopped the instance and cannot finish: $1" >&2
+  [ -n "$RECOVER_BIN" ] && [ -x "$RECOVER_BIN" ] ||
+    fail "the restart did not complete ($1); no proven copy of the previous executable exists, so nothing was started"
+  BINARY=$RECOVER_BIN
+  note "starting the captured previous executable $BINARY again; this restart wrote nothing, but the state was not verified"
+  cmd_start
+  fail "the restart did not complete ($1), but the instance was started again on the captured previous executable"
+}
+
 cmd_restart() {
   select_target || fail "$(nothing_reachable_text) — nothing to restart"
   local pid=$TARGET_PID
@@ -1155,13 +1292,18 @@ cmd_restart() {
   # now. A restart that cannot verify its own state does not start.
   state_snapshot "$STATE_BASE" >/dev/null ||
     refuse "the protected state cannot be verified now, so the instance was not stopped (see the reason above)"
-  # A restart whose start could not succeed must not stop the instance first.
+  # A restart whose start could not succeed, or whose backup cannot be written,
+  # must not stop the instance first.
   launch_gates
+  precheck_backup_room
+  capture_running_executable
   note "controlled restart of pid $pid on $ENDPOINT"
   cmd_stop
 
   local stamp backup
-  stamp=$(write_backup) || exit 1
+  if ! stamp=$(write_backup); then
+    restart_recover "the state backup failed after the stop"
+  fi
   backup=$SUP_DIR/backup/$stamp
   note "state backed up and verified at $backup"
 
@@ -1182,6 +1324,7 @@ cmd_restart() {
     note "UI preference files (WebKit origin storage) were rewritten by the reload; they are not application state, so the restart is not failed"
   fi
   rm -f "$after"
+  rm -f "$SUP_DIR/recover/slashit-ui" "$SUP_DIR/recover/slashit-ui.frontend"
   note "verified: application state is checksum-identical before and after the restart"
 }
 

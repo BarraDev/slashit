@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=138
+EXPECTED_TOTAL=145
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -229,6 +229,13 @@ case $last in
     ;;
   quit)
     if [ -f "$stub_dir/pid" ]; then
+      # Test hook: as the instance shuts down, a regular file takes the place of
+      # the backup directory (the old one is moved aside), so the backup fails
+      # after the stop whatever the user's privileges (root included).
+      if [ -n "${SLASHIT_TEST_QUIT_BLOCK:-}" ]; then
+        mv "$SLASHIT_TEST_QUIT_BLOCK" "$SLASHIT_TEST_QUIT_BLOCK.aside" && : >"$SLASHIT_TEST_QUIT_BLOCK"
+      fi
+      if [ -n "${SLASHIT_TEST_QUIT_RUN:-}" ]; then "$SLASHIT_TEST_QUIT_RUN"; fi
       touch "$stub_dir/quit"
       echo "Shutting down."
       exit 0
@@ -629,6 +636,146 @@ cleanup_instances
 printf 'session 7\n' >"$state/data/slashit-app/board.toml"
 rm -rf "$state/data/com.barradev.slashit-app"
 
+echo "== restart ignores a third-party file that is rewritten while the instance runs"
+codex="$state/config/Codex/cache.bin"
+mkdir -p "$(dirname "$codex")"
+printf 'v0\n' >"$codex"
+sv start >/dev/null 2>&1 || bad "third-party fixture: start failed"
+( while :; do printf '%s' "$RANDOM" >"$codex"; done ) &
+writer=$!
+out=$(sv restart 2>&1); status=$?
+kill "$writer" 2>/dev/null; wait "$writer" 2>/dev/null
+manifest=$(ls -1t "$state"/supervisor/backup/*/manifest.sha256 2>/dev/null | head -n 1)
+if [ "$status" -eq 0 ] && [ -n "$manifest" ] && ! grep -q 'config/Codex/' "$manifest"; then
+  ok "a volatile third-party cache under config/ does not fail the restart and is not in the SlashIt backup"
+else
+  bad "a rewritten third-party file failed the restart or stayed in the set (exit $status)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+rm -rf "$state/config/Codex"
+
+echo "== a backup location that cannot be written is refused before the instance is stopped"
+sv start >/dev/null 2>&1 || bad "backup precheck fixture: start failed"
+pre=$(stub_pid)
+mv "$state/supervisor/backup" "$work/backup-moved"
+: >"$state/supervisor/backup"
+out=$(sv restart 2>&1); st=$?
+rm -f "$state/supervisor/backup"
+mv "$work/backup-moved" "$state/supervisor/backup"
+if [ "$st" -eq 1 ] && [[ "$out" == *"refusing"* ]] && [ -n "$pre" ] && kill -0 "$pre" 2>/dev/null; then
+  ok "an unwritable backup location is refused, and the running instance is left untouched"
+else
+  bad "an unwritable backup location did not refuse before the stop (exit $st, pid '$pre')"; printf '%s\n' "$out" >&2
+fi
+
+# The compared set's checksums, from the files on disk.
+state_sums() { (cd "$state" && find config/slashit-app data/slashit-app -type f ! -path '*/logs/*' ! -path '*/pr-helper-logs/*' ! -path '*/worktrees/*' ! -name terminal_sessions.toml -exec sha256sum {} + | LC_ALL=C sort); }
+backup_count() { local n=0 d; for d in "$state"/supervisor/backup/[0-9]*/; do [ -d "$d" ] && n=$((n + 1)); done; echo "$n"; }
+unblock_backup() { rm -f "$state/supervisor/backup"; mv "$state/supervisor/backup.aside" "$state/supervisor/backup"; }
+running_exe() { # the script the running stub instance was exec'd from
+  local pid; pid=$(stub_pid); [ -n "$pid" ] || return 1
+  tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | sed -n 2p
+}
+
+echo "== a backup that fails after the stop starts the captured executable again, over unchanged state"
+sv verify >/dev/null 2>&1 || sv start >/dev/null 2>&1 || bad "post-stop fixture: start failed"
+sums_before=$(state_sums); n_before=$(backup_count); old_pid=$(stub_pid)
+out=$(sv SLASHIT_TEST_QUIT_BLOCK="$state/supervisor/backup" restart 2>&1); st=$?
+[ -f "$state/supervisor/backup" ] && blocked=yes || blocked=no
+unblock_backup
+exe=$(running_exe); new_pid=$(stub_pid)
+if [ "$st" -eq 1 ] && [ "$blocked" = yes ] && [[ "$out" == *"captured previous executable"* ]] &&
+  [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] && sv verify >/dev/null 2>&1 &&
+  [ "$exe" = "$state/supervisor/recover/slashit-ui" ] &&
+  cmp -s "$exe" "$bin_dir/slashit-ui" && [ "$sums_before" = "$(state_sums)" ] && [ "$(backup_count)" = "$n_before" ]; then
+  ok "a backup blocked after the stop (a file in its place) restarts the captured copy, leaves the state checksums unchanged and keeps no partial backup"
+else
+  bad "a backup failure after the stop did not recover as required (exit $st, blocked $blocked, exe '$exe')"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== recovery starts the captured executable, never the newly promoted one"
+sel=$work/select
+mkdir -p "$sel"
+cp "$bin_dir/slashit-ui" "$sel/slashit-ui"; touch -d '2000-01-01 00:00:00' "$sel/slashit-ui"
+cp "$bin_dir/slashit-ui.frontend" "$sel/slashit-ui.frontend"
+old_sha=$(sha256sum <"$sel/slashit-ui" | cut -d' ' -f1)
+sv SLASHIT_DOGFOOD_BINARY="$sel/slashit-ui" start >/dev/null 2>&1 || bad "selection fixture: start failed"
+# The "new build" is promoted by rename while the old one runs: it answers
+# --version, but leaves a marker if it is ever started as the instance.
+{ head -n 1 "$bin_dir/slashit-ui"; echo '[ "${1:-}" = --version ] || touch "$SLASHIT_TEST_STUB_DIR/new-build-ran"'; tail -n +2 "$bin_dir/slashit-ui"; } >"$sel/new"
+chmod +x "$sel/new"; touch -d '2000-01-01 00:00:00' "$sel/new"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$(sha256sum <"$sel/new" | cut -d' ' -f1)" >"$sel/new.frontend"
+# As the build script does, the replaced pair is kept in previous/. The stub is a
+# script, so /proc/<pid>/exe names bash: the rollback copy is what proves out.
+mkdir -p "$sel/previous"; cp -p "$sel/slashit-ui" "$sel/slashit-ui.frontend" "$sel/previous/"
+mv "$sel/new" "$sel/slashit-ui"; mv "$sel/new.frontend" "$sel/slashit-ui.frontend"
+sums_before=$(state_sums); rm -f "$stub_dir/new-build-ran"
+out=$(sv SLASHIT_DOGFOOD_BINARY="$sel/slashit-ui" SLASHIT_TEST_QUIT_BLOCK="$state/supervisor/backup" restart 2>&1); st=$?
+unblock_backup
+exe=$(running_exe)
+rec_bin=$(awk -F '\t' '$1 == "binary" { print $2 }' "$state/supervisor/instance" 2>/dev/null)
+if [ "$st" -eq 1 ] && [ "$exe" = "$state/supervisor/recover/slashit-ui" ] && [ "$rec_bin" = "$exe" ] &&
+  [ "$(sha256sum <"$exe" | cut -d' ' -f1)" = "$old_sha" ] && [ ! -e "$stub_dir/new-build-ran" ] &&
+  [ "$sums_before" = "$(state_sums)" ]; then
+  ok "with a new build already promoted, recovery runs the captured old executable (sha256 proven) and never the new one"
+else
+  bad "recovery did not select the captured executable (exit $st, exe '$exe', record '$rec_bin')"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+echo "== a running executable whose identity cannot be proven is not stopped"
+sv start >/dev/null 2>&1 || bad "unprovable fixture: start failed"
+pre=$(stub_pid)
+sed -i 's/^sha256\t.*/sha256\t0000000000000000000000000000000000000000000000000000000000000000/' "$state/supervisor/instance"
+out=$(sv restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"cannot prove which executable"* ]] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null; then
+  ok "a restart that cannot prove the running executable refuses before the stop; the instance keeps running"
+else
+  bad "an unprovable running executable was not refused before the stop (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+rm -f "$state/supervisor/instance"
+
+echo "== a running embedded build with no matching frontend sidecar is not stopped"
+nos=$repo/target/nosidecar
+mkdir -p "$nos"
+cp "$bin_dir/slashit-ui" "$nos/slashit-ui"; touch -d '2000-01-01 00:00:00' "$nos/slashit-ui"
+cp "$bin_dir/slashit-ui.frontend" "$nos/slashit-ui.frontend"
+sv SLASHIT_DOGFOOD_BINARY="$nos/slashit-ui" start >/dev/null 2>&1 || bad "no-sidecar fixture: start failed"
+pre=$(stub_pid)
+# A new embedded build replaces the pair; the old binary survives in previous/
+# without its sidecar, so it proves out but no sidecar names the running sha256.
+# The dev server (harness default) does not answer.
+mkdir -p "$nos/previous"; cp -p "$nos/slashit-ui" "$nos/previous/"
+{ head -n 1 "$bin_dir/slashit-ui"; echo '# newer build'; tail -n +2 "$bin_dir/slashit-ui"; } >"$nos/new"
+chmod +x "$nos/new"; touch -d '2000-01-01 00:00:00' "$nos/new"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$(sha256sum <"$nos/new" | cut -d' ' -f1)" >"$nos/slashit-ui.frontend"
+mv "$nos/new" "$nos/slashit-ui"
+out=$(sv SLASHIT_DOGFOOD_BINARY="$nos/slashit-ui" restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"no frontend sidecar matches"* ]] && [ -n "$pre" ] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null; then
+  ok "a running build whose recovery copy has no frontend sidecar and no dev server is refused before the stop; the pid is unchanged"
+else
+  bad "a recovery copy without a frontend was not refused before the stop (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+rm -f "$state/supervisor/instance"
+
+echo "== an empty required data root is backed up as an empty directory"
+aside=$work/data-aside
+mkdir -p "$aside"; mv "$state/data/slashit-app" "$aside/"; mkdir -p "$state/data/slashit-app"
+sv start >/dev/null 2>&1 || bad "empty-root fixture: start failed"
+out=$(sv restart 2>&1); st=$?
+latest=$(ls -1d "$state"/supervisor/backup/[0-9]* 2>/dev/null | tail -n 1)
+if [ "$st" -eq 0 ] && [ -d "$latest/data/slashit-app" ] && [ -z "$(ls -A "$latest/data/slashit-app")" ] &&
+  [ -f "$latest/config/slashit-app/settings.toml" ] && cmp -s "$latest/config/slashit-app/settings.toml" "$state/config/slashit-app/settings.toml"; then
+  ok "an empty data/slashit-app is created in the backup, the verified copy matches, and the restart succeeds"
+else
+  bad "an empty required root broke the backup (exit $st, backup '${latest:-none}')"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+rm -rf "$state/data/slashit-app"; mv "$aside/slashit-app" "$state/data/"
+rm -rf "$state/supervisor/backup/"*; rm -f "$state/supervisor/instance"
 echo "== frontend mode: an embedded build needs no server; a development build needs its dev server"
 fe=$work/frontend
 mkdir -p "$fe"
