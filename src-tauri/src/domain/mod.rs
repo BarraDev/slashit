@@ -19,6 +19,7 @@ pub mod jira;
 pub mod storage_usage;
 pub mod integration;
 pub mod publication;
+pub mod pr_reply_history;
 
 pub use repository::*;
 pub use project::*;

@@ -62,6 +62,20 @@ impl GitFixture {
         git(&self.path, &["remote", "set-url", "--push", "origin", push_url])
     }
 
+    /// Makes `origin` an scp-style GitHub address that SlashIt reads as GitHub,
+    /// while fetches and listings reach the local bare repository through the
+    /// `ssh` stand-in in `fixtures/ssh-to-local-origin`, the same arrangement
+    /// `stacked_tasks` uses. A delivery check needs to fetch the pull request's
+    /// branch, which an address rewrite would hide from the product's own
+    /// reading of `origin`.
+    pub(super) fn serve_github_from_origin(&self) -> Result<()> {
+        let origin = self.origin_path()?.to_str().context("the origin path is not UTF-8")?;
+        let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join("ssh-to-local-origin");
+        let shim = shim.to_str().context("the ssh stand-in's path is not UTF-8")?;
+        git(&self.path, &["remote", "set-url", "origin", "git@github.com:slashit-acceptance/fixture.git"])?;
+        git(&self.path, &["config", "core.sshCommand", &format!("'{shim}' '{origin}'")])
+    }
+
     fn origin_path(&self) -> Result<&Path> {
         self.origin
             .as_deref()
@@ -404,7 +418,7 @@ async fn approve_journey(context: &TestContext) -> Result<()> {
     outcome
 }
 
-async fn approve_and_open_the_pull_request(
+pub(super) async fn approve_and_open_the_pull_request(
     driver: &WebDriver,
     agent: &FakeAgent,
     gh: &FakeGh,
@@ -1024,7 +1038,7 @@ async fn move_to_done_from_the_menu(driver: &WebDriver, title: &str) -> Result<(
 /// Clicked from script: the button only becomes opaque on hover, and
 /// WebDriver refuses to click an element it considers invisible. The click
 /// still goes through the button's own handler.
-async fn open_card_menu(driver: &WebDriver, title: &str) -> Result<()> {
+pub(super) async fn open_card_menu(driver: &WebDriver, title: &str) -> Result<()> {
     let opened = page(
         driver,
         r#"

@@ -394,6 +394,17 @@ pub struct FixedContent {
 }
 
 impl PrReviewPlan {
+    /// The comments whose Fix this plan approves. The dialog keeps a copy of
+    /// this as loaded from the backend, so a checkbox ticked in the browser is
+    /// not mistaken for a recorded approval.
+    pub fn approved_fix_ids(&self) -> Vec<u64> {
+        self.items
+            .iter()
+            .filter(|i| i.approved && matches!(i.decision, PrReviewDecisionKind::Fix))
+            .filter_map(|i| i.comment_id)
+            .collect()
+    }
+
     /// Mirrors the backend rule of the same name, through the same shared
     /// `slashit_review_content` functions.
     pub fn fixed_content_is_current(
@@ -532,6 +543,9 @@ pub struct PrReviewItem {
     pub fix_effect: Option<FixEffect>,
     #[serde(default)]
     pub reply_posted: bool,
+    /// Mirrors the backend: a PR-level reply may already be on GitHub.
+    #[serde(default)]
+    pub reply_uncertain: bool,
     #[serde(default)]
     pub last_agent_summary: Option<String>,
     #[serde(default)]

@@ -45,6 +45,41 @@ const DELAY_VIEW: &str = "delay-view";
 /// refusal (`HTTP 422`), which is what proves that nothing was opened.
 pub const CREATE_FAILURE: &str = "creating the pull request was scripted to fail";
 
+/// One public reply the fake received: the exact text and its destination,
+/// `PR-LEVEL <number>` for `gh pr comment` or `POST <endpoint>` for a threaded reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Post {
+    pub target: String,
+    pub body: String,
+}
+
+/// A GitHub read that Analyze makes and a journey can script with
+/// [`FakeGh::script_read`]. Unscripted, each REST list is empty and no review
+/// thread is resolved.
+#[derive(Debug, Clone, Copy)]
+pub enum ScriptedRead {
+    /// `repos/<repo>/pulls/<n>/reviews`: the reviews, as a REST list.
+    PullReviews,
+    /// `repos/<repo>/pulls/<n>/comments`: the inline review comments.
+    PullComments,
+    /// `repos/<repo>/issues/<n>/comments`: the conversation comments.
+    IssueComments,
+    /// The `reviewThreads` GraphQL answer, one page.
+    ReviewThreads,
+}
+
+impl ScriptedRead {
+    /// The file under the fixture's directory the `gh` fixture reads for this read.
+    fn file(self) -> &'static str {
+        match self {
+            Self::PullReviews => "pull-reviews.json",
+            Self::PullComments => "pull-comments.json",
+            Self::IssueComments => "issue-comments.json",
+            Self::ReviewThreads => "review-threads.json",
+        }
+    }
+}
+
 pub struct FakeGh {
     dir: PathBuf,
 }
@@ -158,6 +193,12 @@ impl FakeGh {
         self.replace(&format!("pr-commits/{number}"), &format!("{}\n", commits.join("\n")))
     }
 
+    /// Make `read` answer with `answer`: a JSON list for a REST read, the whole
+    /// GraphQL answer for the review threads.
+    pub fn script_read(&self, read: ScriptedRead, answer: &serde_json::Value) -> Result<()> {
+        self.replace(read.file(), &answer.to_string())
+    }
+
     /// Write `name` under the fixture's directory whole, so a `gh` running at
     /// the same moment reads the old contents or the new, never half.
     fn replace(&self, name: &str, contents: &str) -> Result<()> {
@@ -208,6 +249,32 @@ impl FakeGh {
         }
         numbered.sort_by_key(|(n, _)| *n);
         Ok(numbered.into_iter().map(|(_, args)| args).collect())
+    }
+
+    /// Every public reply the fake was asked to post, in start order: the
+    /// exact body and where it was sent. Only `gh pr comment` and the threaded
+    /// reply POST are recorded, so this is the complete list of public writes.
+    pub fn posts(&self) -> Result<Vec<Post>> {
+        let directory = self.dir.join("posts");
+        let mut numbered = Vec::new();
+        match std::fs::read_dir(&directory) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let Some(number) = name.strip_suffix(".body").and_then(|n| n.parse::<u32>().ok()) else {
+                        continue;
+                    };
+                    let body = std::fs::read_to_string(entry.path())?;
+                    let target = std::fs::read_to_string(directory.join(format!("{number}.target")))?;
+                    numbered.push((number, Post { target, body }));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        numbered.sort_by_key(|(n, _)| *n);
+        Ok(numbered.into_iter().map(|(_, post)| post).collect())
     }
 
     /// How many times `gh pr create` was run, failed or not.

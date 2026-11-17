@@ -334,6 +334,13 @@ pub struct Task {
     #[serde(default)]
     pub pr_review_plan: Option<PrReviewPlan>,
 
+    /// Durable record of the PR-level replies this Task's review sent or may
+    /// have sent. It is kept apart from `pr_review_plan` because a re-analysis
+    /// replaces the plan and must not erase these facts. See
+    /// [`super::pr_reply_history`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pr_reply_records: Vec<super::pr_reply_history::PrReplyRecord>,
+
     /// Milestones nothing else on the record keeps, oldest first: runs, AI
     /// reviews, delivery, moves. Each is appended in the durable write of the
     /// transition it describes. Mostly history, but the next run and review
@@ -1057,6 +1064,7 @@ impl Task {
             pending_republish: None,
             pr_create_unconfirmed: None,
             pr_publication: None,
+            pr_reply_records: Vec::new(),
             local_integration: None,
             cleanup_in_flight: false,
             pr_review_plan: None,
@@ -1825,6 +1833,11 @@ pub struct PrReviewItem {
     /// failed reply leaves the item visibly pending in the "Sync replies" path.
     #[serde(default)]
     pub reply_posted: bool,
+    /// Set when a PR-level reply's POST failed after it may have reached
+    /// GitHub. A PR-level reply has no id to look up, so Sync posts it again
+    /// only after the person accepts the duplicate risk. Cleared on success.
+    #[serde(default)]
+    pub reply_uncertain: bool,
     /// Agent's per-item report from the run that set `fix_done=true`. Reused
     /// as the body of a deferred reply when the agent does not need to run
     /// again (already fixed, only the reply is missing).
@@ -1908,9 +1921,10 @@ pub struct PrReviewApplyResult {
     /// disk; this records why.
     #[serde(default)]
     pub push_error: Option<String>,
-    /// Whether this apply ran with `auto_reply=true` — `Some(true)`/`Some(false)`
-    /// for any apply recorded since this field existed, `None` for a result
-    /// persisted before it did. Needed to distinguish "reply attempted and
+    /// Whether this apply published replies itself. Applies from this change on
+    /// never do, so they record `Some(false)`; an older apply may have recorded
+    /// `Some(true)`, and `None` marks a result persisted before this field
+    /// existed. Needed to distinguish "reply attempted and
     /// succeeded" from "reply intentionally never attempted" when backfilling
     /// `reply_posted` from `fixed_ids` — collapsing the missing-historical-value
     /// case to `false` would make backfill treat "we don't actually know" the

@@ -5867,6 +5867,7 @@ impl TaskExecutor {
                 tools: ToolAccess::Full {
                     auto_approve: Vec::new(),
                     permission_mode: Some("auto".to_string()),
+                    denied_tools: Vec::new(),
                 },
                 max_turns: Some(50),
                 max_budget_usd: None,
@@ -6624,6 +6625,13 @@ impl TaskExecutor {
             .await?;
 
         Ok(self.register_pr_owner(task_id, PrOwnerKind::SideEffect, None))
+    }
+
+    /// Whether a PR helper or PR side-effect flow owns `task_id` now. Its
+    /// registration is made under the task's lifecycle lease, so a caller
+    /// that holds that lease gets a settled answer.
+    pub fn pr_helper_owns(&self, task_id: Uuid) -> bool {
+        self.pr_helper_handles.lock().unwrap().contains_key(&task_id)
     }
 
     /// Insert a PR owner into `pr_helper_handles` and hand back the lease
@@ -7849,6 +7857,7 @@ impl TaskExecutor {
                                         tools: ToolAccess::Full {
                                             auto_approve: Vec::new(),
                                             permission_mode: Some("auto".to_string()),
+                                            denied_tools: Vec::new(),
                                         },
                                         max_turns: Some(20),
                                         max_budget_usd: None,

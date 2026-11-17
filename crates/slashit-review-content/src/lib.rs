@@ -84,9 +84,46 @@ pub fn fixed_content_is_current(
     }
 }
 
+/// The public reply to a review comment: the text the fix agent wrote for the
+/// reviewer, trimmed, or `None` when it wrote none. The triage reasoning and
+/// the summary are internal analysis, so they are never a fallback here. The
+/// backend posts this text and the frontend shows it for approval, so both use
+/// this one rule.
+pub fn public_reply(pr_reply_text: Option<&str>) -> Option<String> {
+    pr_reply_text
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The full text a reply to a PR-level comment publishes: a line naming the
+/// comment it answers, then the reply. A threaded reply publishes `reply_body`
+/// alone. Backend and frontend both use this, so the approval shows what is posted.
+pub fn pr_level_reply_text(comment_url: Option<&str>, author: &str, reply: &str) -> String {
+    let named = match comment_url {
+        Some(url) => format!("Re {url}"),
+        None => format!("Re the comment by @{author}"),
+    };
+    format!("{named}\n\n{reply}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_public_reply_is_only_the_text_the_fix_agent_wrote() {
+        assert_eq!(public_reply(Some("  wrote it  ")), Some("wrote it".to_string()));
+        assert_eq!(public_reply(Some("  ")), None);
+        assert_eq!(public_reply(None), None);
+    }
+
+    #[test]
+    fn a_pr_level_reply_names_the_comment_it_answers() {
+        let url = "https://github.com/o/r/pull/1#issuecomment-9";
+        assert_eq!(pr_level_reply_text(Some(url), "rev", "fixed"), format!("Re {url}\n\nfixed"));
+        assert_eq!(pr_level_reply_text(None, "rev", "fixed"), "Re the comment by @rev\n\nfixed");
+    }
 
     #[test]
     fn the_fingerprint_is_a_known_value() {
