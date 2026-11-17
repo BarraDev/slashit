@@ -15,12 +15,30 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/release-bump-test.XXXXXX") || { echo "cannot c
 # Every rm below runs on a path under $work, so $work must be a real directory.
 case $work in /?*/?*) [ -d "$work" ] || { echo "temporary directory $work is missing" >&2; exit 1; } ;;
   *) echo "refusing to use '$work' as the temporary directory" >&2; exit 1 ;; esac
-# Every process a test starts names $work on its command line (stubs, background
-# runs, lock holders), so it can be found, killed and checked for at exit.
+# Every process a test starts inherits this run's marker in its environment (stubs,
+# background runs, lock holders), so cleanup and the exit check find exactly those.
+# Command lines are never matched: a look-alike process does not carry the marker.
+export RELEASE_BUMP_TEST_RUN=$work
+owned_pids() { # pids, other than this shell's, whose environment carries the marker
+  local f p
+  # env -u keeps grep itself from carrying the marker; -z reads each NUL-terminated
+  # variable as one record, and -x requires the record to be exactly the marker.
+  while IFS= read -r f; do
+    p=${f#/proc/}
+    p=${p%/environ}
+    [ "$p" = "$$" ] || [ "$p" = "$BASHPID" ] || echo "$p"
+  done < <(env -u RELEASE_BUMP_TEST_RUN grep -l -z -x -F "RELEASE_BUMP_TEST_RUN=$work" /proc/[0-9]*/environ 2>/dev/null)
+  return 0
+}
 cleanup() {
-  pkill -KILL -f -- "$work/" 2>/dev/null
-  for _ in $(seq 50); do pgrep -f -- "$work/" >/dev/null || break; sleep 0.1; done
-  pgrep -f -- "$work/" >/dev/null && echo "warning: processes from $work survived SIGKILL" >&2
+  local i owned
+  for i in $(seq 50); do
+    owned=$(owned_pids)
+    [ -n "$owned" ] || break
+    kill -KILL $owned 2>/dev/null
+    sleep 0.1
+  done
+  [ -z "$(owned_pids)" ] || echo "warning: processes from $work survived SIGKILL" >&2
   rm -rf -- "$work"
 }
 trap cleanup EXIT
@@ -505,7 +523,7 @@ pid=$!
 for _ in $(seq 100); do [ -e "$work/started" ] && break; sleep 0.1; done
 [ -e "$work/started" ] || bad "orphan: cargo stub never started"
 kill -KILL "$pid"; wait "$pid" 2>/dev/null
-pgrep -f -- "$work/cargo-orphan" >/dev/null || bad "orphan: the cargo stub did not outlive the SIGKILLed apply"
+[ -n "$(owned_pids)" ] || bad "orphan: the cargo stub did not outlive the SIGKILLed apply"
 held=$(digest "$repo")
 out=$(run --recover); st=$?
 if [ "$st" -eq 1 ] && [[ "$out" == *"still holds"* ]] && [[ "$out" == *"nothing was changed"* ]] && journal_left &&
@@ -518,7 +536,7 @@ if [ "$st" -eq 1 ] && [[ "$out" == *"holds"* ]] && [ "$held" = "$(digest "$repo"
 else bad "--apply ran while the orphaned cargo was running (exit $st)"; printf '%s\n' "$out" >&2; fi
 : >"$work/go"
 settle
-if grep -q 'written by the orphaned cargo' "$repo/Cargo.lock" && ! pgrep -f -- "$work/cargo-orphan" >/dev/null; then
+if grep -q 'written by the orphaned cargo' "$repo/Cargo.lock" && [ -z "$(owned_pids)" ]; then
   ok "the orphaned cargo wrote Cargo.lock after the apply died, then exited"
 else bad "the orphaned cargo did not write Cargo.lock and exit"; fi
 crashed=$(digest "$repo")
@@ -597,9 +615,16 @@ else
   printf 'second:\n%s\ndry run:\n%s\nfirst:\n%s\n' "$out_b" "$out_d" "$(cat "$work/run-a.out")" >&2
 fi
 
+echo "== a process whose command line names the fixture but not the marker is not owned"
+env -u RELEASE_BUMP_TEST_RUN bash -c 'sleep 30' "$work/look-alike" &
+lookalike=$!
+if owned_pids | grep -qx "$lookalike"; then bad "a process without the marker was counted as owned"
+else ok "ownership follows the environment marker, so a look-alike command line is not counted"; fi
+kill -KILL "$lookalike" 2>/dev/null; wait "$lookalike" 2>/dev/null
+
 echo "== no process started by the tests is left running"
-for _ in $(seq 50); do pgrep -f -- "$work/" >/dev/null || break; sleep 0.1; done
-if pgrep -f -- "$work/" >/dev/null; then bad "processes are still running: $(pgrep -f -- "$work/" | tr '\n' ' ')"
+for _ in $(seq 50); do [ -z "$(owned_pids)" ] && break; sleep 0.1; done
+if [ -n "$(owned_pids)" ]; then bad "processes are still running: $(owned_pids | tr '\n' ' ')"
 else ok "every stub, run and lock holder has exited"; fi
 
 echo
