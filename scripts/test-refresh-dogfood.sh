@@ -28,6 +28,7 @@ echo one >"$repo/f"; git -C "$repo" add f; git -C "$repo" commit -qm one
 old=$(git -C "$repo" rev-parse HEAD)
 echo two >"$repo/f"; git -C "$repo" commit -qam two
 new=$(git -C "$repo" rev-parse HEAD)
+repo_real=$(cd "$repo" && pwd -P)
 
 # Stub supervisor: status output and exit come from the environment, every
 # restart is logged, and restart's exit status is configurable.
@@ -54,11 +55,20 @@ printf 'binary %s\n' "\$(git rev-parse HEAD)" >target/dogfood/slashit-ui
 sha=\$(sha256sum target/dogfood/slashit-ui | cut -d' ' -f1)
 printf 'mode=embedded\nsha256=%s\nwasm=x.wasm\ncommit=%s\ndirty=no\n' "\$sha" "\${STUB_BUILD_COMMIT:-\$(git rev-parse HEAD)}" >target/dogfood/slashit-ui.frontend
 if [ -n "\${STUB_BUILD_KILL:-}" ]; then
+  # The victim is the refresh script's own process: the outermost ancestor that
+  # runs scripts/refresh-dogfood.sh in this fixture. The refresh script's
+  # subshells share its argv on some bash builds (bash 5.1 keeps it), so the
+  # nearest match can be a subshell; the walk therefore keeps the outermost one.
+  victim=
   p=\$PPID
   while [ "\$p" -gt 1 ]; do
-    if tr '\\0' ' ' </proc/\$p/cmdline | grep -q 'refresh-dogfood.sh'; then kill -9 "\$p"; exit 0; fi
+    argv=\$(tr '\\0' ' ' </proc/\$p/cmdline 2>/dev/null)
+    if [ "\$(readlink /proc/\$p/cwd 2>/dev/null)" = "$repo_real" ] && [[ "\$argv" == "bash scripts/refresh-dogfood.sh "* ]]; then
+      victim=\$p
+    fi
     p=\$(awk '{ print \$4 }' /proc/\$p/stat)
   done
+  if [ -n "\$victim" ]; then kill -9 "\$victim"; exit 0; fi
 fi
 STUB
 chmod +x "$work/sup" "$work/build"
