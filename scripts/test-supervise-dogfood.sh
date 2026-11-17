@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=150
+EXPECTED_TOTAL=181
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -269,6 +269,14 @@ printf 'transcript\n' >"$state/data/slashit-app/logs/agent.txt"
 printf 'helper log\n' >"$state/data/slashit-app/pr-helper-logs/helper.txt"
 printf 'ended\n' >"$state/data/slashit-app/terminal_sessions.toml"
 printf 'uncommitted checkout content\n' >"$state/data/slashit-app/worktrees/task.txt"
+stub_sha=$(sha256sum <"$bin_dir/slashit-ui" | cut -d' ' -f1)
+# The fixture state exists, so it carries a writer record naming the stub
+# build, as an installation adopted by the operator would.
+seed_writer() { # BASE
+  mkdir -p "$1/supervisor"
+  printf 'commit=%s\nsha256=%s\nprovenance=verified-sidecar\n' "$commit_id" "$stub_sha" >"$1/supervisor/state-writer"
+}
+seed_writer "$state"
 
 BASEENV=(
   SLASHIT_TEST_STUB_DIR="$stub_dir"
@@ -752,13 +760,21 @@ pre=$(stub_pid)
 mkdir -p "$nos/previous"; cp -p "$nos/slashit-ui" "$nos/previous/"
 { head -n 1 "$bin_dir/slashit-ui"; echo '# newer build'; tail -n +2 "$bin_dir/slashit-ui"; } >"$nos/new"
 chmod +x "$nos/new"; touch -d '2000-01-01 00:00:00' "$nos/new"
-printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$(sha256sum <"$nos/new" | cut -d' ' -f1)" >"$nos/slashit-ui.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\n' "$(sha256sum <"$nos/new" | cut -d' ' -f1)" "$commit_id" >"$nos/slashit-ui.frontend"
 mv "$nos/new" "$nos/slashit-ui"
 out=$(sv SLASHIT_DOGFOOD_BINARY="$nos/slashit-ui" restart 2>&1); st=$?
 if [ "$st" -eq 1 ] && [[ "$out" == *"no frontend sidecar matches"* ]] && [ -n "$pre" ] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null; then
   ok "a running build whose recovery copy has no frontend sidecar and no dev server is refused before the stop; the pid is unchanged"
 else
   bad "a recovery copy without a frontend was not refused before the stop (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2
+fi
+# A dev server answering (curl reads a file: URL) no longer makes the copy
+# recoverable: without a sidecar it has no verified commit to start under.
+out=$(sv SLASHIT_DOGFOOD_BINARY="$nos/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="file://$nos/slashit-ui" restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"no frontend sidecar matches"* ]] && [ -n "$pre" ] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null; then
+  ok "a recovery copy without a sidecar is refused before the stop even when a dev server answers"
+else
+  bad "a sidecar-less recovery copy was accepted because a dev server answers (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2
 fi
 cleanup_instances
 rm -f "$state/supervisor/instance"
@@ -788,7 +804,7 @@ cleanup_instances; rm -f "$state/supervisor/instance"
 # A newer build (a child commit) wrote this state; the instance is now stopped.
 printf 'newer\n' >"$repo/newer.txt"; git -C "$repo" add newer.txt; git -C "$repo" commit -q -m newer
 newer=$(git -C "$repo" rev-parse HEAD)
-printf 'commit=%s\nsha256=feed\n' "$newer" >"$writer"
+printf 'commit=%s\nsha256=feed\nprovenance=verified-sidecar\n' "$newer" >"$writer"
 writer_sum=$(sha256sum <"$writer"); sums_before=$(state_sums)
 out=$(sv start 2>&1); st=$?
 if [ "$st" -eq 1 ] && [[ "$out" == *"does not provably descend from commit $newer"* ]] && [ -z "$(stub_pid)" ] &&
@@ -818,6 +834,140 @@ else bad "a restart onto an older build was not refused before the stop (exit $s
 cleanup_instances; rm -f "$state/supervisor/instance" "$writer"
 rm -rf "$fwd"
 git -C "$repo" reset -q --hard "$commit_id"
+seed_writer "$state"
+
+echo "== state-writer provenance: fresh installs initialize, unknown writers fail closed until adopted"
+prov=$work/prov
+fresh_env=(SLASHIT_DOGFOOD_STATE="$prov")
+out=$(sv "${fresh_env[@]}" start 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qx "commit=$commit_id" "$prov/supervisor/state-writer" &&
+  grep -qx "sha256=$stub_sha" "$prov/supervisor/state-writer" &&
+  grep -qx provenance=verified-sidecar "$prov/supervisor/state-writer" && [ -n "$(stub_pid)" ]; then
+  ok "a first start on an empty state base initializes the writer record from the verified sidecar"
+else bad "a fresh installation did not initialize its writer (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances; rm -rf "$prov"
+# A build without a verified sidecar never gets a writer identity. The checkout
+# HEAD here is $commit_id, which an earlier version of the supervisor recorded.
+dev_dir=$repo/target/devprov
+mkdir -p "$dev_dir"; cp -p "$bin_dir/slashit-ui" "$dev_dir/"
+dev_env=(SLASHIT_DOGFOOD_BINARY="$dev_dir/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="file://$dev_dir/slashit-ui")
+out=$(sv "${fresh_env[@]}" "${dev_env[@]}" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"never taken as the commit of a built executable"* ]] &&
+  [ ! -e "$prov/supervisor/state-writer" ] && [ -z "$(stub_pid)" ]; then
+  ok "a fresh start of a build without a sidecar is refused and records no writer, not the checkout HEAD"
+else bad "a sidecar-less build initialized a fresh installation (exit $st)"; printf '%s\n' "$out" >&2; cat "$prov/supervisor/state-writer" >&2 2>/dev/null; fi
+cleanup_instances; rm -rf "$prov"
+# A sidecar that names no commit, or an unknown one, is no better.
+for c in '' unknown; do
+  mkdir -p "$dev_dir/nc"; cp -p "$bin_dir/slashit-ui" "$dev_dir/nc/"
+  printf 'mode=embedded\nsha256=%s\n%s\n' "$stub_sha" "${c:+commit=$c}" >"$dev_dir/nc/slashit-ui.frontend"
+  out=$(sv "${fresh_env[@]}" SLASHIT_DOGFOOD_BINARY="$dev_dir/nc/slashit-ui" start 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"has no verified sidecar naming its commit"* ]] && [ ! -e "$prov/supervisor/state-writer" ] && [ -z "$(stub_pid)" ]; then
+    ok "a sidecar with commit '${c:-<absent>}' is refused and records no writer"
+  else bad "a sidecar with commit '${c:-<absent>}' was accepted (exit $st)"; printf '%s\n' "$out" >&2; fi
+  cleanup_instances; rm -rf "$prov" "$dev_dir/nc"
+done
+# Existing state with a verified record: a sidecar-less build is refused and
+# the record is untouched (an earlier version rewrote it with the HEAD).
+seed_writer "$prov"; mkdir -p "$prov/config/slashit-app"; printf 'settings v1\n' >"$prov/config/slashit-app/settings.toml"
+rec_sum=$(sha256sum <"$prov/supervisor/state-writer")
+out=$(sv "${fresh_env[@]}" "${dev_env[@]}" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"never taken as the commit of a built executable"* ]] && [ -z "$(stub_pid)" ] &&
+  [ "$(sha256sum <"$prov/supervisor/state-writer")" = "$rec_sum" ]; then
+  ok "a build without a sidecar is refused over recorded state; the record is unchanged"
+else bad "a sidecar-less build launched over recorded state (exit $st)"; printf '%s\n' "$out" >&2; fi
+expect fail "run of a build without a sidecar is refused the same way" \
+  "$(sv "${fresh_env[@]}" "${dev_env[@]}" run 2>&1)" $? "never taken as the commit of a built executable"
+cleanup_instances; rm -rf "$prov"
+# Existing state, writer record missing, instance stopped: an older executable.
+mkdir -p "$prov/config/slashit-app" "$prov/data/slashit-app"
+printf 'settings v1\n' >"$prov/config/slashit-app/settings.toml"
+printf 'session 7\n' >"$prov/data/slashit-app/board.toml"
+old_dir=$repo/target/older
+mkdir -p "$old_dir"; cp -p "$bin_dir/slashit-ui" "$bin_dir/slashit-ui.frontend" "$old_dir/"
+out=$(sv "${fresh_env[@]}" SLASHIT_DOGFOOD_BINARY="$old_dir/slashit-ui" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"state-writer is missing"* ]] && [[ "$out" == *"adopt COMMIT SHA256"* ]] &&
+  [ -z "$(stub_pid)" ] && [ ! -e "$prov/supervisor/state-writer" ]; then
+  ok "a stopped installation whose state has no writer record refuses an arbitrary executable and names adopt"
+else bad "existing state without a writer record was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+expect fail "run is refused the same way" "$(sv "${fresh_env[@]}" run 2>&1)" $? "state-writer is missing"
+bad_sha=$(printf '%064d' 0)
+expect fail "adoption with a sha256 that is not the installed binary's is refused" \
+  "$(sv "${fresh_env[@]}" adopt "$commit_id" "$bad_sha" 2>&1)" $? "not the stated $bad_sha"
+expect fail "adoption with a commit the sidecar does not name is refused" \
+  "$(sv "${fresh_env[@]}" adopt "$(printf '%040d' 0)" "$stub_sha" 2>&1)" $? "provenance does not match"
+expect fail "adoption with a malformed commit is refused" \
+  "$(sv "${fresh_env[@]}" adopt HEAD "$stub_sha" 2>&1)" $? "COMMIT must be"
+# A development build has no sidecar: its commit would come from a checkout
+# HEAD, which adoption never trusts. Nor a sidecar recorded for another binary.
+expect fail "adoption of a binary without a verified sidecar never falls back to the checkout HEAD" \
+  "$(sv "${fresh_env[@]}" SLASHIT_DOGFOOD_BINARY="$dev_dir/slashit-ui" adopt "$commit_id" "$stub_sha" 2>&1)" $? "never infers it from a checkout HEAD"
+printf 'mode=embedded\nsha256=%s\ncommit=%s\n' "$bad_sha" "$commit_id" >"$dev_dir/slashit-ui.frontend"
+expect fail "adoption of a binary whose sidecar names another sha256 is refused" \
+  "$(sv "${fresh_env[@]}" SLASHIT_DOGFOOD_BINARY="$dev_dir/slashit-ui" adopt "$commit_id" "$stub_sha" 2>&1)" $? "never infers it from a checkout HEAD"
+rm -f "$dev_dir/slashit-ui.frontend"
+[ ! -e "$prov/supervisor/state-writer" ] && ok "the refused adoptions wrote no record" || bad "a refused adoption wrote a record"
+expect fail "adoption on an empty state base is refused: a fresh install needs none" \
+  "$(sv SLASHIT_DOGFOOD_STATE="$work/prov-empty" adopt "$commit_id" "$stub_sha" 2>&1)" $? "no persistent state"
+# Crash at the commit boundary: a shim ln fails, then one kills the supervisor.
+shim=$work/shim-ln
+mkdir -p "$shim"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$shim/ln"; chmod +x "$shim/ln"
+out=$(sv "${fresh_env[@]}" PATH="$shim:$PATH" adopt "$commit_id" "$stub_sha" 2>&1); st=$?
+if [ "$st" -eq 1 ] && [ ! -e "$prov/supervisor/state-writer" ]; then
+  ok "a failed link at the adoption boundary leaves no record"
+else bad "a failed adoption left a record or succeeded (exit $st)"; printf '%s\n' "$out" >&2; fi
+printf '#!/usr/bin/env bash\nkill -9 "$PPID"\nexit 1\n' >"$shim/ln"
+sv "${fresh_env[@]}" PATH="$shim:$PATH" adopt "$commit_id" "$stub_sha" >/dev/null 2>&1; st=$?
+if [ "$st" -ne 0 ] && [ ! -e "$prov/supervisor/state-writer" ]; then
+  ok "a supervisor killed at the adoption boundary leaves no record (a stray temp file at most)"
+else bad "a killed adoption left a record (exit $st)"; fi
+expect fail "after the crash the state is still refused" "$(sv "${fresh_env[@]}" start 2>&1)" $? "state-writer is missing"
+out=$(sv "${fresh_env[@]}" adopt "$commit_id" "$stub_sha" 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qx "commit=$commit_id" "$prov/supervisor/state-writer" &&
+  grep -qx "sha256=$stub_sha" "$prov/supervisor/state-writer" && grep -qx adopted=1 "$prov/supervisor/state-writer" &&
+  grep -qx provenance=verified-sidecar "$prov/supervisor/state-writer"; then
+  ok "adoption with the verified executable's commit and sha256 writes a complete record"
+else bad "adoption of the verified executable failed (exit $st)"; printf '%s\n' "$out" >&2; fi
+rec_sum=$(sha256sum <"$prov/supervisor/state-writer")
+expect pass "repeating the same adoption is a no-op" "$(sv "${fresh_env[@]}" adopt "$commit_id" "$stub_sha" 2>&1)" $?
+expect fail "a different adoption never replaces an existing record" \
+  "$(sv "${fresh_env[@]}" adopt "$commit_id" "$bad_sha" 2>&1)" $? "never replaces a record"
+[ "$(sha256sum <"$prov/supervisor/state-writer")" = "$rec_sum" ] && ok "the record is byte-identical after the repeated adoptions" ||
+  bad "a repeated adoption changed the record"
+expect pass "the adopted build starts" "$(sv "${fresh_env[@]}" start 2>&1)" $?
+cleanup_instances; rm -f "$prov/supervisor/instance"
+# A record without the provenance mark (written by an earlier supervisor, which
+# took a checkout HEAD for a build without a sidecar) is not evidence.
+printf 'newer\n' >"$repo/newer.txt"; git -C "$repo" add newer.txt; git -C "$repo" commit -q -m newer
+newer=$(git -C "$repo" rev-parse HEAD); git -C "$repo" reset -q --hard "$commit_id"
+printf 'commit=%s\nsha256=%s\n' "$commit_id" "$stub_sha" >"$prov/supervisor/state-writer"
+out=$(sv "${fresh_env[@]}" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"not that it came from a verified sidecar"* ]] && [[ "$out" == *"adopt COMMIT SHA256"* ]] && [ -z "$(stub_pid)" ]; then
+  ok "a record without the provenance mark is refused on launch, even when it names the build's own commit"
+else bad "an unmarked record was accepted (exit $st)"; printf '%s\n' "$out" >&2; fi
+# Adoption over an unmarked record keeps the downgrade check: it names a newer
+# commit, and the stub's commit does not descend from it.
+printf 'commit=%s\nsha256=feed\n' "$newer" >"$prov/supervisor/state-writer"
+rec_sum=$(sha256sum <"$prov/supervisor/state-writer")
+expect fail "adoption over an unmarked record naming a newer commit is refused" \
+  "$(sv "${fresh_env[@]}" adopt "$commit_id" "$stub_sha" 2>&1)" $? "never hands state to an older build"
+[ "$(sha256sum <"$prov/supervisor/state-writer")" = "$rec_sum" ] && ok "the refused adoption left the unmarked record unchanged" ||
+  bad "a refused adoption changed the unmarked record"
+printf 'commit=%s\nsha256=%s\n' "$commit_id" "$stub_sha" >"$prov/supervisor/state-writer"
+out=$(sv "${fresh_env[@]}" adopt "$commit_id" "$stub_sha" 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qx provenance=verified-sidecar "$prov/supervisor/state-writer" && grep -qx "commit=$commit_id" "$prov/supervisor/state-writer"; then
+  ok "adoption by the verified build replaces an unmarked record naming its own commit"
+else bad "adoption over an unmarked record failed (exit $st)"; printf '%s\n' "$out" >&2; fi
+rec_sum=$(sha256sum <"$prov/supervisor/state-writer")
+expect pass "repeating that adoption is a no-op" "$(sv "${fresh_env[@]}" adopt "$commit_id" "$stub_sha" 2>&1)" $?
+[ "$(sha256sum <"$prov/supervisor/state-writer")" = "$rec_sum" ] && ok "the replaced record is unchanged by the repeat" ||
+  bad "a repeated adoption changed the replaced record"
+# A recorded writer the executable does not match (unrelated commit) is refused.
+printf 'commit=%s\nsha256=%s\nprovenance=verified-sidecar\n' "$(printf '%040d' 1)" "$stub_sha" >"$prov/supervisor/state-writer"
+expect fail "a recorded writer that the executable does not descend from is refused" \
+  "$(sv "${fresh_env[@]}" start 2>&1)" $? "does not provably descend"
+cleanup_instances; rm -rf "$prov" "$work/prov-empty" "$shim" "$old_dir" "$dev_dir"
 
 echo "== frontend mode: an embedded build needs no server; a development build needs its dev server"
 # Inside the git checkout, so a development build (no sidecar) still has a commit.
@@ -877,7 +1027,11 @@ if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
   fi
   if [ "$fe_ready" = 1 ]; then
     out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" start 2>&1)
-    expect pass "a development build starts once its dev server answers" "$out" $?
+    expect fail "a development build is refused even when its dev server answers: it has no verified commit" "$out" $? "never taken as the commit of a built executable"
+    # A running instance that lost its sidecar is reported against the dev server.
+    printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
+    sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" start >/dev/null 2>&1 || bad "ready-dev-server fixture: start failed"
+    rm -f "$fe/slashit-ui.frontend"
     out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" verify 2>&1)
     st=$?
     if [ "$st" -eq 0 ] && [[ "$out" == *"development server answers"* ]]; then ok "verify reports a ready dev server"
@@ -919,6 +1073,7 @@ make_state() {
   printf 'session 7\n' >"$1/data/slashit-app/board.toml"
   printf 'transcript\n' >"$1/data/slashit-app/logs/agent.txt"
   printf 'uncommitted\n' >"$1/data/slashit-app/worktrees/task.txt"
+  seed_writer "$1"
 }
 
 echo "== default discovery: no explicit binary or CLI, inside a git checkout"
@@ -964,6 +1119,7 @@ empty=$work/empty-state
 mkdir -p "$empty/config" "$empty/data/slashit-app/logs" "$empty/data/slashit-app/worktrees"
 printf 'log\n' >"$empty/data/slashit-app/logs/agent.txt"
 printf 'wt\n' >"$empty/data/slashit-app/worktrees/task.txt"
+seed_writer "$empty"
 out=$(sv SLASHIT_DOGFOOD_STATE="$empty" start 2>&1); st=$?
 [ "$st" -eq 0 ] || { bad "empty-set fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2; }
 out=$(sv SLASHIT_DOGFOOD_STATE="$empty" restart 2>&1); st=$?
