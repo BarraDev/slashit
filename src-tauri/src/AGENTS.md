@@ -29,10 +29,11 @@ Backend source for Tauri v2. This folder contains all Rust backend code organize
 
 ## AppState Pattern
 
-Commands that need managed state receive `AppState` via Tauri's `manage()` mechanism. State
-is organized by domain: one field per feature area (`state.task`,
-`state.queue`, `state.agent`, ...), plus shared services such as the event sink
-and the resolved paths. The `AppState` struct in `lib.rs` is the authoritative
+Commands that need domain state receive `AppState` via Tauri's `manage()`
+mechanism (see Managed state below for the one other registered type). State is
+organized by domain: one field per feature area (`state.task`, `state.queue`,
+`state.agent`, ...), plus shared services such as the event sink and the
+resolved paths. The `AppState` struct in `lib.rs` is the authoritative
 field list; do not copy it here.
 
 Most per-domain state types are defined in their respective `commands/`
@@ -93,14 +94,19 @@ anything in `ipc/` or in `crates/slashit-ipc`.
 
 ## Managed state
 
-`AppState` is the only managed root for subordinate state. A command that needs
-managed state requests **`tauri::State<'_, AppState>`** and reaches sub-state
+`lib.rs` registers `AppState` as the root for domain state, and one other managed
+type: `RestartRequested` (`lib.rs`, the `.manage(RestartRequested(...))` call),
+which `updater_restart` requests to restart after an update. A command that needs
+domain state requests **`tauri::State<'_, AppState>`** and reaches sub-state
 through a field (`state.roadmap`, `state.task`, ...). A command must not request
-a subordinate state type such as `tauri::State<'_, RoadmapState>`: it compiles
-and then fails at run time with "state not managed", because Tauri resolves by
-`TypeId` against the managed map. This has already happened once; do not
-reintroduce it. A command that needs no managed state takes no `tauri::State`
-parameter; do not add an unused `AppState` parameter to satisfy this rule.
+a subordinate state type that `run()` does not register, such as
+`tauri::State<'_, RoadmapState>`: it compiles and then fails at run time with
+"state not managed", because Tauri resolves by `TypeId` against the managed map.
+This has already happened once; do not reintroduce it. A command may request a
+separately registered state type only when `run()` registers it and the command
+names its owner, as `updater_restart` does. A command that needs no managed state
+takes no `tauri::State` parameter; do not add an unused `AppState` parameter to
+satisfy this rule.
 
 ## Paths
 
