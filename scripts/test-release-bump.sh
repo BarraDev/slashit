@@ -236,6 +236,14 @@ else bad "--recover did not restore (exit $st)"; printf '%s\n' "$out" >&2; fi
 out=$(run --recover); st=$?
 [ "$st" -eq 1 ] && ok "--recover with no journal refuses" || bad "--recover without a journal returned $st"
 
+echo "== a leftover committed journal (.done) is removed, not restored, and does not block"
+make_repo "$repo" 0.0.3
+mkdir -p "$repo/.release-bump-journal.done" && echo junk >"$repo/.release-bump-journal.done/manifest"
+out=$(run --dry-run 0.0.4 2>&1); st=$?
+if [ ! -e "$repo/.release-bump-journal.done" ] && [[ "$out" != *"exists"* ]] && grep -q '"version": "0.0.3"' "$repo/src-tauri/tauri.conf.json"; then
+  ok "a committed .done leftover is removed and does not block a dry run"
+else bad "committed .done leftover mishandled (exit $st)"; printf '%s\n' "$out" >&2; fi
+
 echo "== a successful apply leaves no backup or staged file behind"
 make_repo "$repo" 0.0.3
 run --apply 0.0.4 >/dev/null; st=$?

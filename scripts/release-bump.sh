@@ -89,6 +89,13 @@ read_version() { # manifest file
   esac
 }
 
+# Removes the journal in two steps so a kill cannot leave a manifest-less or
+# partly deleted journal: the rename is the commit point, the delete is cleanup.
+commit_journal() {
+  mv -- "$journal" "$journal.done" || { echo "$SELF: warning: could not retire $journal; remove it by hand" >&2; exit 1; }
+  rm -rf -- "$journal.done"
+}
+
 # Puts back every file listed in the journal manifest (also removing any staged
 # file left beside it). Succeeds only if every file was restored.
 restore_all() {
@@ -104,10 +111,11 @@ restore_all() {
 if [ "$mode" = --recover ]; then
   [ -f "$journal/manifest" ] || refuse "no $journal/manifest here; nothing to recover"
   restore_all || refuse "could not restore every file; the originals remain in $journal"
-  rm -rf -- "$journal"
+  commit_journal
   echo "$SELF: restored every file from $journal and removed it"
   exit 0
 fi
+[ ! -e "$journal.done" ] || rm -rf -- "$journal.done"
 [ ! -e "$journal" ] ||
   refuse "$journal exists: an earlier run did not finish. Run $SELF --recover to restore the original files"
 
@@ -166,7 +174,7 @@ discard_staged() {
 }
 
 # Restores from the journal and removes it, or keeps it for --recover.
-undo() { restore_all && rm -rf -- "$journal"; }
+undo() { restore_all && commit_journal; }
 
 # A signal runs the same recovery as a failure, then exits 128+N.
 on_signal() { # status name
@@ -269,5 +277,5 @@ run_cargo metadata --locked --format-version 1 ||
   rollback "Cargo.lock does not match the manifests after the bump"
 
 trap '' INT TERM HUP
-rm -rf -- "$journal"
+commit_journal
 echo "$SELF: all ${#files[@]} files and Cargo.lock now declare $target; nothing committed or tagged"
