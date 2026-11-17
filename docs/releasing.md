@@ -40,7 +40,31 @@ Tauri reads its own.
 preflight job checks every file above against it, so a build whose installer
 and whose `slashit --version` disagree cannot get out.
 
-Then refresh the lockfile, which records workspace member versions:
+`scripts/release-bump.sh` makes this change in one step. It also rewrites the
+root entries of `package-lock.json`, which carry the version too. Run it from
+the repository root, after the CHANGELOG section for the version is written
+(see [Version links](#version-links-in-changelogmd)):
+
+```bash
+scripts/release-bump.sh --dry-run 0.0.4   # read-only: shows the current versions and the plan
+scripts/release-bump.sh --apply 0.0.4     # rewrites the files, refreshes Cargo.lock
+```
+
+`--apply` refuses, and changes nothing, when the files disagree on the current
+version, when the files already declare the target, or when `CHANGELOG.md` has
+no non-empty `## [<version>]` section. Once those checks pass it stages the new
+content of every file beside its original, renames each into place, and runs
+`cargo metadata` to refresh `Cargo.lock`. If any step after the first rename
+fails, it restores every file it had changed from a backup and exits 1, naming
+how many files it restored. It never commits, tags, pushes or publishes, so the
+rest of this document still applies. Review the diff before committing it.
+
+The behavior above is what `scripts/test-release-bump.sh` checks, against
+disposable fixture repositories with a stub cargo. It has not been run against
+a real release bump.
+
+Without the tool, bump the eleven files by hand and then refresh the lockfile,
+which records workspace member versions:
 
 ```bash
 cargo check --workspace
