@@ -31,6 +31,20 @@
 #       refused, never guessed at. Each restore is a rename, so an interrupted
 #       --recover can be run again. A successful or rolled-back run removes the
 #       journal itself.
+#       Before it looks at any file, --recover takes the journal's writer lock
+#       (below) without waiting, and refuses, changing nothing, while any process
+#       of the interrupted run still holds it.
+#
+# Writer lock: --apply holds an exclusive flock(1) on .release-bump-journal/
+# writer.lock from before the journal exists until it exits, on descriptor 9,
+# which it leaves open across exec. Every process it starts (cargo, and cargo's
+# own children such as rustc) inherits that descriptor, so the kernel keeps the
+# lock until the last of them exits, even when --apply itself was SIGKILLed. A
+# lock file nobody holds, left by a crash, does not block anything. The lock
+# names no process, so a reused PID cannot fool it. Limits: a descendant that
+# closes descriptor 9 and keeps writing is not covered (cargo and rustc keep it);
+# flock(1) must be installed (util-linux on Linux; macOS does not ship it), and
+# the lock is advisory and may not work on a network filesystem.
 #
 # Durability: journal entries, staged files, restored files and the directories
 # holding them are fsynced (coreutils sync) before the step that relies on them.
@@ -215,8 +229,18 @@ undo() { # trust-lock|no
   restore_files && commit_journal
 }
 
+writer_lock=$journal/writer.lock
+have_flock() {
+  command -v flock >/dev/null 2>&1 ||
+    refuse "flock (util-linux) is required to tell whether a process of an interrupted run is still running"
+}
+
 if [ "$mode" = --recover ]; then
   [ -e "$journal" ] || refuse "no $journal here; nothing to recover"
+  have_flock
+  { [ -f "$writer_lock" ] && exec 9<>"$writer_lock"; } 2>/dev/null || { bad_journal "no writer lock"; exit 1; }
+  flock -n 9 ||
+    refuse "a process of the interrupted run (cargo or a child of it) still holds $writer_lock and could still change Cargo.lock; nothing was changed. Wait for it to exit (fuser -v $writer_lock names it), then run $SELF --recover again"
   classify no || exit 1
   [ "${#foreign[@]}" -eq 0 ] || { report_foreign; exit 1; }
   restore_files || refuse "could not restore every file; the originals remain in $journal; run $SELF --recover again"
@@ -224,9 +248,9 @@ if [ "$mode" = --recover ]; then
   echo "$SELF: restored ${#todo[@]} file(s) from $journal and removed it"
   exit 0
 fi
-[ ! -e "$journal.done" ] || rm -rf -- "$journal.done"
 [ ! -e "$journal" ] ||
   refuse "$journal exists: an earlier run did not finish. Run $SELF --recover to restore the original files"
+have_flock
 
 files=(src-tauri/tauri.conf.json package.json package-lock.json Cargo.toml src-tauri/Cargo.toml)
 for c in crates/*/Cargo.toml; do files+=("$c"); done
@@ -262,6 +286,9 @@ printf '  %-36s %s\n' "Cargo.lock" "refreshed by cargo metadata (no build)"
 echo "  CHANGELOG.md                         curated section for $target present"
 
 [ "$mode" = --dry-run ] && { echo "$SELF: dry run; nothing changed"; exit 0; }
+# A journal a successful run committed but did not finish deleting; only a mode
+# that changes files removes it.
+[ ! -e "$journal.done" ] || rm -rf -- "$journal.done"
 
 # --apply ---------------------------------------------------------------------
 # Three phases. 1: every rewritten file is written to a sibling temporary file and
@@ -354,6 +381,9 @@ sync -- "${staged[@]}" || { discard_staged; refuse "cannot flush the staged file
 jt=$journal.tmp
 rm -rf -- "$jt"
 mkdir -- "$jt" && echo "$journal_format" >"$jt/manifest" || { discard_staged; refuse "cannot create $jt"; }
+# The writer lock (see the header). It is taken before the journal exists and
+# before cargo starts; descriptor 9 stays open across exec on purpose.
+{ exec 9>"$jt/writer.lock"; } 2>/dev/null && flock -n 9 || { discard_staged; refuse "cannot lock $jt/writer.lock"; }
 for i in "${!files[@]}"; do
   f=${files[$i]}
   cp -p -- "$f" "$jt/$i" &&

@@ -80,6 +80,22 @@ leaves a `Cargo.lock` that cannot be told apart from an edit, and `--recover`
 refuses it the same way. A journal that is missing its manifest, truncated or
 otherwise malformed is refused too. `--recover` can be killed and run again.
 
+A killed `--apply` can leave `cargo metadata` running, and it can still rewrite
+`Cargo.lock`. So `--apply` holds an exclusive `flock` on
+`.release-bump-journal/writer.lock` on a descriptor that cargo and its children
+(rustc included) inherit, and the kernel keeps the lock until the last of them
+exits. `--recover` checks that lock before anything else and, while any holder is
+alive, refuses and changes nothing; `fuser -v .release-bump-journal/writer.lock`
+names the holder. A lock file nobody holds does not block it. The check names no
+process, so a reused PID cannot fool it. It does not cover a child that closes
+the inherited descriptor and keeps writing; cargo and rustc keep it. The tool
+needs `flock(1)` (util-linux, Linux; macOS does not ship it), and the lock is
+advisory, so it may not hold on a network filesystem.
+
+`--dry-run` changes nothing, not even a leftover `.release-bump-journal.done`
+from a run that committed but was stopped before deleting it; `--apply` removes
+that leftover.
+
 The journal, the staged files, the restored files and the directories holding
 them are fsynced before the step that depends on them, which orders the writes
 for a power cut. That ordering has not been tested against a real power cut.

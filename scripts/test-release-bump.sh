@@ -15,7 +15,15 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/release-bump-test.XXXXXX") || { echo "cannot c
 # Every rm below runs on a path under $work, so $work must be a real directory.
 case $work in /?*/?*) [ -d "$work" ] || { echo "temporary directory $work is missing" >&2; exit 1; } ;;
   *) echo "refusing to use '$work' as the temporary directory" >&2; exit 1 ;; esac
-trap 'rm -rf -- "$work"' EXIT
+# Every process a test starts names $work on its command line (stubs, background
+# runs, lock holders), so it can be found, killed and checked for at exit.
+cleanup() {
+  pkill -KILL -f -- "$work/" 2>/dev/null
+  for _ in $(seq 50); do pgrep -f -- "$work/" >/dev/null || break; sleep 0.1; done
+  pgrep -f -- "$work/" >/dev/null && echo "warning: processes from $work survived SIGKILL" >&2
+  rm -rf -- "$work"
+}
+trap cleanup EXIT
 real_mv=$(command -v mv)
 pass=0
 fails=0
@@ -36,12 +44,20 @@ cat >"$work/cargo-lock-fail" <<'STUB'
 echo "written by cargo" >Cargo.lock
 exit 1
 STUB
-# Announces itself, then sleeps until killed.
+# Announces itself, then sleeps until killed (at most 30 s).
 cat >"$work/cargo-sleep" <<STUB
 #!/usr/bin/env bash
 echo "written by cargo" >Cargo.lock
 : >"$work/started"
-exec sleep 30
+for _ in \$(seq 300); do sleep 0.1; done
+STUB
+# Announces itself, waits (at most 10 s) for $work/go, then writes Cargo.lock: a
+# cargo that outlives the SIGKILLed bump and changes the lockfile afterwards.
+cat >"$work/cargo-orphan" <<STUB
+#!/usr/bin/env bash
+: >"$work/started"
+for _ in \$(seq 100); do [ -e "$work/go" ] && break; sleep 0.1; done
+[ -e "$work/go" ] && echo "written by the orphaned cargo" >Cargo.lock
 STUB
 # Kills its parent (the bump script) outright, so no trap runs.
 cat >"$work/cargo-crash" <<'STUB'
@@ -138,6 +154,14 @@ run() { # args...: run the script in the fixture with the stub cargo
 killed_at() { # before|after destination args...
   local when=$1 dest=$2; shift 2
   (PATH="$work/shim:$PATH" REAL_MV="$real_mv" MV_KILL="$when" MV_KILL_TARGET="$dest" run "$@") >/dev/null 2>&1
+  settle
+}
+# A stub that SIGKILLed the script inherited its writer lock and may still be
+# exiting; waits, at most 20 s, until nothing holds the lock.
+settle() {
+  local l=$repo/.release-bump-journal/writer.lock
+  [ -e "$l" ] || return 0
+  flock -w 20 "$l" true || bad "a process of the killed run still holds $l after 20 s"
 }
 journal_left() { [ -d "$repo/.release-bump-journal" ]; }
 # Runs the hand-recovery command that --recover printed (in $out) for file $1.
@@ -253,7 +277,7 @@ for have in with without; do
   make_repo "$repo" 0.0.3
   [ "$have" = with ] && printf 'original lock\n' >"$repo/Cargo.lock"
   before=$(digest "$repo")
-  (CARGO_STUB="$work/cargo-crash" run --apply 0.0.4) >/dev/null 2>&1
+  (CARGO_STUB="$work/cargo-crash" run --apply 0.0.4) >/dev/null 2>&1; settle
   journal_left && [ "$before" != "$(digest "$repo")" ] &&
     ok "$have Cargo.lock: a SIGKILLed run leaves the journal and changed files" || bad "$have Cargo.lock: the crash did not leave a journal"
   crashed=$(digest "$repo")
@@ -353,14 +377,14 @@ for when in before after; do
 done
 make_repo "$repo" 0.0.3
 before=$(digest "$repo")
-(CARGO_STUB="$work/cargo-crash-locked" run --apply 0.0.4) >/dev/null 2>&1
+(CARGO_STUB="$work/cargo-crash-locked" run --apply 0.0.4) >/dev/null 2>&1; settle
 out=$(run --recover); st=$?
 if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ] && [ ! -e "$repo/Cargo.lock" ]; then
   ok "a Cargo.lock that cargo created, recorded before the crash, is removed by --recover"
 else bad "a recorded new Cargo.lock was not removed (exit $st)"; printf '%s\n' "$out" >&2; fi
 make_repo "$repo" 0.0.3
 printf 'original lock\n' >"$repo/Cargo.lock"
-(CARGO_STUB="$work/cargo-crash-locked" run --apply 0.0.4) >/dev/null 2>&1
+(CARGO_STUB="$work/cargo-crash-locked" run --apply 0.0.4) >/dev/null 2>&1; settle
 printf 'operator lock\n' >"$repo/Cargo.lock"
 edited=$(digest "$repo")
 out=$(run --recover); st=$?
@@ -377,7 +401,7 @@ echo "== an incomplete or corrupt journal is refused and nothing changes"
 for damage in no-manifest no-end-line truncated bad-copy missing-copy bad-lock-post old-format outside-path; do
   make_repo "$repo" 0.0.3
   printf 'original lock\n' >"$repo/Cargo.lock"
-  if [ "$damage" = bad-lock-post ]; then (CARGO_STUB="$work/cargo-crash-locked" run --apply 0.0.4) >/dev/null 2>&1
+  if [ "$damage" = bad-lock-post ]; then (CARGO_STUB="$work/cargo-crash-locked" run --apply 0.0.4) >/dev/null 2>&1; settle
   else killed_at after Cargo.toml --apply 0.0.4; fi
   j=${repo:?}/.release-bump-journal
   case $damage in
@@ -423,13 +447,87 @@ if [ "$st" -ne 0 ] && grep -q '"name": "operator"' "$repo/package.json" && grep 
   ok "SIGTERM rollback refuses to overwrite package.json edited during the run and keeps the journal"
 else bad "SIGTERM rollback overwrote an edit (exit $st)"; cat "$work/sig.out" >&2; fi
 
-echo "== a leftover committed journal (.done) is removed, not restored, and does not block"
+echo "== a leftover committed journal (.done): --dry-run leaves it, --apply removes it"
 make_repo "$repo" 0.0.3
 mkdir -p "$repo/.release-bump-journal.done" && echo junk >"$repo/.release-bump-journal.done/manifest"
-out=$(run --dry-run 0.0.4 2>&1); st=$?
-if [ ! -e "$repo/.release-bump-journal.done" ] && [[ "$out" != *"exists"* ]] && grep -q '"version": "0.0.3"' "$repo/src-tauri/tauri.conf.json"; then
-  ok "a committed .done leftover is removed and does not block a dry run"
-else bad "committed .done leftover mishandled (exit $st)"; printf '%s\n' "$out" >&2; fi
+before=$(digest "$repo")
+out=$(run --dry-run 0.0.4); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"0.0.3 -> 0.0.4"* ]] && [ "$before" = "$(digest "$repo")" ] &&
+  [ "$(cat "$repo/.release-bump-journal.done/manifest")" = junk ]; then
+  ok "--dry-run is not blocked by a .done leftover and leaves every file, the leftover included, byte-identical"
+else bad "--dry-run changed a file or was blocked by a .done leftover (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(run --apply 0.0.4); st=$?
+if [ "$st" -eq 0 ] && [ ! -e "$repo/.release-bump-journal.done" ] && grep -q '"version": "0.0.4"' "$repo/src-tauri/tauri.conf.json"; then
+  ok "--apply removes the .done leftover, does not restore it, and is not blocked by it"
+else bad "--apply mishandled the .done leftover (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== a cargo left running by a SIGKILLed apply blocks --recover until it exits"
+make_repo "$repo" 0.0.3
+printf 'original lock\n' >"$repo/Cargo.lock"
+before=$(digest "$repo")
+rm -f "$work/started" "$work/go"
+SLASHIT_RELEASE_CARGO="$work/cargo-orphan" bash "$src" --apply 0.0.4 "$repo" >/dev/null 2>&1 &
+pid=$!
+for _ in $(seq 100); do [ -e "$work/started" ] && break; sleep 0.1; done
+[ -e "$work/started" ] || bad "orphan: cargo stub never started"
+kill -KILL "$pid"; wait "$pid" 2>/dev/null
+pgrep -f -- "$work/cargo-orphan" >/dev/null || bad "orphan: the cargo stub did not outlive the SIGKILLed apply"
+held=$(digest "$repo")
+out=$(run --recover); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"still holds"* ]] && [[ "$out" == *"nothing was changed"* ]] && journal_left &&
+  [ "$held" = "$(digest "$repo")" ]; then
+  ok "while the orphaned cargo runs, --recover refuses and the whole fixture digest is unchanged"
+else bad "--recover acted while the orphaned cargo was running (exit $st)"; printf '%s\n' "$out" >&2; fi
+: >"$work/go"
+settle
+if grep -q 'written by the orphaned cargo' "$repo/Cargo.lock" && ! pgrep -f -- "$work/cargo-orphan" >/dev/null; then
+  ok "the orphaned cargo wrote Cargo.lock after the apply died, then exited"
+else bad "the orphaned cargo did not write Cargo.lock and exit"; fi
+crashed=$(digest "$repo")
+out=$(run --recover); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"Cargo.lock differs from its original, and the run stopped before recording"* ]] &&
+  [ "$crashed" = "$(digest "$repo")" ]; then
+  ok "after it exits, --recover refuses its unrecorded Cargo.lock as ambiguous and changes nothing"
+else bad "--recover after the orphan exited did not refuse cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
+follow_instruction Cargo.lock && out=$(run --recover); st=$?
+if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then
+  ok "after the printed command for Cargo.lock, --recover restores the original fixture digest"
+else bad "the orphan case did not end in the original digest (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== the writer lock is held by processes, not named by a PID"
+make_repo "$repo" 0.0.3
+printf 'original lock\n' >"$repo/Cargo.lock"
+before=$(digest "$repo")
+killed_at after Cargo.toml --apply 0.0.4
+l=$repo/.release-bump-journal/writer.lock
+[ -f "$l" ] || bad "a killed apply left no writer lock in the journal"
+echo "$$" >"$l" # a live PID in a lock file nobody holds must not matter
+out=$(run --recover); st=$?
+if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then
+  ok "a stale writer lock nobody holds (naming a live PID) does not block --recover"
+else bad "a stale writer lock blocked --recover (exit $st)"; printf '%s\n' "$out" >&2; fi
+make_repo "$repo" 0.0.3
+printf 'original lock\n' >"$repo/Cargo.lock"
+before=$(digest "$repo")
+killed_at after Cargo.toml --apply 0.0.4
+rm -f "$work/held"
+# Holds the lock, at most 20 s, from a process that is not a child of any run.
+bash -c 'exec 9<>"$1" && flock -n 9 || exit 1; : >"$2"; for _ in $(seq 200); do sleep 0.1; done' \
+  holder "$l" "$work/held" &
+hpid=$!
+for _ in $(seq 100); do [ -e "$work/held" ] && break; sleep 0.1; done
+[ -e "$work/held" ] || bad "the lock holder never took the lock"
+edited=$(digest "$repo")
+out=$(run --recover); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"still holds"* ]] && journal_left && [ "$edited" = "$(digest "$repo")" ]; then
+  ok "a live holder of the writer lock makes --recover refuse and change nothing"
+else bad "--recover ignored a live holder of the writer lock (exit $st)"; printf '%s\n' "$out" >&2; fi
+kill -KILL "$hpid"; wait "$hpid" 2>/dev/null
+settle
+out=$(run --recover); st=$?
+if [ "$st" -eq 0 ] && [ "$before" = "$(digest "$repo")" ]; then
+  ok "once the holder exits, --recover restores the original fixture digest"
+else bad "--recover after the holder exited failed (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 echo "== a successful apply leaves no backup or staged file behind"
 make_repo "$repo" 0.0.3
@@ -437,6 +535,11 @@ run --apply 0.0.4 >/dev/null; st=$?
 leftover=$(find "$repo" \( -name '*.bump.*' -o -name '.release-bump-journal*' \) | wc -l)
 if [ "$st" -eq 0 ] && [ "$leftover" -eq 0 ]; then ok "apply removes its temporary and backup files"
 else bad "apply left files behind (exit $st, $leftover)"; fi
+
+echo "== no process started by the tests is left running"
+for _ in $(seq 50); do pgrep -f -- "$work/" >/dev/null || break; sleep 0.1; done
+if pgrep -f -- "$work/" >/dev/null; then bad "processes are still running: $(pgrep -f -- "$work/" | tr '\n' ' ')"
+else ok "every stub, run and lock holder has exited"; fi
 
 echo
 echo "$pass passed, $fails failed"
