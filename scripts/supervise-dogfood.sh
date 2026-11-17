@@ -16,7 +16,8 @@
 # started it. This script makes the launch explicit and verifiable:
 #
 #   scripts/supervise-dogfood.sh start
-#       Spawn the binary detached, under the declared environment below. The
+#       Spawn a private copy of the binary detached, under the declared environment below. The copy is checked
+#       and executed; $BINARY itself is never executed by path (see launch_snapshot). The
 #       FIRST check is the control socket: a start refuses while an instance
 #       already answers on it, and refuses an ambiguous socket path (present
 #       but without a verified answer), before any binary handling. Then the
@@ -100,7 +101,19 @@
 # The supervisor keeps its own files under $STATE_BASE/supervisor: the launch
 # record (a key<TAB>value file), the instance log, the lifecycle lock, and the
 # start/run/stop/restart verbs take an advisory flock on that directory, so
-# two lifecycle operations can never interleave.
+# two lifecycle operations can never interleave. It also keeps the state-writer
+# file: the commit and sha256 of the last build started over this state. Every
+# start, run and restart refuses a build whose commit does not descend from it,
+# whether or not an instance is running. A build's commit comes only from its
+# verified sidecar (see binary_commit), never from a checkout HEAD, so a build
+# without one is never started. A fresh installation (no file under
+# config/slashit-app or data/slashit-app) records its writer at its first start.
+# Existing state without a record, or with one not marked as taken from a
+# verified sidecar (written by an earlier version of this script), is refused
+# until an operator runs
+#   scripts/supervise-dogfood.sh adopt COMMIT SHA256
+# with the binary stopped: COMMIT and SHA256 must equal the installed binary's
+# verified embedded sidecar commit and its sha256 (see cmd_adopt).
 #
 # Which state files a restart must preserve, and therefore backs up, is the
 # compared snapshot: regular files under the STATE_ROOTS directories (SlashIt's
@@ -124,6 +137,10 @@
 #   SLASHIT_DOGFOOD_START_TIMEOUT  seconds to wait for the control socket
 #   SLASHIT_DOGFOOD_STOP_TIMEOUT   seconds to wait for a graceful quit
 #   SLASHIT_DOGFOOD_FORCE_TIMEOUT  seconds between SIGTERM and SIGKILL
+#   SLASHIT_DOGFOOD_EXPECT_COMMIT  the commit a start or restart must launch
+#                                   (refresh-dogfood.sh sets it to its target). A
+#                                   launch copy of any other commit is refused
+#                                   before anything is stopped or started.
 #   SLASHIT_DOGFOOD_CLI_TIMEOUT    seconds before a CLI call (--version, ping,
 #                                   quit) is abandoned
 #
@@ -156,18 +173,24 @@ fi
 
 usage() {
   echo "usage: $SELF {start|run|stop|restart|status|verify|env} [--force]" >&2
+  echo "       $SELF adopt COMMIT SHA256" >&2
   exit 2
 }
 
-[ "$#" -le 2 ] || usage
 verb=${1:-}
 [ -n "$verb" ] || usage
+if [ "$verb" = adopt ]; then
+  [ "$#" -eq 3 ] || usage
+  ADOPT_COMMIT=$2 ADOPT_SHA=$3
+  set -- adopt
+fi
+[ "$#" -le 2 ] || usage
 case ${2:-} in "" | --force) ;; *) usage ;; esac
 case $verb in
-  start | run | stop | restart | status | verify | env) ;;
+  start | run | stop | restart | status | verify | env | adopt) ;;
   *) usage ;;
 esac
-case $verb in env | status | run) [ "${2:-}" = "" ] || usage ;; esac
+case $verb in env | status | run | adopt) [ "${2:-}" = "" ] || usage ;; esac
 case $verb in stop | restart) : ;; *) [ "${2:-}" != "--force" ] || usage ;; esac
 force=0
 [ "${2:-}" = "--force" ] && force=1
@@ -227,11 +250,17 @@ fi
 
 SUP_DIR=$STATE_BASE/supervisor
 RECORD=$SUP_DIR/instance
+STATE_WRITER=$SUP_DIR/state-writer
 CHILD_PID=$SUP_DIR/child.pid
 INSTANCE_LOG=$SUP_DIR/instance.log
 LOCK=$SUP_DIR/lifecycle.lock
 SOCKET=$RUNTIME_BASE/slashit-app/slashit.sock
 ENDPOINT=unix:$SOCKET
+# The commit the caller requires the launched build to be (refresh-dogfood.sh passes
+# its target). It is checked on the private launch copy before anything is stopped.
+EXPECT_COMMIT=${SLASHIT_DOGFOOD_EXPECT_COMMIT:-}
+# Set when restart has already validated its launch copy; start then reuses that copy.
+PREVALIDATED=0
 
 # The declared environment ---------------------------------------------------
 declare_config=$STATE_BASE/config
@@ -254,6 +283,7 @@ note() {
 # A refusal explains why the requested action was not taken.
 refuse() {
   echo "$SELF: refusing: $*" >&2
+  [ -z "${LAUNCH_DIR:-}" ] || launch_discard
   exit 1
 }
 
@@ -522,13 +552,23 @@ signal_target() { # SIGNAL
   kill -"$1" "$TARGET_PID" 2>/dev/null
 }
 
-# Provenance: the commit of the checkout the binary was built in, resolved
-# through that checkout's own .git. The value is recorded at launch time.
-binary_commit() {
-  local dir=$1 top commit
-  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
-  commit=$(git -C "$top" rev-parse HEAD 2>/dev/null) || return 1
-  printf '%s\n' "$commit"
+# Provenance: the commit $BINARY was built from, set in BINARY_COMMIT only when
+# its sidecar is verified (mode=embedded, and a sha256 equal to SHA, the checksum the
+# caller computed and will record) and names a full commit id. A binary
+# without one has no known commit: a checkout HEAD says nothing about an
+# executable that was already built, so it is never used. Otherwise
+# BINARY_COMMIT is empty and it returns 1. Not for a subshell: the caller's
+# refusal reports FRONTEND_MODE and SIDE_COMMIT.
+binary_commit() { # SHA [PATH]
+  local bin=${2:-$BINARY}
+  BINARY_COMMIT=
+  frontend_mode "$bin"
+  [ "$FRONTEND_MODE" = embedded ] && [ -n "$1" ] && [ "$SIDE_SHA" = "$1" ] || return 1
+  case $SIDE_COMMIT in *[!0-9a-f]* | '') return 1 ;; esac
+  [ "${#SIDE_COMMIT}" -eq 40 ] || return 1
+  # A build from a dirty source (older builds promoted those) names no commit that holds it.
+  [ "$(sed -n 's/^dirty=//p' "$bin.frontend" 2>/dev/null | head -n 1)" = no ] || return 1
+  BINARY_COMMIT=$SIDE_COMMIT
 }
 
 # The new PID's real process environment, compared value-by-value against the
@@ -696,6 +736,7 @@ BINARY           ${BINARY:-"unresolved (no workspace checkout resolved; set SLAS
 CLI              ${CLI_BIN:-"<no slashit CLI beside the binary; set SLASHIT_DOGFOOD_CLI>"}
 SOCKET           $SOCKET
 ENDPOINT         $ENDPOINT
+STATE_WRITER     $STATE_WRITER
 EOF
 }
 
@@ -711,15 +752,24 @@ EOF
 # binary is stale, so a rebuilt or replaced binary is never trusted on the
 # strength of an old record.
 DEV_URL=${SLASHIT_DOGFOOD_DEV_URL:-http://localhost:1420/}
-frontend_mode() { # sets FRONTEND_MODE: embedded | devserver | stale | invalid
-  local side="$BINARY.frontend" mode want sha
+# The only reader of a sidecar (written by scripts/build-dogfood-app.sh). Sets
+# SIDE_MODE, SIDE_SHA and SIDE_COMMIT from the first mode=, sha256= and commit=
+# lines of PATH, each empty when absent; returns 1 when PATH is not a file.
+# Other keys are ignored.
+read_sidecar() { # PATH
+  SIDE_MODE= SIDE_SHA= SIDE_COMMIT=
+  [ -f "$1" ] || return 1
+  SIDE_MODE=$(sed -n 's/^mode=//p' "$1" 2>/dev/null | head -n 1)
+  SIDE_SHA=$(sed -n 's/^sha256=//p' "$1" 2>/dev/null | head -n 1)
+  SIDE_COMMIT=$(sed -n 's/^commit=//p' "$1" 2>/dev/null | head -n 1)
+}
+frontend_mode() { # [PATH]; sets FRONTEND_MODE: embedded | devserver | stale | invalid
+  local sha bin=${1:-$BINARY}
   FRONTEND_MODE=devserver
-  [ -n "$BINARY" ] && [ -f "$side" ] || return 0
-  mode=$(sed -n 's/^mode=//p' "$side" | head -n 1)
-  want=$(sed -n 's/^sha256=//p' "$side" | head -n 1)
-  sha=$(sha256sum "$BINARY" 2>/dev/null | cut -d' ' -f1)
-  case $mode in
-    embedded) if [ -n "$sha" ] && [ "$sha" = "$want" ]; then FRONTEND_MODE=embedded; else FRONTEND_MODE=stale; fi ;;
+  [ -n "$bin" ] && read_sidecar "$bin.frontend" || return 0
+  sha=$(sha256sum "$bin" 2>/dev/null | cut -d' ' -f1)
+  case $SIDE_MODE in
+    embedded) if [ -n "$sha" ] && [ "$sha" = "$SIDE_SHA" ]; then FRONTEND_MODE=embedded; else FRONTEND_MODE=stale; fi ;;
     *) FRONTEND_MODE=invalid ;;
   esac
 }
@@ -755,6 +805,191 @@ frontend_report() {
   esac
 }
 
+# The last build that wrote state. The launch record is removed on stop, so it
+# cannot protect a stopped instance; this file stays with the state. It names the
+# commit and sha256 of the last build started over this state, and is replaced by
+# rename before every spawn. A launch whose commit does not descend from it is
+# refused, running or stopped: restoring an older executable does not make state
+# a newer one wrote safe for it, and no backward compatibility is assumed. A
+# build of unknown commit (no verified sidecar) is refused whether or not the
+# file exists, and never creates it. A record lacking PROVENANCE_MARK was
+# written by an earlier version of this script, which took a checkout HEAD as
+# the commit of a build without a sidecar, so it is not evidence and is refused
+# until adopted.
+LAUNCH_COMMIT=unknown
+PROVENANCE_MARK=provenance=verified-sidecar
+state_writer_gate() {
+  local writer
+  LAUNCH_COMMIT=unknown
+  if ! binary_commit "$LAUNCH_SHA" "$LAUNCH_EXEC"; then
+    [ "$(sed -n 's/^dirty=//p' "$LAUNCH_EXEC.frontend" 2>/dev/null | head -n 1)" != yes ] ||
+      refuse "$BINARY was built from a dirty source (dirty=yes in $BINARY.frontend), so its commit does not hold what was built. Nothing was started. Commit or describe the source, then build it with scripts/build-dogfood-app.sh"
+    refuse "$BINARY has no verified sidecar naming its commit ($BINARY.frontend: $FRONTEND_MODE, commit '${SIDE_COMMIT:-none}'), so the build it came from is unknown. A checkout HEAD is never taken as the commit of a built executable, so this build can neither be checked against nor recorded as the writer of the state under $STATE_BASE. Nothing was started. Build it with scripts/build-dogfood-app.sh"
+  fi
+  LAUNCH_COMMIT=$BINARY_COMMIT
+  if [ ! -e "$STATE_WRITER" ]; then
+    has_persistent_state || return 0
+    refuse "the state under $STATE_BASE exists but $STATE_WRITER is missing, so the build that last wrote it is unknown and an older build could run over newer state. Nothing was started. Establish the writer with \`$SELF adopt COMMIT SHA256\` for the build verified to have written this state (see the header of this script)"
+  fi
+  writer=$(sed -n 's/^commit=//p' "$STATE_WRITER" 2>/dev/null | head -n 1)
+  [ -n "$writer" ] || refuse "$STATE_WRITER names no commit, so no build can be proven safe for this state"
+  grep -qx "$PROVENANCE_MARK" "$STATE_WRITER" 2>/dev/null ||
+    refuse "$STATE_WRITER names commit $writer but not that it came from a verified sidecar; an earlier version of this script recorded a checkout HEAD for a build without one, so the build that last wrote this state is unknown. Nothing was started. Re-establish the writer with \`$SELF adopt COMMIT SHA256\` for the build verified to have written this state (see the header of this script)"
+  [ "$writer" != "$LAUNCH_COMMIT" ] || return 0
+  git -C "$(dirname "$BINARY")" merge-base --is-ancestor "$writer" "$LAUNCH_COMMIT" 2>/dev/null ||
+    refuse "commit $LAUNCH_COMMIT of $BINARY does not provably descend from commit $writer, the last build that wrote this state; an older build must never run over newer state. After a JJ rewrite (squash, rebase, amend): remove $STATE_WRITER only if no newer build has written this state (verified by the owner)"
+}
+
+# The writer record is prepared beside its final place (WRITER_TMP) and promoted
+# by rename. A start promotes it inside the child, immediately before the exec,
+# so a failure before that rename never changes the writer. A run
+# promotes it directly, because its exec replaces the process that holds the lock.
+prepare_state_writer() {
+  [ "$LAUNCH_COMMIT" != unknown ] || return 1
+  WRITER_TMP=$(mktemp "$STATE_WRITER.tmp.XXXXXX" 2>/dev/null) || return 1
+  printf 'commit=%s\nsha256=%s\n%s\nbinary=%s\nwritten_at=%s\n' \
+    "$LAUNCH_COMMIT" "$LAUNCH_SHA" "$PROVENANCE_MARK" "$BINARY" "$(date -u +%FT%TZ)" >"$WRITER_TMP" &&
+    sync -- "$WRITER_TMP" && return 0
+  rm -f "$WRITER_TMP"
+  WRITER_TMP=
+  return 1
+}
+promote_state_writer() { # after prepare_state_writer
+  mv -f -T "$WRITER_TMP" "$STATE_WRITER" && sync -- "$SUP_DIR" && return 0
+  rm -f "$WRITER_TMP"
+  WRITER_TMP=
+  return 1
+}
+WRITER_TMP=
+
+# Fresh versus existing installation: any regular file under SlashIt's own
+# config or data root (excluded ones too) means some build has written state.
+# A root that cannot be searched counts as existing state (fail closed).
+has_persistent_state() {
+  local d found
+  for d in "$STATE_BASE/config/slashit-app" "$STATE_BASE/data/slashit-app"; do
+    [ -e "$d" ] || continue
+    found=$(find "$d" -type f -print -quit 2>/dev/null) || return 0
+    [ -z "$found" ] || return 0
+  done
+  return 1
+}
+
+# Controlled adoption: establishes the state-writer record for state that
+# exists, naming the executable the operator verified wrote it. The operator
+# states COMMIT and SHA256; both must equal the installed binary's own
+# evidence: its sha256 and the commit in its verified embedded sidecar
+# (binary_commit). No commit is ever taken from a checkout HEAD. A missing
+# record is created with link(2), which never replaces a file, so a crash
+# leaves no record or a complete one (a stray temp file at most). A record
+# without PROVENANCE_MARK (an earlier version of this script) is replaced by
+# rename, but only by a COMMIT equal to or descending from the commit it names:
+# adoption is not a way around the downgrade check. A marked record is never
+# replaced. Repeating an adoption that already holds is a no-op.
+cmd_adopt() {
+  local sha existing tmp old= install=(ln -T)
+  case $ADOPT_COMMIT in *[!0-9a-f]* | '') refuse "COMMIT must be a full lowercase hex commit id ('$ADOPT_COMMIT')" ;; esac
+  [ "${#ADOPT_COMMIT}" -eq 40 ] || refuse "COMMIT must be a full 40-character commit id ('$ADOPT_COMMIT')"
+  case $ADOPT_SHA in *[!0-9a-f]* | '') refuse "SHA256 must be a lowercase hex digest ('$ADOPT_SHA')" ;; esac
+  [ "${#ADOPT_SHA}" -eq 64 ] || refuse "SHA256 must be a 64-character digest ('$ADOPT_SHA')"
+  if [ -e "$STATE_WRITER" ]; then
+    existing=$(sed -n 's/^commit=//p;s/^sha256=//p' "$STATE_WRITER" 2>/dev/null | tr '\n' ' ')
+    if grep -qx "$PROVENANCE_MARK" "$STATE_WRITER" 2>/dev/null; then
+      [ "$existing" = "$ADOPT_COMMIT $ADOPT_SHA " ] &&
+        { echo "$SELF: $STATE_WRITER already names commit $ADOPT_COMMIT and sha256 $ADOPT_SHA; nothing changed"; exit 0; }
+      refuse "$STATE_WRITER already exists and names a different writer; adoption never replaces a record that came from a verified sidecar"
+    fi
+    old=$(sed -n 's/^commit=//p' "$STATE_WRITER" 2>/dev/null | head -n 1)
+    install=(mv -f -T)
+  else
+    has_persistent_state ||
+      refuse "there is no persistent state under $STATE_BASE to adopt; a fresh installation records its writer at its first start"
+  fi
+  # Adoption is for a stopped instance: nothing may write state meanwhile.
+  if ping_fields; then refuse "an instance answers on $ENDPOINT (pid $PING_PID); stop it before adopting"; fi
+  [ -e "$SOCKET" ] && refuse "the endpoint path $SOCKET exists; resolve it with \`$SELF status\` before adopting"
+  record_state
+  case $REC_STATE in match | unverifiable) refuse "the launch record names pid $REC_PID, which may still run; stop it before adopting" ;; esac
+  [ -n "$BINARY" ] && [ -f "$BINARY" ] && [ -x "$BINARY" ] || refuse "the installed binary is missing or not executable: ${BINARY:-unresolved}"
+  # The same private copy the launch verifies: the writer must name exactly the
+  # bytes and sidecar that were checked, not whatever $BINARY holds later.
+  launch_snapshot
+  timeout -k 2 "$CLI_TIMEOUT" "$LAUNCH_EXEC" --version >/dev/null 2>&1 ||
+    refuse "the binary does not answer --version; its provenance is unverifiable: $BINARY"
+  sha=$(sha256sum <"$LAUNCH_EXEC" 2>/dev/null | cut -d' ' -f1)
+  [ -n "$sha" ] || refuse "cannot checksum the binary: $BINARY"
+  [ "$sha" = "$ADOPT_SHA" ] || refuse "the sha256 of $BINARY is $sha, not the stated $ADOPT_SHA; this is not the verified executable"
+  binary_commit "$sha" "$LAUNCH_EXEC" ||
+    refuse "$BINARY has no verified embedded sidecar naming its commit ($BINARY.frontend: $FRONTEND_MODE, commit '${SIDE_COMMIT:-none}'), so its commit is unverifiable; adoption never infers it from a checkout HEAD"
+  [ "$BINARY_COMMIT" = "$ADOPT_COMMIT" ] ||
+    refuse "$BINARY.frontend names commit '$BINARY_COMMIT', not the stated $ADOPT_COMMIT; the provenance does not match"
+  if [ -n "$old" ] && [ "$old" != "$ADOPT_COMMIT" ]; then
+    git -C "$(dirname "$BINARY")" merge-base --is-ancestor "$old" "$ADOPT_COMMIT" 2>/dev/null ||
+      refuse "$STATE_WRITER names commit $old, and $ADOPT_COMMIT does not provably descend from it; adoption never hands state to an older build"
+  fi
+  # State compatibility: the compared state must be fully readable evidence.
+  state_snapshot "$STATE_BASE" >/dev/null || refuse "the state under $STATE_BASE cannot be read and checksummed, so its compatibility is unverifiable"
+  tmp=$(mktemp "$STATE_WRITER.tmp.XXXXXX" 2>/dev/null) || fail "cannot create a temporary file beside $STATE_WRITER"
+  if printf 'commit=%s\nsha256=%s\n%s\nbinary=%s\nwritten_at=%s\nadopted=1\n' \
+    "$ADOPT_COMMIT" "$ADOPT_SHA" "$PROVENANCE_MARK" "$BINARY" "$(date -u +%FT%TZ)" >"$tmp" &&
+    sync -- "$tmp" && "${install[@]}" "$tmp" "$STATE_WRITER" 2>/dev/null; then
+    rm -f "$tmp"
+    launch_discard
+    sync -- "$SUP_DIR" || fail "adopted, but cannot sync $SUP_DIR; re-run adopt to confirm"
+    echo "$SELF: adopted commit $ADOPT_COMMIT (sha256 $ADOPT_SHA) as the writer of $STATE_BASE"
+    exit 0
+  fi
+  rm -f "$tmp"
+  fail "cannot create $STATE_WRITER; no record was written"
+}
+
+# The private copy that every launch checks and executes. It lives in a directory
+# made by mktemp -d (owner-only), and its sidecar travels with it, so no check
+# reads $BINARY again. Other users are kept out by the owner-only directory under
+# $STATE_BASE (mode 700); this assumes SLASHIT_DOGFOOD_STATE is not a directory
+# other users can write to. The read-only bits only slow a same-user process
+# down. shortcut: a process of this same user can restore write access and
+# replace the copy between its checks and the exec; no narrower bound is
+# available without a kernel-enforced exec of a verified descriptor, upgrade if
+# that threat ever applies.
+LAUNCH_DIR=
+LAUNCH_EXEC=
+launch_snapshot() {
+  LAUNCH_DIR= LAUNCH_EXEC=
+  mkdir -p "$SUP_DIR" 2>/dev/null
+  launch_prune
+  LAUNCH_DIR=$(mktemp -d "$SUP_DIR/launch.XXXXXX" 2>/dev/null) ||
+    refuse "cannot create a private directory for the launch under $SUP_DIR; nothing was started"
+  LAUNCH_EXEC=$LAUNCH_DIR/slashit-ui
+  cp -- "$BINARY" "$LAUNCH_EXEC" 2>/dev/null ||
+    refuse "cannot copy $BINARY for the launch; nothing was started"
+  if [ -e "$BINARY.frontend" ]; then
+    cp -- "$BINARY.frontend" "$LAUNCH_EXEC.frontend" 2>/dev/null ||
+      refuse "cannot copy $BINARY.frontend for the launch; nothing was started"
+    chmod 400 "$LAUNCH_EXEC.frontend"
+  fi
+  chmod 500 "$LAUNCH_EXEC" && chmod 500 "$LAUNCH_DIR" ||
+    refuse "cannot make the launch copy read-only; nothing was started"
+}
+# Removes the copies of earlier launches. A running instance may still use its
+# copy: on Linux an executing file survives its unlink, and a restart recovers
+# a running image through /proc/<pid>/exe.
+launch_prune() {
+  local d
+  for d in "$SUP_DIR"/launch.*; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    chmod -R u+w -- "$d" 2>/dev/null
+    rm -rf -- "$d"
+  done
+}
+# A launch that will not exec removes its own copy. Called by refuse, and after
+# a start is verified (the child has exec'd; its image is no longer needed).
+launch_discard() {
+  [ -n "$LAUNCH_DIR" ] && chmod -R u+w -- "$LAUNCH_DIR" 2>/dev/null
+  rm -rf -- "$LAUNCH_DIR"
+  LAUNCH_DIR= LAUNCH_EXEC=
+}
+
 launch_gates() {
   [ -n "$CLI_BIN" ] ||
     refuse "cannot verify the endpoint: no \`slashit\` CLI is available (it normally sits beside the binary; set SLASHIT_DOGFOOD_CLI) — a launch refuses an unverified control channel"
@@ -765,23 +1000,33 @@ launch_gates() {
     refuse "the binary location is unresolved: no workspace checkout was found next to this script (set SLASHIT_DOGFOOD_BINARY to point at slashit-ui)"
   [ -f "$BINARY" ] || refuse "the binary is missing: $BINARY"
   [ -x "$BINARY" ] || refuse "the binary is not executable: $BINARY"
+  # Every check below reads, and the exec runs, one private copy. $BINARY itself
+  # may be replaced by a build promotion at any moment, so it is never checked
+  # or executed by path after this point.
+  launch_snapshot
   # One bounded call: its status is the gate, its output the version.
   local out
-  out=$(timeout -k 2 "$CLI_TIMEOUT" "$BINARY" --version 2>/dev/null) ||
+  out=$(timeout -k 2 "$CLI_TIMEOUT" "$LAUNCH_EXEC" --version 2>/dev/null) ||
     refuse "the binary does not answer --version; refusing a build with unknown provenance: $BINARY"
   version_line=$(printf '%s\n' "$out" | head -n 1)
   [ -n "$version_line" ] || refuse "the binary answers --version with nothing; refusing it: $BINARY"
-  LAUNCH_SHA=$(sha256sum <"$BINARY" 2>/dev/null | cut -d' ' -f1)
+  LAUNCH_SHA=$(sha256sum <"$LAUNCH_EXEC" 2>/dev/null | cut -d' ' -f1)
   [ -n "$LAUNCH_SHA" ] || refuse "cannot checksum the binary: $BINARY"
   # A launch must not start a GUI that cannot show its frontend. Refused here,
   # before any stop, so a restart does not take the running instance down first.
-  frontend_mode
+  frontend_mode "$LAUNCH_EXEC"
   case $FRONTEND_MODE in
     embedded) ;;
-    stale) refuse "$BINARY.frontend does not match the binary's sha256 (the binary was replaced after its frontend was recorded); rebuild with scripts/build-dogfood-app.sh" ;;
+    stale) refuse "$BINARY.frontend does not match the binary's sha256 (the binary was replaced after its frontend was recorded, or the launch copy is not the bytes the frontend names); rebuild with scripts/build-dogfood-app.sh" ;;
     invalid) refuse "$BINARY.frontend declares an unknown frontend mode" ;;
     *) frontend_ready || refuse "this is a development build, which loads $DEV_URL, and nothing answers there; start \`trunk serve\` on port 1420, or build a self-contained binary with scripts/build-dogfood-app.sh" ;;
   esac
+  state_writer_gate
+  # The requested target was checked by the caller before this copy was taken, so a
+  # promotion in between must be refused here, before anything is stopped.
+  if [ -n "$EXPECT_COMMIT" ] && [ "$LAUNCH_COMMIT" != "$EXPECT_COMMIT" ]; then
+    refuse "the build that would launch is $LAUNCH_COMMIT, not the requested target $EXPECT_COMMIT: $BINARY changed after the target was checked. Nothing was stopped or started"
+  fi
 }
 
 # A start that fails after its spawn must not leave the child running untracked.
@@ -793,6 +1038,12 @@ launch_gates() {
 # may say it is kept; the operator checks the process by hand instead.
 abort_start() { # message; uses TARGET_PID, TARGET_ID and RECORD_WRITTEN
   local msg=$1 st deadline
+  # The copy is kept: the child may already have promoted the writer and be about
+  # to exec it, and an exec of a removed copy would leave a writer that names a
+  # build which never ran. launch_prune removes it at the next launch. Removing the
+  # prepared writer is safe: a child can then no longer rename it.
+  [ -z "$WRITER_TMP" ] || rm -f -- "$WRITER_TMP"
+  WRITER_TMP=
   if [ -z "$TARGET_ID" ]; then
     if [ "$RECORD_WRITTEN" = 1 ]; then
       fail "$msg; pid $TARGET_PID has no captured identity, so nothing was signaled; the record $RECORD is kept for inspection"
@@ -847,18 +1098,20 @@ cmd_start() {
     unverifiable) refuse "the launch record names pid $REC_PID, which $REC_WHY; a launch will not start beside a process it cannot identify (see \`$SELF status\`)" ;;
   esac
 
-  # Provenance gates: the CLI first (it verifies the instance), then the binary.
-  launch_gates
+  # Provenance gates: the CLI first (it verifies the instance), then the binary. A
+  # restart already ran them on the copy it will start, before it stopped anything;
+  # running them again would prune that copy and check a binary that may have changed.
+  [ "$PREVALIDATED" = 1 ] || launch_gates
   command -v setsid >/dev/null 2>&1 || refuse "setsid is required to detach the instance"
 
   mkdir -p "$STATE_BASE/config" "$STATE_BASE/data" "$STATE_BASE/cache" "$SUP_DIR" 2>/dev/null
   mkdir -p "$RUNTIME_BASE" 2>/dev/null
   chmod 700 "$STATE_BASE" "$RUNTIME_BASE" 2>/dev/null
   rm -f "$CHILD_PID"
-  # The provenance lookup runs before the spawn, so no git call sits between the
-  # child's start and its provisional record.
-  local commit=unknown
-  commit=$(binary_commit "$(dirname "$BINARY")" 2>/dev/null) || commit=unknown
+  # The provenance lookup ran in launch_gates, before the spawn, so no git call
+  # sits between the child's start and its provisional record.
+  local commit=$LAUNCH_COMMIT
+  prepare_state_writer || refuse "cannot write $STATE_WRITER; nothing was started"
 
   {
     echo "=== $(date -u +%FT%TZ) start by $SELF (user $uid)"
@@ -878,9 +1131,18 @@ cmd_start() {
       XDG_STATE_HOME="$declare_state" \
       XDG_RUNTIME_DIR="$declare_runtime" \
       GH_CONFIG_DIR="$GH_CONFIG"
-    setsid -f bash -c 'cd "$3" && printf "%s\n" "$$" > "$1" && exec "$2"' \
-      supervise "$CHILD_PID" "$BINARY" "$HOME" >>"$INSTANCE_LOG" 2>&1 </dev/null 9>&-
-  )
+    # The writer is promoted by the rename here, after the PID is recorded and
+    # immediately before the exec of the copy. A failure before the rename leaves
+    # the writer unchanged. An exec that fails after the rename leaves it promoted
+    # with nothing running: conservative (it only refuses older builds).
+    setsid -f bash -c 'cd "$3" && printf "%s\n" "$$" > "$1" && mv -f -T "$4" "$5" && exec "$2"' \
+      supervise "$CHILD_PID" "$LAUNCH_EXEC" "$HOME" "$WRITER_TMP" "$STATE_WRITER" >>"$INSTANCE_LOG" 2>&1 </dev/null 9>&-
+  ) || {
+    rm -f "$WRITER_TMP"
+    WRITER_TMP=
+    launch_discard
+    fail "setsid failed, so no child was started; the writer record is unchanged; see $INSTANCE_LOG"
+  }
   # fd 9 is closed on purpose: the detached instance must not outlast the
   # supervisor while still holding its lifecycle lock.
 
@@ -892,8 +1154,13 @@ cmd_start() {
   done
   child=$(cat "$CHILD_PID" 2>/dev/null || true)
   rm -f "$CHILD_PID"
-  [ -n "$child" ] ||
+  # Without a PID no child is recorded, and removing the prepared writer keeps
+  # the writer unchanged if a late child reaches its rename (the rename then fails).
+  [ -n "$child" ] || {
+    [ -z "$WRITER_TMP" ] || rm -f -- "$WRITER_TMP"
+    WRITER_TMP=
     fail "no PID was recorded for the spawn; see $INSTANCE_LOG. A process may have started without a record: check with pgrep before starting again"
+  }
 
   # The provisional record comes before any waiting. From here the child is a
   # recorded process, so a start that fails below cannot leave it untracked.
@@ -929,6 +1196,8 @@ cmd_start() {
   # fails is never reported as a successful start.
   write_record verified "$child" "$ident" "$commit" ||
     abort_start "cannot write the verified launch record $RECORD, so the start is not reported as successful"
+  # The verified child has exec'd its copy, so the copy is no longer needed.
+  launch_discard
 
   note "started pid $child ($version_line, commit ${commit:0:12}) on $ENDPOINT"
   env_verdict
@@ -979,8 +1248,8 @@ EOF
   mkdir -p "$STATE_BASE/config" "$STATE_BASE/data" "$STATE_BASE/cache" "$SUP_DIR" "$RUNTIME_BASE" 2>/dev/null
   chmod 700 "$STATE_BASE" "$RUNTIME_BASE" 2>/dev/null
 
-  local commit=unknown
-  commit=$(binary_commit "$(dirname "$BINARY")" 2>/dev/null) || commit=unknown
+  local commit=$LAUNCH_COMMIT
+  prepare_state_writer || refuse "cannot write $STATE_WRITER; nothing was started"
 
   {
     echo "=== $(date -u +%FT%TZ) run by $SELF for a service manager (user $uid)"
@@ -999,6 +1268,8 @@ EOF
     fail "the identity of pid $$ cannot be read, so the launch record could not authorize a signal; nothing was started"
   write_record run "$$" "$ident" "$commit" ||
     fail "cannot write the launch record $RECORD; nothing was started"
+  # The writer is promoted last, after every failure point before the exec.
+  promote_state_writer || fail "cannot promote $STATE_WRITER; nothing was started"
 
   note "exec $BINARY ($version_line, commit ${commit:0:12}) in the foreground as pid $$; the service manager owns this process"
   cd "$HOME" 2>/dev/null
@@ -1010,7 +1281,7 @@ EOF
     XDG_RUNTIME_DIR="$declare_runtime" \
     GH_CONFIG_DIR="$GH_CONFIG"
   exec 9>&- # release the lifecycle lock before the exec
-  exec "$BINARY"
+  exec "$LAUNCH_EXEC"
 }
 
 cmd_stop() {
@@ -1248,21 +1519,33 @@ capture_running_executable() {
     chmod 555 "$tmp" && mv -f -T "$tmp" "$dir/slashit-ui" || break
     rm -f "$dir/slashit-ui.frontend"
     for side in "$BINARY.frontend" "$(dirname "$BINARY")/previous/slashit-ui.frontend"; do
-      if [ "$(sed -n 's/^sha256=//p' "$side" 2>/dev/null | head -n 1)" = "$sha" ]; then
+      if read_sidecar "$side" && [ "$SIDE_SHA" = "$sha" ]; then
         cp -- "$side" "$dir/slashit-ui.frontend" 2>/dev/null || { rm -f "$dir/slashit-ui"; break 2; }
         break
       fi
     done
-    # Recovery without a sidecar runs as a development build, which needs the dev server.
-    if [ ! -f "$dir/slashit-ui.frontend" ] && ! frontend_ready; then
+    # Without a sidecar the copy has no verified commit, so its start would be refused.
+    if [ ! -f "$dir/slashit-ui.frontend" ]; then
       rm -f "$dir/slashit-ui"
-      refuse "no frontend sidecar matches the running executable (sha256 $sha) and nothing answers on $DEV_URL, so a failed restart could not start it again; the instance was not stopped"
+      refuse "no frontend sidecar matches the running executable (sha256 $sha), so its commit is unverifiable and a failed restart could not start it again; the instance was not stopped"
+    fi
+    # The start that would run this copy after a failed backup applies the full launch
+    # provenance: a verified clean commit, which the state writer must name. Checked
+    # here, before the stop, so a copy that could not start is refused while it runs.
+    if ! binary_commit "$sha" "$dir/slashit-ui" || [ "$BINARY_COMMIT" != "$(sed -n 's/^commit=//p' "$STATE_WRITER" 2>/dev/null | head -n 1)" ] ||
+      ! grep -qx "$PROVENANCE_MARK" "$STATE_WRITER" 2>/dev/null; then
+      rm -f "$dir/slashit-ui" "$dir/slashit-ui.frontend"
+      refuse "the sidecar of the running executable (sha256 $sha) does not name a verified clean commit that the state writer records, so a failed restart could not start it again; the instance was not stopped"
     fi
     RECOVER_BIN=$dir/slashit-ui
     return 0
   done
   rm -f "$tmp"
-  refuse "cannot prove which executable pid $TARGET_PID is running${want:+ (launch sha256 $want)}, so a failed restart could not recover it; the instance was not stopped"
+  # A build promotion whose backup retention failed leaves the replaced pair only in
+  # .previous.*: name it, but never use it unverified (the operator checks it first).
+  local kept
+  kept=$(compgen -G "$(dirname "$BINARY")/.previous.*" | tr '\n' ' ') || kept=
+  refuse "cannot prove which executable pid $TARGET_PID is running${want:+ (launch sha256 $want)}, so a failed restart could not start it again; the instance was not stopped and keeps running.${kept:+ A build promotion left a replaced executable under ${kept% } that was not verified and is not used automatically. Manual recovery, with the instance still running: check that its slashit-ui hashes to ${want:-the sha256 the launch record captured} and that its slashit-ui.frontend names the commit the state writer records; only then copy (cp -p, never mv) the pair into $(dirname "$BINARY")/previous/ and run the restart again. Do not delete any .previous.* or .superseded.* directory.}"
 }
 
 # The restart stopped the instance and then could not take its backup. The backup
@@ -1277,6 +1560,9 @@ restart_recover() { # message
   [ -n "$RECOVER_BIN" ] && [ -x "$RECOVER_BIN" ] ||
     fail "the restart did not complete ($1); no proven copy of the previous executable exists, so nothing was started"
   BINARY=$RECOVER_BIN
+  # Recovery starts the executable that was running, not the requested target, so
+  # the target expectation does not apply to it, and its launch copy is checked afresh.
+  EXPECT_COMMIT= PREVALIDATED=0
   note "starting the captured previous executable $BINARY again; this restart wrote nothing, but the state was not verified"
   cmd_start
   fail "the restart did not complete ($1), but the instance was started again on the captured previous executable"
@@ -1295,6 +1581,10 @@ cmd_restart() {
   # A restart whose start could not succeed, or whose backup cannot be written,
   # must not stop the instance first.
   launch_gates
+  # The copy these gates validated is the one the start after the stop runs. A
+  # build promoted during the stop cannot replace it, and nothing is re-checked
+  # against a path that may have changed.
+  PREVALIDATED=1
   precheck_backup_room
   capture_running_executable
   note "controlled restart of pid $pid on $ENDPOINT"
@@ -1471,7 +1761,7 @@ resolve_cli
 cli_state
 
 case $verb in
-  start | run | stop | restart) lifecycle_lock ;;
+  start | run | stop | restart | adopt) lifecycle_lock ;;
 esac
 
 case $verb in
@@ -1482,4 +1772,5 @@ case $verb in
   restart) cmd_restart ;;
   status) cmd_status ;;
   verify) cmd_verify ;;
+  adopt) cmd_adopt ;;
 esac

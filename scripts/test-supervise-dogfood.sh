@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=145
+EXPECTED_TOTAL=198
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -118,6 +118,9 @@ cleanup_all() {
   for rec in "${foreign_pids[@]+"${foreign_pids[@]}"}"; do
     signal_owned KILL "$rec" || true
   done
+  # A launch copy is left read-only when its launch never reaches the exec path
+  # of the supervisor; restore the owner's write bit so the tree can be removed.
+  chmod -R u+w "$work" 2>/dev/null
   rm -rf "$work"
 }
 
@@ -259,6 +262,8 @@ printf test >"$repo/provenance.txt"
 git -C "$repo" add provenance.txt
 git -C "$repo" commit -q -m provenance
 commit_id=$(git -C "$repo" rev-parse HEAD)
+# The sidecar names the commit the stub was "built" from, as the build script's does.
+printf "commit=%s\ndirty=no\n" "$commit_id" >>"$bin_dir/slashit-ui.frontend"
 
 # Application state that a restart must preserve.
 printf 'settings v1\n' >"$state/config/slashit-app/settings.toml"
@@ -267,6 +272,14 @@ printf 'transcript\n' >"$state/data/slashit-app/logs/agent.txt"
 printf 'helper log\n' >"$state/data/slashit-app/pr-helper-logs/helper.txt"
 printf 'ended\n' >"$state/data/slashit-app/terminal_sessions.toml"
 printf 'uncommitted checkout content\n' >"$state/data/slashit-app/worktrees/task.txt"
+stub_sha=$(sha256sum <"$bin_dir/slashit-ui" | cut -d' ' -f1)
+# The fixture state exists, so it carries a writer record naming the stub
+# build, as an installation adopted by the operator would.
+seed_writer() { # BASE
+  mkdir -p "$1/supervisor"
+  printf 'commit=%s\nsha256=%s\nprovenance=verified-sidecar\n' "$commit_id" "$stub_sha" >"$1/supervisor/state-writer"
+}
+seed_writer "$state"
 
 BASEENV=(
   SLASHIT_TEST_STUB_DIR="$stub_dir"
@@ -392,8 +405,8 @@ fi
 
 echo "== env"
 out=$(sv env 2>&1)
-if [ "$out" = "$(printf 'STATE_BASE       %s\nXDG_CONFIG_HOME  %s/config\nXDG_DATA_HOME    %s/data\nXDG_CACHE_HOME   %s/cache\nXDG_STATE_HOME   %s\nXDG_RUNTIME_DIR  %s\nGH_CONFIG_DIR    %s\nBINARY           %s\nCLI              %s\nSOCKET           %s\nENDPOINT         unix:%s\n' \
-  "$state" "$state" "$state" "$state" "$state" "$runtime" "$HOME/.config/gh" "$bin_dir/slashit-ui" "$stub_dir/slashit" "$socket" "$socket")" ]; then
+if [ "$out" = "$(printf 'STATE_BASE       %s\nXDG_CONFIG_HOME  %s/config\nXDG_DATA_HOME    %s/data\nXDG_CACHE_HOME   %s/cache\nXDG_STATE_HOME   %s\nXDG_RUNTIME_DIR  %s\nGH_CONFIG_DIR    %s\nBINARY           %s\nCLI              %s\nSOCKET           %s\nENDPOINT         unix:%s\nSTATE_WRITER     %s/supervisor/state-writer\n' \
+  "$state" "$state" "$state" "$state" "$state" "$runtime" "$HOME/.config/gh" "$bin_dir/slashit-ui" "$stub_dir/slashit" "$socket" "$socket" "$state")" ]; then
   ok "env prints the whole declared environment"
 else
   bad "env output does not match the declaration"; printf '%s\n' "$out" >&2
@@ -676,6 +689,8 @@ running_exe() { # the script the running stub instance was exec'd from
   local pid; pid=$(stub_pid); [ -n "$pid" ] || return 1
   tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | sed -n 2p
 }
+# The sha256 the launch record captured for the running instance (the copy it execs).
+record_sha() { awk -F '\t' '$1 == "sha256" { print $2 }' "$state/supervisor/instance" 2>/dev/null; }
 
 echo "== a backup that fails after the stop starts the captured executable again, over unchanged state"
 sv verify >/dev/null 2>&1 || sv start >/dev/null 2>&1 || bad "post-stop fixture: start failed"
@@ -686,8 +701,8 @@ unblock_backup
 exe=$(running_exe); new_pid=$(stub_pid)
 if [ "$st" -eq 1 ] && [ "$blocked" = yes ] && [[ "$out" == *"captured previous executable"* ]] &&
   [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] && sv verify >/dev/null 2>&1 &&
-  [ "$exe" = "$state/supervisor/recover/slashit-ui" ] &&
-  cmp -s "$exe" "$bin_dir/slashit-ui" && [ "$sums_before" = "$(state_sums)" ] && [ "$(backup_count)" = "$n_before" ]; then
+  [[ "$exe" == "$state/supervisor/launch."*/slashit-ui ]] && [ "$(record_sha)" = "$stub_sha" ] &&
+  [ "$sums_before" = "$(state_sums)" ] && [ "$(backup_count)" = "$n_before" ]; then
   ok "a backup blocked after the stop (a file in its place) restarts the captured copy, leaves the state checksums unchanged and keeps no partial backup"
 else
   bad "a backup failure after the stop did not recover as required (exit $st, blocked $blocked, exe '$exe')"; printf '%s\n' "$out" >&2
@@ -705,7 +720,7 @@ sv SLASHIT_DOGFOOD_BINARY="$sel/slashit-ui" start >/dev/null 2>&1 || bad "select
 # --version, but leaves a marker if it is ever started as the instance.
 { head -n 1 "$bin_dir/slashit-ui"; echo '[ "${1:-}" = --version ] || touch "$SLASHIT_TEST_STUB_DIR/new-build-ran"'; tail -n +2 "$bin_dir/slashit-ui"; } >"$sel/new"
 chmod +x "$sel/new"; touch -d '2000-01-01 00:00:00' "$sel/new"
-printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$(sha256sum <"$sel/new" | cut -d' ' -f1)" >"$sel/new.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$(sha256sum <"$sel/new" | cut -d' ' -f1)" "$commit_id" >"$sel/new.frontend"
 # As the build script does, the replaced pair is kept in previous/. The stub is a
 # script, so /proc/<pid>/exe names bash: the rollback copy is what proves out.
 mkdir -p "$sel/previous"; cp -p "$sel/slashit-ui" "$sel/slashit-ui.frontend" "$sel/previous/"
@@ -715,8 +730,8 @@ out=$(sv SLASHIT_DOGFOOD_BINARY="$sel/slashit-ui" SLASHIT_TEST_QUIT_BLOCK="$stat
 unblock_backup
 exe=$(running_exe)
 rec_bin=$(awk -F '\t' '$1 == "binary" { print $2 }' "$state/supervisor/instance" 2>/dev/null)
-if [ "$st" -eq 1 ] && [ "$exe" = "$state/supervisor/recover/slashit-ui" ] && [ "$rec_bin" = "$exe" ] &&
-  [ "$(sha256sum <"$exe" | cut -d' ' -f1)" = "$old_sha" ] && [ ! -e "$stub_dir/new-build-ran" ] &&
+if [ "$st" -eq 1 ] && [[ "$exe" == "$state/supervisor/launch."*/slashit-ui ]] && [ "$rec_bin" = "$state/supervisor/recover/slashit-ui" ] &&
+  [ "$(record_sha)" = "$old_sha" ] && [ ! -e "$stub_dir/new-build-ran" ] &&
   [ "$sums_before" = "$(state_sums)" ]; then
   ok "with a new build already promoted, recovery runs the captured old executable (sha256 proven) and never the new one"
 else
@@ -737,6 +752,39 @@ fi
 cleanup_instances
 rm -f "$state/supervisor/instance"
 
+echo "== a promotion whose backup retention failed refuses a restart before the stop"
+# The build script promoted a new pair, but keeping the replaced pair in previous/
+# failed: it sits only in .previous.*, so the rollback copy is not at previous/.
+ret=$repo/target/retained
+mkdir -p "$ret"
+cp "$bin_dir/slashit-ui" "$ret/slashit-ui"; touch -d '2000-01-01 00:00:00' "$ret/slashit-ui"
+cp "$bin_dir/slashit-ui.frontend" "$ret/slashit-ui.frontend"
+sv SLASHIT_DOGFOOD_BINARY="$ret/slashit-ui" start >/dev/null 2>&1 || bad "retention fixture: start failed"
+pre=$(stub_pid); writer_sum=$(sha256sum <"$state/supervisor/state-writer"); sums_before=$(state_sums)
+kept=$(mktemp -d "$ret/.previous.XXXXXX")
+cp -p "$ret/slashit-ui" "$ret/slashit-ui.frontend" "$kept/"
+old_ret_sha=$(sha256sum <"$kept/slashit-ui" | cut -d' ' -f1)
+{ cat "$ret/slashit-ui"; echo '# promoted build'; } >"$ret/new"; chmod +x "$ret/new"; touch -d '2000-01-01 00:00:00' "$ret/new"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$(sha256sum <"$ret/new" | cut -d' ' -f1)" "$commit_id" >"$ret/new.frontend"
+mv "$ret/new" "$ret/slashit-ui"; mv "$ret/new.frontend" "$ret/slashit-ui.frontend"
+new_ret_sha=$(sha256sum <"$ret/slashit-ui" | cut -d' ' -f1)
+out=$(sv SLASHIT_DOGFOOD_BINARY="$ret/slashit-ui" restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"cannot prove which executable"* ]] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null &&
+  [ "$(sha256sum <"$state/supervisor/state-writer")" = "$writer_sum" ] && [ "$sums_before" = "$(state_sums)" ] &&
+  [ "$(sha256sum <"$kept/slashit-ui" | cut -d' ' -f1)" = "$old_ret_sha" ] && [ "$(sha256sum <"$ret/slashit-ui" | cut -d' ' -f1)" = "$new_ret_sha" ] &&
+  [ ! -e "$ret/previous" ]; then
+  ok "a restart after a failed retention refuses before the stop; the instance, state writer, state and both binaries are unchanged"
+else
+  bad "a restart after a failed retention was not refused before the stop (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2
+fi
+if [[ "$out" == *"$kept"* ]] && [[ "$out" == *"Manual recovery"* ]] && [[ "$out" == *"not verified"* ]] && [[ "$out" == *"cp -p, never mv"* ]] && [[ "$out" == *"Do not delete"* ]]; then
+  ok "the refusal names the preserved copy and gives a manual recovery that verifies it first"
+else
+  bad "the refusal does not name the preserved copy or its safe manual recovery"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+rm -f "$state/supervisor/instance"
+
 echo "== a running embedded build with no matching frontend sidecar is not stopped"
 nos=$repo/target/nosidecar
 mkdir -p "$nos"
@@ -750,7 +798,7 @@ pre=$(stub_pid)
 mkdir -p "$nos/previous"; cp -p "$nos/slashit-ui" "$nos/previous/"
 { head -n 1 "$bin_dir/slashit-ui"; echo '# newer build'; tail -n +2 "$bin_dir/slashit-ui"; } >"$nos/new"
 chmod +x "$nos/new"; touch -d '2000-01-01 00:00:00' "$nos/new"
-printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$(sha256sum <"$nos/new" | cut -d' ' -f1)" >"$nos/slashit-ui.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$(sha256sum <"$nos/new" | cut -d' ' -f1)" "$commit_id" >"$nos/slashit-ui.frontend"
 mv "$nos/new" "$nos/slashit-ui"
 out=$(sv SLASHIT_DOGFOOD_BINARY="$nos/slashit-ui" restart 2>&1); st=$?
 if [ "$st" -eq 1 ] && [[ "$out" == *"no frontend sidecar matches"* ]] && [ -n "$pre" ] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null; then
@@ -758,8 +806,82 @@ if [ "$st" -eq 1 ] && [[ "$out" == *"no frontend sidecar matches"* ]] && [ -n "$
 else
   bad "a recovery copy without a frontend was not refused before the stop (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2
 fi
+# A dev server answering (curl reads a file: URL) no longer makes the copy
+# recoverable: without a sidecar it has no verified commit to start under.
+out=$(sv SLASHIT_DOGFOOD_BINARY="$nos/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="file://$nos/slashit-ui" restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"no frontend sidecar matches"* ]] && [ -n "$pre" ] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null; then
+  ok "a recovery copy without a sidecar is refused before the stop even when a dev server answers"
+else
+  bad "a sidecar-less recovery copy was accepted because a dev server answers (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2
+fi
 cleanup_instances
 rm -f "$state/supervisor/instance"
+
+echo "== the requested target is the build a launch runs (SLASHIT_DOGFOOD_EXPECT_COMMIT)"
+sv stop >/dev/null 2>&1; cleanup_instances
+seed_writer "$state"
+other=$(printf 'a%.0s' $(seq 40))
+writer_sum=$(sha256sum <"$state/supervisor/state-writer")
+out=$(sv SLASHIT_DOGFOOD_EXPECT_COMMIT="$other" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"not the requested target $other"* ]] && [ -z "$(stub_pid)" ] &&
+  [ "$(sha256sum <"$state/supervisor/state-writer")" = "$writer_sum" ]; then
+  ok "a start for another target is refused before anything is spawned; the state writer is unchanged"
+else bad "a start for another target was not refused before spawning (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(sv SLASHIT_DOGFOOD_EXPECT_COMMIT="$commit_id" start 2>&1); expect pass "a start for the build's own commit still succeeds" "$out" $?
+
+# A build promoted for another commit after the target was checked, but before the
+# restart's launch copy, must be refused while the running instance is still up.
+u=$(git -C "$repo" commit-tree "$(git -C "$repo" rev-parse "$commit_id^{tree}")" -p "$commit_id" -m "promoted build")
+pre=$(stub_pid)
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$stub_sha" "$u" >"$bin_dir/slashit-ui.frontend"
+out=$(sv SLASHIT_DOGFOOD_EXPECT_COMMIT="$commit_id" restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"not the requested target $commit_id"* ]] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null; then
+  ok "a restart whose launch copy is another commit is refused before the stop; the instance keeps running"
+else bad "a promoted build for another commit was not refused before the stop (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2; fi
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$stub_sha" "$commit_id" >"$bin_dir/slashit-ui.frontend"
+sv stop >/dev/null 2>&1; cleanup_instances
+
+echo "== a build promoted during a restart's stop cannot fail the restart"
+sv start >/dev/null 2>&1 || bad "stop-promotion fixture: start failed"
+promote=$work/promote-dirty.sh
+cat >"$promote" <<PROMOTE
+#!/usr/bin/env bash
+# Runs during the stop: promotes a build that a fresh launch would refuse (dirty source).
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=yes\n' "\$(sha256sum <"$bin_dir/slashit-ui" | cut -d' ' -f1)" "$commit_id" >"$bin_dir/slashit-ui.frontend"
+PROMOTE
+chmod +x "$promote"
+pre=$(stub_pid); sums_before=$(state_sums)
+out=$(sv SLASHIT_TEST_QUIT_RUN="$promote" restart 2>&1); st=$?
+post=$(stub_pid)
+if [ "$st" -eq 0 ] && [ -n "$post" ] && [ "$post" != "$pre" ] && [ "$(record_sha)" = "$stub_sha" ] && [ "$sums_before" = "$(state_sums)" ]; then
+  ok "a build promoted during the stop is not the one restarted: the validated copy starts, state unchanged"
+else bad "a promotion during the stop failed the restart (exit $st, pid '$pre' now '$post')"; printf '%s\n' "$out" >&2; fi
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$stub_sha" "$commit_id" >"$bin_dir/slashit-ui.frontend"
+sv stop >/dev/null 2>&1; cleanup_instances
+
+echo "== a recovery copy with incomplete provenance is refused before the stop"
+prov="$work/prov"
+mkdir -p "$prov/previous"
+cp "$bin_dir/slashit-ui" "$prov/slashit-ui"; touch -d '2000-01-01 00:00:00' "$prov/slashit-ui"
+old_sha=$(sha256sum <"$prov/slashit-ui" | cut -d' ' -f1)
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$old_sha" "$commit_id" >"$prov/slashit-ui.frontend"
+seed_writer "$state"
+sv SLASHIT_DOGFOOD_BINARY="$prov/slashit-ui" start >/dev/null 2>&1 || bad "provenance fixture: start failed"
+# The running copy is kept in previous/ with a dirty sidecar; the promoted build is clean.
+cp -p "$prov/slashit-ui" "$prov/previous/slashit-ui"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=yes\n' "$old_sha" "$commit_id" >"$prov/previous/slashit-ui.frontend"
+{ cat "$prov/slashit-ui"; echo '# promoted build'; } >"$prov/new"; chmod +x "$prov/new"; touch -d '2000-01-01 00:00:00' "$prov/new"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$(sha256sum <"$prov/new" | cut -d' ' -f1)" "$commit_id" >"$prov/new.frontend"
+mv "$prov/new" "$prov/slashit-ui"; mv "$prov/new.frontend" "$prov/slashit-ui.frontend"
+pre=$(stub_pid); sums_before=$(state_sums)
+# The backup is blocked, so a restart would stop the instance and then need the recovery copy.
+out=$(sv SLASHIT_DOGFOOD_BINARY="$prov/slashit-ui" SLASHIT_TEST_QUIT_BLOCK="$state/supervisor/backup" restart 2>&1); st=$?
+unblock_backup
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not name a verified clean commit"* ]] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null &&
+  [ "$sums_before" = "$(state_sums)" ]; then
+  ok "a recovery copy with a dirty sidecar is refused before the stop; the instance keeps running"
+else bad "an incomplete recovery copy was not refused before the stop (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2; fi
+sv stop >/dev/null 2>&1; cleanup_instances
 
 echo "== an empty required data root is backed up as an empty directory"
 aside=$work/data-aside
@@ -776,8 +898,184 @@ fi
 cleanup_instances
 rm -rf "$state/data/slashit-app"; mv "$aside/slashit-app" "$state/data/"
 rm -rf "$state/supervisor/backup/"*; rm -f "$state/supervisor/instance"
+echo "== the state-writer record refuses an older build, running or stopped"
+writer=$state/supervisor/state-writer
+sv start >/dev/null 2>&1 || bad "state-writer fixture: start failed"
+if grep -qx "commit=$commit_id" "$writer" && grep -qx "sha256=$(sha256sum <"$bin_dir/slashit-ui" | cut -d' ' -f1)" "$writer"; then
+  ok "a start records the commit and sha256 of the build it starts in the state-writer file"
+else bad "the state-writer file does not name the started build"; cat "$writer" >&2; fi
+cleanup_instances; rm -f "$state/supervisor/instance"
+# A newer build (a child commit) wrote this state; the instance is now stopped.
+printf 'newer\n' >"$repo/newer.txt"; git -C "$repo" add newer.txt; git -C "$repo" commit -q -m newer
+newer=$(git -C "$repo" rev-parse HEAD)
+printf 'commit=%s\nsha256=feed\nprovenance=verified-sidecar\n' "$newer" >"$writer"
+writer_sum=$(sha256sum <"$writer"); sums_before=$(state_sums)
+out=$(sv start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not provably descend from commit $newer"* ]] && [ -z "$(stub_pid)" ] &&
+  [ ! -e "$stub_dir/environ" ] && [ "$(sha256sum <"$writer")" = "$writer_sum" ] && [ "$sums_before" = "$(state_sums)" ]; then
+  ok "a stopped instance's state written by a newer commit refuses an older build: nothing runs, state and record unchanged"
+else bad "an older build was not refused over newer state (exit $st)"; printf '%s\n' "$out" >&2; fi
+# A JJ rewrite (squash, rebase, amend) also fails the descent rule; the refusal
+# names the file and the one condition under which removing it is safe.
+if [[ "$out" == *"remove $writer only if no newer build has written this state (verified by the owner)"* ]]; then
+  ok "the descent refusal names the state-writer file and when removing it is safe"
+else bad "the descent refusal gives no remedy naming $writer"; printf '%s\n' "$out" >&2; fi
+# The same build under its descendant commit is accepted and becomes the writer.
+fwd=$repo/target/forward
+git -C "$repo" commit -q --allow-empty -m newest; newest=$(git -C "$repo" rev-parse HEAD)
+mkdir -p "$fwd"; cp -p "$bin_dir/slashit-ui" "$fwd/slashit-ui"
+sed "s/^commit=.*/commit=$newest/" "$bin_dir/slashit-ui.frontend" >"$fwd/slashit-ui.frontend"
+out=$(sv SLASHIT_DOGFOOD_BINARY="$fwd/slashit-ui" start 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qx "commit=$newest" "$writer" && [ -n "$(stub_pid)" ]; then
+  ok "a build that descends from the state writer starts and becomes the new writer"
+else bad "a descendant build was refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+pre=$(stub_pid); sums_before=$(state_sums)
+out=$(sv restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not provably descend from commit $newest"* ]] && [ -n "$pre" ] &&
+  [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null && grep -qx "commit=$newest" "$writer" && [ "$sums_before" = "$(state_sums)" ]; then
+  ok "a restart onto an older build is refused before the stop; the newer instance keeps running and the state is unchanged"
+else bad "a restart onto an older build was not refused before the stop (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances; rm -f "$state/supervisor/instance" "$writer"
+rm -rf "$fwd"
+git -C "$repo" reset -q --hard "$commit_id"
+seed_writer "$state"
+
+echo "== state-writer provenance: fresh installs initialize, unknown writers fail closed until adopted"
+prov=$work/prov
+fresh_env=(SLASHIT_DOGFOOD_STATE="$prov")
+out=$(sv "${fresh_env[@]}" start 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qx "commit=$commit_id" "$prov/supervisor/state-writer" &&
+  grep -qx "sha256=$stub_sha" "$prov/supervisor/state-writer" &&
+  grep -qx provenance=verified-sidecar "$prov/supervisor/state-writer" && [ -n "$(stub_pid)" ]; then
+  ok "a first start on an empty state base initializes the writer record from the verified sidecar"
+else bad "a fresh installation did not initialize its writer (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances; rm -rf "$prov"
+# A build without a verified sidecar never gets a writer identity. The checkout
+# HEAD here is $commit_id, which an earlier version of the supervisor recorded.
+dev_dir=$repo/target/devprov
+mkdir -p "$dev_dir"; cp -p "$bin_dir/slashit-ui" "$dev_dir/"
+dev_env=(SLASHIT_DOGFOOD_BINARY="$dev_dir/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="file://$dev_dir/slashit-ui")
+out=$(sv "${fresh_env[@]}" "${dev_env[@]}" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"never taken as the commit of a built executable"* ]] &&
+  [ ! -e "$prov/supervisor/state-writer" ] && [ -z "$(stub_pid)" ]; then
+  ok "a fresh start of a build without a sidecar is refused and records no writer, not the checkout HEAD"
+else bad "a sidecar-less build initialized a fresh installation (exit $st)"; printf '%s\n' "$out" >&2; cat "$prov/supervisor/state-writer" >&2 2>/dev/null; fi
+cleanup_instances; rm -rf "$prov"
+# A sidecar that names no commit, or an unknown one, is no better.
+for c in '' unknown; do
+  mkdir -p "$dev_dir/nc"; cp -p "$bin_dir/slashit-ui" "$dev_dir/nc/"
+  printf 'mode=embedded\nsha256=%s\n%s\n' "$stub_sha" "${c:+commit=$c}" >"$dev_dir/nc/slashit-ui.frontend"
+  out=$(sv "${fresh_env[@]}" SLASHIT_DOGFOOD_BINARY="$dev_dir/nc/slashit-ui" start 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"has no verified sidecar naming its commit"* ]] && [ ! -e "$prov/supervisor/state-writer" ] && [ -z "$(stub_pid)" ]; then
+    ok "a sidecar with commit '${c:-<absent>}' is refused and records no writer"
+  else bad "a sidecar with commit '${c:-<absent>}' was accepted (exit $st)"; printf '%s\n' "$out" >&2; fi
+  cleanup_instances; rm -rf "$prov" "$dev_dir/nc"
+done
+# Existing state with a verified record: a sidecar-less build is refused and
+# the record is untouched (an earlier version rewrote it with the HEAD).
+seed_writer "$prov"; mkdir -p "$prov/config/slashit-app"; printf 'settings v1\n' >"$prov/config/slashit-app/settings.toml"
+rec_sum=$(sha256sum <"$prov/supervisor/state-writer")
+out=$(sv "${fresh_env[@]}" "${dev_env[@]}" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"never taken as the commit of a built executable"* ]] && [ -z "$(stub_pid)" ] &&
+  [ "$(sha256sum <"$prov/supervisor/state-writer")" = "$rec_sum" ]; then
+  ok "a build without a sidecar is refused over recorded state; the record is unchanged"
+else bad "a sidecar-less build launched over recorded state (exit $st)"; printf '%s\n' "$out" >&2; fi
+expect fail "run of a build without a sidecar is refused the same way" \
+  "$(sv "${fresh_env[@]}" "${dev_env[@]}" run 2>&1)" $? "never taken as the commit of a built executable"
+cleanup_instances; rm -rf "$prov"
+# Existing state, writer record missing, instance stopped: an older executable.
+mkdir -p "$prov/config/slashit-app" "$prov/data/slashit-app"
+printf 'settings v1\n' >"$prov/config/slashit-app/settings.toml"
+printf 'session 7\n' >"$prov/data/slashit-app/board.toml"
+old_dir=$repo/target/older
+mkdir -p "$old_dir"; cp -p "$bin_dir/slashit-ui" "$bin_dir/slashit-ui.frontend" "$old_dir/"
+out=$(sv "${fresh_env[@]}" SLASHIT_DOGFOOD_BINARY="$old_dir/slashit-ui" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"state-writer is missing"* ]] && [[ "$out" == *"adopt COMMIT SHA256"* ]] &&
+  [ -z "$(stub_pid)" ] && [ ! -e "$prov/supervisor/state-writer" ]; then
+  ok "a stopped installation whose state has no writer record refuses an arbitrary executable and names adopt"
+else bad "existing state without a writer record was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+expect fail "run is refused the same way" "$(sv "${fresh_env[@]}" run 2>&1)" $? "state-writer is missing"
+bad_sha=$(printf '%064d' 0)
+expect fail "adoption with a sha256 that is not the installed binary's is refused" \
+  "$(sv "${fresh_env[@]}" adopt "$commit_id" "$bad_sha" 2>&1)" $? "not the stated $bad_sha"
+expect fail "adoption with a commit the sidecar does not name is refused" \
+  "$(sv "${fresh_env[@]}" adopt "$(printf '%040d' 0)" "$stub_sha" 2>&1)" $? "provenance does not match"
+expect fail "adoption with a malformed commit is refused" \
+  "$(sv "${fresh_env[@]}" adopt HEAD "$stub_sha" 2>&1)" $? "COMMIT must be"
+# A development build has no sidecar: its commit would come from a checkout
+# HEAD, which adoption never trusts. Nor a sidecar recorded for another binary.
+expect fail "adoption of a binary without a verified sidecar never falls back to the checkout HEAD" \
+  "$(sv "${fresh_env[@]}" SLASHIT_DOGFOOD_BINARY="$dev_dir/slashit-ui" adopt "$commit_id" "$stub_sha" 2>&1)" $? "never infers it from a checkout HEAD"
+printf 'mode=embedded\nsha256=%s\ncommit=%s\n' "$bad_sha" "$commit_id" >"$dev_dir/slashit-ui.frontend"
+expect fail "adoption of a binary whose sidecar names another sha256 is refused" \
+  "$(sv "${fresh_env[@]}" SLASHIT_DOGFOOD_BINARY="$dev_dir/slashit-ui" adopt "$commit_id" "$stub_sha" 2>&1)" $? "never infers it from a checkout HEAD"
+rm -f "$dev_dir/slashit-ui.frontend"
+[ ! -e "$prov/supervisor/state-writer" ] && ok "the refused adoptions wrote no record" || bad "a refused adoption wrote a record"
+expect fail "adoption on an empty state base is refused: a fresh install needs none" \
+  "$(sv SLASHIT_DOGFOOD_STATE="$work/prov-empty" adopt "$commit_id" "$stub_sha" 2>&1)" $? "no persistent state"
+# Crash at the commit boundary: a shim ln fails, then one kills the supervisor.
+shim=$work/shim-ln
+mkdir -p "$shim"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$shim/ln"; chmod +x "$shim/ln"
+out=$(sv "${fresh_env[@]}" PATH="$shim:$PATH" adopt "$commit_id" "$stub_sha" 2>&1); st=$?
+if [ "$st" -eq 1 ] && [ ! -e "$prov/supervisor/state-writer" ]; then
+  ok "a failed link at the adoption boundary leaves no record"
+else bad "a failed adoption left a record or succeeded (exit $st)"; printf '%s\n' "$out" >&2; fi
+printf '#!/usr/bin/env bash\nkill -9 "$PPID"\nexit 1\n' >"$shim/ln"
+sv "${fresh_env[@]}" PATH="$shim:$PATH" adopt "$commit_id" "$stub_sha" >/dev/null 2>&1; st=$?
+if [ "$st" -ne 0 ] && [ ! -e "$prov/supervisor/state-writer" ]; then
+  ok "a supervisor killed at the adoption boundary leaves no record (a stray temp file at most)"
+else bad "a killed adoption left a record (exit $st)"; fi
+expect fail "after the crash the state is still refused" "$(sv "${fresh_env[@]}" start 2>&1)" $? "state-writer is missing"
+out=$(sv "${fresh_env[@]}" adopt "$commit_id" "$stub_sha" 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qx "commit=$commit_id" "$prov/supervisor/state-writer" &&
+  grep -qx "sha256=$stub_sha" "$prov/supervisor/state-writer" && grep -qx adopted=1 "$prov/supervisor/state-writer" &&
+  grep -qx provenance=verified-sidecar "$prov/supervisor/state-writer"; then
+  ok "adoption with the verified executable's commit and sha256 writes a complete record"
+else bad "adoption of the verified executable failed (exit $st)"; printf '%s\n' "$out" >&2; fi
+rec_sum=$(sha256sum <"$prov/supervisor/state-writer")
+expect pass "repeating the same adoption is a no-op" "$(sv "${fresh_env[@]}" adopt "$commit_id" "$stub_sha" 2>&1)" $?
+expect fail "a different adoption never replaces an existing record" \
+  "$(sv "${fresh_env[@]}" adopt "$commit_id" "$bad_sha" 2>&1)" $? "never replaces a record"
+[ "$(sha256sum <"$prov/supervisor/state-writer")" = "$rec_sum" ] && ok "the record is byte-identical after the repeated adoptions" ||
+  bad "a repeated adoption changed the record"
+expect pass "the adopted build starts" "$(sv "${fresh_env[@]}" start 2>&1)" $?
+cleanup_instances; rm -f "$prov/supervisor/instance"
+# A record without the provenance mark (written by an earlier supervisor, which
+# took a checkout HEAD for a build without a sidecar) is not evidence.
+printf 'newer\n' >"$repo/newer.txt"; git -C "$repo" add newer.txt; git -C "$repo" commit -q -m newer
+newer=$(git -C "$repo" rev-parse HEAD); git -C "$repo" reset -q --hard "$commit_id"
+printf 'commit=%s\nsha256=%s\n' "$commit_id" "$stub_sha" >"$prov/supervisor/state-writer"
+out=$(sv "${fresh_env[@]}" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"not that it came from a verified sidecar"* ]] && [[ "$out" == *"adopt COMMIT SHA256"* ]] && [ -z "$(stub_pid)" ]; then
+  ok "a record without the provenance mark is refused on launch, even when it names the build's own commit"
+else bad "an unmarked record was accepted (exit $st)"; printf '%s\n' "$out" >&2; fi
+# Adoption over an unmarked record keeps the downgrade check: it names a newer
+# commit, and the stub's commit does not descend from it.
+printf 'commit=%s\nsha256=feed\n' "$newer" >"$prov/supervisor/state-writer"
+rec_sum=$(sha256sum <"$prov/supervisor/state-writer")
+expect fail "adoption over an unmarked record naming a newer commit is refused" \
+  "$(sv "${fresh_env[@]}" adopt "$commit_id" "$stub_sha" 2>&1)" $? "never hands state to an older build"
+[ "$(sha256sum <"$prov/supervisor/state-writer")" = "$rec_sum" ] && ok "the refused adoption left the unmarked record unchanged" ||
+  bad "a refused adoption changed the unmarked record"
+printf 'commit=%s\nsha256=%s\n' "$commit_id" "$stub_sha" >"$prov/supervisor/state-writer"
+out=$(sv "${fresh_env[@]}" adopt "$commit_id" "$stub_sha" 2>&1); st=$?
+if [ "$st" -eq 0 ] && grep -qx provenance=verified-sidecar "$prov/supervisor/state-writer" && grep -qx "commit=$commit_id" "$prov/supervisor/state-writer"; then
+  ok "adoption by the verified build replaces an unmarked record naming its own commit"
+else bad "adoption over an unmarked record failed (exit $st)"; printf '%s\n' "$out" >&2; fi
+rec_sum=$(sha256sum <"$prov/supervisor/state-writer")
+expect pass "repeating that adoption is a no-op" "$(sv "${fresh_env[@]}" adopt "$commit_id" "$stub_sha" 2>&1)" $?
+[ "$(sha256sum <"$prov/supervisor/state-writer")" = "$rec_sum" ] && ok "the replaced record is unchanged by the repeat" ||
+  bad "a repeated adoption changed the replaced record"
+# A recorded writer the executable does not match (unrelated commit) is refused.
+printf 'commit=%s\nsha256=%s\nprovenance=verified-sidecar\n' "$(printf '%040d' 1)" "$stub_sha" >"$prov/supervisor/state-writer"
+expect fail "a recorded writer that the executable does not descend from is refused" \
+  "$(sv "${fresh_env[@]}" start 2>&1)" $? "does not provably descend"
+cleanup_instances; rm -rf "$prov" "$work/prov-empty" "$shim" "$old_dir" "$dev_dir"
+
 echo "== frontend mode: an embedded build needs no server; a development build needs its dev server"
-fe=$work/frontend
+# Inside the git checkout, so a development build (no sidecar) still has a commit.
+fe=$repo/target/frontend
 mkdir -p "$fe"
 cp "$bin_dir/slashit-ui" "$fe/slashit-ui"
 # Backdate the fixture binary: the stale-instance check compares whole-second
@@ -786,13 +1084,27 @@ cp "$bin_dir/slashit-ui" "$fe/slashit-ui"
 touch -d '2000-01-01 00:00:00' "$fe/slashit-ui"
 fe_sha=$(sha256sum "$fe/slashit-ui" | cut -d' ' -f1)
 fe_dead=http://127.0.0.1:9/
-printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\n' "$fe_sha" >"$fe/slashit-ui.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=no\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
 
 out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start 2>&1)
 expect pass "an embedded build starts with no dev server answering" "$out" $?
 out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" verify 2>&1); st=$?
 if [ "$st" -eq 0 ] && [[ "$out" == *"frontend:       embedded in the binary"* ]]; then ok "verify reports the embedded frontend, not a server"
 else bad "verify did not report the embedded frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# A sidecar from a dirty source names a commit that does not hold what was built:
+# refused even with a matching sha256, so it can never become the state writer. The
+# instance is stopped first, so the refusal can only come from the dirty gate, not
+# from "already answers". The writer checked is the one the supervisor really uses.
+sv stop >/dev/null 2>&1
+writer_sum=$(sha256sum <"$state/supervisor/state-writer")
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=yes\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
+out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"built from a dirty source (dirty=yes"* ]] && [ -z "$(stub_pid)" ] &&
+  [ "$(sha256sum <"$state/supervisor/state-writer")" = "$writer_sum" ]; then
+  ok "a sidecar with dirty=yes is refused for its dirty source, starts nothing, and leaves the state writer unchanged"
+else bad "a dirty sidecar was not refused for dirty provenance (exit $st)"; printf '%s\n' "$out" >&2; fi
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=no\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
 cleanup_instances
 
 printf 'mode=embedded\nsha256=0000000000000000000000000000000000000000000000000000000000000000\n' >"$fe/slashit-ui.frontend"
@@ -806,7 +1118,7 @@ expect fail "a development build without its dev server is refused, not started 
 cleanup_instances
 # A running instance whose frontend record is then lost (a development build
 # now, with no server) must be reported as degraded, not healthy.
-printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\n' "$fe_sha" >"$fe/slashit-ui.frontend"
+printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=no\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
 sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" start >/dev/null 2>&1 || bad "degraded-verify fixture: start failed"
 rm -f "$fe/slashit-ui.frontend"
 out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_dead" verify 2>&1); st=$?
@@ -833,7 +1145,11 @@ if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
   fi
   if [ "$fe_ready" = 1 ]; then
     out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" start 2>&1)
-    expect pass "a development build starts once its dev server answers" "$out" $?
+    expect fail "a development build is refused even when its dev server answers: it has no verified commit" "$out" $? "never taken as the commit of a built executable"
+    # A running instance that lost its sidecar is reported against the dev server.
+    printf 'mode=embedded\nsha256=%s\nwasm=x_bg.wasm\ncommit=%s\ndirty=no\n' "$fe_sha" "$commit_id" >"$fe/slashit-ui.frontend"
+    sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" start >/dev/null 2>&1 || bad "ready-dev-server fixture: start failed"
+    rm -f "$fe/slashit-ui.frontend"
     out=$(sv SLASHIT_DOGFOOD_BINARY="$fe/slashit-ui" SLASHIT_DOGFOOD_DEV_URL="$fe_url" verify 2>&1)
     st=$?
     if [ "$st" -eq 0 ] && [[ "$out" == *"development server answers"* ]]; then ok "verify reports a ready dev server"
@@ -875,6 +1191,7 @@ make_state() {
   printf 'session 7\n' >"$1/data/slashit-app/board.toml"
   printf 'transcript\n' >"$1/data/slashit-app/logs/agent.txt"
   printf 'uncommitted\n' >"$1/data/slashit-app/worktrees/task.txt"
+  seed_writer "$1"
 }
 
 echo "== default discovery: no explicit binary or CLI, inside a git checkout"
@@ -920,6 +1237,7 @@ empty=$work/empty-state
 mkdir -p "$empty/config" "$empty/data/slashit-app/logs" "$empty/data/slashit-app/worktrees"
 printf 'log\n' >"$empty/data/slashit-app/logs/agent.txt"
 printf 'wt\n' >"$empty/data/slashit-app/worktrees/task.txt"
+seed_writer "$empty"
 out=$(sv SLASHIT_DOGFOOD_STATE="$empty" start 2>&1); st=$?
 [ "$st" -eq 0 ] || { bad "empty-set fixture: start failed (exit $st)"; printf '%s\n' "$out" >&2; }
 out=$(sv SLASHIT_DOGFOOD_STATE="$empty" restart 2>&1); st=$?
@@ -1795,6 +2113,112 @@ if [ "$st" -eq 0 ] && grep -qxF "STATE_BASE       $state" <<<"$out"; then
   ok "a trailing slash on the isolated state base is kept, in normalized form"
 else
   bad "a trailing slash on the isolated state base was not normalized (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+echo "== launch copy: what runs is the copy that was checked"
+# A verified start executes a private copy whose sha256 is the proven one, and
+# the copy is removed once the start is verified.
+cleanup_instances
+out=$(sv start 2>&1); st=$?
+if [ "$st" -eq 0 ] && [ "$(record_sha)" = "$stub_sha" ] && ! compgen -G "$state/supervisor/launch.*" >/dev/null; then
+  ok "a verified start executes a copy with the proven sha256 and removes the copy once verified"
+else
+  bad "a verified start did not execute a proven copy (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+
+# The publisher and torn-copy stand-in: a `cp` shim that runs the real copy and
+# then acts once (FAULT_FLAG) on the supervisor's copy of the source binary.
+fault_shim=$work/shim-fault
+mkdir -p "$fault_shim"
+cat >"$fault_shim/cp" <<'SHIM'
+#!/usr/bin/env bash
+/usr/bin/cp "$@" || exit $?
+[ -n "${FAULT_MODE:-}" ] && [ ! -e "$FAULT_FLAG" ] && [ "${1:-}" = -- ] && [ "${2:-}" = "$FAULT_SRC" ] || exit 0
+: >"$FAULT_FLAG"
+case $FAULT_MODE in
+  swap) /usr/bin/cp -- "$FAULT_NEW" "$FAULT_SRC.next" && /usr/bin/mv -f -T "$FAULT_SRC.next" "$FAULT_SRC" ;;
+  corrupt) printf 'torn\n' >>"$3" ;;
+esac
+exit 0
+SHIM
+chmod +x "$fault_shim/cp"
+cp -p "$bin_dir/slashit-ui" "$work/slashit-ui.orig"
+cp -p "$bin_dir/slashit-ui.frontend" "$work/slashit-ui.frontend.orig"
+restore_stub() {
+  cp -p "$work/slashit-ui.orig" "$bin_dir/slashit-ui"
+  cp -p "$work/slashit-ui.frontend.orig" "$bin_dir/slashit-ui.frontend"
+}
+
+# A build promoted over the source after its copy is not the one started.
+printf '%s\n' '#!/usr/bin/env bash' '[ "${1:-}" = --version ] && { echo "slashit-ui 9.9.9-promoted"; exit 0; }' \
+  'touch "$SLASHIT_TEST_STUB_DIR/promoted-ran"' 'exit 1' >"$work/promoted-build"
+chmod +x "$work/promoted-build"
+rm -f "$stub_dir/promoted-ran"
+out=$(sv PATH="$fault_shim:$PATH" FAULT_MODE=swap FAULT_SRC="$bin_dir/slashit-ui" FAULT_NEW="$work/promoted-build" \
+  FAULT_FLAG="$work/fault-swap" start 2>&1); st=$?
+cleanup_instances
+if [ "$st" -eq 0 ] && [ -e "$work/fault-swap" ] && cmp -s "$bin_dir/slashit-ui" "$work/promoted-build" &&
+  [ "$(record_sha)" = "$stub_sha" ] && [ ! -e "$stub_dir/promoted-ran" ]; then
+  ok "a build promoted over the source after its copy never runs; the copied, checked build starts"
+else
+  bad "a promoted build replaced the checked copy (exit $st)"; printf '%s\n' "$out" >&2
+fi
+restore_stub
+
+# A copy whose bytes differ from the sidecar's sha256 is refused, and no copy is kept.
+out=$(sv PATH="$fault_shim:$PATH" FAULT_MODE=corrupt FAULT_SRC="$bin_dir/slashit-ui" FAULT_FLAG="$work/fault-corrupt" start 2>&1); st=$?
+[ -e "$work/fault-corrupt" ] || bad "the corrupt-copy fault did not fire"
+expect fail "a torn launch copy is refused against its sidecar" "$out" $st "does not match the binary's sha256"
+if ! compgen -G "$state/supervisor/launch.*" >/dev/null; then
+  ok "a refused launch removes its copy"
+else
+  bad "a refused launch left a copy behind"
+fi
+
+# A build with no frontend sidecar, and a dirty build, are refused before any start.
+mv "$bin_dir/slashit-ui.frontend" "$work/sidecar.aside"
+out=$(sv start 2>&1); st=$?
+cp -p "$work/sidecar.aside" "$bin_dir/slashit-ui.frontend"
+expect fail "a build without its frontend sidecar is refused" "$out" $st "development build"
+sed -i 's/^dirty=no$/dirty=yes/' "$bin_dir/slashit-ui.frontend"
+out=$(sv start 2>&1); st=$?
+restore_stub
+expect fail "a dirty build cannot become the state writer" "$out" $st "built from a dirty source (dirty=yes"
+if ! compgen -G "$state/supervisor/launch.*" >/dev/null; then
+  ok "refused dirty and sidecar-less launches leave no copy"
+else
+  bad "a refused launch left a copy behind after the sidecar cases"
+fi
+
+# A failure before the exec never promotes the writer: an unchanged writer
+# record and no prepared temporary file are the evidence.
+writer="$state/supervisor/state-writer"
+setsid_shim=$work/shim-setsid
+mkdir -p "$setsid_shim"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$setsid_shim/setsid"
+chmod +x "$setsid_shim/setsid"
+writer_before=$(cat "$writer")
+out=$(sv PATH="$setsid_shim:$PATH" start 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"setsid failed"* ]] && [ "$(cat "$writer")" = "$writer_before" ] &&
+  ! compgen -G "$writer.tmp.*" >/dev/null && ! compgen -G "$state/supervisor/launch.*" >/dev/null; then
+  ok "a start whose spawn fails before any child leaves the writer and its temporary file unchanged"
+else
+  bad "a failed spawn changed the writer or left files (exit $st)"; printf '%s\n' "$out" >&2
+fi
+
+# A child that cannot promote the writer dies before its exec; the writer stays.
+mv_shim=$work/shim-mv
+mkdir -p "$mv_shim"
+printf '%s\n' '#!/usr/bin/env bash' 'case " $* " in *" $SHIM_WRITER "*) exit 1 ;; esac' 'exec /usr/bin/mv "$@"' >"$mv_shim/mv"
+chmod +x "$mv_shim/mv"
+writer_before=$(cat "$writer")
+out=$(sv PATH="$mv_shim:$PATH" SHIM_WRITER="$writer" start 2>&1); st=$?
+cleanup_instances
+if [ "$st" -eq 1 ] && [ "$(cat "$writer")" = "$writer_before" ] && ! compgen -G "$writer.tmp.*" >/dev/null; then
+  ok "a child that fails before its exec leaves the writer unchanged and removes its prepared record"
+else
+  bad "a child that failed before its exec changed the writer or left files (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
 echo
