@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=196
+EXPECTED_TOTAL=198
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -748,6 +748,39 @@ if [ "$st" -eq 1 ] && [[ "$out" == *"cannot prove which executable"* ]] && [ "$(
   ok "a restart that cannot prove the running executable refuses before the stop; the instance keeps running"
 else
   bad "an unprovable running executable was not refused before the stop (exit $st)"; printf '%s\n' "$out" >&2
+fi
+cleanup_instances
+rm -f "$state/supervisor/instance"
+
+echo "== a promotion whose backup retention failed refuses a restart before the stop"
+# The build script promoted a new pair, but keeping the replaced pair in previous/
+# failed: it sits only in .previous.*, so the rollback copy is not at previous/.
+ret=$repo/target/retained
+mkdir -p "$ret"
+cp "$bin_dir/slashit-ui" "$ret/slashit-ui"; touch -d '2000-01-01 00:00:00' "$ret/slashit-ui"
+cp "$bin_dir/slashit-ui.frontend" "$ret/slashit-ui.frontend"
+sv SLASHIT_DOGFOOD_BINARY="$ret/slashit-ui" start >/dev/null 2>&1 || bad "retention fixture: start failed"
+pre=$(stub_pid); writer_sum=$(sha256sum <"$state/supervisor/state-writer"); sums_before=$(state_sums)
+kept=$(mktemp -d "$ret/.previous.XXXXXX")
+cp -p "$ret/slashit-ui" "$ret/slashit-ui.frontend" "$kept/"
+old_ret_sha=$(sha256sum <"$kept/slashit-ui" | cut -d' ' -f1)
+{ cat "$ret/slashit-ui"; echo '# promoted build'; } >"$ret/new"; chmod +x "$ret/new"; touch -d '2000-01-01 00:00:00' "$ret/new"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$(sha256sum <"$ret/new" | cut -d' ' -f1)" "$commit_id" >"$ret/new.frontend"
+mv "$ret/new" "$ret/slashit-ui"; mv "$ret/new.frontend" "$ret/slashit-ui.frontend"
+new_ret_sha=$(sha256sum <"$ret/slashit-ui" | cut -d' ' -f1)
+out=$(sv SLASHIT_DOGFOOD_BINARY="$ret/slashit-ui" restart 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"cannot prove which executable"* ]] && [ "$(stub_pid)" = "$pre" ] && kill -0 "$pre" 2>/dev/null &&
+  [ "$(sha256sum <"$state/supervisor/state-writer")" = "$writer_sum" ] && [ "$sums_before" = "$(state_sums)" ] &&
+  [ "$(sha256sum <"$kept/slashit-ui" | cut -d' ' -f1)" = "$old_ret_sha" ] && [ "$(sha256sum <"$ret/slashit-ui" | cut -d' ' -f1)" = "$new_ret_sha" ] &&
+  [ ! -e "$ret/previous" ]; then
+  ok "a restart after a failed retention refuses before the stop; the instance, state writer, state and both binaries are unchanged"
+else
+  bad "a restart after a failed retention was not refused before the stop (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2
+fi
+if [[ "$out" == *"$kept"* ]] && [[ "$out" == *"Manual recovery"* ]] && [[ "$out" == *"not verified"* ]] && [[ "$out" == *"cp -p, never mv"* ]] && [[ "$out" == *"Do not delete"* ]]; then
+  ok "the refusal names the preserved copy and gives a manual recovery that verifies it first"
+else
+  bad "the refusal does not name the preserved copy or its safe manual recovery"; printf '%s\n' "$out" >&2
 fi
 cleanup_instances
 rm -f "$state/supervisor/instance"

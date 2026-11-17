@@ -1541,7 +1541,11 @@ capture_running_executable() {
     return 0
   done
   rm -f "$tmp"
-  refuse "cannot prove which executable pid $TARGET_PID is running${want:+ (launch sha256 $want)}, so a failed restart could not recover it; the instance was not stopped"
+  # A build promotion whose backup retention failed leaves the replaced pair only in
+  # .previous.*: name it, but never use it unverified (the operator checks it first).
+  local kept
+  kept=$(compgen -G "$(dirname "$BINARY")/.previous.*" | tr '\n' ' ') || kept=
+  refuse "cannot prove which executable pid $TARGET_PID is running${want:+ (launch sha256 $want)}, so a failed restart could not start it again; the instance was not stopped and keeps running.${kept:+ A build promotion left a replaced executable under ${kept% } that was not verified and is not used automatically. Manual recovery, with the instance still running: check that its slashit-ui hashes to ${want:-the sha256 the launch record captured} and that its slashit-ui.frontend names the commit the state writer records; only then copy (cp -p, never mv) the pair into $(dirname "$BINARY")/previous/ and run the restart again. Do not delete any .previous.* or .superseded.* directory.}"
 }
 
 # The restart stopped the instance and then could not take its backup. The backup
