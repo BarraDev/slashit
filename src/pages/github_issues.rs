@@ -93,6 +93,11 @@ fn shown_mode(chosen: LinkMode, already_linked: bool) -> LinkMode {
     }
 }
 
+/// The Issue numbered `number` in the listing the page shows, as it is now.
+fn issue_record(list: &[GithubIssue], number: i32) -> Option<&GithubIssue> {
+    list.iter().find(|i| i.number == number)
+}
+
 #[component]
 pub fn GithubIssues(project_id: String) -> impl IntoView {
     let initial_repo = get_persisted_repo();
@@ -497,12 +502,11 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                         <div class="flex-1 overflow-y-auto p-2 space-y-2">
                             <For
                                 each=move || issues.get()
-                                key=|issue| format!("{}:{}:{}", issue.number, issue.state, issue.updated_at.timestamp_millis())
+                                key=|issue| issue.number
                                 children=move |issue: GithubIssue| {
                                     let number = issue.number;
-                                    let state_class = state_badge_class(&issue.state);
-                                    let time_str = format_relative_time(&issue.created_at);
-                                    let assignees = issue.assignees.iter().map(|a| a.login.clone()).collect::<Vec<_>>().join(", ");
+                                    // The row reads its record from the list, so a refreshed Issue updates in place.
+                                    let record = move || issues.with(|l| issue_record(l, number).cloned());
                                     view! {
                                         <button
                                             data-testid="issue-row"
@@ -516,6 +520,11 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                                 }
                                             )
                                         >
+                                            {move || record().map(|issue| {
+                                                let state_class = state_badge_class(&issue.state);
+                                                let time_str = format_relative_time(&issue.created_at);
+                                                let assignees = issue.assignees.iter().map(|a| a.login.clone()).collect::<Vec<_>>().join(", ");
+                                                view! {
                                             <div class="flex items-start gap-2">
                                                 <span class=format!("px-2 py-0.5 text-xs rounded {}", state_class)>
                                                     {issue.state.clone()}
@@ -537,6 +546,8 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                                     </span>
                                                 }).collect::<Vec<_>>()}
                                             </div>
+                                                }
+                                            })}
                                         </button>
                                     }
                                 }
@@ -556,6 +567,7 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                     render_safe_markdown(&issue.body)
                                 };
                                 let linked_list = move || linked_here(number);
+                                let linked_ids = move || linked_here(number).iter().map(|t| t.id).collect::<Vec<Uuid>>();
                                 let candidate_list = move || candidates(number);
                                 let url = issue_url(&shown_repo.get(), number);
                                 view! {
@@ -618,37 +630,38 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                                                 </div>
 
                                                 <div data-testid="issue-linked-tasks">
-                                                    {move || {
-                                                        let list = linked_list();
-                                                        if list.is_empty() {
-                                                            view! { <p class="text-sm text-white/40">"No Task in this Project links this Issue."</p> }.into_any()
-                                                        } else {
-                                                            view! {
-                                                                <div>
-                                                                    <p class="text-sm text-white/50 mb-2">"Already linked in this Project:"</p>
-                                                                    <ul class="space-y-1">
-                                                                        {list.iter().map(|task| {
-                                                                            let task_id = task.id;
-                                                                            view! {
-                                                                                <li class="flex flex-wrap items-center gap-2 text-sm text-white/80">
-                                                                                    <span>{task.title.clone()}</span>
-                                                                                    <span class="text-xs text-white/40">{status_label(&task.status)}</span>
-                                                                                    <button
-                                                                                        type="button"
-                                                                                        data-testid="issue-open-task"
-                                                                                        on:click=move |_| open_task(task_id)
-                                                                                        class="px-2 py-1 rounded-lg text-xs bg-white/5 text-white/80 hover:bg-white/10"
-                                                                                    >
-                                                                                        "Open Task"
-                                                                                    </button>
-                                                                                </li>
-                                                                            }
-                                                                        }).collect::<Vec<_>>()}
-                                                                    </ul>
-                                                                </div>
-                                                            }.into_any()
-                                                        }
-                                                    }}
+                                                    {move || linked_list().is_empty().then(|| view! {
+                                                        <p class="text-sm text-white/40">"No Task in this Project links this Issue."</p>
+                                                    })}
+                                                    {move || (!linked_list().is_empty()).then(|| view! {
+                                                        <p class="text-sm text-white/50 mb-2">"Already linked in this Project:"</p>
+                                                    })}
+                                                    // The list itself is never rebuilt; each row reads its Task from the list.
+                                                    <ul class="space-y-1">
+                                                        <For
+                                                            each=linked_ids
+                                                            key=|id| *id
+                                                            children=move |task_id: Uuid| {
+                                                                let record = move || tasks.with(|l| l.iter().find(|t| t.id == task_id).cloned());
+                                                                view! {
+                                                                    <li class="flex flex-wrap items-center gap-2 text-sm text-white/80">
+                                                                        {move || record().map(|task| view! {
+                                                                            <span>{task.title.clone()}</span>
+                                                                            <span class="text-xs text-white/40">{status_label(&task.status)}</span>
+                                                                        })}
+                                                                        <button
+                                                                            type="button"
+                                                                            data-testid="issue-open-task"
+                                                                            on:click=move |_| open_task(task_id)
+                                                                            class="px-2 py-1 rounded-lg text-xs bg-white/5 text-white/80 hover:bg-white/10"
+                                                                        >
+                                                                            "Open Task"
+                                                                        </button>
+                                                                    </li>
+                                                                }
+                                                            }
+                                                        />
+                                                    </ul>
                                                 </div>
 
                                                 <fieldset class="space-y-3" disabled=move || busy.get()>
@@ -851,5 +864,26 @@ mod tests {
         assert!(!html.contains("<img"));
         assert!(!html.contains("onerror"));
         assert!(!html.contains("javascript:"));
+    }
+
+    #[test]
+    fn a_row_reads_the_record_a_refresh_last_stored() {
+        let issue = |title: &str, state: &str| GithubIssue {
+            number: 7,
+            title: title.into(),
+            body: String::new(),
+            state: state.into(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            comments: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let before = vec![issue("Old title", "OPEN")];
+        assert_eq!(issue_record(&before, 7).map(|i| i.title.as_str()), Some("Old title"));
+        let after = vec![issue("New title", "CLOSED")];
+        let record = issue_record(&after, 7).expect("the Issue is still listed");
+        assert_eq!((record.title.as_str(), record.state.as_str()), ("New title", "CLOSED"));
+        assert!(issue_record(&after, 8).is_none());
     }
 }
