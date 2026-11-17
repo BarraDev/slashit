@@ -25,6 +25,7 @@ cleanup() {
 }
 trap cleanup EXIT
 real_mv=$(command -v mv)
+real_cp=$(command -v cp)
 pass=0
 fails=0
 ok() { pass=$((pass + 1)); echo "ok   $1"; }
@@ -91,6 +92,21 @@ fi
 exec "$REAL_MV" "$@"
 STUB
 chmod +x "$work/shim/mv"
+# A cp that, only in the run whose environment names $CP_GATE, pauses its first
+# copy into the journal's staging directory until $CP_GATE.go exists (at most
+# 20 s): that run holds its staging lock while a second run starts.
+cat >"$work/shim/cp" <<STUB
+#!/usr/bin/env bash
+case " \$* " in
+  *" .release-bump-journal.tmp/"*)
+    if [ -n "\${CP_GATE:-}" ]; then
+      : >"\$CP_GATE.paused"
+      for _ in \$(seq 200); do [ -e "\$CP_GATE.go" ] && break; sleep 0.1; done
+    fi ;;
+esac
+exec "$real_cp" "\$@"
+STUB
+chmod +x "$work/shim/cp"
 
 # A fixture repository at version $1, with a curated section for 0.0.4 and an
 # empty one for 0.0.5.
@@ -141,7 +157,7 @@ CL
 }
 
 digest() { # dir: every file's content, in order
-  (cd "$1" && find . -type f -print0 | sort -z | xargs -0 sha256sum)
+  (cd "$1" && find . -type f ! -name .release-bump.lock -print0 | sort -z | xargs -0 sha256sum)
 }
 
 repo=$work/repo
@@ -174,8 +190,8 @@ follow_instruction() { # path
 echo "== dry run is read-only and reports the bump"
 before=$(digest "$repo")
 out=$(run --dry-run 0.0.4); st=$?
-if [ "$st" -eq 0 ] && [[ "$out" == *"0.0.3 -> 0.0.4"* ]] && [ "$before" = "$(digest "$repo")" ]; then
-  ok "--dry-run reports the bump and changes nothing"
+if [ "$st" -eq 0 ] && [[ "$out" == *"0.0.3 -> 0.0.4"* ]] && [ "$before" = "$(digest "$repo")" ] && [ ! -e "$repo/.release-bump.lock" ]; then
+  ok "--dry-run reports the bump, changes nothing and creates no lock file"
 else bad "--dry-run did not behave read-only (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 echo "== apply rewrites every version and nothing else"
@@ -478,6 +494,10 @@ if [ "$st" -eq 1 ] && [[ "$out" == *"still holds"* ]] && [[ "$out" == *"nothing 
   [ "$held" = "$(digest "$repo")" ]; then
   ok "while the orphaned cargo runs, --recover refuses and the whole fixture digest is unchanged"
 else bad "--recover acted while the orphaned cargo was running (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(run --apply 0.0.4); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"holds"* ]] && [ "$held" = "$(digest "$repo")" ]; then
+  ok "while the orphaned cargo runs, a new --apply refuses and changes nothing"
+else bad "--apply ran while the orphaned cargo was running (exit $st)"; printf '%s\n' "$out" >&2; fi
 : >"$work/go"
 settle
 if grep -q 'written by the orphaned cargo' "$repo/Cargo.lock" && ! pgrep -f -- "$work/cargo-orphan" >/dev/null; then
@@ -535,6 +555,29 @@ run --apply 0.0.4 >/dev/null; st=$?
 leftover=$(find "$repo" \( -name '*.bump.*' -o -name '.release-bump-journal*' \) | wc -l)
 if [ "$st" -eq 0 ] && [ "$leftover" -eq 0 ]; then ok "apply removes its temporary and backup files"
 else bad "apply left files behind (exit $st, $leftover)"; fi
+
+echo "== a second --apply or --dry-run while an apply is still staging is refused"
+make_repo "$repo" 0.0.3
+printf 'original lock\n' >"$repo/Cargo.lock"
+gate=$work/gate-a
+rm -f "$gate.paused" "$gate.go"
+SLASHIT_RELEASE_CARGO="$work/cargo-ok" PATH="$work/shim:$PATH" REAL_MV="$real_mv" CP_GATE="$gate" \
+  bash "$src" --apply 0.0.4 "$repo" >"$work/run-a.out" 2>&1 &
+pid_a=$!
+for _ in $(seq 100); do [ -e "$gate.paused" ] && break; sleep 0.1; done
+[ -e "$gate.paused" ] || bad "concurrency: the first apply never reached its staging copy"
+out_b=$(run --apply 0.0.4); st_b=$?
+out_d=$(run --dry-run 0.0.4); st_d=$?
+: >"$gate.go"
+wait "$pid_a"; st_a=$?
+if [ "$st_a" -eq 0 ] && [ "$st_b" -eq 1 ] && [ "$st_d" -eq 1 ] && [[ "$out_d" == *"in progress"* ]] && [[ "$out_b" == *"holds"* ]] &&
+  ! journal_left && grep -q '"version": "0.0.4"' "$repo/src-tauri/tauri.conf.json" &&
+  grep -q '^version = "0.0.4"' "$repo/Cargo.toml" && ! find "$repo" -name '*.bump.*' | grep -q .; then
+  ok "a second apply and a dry run are refused while the first stages; the first completes intact"
+else
+  bad "concurrent apply: first exit $st_a, second exit $st_b, dry run exit $st_d"
+  printf 'second:\n%s\ndry run:\n%s\nfirst:\n%s\n' "$out_b" "$out_d" "$(cat "$work/run-a.out")" >&2
+fi
 
 echo "== no process started by the tests is left running"
 for _ in $(seq 50); do pgrep -f -- "$work/" >/dev/null || break; sleep 0.1; done

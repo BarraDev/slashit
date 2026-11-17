@@ -35,6 +35,13 @@
 #       (below) without waiting, and refuses, changing nothing, while any process
 #       of the interrupted run still holds it.
 #
+# Run lock: --apply and --recover hold an exclusive flock(1) on .release-bump.lock
+# in the repository root from before they inspect the journal until they exit; a
+# second run is refused, and so is --dry-run while one holds it. The lock file is
+# never removed, so it may remain after a run (it is git-ignored; `git clean -fX`
+# would delete it, so do not run that during a release). Like the writer
+# lock below, it stays held by a cargo that outlives a SIGKILLed run.
+#
 # Writer lock: --apply holds an exclusive flock(1) on .release-bump-journal/
 # writer.lock from before the journal exists until it exits, on descriptor 9,
 # which it leaves open across exec. Every process it starts (cargo, and cargo's
@@ -230,14 +237,27 @@ undo() { # trust-lock|no
 }
 
 writer_lock=$journal/writer.lock
+root_lock=.release-bump.lock
 have_flock() {
   command -v flock >/dev/null 2>&1 ||
     refuse "flock (util-linux) is required to tell whether a process of an interrupted run is still running"
 }
+# The run lock (see the header). It sits beside the journal, not inside it, because
+# every run recreates and deletes the journal's directories; it is never unlinked.
+take_run_lock() {
+  { exec 8>>"$root_lock"; } 2>/dev/null || refuse "cannot open $root_lock"
+  flock -n 8 ||
+    refuse "another release-bump run, or a process of an interrupted run (cargo or a child of it), still holds $root_lock; nothing was changed"
+  # Guards only a replacement between our open and our flock. A holder of a file
+  # deleted earlier is not seen: the lock file must never be removed (docs/releasing.md).
+  [ "$root_lock" -ef "/proc/$$/fd/8" ] ||
+    refuse "$root_lock was replaced while this run was starting; nothing was changed"
+}
 
 if [ "$mode" = --recover ]; then
-  [ -e "$journal" ] || refuse "no $journal here; nothing to recover"
   have_flock
+  take_run_lock
+  [ -e "$journal" ] || refuse "no $journal here; nothing to recover"
   { [ -f "$writer_lock" ] && exec 9<>"$writer_lock"; } 2>/dev/null || { bad_journal "no writer lock"; exit 1; }
   flock -n 9 ||
     refuse "a process of the interrupted run (cargo or a child of it) still holds $writer_lock and could still change Cargo.lock; nothing was changed. Wait for it to exit (fuser -v $writer_lock names it), then run $SELF --recover again"
@@ -248,9 +268,19 @@ if [ "$mode" = --recover ]; then
   echo "$SELF: restored ${#todo[@]} file(s) from $journal and removed it"
   exit 0
 fi
+have_flock
+if [ "$mode" = --dry-run ]; then
+  # Writes nothing. It briefly probes the lock with a shared flock and refuses only
+  # while a run holds it; the probe's descriptor is closed at once.
+  if [ -e "$root_lock" ] && { exec 8<"$root_lock"; } 2>/dev/null && ! flock -n -s 8; then
+    refuse "a release-bump run is in progress; try again when it finishes"
+  fi
+  exec 8<&-
+else
+  take_run_lock
+fi
 [ ! -e "$journal" ] ||
   refuse "$journal exists: an earlier run did not finish. Run $SELF --recover to restore the original files"
-have_flock
 
 files=(src-tauri/tauri.conf.json package.json package-lock.json Cargo.toml src-tauri/Cargo.toml)
 for c in crates/*/Cargo.toml; do files+=("$c"); done

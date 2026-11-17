@@ -84,13 +84,22 @@ A killed `--apply` can leave `cargo metadata` running, and it can still rewrite
 `Cargo.lock`. So `--apply` holds an exclusive `flock` on
 `.release-bump-journal/writer.lock` on a descriptor that cargo and its children
 (rustc included) inherit, and the kernel keeps the lock until the last of them
-exits. `--recover` checks that lock before anything else and, while any holder is
+exits. `--recover` checks that lock before it reads the journal and, while any holder is
 alive, refuses and changes nothing; `fuser -v .release-bump-journal/writer.lock`
 names the holder. A lock file nobody holds does not block it. The check names no
 process, so a reused PID cannot fool it. It does not cover a child that closes
 the inherited descriptor and keeps writing; cargo and rustc keep it. The tool
 needs `flock(1)` (util-linux, Linux; macOS does not ship it), and the lock is
 advisory, so it may not hold on a network filesystem.
+
+Every run that changes files first takes an exclusive `flock` on `.release-bump.lock`
+in the repository root, before it looks at the journal, and holds it until it exits.
+The lock sits beside the journal because each run recreates the journal's
+directory, and the file must never be removed, and it is git-ignored, so `git clean -fX` would
+delete it: do not run that while a release is in progress. Deleting it while a
+run holds it defeats the lock, and no check can see that. A second `--apply` or
+`--recover` is refused while one runs, and so is `--dry-run` (which only probes the lock briefly and writes nothing); the cargo of a SIGKILLed run keeps this lock too, so a new run
+is refused until it exits.
 
 `--dry-run` changes nothing, not even a leftover `.release-bump-journal.done`
 from a run that committed but was stopped before deleting it; `--apply` removes
