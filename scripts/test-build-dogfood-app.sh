@@ -343,10 +343,11 @@ else
   mkdir -p "$jjm/scripts" "$jjm/src-tauri"
   cp "$src_script" "$jjm/scripts/build-dogfood-app.sh"; cp "$repo/src-tauri/tauri.conf.json" "$jjm/src-tauri/"
   printf 'target/\ndist/\n' >"$jjm/.gitignore"
-  (cd "$jjm" && jj --quiet git init --no-colocate . && jj --quiet commit -m base) || bad "JJ fixture: init failed"
+  # Every fixture command uses the discovered executable: the ambient PATH may not have jj.
+  (cd "$jjm" && "$jj_real" --quiet git init --no-colocate . && "$jj_real" --quiet commit -m base) || bad "JJ fixture: init failed"
   jj_build() { (cd "${JJ_DIR:-$jjm}" && env PATH="$work/bin:$PATH" "$@" bash scripts/build-dogfood-app.sh) 2>&1; }
-  jjid() { (cd "${JJ_DIR:-$jjm}" && jj log -r @ --no-graph -T "$1"); }
-  jjparent() { (cd "${JJ_DIR:-$jjm}" && jj log -r @- --no-graph -T commit_id); }
+  jjid() { (cd "${JJ_DIR:-$jjm}" && "$jj_real" log -r @ --no-graph -T "$1"); }
+  jjparent() { (cd "${JJ_DIR:-$jjm}" && "$jj_real" log -r @- --no-graph -T commit_id); }
   jj_dog_sums() { (cd "$jjm/target/dogfood" && sha256sum slashit-ui slashit slashit-ui.frontend 2>&1); }
 
   # 15. The case the old script got wrong: no .git, so it recorded commit=unknown.
@@ -382,7 +383,7 @@ else
   rm -f "$jjm/during-build.txt" "$jjm/wip.txt"
 
   # 18. A linked JJ workspace shares the primary's artifact root and lock.
-  (cd "$jjm" && jj --quiet workspace add "$work/jj-linked") || bad "JJ fixture: workspace add failed"
+  (cd "$jjm" && "$jj_real" --quiet workspace add "$work/jj-linked") || bad "JJ fixture: workspace add failed"
   jjl=$work/jj-linked
   ls "$jjl/scripts/build-dogfood-app.sh" >/dev/null || bad "linked JJ workspace fixture lacks the script"
   rm -f "$hold/started" "$hold/go"
