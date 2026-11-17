@@ -286,7 +286,7 @@ pub fn Sidebar(
                     page="github_issues".to_string()
                     current_page=current_page
                     on_navigate=on_navigate
-                    label="GitHub Issues".to_string()
+                    label="Issues".to_string()
                     shortcut="".to_string()
                     collapsed=collapsed
                 >

@@ -299,6 +299,21 @@ pub async fn create_task_from_issue(
     project_id: String,
 ) -> Result<Task, String> {
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
+    let address = crate::domain::github_issue_link::parse_issue_url(&format!(
+        "https://github.com/{repo}/issues/{issue_number}"
+    ))?;
+    // Refuse before the Issue is fetched: a second Task for it would duplicate
+    // the Issue. The person links the existing Task instead.
+    {
+        let tasks = state.task.tasks.read().await;
+        if let Some(refusal) = crate::domain::github_issue_link::project_issue_refusal(
+            tasks.values(),
+            project_id,
+            &address,
+        ) {
+            return Err(refusal);
+        }
+    }
 
     // Fetch issue
     let issue = get_issue(repo.clone(), issue_number).await?;

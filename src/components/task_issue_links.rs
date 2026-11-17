@@ -59,6 +59,24 @@ pub fn unlink_target(refs: &[ExternalRef], url: &str) -> Option<(usize, External
     })
 }
 
+/// The Tasks among `tasks` that already link the Issue `repo` `number`. The
+/// external identity is the repository (case-insensitive, as GitHub is) and the
+/// number; a Task title is never compared.
+pub fn tasks_linking_issue<'a>(tasks: &'a [Task], repo: &str, number: i32) -> Vec<&'a Task> {
+    tasks
+        .iter()
+        .filter(|task| refs_link_issue(&task.external_refs, repo, number))
+        .collect()
+}
+
+/// Whether these references include the GitHub Issue `repo` `number`.
+pub fn refs_link_issue(refs: &[ExternalRef], repo: &str, number: i32) -> bool {
+    refs.iter().any(|r| {
+        matches!(r, ExternalRef::GithubIssue { repo: held, number: held_number, .. }
+            if *held_number == number as u32 && held.eq_ignore_ascii_case(repo))
+    })
+}
+
 /// The GitHub Issues section of the task drawer.
 #[component]
 pub fn TaskIssueLinks(
@@ -274,6 +292,28 @@ mod tests {
         assert_eq!(index, 1);
         assert_eq!(expected, refs[1]);
         assert_eq!(unlink_target(&refs, "https://github.com/o/r/issues/9"), None);
+    }
+
+    #[test]
+    fn an_issue_is_matched_by_repository_and_number_only() {
+        let refs = vec![
+            ExternalRef::GithubIssue {
+                url: "https://github.com/Owner/Repo/issues/7".into(),
+                number: 7,
+                repo: "Owner/Repo".into(),
+                state: Some("OPEN".into()),
+            },
+            ExternalRef::GithubPr {
+                url: "https://github.com/o/r/pull/8".into(),
+                number: 8,
+                repo: "o/r".into(),
+                state: None,
+            },
+        ];
+        assert!(refs_link_issue(&refs, "owner/repo", 7));
+        assert!(!refs_link_issue(&refs, "owner/repo", 8));
+        assert!(!refs_link_issue(&refs, "owner/other", 7));
+        assert!(!refs_link_issue(&[], "owner/repo", 7));
     }
 
     #[test]
