@@ -118,6 +118,7 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
     let projects = RwSignal::new(Vec::<Project>::new());
     let destination = RwSignal::new(project_id.clone());
     let tasks = RwSignal::new(Vec::<Task>::new());
+    let tasks_seq = RwSignal::new(0_u64);
     let mode = RwSignal::new(LinkMode::Existing);
     let chosen_task = RwSignal::new(String::new());
     let busy = RwSignal::new(false);
@@ -142,10 +143,14 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
         if project.is_empty() {
             return;
         }
+        let seq = tasks_seq.get_untracked() + 1;
+        tasks_seq.set(seq);
         spawn_local(async move {
             let result = list_tasks(project.clone()).await;
-            // A reply for a Project the person has since left is not shown.
-            if destination.try_get_untracked().as_deref() != Some(project.as_str()) {
+            // A reply for a Project the person has since left, or one a later reload overtook, is not shown.
+            if destination.try_get_untracked().as_deref() != Some(project.as_str())
+                || tasks_seq.try_get_untracked() != Some(seq)
+            {
                 return;
             }
             match result {
@@ -263,6 +268,11 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
         }
     });
     reload_tasks(project_id.clone());
+    // A remembered repository without a cached listing is read now. Otherwise
+    // the page would show its empty state as if GitHub had answered.
+    if initial.is_none() && !initial_repo.is_empty() {
+        load(false);
+    }
 
     let choose_project = move |project: String| {
         destination.set(project.clone());
