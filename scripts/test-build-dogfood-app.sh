@@ -19,7 +19,32 @@ set -uo pipefail
 
 src_script=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build-dogfood-app.sh
 work=$(mktemp -d "${TMPDIR:-/tmp}/build-dogfood-test.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+
+# Every wait on a fixture is bounded, and nothing the test started outlives it:
+# the holds are released, every process whose command line or cwd names $work is
+# killed and gone, and only then is $work removed.
+work_pids() { # pids (not this shell) whose command line or cwd is under $work
+  local d pid
+  ps -eo pid=,args= | while read -r pid args; do [[ "$args" == *"$work"* ]] && echo "$pid"; done
+  for d in /proc/[0-9]*; do
+    case "$(readlink "$d/cwd" 2>/dev/null)" in "$work"|"$work"/*) echo "${d#/proc/}";; esac
+  done
+}
+cleanup() {
+  trap - EXIT INT TERM
+  local pid i d
+  for d in $(find "$work" -type d -name "hold*" 2>/dev/null); do : >"$d/go"; done
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    for pid in $(work_pids | sort -u); do [ "$pid" = "$$" ] || [ "$pid" = "$BASHPID" ] || kill -KILL "$pid" 2>/dev/null; done
+    wait 2>/dev/null
+    [ -z "$(work_pids | grep -vx -e "$$" -e "$BASHPID")" ] && break
+    sleep 0.1
+  done
+  rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 pass=0
 fails=0
@@ -54,10 +79,15 @@ case " $* " in
     [ -z "${STUB_COMMIT_DURING:-}" ] || git commit -q --allow-empty -m during-build
     [ -z "${STUB_TOUCH_DURING:-}" ] || : >during-build.txt
     [ -z "${STUB_EDIT_DURING:-}" ] || echo edited-during-build >>"$STUB_EDIT_DURING"
-    # Hold the build open (and so the lock) until the test releases it.
+    # Hold the build open (and so the lock) until the test releases it, but
+    # never longer than STUB_HOLD_TIMEOUT seconds: an unreleased hold fails the build.
     if [ -n "${STUB_HOLD_DIR:-}" ]; then
       echo "$PPID" >"$STUB_HOLD_DIR/started.tmp" && mv -f "$STUB_HOLD_DIR/started.tmp" "$STUB_HOLD_DIR/started"
-      while [ ! -e "$STUB_HOLD_DIR/go" ]; do sleep 0.05; done
+      deadline=$((SECONDS + ${STUB_HOLD_TIMEOUT:-60}))
+      while [ ! -e "$STUB_HOLD_DIR/go" ]; do
+        [ "$SECONDS" -lt "$deadline" ] || { echo "stub cargo: hold timed out: never released" >&2; exit 3; }
+        sleep 0.05
+      done
     fi
     if [ -n "${STUB_NO_EMBED:-}" ]; then printf 'no assets here\n' >target/debug/slashit-ui
     else printf 'ELF...dogfood_test_bg.wasm...%s\n' "${STUB_BUILD_ID:-}" >target/debug/slashit-ui; fi ;;
@@ -378,6 +408,20 @@ else
     ok "a JJ workspace whose jj fails is refused; the promoted pair is unchanged"
   else bad "a failing jj was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
 fi
+
+# 20. Fixture waits are bounded: a hold that is never released ends the build
+#     with an error inside its bound, frees the lock, and leaves no process
+#     whose command line names the scratch directory.
+hold_never=$work/hold-never; mkdir -p "$hold_never"
+t0=$SECONDS
+out=$(cd "$main" && timeout 30 env PATH="$work/bin:$PATH" STUB_HOLD_DIR="$hold_never" STUB_HOLD_TIMEOUT=2 bash scripts/build-dogfood-app.sh 2>&1); st=$?
+elapsed=$((SECONDS - t0))
+lock_free=no; flock -n "$main/target/dogfood/.build.lock" true && lock_free=yes
+left=$(ps -eo pid,args | grep -e "[/]${work#/}")
+if [ -e "$hold_never/started" ] && [ "$st" -ne 0 ] && [ "$st" -ne 124 ] && [ "$elapsed" -lt 20 ] &&
+  [[ "$out" == *"hold timed out"* ]] && [ "$lock_free" = yes ] && [ -z "$left" ]; then
+  ok "an unreleased hold times out with an error, releases the build lock and leaves no process behind"
+else bad "an unreleased hold was not bounded and released (exit $st after ${elapsed}s, lock free: $lock_free)"; printf '%s\n%s\n' "$out" "$left" >&2; fi
 
 echo "$pass passed, $fails failed"
 [ "$fails" -eq 0 ]
