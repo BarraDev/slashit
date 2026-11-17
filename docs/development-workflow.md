@@ -1303,6 +1303,25 @@ Three build modes exist. They do not share a binary path:
   not match the binary as stale and refuses it. Promoted artifacts live inside
   the workspace's `target/` and are regenerable. They are not Task data and are
   not part of the restart snapshot.
+- **Source identity and one build at a time.** The sidecar also records the
+  source: `vcs`, `commit` (a concrete commit id), `dirty`, `source_digest`,
+  the promoted CLI's `cli_sha256`, and for JJ the `change` id. A Git checkout
+  (colocated JJ included) uses `git rev-parse HEAD`, so a detached HEAD works
+  and a branch name is never an identity. A JJ-only workspace, which has no
+  `.git`, uses the commit id of `@` after JJ's working-copy snapshot; `dirty`
+  means `@` is not empty. A build whose source has no commit identity (an unborn
+  HEAD, no VCS, a failing or conflicted `jj`) is refused before it starts; there
+  is no `unknown` or HEAD fallback. The identity is read again after the build
+  and any difference, including an edit to an already-dirty file, refuses
+  promotion. The binary is hashed from the staged copy that is renamed into
+  place, and re-hashed just before the rename. `target/dogfood/.build.lock` is
+  an `flock` held across build and publication; a second build is refused, and
+  the kernel releases the lock when the holder dies. Linked Git worktrees and
+  linked JJ workspaces share the primary checkout's `target/dogfood` and lock.
+  Accepted gap: comparing identity before and after cannot see a source edit
+  that is made during the build and reverted before it ends, and files that Git
+  or JJ ignore are not covered. Closing it needs a build from an immutable export
+  in a scratch directory, which gives up the incremental build caches.
 - **Failure keeps the last good pair.** A failed trunk or cargo build publishes
   nothing. A failure during promotion restores the previously promoted binary,
   CLI and sidecar, so the sidecar always describes the binary beside it.

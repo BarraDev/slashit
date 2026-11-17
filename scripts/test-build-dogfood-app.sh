@@ -5,7 +5,12 @@
 # compilation happens. Covers: promotion into target/dogfood, the sidecar bound
 # to the promoted binary's sha256, refusal when the frontend is not embedded,
 # immunity to a later overwrite of target/debug (the acceptance collision), and
-# the previous promoted pair surviving failed builds and failed promotions.
+# the previous promoted pair surviving failed builds and failed promotions,
+# source edits during a build (dirty files included), a candidate swapped
+# between validation and publication, two real builds contending the lock, and
+# the source identity of Git and JJ-only checkouts (a build whose source has no
+# commit identity is refused). The JJ tests need a pinned jj (mise exec -- jj);
+# without one they are reported as SKIP, not as a pass.
 #
 # usage: scripts/test-build-dogfood-app.sh
 set -uo pipefail
@@ -26,6 +31,11 @@ repo="$work/repo"
 mkdir -p "$repo/scripts" "$repo/src-tauri" "$work/bin"
 cp "$src_script" "$repo/scripts/build-dogfood-app.sh"
 printf '{ "build": { "beforeBuildCommand": "trunk build" } }\n' >"$repo/src-tauri/tauri.conf.json"
+# Every build needs a source identity: the fixture is a Git checkout with one commit.
+printf 'target/\ndist/\n' >"$repo/.gitignore"
+git -C "$repo" init -q
+git -C "$repo" config user.name "Build Test"; git -C "$repo" config user.email build-test@example.invalid
+git -C "$repo" add -A; git -C "$repo" commit -qm base
 
 # Stub trunk: produces the frontend bundle name the embedding check looks for.
 cat >"$work/bin/trunk" <<'STUB'
@@ -43,6 +53,12 @@ case " $* " in
     # Simulate source changes while the build runs: a commit, or a new file.
     [ -z "${STUB_COMMIT_DURING:-}" ] || git commit -q --allow-empty -m during-build
     [ -z "${STUB_TOUCH_DURING:-}" ] || : >during-build.txt
+    [ -z "${STUB_EDIT_DURING:-}" ] || echo edited-during-build >>"$STUB_EDIT_DURING"
+    # Hold the build open (and so the lock) until the test releases it.
+    if [ -n "${STUB_HOLD_DIR:-}" ]; then
+      echo "$PPID" >"$STUB_HOLD_DIR/started.tmp" && mv -f "$STUB_HOLD_DIR/started.tmp" "$STUB_HOLD_DIR/started"
+      while [ ! -e "$STUB_HOLD_DIR/go" ]; do sleep 0.05; done
+    fi
     if [ -n "${STUB_NO_EMBED:-}" ]; then printf 'no assets here\n' >target/debug/slashit-ui
     else printf 'ELF...dogfood_test_bg.wasm...%s\n' "${STUB_BUILD_ID:-}" >target/debug/slashit-ui; fi ;;
   *" -p slashit "*) printf '#!/bin/sh\necho cli\n' >target/debug/slashit; chmod +x target/debug/slashit ;;
@@ -59,7 +75,19 @@ if [ -n "\${STUB_MV_FAIL_CLI:-}" ] && [[ "\$*" == *".tmp."* ]] && [[ "\$*" == */
 if [ -n "\${STUB_MV_FAIL_SIDE:-}" ] && [[ "\$*" == *".tmp."* ]] && [[ "\$*" == *.frontend ]]; then exit 1; fi
 exec "$real_mv" "\$@"
 STUB
-chmod +x "$work/bin/trunk" "$work/bin/cargo" "$work/bin/mv"
+# Stub sha256sum: when STUB_SWAP_AFTER_HASH is set, the first time a staged
+# binary is hashed, it is replaced right after its hash was taken: a candidate
+# swapped between validation and publication.
+real_sha=$(command -v sha256sum)
+cat >"$work/bin/sha256sum" <<STUB
+#!/usr/bin/env bash
+"$real_sha" "\$@"; st=\$?
+if [ -n "\${STUB_SWAP_AFTER_HASH:-}" ] && [ ! -e "\$STUB_SWAP_AFTER_HASH" ] && [[ "\$*" == */slashit-ui.tmp.* ]]; then
+  : >"\$STUB_SWAP_AFTER_HASH"; echo swapped >>"\${@: -1}"
+fi
+exit \$st
+STUB
+chmod +x "$work/bin/trunk" "$work/bin/cargo" "$work/bin/mv" "$work/bin/sha256sum"
 
 run_build() {
   (cd "$repo" && env PATH="$work/bin:$PATH" bash scripts/build-dogfood-app.sh) 2>&1
@@ -191,6 +219,165 @@ rm -f "$main/during-build.txt"
 if [ "$st" -ne 0 ] && [[ "$out" == *"changed during the build"* ]] && [[ "$out" == *"during-build.txt"* ]] && [ "$(dog_sums)" = "$before" ]; then
   ok "an untracked file created during the build is refused; the promoted pair and previous build are unchanged"
 else bad "a file created during the build was not refused cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# 10. A tracked file that was already dirty and is edited again during the build:
+#     HEAD and the porcelain status are unchanged, only the content digest moves.
+echo dirty >"$main/f2"; git -C "$main" add f2; git -C "$main" commit -qm f2; echo dirty-before >>"$main/f2"
+out=$(main_build STUB_BUILD_ID=dirty-ok); st=$?
+if [ "$st" -eq 0 ] && grep -qx 'dirty=yes' "$main/target/dogfood/slashit-ui.frontend" &&
+  grep -qE '^source_digest=[0-9a-f]{64}$' "$main/target/dogfood/slashit-ui.frontend" &&
+  grep -qx "cli_sha256=$(sha256sum "$main/target/dogfood/slashit" | cut -d' ' -f1)" "$main/target/dogfood/slashit-ui.frontend"; then
+  ok "a dirty build records dirty=yes, the source digest and the CLI's sha256"
+else bad "dirty build provenance is wrong (exit $st)"; printf '%s\n' "$out" >&2; fi
+before=$(dog_sums)
+out=$(main_build STUB_BUILD_ID=edited STUB_EDIT_DURING=f2); st=$?
+if [ "$st" -ne 0 ] && [[ "$out" == *"changed during the build"* ]] && [ "$(dog_sums)" = "$before" ]; then
+  ok "an edit to an already-dirty file during the build is refused; the promoted pair is unchanged"
+else bad "an edit to a dirty file during the build was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+git -C "$main" checkout -q -- f2
+
+# 11. Publication conflict: the staged binary is replaced after it was hashed.
+#     The re-check before the rename refuses it and the prior state is restored.
+before=$(dog_sums)
+out=$(main_build STUB_BUILD_ID=swap STUB_SWAP_AFTER_HASH="$work/swap.marker"); st=$?
+if [ "$st" -ne 0 ] && [ -e "$work/swap.marker" ] && [[ "$out" == *"changed after it was verified"* ]] &&
+  [ "$(dog_sums)" = "$before" ] && [ -z "$(find "$main/target/dogfood" -name '*.tmp.*' -print -quit)" ]; then
+  ok "a candidate replaced between validation and publication is refused; the promoted pair is unchanged"
+else bad "a swapped candidate was published or damaged state (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# 12. Competing builds: two real processes on one artifact root. The second is
+#     refused while the first holds the lock; the first then publishes its own
+#     binary with a sidecar that names it.
+hold=$work/hold; mkdir -p "$hold"
+before=$(dog_sums)
+(cd "$main" && env PATH="$work/bin:$PATH" STUB_BUILD_ID=first STUB_HOLD_DIR="$hold" bash scripts/build-dogfood-app.sh >"$work/first.log" 2>&1) &
+first=$!
+for _ in $(seq 200); do [ -e "$hold/started" ] && break; sleep 0.05; done
+out=$(main_build STUB_BUILD_ID=second); st=$?
+mid=$(dog_sums)
+: >"$hold/go"; wait "$first"; st1=$?
+if [ -e "$hold/started" ] && [ "$st" -ne 0 ] && [[ "$out" == *"another dogfood build"* ]] && [ "$mid" = "$before" ] &&
+  [ "$st1" -eq 0 ] && grep -q first "$main/target/dogfood/slashit-ui" &&
+  grep -qx "sha256=$(sha256sum "$main/target/dogfood/slashit-ui" | cut -d' ' -f1)" "$main/target/dogfood/slashit-ui.frontend"; then
+  ok "a second concurrent build is refused while the first holds the lock; the first publishes its own binary"
+else bad "competing builds (second exit $st, first exit $st1)"; printf '%s\n' "$out" >&2; cat "$work/first.log" >&2; fi
+
+# 13. The lock dies with its holder: after the build script is killed (its
+#     children do not inherit the lock descriptor), the next build runs.
+rm -f "$hold/started" "$hold/go"
+(cd "$main" && env PATH="$work/bin:$PATH" STUB_HOLD_DIR="$hold" bash scripts/build-dogfood-app.sh >/dev/null 2>&1) &
+victim=$!
+for _ in $(seq 200); do [ -e "$hold/started" ] && break; sleep 0.05; done
+kill -KILL "$(cat "$hold/started")"; wait "$victim" 2>/dev/null
+out=$(main_build STUB_BUILD_ID=after-kill); st=$?
+: >"$hold/go" # only now lets the orphaned stub cargo exit
+if [ "$st" -eq 0 ] && grep -q after-kill "$main/target/dogfood/slashit-ui"; then
+  ok "the lock is released when its holder is killed"
+else bad "build after a killed holder failed (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# 14. Git source identity: a detached HEAD is identified by its commit, never by
+#     a branch name; an unborn HEAD and a directory with no VCS are refused
+#     before anything is built.
+git -C "$main" checkout -q --detach
+det_head=$(git -C "$main" rev-parse HEAD)
+out=$(main_build STUB_BUILD_ID=detached); st=$?
+side=$main/target/dogfood/slashit-ui.frontend
+if [ "$st" -eq 0 ] && grep -qx "commit=$det_head" "$side" && grep -qx 'vcs=git' "$side" && ! grep -qE 'master|main|linked' "$side"; then
+  ok "a detached HEAD is recorded by its commit id, not a branch name"
+else bad "detached HEAD identity is wrong (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+refused_cleanly() { # dir: no source identity -> refused, nothing built, nothing promoted
+  mkdir -p "$1/scripts" "$1/src-tauri"
+  cp "$src_script" "$1/scripts/build-dogfood-app.sh"; cp "$repo/src-tauri/tauri.conf.json" "$1/src-tauri/"
+  local o s
+  o=$(cd "$1" && env PATH="$work/bin:$PATH" "${@:2}" bash scripts/build-dogfood-app.sh 2>&1); s=$?
+  [ "$s" -ne 0 ] && [[ "$o" == *"cannot establish the source identity"* ]] && [ ! -e "$1/dist" ] &&
+    [ ! -e "$1/target/dogfood/slashit-ui" ] && [ ! -e "$1/target/dogfood/slashit-ui.frontend" ] || { printf '%s\n' "$o" >&2; return 1; }
+}
+unborn=$work/unborn; mkdir -p "$unborn"; git -C "$unborn" init -q
+if refused_cleanly "$unborn"; then ok "an unborn HEAD is refused: no commit identity, nothing built or promoted"
+else bad "an unborn HEAD was not refused cleanly"; fi
+novcs=$work/novcs
+if refused_cleanly "$novcs"; then ok "a checkout with neither Git nor JJ is refused, with no commit=unknown fallback"
+else bad "a directory with no VCS was not refused cleanly"; fi
+
+# JJ-only workspaces: no .git. Needs the pinned jj; hermetic user identity.
+jj_real=$(cd "$(dirname "$src_script")/.." && { command -v mise >/dev/null 2>&1 && mise exec -- which jj 2>/dev/null; } || command -v jj)
+if [ -z "$jj_real" ] || [ ! -x "$jj_real" ]; then
+  echo "SKIP JJ-only identity tests: no jj found (install the pinned jj from mise.toml)"
+else
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$jj_real" >"$work/bin/jj"; chmod +x "$work/bin/jj"
+  printf '[user]\nname = "Build Test"\nemail = "build-test@example.invalid"\n' >"$work/jj-config.toml"
+  export JJ_CONFIG="$work/jj-config.toml"
+  jjm=$work/jj-main
+  mkdir -p "$jjm/scripts" "$jjm/src-tauri"
+  cp "$src_script" "$jjm/scripts/build-dogfood-app.sh"; cp "$repo/src-tauri/tauri.conf.json" "$jjm/src-tauri/"
+  printf 'target/\ndist/\n' >"$jjm/.gitignore"
+  (cd "$jjm" && jj --quiet git init --no-colocate . && jj --quiet commit -m base) || bad "JJ fixture: init failed"
+  jj_build() { (cd "${JJ_DIR:-$jjm}" && env PATH="$work/bin:$PATH" "$@" bash scripts/build-dogfood-app.sh) 2>&1; }
+  jjid() { (cd "${JJ_DIR:-$jjm}" && jj log -r @ --no-graph -T "$1"); }
+  jj_dog_sums() { (cd "$jjm/target/dogfood" && sha256sum slashit-ui slashit slashit-ui.frontend 2>&1); }
+
+  # 15. The case the old script got wrong: no .git, so it recorded commit=unknown.
+  jjside=$jjm/target/dogfood/slashit-ui.frontend
+  out=$(jj_build STUB_BUILD_ID=jj-clean); st=$?
+  jj_commit=$(jjid commit_id); jj_change=$(jjid change_id)
+  if [ ! -e "$jjm/.git" ] && [ "$st" -eq 0 ] && grep -qx "commit=$jj_commit" "$jjside" && grep -qx "change=$jj_change" "$jjside" &&
+    grep -qx 'vcs=jj' "$jjside" && grep -qx 'dirty=no' "$jjside" && ! grep -q unknown "$jjside" &&
+    grep -qx "sha256=$(sha256sum "$jjm/target/dogfood/slashit-ui" | cut -d' ' -f1)" "$jjside"; then
+    ok "a JJ-only build records the concrete commit id and the change id, never unknown"
+  else bad "JJ-only identity is wrong (exit $st)"; printf '%s\n' "$out" >&2; cat "$jjside" >&2; fi
+  clean_digest=$(sed -n 's/^source_digest=//p' "$jjside")
+
+  # 16. Uncommitted work is dirty=yes, changes the commit id and the digest.
+  echo wip >"$jjm/wip.txt"
+  out=$(jj_build STUB_BUILD_ID=jj-dirty); st=$?
+  if [ "$st" -eq 0 ] && grep -qx 'dirty=yes' "$jjside" && grep -qx "commit=$(jjid commit_id)" "$jjside" &&
+    [ "$(sed -n 's/^source_digest=//p' "$jjside")" != "$clean_digest" ] && ! grep -qx "commit=$jj_commit" "$jjside"; then
+    ok "a JJ working copy with uncommitted files is recorded dirty with a different commit id and digest"
+  else bad "JJ dirty build provenance is wrong (exit $st)"; printf '%s\n' "$out" >&2; cat "$jjside" >&2; fi
+
+  # 17. Edits during the build (a new file, then an edit of an already-dirty one) are refused.
+  before=$(jj_dog_sums)
+  out=$(jj_build STUB_BUILD_ID=jj-edit STUB_EDIT_DURING=wip.txt); st=$?
+  if [ "$st" -ne 0 ] && [[ "$out" == *"changed during the build"* ]] && [ "$(jj_dog_sums)" = "$before" ]; then
+    ok "an edit to a dirty file during a JJ build is refused; the promoted pair is unchanged"
+  else bad "JJ edit during the build was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+  out=$(jj_build STUB_BUILD_ID=jj-touch STUB_TOUCH_DURING=1); st=$?
+  if [ "$st" -ne 0 ] && [[ "$out" == *"changed during the build"* ]] && [[ "$out" == *"during-build.txt"* ]] && [ "$(jj_dog_sums)" = "$before" ]; then
+    ok "a file created during a JJ build is refused; the promoted pair is unchanged"
+  else bad "JJ file created during the build was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+  rm -f "$jjm/during-build.txt" "$jjm/wip.txt"
+
+  # 18. A linked JJ workspace shares the primary's artifact root and lock.
+  (cd "$jjm" && jj --quiet workspace add "$work/jj-linked") || bad "JJ fixture: workspace add failed"
+  jjl=$work/jj-linked
+  ls "$jjl/scripts/build-dogfood-app.sh" >/dev/null || bad "linked JJ workspace fixture lacks the script"
+  rm -f "$hold/started" "$hold/go"
+  (cd "$jjm" && env PATH="$work/bin:$PATH" STUB_BUILD_ID=jj-holder STUB_HOLD_DIR="$hold" bash scripts/build-dogfood-app.sh >"$work/jj-first.log" 2>&1) &
+  jj_first=$!
+  for _ in $(seq 200); do [ -e "$hold/started" ] && break; sleep 0.05; done
+  before=$(jj_dog_sums)
+  out=$(JJ_DIR=$jjl jj_build STUB_BUILD_ID=jj-second); st=$?
+  if [ -e "$hold/started" ] && [ "$st" -ne 0 ] && [[ "$out" == *"another dogfood build"* ]] && [ "$(jj_dog_sums)" = "$before" ]; then
+    ok "a build in a linked JJ workspace is refused while the primary's build holds the shared lock"
+  else bad "linked JJ workspace did not contend the primary's lock (exit $st)"; printf '%s\n' "$out" >&2; fi
+  : >"$hold/go"; wait "$jj_first"
+  out=$(JJ_DIR=$jjl jj_build STUB_BUILD_ID=jj-linked); st=$?
+  if [ "$st" -eq 0 ] && [ ! -e "$jjl/target/dogfood" ] && grep -qx "commit=$(JJ_DIR=$jjl jjid commit_id)" "$jjside" &&
+    grep -qx "change=$(JJ_DIR=$jjl jjid change_id)" "$jjside" &&
+    grep -qx "sha256=$(sha256sum "$jjm/target/dogfood/slashit-ui" | cut -d' ' -f1)" "$jjside"; then
+    ok "a linked JJ workspace promotes into the primary workspace's target/dogfood with its own commit and change id"
+  else bad "linked JJ workspace promoted to the wrong place (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+  # 19. A failing jj means no identity: refused before the build, no fallback.
+  mkdir -p "$work/failbin"; printf '#!/bin/sh\necho "jj: simulated failure" >&2; exit 1\n' >"$work/failbin/jj"; chmod +x "$work/failbin/jj"
+  before=$(jj_dog_sums)
+  out=$(cd "$jjm" && env PATH="$work/failbin:$work/bin:$PATH" bash scripts/build-dogfood-app.sh 2>&1); st=$?
+  if [ "$st" -ne 0 ] && [[ "$out" == *"cannot establish the source identity"* ]] && [ "$(jj_dog_sums)" = "$before" ]; then
+    ok "a JJ workspace whose jj fails is refused; the promoted pair is unchanged"
+  else bad "a failing jj was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+fi
 
 echo "$pass passed, $fails failed"
 [ "$fails" -eq 0 ]
