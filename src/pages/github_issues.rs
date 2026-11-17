@@ -11,7 +11,7 @@ use crate::components::task_dependency::status_label;
 use crate::components::task_issue_links::tasks_linking_issue;
 use crate::models::github::GithubIssue;
 use crate::models::{Project, Task};
-use crate::services::github_issue_cache::{self, CacheKey, CachedIssues};
+use crate::services::github_issue_cache::{self, CacheKey, CachedIssues, IssueFilter};
 use crate::services::{github_service, link_github_issue, list_tasks, project_service};
 use chrono::{DateTime, Utc};
 use leptos::prelude::*;
@@ -85,14 +85,15 @@ enum LinkMode {
 pub fn GithubIssues(project_id: String) -> impl IntoView {
     let initial_repo = get_persisted_repo();
     let initial = (!initial_repo.is_empty())
-        .then(|| github_issue_cache::cached(&CacheKey::github(&initial_repo)))
+        .then(|| github_issue_cache::cached(&CacheKey::github(&initial_repo, IssueFilter::Open)))
         .flatten();
 
     // Browsing. `active` is the listing the page shows or is loading; a response
     // applies only while it is still the newest request for that listing.
     let repo = RwSignal::new(initial_repo.clone());
     let shown_repo = RwSignal::new(initial_repo.clone());
-    let active = RwSignal::new((!initial_repo.is_empty()).then(|| CacheKey::github(&initial_repo)));
+    let filter = RwSignal::new(IssueFilter::Open);
+    let active = RwSignal::new((!initial_repo.is_empty()).then(|| CacheKey::github(&initial_repo, IssueFilter::Open)));
     let issues = RwSignal::new(initial.as_ref().map(|c| c.issues.clone()).unwrap_or_default());
     let refreshed_at = RwSignal::new(initial.as_ref().map(|c| c.refreshed_at));
     let request_seq = RwSignal::new(0_u64);
@@ -146,29 +147,34 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
         });
     };
 
-    // Load a listing. A cached listing is shown without a network read unless
-    // `force` asks for one. A refresh keeps what is shown; a different
-    // repository starts empty so its data never mixes with another's.
-    let load = move |force: bool| {
+    // Load a listing for the selected filter. A cached listing is shown without
+    // a network read unless `force` asks for one. A refresh keeps what is shown;
+    // a different repository or filter starts empty, so an unqueried listing is
+    // never shown as an empty result. Returns whether the listing was applied.
+    let load = move |force: bool| -> bool {
         let repo_val = repo.get_untracked().trim().to_string();
         if !is_repo_address(&repo_val) {
             error.set(Some("Enter a repository as owner/repo, for example leptos-rs/leptos.".to_string()));
-            return;
+            return false;
         }
-        let key = CacheKey::github(&repo_val);
+        let state_filter = filter.get_untracked();
+        let key = CacheKey::github(&repo_val, state_filter);
+        let same_listing = active.get_untracked().as_ref() == Some(&key);
         if !force {
             if let Some(entry) = github_issue_cache::cached(&key) {
                 request_seq.update(|s| *s += 1);
+                if !same_listing {
+                    selected.set(None);
+                }
                 active.set(Some(key));
                 shown_repo.set(repo_val);
                 issues.set(entry.issues);
                 refreshed_at.set(Some(entry.refreshed_at));
                 error.set(None);
                 loading.set(false);
-                return;
+                return true;
             }
         }
-        let same_listing = active.get_untracked().as_ref() == Some(&key);
         if !same_listing {
             issues.set(Vec::new());
             refreshed_at.set(None);
@@ -180,9 +186,10 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
         shown_repo.set(repo_val.clone());
         loading.set(true);
         error.set(None);
+        let state = state_filter.gh_state();
 
         spawn_local(async move {
-            let result = github_service::get_issues(repo_val).await;
+            let result = github_service::get_issues(repo_val, state).await;
             let latest = request_seq.try_get_untracked();
             let current = active.try_get_untracked().flatten();
             let may_apply = latest.is_some_and(|latest| {
@@ -214,6 +221,20 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                 }
             }
         });
+        true
+    };
+
+    // Select a filter. It takes effect only if its listing is applied, so the
+    // buttons never name a state the list does not show.
+    let choose_filter = move |next: IssueFilter| {
+        let previous = filter.get_untracked();
+        if next == previous {
+            return;
+        }
+        filter.set(next);
+        if active.get_untracked().is_some() && !load(false) {
+            filter.set(previous);
+        }
     };
 
     // Projects and the Tasks of the starting Project. A Project that is not
@@ -359,7 +380,7 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                     <button
                         type="button"
                         data-testid="issues-refresh"
-                        on:click=move |_| load(true)
+                        on:click=move |_| { load(true); }
                         disabled=move || loading.get()
                         class="px-4 py-2.5 rounded-lg border border-white/10 text-white/70 hover:text-white/90 hover:bg-white/5 disabled:opacity-50 transition-colors text-sm"
                     >
@@ -367,6 +388,27 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                     </button>
                 })}
             </form>
+
+            <div role="group" aria-label="Issue state" class="flex items-center gap-2">
+                {IssueFilter::ALL
+                    .into_iter()
+                    .map(|f| view! {
+                        <button
+                            type="button"
+                            data-testid=format!("issues-filter-{}", f.gh_state())
+                            aria-pressed=move || (filter.get() == f).to_string()
+                            on:click=move |_| choose_filter(f)
+                            class=move || if filter.get() == f {
+                                "px-3 py-1.5 rounded-lg bg-white/10 text-white/90 text-sm"
+                            } else {
+                                "px-3 py-1.5 rounded-lg text-white/50 hover:text-white/90 hover:bg-white/5 text-sm"
+                            }
+                        >
+                            {f.label()}
+                        </button>
+                    })
+                    .collect_view()}
+            </div>
 
             {move || refreshed_at.get().map(|at| view! {
                 <p data-testid="issues-refreshed" class="text-xs text-white/40">
@@ -399,7 +441,7 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                 let listed = active.with(|a| a.is_some());
                 (empty && listed && !loading.get() && error.with(|e| e.is_none())).then(|| view! {
                     <div class="text-center py-12 text-white/40">
-                        <p>{format!("No open Issues in {}.", shown_repo.get())}</p>
+                        <p>{move || empty_message(filter.get(), &shown_repo.get())}</p>
                     </div>
                 })
             }}
@@ -414,8 +456,8 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                     // Issues list panel
                     <div class="col-span-1 border border-white/10 rounded-xl bg-white/[0.02] overflow-hidden flex flex-col">
                         <div class="p-3 border-b border-white/10 flex items-center justify-between">
-                            <span class="text-sm text-white/50">
-                                {move || format!("{} open Issues", issues.with(|l| l.len()))}
+                            <span data-testid="issues-count" class="text-sm text-white/50">
+                                {move || format!("{} {}", issues.with(|l| l.len()), listing_name(filter.get()))}
                             </span>
                         </div>
                         <div class="flex-1 overflow-y-auto p-2 space-y-2">
@@ -700,6 +742,23 @@ pub fn GithubIssues(project_id: String) -> impl IntoView {
                 </div>
             })}
         </div>
+    }
+}
+
+/// The words that name a listing in the list header: "12 open Issues".
+fn listing_name(filter: IssueFilter) -> &'static str {
+    match filter {
+        IssueFilter::Open => "open Issues",
+        IssueFilter::Closed => "closed Issues",
+        IssueFilter::All => "Issues",
+    }
+}
+
+fn empty_message(filter: IssueFilter, repo: &str) -> String {
+    match filter {
+        IssueFilter::Open => format!("No open Issues in {repo}."),
+        IssueFilter::Closed => format!("No closed Issues in {repo}."),
+        IssueFilter::All => format!("No Issues in {repo}."),
     }
 }
 

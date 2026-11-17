@@ -149,12 +149,39 @@ case "$1 $2" in
         ;;
     "issue view")
         # `issue-view-<number>.json` is what `issue view <number>` prints; by
-        # default the Issue is open at the fixture repository's own address.
+        # default the Issue is open at the fixture repository's own address,
+        # with the fields a Task created from it reads.
         number="$3"
         if [ -f "$dir/issue-view-$number.json" ]; then
             cat "$dir/issue-view-$number.json"
         else
-            printf '{"number":%s,"state":"OPEN","url":"%s/issues/%s"}' "$number" "$repository" "$number"
+            printf '{"number":%s,"title":"Fixture issue %s","body":"","state":"OPEN","labels":[],"assignees":[],"comments":[],"createdAt":"2026-11-01T00:00:00Z","updatedAt":"2026-11-01T00:00:00Z","url":"%s/issues/%s"}' "$number" "$number" "$repository" "$number"
+        fi
+        ;;
+    "auth status")
+        # The Issues page checks the sign-in before it reads. The fake is always signed in.
+        printf 'github.com\n  Logged in to github.com account acceptance\n'
+        ;;
+    "issue list")
+        # `issue-list-<state>.json` is what `issue list --state <state>` prints,
+        # where <state> is the word after `--state`. A state with no file lists
+        # nothing, so a journey must script every state it asks for.
+        state=""
+        take_state=""
+        for arg in "$@"; do
+            if [ -n "$take_state" ]; then
+                state="$arg"
+                take_state=""
+                continue
+            fi
+            if [ "$arg" = "--state" ]; then
+                take_state="yes"
+            fi
+        done
+        if [ -f "$dir/issue-list-$state.json" ]; then
+            cat "$dir/issue-list-$state.json"
+        else
+            printf '[]'
         fi
         ;;
     "api --paginate")

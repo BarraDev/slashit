@@ -17,25 +17,53 @@ use crate::models::github::GithubIssue;
 /// The provider the page browses. Only GitHub exists today.
 pub const PROVIDER_GITHUB: &str = "github";
 
-/// The one query the backend answers: the default open listing.
-pub const OPEN_QUERY: &str = "open";
+/// Which Issues a listing asks GitHub for. The value is the state word
+/// `gh issue list --state` takes, so the query and the cache agree on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IssueFilter {
+    Open,
+    Closed,
+    All,
+}
+
+impl IssueFilter {
+    pub const ALL: [IssueFilter; 3] = [IssueFilter::Open, IssueFilter::Closed, IssueFilter::All];
+
+    /// The value passed to `gh issue list --state`.
+    pub fn gh_state(self) -> &'static str {
+        match self {
+            IssueFilter::Open => "open",
+            IssueFilter::Closed => "closed",
+            IssueFilter::All => "all",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            IssueFilter::Open => "Open",
+            IssueFilter::Closed => "Closed",
+            IssueFilter::All => "All",
+        }
+    }
+}
 
 /// Identifies one browsed listing. The repository is compared without regard
-/// to case, as GitHub does.
+/// to case, as GitHub does. A listing of open Issues and one of closed Issues
+/// are different listings.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     provider: &'static str,
     repo: String,
-    query: &'static str,
+    filter: IssueFilter,
 }
 
 impl CacheKey {
-    /// The key for the open Issues of `repo` (`owner/name`) on GitHub.
-    pub fn github(repo: &str) -> Self {
+    /// The key for the `filter` Issues of `repo` (`owner/name`) on GitHub.
+    pub fn github(repo: &str, filter: IssueFilter) -> Self {
         Self {
             provider: PROVIDER_GITHUB,
             repo: repo.trim().to_ascii_lowercase(),
-            query: OPEN_QUERY,
+            filter,
         }
     }
 }
@@ -112,24 +140,35 @@ mod tests {
 
     #[test]
     fn keys_ignore_case_and_surrounding_space_but_not_the_repository() {
-        assert_eq!(CacheKey::github(" Owner/Repo "), CacheKey::github("owner/repo"));
-        assert_ne!(CacheKey::github("owner/repo"), CacheKey::github("owner/other"));
+        use IssueFilter::Open;
+        assert_eq!(CacheKey::github(" Owner/Repo ", Open), CacheKey::github("owner/repo", Open));
+        assert_ne!(CacheKey::github("owner/repo", Open), CacheKey::github("owner/other", Open));
     }
 
     #[test]
-    fn a_listing_is_kept_per_repository() {
+    fn a_listing_is_kept_per_repository_and_per_filter() {
+        use IssueFilter::{Closed, Open};
         let mut cache = IssueCache::default();
-        cache.put(CacheKey::github("a/one"), entry(&[1, 2]));
-        cache.put(CacheKey::github("b/two"), entry(&[9]));
-        assert_eq!(cache.get(&CacheKey::github("a/one")).unwrap().issues.len(), 2);
-        assert_eq!(cache.get(&CacheKey::github("b/two")).unwrap().issues[0].number, 9);
-        assert!(cache.get(&CacheKey::github("c/three")).is_none());
+        cache.put(CacheKey::github("a/one", Open), entry(&[1, 2]));
+        cache.put(CacheKey::github("a/one", Closed), entry(&[]));
+        cache.put(CacheKey::github("b/two", Open), entry(&[9]));
+        assert_eq!(cache.get(&CacheKey::github("a/one", Open)).unwrap().issues.len(), 2);
+        assert!(cache.get(&CacheKey::github("a/one", Closed)).unwrap().issues.is_empty());
+        assert_eq!(cache.get(&CacheKey::github("b/two", Open)).unwrap().issues[0].number, 9);
+        assert!(cache.get(&CacheKey::github("c/three", Open)).is_none());
+        assert!(cache.get(&CacheKey::github("a/one", IssueFilter::All)).is_none());
+    }
+
+    #[test]
+    fn each_filter_asks_gh_for_its_own_state() {
+        let states: Vec<&str> = IssueFilter::ALL.iter().map(|f| f.gh_state()).collect();
+        assert_eq!(states, ["open", "closed", "all"]);
     }
 
     #[test]
     fn a_response_for_another_repository_is_not_applied() {
-        let page = CacheKey::github("a/one");
-        let late = CacheKey::github("b/two");
+        let page = CacheKey::github("a/one", IssueFilter::Open);
+        let late = CacheKey::github("b/two", IssueFilter::Open);
         // The page moved to b/two; a/one's answer (request 1) arrives last.
         assert!(!may_apply(2, 1, Some(&late), &page));
         assert!(may_apply(2, 2, Some(&late), &late));
@@ -137,7 +176,7 @@ mod tests {
 
     #[test]
     fn an_overtaken_request_for_the_same_repository_is_not_applied() {
-        let key = CacheKey::github("a/one");
+        let key = CacheKey::github("a/one", IssueFilter::Open);
         assert!(!may_apply(3, 2, Some(&key), &key));
         assert!(may_apply(3, 3, Some(&key), &key));
         assert!(!may_apply(3, 3, None, &key));

@@ -32,7 +32,7 @@ test.describe('Sidebar Navigation', () => {
       'Context',
       'MCP Overview',
       'Worktrees',
-      'GitHub Issues',
+      'Issues',
       'GitHub PRs',
       'Settings',
     ];
