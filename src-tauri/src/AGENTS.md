@@ -29,7 +29,7 @@ Backend source for Tauri v2. This folder contains all Rust backend code organize
 
 ## AppState Pattern
 
-All command handlers receive `AppState` via Tauri's `manage()` mechanism. State
+Commands that need managed state receive `AppState` via Tauri's `manage()` mechanism. State
 is organized by domain: one field per feature area (`state.task`,
 `state.queue`, `state.agent`, ...), plus shared services such as the event sink
 and the resolved paths. The `AppState` struct in `lib.rs` is the authoritative
@@ -43,7 +43,7 @@ submodule.
 Commands are registered in `lib.rs` using `tauri::generate_handler!`. All commands must:
 1. Accept parameters matching the frontend's `invoke()` call
 2. Return `std::result::Result<T, E>` where E implements `serde::Serialize`
-3. Use `AppState` via `tauri::State<AppState>` parameter if needed
+3. Request `tauri::State<'_, AppState>` only if they need managed state; a command that needs no managed state takes no `tauri::State` parameter
 
 ## Tauri Commands Exposed
 
@@ -93,12 +93,14 @@ anything in `ipc/` or in `crates/slashit-ipc`.
 
 ## Managed state
 
-`lib.rs` calls `.manage()` exactly once, with `AppState`. Therefore **every
-command must take `tauri::State<'_, AppState>`** and reach sub-state through a
-field (`state.roadmap`, `state.task`, ...). A command that asks for
-`tauri::State<'_, RoadmapState>` compiles fine and then fails at run time with
-"state not managed", because Tauri resolves by `TypeId` against the managed
-map. This has already happened once; do not reintroduce it.
+`AppState` is the only managed root for subordinate state. A command that needs
+managed state requests **`tauri::State<'_, AppState>`** and reaches sub-state
+through a field (`state.roadmap`, `state.task`, ...). A command must not request
+a subordinate state type such as `tauri::State<'_, RoadmapState>`: it compiles
+and then fails at run time with "state not managed", because Tauri resolves by
+`TypeId` against the managed map. This has already happened once; do not
+reintroduce it. A command that needs no managed state takes no `tauri::State`
+parameter; do not add an unused `AppState` parameter to satisfy this rule.
 
 ## Paths
 
