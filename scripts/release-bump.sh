@@ -22,8 +22,9 @@
 #       file and a manifest with the SHA-256 of each original and of the content
 #       about to replace it. A run killed without a chance to clean up (SIGKILL,
 #       power loss) leaves it. While it exists every mode refuses to run. A kill
-#       before the journal is in place leaves only staged copies (<file>.bump.XXXXXX),
-#       which --recover and the next --apply remove. --recover
+#       before the journal is in place leaves only staged copies
+#       (<file>.release-bump-stage.XXXXXX), which --recover and the next --apply
+#       remove. --recover
 #       first checks every file: one still holding its original is left alone, one
 #       holding exactly what the run wrote is restored, and anything else (an edit
 #       made after the crash, a deleted file) makes it refuse, change nothing, and
@@ -175,7 +176,7 @@ classify() { # trust-lock|no
       [[ -z $x && -n $p && $p != /* && $p != -* && $p != *..* ]] &&
         [[ $o =~ ^[0-9a-f]{64}$|^-$ && $q =~ ^[0-9a-f]{64}$|^-$ ]] &&
         { [ "$q" != - ] || [ "$p" = Cargo.lock ]; } &&
-        { [ "$s" = - ] || [[ $s == "$p".bump.?????? ]]; } &&
+        { [ "$s" = - ] || [[ $s == "$p".release-bump-stage.?????? ]]; } &&
         if [ "$b" = - ]; then [ "$o" = - ] && [ "$p" = Cargo.lock ]; else [[ $b =~ ^[0-9]+$|^lock$ ]] && [ "$(hash_of "$journal/$b")" = "$o" ]; fi ||
         { bad_journal "entry $n is malformed or its original copy does not match"; return 1; }
       [ "$s" = - ] || leftovers+=("$s")
@@ -259,16 +260,18 @@ take_run_lock() {
 files=(src-tauri/tauri.conf.json package.json package-lock.json Cargo.toml src-tauri/Cargo.toml)
 for c in crates/*/Cargo.toml; do files+=("$c"); done
 
-# A run killed before its journal was in place leaves no journal, only the staged
-# copies beside each managed file (<file>.bump.XXXXXX) and an unfinished journal
-# directory. Removes them and prints how many. Called only under the run lock with
-# no journal present, so no live run can be writing them.
+# Leftovers of a run killed before its journal was in place, or during --recover:
+# the staged copies (<file>.release-bump-stage.XXXXXX), the restore copies
+# (<file>.release-bump-restore) and an unfinished journal directory. Each name is
+# specific to this tool, so an operator's file is never one of them. Removes them,
+# names each one on stderr, and prints how many. Called only under the run lock
+# with no journal present, so no live run can be writing them.
 sweep_stale() {
   local f s n=0
-  if [ -e "$journal.tmp" ]; then rm -rf -- "$journal.tmp" && n=1; fi
+  if [ -e "$journal.tmp" ]; then rm -rf -- "$journal.tmp" && n=1 && echo "$SELF: removed $journal.tmp" >&2; fi
   for f in "${files[@]}"; do
-    for s in "$f".bump.??????; do
-      [ -e "$s" ] && rm -f -- "$s" && n=$((n + 1))
+    for s in "$f".release-bump-stage.?????? "$f".release-bump-restore; do
+      [ -e "$s" ] && rm -f -- "$s" && n=$((n + 1)) && echo "$SELF: removed $s" >&2
     done
   done
   echo "$n"
@@ -280,7 +283,7 @@ if [ "$mode" = --recover ]; then
   if [ ! -e "$journal" ]; then
     n=$(sweep_stale)
     [ "$n" -gt 0 ] || refuse "no $journal here; nothing to recover"
-    echo "$SELF: removed $n staged file(s) left by a run that stopped before its journal existed; nothing else to recover"
+    echo "$SELF: removed $n leftover file(s) of a run that stopped before its journal existed; nothing else to recover"
     exit 0
   fi
   { [ -f "$writer_lock" ] && exec 9<>"$writer_lock"; } 2>/dev/null || { bad_journal "no writer lock"; exit 1; }
@@ -306,10 +309,6 @@ else
 fi
 [ ! -e "$journal" ] ||
   refuse "$journal exists: an earlier run did not finish. Run $SELF --recover to restore the original files"
-if [ "$mode" = --apply ]; then
-  n=$(sweep_stale)
-  [ "$n" -gt 0 ] && echo "$SELF: removed $n staged file(s) left by an earlier run that stopped before its journal existed"
-fi
 for f in "${files[@]}"; do [ -f "$f" ] || refuse "$f is missing"; done
 
 declare -A current=()
@@ -345,6 +344,10 @@ echo "  CHANGELOG.md                         curated section for $target present
 # A journal a successful run committed but did not finish deleting; only a mode
 # that changes files removes it.
 [ ! -e "$journal.done" ] || rm -rf -- "$journal.done"
+# Leftovers of an earlier killed run. Only after every refusal above has passed, so
+# a refused --apply changes nothing, operator files included.
+n=$(sweep_stale)
+[ "$n" -gt 0 ] && echo "$SELF: removed $n leftover file(s) of an earlier run that stopped before its journal existed"
 
 # --apply ---------------------------------------------------------------------
 # Three phases. 1: every rewritten file is written to a sibling temporary file and
@@ -407,7 +410,7 @@ renamed=()
 
 # Phase 1: stage. A failure here has changed nothing yet.
 for f in "${files[@]}"; do
-  t=$(mktemp -- "$f.bump.XXXXXX") ||
+  t=$(mktemp -- "$f.release-bump-stage.XXXXXX") ||
     { discard_staged; refuse "cannot create a temporary file beside $f"; }
   staged[$f]=$t
   if [ "$f" = package-lock.json ]; then

@@ -239,6 +239,20 @@ out=$(run --apply 0.0.5); st=$?
 if [ "$st" -eq 1 ] && [[ "$out" == *"no curated section"* ]]; then ok "an empty CHANGELOG section for the target is refused"
 else bad "empty changelog section was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
 
+echo "== operator files and leftovers of a refused run"
+make_repo "$repo" 0.0.3
+printf 'keep\n' >"$repo/Cargo.toml.bump.backup"
+out=$(run --apply 0.0.5); st=$?
+out_r=$(run --recover); st_r=$?
+if [ "$st" -eq 1 ] && [ "$st_r" -eq 1 ] && [ "$(cat "$repo/Cargo.toml.bump.backup")" = keep ]; then
+  ok "a refused --apply and a --recover with nothing to recover leave an operator file named *.bump.* alone"
+else bad "an operator file named like a staging copy was touched (apply $st, recover $st_r)"; printf '%s\n%s\n' "$out" "$out_r" >&2; fi
+printf 'stale restore\n' >"$repo/Cargo.toml.release-bump-restore"
+out=$(run --recover); st=$?
+if [ "$st" -eq 0 ] && [ ! -e "$repo/Cargo.toml.release-bump-restore" ] && [[ "$out" == *"removed Cargo.toml.release-bump-restore"* ]]; then
+  ok "a restore copy left by a killed --recover is removed, and the removal is named"
+else bad "a restore copy left behind was not removed (exit $st)"; printf '%s\n' "$out" >&2; fi
+
 out=$(run --apply 0.0.9-rc1); st=$?
 if [ "$st" -eq 2 ]; then ok "a prerelease or non-plain version is a usage error"
 else bad "invalid version not rejected (exit $st)"; fi
@@ -381,14 +395,14 @@ for f in src-tauri/tauri.conf.json package.json package-lock.json Cargo.toml src
 done
 
 echo "== SIGKILL before the journal exists: staged copies are cleared by --recover and by a new --apply"
-stray() { find "$repo" \( -name '*.bump.??????' -o -name '.release-bump-journal.tmp' \) | wc -l; }
+stray() { find "$repo" \( -name '*.release-bump-stage.??????' -o -name '*.release-bump-restore' -o -name '.release-bump-journal.tmp' \) | wc -l; }
 make_repo "$repo" 0.0.3
 printf 'original lock\n' >"$repo/Cargo.lock"
 before=$(digest "$repo")
 killed_at before .release-bump-journal --apply 0.0.4
 strays=$(stray)
 out=$(run --recover); st=$?
-if [ "$strays" -gt 0 ] && [ "$st" -eq 0 ] && [ "$(stray)" -eq 0 ] && [[ "$out" == *"removed $strays staged file"* ]] && [ "$before" = "$(digest "$repo")" ]; then
+if [ "$strays" -gt 0 ] && [ "$st" -eq 0 ] && [ "$(stray)" -eq 0 ] && [[ "$out" == *"removed $strays leftover file"* ]] && [ "$before" = "$(digest "$repo")" ]; then
   ok "killed before the journal ($strays leftover(s)): --recover removes them and restores the original digest"
 else bad "killed before the journal: --recover left $(stray) leftover(s) (exit $st, expected $strays removed)"; printf '%s\n' "$out" >&2; fi
 make_repo "$repo" 0.0.3
@@ -402,7 +416,7 @@ echo "== SIGKILL around the journal's own rename"
 make_repo "$repo" 0.0.3
 killed_at before .release-bump-journal --apply 0.0.4
 out=$(run --recover); st=$?
-v=$(grep -rl '0\.0\.4' "$repo" --include='*.json' --include='*.toml' | grep -v '\.bump\.' || true)
+v=$(grep -rl '0\.0\.4' "$repo" --include='*.json' --include='*.toml' | grep -v 'release-bump-stage' || true)
 if [ "$st" -eq 0 ] && [ -z "$v" ] && run --apply 0.0.4 >/dev/null; then
   ok "killed before the journal exists: no managed file changed, and a new --apply succeeds"
 else bad "killed before the journal: unexpected state (exit $st, changed: ${v:-none})"; printf '%s\n' "$out" >&2; fi
@@ -588,7 +602,7 @@ else bad "--recover after the holder exited failed (exit $st)"; printf '%s\n' "$
 echo "== a successful apply leaves no backup or staged file behind"
 make_repo "$repo" 0.0.3
 run --apply 0.0.4 >/dev/null; st=$?
-leftover=$(find "$repo" \( -name '*.bump.*' -o -name '.release-bump-journal*' \) | wc -l)
+leftover=$(find "$repo" \( -name '*.release-bump-stage.*' -o -name '*.release-bump-restore' -o -name '.release-bump-journal*' \) | wc -l)
 if [ "$st" -eq 0 ] && [ "$leftover" -eq 0 ]; then ok "apply removes its temporary and backup files"
 else bad "apply left files behind (exit $st, $leftover)"; fi
 
@@ -608,7 +622,7 @@ out_d=$(run --dry-run 0.0.4); st_d=$?
 wait "$pid_a"; st_a=$?
 if [ "$st_a" -eq 0 ] && [ "$st_b" -eq 1 ] && [ "$st_d" -eq 1 ] && [[ "$out_d" == *"in progress"* ]] && [[ "$out_b" == *"holds"* ]] &&
   ! journal_left && grep -q '"version": "0.0.4"' "$repo/src-tauri/tauri.conf.json" &&
-  grep -q '^version = "0.0.4"' "$repo/Cargo.toml" && ! find "$repo" -name '*.bump.*' | grep -q .; then
+  grep -q '^version = "0.0.4"' "$repo/Cargo.toml" && ! find "$repo" -name '*.release-bump-stage.*' | grep -q .; then
   ok "a second apply and a dry run are refused while the first stages; the first completes intact"
 else
   bad "concurrent apply: first exit $st_a, second exit $st_b, dry run exit $st_d"
@@ -616,9 +630,12 @@ else
 fi
 
 echo "== a process whose command line names the fixture but not the marker is not owned"
-env -u RELEASE_BUMP_TEST_RUN bash -c 'sleep 30' "$work/look-alike" &
+# Two commands, so bash does not exec sleep and drop the fixture path from the argv.
+env -u RELEASE_BUMP_TEST_RUN bash -c 'sleep 30; :' "$work/look-alike" &
 lookalike=$!
-if owned_pids | grep -qx "$lookalike"; then bad "a process without the marker was counted as owned"
+sleep 0.2
+if ! tr '\0' ' ' <"/proc/$lookalike/cmdline" 2>/dev/null | grep -qF "$work/look-alike"; then bad "precondition: the look-alike's command line does not name the fixture"
+elif owned_pids | grep -qx "$lookalike"; then bad "a process without the marker was counted as owned"
 else ok "ownership follows the environment marker, so a look-alike command line is not counted"; fi
 kill -KILL "$lookalike" 2>/dev/null; wait "$lookalike" 2>/dev/null
 
