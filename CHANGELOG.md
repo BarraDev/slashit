@@ -93,6 +93,10 @@ It names each file, says what was checked for it, and says what was not.
 - `--version` and `--help` answer without starting the desktop app or touching its state.
 - OpenCode Coding Workers get a native shell permission. Every action the policy
   does not name is denied.
+- **Visual identity.** The sidebar shows the SlashIt logo, expanded and collapsed,
+  in place of a generic "S" and the "Task orchestration" subtitle. On Linux the
+  tray entry is named SlashIt. The tray name was checked in isolated library tests,
+  not in an installed package.
 
 ### Security
 

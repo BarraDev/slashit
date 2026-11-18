@@ -293,7 +293,8 @@ Before you install 0.0.4, and before you go back to 0.0.3, quit SlashIt and
   the `refs/slashit/` references. Restoring the directories without it can leave
   worktree references inconsistent.
 
-Record a checksum of the copy. Restore everything together, with SlashIt closed.
+Record a checksum of the copy. Restore everything together, with both SlashIt and
+`slashitd` stopped.
 Changes made in 0.0.4 after the backup are lost when you restore it. Changes
 made on GitHub, such as pull requests and comments, are not restored by any file
 copy.
