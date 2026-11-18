@@ -113,8 +113,9 @@ It names each file, says what was checked for it, and says what was not.
 - A Worker run that starts after requested changes is told when its checkout
   already holds uncommitted edits.
 - Lifecycle milestones are never evicted to stay within the 200-entry Activity cap.
-- A Human Review approval is delivered only through its own action. Generic actions
-  no longer deliver unapproved work.
+- Creating a pull request for a Task in Human Review, singly or in bulk, now requires
+  a current approval, and `slashit move <task> done` refuses a Task in Human Review.
+  Approved delivery is unchanged.
 - The AI Reviewer's verdict is taken from its final result.
 - Each provider session records one "Session started" Activity entry.
 - A Worker run that finds its work already committed no longer adds an empty Task commit.

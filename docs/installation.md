@@ -177,10 +177,11 @@ sudo apt install ./SlashIt_0.0.4_amd64.deb
 slashit --version
 ```
 
-Not verified for 0.0.4. The 0.0.3 package declares dependencies on
+Not verified for 0.0.4. The 0.0.2 package was inspected and declared dependencies on
 `libwebkit2gtk-4.1-0`, `libgtk-3-0`, and `libayatana-appindicator3-1`, without
-version constraints. Not verified: the 0.0.4 package's dependencies, an actual
-install, and the commands above on a real system.
+version constraints. The 0.0.3 and 0.0.4 packages were not inspected the same way.
+Not verified: the dependencies of the 0.0.4 package, an actual install, and the
+commands above on a real system.
 
 The 0.0.4 package is expected to install:
 
@@ -189,7 +190,8 @@ The 0.0.4 package is expected to install:
 - `/usr/bin/slashit-ui` (the desktop app)
 - a desktop entry, `SlashIt`, which starts `slashit-ui`, and its icons
 
-It has no install or removal scripts. Removing it does not touch your data:
+The 0.0.2 package had no install or removal scripts, and the 0.0.4 package is
+expected to have none. Removing it does not touch your data:
 
 ```bash
 sudo apt remove slash-it
