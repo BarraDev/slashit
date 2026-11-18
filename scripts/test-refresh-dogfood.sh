@@ -243,6 +243,7 @@ esac
 STUB
 chmod +x "$work/sup-spaces"
 printf 'commit=%s\nsha256=x\n' "$old" >"$spaced/state/supervisor/state-writer"
+: >"$spaced/state/supervisor/backup/20260101-000000/complete"
 status_stopped; reset
 out=$(export SLASHIT_REFRESH_SUPERVISOR=$work/sup-spaces; run --check); st=$?
 if [[ "$out" == *"artifact:         $spaced/bin/slashit-ui"* ]] &&
@@ -250,6 +251,21 @@ if [[ "$out" == *"artifact:         $spaced/bin/slashit-ui"* ]] &&
   [[ "$out" == *"state writer:     ${old:0:12} forward=yes"* ]]; then
   ok "artifact, state base and state-writer paths containing spaces are read whole"
 else bad "a path with spaces was truncated (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== an incomplete backup is never reported as the latest recovery point"
+bdir=$spaced/state/supervisor/backup
+mkdir -p "$bdir/20260102-000000"; printf 'partial\n' >"$bdir/20260102-000000/manifest.sha256"
+out=$(export SLASHIT_REFRESH_SUPERVISOR=$work/sup-spaces; run --check)
+if [[ "$out" == *"latest backup:    $bdir/20260101-000000"* ]] &&
+  [[ "$out" == *"newest unmarked:  $bdir/20260102-000000 (not a verified recovery point"* ]]; then
+  ok "a newer unmarked directory is listed apart; the latest complete backup is still reported"
+else bad "an unmarked newer backup was reported as the latest recovery point"; printf '%s\n' "$out" >&2; fi
+rm -f "$bdir/20260101-000000/complete"
+out=$(export SLASHIT_REFRESH_SUPERVISOR=$work/sup-spaces; run --check)
+if [[ "$out" == *"latest backup:    none verified (no backup is marked complete)"* ]]; then
+  ok "with no backup marked complete, the report says none is verified rather than naming a directory"
+else bad "a directory without the marker was reported as verified"; printf '%s\n' "$out" >&2; fi
+rm -rf "$bdir/20260102-000000"; : >"$bdir/20260101-000000/complete"
 
 echo "== a status that exits 1 is not a verified running instance"
 status_running "$old"; reset

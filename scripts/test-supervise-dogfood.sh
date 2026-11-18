@@ -1176,12 +1176,13 @@ for i in 1 2 3 4 5 6; do
   restarts_ok=$((restarts_ok + 1))
 done
 # Count backup directories by glob, not by parsing ls output.
-kept=0
+kept=0 marked=0
 for dir in "$state"/supervisor/backup/[0-9]*/; do
   [ -d "$dir" ] && kept=$((kept + 1))
+  [ -f "$dir/complete" ] && marked=$((marked + 1))
 done
-if [ "$restarts_ok" -eq 6 ] && [ "$kept" -eq 5 ]; then ok "six successful restarts leave exactly five snapshots"
-else bad "after $restarts_ok successful restarts, $kept snapshots remain; expected exactly 5 after 6"; fi
+if [ "$restarts_ok" -eq 6 ] && [ "$kept" -eq 5 ] && [ "$marked" -eq 5 ]; then ok "six successful restarts leave exactly five snapshots, each marked complete"
+else bad "after $restarts_ok successful restarts, $kept snapshots remain ($marked marked complete); expected 5 marked after 6"; fi
 cleanup_instances
 
 # A small protected-state fixture: two compared files and two excluded ones.

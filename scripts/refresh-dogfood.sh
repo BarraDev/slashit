@@ -128,7 +128,14 @@ if [ -n "$writer_commit" ]; then
 elif [ -e "$writer_file" ]; then
   state_forward=NO
 fi
-latest_backup=$(ls -1d "$state_base"/supervisor/backup/[0-9]* 2>/dev/null | tail -n 1)
+# The newest backup the supervisor marked complete after verifying it. A newer
+# directory without the marker is shown apart: it is not a recovery point.
+latest_backup=
+latest_unmarked=
+while IFS= read -r d; do
+  if [ -f "$d/complete" ]; then latest_backup=$d; break; fi
+  [ -n "$latest_unmarked" ] || latest_unmarked=$d
+done < <(ls -1d "$state_base"/supervisor/backup/[0-9]* 2>/dev/null | sort -r)
 prev_commit=$(field "$prev_sidecar" commit)
 
 # Provenance facts for the report and the apply gate. The writer provenance comes
@@ -184,7 +191,8 @@ report() {
   echo "state writer:     $(short "$writer_commit") forward=$state_forward (target descends from the last build that wrote the state)"
   echo "artifact:         $binary"
   echo "built:            $(short "$built_commit") mode=${built_mode:-none} dirty=${built_dirty:-unknown} verified=$built_verified"
-  echo "latest backup:    ${latest_backup:-none}"
+  echo "latest backup:    ${latest_backup:-none verified (no backup is marked complete)}"
+  [ -z "$latest_unmarked" ] || echo "newest unmarked:  $latest_unmarked (not a verified recovery point; backups from before the marker are unmarked)"
   echo "rollback build:   $(short "$prev_commit") (in $(dirname "$binary")/previous/)"
   echo "running exe sha:  ${running_sha:-none read}${running_sha:+ (state-writer names it: $([ "$running_sha" = "$writer_sha" ] && echo yes || echo no))}"
   echo "selected artifact: $binary"

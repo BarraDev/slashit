@@ -1541,6 +1541,10 @@ write_backup() {
     fail "the backup copy under $dir does not match its manifest; it is kept for inspection"
   fi
   rm -f "$copy"
+  # The marker is written last. A directory without it failed or was interrupted,
+  # and refresh-dogfood.sh never reports it as a verified recovery point.
+  : >"$dir/complete" && sync -- "$dir" ||
+    fail "the backup copy under $dir verified but cannot be marked complete; it is kept for inspection"
   # A legacy migration keeps every earlier backup: the retention prune below is
   # for routine restarts only, and is skipped when the caller passes "keep".
   if [ "${1:-}" != keep ]; then
