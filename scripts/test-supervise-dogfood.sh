@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=210
+EXPECTED_TOTAL=212
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -2342,6 +2342,26 @@ if [ "$winners" -eq 1 ] && [ "$losers" -eq 1 ] && grep -qx 'provenance=legacy-at
   [ "$(compgen -G "$race/supervisor/backup/[0-9]*" | wc -l)" -eq 1 ] && [ "$(legacy_sums "$race")" = "$(legacy_sums "$race_ref")" ]; then
   ok "two simultaneous migrations: one writer, one backup, the loser refused, state unchanged"
 else bad "concurrent migrations were not serialized (exit $ra/$rb, writer: ${race_writer:-none})"; cat "$work/race-a.out" "$work/race-b.out" >&2; fi
+
+# A start that promotes the writer and then never answers leaves the writer naming the
+# verified build that exec'd. Forward recovery is starting that same build again: the
+# writer names it, so the gate accepts the retry, and the record becomes verified.
+fwd=$work/forward-state
+mkdir -p "$fwd"
+cleanup_instances
+out=$(sv SLASHIT_DOGFOOD_STATE="$fwd" SLASHIT_TEST_CLI_NEVER_ANSWERS=1 SLASHIT_TEST_STUB_ROLE=noquit SLASHIT_DOGFOOD_START_TIMEOUT=2 start 2>&1); st=$?
+cleanup_instances
+fwd_writer=$(cat "$fwd/supervisor/state-writer" 2>/dev/null)
+if [ "$st" -eq 1 ] && [[ "$out" == *"no answer on"* ]] && grep -qx "commit=$commit_id" <<<"$fwd_writer" &&
+  grep -qx 'provenance=verified-sidecar' <<<"$fwd_writer" && [ -z "$(stub_pid)" ]; then
+  ok "a start that promotes the writer and never answers leaves the writer on the build that exec'd, with no live child"
+else bad "a post-promotion startup failure did not leave the expected writer (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(sv SLASHIT_DOGFOOD_STATE="$fwd" SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+cleanup_instances
+if [ "$st" -eq 0 ] && grep -qx "commit=$commit_id" <<<"$(cat "$fwd/supervisor/state-writer" 2>/dev/null)" &&
+  grep -q '^state[[:space:]]verified' "$fwd/supervisor/instance" 2>/dev/null; then
+  ok "starting the same verified build again after that failure succeeds and records it as verified"
+else bad "forward recovery with the same verified build failed (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 echo
 if [ "$((passed + failed))" -ne "$EXPECTED_TOTAL" ]; then
