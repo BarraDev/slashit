@@ -9,7 +9,12 @@
 #       the running commit, whether the target is a descendant of the running
 #       commit (state is never handed to an older build), the built commit and
 #       whether the promoted binary still matches its sidecar, the latest state
-#       backup, and the rollback candidate. Changes nothing.
+#       backup, the rollback candidate, the running executable (read from /proc,
+#       not the selected artifact) and the state-writer provenance. Changes
+#       nothing. Exits 1 and names every "apply blocked" precondition (a missing
+#       state-writer record for existing state, a legacy running executable, a
+#       downgrade) when apply would refuse, so a clean report is never a promise
+#       that apply will run.
 #
 #   scripts/refresh-dogfood.sh --apply [REF]
 #       Refuses when the tree has uncommitted changes, when the running instance
@@ -126,6 +131,48 @@ fi
 latest_backup=$(ls -1d "$state_base"/supervisor/backup/[0-9]* 2>/dev/null | tail -n 1)
 prev_commit=$(field "$prev_sidecar" commit)
 
+# Provenance facts for the report and the apply gate. The writer provenance comes
+# from the record itself. The running executable is the file the live process
+# executes (/proc), never the selected artifact. Both are reported separately.
+writer_prov=missing
+if [ -e "$writer_file" ]; then
+  writer_prov=unmarked
+  grep -qx 'provenance=verified-sidecar' "$writer_file" 2>/dev/null && writer_prov=verified-sidecar
+  grep -qx 'provenance=legacy-attested' "$writer_file" 2>/dev/null && writer_prov=legacy-attested
+fi
+running_pid=$(printf '%s\n' "$status_out" | sed -n 's/^record: .*pid \([0-9][0-9]*\).*$/\1/p' | head -n 1)
+# The running image is hashed through /proc, not read by path: a verified start
+# removes its launch copy, so the link then ends in "(deleted)" while the bytes
+# stay readable through /proc/PID/exe.
+running_sha=
+if [ "$running" = running ] && [ -n "$running_pid" ]; then
+  running_sha=$(sha256sum "/proc/$running_pid/exe" 2>/dev/null | cut -d' ' -f1)
+fi
+writer_sha=$(field "$writer_file" sha256)
+root_mismatch=no
+[ -n "$running_sha" ] && [ "$running_sha" != "$actual_sha" ] && root_mismatch=yes
+has_state=no
+[ -n "$(find "$state_base/config/slashit-app" "$state_base/data/slashit-app" -type f -print -quit 2>/dev/null)" ] && has_state=yes
+
+# Why apply would refuse, in the order an operator must resolve them. The pending
+# check is always reported, so a dirty tree is never hidden behind a running target.
+blockers=()
+[ "$pending" -eq 0 ] || blockers+=("uncommitted changes in this checkout")
+if [ "$running" != running ] || [ "$running_commit" != "$target" ]; then
+  if [ "$has_state" = yes ] && [ "$writer_prov" = missing ]; then
+    blockers+=("no state-writer record for the existing state, so start and restart refuse; establish it with scripts/supervise-dogfood.sh migrate-legacy COMMIT SHA256 (legacy executable, instance stopped) or adopt COMMIT SHA256")
+  fi
+  [ "$state_forward" != NO ] || blockers+=("the target does not descend from the last build that wrote the state")
+  [ "$forward" != NO ] || blockers+=("the target does not descend from the running commit")
+  [ "$running" != running ] || [ "$forward" != n/a ] || blockers+=("the running commit (${running_commit:-none}) cannot be compared with the target")
+  if [ "$running" = running ] && [ -z "$running_sha" ] && [ -n "$running_pid" ]; then
+    blockers+=("the running executable of pid $running_pid cannot be read from /proc, so a failed restart could not be recovered")
+  fi
+  if [ "$running" = running ] && [ -n "$running_sha" ] && { [ "$writer_prov" != verified-sidecar ] || [ "$running_sha" != "$writer_sha" ]; }; then
+    blockers+=("the running executable (sha256 ${running_sha:0:12}) is not the build the verified state-writer names, so a restart cannot capture it for recovery; stop the instance cooperatively, then migrate-legacy or adopt")
+  fi
+fi
+
 short() { printf '%s' "${1:-none}" | cut -c1-12; }
 
 report() {
@@ -139,12 +186,22 @@ report() {
   echo "built:            $(short "$built_commit") mode=${built_mode:-none} dirty=${built_dirty:-unknown} verified=$built_verified"
   echo "latest backup:    ${latest_backup:-none}"
   echo "rollback build:   $(short "$prev_commit") (in $(dirname "$binary")/previous/)"
+  echo "running exe sha:  ${running_sha:-none read}${running_sha:+ (state-writer names it: $([ "$running_sha" = "$writer_sha" ] && echo yes || echo no))}"
+  echo "selected artifact: $binary"
+  echo "verification CLI: $(envf CLI)"
+  echo "state-writer prov: $writer_prov"
+  [ "$root_mismatch" = no ] || echo "note: the running executable differs from the selected artifact; a refresh replaces the running instance with the selected artifact"
+  [ -n "$prev_commit" ] || echo "warning: no verified rollback build beside the selected artifact"
+  if [ "${#blockers[@]}" -gt 0 ]; then printf 'apply blocked:    %s\n' "${blockers[@]}"; fi
 }
 
 if [ "$mode" = --check ]; then
   report
   [ "$running" != unverifiable ] || exit 3
   { [ "$pending" -eq 0 ] && [ "$state_forward" != NO ] && { [ "$running" != running ] || [ "$forward" = yes ]; }; } || exit 1
+  # A clean, forward target is not ready while a known precondition of apply is
+  # missing (the state-writer record, a legacy running executable, and so on).
+  [ "${#blockers[@]}" -eq 0 ] || exit 1
   exit 0
 fi
 
@@ -158,6 +215,11 @@ if [ "$running" = running ] && [ "$forward" != yes ]; then
 fi
 if [ "$state_forward" = NO ]; then
   echo "$SELF: refusing: the target does not descend from ${writer_commit:-an unreadable record}, the last build that wrote the state in $state_base; an older build never runs over newer state, even when stopped" >&2
+  exit 1
+fi
+if [ "${#blockers[@]}" -gt 0 ]; then
+  printf '%s\n' "$SELF: refusing: ${blockers[0]}" >&2
+  [ "${#blockers[@]}" -eq 1 ] || printf '%s\n' "$SELF: and ${#blockers[@]} more blocker(s) above; nothing was built, stopped or started" >&2
   exit 1
 fi
 if [ "$running" = running ] && [ "$running_commit" = "$target" ]; then

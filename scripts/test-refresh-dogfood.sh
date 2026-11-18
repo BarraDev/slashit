@@ -268,6 +268,43 @@ out=$(run --apply); st=$?
 if [ "$st" -eq 0 ] && [ "$(cat "$work/expect" 2>/dev/null)" = "$(git -C "$repo" rev-parse HEAD)" ]; then ok "start receives the requested target as SLASHIT_DOGFOOD_EXPECT_COMMIT"
 else bad "the supervisor did not receive the expected commit (exit $st, got '$(cat "$work/expect" 2>/dev/null)')"; printf '%s\n' "$out" >&2; fi
 
+echo "== preflight names the missing state-writer precondition for existing state"
+status_stopped; reset
+mkdir -p "$work/state/config/slashit-app" && echo "settings" >"$work/state/config/slashit-app/settings.toml"
+rm -f "$work/state/supervisor/state-writer"
+out=$(run --check); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"apply blocked:"*"no state-writer record"* ]] && [[ "$out" == *"state-writer prov: missing"* ]] && [ ! -f "$calls" ]; then
+  ok "--check exits 1 and names the missing state-writer when state exists and no record does"
+else bad "--check did not block on the missing state-writer (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(run --apply); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"refusing: no state-writer record"* ]] && [ ! -f "$calls" ]; then
+  ok "--apply refuses the same precondition before any build, stop or start"
+else bad "--apply did not refuse the missing state-writer (exit $st)"; printf '%s\n' "$out" >&2; fi
+mkdir -p "$work/state/supervisor"
+printf 'commit=%s\nsha256=0\nprovenance=legacy-attested\n' "$new" >"$work/state/supervisor/state-writer"
+out=$(run --check); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"state-writer prov: legacy-attested"* ]] && [[ "$out" != *"apply blocked"* ]] && [ ! -f "$calls" ]; then
+  ok "a legacy-attested writer that the target descends from is reported and is not a blocker"
+else bad "a legacy-attested writer blocked a forward target (exit $st)"; printf '%s\n' "$out" >&2; fi
+rm -rf "$work/state"
+
+echo "== a running image whose launch copy was removed is identified by its bytes, not its path"
+dead_copy=$work/launch-copy-sleep
+cp -p "$(command -v sleep)" "$dead_copy"
+"$dead_copy" 300 &
+live_pid=$!
+rm -f "$dead_copy"
+printf 'instance:       running (pid %s, mode gui, version x)\ncommit:         %s\nrecord:         started 2026-11-17T06:50:39Z, pid %s\n' "$live_pid" "$new" "$live_pid" >"$work/status"
+want_sha=$(sha256sum "/proc/$live_pid/exe" | cut -d' ' -f1)
+mkdir -p "$work/state/supervisor"
+printf 'commit=%s\nsha256=%s\nprovenance=verified-sidecar\n' "$new" "$want_sha" >"$work/state/supervisor/state-writer"
+out=$(run --check); st=$?
+kill "$live_pid" 2>/dev/null; wait "$live_pid" 2>/dev/null
+if [[ "$out" == *"running exe sha:  $want_sha (state-writer names it: yes)"* ]] && [[ "$out" != *"artifact-root mismatch"* ]] && [[ "$out" != *"apply blocked"* ]] && [ ! -f "$calls" ]; then
+  ok "a deleted launch copy is still identified by sha256 through /proc and matches the writer"
+else bad "a running image with a deleted path was misreported (exit $st)"; printf '%s\n' "$out" >&2; fi
+rm -rf "$work/state"
+
 echo
 echo "$pass passed, $fails failed"
 [ "$fails" -eq 0 ]
