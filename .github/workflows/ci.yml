@@ -82,7 +82,7 @@ jobs:
 
       # Both scripts are executed directly; a missing execute bit fails with exit 126.
       - name: Check the supervisor scripts are executable
-        run: test -x scripts/supervise-dogfood.sh && test -x scripts/test-supervise-dogfood.sh && test -x scripts/build-dogfood-app.sh && test -x scripts/test-build-dogfood-app.sh
+        run: test -x scripts/supervise-dogfood.sh && test -x scripts/test-supervise-dogfood.sh && test -x scripts/build-dogfood-app.sh && test -x scripts/test-build-dogfood-app.sh && test -x scripts/refresh-dogfood.sh && test -x scripts/test-refresh-dogfood.sh
 
       - name: Run the supervisor harness
         env:
@@ -93,6 +93,13 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
         run: scripts/test-build-dogfood-app.sh
+
+      # The refresh script's supervisor and build are stubs in this test, so it
+      # starts, stops and builds nothing. Its fixture repository is disposable.
+      - name: Run the dogfood refresh harness
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: scripts/test-refresh-dogfood.sh
 
   # The Linux validation is three independent jobs rather than one serial one,
   # so the wall-clock is the slowest of them, not their sum. Each installs and
