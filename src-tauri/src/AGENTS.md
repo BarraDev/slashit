@@ -44,7 +44,7 @@ submodule.
 Commands are registered in `lib.rs` using `tauri::generate_handler!`. All commands must:
 1. Accept parameters matching the frontend's `invoke()` call
 2. Return `std::result::Result<T, E>` where E implements `serde::Serialize`
-3. Request `tauri::State<'_, AppState>` only if they need managed state; a command that needs no managed state takes no `tauri::State` parameter
+3. Follow the Managed state rule below: take `tauri::State<'_, AppState>` only when they need domain state, reach sub-state through an `AppState` field, and never request a subordinate state type; a command that needs no managed state takes no `tauri::State` parameter
 
 ## Tauri Commands Exposed
 
