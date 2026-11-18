@@ -89,7 +89,8 @@ It names each file, says what was checked for it, and says what was not.
 - Pull-request review auto-push is off by default.
 - Pull-request status polling runs every five minutes, with a manual refresh and
   backoff, up to one hour, when GitHub rate-limits SlashIt.
-- The review-fix agent runs on the Task's configured model.
+- The review-fix agent runs on the Task's configured model and provider.
+- `--version` and `--help` answer without starting the desktop app or touching its state.
 - OpenCode Coding Workers get a native shell permission. Every action the policy
   does not name is denied.
 
@@ -112,6 +113,17 @@ It names each file, says what was checked for it, and says what was not.
 - A Worker run that starts after requested changes is told when its checkout
   already holds uncommitted edits.
 - Lifecycle milestones are never evicted to stay within the 200-entry Activity cap.
+- A Human Review approval is delivered only through its own action. Generic actions
+  no longer deliver unapproved work.
+- The AI Reviewer's verdict is taken from its final result.
+- Each provider session records one "Session started" Activity entry.
+- A Worker run that finds its work already committed no longer adds an empty Task commit.
+- A pull-request review Apply is bound to the pull-request head it analyzed, and reply
+  ownership is verified before a reply is posted.
+- A pull-request review apply refuses uncommitted edits it did not make.
+- An unreadable branch commit in Human Review is reported, with a retry.
+- Only review-fix runs that change the checkout's content are credited.
+- Updater release notes are rendered as safe Markdown.
 - Pull-request creation is confirmed from the remote before it is recorded, and an
   unconfirmed creation is listed under Needs You.
 - Email autolinks in Markdown stay clickable.
