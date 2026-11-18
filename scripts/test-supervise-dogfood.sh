@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=198
+EXPECTED_TOTAL=212
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -1170,18 +1170,23 @@ fi
 echo "== restart snapshots are bounded to the newest five"
 cleanup_instances
 sv start >/dev/null 2>&1 || bad "retention fixture: start failed"
+# A migration snapshot is retained: it sorts oldest, so only the retained marker keeps it.
+retained_dir=$state/supervisor/backup/00000000-000000-1
+mkdir -p "$retained_dir" && : >"$retained_dir/complete" && : >"$retained_dir/retained"
 restarts_ok=0
 for i in 1 2 3 4 5 6; do
   out=$(sv restart 2>&1) || { bad "restart $i of 6 failed"; printf '%s\n' "$out" >&2; break; }
   restarts_ok=$((restarts_ok + 1))
 done
 # Count backup directories by glob, not by parsing ls output.
-kept=0
+kept=0 marked=0
 for dir in "$state"/supervisor/backup/[0-9]*/; do
-  [ -d "$dir" ] && kept=$((kept + 1))
+  [ -d "$dir" ] && [ ! -f "$dir/retained" ] && kept=$((kept + 1))
+  [ -f "$dir/complete" ] && marked=$((marked + 1))
 done
-if [ "$restarts_ok" -eq 6 ] && [ "$kept" -eq 5 ]; then ok "six successful restarts leave exactly five snapshots"
-else bad "after $restarts_ok successful restarts, $kept snapshots remain; expected exactly 5 after 6"; fi
+if [ "$restarts_ok" -eq 6 ] && [ "$kept" -eq 5 ] && [ "$marked" -eq 6 ] && [ -f "$retained_dir/retained" ]; then ok "six successful restarts leave five routine snapshots and never prune a retained migration snapshot"
+else bad "after $restarts_ok successful restarts: $kept routine snapshots, $marked marked complete, retained kept: $([ -f "$retained_dir/retained" ] && echo yes || echo no)"; fi
+rm -rf "$retained_dir"
 cleanup_instances
 
 # A small protected-state fixture: two compared files and two excluded ones.
@@ -2220,6 +2225,143 @@ if [ "$st" -eq 1 ] && [ "$(cat "$writer")" = "$writer_before" ] && ! compgen -G 
 else
   bad "a child that failed before its exec changed the writer or left files (exit $st)"; printf '%s\n' "$out" >&2
 fi
+
+# ---- migrate-legacy: a one-time attestation for an executable whose sidecar
+# predates the commit field. Each case uses its own disposable state and binary.
+echo "== migrate-legacy: explicit, attested, stopped-only, and never a verified record"
+legacy_sums() { (cd "$1" && find config/slashit-app data/slashit-app -type f ! -path '*/logs/*' ! -path '*/worktrees/*' -exec sha256sum {} + 2>/dev/null | LC_ALL=C sort); }
+legacy_run() { # BINARY_DIR STATE COMMIT SHA256
+  sv SLASHIT_DOGFOOD_STATE="$2" SLASHIT_DOGFOOD_BINARY="$1/slashit-ui" SLASHIT_DOGFOOD_RUNTIME="$work/legacy-runtime" migrate-legacy "$3" "$4" 2>&1
+}
+leg_bin=$work/legacy-bin
+leg_state=$work/legacy-state
+mkdir -p "$leg_bin"
+cp -p "$bin_dir/slashit-ui" "$leg_bin/slashit-ui"
+# The legacy build record is inside the executable's bytes (a bash comment, so the stub still runs).
+printf '\n# unverified:%s\n' "$commit_id" >>"$leg_bin/slashit-ui"
+leg_sha=$(sha256sum <"$leg_bin/slashit-ui" | cut -d' ' -f1)
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$leg_sha" >"$leg_bin/slashit-ui.frontend"
+make_state "$leg_state"
+rm -f "$leg_state/supervisor/state-writer"
+leg_before=$(legacy_sums "$leg_state")
+zeros=$(printf '0%.0s' $(seq 64))
+other=$(printf 'a%.0s' $(seq 40))
+
+out=$(legacy_run "$leg_bin" "$leg_state" "$commit_id" "$zeros"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"is not the executable being attested"* ]] && [ ! -e "$leg_state/supervisor/state-writer" ] && [ "$(legacy_sums "$leg_state")" = "$leg_before" ]; then
+  ok "a wrong executable sha256 is refused; no writer is written and the state is unchanged"
+else bad "a wrong sha256 was not refused cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+out=$(legacy_run "$leg_bin" "$leg_state" "$other" "$leg_sha"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not embed exactly one build record for commit $other"* ]] && [ ! -e "$leg_state/supervisor/state-writer" ]; then
+  ok "a commit that the executable's embedded build record does not name is refused"
+else bad "a mismatched embedded commit was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+mkdir -p "$work/legacy-bin-commit"
+cp -p "$leg_bin/slashit-ui" "$work/legacy-bin-commit/slashit-ui"
+printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$leg_sha" "$commit_id" >"$work/legacy-bin-commit/slashit-ui.frontend"
+out=$(legacy_run "$work/legacy-bin-commit" "$leg_state" "$commit_id" "$leg_sha"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"names a commit, so this build has verified provenance"* ]] && [ ! -e "$leg_state/supervisor/state-writer" ]; then
+  ok "a sidecar that names a commit is not a legacy build; it goes through adopt"
+else bad "a commit-bearing sidecar was accepted as legacy (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+out=$(legacy_run "$leg_bin" "$leg_state" abc "$leg_sha"); st=$?
+out2=$(legacy_run "$leg_bin" "$leg_state" "$(printf 'A%.0s' $(seq 40))" "$leg_sha"); st2=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"COMMIT must be a full 40-character"* ]] && [ "$st2" -eq 1 ] && [[ "$out2" == *"COMMIT must be a full lowercase hex"* ]]; then
+  ok "a short or uppercase COMMIT is refused before anything is read"
+else bad "malformed COMMIT was not refused (short $st, upper $st2)"; fi
+
+mkdir -p "$work/legacy-bin-nosidecar"
+cp -p "$leg_bin/slashit-ui" "$work/legacy-bin-nosidecar/slashit-ui"
+out=$(legacy_run "$work/legacy-bin-nosidecar" "$leg_state" "$commit_id" "$leg_sha"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"is not an embedded frontend record"* ]] && [ ! -e "$leg_state/supervisor/state-writer" ]; then
+  ok "an executable without a matching embedded sidecar is refused"
+else bad "a missing sidecar was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+fresh=$work/fresh-migrate-state
+mkdir -p "$fresh"
+out=$(legacy_run "$leg_bin" "$fresh" "$commit_id" "$leg_sha"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"no persistent state"* ]] && [ ! -e "$fresh/supervisor/state-writer" ]; then
+  ok "a fresh installation is not migrated; it records its writer at its first start"
+else bad "a fresh installation was migrated (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# A backup that cannot be written refuses the migration before the writer changes.
+bk=$work/legacy-backup-fail
+make_state "$bk"; rm -f "$bk/supervisor/state-writer"
+: >"$bk/supervisor/backup"
+bk_before=$(legacy_sums "$bk")
+out=$(legacy_run "$leg_bin" "$bk" "$commit_id" "$leg_sha"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"the state backup failed"* ]] && [ ! -e "$bk/supervisor/state-writer" ] && [ "$(legacy_sums "$bk")" = "$bk_before" ]; then
+  ok "a failed backup refuses the migration; no writer is written and the state is unchanged"
+else bad "a failed backup did not refuse the migration cleanly (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# An existing verified writer is never replaced by a migration.
+writer_main_before=$(cat "$state/supervisor/state-writer")
+out=$(legacy_run "$leg_bin" "$state" "$commit_id" "$leg_sha"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"already exists"* ]] && [ "$(cat "$state/supervisor/state-writer")" = "$writer_main_before" ]; then
+  ok "an existing verified state-writer record is never replaced by a legacy migration"
+else bad "a verified writer was replaced or not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+out=$(legacy_run "$leg_bin" "$leg_state" "$commit_id" "$leg_sha"); st=$?
+writer_leg=$(cat "$leg_state/supervisor/state-writer" 2>/dev/null)
+if [ "$st" -eq 0 ] && grep -qx 'provenance=legacy-attested' <<<"$writer_leg" && grep -qx "commit=$commit_id" <<<"$writer_leg" &&
+  ! grep -qx 'provenance=verified-sidecar' <<<"$writer_leg" && [ "$(compgen -G "$leg_state/supervisor/backup/[0-9]*" | wc -l)" -eq 1 ] &&
+  [ "$(legacy_sums "$leg_state")" = "$leg_before" ]; then
+  ok "a valid legacy executable is migrated as legacy-attested, with a verified backup and unchanged state"
+else bad "the valid legacy migration did not complete as attested (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# A launch of a build whose commit does not descend from the legacy floor is refused.
+fwd=$work/legacy-forward-state
+make_state "$fwd"; rm -f "$fwd/supervisor/state-writer"
+printf 'commit=%s\nsha256=%s\nprovenance=legacy-attested\n' "$other" "$leg_sha" >"$fwd/supervisor/state-writer"
+out=$(sv SLASHIT_DOGFOOD_STATE="$fwd" SLASHIT_DOGFOOD_RUNTIME="$work/legacy-runtime" start 2>&1); st=$?
+cleanup_instances
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not provably descend"* ]] && [ -z "$(stub_pid)" ]; then
+  ok "a legacy-attested floor still enforces forward-only ancestry for a verified launch"
+else bad "a build that does not descend from the legacy floor was launched (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# A verified build that starts over the legacy record replaces it with its own verified record.
+# The stub instance answers on the suite's runtime endpoint, so this start uses it (no override).
+out=$(sv SLASHIT_DOGFOOD_STATE="$leg_state" start 2>&1); st=$?
+cleanup_instances
+writer_new=$(cat "$leg_state/supervisor/state-writer" 2>/dev/null)
+if [ "$st" -eq 0 ] && grep -qx 'provenance=verified-sidecar' <<<"$writer_new" && ! grep -qx 'provenance=legacy-attested' <<<"$writer_new"; then
+  ok "the first verified build that starts replaces the legacy attestation with its verified record"
+else bad "a verified start did not replace the legacy record (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# Two migrations at once: the lifecycle lock serializes them, so exactly one writer and one backup result.
+race=$work/legacy-race-state
+make_state "$race"; rm -f "$race/supervisor/state-writer"
+race_ref=$work/legacy-race-ref; make_state "$race_ref"
+legacy_run "$leg_bin" "$race" "$commit_id" "$leg_sha" >"$work/race-a.out" 2>&1 & pa=$!
+legacy_run "$leg_bin" "$race" "$commit_id" "$leg_sha" >"$work/race-b.out" 2>&1 & pb=$!
+wait "$pa"; ra=$?; wait "$pb"; rb=$?
+winners=$(( (ra == 0) + (rb == 0) )); losers=$(( (ra == 1) + (rb == 1) ))
+race_writer=$(cat "$race/supervisor/state-writer" 2>/dev/null)
+if [ "$winners" -eq 1 ] && [ "$losers" -eq 1 ] && grep -qx 'provenance=legacy-attested' <<<"$race_writer" &&
+  [ "$(compgen -G "$race/supervisor/backup/[0-9]*" | wc -l)" -eq 1 ] && [ "$(legacy_sums "$race")" = "$(legacy_sums "$race_ref")" ]; then
+  ok "two simultaneous migrations: one writer, one backup, the loser refused, state unchanged"
+else bad "concurrent migrations were not serialized (exit $ra/$rb, writer: ${race_writer:-none})"; cat "$work/race-a.out" "$work/race-b.out" >&2; fi
+
+# A start that promotes the writer and then never answers leaves the writer naming the
+# verified build that exec'd. Forward recovery is starting that same build again: the
+# writer names it, so the gate accepts the retry, and the record becomes verified.
+fwd=$work/forward-state
+mkdir -p "$fwd"
+cleanup_instances
+out=$(sv SLASHIT_DOGFOOD_STATE="$fwd" SLASHIT_TEST_CLI_NEVER_ANSWERS=1 SLASHIT_TEST_STUB_ROLE=noquit SLASHIT_DOGFOOD_START_TIMEOUT=2 start 2>&1); st=$?
+cleanup_instances
+fwd_writer=$(cat "$fwd/supervisor/state-writer" 2>/dev/null)
+if [ "$st" -eq 1 ] && [[ "$out" == *"no answer on"* ]] && grep -qx "commit=$commit_id" <<<"$fwd_writer" &&
+  grep -qx 'provenance=verified-sidecar' <<<"$fwd_writer" && [ -z "$(stub_pid)" ]; then
+  ok "a start that promotes the writer and never answers leaves the writer on the build that exec'd, with no live child"
+else bad "a post-promotion startup failure did not leave the expected writer (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(sv SLASHIT_DOGFOOD_STATE="$fwd" SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
+cleanup_instances
+if [ "$st" -eq 0 ] && grep -qx "commit=$commit_id" <<<"$(cat "$fwd/supervisor/state-writer" 2>/dev/null)" &&
+  grep -q '^state[[:space:]]verified' "$fwd/supervisor/instance" 2>/dev/null; then
+  ok "starting the same verified build again after that failure succeeds and records it as verified"
+else bad "forward recovery with the same verified build failed (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 echo
 if [ "$((passed + failed))" -ne "$EXPECTED_TOTAL" ]; then

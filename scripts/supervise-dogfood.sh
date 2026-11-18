@@ -73,6 +73,15 @@
 #       of state is assumed. A copy no frontend sidecar matches is refused before
 #       the stop unless the development server answers.
 #
+#   scripts/supervise-dogfood.sh migrate-legacy COMMIT SHA256
+#       One-time, for a stopped instance whose executable predates the sidecar
+#       commit field (adopt cannot name it). The operator attests COMMIT and
+#       SHA256; both must match the executable's bytes and its embedded
+#       `unverified:COMMIT` build record, and its sidecar must carry no commit.
+#       A verified state backup is taken first (kept, never pruned). The writer
+#       record is written with provenance=legacy-attested, never as
+#       verified-sidecar, and an existing writer is never replaced.
+#
 #   scripts/supervise-dogfood.sh env
 #       Print the declared environment and the resolved paths.
 #
@@ -174,23 +183,24 @@ fi
 usage() {
   echo "usage: $SELF {start|run|stop|restart|status|verify|env} [--force]" >&2
   echo "       $SELF adopt COMMIT SHA256" >&2
+  echo "       $SELF migrate-legacy COMMIT SHA256" >&2
   exit 2
 }
 
 verb=${1:-}
 [ -n "$verb" ] || usage
-if [ "$verb" = adopt ]; then
+if [ "$verb" = adopt ] || [ "$verb" = migrate-legacy ]; then
   [ "$#" -eq 3 ] || usage
   ADOPT_COMMIT=$2 ADOPT_SHA=$3
-  set -- adopt
+  set -- "$verb"
 fi
 [ "$#" -le 2 ] || usage
 case ${2:-} in "" | --force) ;; *) usage ;; esac
 case $verb in
-  start | run | stop | restart | status | verify | env | adopt) ;;
+  start | run | stop | restart | status | verify | env | adopt | migrate-legacy) ;;
   *) usage ;;
 esac
-case $verb in env | status | run | adopt) [ "${2:-}" = "" ] || usage ;; esac
+case $verb in env | status | run | adopt | migrate-legacy) [ "${2:-}" = "" ] || usage ;; esac
 case $verb in stop | restart) : ;; *) [ "${2:-}" != "--force" ] || usage ;; esac
 force=0
 [ "${2:-}" = "--force" ] && force=1
@@ -818,6 +828,9 @@ frontend_report() {
 # until adopted.
 LAUNCH_COMMIT=unknown
 PROVENANCE_MARK=provenance=verified-sidecar
+# Written only by migrate-legacy: the operator attested the legacy source boundary
+# of an executable whose sidecar predates the commit field. Never a verified record.
+LEGACY_MARK=provenance=legacy-attested
 state_writer_gate() {
   local writer
   LAUNCH_COMMIT=unknown
@@ -833,8 +846,11 @@ state_writer_gate() {
   fi
   writer=$(sed -n 's/^commit=//p' "$STATE_WRITER" 2>/dev/null | head -n 1)
   [ -n "$writer" ] || refuse "$STATE_WRITER names no commit, so no build can be proven safe for this state"
-  grep -qx "$PROVENANCE_MARK" "$STATE_WRITER" 2>/dev/null ||
-    refuse "$STATE_WRITER names commit $writer but not that it came from a verified sidecar; an earlier version of this script recorded a checkout HEAD for a build without one, so the build that last wrote this state is unknown. Nothing was started. Re-establish the writer with \`$SELF adopt COMMIT SHA256\` for the build verified to have written this state (see the header of this script)"
+  # A legacy-attested writer is accepted only as the ancestry floor for this launch.
+  # The launching build still carries its own verified sidecar (checked above), and
+  # its start replaces the record with a verified one.
+  grep -qx -e "$PROVENANCE_MARK" -e "$LEGACY_MARK" "$STATE_WRITER" 2>/dev/null ||
+    refuse "$STATE_WRITER names commit $writer but not that it came from a verified sidecar or a legacy migration; an earlier version of this script recorded a checkout HEAD for a build without one, so the build that last wrote this state is unknown. Nothing was started. Re-establish the writer with \`$SELF adopt COMMIT SHA256\` for the build verified to have written this state (see the header of this script)"
   [ "$writer" != "$LAUNCH_COMMIT" ] || return 0
   git -C "$(dirname "$BINARY")" merge-base --is-ancestor "$writer" "$LAUNCH_COMMIT" 2>/dev/null ||
     refuse "commit $LAUNCH_COMMIT of $BINARY does not provably descend from commit $writer, the last build that wrote this state; an older build must never run over newer state. After a JJ rewrite (squash, rebase, amend): remove $STATE_WRITER only if no newer build has written this state (verified by the owner)"
@@ -941,6 +957,75 @@ cmd_adopt() {
   fi
   rm -f "$tmp"
   fail "cannot create $STATE_WRITER; no record was written"
+}
+
+# One-time migration for an installation whose executable predates the sidecar
+# commit field, so `adopt` cannot name it. The operator attests the legacy source
+# boundary: COMMIT and SHA256 are checked against the bytes they name, never
+# against a checkout HEAD. The record is marked legacy-attested and is never
+# presented as verified-sidecar. It is written only while the instance is stopped,
+# after a backup of the protected state is verified, and only when no record
+# exists: an existing record is never replaced. It sets the floor that later builds
+# must descend from. The first verified build that starts afterwards replaces it.
+# Nothing is written when any check fails, and the state is never changed.
+cmd_migrate_legacy() {
+  case $ADOPT_COMMIT in *[!0-9a-f]* | '') refuse "COMMIT must be a full lowercase hex commit id ('$ADOPT_COMMIT')" ;; esac
+  [ "${#ADOPT_COMMIT}" -eq 40 ] || refuse "COMMIT must be a full 40-character commit id ('$ADOPT_COMMIT')"
+  case $ADOPT_SHA in *[!0-9a-f]* | '') refuse "SHA256 must be a lowercase hex digest ('$ADOPT_SHA')" ;; esac
+  [ "${#ADOPT_SHA}" -eq 64 ] || refuse "SHA256 must be a 64-character digest ('$ADOPT_SHA')"
+  [ ! -e "$STATE_WRITER" ] ||
+    refuse "$STATE_WRITER already exists; a legacy migration never replaces a state-writer record. Nothing was changed"
+  has_persistent_state ||
+    refuse "there is no persistent state under $STATE_BASE to migrate; a fresh installation records its writer at its first start"
+  # Stopped only: nothing may write state while the boundary is attested.
+  if ping_fields; then refuse "an instance answers on $ENDPOINT (pid $PING_PID); stop it before migrating"; fi
+  [ -e "$SOCKET" ] && refuse "the endpoint path $SOCKET exists; resolve it with \`$SELF status\` before migrating"
+  record_state
+  case $REC_STATE in match | unverifiable) refuse "the launch record names pid $REC_PID, which may still run; stop it before migrating" ;; esac
+  [ -n "$BINARY" ] && [ -f "$BINARY" ] && [ -x "$BINARY" ] || refuse "the installed binary is missing or not executable: ${BINARY:-unresolved}"
+  # Every check below reads the same private copy that a launch would execute.
+  launch_snapshot
+  timeout -k 2 "$CLI_TIMEOUT" "$LAUNCH_EXEC" --version >/dev/null 2>&1 ||
+    refuse "the binary does not answer --version; its provenance is unverifiable: $BINARY"
+  local sha
+  sha=$(sha256sum <"$LAUNCH_EXEC" 2>/dev/null | cut -d' ' -f1)
+  [ "$sha" = "$ADOPT_SHA" ] ||
+    refuse "the sha256 of $BINARY is ${sha:-unreadable}, not the stated $ADOPT_SHA; this is not the executable being attested"
+  frontend_mode "$LAUNCH_EXEC"
+  [ "$FRONTEND_MODE" = embedded ] ||
+    refuse "$BINARY.frontend is not an embedded frontend record for this executable ($FRONTEND_MODE); a legacy migration needs the embedded frontend"
+  # A sidecar that names a commit is modern provenance and goes through adopt.
+  if grep -q '^commit=' "$LAUNCH_EXEC.frontend" 2>/dev/null; then
+    refuse "$BINARY.frontend names a commit, so this build has verified provenance; use \`$SELF adopt COMMIT SHA256\` instead of a legacy migration"
+  fi
+  # The embedded build record is inside the bytes the sha256 above attests. It must
+  # name exactly the commit being attested, and no other.
+  local recorded
+  recorded=$(grep -a -o -E 'unverified:[0-9a-f]{40}' "$LAUNCH_EXEC" 2>/dev/null | sort -u)
+  [ "$recorded" = "unverified:$ADOPT_COMMIT" ] ||
+    refuse "$BINARY does not embed exactly one build record for commit $ADOPT_COMMIT (found: ${recorded:-none}); the attested commit does not match this executable"
+  state_snapshot "$STATE_BASE" >/dev/null ||
+    refuse "the state under $STATE_BASE cannot be read and checksummed, so its compatibility is unverifiable"
+  # The backup comes first. Nothing below runs unless it verifies.
+  local stamp
+  stamp=$(write_backup keep) ||
+    fail "the state backup failed; no state-writer record was written and the state is unchanged"
+  local tmp
+  tmp=$(mktemp "$STATE_WRITER.tmp.XXXXXX" 2>/dev/null) ||
+    fail "cannot create a temporary file beside $STATE_WRITER; the backup is $SUP_DIR/backup/$stamp"
+  # ln -T never replaces an existing file, so a record that appeared meanwhile wins.
+  if printf 'commit=%s\nsha256=%s\n%s\nbinary=%s\nbackup=%s\nwritten_at=%s\n' \
+    "$ADOPT_COMMIT" "$ADOPT_SHA" "$LEGACY_MARK" "$BINARY" "$stamp" "$(date -u +%FT%TZ)" >"$tmp" &&
+    sync -- "$tmp" && ln -T "$tmp" "$STATE_WRITER" 2>/dev/null; then
+    rm -f "$tmp"
+    launch_discard
+    sync -- "$SUP_DIR" || fail "migrated, but cannot sync $SUP_DIR; re-run status to confirm"
+    echo "$SELF: migrated legacy executable $ADOPT_SHA (commit $ADOPT_COMMIT, legacy-attested) as the writer of $STATE_BASE; backup $SUP_DIR/backup/$stamp"
+    exit 0
+  fi
+  rm -f "$tmp"
+  launch_discard
+  fail "cannot create $STATE_WRITER; no record was written. The backup is $SUP_DIR/backup/$stamp"
 }
 
 # The private copy that every launch checks and executes. It lives in a directory
@@ -1456,9 +1541,21 @@ write_backup() {
     fail "the backup copy under $dir does not match its manifest; it is kept for inspection"
   fi
   rm -f "$copy"
-  ls -1d "$SUP_DIR"/backup/[0-9]* 2>/dev/null | head -n -5 | while read -r old; do
-    rm -rf "$old"
-  done
+  # The marker is written last. A directory without it failed or was interrupted,
+  # and refresh-dogfood.sh never reports it as a verified recovery point.
+  # A migration backup ("keep") is also marked retained: routine pruning never removes it.
+  : >"$dir/complete" && { [ "${1:-}" != keep ] || : >"$dir/retained"; } && sync -- "$dir" ||
+    fail "the backup copy under $dir verified but cannot be marked complete; it is kept for inspection"
+  # A legacy migration keeps every earlier backup: the retention prune below is
+  # for routine restarts only, and is skipped when the caller passes "keep".
+  if [ "${1:-}" != keep ]; then
+    # Only unretained snapshots count toward the newest five.
+    ls -1d "$SUP_DIR"/backup/[0-9]* 2>/dev/null | while read -r old; do
+      [ -f "$old/retained" ] || printf '%s\n' "$old"
+    done | head -n -5 | while read -r old; do
+      rm -rf "$old"
+    done
+  fi
   printf '%s\n' "$stamp"
 }
 
@@ -1761,7 +1858,7 @@ resolve_cli
 cli_state
 
 case $verb in
-  start | run | stop | restart | adopt) lifecycle_lock ;;
+  start | run | stop | restart | adopt | migrate-legacy) lifecycle_lock ;;
 esac
 
 case $verb in
@@ -1773,4 +1870,5 @@ case $verb in
   status) cmd_status ;;
   verify) cmd_verify ;;
   adopt) cmd_adopt ;;
+  migrate-legacy) cmd_migrate_legacy ;;
 esac

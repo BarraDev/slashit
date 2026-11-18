@@ -37,7 +37,7 @@ cat >"$work/sup" <<STUB
 #!/usr/bin/env bash
 case "\$1" in
   status) cat "\$STUB_STATUS"; exit "\${STUB_STATUS_RC:-0}" ;;
-  env) printf 'STATE_BASE       %s\nBINARY           %s\nSTATE_WRITER     %s\n' "$work/state" "$repo/target/dogfood/slashit-ui" "$work/state/supervisor/state-writer" ;;
+  env) printf 'STATE_BASE       %s\nBINARY           %s\nSTATE_WRITER     %s\n' "$work/state" "\${STUB_BINARY:-$repo/target/dogfood/slashit-ui}" "$work/state/supervisor/state-writer" ;;
   restart) echo restart >>"$calls"; printf '%s\n' "\${SLASHIT_DOGFOOD_EXPECT_COMMIT-unset}" >>"$work/expect"; exit "\${STUB_RESTART_RC:-0}" ;;
   start) echo start >>"$calls"; printf '%s\n' "\${SLASHIT_DOGFOOD_EXPECT_COMMIT-unset}" >>"$work/expect"; exit 0 ;;
   *) echo "stub sup: \$*" >&2; exit 2 ;;
@@ -243,6 +243,7 @@ esac
 STUB
 chmod +x "$work/sup-spaces"
 printf 'commit=%s\nsha256=x\n' "$old" >"$spaced/state/supervisor/state-writer"
+: >"$spaced/state/supervisor/backup/20260101-000000/complete"
 status_stopped; reset
 out=$(export SLASHIT_REFRESH_SUPERVISOR=$work/sup-spaces; run --check); st=$?
 if [[ "$out" == *"artifact:         $spaced/bin/slashit-ui"* ]] &&
@@ -250,6 +251,34 @@ if [[ "$out" == *"artifact:         $spaced/bin/slashit-ui"* ]] &&
   [[ "$out" == *"state writer:     ${old:0:12} forward=yes"* ]]; then
   ok "artifact, state base and state-writer paths containing spaces are read whole"
 else bad "a path with spaces was truncated (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== an incomplete backup is never reported as the latest recovery point"
+bdir=$spaced/state/supervisor/backup
+mkdir -p "$bdir/20260102-000000"; printf 'partial\n' >"$bdir/20260102-000000/manifest.sha256"
+out=$(export SLASHIT_REFRESH_SUPERVISOR=$work/sup-spaces; run --check)
+if [[ "$out" == *"latest backup:    $bdir/20260101-000000"* ]] &&
+  [[ "$out" == *"newest unmarked:  $bdir/20260102-000000 (not a verified recovery point"* ]]; then
+  ok "a newer unmarked directory is listed apart; the latest complete backup is still reported"
+else bad "an unmarked newer backup was reported as the latest recovery point"; printf '%s\n' "$out" >&2; fi
+rm -f "$bdir/20260101-000000/complete"
+out=$(export SLASHIT_REFRESH_SUPERVISOR=$work/sup-spaces; run --check)
+if [[ "$out" == *"latest backup:    none verified (no backup is marked complete)"* ]]; then
+  ok "with no backup marked complete, the report says none is verified rather than naming a directory"
+else bad "a directory without the marker was reported as verified"; printf '%s\n' "$out" >&2; fi
+rm -rf "$bdir/20260102-000000"; : >"$bdir/20260101-000000/complete"
+
+echo "== an artifact override naming an older build is refused before anything is started"
+old_art=$work/old-artifact; mkdir -p "$old_art"
+printf 'older binary\n' >"$old_art/slashit-ui"
+osha=$(sha256sum "$old_art/slashit-ui" | cut -d' ' -f1)
+printf 'mode=embedded\nsha256=%s\nwasm=x.wasm\ncommit=%s\ndirty=no\n' "$osha" "$old" >"$old_art/slashit-ui.frontend"
+status_stopped; reset
+saved_head=$(git -C "$repo" rev-parse HEAD); git -C "$repo" checkout -q --detach "$new"
+out=$(export STUB_BINARY=$old_art/slashit-ui; run --apply "$new"); st=$?
+git -C "$repo" checkout -q --detach "$saved_head"
+if [ "$st" -eq 1 ] && [[ "$out" == *"is not a verified clean build of ${new:0:12}"* ]] && ! grep -qE '^(start|restart)$' "$calls" 2>/dev/null; then
+  ok "an override selecting an older artifact is refused; no start or restart reaches it"
+else bad "an older artifact selected by override was not refused before start (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 echo "== a status that exits 1 is not a verified running instance"
 status_running "$old"; reset
@@ -267,6 +296,61 @@ status_stopped; reset; rm -f "$work/expect"
 out=$(run --apply); st=$?
 if [ "$st" -eq 0 ] && [ "$(cat "$work/expect" 2>/dev/null)" = "$(git -C "$repo" rev-parse HEAD)" ]; then ok "start receives the requested target as SLASHIT_DOGFOOD_EXPECT_COMMIT"
 else bad "the supervisor did not receive the expected commit (exit $st, got '$(cat "$work/expect" 2>/dev/null)')"; printf '%s\n' "$out" >&2; fi
+
+echo "== preflight names the missing state-writer precondition for existing state"
+status_stopped; reset
+mkdir -p "$work/state/config/slashit-app" && echo "settings" >"$work/state/config/slashit-app/settings.toml"
+rm -f "$work/state/supervisor/state-writer"
+out=$(run --check); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"apply blocked:"*"no state-writer record"* ]] && [[ "$out" == *"state-writer prov: missing"* ]] && [ ! -f "$calls" ]; then
+  ok "--check exits 1 and names the missing state-writer when state exists and no record does"
+else bad "--check did not block on the missing state-writer (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(run --apply); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"refusing: no state-writer record"* ]] && [ ! -f "$calls" ]; then
+  ok "--apply refuses the same precondition before any build, stop or start"
+else bad "--apply did not refuse the missing state-writer (exit $st)"; printf '%s\n' "$out" >&2; fi
+echo "== a state-writer with no accepted provenance blocks --check and --apply alike"
+printf 'commit=%s\nsha256=0\n' "$new" >"$work/state/supervisor/state-writer"
+status_stopped; reset
+out=$(run --check); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"apply blocked:"*"names no accepted provenance"* ]] && [ ! -f "$calls" ]; then
+  ok "--check exits 1 for an unmarked state-writer, the same case --apply refuses"
+else bad "--check accepted an unmarked state-writer (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(run --apply); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"refusing: the state-writer record names no accepted provenance"* ]] && [ ! -f "$calls" ]; then
+  ok "--apply refuses the unmarked state-writer before any build, stop or start"
+else bad "--apply did not refuse the unmarked state-writer (exit $st)"; printf '%s\n' "$out" >&2; fi
+mkdir -p "$work/state/supervisor"
+printf 'commit=%s\nsha256=0\nprovenance=legacy-attested\n' "$new" >"$work/state/supervisor/state-writer"
+out=$(run --check); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"state-writer prov: legacy-attested"* ]] && [[ "$out" != *"apply blocked"* ]] && [ ! -f "$calls" ]; then
+  ok "a legacy-attested writer that the target descends from is reported and is not a blocker"
+else bad "a legacy-attested writer blocked a forward target (exit $st)"; printf '%s\n' "$out" >&2; fi
+rm -rf "$work/state"
+
+echo "== a running image whose launch copy was removed is identified by its bytes, not its path"
+dead_copy=$work/launch-copy-sleep
+cp -p "$(command -v sleep)" "$dead_copy"
+"$dead_copy" 300 &
+live_pid=$!
+# Unlink only once the child has exec'd the copy (bounded wait), so /proc names this image.
+exec_ok=no
+for _ in $(seq 50); do
+  [ "$(readlink -f "/proc/$live_pid/exe" 2>/dev/null)" = "$(readlink -f "$dead_copy")" ] && { exec_ok=yes; break; }
+  sleep 0.1
+done
+[ "$exec_ok" = yes ] || bad "the fixture process did not execute its copy within 5 seconds"
+rm -f "$dead_copy"
+printf 'instance:       running (pid %s, mode gui, version x)\ncommit:         %s\nrecord:         started 2026-11-17T06:50:39Z, pid %s\n' "$live_pid" "$new" "$live_pid" >"$work/status"
+want_sha=$(sha256sum "/proc/$live_pid/exe" | cut -d' ' -f1)
+mkdir -p "$work/state/supervisor"
+printf 'commit=%s\nsha256=%s\nprovenance=verified-sidecar\n' "$new" "$want_sha" >"$work/state/supervisor/state-writer"
+out=$(run --check); st=$?
+kill "$live_pid" 2>/dev/null; wait "$live_pid" 2>/dev/null
+if [[ "$out" == *"running exe sha:  $want_sha (state-writer names it: yes)"* ]] && [[ "$out" != *"artifact-root mismatch"* ]] && [[ "$out" != *"apply blocked"* ]] && [ ! -f "$calls" ]; then
+  ok "a deleted launch copy is still identified by sha256 through /proc and matches the writer"
+else bad "a running image with a deleted path was misreported (exit $st)"; printf '%s\n' "$out" >&2; fi
+rm -rf "$work/state"
 
 echo
 echo "$pass passed, $fails failed"
