@@ -1543,12 +1543,16 @@ write_backup() {
   rm -f "$copy"
   # The marker is written last. A directory without it failed or was interrupted,
   # and refresh-dogfood.sh never reports it as a verified recovery point.
-  : >"$dir/complete" && sync -- "$dir" ||
+  # A migration backup ("keep") is also marked retained: routine pruning never removes it.
+  : >"$dir/complete" && { [ "${1:-}" != keep ] || : >"$dir/retained"; } && sync -- "$dir" ||
     fail "the backup copy under $dir verified but cannot be marked complete; it is kept for inspection"
   # A legacy migration keeps every earlier backup: the retention prune below is
   # for routine restarts only, and is skipped when the caller passes "keep".
   if [ "${1:-}" != keep ]; then
-    ls -1d "$SUP_DIR"/backup/[0-9]* 2>/dev/null | head -n -5 | while read -r old; do
+    # Only unretained snapshots count toward the newest five.
+    ls -1d "$SUP_DIR"/backup/[0-9]* 2>/dev/null | while read -r old; do
+      [ -f "$old/retained" ] || printf '%s\n' "$old"
+    done | head -n -5 | while read -r old; do
       rm -rf "$old"
     done
   fi

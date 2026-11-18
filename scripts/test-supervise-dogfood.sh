@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=209
+EXPECTED_TOTAL=210
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -1170,6 +1170,9 @@ fi
 echo "== restart snapshots are bounded to the newest five"
 cleanup_instances
 sv start >/dev/null 2>&1 || bad "retention fixture: start failed"
+# A migration snapshot is retained: it sorts oldest, so only the retained marker keeps it.
+retained_dir=$state/supervisor/backup/00000000-000000-1
+mkdir -p "$retained_dir" && : >"$retained_dir/complete" && : >"$retained_dir/retained"
 restarts_ok=0
 for i in 1 2 3 4 5 6; do
   out=$(sv restart 2>&1) || { bad "restart $i of 6 failed"; printf '%s\n' "$out" >&2; break; }
@@ -1178,11 +1181,12 @@ done
 # Count backup directories by glob, not by parsing ls output.
 kept=0 marked=0
 for dir in "$state"/supervisor/backup/[0-9]*/; do
-  [ -d "$dir" ] && kept=$((kept + 1))
+  [ -d "$dir" ] && [ ! -f "$dir/retained" ] && kept=$((kept + 1))
   [ -f "$dir/complete" ] && marked=$((marked + 1))
 done
-if [ "$restarts_ok" -eq 6 ] && [ "$kept" -eq 5 ] && [ "$marked" -eq 5 ]; then ok "six successful restarts leave exactly five snapshots, each marked complete"
-else bad "after $restarts_ok successful restarts, $kept snapshots remain ($marked marked complete); expected 5 marked after 6"; fi
+if [ "$restarts_ok" -eq 6 ] && [ "$kept" -eq 5 ] && [ "$marked" -eq 6 ] && [ -f "$retained_dir/retained" ]; then ok "six successful restarts leave five routine snapshots and never prune a retained migration snapshot"
+else bad "after $restarts_ok successful restarts: $kept routine snapshots, $marked marked complete, retained kept: $([ -f "$retained_dir/retained" ] && echo yes || echo no)"; fi
+rm -rf "$retained_dir"
 cleanup_instances
 
 # A small protected-state fixture: two compared files and two excluded ones.
@@ -2324,6 +2328,20 @@ writer_new=$(cat "$leg_state/supervisor/state-writer" 2>/dev/null)
 if [ "$st" -eq 0 ] && grep -qx 'provenance=verified-sidecar' <<<"$writer_new" && ! grep -qx 'provenance=legacy-attested' <<<"$writer_new"; then
   ok "the first verified build that starts replaces the legacy attestation with its verified record"
 else bad "a verified start did not replace the legacy record (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+# Two migrations at once: the lifecycle lock serializes them, so exactly one writer and one backup result.
+race=$work/legacy-race-state
+make_state "$race"; rm -f "$race/supervisor/state-writer"
+race_ref=$work/legacy-race-ref; make_state "$race_ref"
+legacy_run "$leg_bin" "$race" "$commit_id" "$leg_sha" >"$work/race-a.out" 2>&1 & pa=$!
+legacy_run "$leg_bin" "$race" "$commit_id" "$leg_sha" >"$work/race-b.out" 2>&1 & pb=$!
+wait "$pa"; ra=$?; wait "$pb"; rb=$?
+winners=$(( (ra == 0) + (rb == 0) )); losers=$(( (ra == 1) + (rb == 1) ))
+race_writer=$(cat "$race/supervisor/state-writer" 2>/dev/null)
+if [ "$winners" -eq 1 ] && [ "$losers" -eq 1 ] && grep -qx 'provenance=legacy-attested' <<<"$race_writer" &&
+  [ "$(compgen -G "$race/supervisor/backup/[0-9]*" | wc -l)" -eq 1 ] && [ "$(legacy_sums "$race")" = "$(legacy_sums "$race_ref")" ]; then
+  ok "two simultaneous migrations: one writer, one backup, the loser refused, state unchanged"
+else bad "concurrent migrations were not serialized (exit $ra/$rb, writer: ${race_writer:-none})"; cat "$work/race-a.out" "$work/race-b.out" >&2; fi
 
 echo
 if [ "$((passed + failed))" -ne "$EXPECTED_TOTAL" ]; then

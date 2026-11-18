@@ -169,6 +169,9 @@ if [ "$running" != running ] || [ "$running_commit" != "$target" ]; then
   if [ "$has_state" = yes ] && [ "$writer_prov" = missing ]; then
     blockers+=("no state-writer record for the existing state, so start and restart refuse; establish it with scripts/supervise-dogfood.sh migrate-legacy COMMIT SHA256 (legacy executable, instance stopped) or adopt COMMIT SHA256")
   fi
+  # A record with neither accepted marker is refused by the supervisor's gate, so it blocks here too.
+  [ "$writer_prov" != unmarked ] ||
+    blockers+=("the state-writer record names no accepted provenance, so start and restart refuse it; establish it with adopt COMMIT SHA256 or migrate-legacy COMMIT SHA256")
   [ "$state_forward" != NO ] || blockers+=("the target does not descend from the last build that wrote the state")
   [ "$forward" != NO ] || blockers+=("the target does not descend from the running commit")
   [ "$running" != running ] || [ "$forward" != n/a ] || blockers+=("the running commit (${running_commit:-none}) cannot be compared with the target")
