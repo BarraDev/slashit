@@ -97,6 +97,8 @@ mod terminal_lifecycle;
 mod queue_settings;
 #[path = "product_acceptance/settings_appearance.rs"]
 mod settings_appearance;
+#[path = "product_acceptance/update_notice.rs"]
+mod update_notice;
 #[path = "product_acceptance/run_now.rs"]
 mod run_now;
 #[path = "product_acceptance/stacked_tasks.rs"]

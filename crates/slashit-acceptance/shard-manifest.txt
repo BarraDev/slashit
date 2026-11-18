@@ -103,6 +103,7 @@
 # Recovery of a pull request request whose outcome was never learned: left unanswered, blocked, discarded by the person, then one normal retry.
 1	pr_recovery::an_unanswered_pull_request_request_is_settled_by_the_person_and_a_retry_opens_exactly_one
 2	settings_appearance::settings_marks_the_open_section_and_offers_only_dark_appearance
+2	update_notice::update_notice_fits_both_widths_and_settings_keeps_the_detail
 # Public replies to PR review comments: posted only when selected, with the exact text shown.
 3	pr_comment_review::a_public_reply_is_posted_only_as_the_person_approved_its_exact_text
 3	pr_comment_analyze::analyze_builds_the_review_plan_from_github_and_the_triage_helper

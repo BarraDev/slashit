@@ -82,7 +82,7 @@ run_timed wasm_strip cargo run --quiet -p slashit-acceptance --bin strip-wasm-na
 wasm=$(find dist -maxdepth 1 -name '*_bg.wasm' -print)
 
 echo "==> cargo tauri build --debug --no-bundle (embedding the stripped dist/)"
-run_timed tauri_app_build cargo tauri build --debug --no-bundle --config '{"build":{"beforeBuildCommand":null}}'
+run_timed tauri_app_build cargo tauri build --debug --no-bundle --features updater-test-endpoints --config '{"build":{"beforeBuildCommand":null}}'
 
 echo "==> verify the acceptance application"
 run_timed build_verification cargo run --quiet -p slashit-acceptance --bin strip-wasm-names -- --check dist ||
