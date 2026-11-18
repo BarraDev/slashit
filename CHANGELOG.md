@@ -6,8 +6,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.0.4]
+
+An experimental prerelease. It is not production-ready. It keeps the startup
+mitigation for the Linux AppImage failure tracked in
+[issue #269](https://github.com/BarraDev/slashit/issues/269), which remains open
+until the official artifact of this release has been validated. It adds portable
+Project export and import, an Issues page with GitHub Issue links, a stricter
+pull-request review flow, and a source-level fix for Git over HTTPS from the
+AppImage, which is not yet confirmed in a packaged build.
+
+**Before you install this version, read the known issues below.** A board that
+this version writes can be unreadable by 0.0.3 when one of its Tasks uses a field
+this version added.
+
+**Installing.** Choose the installer for your platform and follow
+[`docs/installation.md`](https://github.com/BarraDev/slashit/blob/v0.0.4/docs/installation.md).
+It names each file, says what was checked for it, and says what was not.
+
 ### Added
 
+- **Portable Project export and import.** A Project can be exported to one
+  checksummed JSON file, with `slashit export` or from the desktop. A file is
+  checked with a read-only preview (`slashit import --preview`, or the desktop
+  Import dialog) and then applied as an inert Project. The SHA-256 checksum
+  detects damage; it does not authenticate the file. Imported Tasks keep no base
+  commit, and a Task in Human Review returns to Backlog. Export refuses a Project
+  with queued, running or AI-review Tasks. Credentials, runtime state, approvals
+  and local paths are not exported. See
+  [the export format](docs/architecture/portable-project-export.md).
+- **GitHub Issue links.** A Task can link GitHub Issues by URL, each at most once.
+  A generated pull-request body says "Fixes #N" only for an Issue in the same
+  repository, which GitHub closes on merge; any other Issue is named as related.
+- **Issues page.** Lists up to 100 GitHub Issues per repository, filterable by
+  Open, Closed or All, and keeps each listing in session memory. An Issue links
+  to an existing Task of the Project or creates one, and an Issue that already has
+  a Task in that Project is not linked twice.
+- **Publish to PR.** One reviewed commit can be pushed to a Task's existing pull
+  request under its own authorization. It does not approve the Task or change its
+  Human Review record.
+- **Human Review shows what an approval covers.** The panel names the exact
+  commit an approval binds, compares it with the Task branch and with the pull
+  request head GitHub last reported, and flags a stale head. Uncommitted edits in
+  the checkout are listed apart and are not approved.
+- **Worker and reviewer models.** The model of a Task's Worker or AI Reviewer is
+  chosen from the models that role can select at runtime, in a searchable picker.
+  Claude Code offers its aliases. OpenCode lists the models visible under the
+  Worker's isolated configuration.
+- **Review mode can be set when a Task is created with `slashit create
+  --review-mode`.** In the desktop app it is changed on an existing Task. The
+  `slashit` command-line client also inspects Tasks read-only, and the control
+  channel can write a Task's model, review mode and dependencies.
+- **About SlashIt** shows the build's version and diagnostics.
 - The control channel answers `GetTaskEvidence`, read-only: one Task's recent
   execution evidence, assembled from its persisted record and Activity (run
   outcomes and failure reasons, the AI-review outcome and signoff, the
@@ -24,6 +74,85 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   clean; a review a newer run began after is still reported, named as
   superseded by that run; and the `slashit runs` report renders every
   externally influenced value with terminal control sequences escaped.
+
+### Changed
+
+- An automatic AI Review runs only on a Claude reviewer model that the Task
+  names. A Task without one ends in Human Review, and the Activity log says that
+  no review ran. A skipped review is no longer recorded as a rejection.
+- A pull-request review reply is published only after the person approves its
+  exact text, and Sync posts only the approved replies it was asked to send.
+- Unresolved pull-request review fixes are held until a person resolves them. Their
+  edits are recorded before a fix agent can change the Task Checkout.
+- The pull-request review apply agent runs under Auto permission mode, not bypass,
+  with isolated customizations.
+- Pull-request review auto-push is off by default.
+- Pull-request status polling runs every five minutes, with a manual refresh and
+  backoff, up to one hour, when GitHub rate-limits SlashIt.
+- The review-fix agent runs on the Task's configured model.
+- OpenCode Coding Workers get a native shell permission. Every action the policy
+  does not name is denied.
+
+### Security
+
+- The Tauri core and the updater plugin were updated (Tauri 2.12.5, tauri-plugin-updater
+  2.14.1), moving the `zip` crate on the Windows updater path to 9.0.5.
+- Log lines no longer contain a full pull-request URL. A PR URL can come from
+  imported Task data, and the log now records only the pull-request number.
+
+### Fixed
+
+- **Git over HTTPS from the AppImage.** The AppImage no longer passes its bundled
+  library paths to host Git processes. A push from the packaged application
+  previously failed with a symbol lookup error, and no pull request was created.
+- The updater ignores an inherited `APPIMAGE` variable when it classifies the
+  install, and its refusal for a `.deb` install names the package manager.
+- Failed writes during Task lifecycle races are reported as failed writes, not as
+  missing Tasks.
+- A Worker run that starts after requested changes is told when its checkout
+  already holds uncommitted edits.
+- Lifecycle milestones are never evicted to stay within the 200-entry Activity cap.
+- Pull-request creation is confirmed from the remote before it is recorded, and an
+  unconfirmed creation is listed under Needs You.
+- Email autolinks in Markdown stay clickable.
+- The Settings view shows the selected section, and unsupported appearance controls
+  are removed.
+
+### Known issues
+
+- **A board can be unreadable by 0.0.3.** When one of a Project's Tasks uses a
+  field this version added, such as an AI reviewer model, a pull-request
+  publication, a pull-request reply record or a review-fix record, 0.0.3 skips
+  that Project's board at startup and refuses to save it. It does not change the
+  file. Other Projects are unaffected. Back up your SlashIt data before you install
+  this version, and before you go back to 0.0.3 (see [Your data](docs/installation.md#your-data)).
+  The rollback procedure has not been tested with a 0.0.3 binary.
+- **Activity can be lost on a downgrade.** A Task's Activity can exceed 200 entries,
+  because lifecycle milestones are kept. An older build keeps such a board as it is
+  until it records a new Activity entry. Then it removes the oldest tool entries
+  first, and the oldest entries of any kind when none is a tool entry.
+- **The Linux AppImage may fail to start.** This release keeps the mitigation for
+  [issue #269](https://github.com/BarraDev/slashit/issues/269). The official
+  artifact of this release has not been validated yet, and the bundled WebKitGTK
+  version of this release's build has not been confirmed.
+- **The AppImage's Git over HTTPS fix is not yet confirmed** in a packaged build.
+- **Terminal processes inherit a reduced realtime-priority limit.** While the
+  mitigation is active, the SlashIt GUI process and the terminals and agents it
+  starts have a soft `RLIMIT_RTPRIO` of 0. The hard limit is unchanged. The
+  `slashitd` daemon and the `slashit` command-line client do not apply it.
+- **The upstream WebKitGTK behavior is not fixed.** The mitigation works in
+  SlashIt's own process.
+- **The installers are not code-signed.** Windows SmartScreen and macOS
+  Gatekeeper warn on first launch. The updater's signatures are a different
+  mechanism and do not remove those warnings.
+- **Installation and launch are not verified on every platform.** The release
+  guide lists what was checked for each file, and treats an unverified platform as
+  untested.
+- **Updates have not been run end to end for this version.** An update interrupted
+  by a crash or a power loss has not been tested.
+- **Media playback was not tested for this build.**
+- The product acceptance checks use fake agent providers. A real agent provider
+  has not been run against this build.
 
 ## [0.0.3]
 
@@ -285,7 +414,8 @@ Known gaps in this prerelease:
 - The product acceptance checks use fake agent providers. A real provider has
   not been run against this build.
 
+[0.0.4]: https://github.com/BarraDev/slashit/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/BarraDev/slashit/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/BarraDev/slashit/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/BarraDev/slashit/releases/tag/v0.0.1
-[Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.3...HEAD
+[Unreleased]: https://github.com/BarraDev/slashit/compare/v0.0.4...HEAD
