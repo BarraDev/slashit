@@ -101,20 +101,13 @@ pub fn Sidebar(
             )>
                 {move || if collapsed.get() {
                     view! {
-                        <div data-testid="sidebar-logo" class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center">
-                            <span class="text-white font-bold text-sm">"S"</span>
-                        </div>
+                        <img data-testid="sidebar-logo" src="logo.svg" alt="SlashIt" class="w-8 h-8 shrink-0" />
                     }.into_any()
                 } else {
                     view! {
                         <div data-testid="sidebar-logo" class="flex items-center gap-3">
-                            <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center">
-                                <span class="text-white font-bold text-sm">"S"</span>
-                            </div>
-                            <div>
-                                <h1 class="font-semibold text-white/90">"SlashIt"</h1>
-                                <p class="text-xs text-white/30">"Task orchestration"</p>
-                            </div>
+                            <img src="logo.svg" alt="" class="w-8 h-8 shrink-0" />
+                            <h1 class="font-semibold text-white/90">"SlashIt"</h1>
                         </div>
                     }.into_any()
                 }}

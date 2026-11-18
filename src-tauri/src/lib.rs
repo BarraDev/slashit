@@ -385,6 +385,17 @@ pub fn run() {
                 use tauri::menu::{MenuBuilder, MenuItem};
                 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
+                // The hover name on Linux is the StatusNotifierItem title, which libayatana
+                // takes from the GLib application name (default: the binary, `slashit-ui`).
+                #[cfg(target_os = "linux")]
+                {
+                    extern "C" {
+                        fn g_set_application_name(application_name: *const std::ffi::c_char);
+                    }
+                    // Safety: the literal is a valid NUL-terminated string, and GLib copies it.
+                    unsafe { g_set_application_name(c"SlashIt".as_ptr()) };
+                }
+
                 let toggle_i = MenuItem::with_id(app, "toggle", "Show/Hide SlashIt", true, None::<&str>)?;
                 let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
                 let menu = MenuBuilder::new(app).items(&[&toggle_i, &quit_i]).build()?;
