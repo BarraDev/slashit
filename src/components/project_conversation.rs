@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::components::attention::AttentionChip;
+use crate::components::markdown::render_chat_markdown;
 use crate::components::task_activity::{compact_time, local_offset_at, OffsetAt};
 use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationExecution, ConversationExecutionResult, ConversationExecutionState, ConversationFieldChange, ConversationHumanAction, ConversationProjectAction, ConversationProjectActionOutcome, ConversationProjectActionStatus, ConversationRole, ConversationSnapshot, ConversationTaskMutation};
 use crate::services::conversation_service;
@@ -636,6 +637,8 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         value.conversation.entries.into_iter().flat_map(|entry| {
                             let when = entry_time(&entry.created_at, now, &local_offset_at);
                             let applied = match &entry.kind { ConversationEntryKind::ProjectActionApplied { action_id, .. } => Some(*action_id), _ => None };
+                            // Only the Coordinator's prose is Markdown. Human text stays as typed.
+                            let markdown = matches!(entry.kind, ConversationEntryKind::CoordinatorReply { .. });
                             let (testid, text) = match entry.kind {
                                 ConversationEntryKind::HumanMessage { text } | ConversationEntryKind::CoordinatorReply { text } => ("conversation-message", Some(text)),
                                 ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {} (Task {}): {}", action.target_task_title, action.target_task_id, action.request)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
@@ -647,7 +650,14 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                 ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", Some(project_action_event_text(kind, &project_actions).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
                             };
                             let role = match entry.role { ConversationRole::Human => "You", ConversationRole::Coordinator => "Coordinator", ConversationRole::Worker => "Worker" };
-                            let event = text.map(|text| view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 flex items-baseline justify-between gap-2 text-xs font-medium text-white/50"><span>{role}</span><span data-testid="conversation-entry-time" class="font-normal text-white/40">{when}</span></div><div class="whitespace-pre-wrap text-sm text-white/90">{text}</div></article> }.into_any());
+                            let event = text.map(|text| {
+                                let body = if markdown {
+                                    view! { <div class="prose prose-sm prose-invert max-w-none break-words text-white/90 prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0 prose-headings:my-2 prose-pre:my-2 prose-pre:bg-black/40 prose-pre:text-xs prose-code:text-xs prose-code:before:hidden prose-code:after:hidden" inner_html=render_chat_markdown(&text)></div> }.into_any()
+                                } else {
+                                    view! { <div class="whitespace-pre-wrap text-sm text-white/90">{text}</div> }.into_any()
+                                };
+                                view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 flex items-baseline justify-between gap-2 text-xs font-medium text-white/50"><span>{role}</span><span data-testid="conversation-entry-time" class="font-normal text-white/40">{when}</span></div>{body}</article> }.into_any()
+                            });
                             // The run an approval started appears beside the event that applied it, so the history keeps it after the proposal card is gone.
                             let card = applied.and_then(|action_id| executions.iter().find(|execution| execution.action_id == action_id).cloned()).map(|execution| {
                                 let approval = approval_text(project_actions.iter().find(|action| action.id == execution.action_id));

@@ -21,6 +21,12 @@ pub fn render_release_notes_markdown(src: &str) -> String {
     render(src, true)
 }
 
+/// Render a Coordinator reply like `render_safe_markdown`, but keep each
+/// source line on its own line, as the reply was written.
+pub fn render_chat_markdown(src: &str) -> String {
+    render(src, true)
+}
+
 fn render(src: &str, hard_line_breaks: bool) -> String {
     use pulldown_cmark::{html, Event, LinkType, Options, Parser, Tag, TagEnd};
 
@@ -61,7 +67,7 @@ fn render(src: &str, hard_line_breaks: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_release_notes_markdown, render_safe_markdown};
+    use super::{render_chat_markdown, render_release_notes_markdown, render_safe_markdown};
     use crate::services::is_safe_link_destination;
 
     #[test]
@@ -320,6 +326,17 @@ mod tests {
         assert_eq!(
             render_safe_markdown("First line\nSecond line").trim(),
             "<p>First line\nSecond line</p>"
+        );
+    }
+
+    #[test]
+    fn chat_replies_keep_lines_and_the_safety_rules() {
+        let html = render_chat_markdown(
+            "**Project** has 2 Tasks:\n- [a](javascript:alert(1)) **x**\n- <b onclick=x>b</b>\n\n```\nlet a = 1 < 2;\n```",
+        );
+        assert_eq!(
+            html.trim(),
+            "<p><strong>Project</strong> has 2 Tasks:</p>\n<ul>\n<li>a <strong>x</strong></li>\n<li>b</li>\n</ul>\n<pre><code>let a = 1 &lt; 2;\n</code></pre>"
         );
     }
 
