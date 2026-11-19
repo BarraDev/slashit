@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::components::attention::AttentionChip;
+use crate::components::conversation_composer::{self as composer, send_hint, shortcut_keys, KeyAction};
 use crate::components::markdown::render_chat_markdown;
 use crate::components::task_activity::{compact_time, local_offset_at, OffsetAt};
-use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationExecution, ConversationExecutionResult, ConversationExecutionState, ConversationFieldChange, ConversationHumanAction, ConversationProjectAction, ConversationProjectActionOutcome, ConversationProjectActionStatus, ConversationRole, ConversationSnapshot, ConversationTaskMutation};
+use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationExecution, ConversationExecutionResult, ConversationExecutionState, ConversationFieldChange, ConversationHumanAction, ConversationPendingSend, ConversationProjectAction, ConversationProjectActionOutcome, ConversationProjectActionStatus, ConversationRole, ConversationSnapshot, ConversationTaskMutation, SendShortcut};
 use crate::services::conversation_service;
 use chrono::{DateTime, Utc};
 use leptos::prelude::*;
@@ -301,6 +302,43 @@ struct EntryEvent {
     role: &'static str,
     text: String,
     markdown: bool,
+    /// The row's border and background, so kinds of entry read apart.
+    tone: &'static str,
+    /// The provider's own words, kept behind a disclosure when the headline replaces them.
+    detail: Option<String>,
+}
+
+/// The text a Coordinator run failure shows. The backend's turn-limit failure
+/// has a specific cause, so it gets a plain explanation; any other failure keeps its message.
+fn run_failure_headline(message: &str) -> String {
+    if is_turn_limit_failure(message) {
+        TURN_LIMIT_HEADLINE.to_string()
+    } else {
+        message.to_string()
+    }
+}
+
+const TURN_LIMIT_HEADLINE: &str = "The Coordinator used up its turn limit before it could reply. Your message is saved. Retry asks the Coordinator again for it, without saving the message a second time. SlashIt does not retry on its own, because each attempt uses provider tokens.";
+
+fn is_turn_limit_failure(message: &str) -> bool {
+    message.contains("error_max_turns")
+}
+
+/// The one status line under the history: what is happening now, from existing state only.
+fn run_state_text(value: &ConversationSnapshot, stop_requested: bool, approval_waiting: bool) -> &'static str {
+    if value.worker_live {
+        "Worker is running in the Task Checkout"
+    } else if value.coordinator_live && stop_requested {
+        "Stopping the run"
+    } else if value.coordinator_live {
+        "Coordinator is responding"
+    } else if approval_waiting {
+        "Waiting for your approval"
+    } else if value.turn_retry_available {
+        "Your last message has no reply. Retry is available."
+    } else {
+        "Conversation is ready"
+    }
 }
 
 fn entry_event(value: &ConversationSnapshot, id: Uuid) -> Option<EntryEvent> {
@@ -309,6 +347,16 @@ fn entry_event(value: &ConversationSnapshot, id: Uuid) -> Option<EntryEvent> {
     let project_actions = &value.conversation.project_actions;
     // Only the Coordinator's prose is Markdown. Human text stays as typed.
     let markdown = matches!(entry.kind, ConversationEntryKind::CoordinatorReply { .. });
+    let tone = match entry.kind {
+        ConversationEntryKind::HumanMessage { .. } => "border-indigo-400/50 bg-indigo-500/10",
+        ConversationEntryKind::CoordinatorReply { .. } => "border-white/25 bg-black/25",
+        ConversationEntryKind::RunFailed { .. } => "border-red-400/50 bg-red-500/10",
+        _ => "border-white/10 bg-white/[0.03]",
+    };
+    let detail = match &entry.kind {
+        ConversationEntryKind::RunFailed { message, .. } if is_turn_limit_failure(message) => Some(message.clone()),
+        _ => None,
+    };
     let (testid, text) = match entry.kind.clone() {
         ConversationEntryKind::HumanMessage { text } | ConversationEntryKind::CoordinatorReply { text } => ("conversation-message", Some(text)),
         ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {} (Task {}): {}", action.target_task_title, action.target_task_id, action.request)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
@@ -316,12 +364,12 @@ fn entry_event(value: &ConversationSnapshot, id: Uuid) -> Option<EntryEvent> {
         ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
         ConversationEntryKind::WorkerResult { result, .. } => ("conversation-worker-result", Some(result)),
         ConversationEntryKind::ActionWithdrawn { .. } => ("conversation-action-event", Some("You withdrew an earlier approval of a retired direct delegation. Nothing was started.".to_string())),
-        ConversationEntryKind::RunFailed { message, .. } => ("conversation-run-failed", Some(message)),
+        ConversationEntryKind::RunFailed { message, .. } => ("conversation-run-failed", Some(run_failure_headline(&message))),
         ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", Some(project_action_event_text(kind, project_actions).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
     };
     let text = text?;
     let role = match entry.role { ConversationRole::Human => "You", ConversationRole::Coordinator => "Coordinator", ConversationRole::Worker => "Worker" };
-    Some(EntryEvent { testid, role, text, markdown })
+    Some(EntryEvent { testid, role, text, markdown, tone, detail })
 }
 
 fn entry_when(value: &ConversationSnapshot, id: Uuid) -> Option<String> {
@@ -380,7 +428,11 @@ fn execution_card(execution: ConversationExecution, approval: &'static str) -> i
 #[component]
 pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let (snapshot, set_snapshot) = signal(None::<ConversationSnapshot>);
-    let (draft, set_draft) = signal(String::new());
+    let pid = project_id.clone();
+    let (draft, set_draft) = signal(composer::draft_text(&pid));
+    let (shortcut, set_shortcut) = signal(SendShortcut::default());
+    let (stop_requested, set_stop_requested) = signal(false);
+    composer::install_unload_flush();
     let (busy, set_busy) = signal(false);
     let (error, set_error) = signal(None::<String>);
     let (executions, set_executions) = signal(Vec::<ConversationExecution>::new());
@@ -394,6 +446,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         });
         request
     });
+    let settle_id = pid.clone();
     let publish_snapshot = Callback::new(move |(request, value): (u64, ConversationSnapshot)| {
         // A response can arrive after a Project switch has disposed this view.
         // The accessors below report that nothing is left, instead of panicking.
@@ -406,6 +459,10 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             // the signal re-renders every entry, so an unchanged poll must not set it.
             if current.as_ref() != Some(&value) {
                 let _ = set_executions.try_set(value.executions.clone());
+                // A send that this history confirms is settled here, so the composer does not keep its text.
+                if composer::settle_pending_send(&settle_id, &value) {
+                    let _ = set_draft.try_set(composer::draft_text(&settle_id));
+                }
                 let _ = set_snapshot.try_set(Some(value));
             }
             let _ = set_applied_snapshot_request.try_set(request);
@@ -453,18 +510,32 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let request = initial_begin_request.run(());
         let publish = initial_publish;
         spawn_local(async move {
+            // The saved draft is read first, so a send that was pending when the app stopped is settled against the history it belongs to.
+            if let Err(error) = composer::load_draft(&id).await { let _ = set_error.try_set(Some(error)); }
+            if let Ok(config) = conversation_service::get_conversations_config().await { let _ = set_shortcut.try_set(config.send_shortcut); }
             // Opening takes the Project lock, which a live run holds, so a page
             // remounted mid-run reads first and only opens a Conversation that
             // has never been opened.
             let loaded = match conversation_service::get_project_conversation(id.clone()).await {
                 Ok(value) => Ok(value),
-                Err(_) => conversation_service::open_project_conversation(id).await,
+                Err(_) => conversation_service::open_project_conversation(id.clone()).await,
             };
             match loaded {
                 Ok(value) => publish.run((request, value)),
                 Err(error) => { let _ = set_error.try_set(Some(error)); }
             }
+            let _ = set_draft.try_set(composer::draft_text(&id));
+            if let Err(error) = composer::flush(id).await { let _ = set_error.try_set(Some(error)); }
         });
+    });
+    // Leaving the page writes whatever the debounce has not written yet.
+    let cleanup_id = pid.clone();
+    on_cleanup(move || { spawn_local(async move { let _ = composer::flush(cleanup_id).await; }); });
+    // Clears the Stop request once the Run has ended, so the next Run is not shown as stopping.
+    Effect::new(move |_| {
+        if snapshot.with(|value| value.as_ref().is_some_and(|value| !value.coordinator_live)) {
+            set_stop_requested.set(false);
+        }
     });
     let poll_id = project_id.clone();
     let poll_begin_request = begin_snapshot_request;
@@ -515,41 +586,79 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let send_id = project_id.clone();
     let send_begin_request = begin_snapshot_request;
     let send_publish = publish_snapshot;
-    let on_send = move || {
-        let message = draft.get_untracked().trim().to_string();
-        if message.is_empty() || busy.get_untracked() { return; }
-        let revision_before = snapshot.get_untracked().map(|value| value.conversation.revision);
-        set_draft.set(String::new()); set_busy.set(true); set_error.set(None);
+    let on_send = Callback::new(move |()| {
+        let project = send_id.clone();
+        let message = composer::draft_text(&project).trim().to_string();
+        if !composer::can_send(&message, busy.get_untracked(), composer::send_blocked(&project)) { return; }
+        let Some(current) = snapshot.get_untracked() else { return; };
+        // The text stays in the composer until the history confirms the message, so a failure never loses it.
+        composer::begin_send(&project);
+        set_busy.set(true); set_error.set(None);
         follow_latest();
-        let id = send_id.clone();
         let request = send_begin_request.run(());
         let publish = send_publish;
-        let refresh_id = send_id.clone();
         let refresh_begin_request = send_begin_request;
-        let refresh_publish = send_publish;
+        let conversation_id = current.conversation.id;
         spawn_local(async move {
-            match conversation_service::send_project_message(id, message.clone()).await {
-                Ok(value) => publish.run((request, value)),
+            // The history count comes from the backend, not from this view, which may lag behind a
+            // reply that just landed. An older count could let an identical earlier message look like this one.
+            let entries_before = match conversation_service::get_project_conversation(project.clone()).await {
+                Ok(fresh) if fresh.conversation.id == conversation_id => fresh.conversation.entries.len(),
+                Ok(_) => { let _ = set_error.try_set(Some("The Conversation changed before the message was sent. Review it, then send again.".to_string())); composer::end_send(&project); let _ = set_busy.try_set(false); return; }
+                Err(error) => { let _ = set_error.try_set(Some(error)); composer::end_send(&project); let _ = set_busy.try_set(false); return; }
+            };
+            // The marker must be stored before the message can be saved, so a crash after the send still shows what was sent.
+            composer::arm_pending_send(&project, ConversationPendingSend { conversation_id, entries_before, message: message.clone() });
+            if let Err(error) = composer::flush(project.clone()).await {
+                composer::forget_pending_send(&project);
+                composer::end_send(&project);
+                let _ = set_error.try_set(Some(error));
+                let _ = set_busy.try_set(false);
+                return;
+            }
+            let known = match conversation_service::send_project_message(project.clone(), message).await {
+                Ok(value) => { publish.run((request, value.clone())); Some(value) }
                 Err(error) => {
-                    set_error.set(Some(error));
-                    // A failed send can still have saved the Human message. Reload first, and
-                    // restore the draft only when the Conversation did not change, so the
-                    // same message is never typed and saved twice.
-                    let refresh_request = refresh_begin_request.run(());
-                    let maybe_saved = match conversation_service::get_project_conversation(refresh_id).await {
+                    let _ = set_error.try_set(Some(error));
+                    // A failed send can still have saved the Human message. Read the history before deciding.
+                    match conversation_service::get_project_conversation(project.clone()).await {
                         Ok(value) => {
-                            let changed = revision_before.is_none_or(|before| value.conversation.revision != before);
-                            refresh_publish.run((refresh_request, value));
-                            changed
+                            publish.run((refresh_begin_request.run(()), value.clone()));
+                            Some(value)
                         }
-                        Err(_) => true,
-                    };
-                    if !maybe_saved && draft.get_untracked().is_empty() { set_draft.set(message); }
+                        Err(_) => None,
+                    }
+                }
+            };
+            composer::end_send(&project);
+            // Without a confirmed read the marker stays, and sending waits for the history to be read.
+            if let Some(value) = known {
+                if composer::settle_pending_send(&project, &value) {
+                    let _ = set_draft.try_set(composer::draft_text(&project));
                 }
             }
-            set_busy.set(false);
+            let _ = set_busy.try_set(false);
         });
-    };
+    });
+    let check_id = pid.clone();
+    let check_begin_request = begin_snapshot_request;
+    let check_publish = publish_snapshot;
+    let check_outcome = Callback::new(move |()| {
+        let id = check_id.clone();
+        let request = check_begin_request.run(());
+        let publish = check_publish;
+        spawn_local(async move {
+            match conversation_service::get_project_conversation(id.clone()).await {
+                Ok(value) => {
+                    publish.run((request, value.clone()));
+                    if composer::settle_pending_send(&id, &value) {
+                        let _ = set_draft.try_set(composer::draft_text(&id));
+                    }
+                }
+                Err(error) => { let _ = set_error.try_set(Some(error)); }
+            }
+        });
+    });
     let stop_id = StoredValue::new_local(project_id.clone());
     let approve_project_id = project_id.clone();
     let approve_begin_request = begin_snapshot_request;
@@ -661,12 +770,25 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             set_busy.set(false);
         });
     });
+    let key_project = pid.clone();
+    let button_project = pid.clone();
+    let outcome_project = pid.clone();
+    let on_key_down = move |event: web_sys::KeyboardEvent| {
+        // The primary shortcut key is Cmd on macOS and Ctrl elsewhere.
+        let primary = if composer::is_macos() { event.meta_key() } else { event.ctrl_key() };
+        let composing = event.is_composing() || event.key_code() == 229;
+        match composer::key_action(shortcut.get_untracked(), event.key() == "Enter", primary, event.shift_key(), event.alt_key(), composing, event.repeat()) {
+            KeyAction::Pass => {}
+            KeyAction::Suppress => event.prevent_default(),
+            KeyAction::Send => { event.prevent_default(); on_send.run(()); }
+        }
+    };
     view! {
             <section data-testid="project-conversation" class="flex h-full min-h-0 flex-col rounded-xl border border-white/10 bg-zinc-900/70 p-4">
                 <header class="mb-3 flex shrink-0 items-center justify-between">
                     <div><h2 class="text-lg font-semibold text-white">"Project Conversation"</h2><p class="text-xs text-white/50">"Talk with the Project Coordinator. Task work always asks for approval."</p></div>
                     <Show when=move || snapshot.get().is_some_and(|s| s.coordinator_live || s.worker_live)>
-                        <button data-testid="conversation-stop" class="rounded-md border border-red-400/40 px-3 py-1 text-sm text-red-200" on:click=move |_| { let id = stop_id.get_value(); spawn_local(async move { if let Err(error) = conversation_service::stop_project_conversation(id).await { set_error.set(Some(error)); } }); }>"Stop run"</button>
+                        <button data-testid="conversation-stop" class="rounded-md border border-red-400/40 px-3 py-1 text-sm text-red-200" disabled=move || stop_requested.get() on:click=move |_| { set_stop_requested.set(true); let id = stop_id.get_value(); spawn_local(async move { if let Err(error) = conversation_service::stop_project_conversation(id).await { let _ = set_stop_requested.try_set(false); let _ = set_error.try_set(Some(error)); } }); }>"Stop run"</button>
                     </Show>
                 </header>
                 <div class="mb-3 min-h-0 flex-1 space-y-2 overflow-y-auto" data-testid="conversation-history" node_ref=history_ref on:scroll=on_history_scroll>
@@ -686,9 +808,10 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                         let body = if event.markdown {
                                             view! { <div class="prose prose-sm prose-invert max-w-none break-words text-white/90 prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0 prose-headings:my-2 prose-pre:my-2 prose-pre:bg-black/40 prose-pre:text-xs prose-code:text-xs prose-code:before:hidden prose-code:after:hidden" inner_html=render_chat_markdown(&event.text)></div> }.into_any()
                                         } else {
-                                            view! { <div class="whitespace-pre-wrap text-sm text-white/90">{event.text}</div> }.into_any()
+                                            view! { <div class="whitespace-pre-wrap break-words text-sm text-white/90">{event.text}</div> }.into_any()
                                         };
-                                        view! { <article data-testid=event.testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 flex items-baseline justify-between gap-2 text-xs font-medium text-white/50"><span>{event.role}</span><span data-testid="conversation-entry-time" class="font-normal text-white/40">{move || when.get()}</span></div>{body}</article> }
+                                        let detail = event.detail.map(|raw| view! { <details class="mt-2 text-xs text-white/50"><summary class="cursor-pointer">"Technical detail"</summary><p class="mt-1 whitespace-pre-wrap break-words font-mono">{raw}</p></details> });
+                                        view! { <article data-testid=event.testid class=format!("min-w-0 rounded-lg border-l-2 px-3 py-2 {}", event.tone)><div class="mb-1 flex items-baseline justify-between gap-2 text-xs font-medium text-white/50"><span>{event.role}</span><span data-testid="conversation-entry-time" class="font-normal text-white/40">{move || when.get()}</span></div>{body}{detail}</article> }
                                     })}
                                     // The run an approval started appears beside the event that applied it, so the history keeps it after the proposal card is gone.
                                     {move || snapshot.with(|value| value.as_ref().and_then(|value| executions.with(|executions| applied_card(value, executions, id))))}
@@ -774,7 +897,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                     />
                 </div>
                 {move || snapshot.get().map(|value| {
-                    let status = if value.worker_live { "Worker is running in the Task Checkout" } else if value.coordinator_live { "Coordinator is responding" } else { "Conversation is ready" };
+                    let status = run_state_text(&value, stop_requested.get(), !pending_project_actions(&value).is_empty());
                     view! { <div data-testid="conversation-run-state" class="mb-2 shrink-0 text-xs text-white/50">{status}</div> }
                 })}
                 {move || {
@@ -806,10 +929,24 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                 {move || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value)).then(|| view! {
                     <p data-testid="conversation-awaiting-mediation" class="mb-2 shrink-0 text-xs text-amber-100/80">"A saved Worker result must be reviewed before you send another message."</p>
                 })}
-                <form class="flex shrink-0 items-end gap-2" on:submit=move |event: web_sys::SubmitEvent| { event.prevent_default(); on_send(); }>
-                    <textarea data-testid="conversation-message-input" class="min-h-16 flex-1 rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-white" placeholder="Ask about this Project…" prop:value=draft disabled=move || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value)) on:input=move |event| set_draft.set(event_target_value(&event))></textarea>
-                    <button data-testid="conversation-send" type="submit" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium" disabled=move || busy.get() || draft.get().trim().is_empty() || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value))>"Send"</button>
+                <form class="flex shrink-0 items-end gap-2" on:submit=move |event: web_sys::SubmitEvent| { event.prevent_default(); on_send.run(()); }>
+                    <textarea data-testid="conversation-message-input" class="min-h-16 flex-1 rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-white" placeholder="Ask about this Project…" aria-describedby="conversation-send-hint" attr:aria-keyshortcuts=move || shortcut_keys(shortcut.get(), composer::is_macos()) prop:value=draft disabled=move || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value)) on:input=move |event| { let text = event_target_value(&event); composer::set_draft_text(&key_project, text.clone()); set_draft.set(text); } on:keydown=on_key_down></textarea>
+                    <button data-testid="conversation-send" type="submit" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium" disabled=move || {
+                    // Every reactive read comes first. A short-circuit before the snapshot read would leave the button
+                    // without that subscription, so it would never re-enable once the draft loads.
+                    let busy_now = busy.get();
+                    let text = draft.get();
+                    let awaiting_result = snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value));
+                    busy_now || awaiting_result || composer::send_blocked(&button_project) || !composer::can_send(&text, false, false)
+                }>"Send"</button>
                 </form>
+                <p id="conversation-send-hint" data-testid="conversation-send-hint" class="mt-1 shrink-0 text-xs text-white/45">{move || send_hint(shortcut.get(), composer::is_macos())}</p>
+                {move || composer::outcome_unknown(&outcome_project).then(|| view! {
+                    <div data-testid="conversation-outcome-unknown" class="mt-2 flex shrink-0 items-center justify-between gap-3 rounded border border-amber-300/30 bg-amber-400/5 p-2 text-sm text-amber-100">
+                        <p>"SlashIt could not confirm whether your last message was saved. Sending stays paused until the history is read."</p>
+                        <button data-testid="conversation-check-outcome" class="shrink-0 rounded border border-amber-200/30 px-3 py-1" on:click=move |_| check_outcome.run(())>"Check history"</button>
+                    </div>
+                })}
                 {move || error.get().map(|message| view! { <p data-testid="conversation-error" class="mt-2 text-sm text-red-300">{message}</p> })}
             </section>
     }
@@ -1044,6 +1181,43 @@ mod tests {
         action.outcome = Some(ConversationProjectActionOutcome::AlreadyQueued { task_id, title: "Build it".into() });
         let found = project_action_event_text(&applied, std::slice::from_ref(&action)).unwrap();
         assert!(found.starts_with("Task was already in the queue") && found.contains("cannot tell"), "{found}");
+    }
+
+    #[test]
+    fn a_turn_limit_failure_gets_a_plain_headline_and_keeps_the_provider_text() {
+        let raw = "The Coordinator did not return a reply: error_max_turns: Reached maximum number of turns (4). The Coordinator used up its provider turns before it answered.";
+        assert!(is_turn_limit_failure(raw));
+        assert_eq!(run_failure_headline(raw), TURN_LIMIT_HEADLINE);
+        assert!(TURN_LIMIT_HEADLINE.contains("turn limit"));
+        assert!(!TURN_LIMIT_HEADLINE.to_lowercase().contains("error_max_turns"));
+        // Any other failure keeps its own message, unchanged.
+        let other = "The Coordinator did not return a reply: Invalid Coordinator JSON.";
+        assert!(!is_turn_limit_failure(other));
+        assert_eq!(run_failure_headline(other), other);
+    }
+
+    fn status_snapshot(coordinator_live: bool, worker_live: bool, turn_retry_available: bool) -> ConversationSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "conversation": {
+                "id": Uuid::nil(), "project_id": Uuid::nil(), "revision": 1,
+                "created_at": "", "updated_at": "", "entries": [], "actions": [],
+            },
+            "coordinator_live": coordinator_live, "worker_live": worker_live,
+            "run_status": null, "turn_retry_available": turn_retry_available,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_status_line_shows_only_states_the_snapshot_reports() {
+        assert_eq!(run_state_text(&status_snapshot(false, false, false), false, false), "Conversation is ready");
+        assert_eq!(run_state_text(&status_snapshot(true, false, false), false, false), "Coordinator is responding");
+        assert_eq!(run_state_text(&status_snapshot(true, false, false), true, false), "Stopping the run");
+        assert_eq!(run_state_text(&status_snapshot(false, true, false), true, true), "Worker is running in the Task Checkout");
+        assert_eq!(run_state_text(&status_snapshot(false, false, false), false, true), "Waiting for your approval");
+        assert_eq!(run_state_text(&status_snapshot(false, false, true), false, false), "Your last message has no reply. Retry is available.");
+        // After a restart nothing is live, so no run is reported as active and a stop request does not carry over.
+        assert_eq!(run_state_text(&status_snapshot(false, false, false), true, false), "Conversation is ready");
     }
 
     #[test]

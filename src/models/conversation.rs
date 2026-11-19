@@ -128,3 +128,20 @@ mod tests {
         assert!(shown != changed, "an action status change must reach the view");
     }
 }
+
+/// Mirrors `config::SendShortcut`. The default keeps Enter for a newline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendShortcut { #[default] ModifierEnter, Enter }
+/// Mirrors `config::ConversationsConfig`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConversationsConfig { pub send_shortcut: SendShortcut }
+/// Mirrors `config::PendingSend`: a send whose Human message may be saved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingSend { pub conversation_id: Uuid, pub entries_before: usize, pub message: String }
+/// Mirrors `config::ConversationDraft`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationDraft { pub seq: u64, pub text: String, #[serde(default, skip_serializing_if = "Option::is_none")] pub pending_send: Option<PendingSend> }

@@ -174,6 +174,8 @@ pub fn Settings(
                                             </div>
                                         </div>
 
+                                        <crate::components::conversation_settings::ConversationSendSettings />
+
                                         <div class="flex items-center justify-between p-4 rounded-xl bg-white/5 border border-white/10">
                                             <div>
                                                 <p class="font-medium text-white/90">"About SlashIt"</p>
