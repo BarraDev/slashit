@@ -22,6 +22,10 @@ const RELEASE: &str = "2026-11-17T10:00:00Z";
 const AVAILABLE: &str = "SlashIt 0.0.5 is available";
 /// One line of text-xs with padding. A taller button has wrapped.
 const MAX_BUTTON_HEIGHT: f64 = 40.0;
+/// Buttons on one row share a top edge; this absorbs subpixel rounding only.
+const ROW_TOLERANCE: f64 = 2.0;
+/// Delays each release listing answer, so a check stays busy long enough to observe.
+const LISTING_DELAY: Duration = Duration::from_millis(1500);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn update_notice_fits_both_widths_and_settings_keeps_the_detail() {
@@ -60,6 +64,10 @@ async fn check_notice(driver: &WebDriver) -> Result<()> {
     )
     .await?;
     await_selected_updates_tab(driver).await?;
+    press_check(driver).await?;
+    // The press starts a check that holds the button busy for LISTING_DELAY.
+    // A second press must wait for that check, then click exactly once.
+    await_check_button_busy(driver).await?;
     press_check(driver).await?;
     await_notice(
         driver,
@@ -122,6 +130,19 @@ fn check_actions(notice: &Notice, width: &str) -> Result<()> {
     }
     if labels.contains(&"Download and install") {
         bail!("{width}: an unsupported build offered an install button: {labels:?}");
+    }
+    let tops: Vec<f64> = buttons
+        .iter()
+        .filter_map(|b| b["rect"]["t"].as_f64())
+        .collect();
+    if tops.len() != buttons.len() {
+        bail!("{width}: could not measure the top edge of every action button");
+    }
+    let (highest, lowest) = tops
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(hi, lo), &t| (hi.min(t), lo.max(t)));
+    if lowest - highest > ROW_TOLERANCE {
+        bail!("{width}: the action buttons are stacked, not on one row (tops {tops:?})");
     }
     let card = &notice.0["card"];
     for button in &buttons {
@@ -204,17 +225,42 @@ async fn await_selected_updates_tab(driver: &WebDriver) -> Result<()> {
 }
 
 /// Presses the Settings check button, which is the path a person uses.
+///
+/// The button is looked up and clicked in one script on every retry, so it is
+/// never clicked while disabled and never clicked twice: the loop ends at the
+/// first successful click. While a check runs the label reads "Checking...",
+/// so the lookup accepts that label too and waits for it to end.
 async fn press_check(driver: &WebDriver) -> Result<()> {
-    let pressed = page(
-        driver,
-        "const b = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Check for updates'); if (!b || b.disabled) return false; b.click(); return true;",
-        vec![],
-    )
-    .await?;
-    if pressed != json!(true) {
-        bail!("the Check for updates button was not available to press");
+    const PRESS: &str = "const b = Array.from(document.querySelectorAll('button')).find(b => ['Check for updates', 'Checking...'].includes(b.textContent.trim())); \
+        if (!b) return 'absent'; if (b.disabled) return 'busy'; b.click(); return 'clicked';";
+    let started = Instant::now();
+    loop {
+        let state = page(driver, PRESS, vec![]).await?;
+        let state = state.as_str().unwrap_or_default();
+        if state == "clicked" {
+            return Ok(());
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            bail!(
+                "the Check for updates button never became available to press; last seen: {state}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Ok(())
+}
+
+/// Waits until the check button reads "Checking..." and is disabled.
+async fn await_check_button_busy(driver: &WebDriver) -> Result<()> {
+    await_condition("the check button is busy", || async {
+        let value = page(
+            driver,
+            "const b = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Checking...'); return !!b && b.disabled;",
+            vec![],
+        )
+        .await?;
+        Ok(value == json!(true))
+    })
+    .await
 }
 
 async fn press_notice_button(driver: &WebDriver, label: &str) -> Result<()> {
@@ -367,6 +413,9 @@ async fn answer(mut socket: TcpStream, download_base: &str) -> std::io::Result<(
         .next()
         .unwrap_or_default()
         .to_string();
+    if path == "/repos/x/y/releases" {
+        tokio::time::sleep(LISTING_DELAY).await;
+    }
     let (status, body) = match path.as_str() {
         "/repos/x/y/releases" => (
             "200 OK",
@@ -393,4 +442,35 @@ async fn answer(mut socket: TcpStream, download_base: &str) -> std::io::Result<(
     );
     socket.write_all(response.as_bytes()).await?;
     socket.shutdown().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two buttons on one row pass; the same two with one pushed below fail.
+    /// The browser journey cannot show this without a restyled page, so the
+    /// row rule is checked here on the measurements it reads.
+    #[test]
+    fn the_action_buttons_must_share_one_row() {
+        let button = |label: &str, left: f64, top: f64| {
+            json!({
+                "label": label,
+                "rect": { "l": left, "t": top, "r": left + 120.0, "b": top + 24.0, "h": 24.0 },
+                "wrap": "nowrap",
+            })
+        };
+        let notice = |later_top: f64| {
+            Notice(json!({
+                "text": "In-app install is unavailable here. See Settings > Updates.",
+                "card": { "l": 0.0, "t": 0.0, "r": 400.0, "b": 200.0 },
+                "buttons": [
+                    button("Skip this version", 150.0, 150.0),
+                    button("Later", 280.0, later_top),
+                ],
+            }))
+        };
+        assert!(check_actions(&notice(150.0), "test").is_ok());
+        assert!(check_actions(&notice(180.0), "test").is_err());
+    }
 }
