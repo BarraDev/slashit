@@ -111,12 +111,13 @@ acceptance-webdriver = ["dep:tauri-plugin-wdio-webdriver"]
 acp-fixture = []
 # TEST-ONLY. Lets an isolated test build read the releases listing and the
 # manifest location from a loopback address instead of GitHub, through the
-# `SLASHIT_UPDATER_TEST_*` variables in `update_feed`. Never enabled by the
-# release workflow. Without it the seam is not compiled: no variable is read
-# and no plaintext transport is accepted. A build with it is still a release
-# build (the updater refuses debug builds), and its test public key and
-# `plugins.updater.dangerousInsecureTransportProtocol` come from a test-only
-# `--config` file, never from the committed `tauri.conf.json`.
+# `SLASHIT_UPDATER_TEST_*` variables in `update_feed`. Only
+# `scripts/build-acceptance-app.sh` enables it; `release.yml` never does.
+# Without it the seam is not compiled: no variable is read and no plaintext
+# transport is accepted. That acceptance build is a debug build, so the updater
+# never installs from it, and the plugin only warns about a non-HTTPS endpoint
+# in debug builds (release builds refuse one). It needs no test key or
+# `--config` file.
 updater-test-endpoints = []
 
 [dev-dependencies]

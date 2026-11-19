@@ -5,7 +5,7 @@ use crate::components::markdown::render_release_notes_markdown;
 use crate::components::toast;
 use crate::components::update_banner::{
     abandon_stalled, check_now, request_restart, set_update_channel, start_install,
-    UpdaterActivity, UpdaterContext,
+    timestamp_label, UpdaterActivity, UpdaterContext,
 };
 use crate::services::updater_service::{format_bytes, CHANNEL_PRERELEASE, CHANNEL_STABLE};
 
@@ -310,8 +310,11 @@ fn UpdatesTab() -> impl IntoView {
                                     // reportable answer; a fake number is not.
                                     {move || ctx.current_version().unwrap_or_else(|| "Unknown".to_string())}
                                 </p>
-                                {move || ctx.last_check.get().map(|ts| view! {
-                                    <p class="text-xs text-white/40 mt-2">{format!("Last checked: {ts}")}</p>
+                                {move || ctx.last_check.get().map(|ts| {
+                                    let (shown, exact) = timestamp_label(&ts);
+                                    view! {
+                                        <p class="text-xs text-white/40 mt-2" title=exact>{format!("Last checked: {shown}")}</p>
+                                    }
                                 })}
                             </div>
                             {move || {
@@ -559,8 +562,8 @@ fn UpdatesTab() -> impl IntoView {
                                         <p class="text-xs text-white/50 mt-1">
                                             {format!("You are running {}.", update.current_version)}
                                         </p>
-                                        {update.date.clone().map(|d| view! {
-                                            <p class="text-xs text-white/35 mt-1">{format!("Released {d}")}</p>
+                                        {update.date.as_deref().map(timestamp_label).map(|(shown, exact)| view! {
+                                            <p class="text-xs text-white/35 mt-1" title=exact>{format!("Released {shown}")}</p>
                                         })}
                                     </div>
                                     {match blocked {

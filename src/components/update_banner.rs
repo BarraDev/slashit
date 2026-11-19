@@ -190,6 +190,40 @@ pub fn offer_matches_channel(offer_channel: Option<&str>, effective_channel: Opt
     matches!((offer_channel, effective_channel), (Some(offered), Some(effective)) if offered == effective)
 }
 
+/// The text a timestamp shows (local time in the browser's locale) and the exact
+/// value as the backend sent it, for a tooltip. A value that is not RFC 3339 is
+/// shown unchanged, so a malformed timestamp never breaks the row.
+pub fn timestamp_label(raw: &str) -> (String, String) {
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(at) => (local_display(at.timestamp_millis()), raw.to_string()),
+        Err(_) => (raw.to_string(), raw.to_string()),
+    }
+}
+
+fn local_display(millis: i64) -> String {
+    use wasm_bindgen::JsValue;
+    let options = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &options,
+        &JsValue::from_str("dateStyle"),
+        &JsValue::from_str("medium"),
+    );
+    let _ = js_sys::Reflect::set(
+        &options,
+        &JsValue::from_str("timeStyle"),
+        &JsValue::from_str("short"),
+    );
+    // An empty locale list means the browser's own locale.
+    let formatter = js_sys::Intl::DateTimeFormat::new(&js_sys::Array::new(), &options);
+    let date = js_sys::Date::new(&JsValue::from_f64(millis as f64));
+    formatter
+        .format()
+        .call1(&JsValue::UNDEFINED, &date)
+        .ok()
+        .and_then(|shown| shown.as_string())
+        .unwrap_or_else(|| String::from(date.to_string()))
+}
+
 /// Forgets the offer and everything found with it. Used whenever the channel an
 /// offer belongs to may no longer be the effective one. The installed version
 /// is left alone.
@@ -849,9 +883,12 @@ fn available_card(ctx: UpdaterContext) -> AnyView {
         return ().into_any();
     }
 
-    let blocked = ctx.blocked_reason();
+    // The full reason lives in Settings > Updates; the notice only points there,
+    // so a long package-manager message never competes with the buttons.
+    let can_install = ctx.blocked_reason().is_none();
     let headline = format!("SlashIt {} is available", update.version);
-    let subline = format!("You are running {}.", update.current_version);
+    let installed = format!("Installed version: {}", update.current_version);
+    let released = update.date.as_deref().map(timestamp_label);
     let later_version = update.version.clone();
     let skip_version = update.version.clone();
 
@@ -863,9 +900,12 @@ fn available_card(ctx: UpdaterContext) -> AnyView {
                 </svg>
                 <div class="min-w-0 flex-1">
                     <p class="font-medium">{headline}</p>
-                    <p class="text-xs text-white/50 mt-0.5">{subline}</p>
-                    {update.date.clone().map(|d| view! {
-                        <p class="text-xs text-white/35 mt-0.5">{format!("Released {d}")}</p>
+                    <p class="text-xs text-white/60 mt-0.5">{installed}</p>
+                    {released.map(|(shown, exact)| view! {
+                        <p class="text-xs text-white/40 mt-0.5" title=exact>{format!("Released {shown}")}</p>
+                    })}
+                    {(!can_install).then(|| view! {
+                        <p class="text-xs text-amber-200/80 mt-1">"In-app install is unavailable here. See Settings > Updates."</p>
                     })}
                 </div>
             </div>
@@ -875,31 +915,26 @@ fn available_card(ctx: UpdaterContext) -> AnyView {
                         set_skipped_version(&skip_version);
                         ctx.dismissed_version.set(Some(skip_version.clone()));
                     }
-                    class="px-2.5 py-1 rounded-lg text-xs text-white/50 hover:text-white/80 hover:bg-white/5"
+                    class="shrink-0 whitespace-nowrap px-2.5 py-1 rounded-lg text-xs text-white/50 hover:text-white/80 hover:bg-white/5"
                 >
                     "Skip this version"
                 </button>
                 <button
                     on:click=move |_| ctx.dismissed_version.set(Some(later_version.clone()))
-                    class="px-2.5 py-1 rounded-lg text-xs text-white/60 hover:text-white/90 hover:bg-white/5"
+                    class="shrink-0 whitespace-nowrap px-2.5 py-1 rounded-lg text-xs text-white/60 hover:text-white/90 hover:bg-white/5"
                 >
                     "Later"
                 </button>
                 // An install button on a build that cannot install is a lie, so
-                // the reason replaces the button rather than sitting next to it.
-                {match blocked {
-                    Some(reason) => view! {
-                        <p class="text-xs text-amber-200/80 text-right">{reason}</p>
-                    }.into_any(),
-                    None => view! {
-                        <button
-                            on:click=move |_| start_install(ctx)
-                            class="px-3 py-1.5 rounded-lg bg-amber-500 text-black text-xs font-semibold hover:bg-amber-400"
-                        >
-                            "Download and install"
-                        </button>
-                    }.into_any(),
-                }}
+                // it is left out entirely rather than shown disabled.
+                {can_install.then(|| view! {
+                    <button
+                        on:click=move |_| start_install(ctx)
+                        class="shrink-0 whitespace-nowrap px-3 py-1.5 rounded-lg bg-amber-500 text-black text-xs font-semibold hover:bg-amber-400"
+                    >
+                        "Download and install"
+                    </button>
+                })}
             </div>
         </div>
     }
@@ -1037,5 +1072,17 @@ mod tests {
         assert!(!offer_matches_channel(Some("stable"), None));
         assert!(!offer_matches_channel(None, Some("stable")));
         assert!(!offer_matches_channel(None, None));
+    }
+
+    #[test]
+    fn a_timestamp_that_is_not_rfc_3339_is_shown_exactly_as_sent() {
+        // The fallback never reaches the browser's date formatting, so it runs on
+        // the host. The local-time path needs the browser and is checked rendered.
+        let raw = "2026-07-01 12:00:00.0 +00:00:00";
+        assert_eq!(timestamp_label(raw), (raw.to_string(), raw.to_string()));
+        assert_eq!(
+            timestamp_label("garbage"),
+            ("garbage".to_string(), "garbage".to_string())
+        );
     }
 }
