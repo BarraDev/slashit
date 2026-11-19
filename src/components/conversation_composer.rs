@@ -127,17 +127,41 @@ struct Slot {
     pending: Option<ConversationPendingSend>,
     /// A send is in flight, from any view of this Project.
     sending: bool,
+    /// The store refused a write because it holds a newer draft. The next read adopts that draft.
+    refused: bool,
+    /// A background failure that no open view of this Project has shown yet.
+    error: Option<String>,
+    /// Bumped when `sending`, `pending` or `loaded` changes, so a view that shows
+    /// [`send_blocked`] or [`outcome_unknown`] updates when they do.
+    revision: ArcRwSignal<u64>,
 }
 
 thread_local! {
-    /// Where a background write's final failure is shown: the open composer's error line.
-    static ERROR_SINK: RefCell<Option<WriteSignal<Option<String>>>> = const { RefCell::new(None) };
+    /// Where a background write's final failure is shown: the error line of the open composer of that Project.
+    static ERROR_SINK: RefCell<Option<(String, WriteSignal<Option<String>>)>> = const { RefCell::new(None) };
     static SLOTS: RefCell<HashMap<String, Slot>> = RefCell::new(HashMap::new());
     static UNLOAD_HOOK: RefCell<Option<Closure<dyn FnMut()>>> = const { RefCell::new(None) };
 }
 
 fn with_slot<R>(project: &str, f: impl FnOnce(&mut Slot) -> R) -> R {
-    SLOTS.with(|slots| f(slots.borrow_mut().entry(project.to_string()).or_default()))
+    let (result, changed) = SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        let slot = slots.entry(project.to_string()).or_default();
+        let before = (slot.sending, slot.pending.clone(), slot.loaded);
+        let result = f(slot);
+        let changed = (before != (slot.sending, slot.pending.clone(), slot.loaded)).then(|| slot.revision.clone());
+        (result, changed)
+    });
+    // Notified after the borrow ends, so nothing that reacts can re-enter the slots.
+    if let Some(revision) = changed {
+        revision.update(|value| *value += 1);
+    }
+    result
+}
+
+/// Subscribe the calling reactive scope to the send state of a Project.
+fn track_send_state(project: &str) {
+    with_slot(project, |slot| slot.revision.clone()).track();
 }
 
 /// The composer text of a Project, including edits not yet saved.
@@ -149,18 +173,24 @@ pub fn draft_text(project: &str) -> String {
 /// draft has not been read yet. A send needs the draft loaded, because its
 /// marker cannot be written before the stored sequence is known.
 pub fn send_blocked(project: &str) -> bool {
+    track_send_state(project);
     with_slot(project, |slot| slot.sending || slot.pending.is_some() || !slot.loaded)
 }
 
 /// Whether a send's outcome is unknown. Sending waits until the history shows it.
 pub fn outcome_unknown(project: &str) -> bool {
+    track_send_state(project);
     with_slot(project, |slot| !slot.sending && slot.pending.is_some())
 }
 
-/// Show background save failures in the open composer. Replaced on every mount, so a
-/// closed view's signal is never written.
-pub fn set_error_sink(sink: WriteSignal<Option<String>>) {
-    ERROR_SINK.with(|cell| *cell.borrow_mut() = Some(sink));
+/// Show background save failures of `project` in the open composer. Replaced on every
+/// mount. A failure of another Project is kept for that Project's next view, and one
+/// kept for this Project is shown now.
+pub fn set_error_sink(project: &str, sink: WriteSignal<Option<String>>) {
+    ERROR_SINK.with(|cell| *cell.borrow_mut() = Some((project.to_string(), sink)));
+    if let Some(message) = with_slot(project, |slot| slot.error.take()) {
+        let _ = sink.try_set(Some(message));
+    }
 }
 
 /// Record the composer text and schedule its write.
@@ -184,17 +214,19 @@ fn arm_flush(project: String) {
     .forget();
 }
 
-fn show_background_error(message: String) {
-    ERROR_SINK.with(|cell| {
-        if let Some(sink) = *cell.borrow() {
-            let _ = sink.try_set(Some(message));
-        }
+fn show_background_error(project: &str, message: String) {
+    let shown = ERROR_SINK.with(|cell| match cell.borrow().as_ref() {
+        Some((owner, sink)) if owner == project => sink.try_set(Some(message.clone())).is_none(),
+        _ => false,
     });
+    if !shown {
+        with_slot(project, |slot| slot.error = Some(message));
+    }
 }
 
 /// A debounced write, retried a bounded number of times. A failure that persists is
-/// shown in the composer, so the text is never left unsaved without a warning.
-async fn flush_in_background(project: String) {
+/// shown in the composer of its Project, so the text is never left unsaved without a warning.
+pub async fn flush_in_background(project: String) {
     for attempt in 1..=BACKGROUND_SAVE_ATTEMPTS {
         // Nothing is written before the stored draft is read; the load path flushes once it is.
         if !with_slot(&project, |slot| slot.loaded) {
@@ -203,9 +235,9 @@ async fn flush_in_background(project: String) {
         match flush(project.clone()).await {
             Ok(()) => return,
             // A newer stored draft makes `flush` unload the slot. Retrying cannot help, so show it now.
-            Err(error) if !with_slot(&project, |slot| slot.loaded) => show_background_error(error),
+            Err(error) if !with_slot(&project, |slot| slot.loaded) => show_background_error(&project, error),
             Err(error) if attempt == BACKGROUND_SAVE_ATTEMPTS => {
-                show_background_error(format!("{error} SlashIt will keep the text and try again on your next change."));
+                show_background_error(&project, format!("{error} SlashIt will keep the text and try again on your next change."));
             }
             Err(_) => TimeoutFuture::new(BACKGROUND_RETRY_MS).await,
         }
@@ -219,22 +251,36 @@ pub async fn load_draft(project: &str) -> Result<(), String> {
         return Ok(());
     }
     let stored = conversation_service::get_conversation_draft(project.to_string()).await?;
-    with_slot(project, |slot| {
-        // The first completed read is applied. A second read that finishes later may hold older text.
-        if slot.loaded {
-            return;
+    with_slot(project, |slot| apply_stored(slot, stored))
+}
+
+/// Apply a completed read of the stored draft. Text typed before the first read is
+/// newer and kept. After a refused write the store is newer, so its text replaces the
+/// local text; the returned error says so.
+fn apply_stored(slot: &mut Slot, stored: Option<ConversationDraft>) -> Result<(), String> {
+    // The first completed read is applied. A second read that finishes later may hold older text.
+    if slot.loaded {
+        return Ok(());
+    }
+    let mut replaced = false;
+    if let Some(stored) = stored {
+        slot.seq = slot.seq.max(stored.seq);
+        if slot.refused {
+            replaced = slot.text != stored.text;
+            slot.text = stored.text;
+            slot.dirty = false;
+        } else if !slot.dirty {
+            slot.text = stored.text;
         }
-        if let Some(stored) = stored {
-            slot.seq = slot.seq.max(stored.seq);
-            if !slot.dirty {
-                slot.text = stored.text;
-            }
-            if slot.pending.is_none() {
-                slot.pending = stored.pending_send;
-            }
+        if slot.pending.is_none() {
+            slot.pending = stored.pending_send;
         }
-        slot.loaded = true;
-    });
+    }
+    slot.refused = false;
+    slot.loaded = true;
+    if replaced {
+        return Err("A newer draft saved elsewhere replaced the unsaved text in this composer.".to_string());
+    }
     Ok(())
 }
 
@@ -277,6 +323,7 @@ pub async fn flush(project: String) -> Result<(), String> {
                 // (reopening the Project) adopts its sequence; until then nothing is written or sent.
                 with_slot(&project, |slot| {
                     slot.loaded = false;
+                    slot.refused = true;
                     slot.dirty = true;
                 });
                 return Err("The draft store holds a newer draft. Reopen the Project to load it before sending.".to_string());
@@ -286,18 +333,17 @@ pub async fn flush(project: String) -> Result<(), String> {
     }
 }
 
-/// Write every Project's unsaved draft. Used when the page is being hidden or closed.
+/// Start a write of every Project's unsaved draft. Used when the page is being hidden or
+/// closed. Failures are shown like any background write's; nothing waits for the writes.
 pub fn flush_all() {
     let projects: Vec<String> = SLOTS.with(|slots| slots.borrow().iter().filter(|(_, slot)| slot.dirty).map(|(id, _)| id.clone()).collect());
     for project in projects {
-        spawn_local(async move {
-            let _ = flush(project).await;
-        });
+        spawn_local(flush_in_background(project));
     }
 }
 
-/// Flush unsaved drafts when the page is hidden. The webview may not finish the
-/// writes if the process exits first, which is why the debounce stays short.
+/// Flush unsaved drafts when the page is hidden. The writes are asynchronous, so the
+/// webview may not finish them if the process exits first; that is why the debounce stays short.
 pub fn install_unload_flush() {
     UNLOAD_HOOK.with(|hook| {
         if hook.borrow().is_some() {
@@ -508,6 +554,99 @@ mod tests {
         assert_eq!(settle_slot(&mut slot, &snapshot(id, after), false), Some(true));
         assert!(slot.pending.is_none());
         assert_eq!(slot.text, "");
+    }
+
+    fn revision(project: &str) -> u64 {
+        with_slot(project, |slot| slot.revision.get_untracked())
+    }
+
+    fn history(id: Uuid, texts: &[&str]) -> ConversationSnapshot {
+        snapshot(id, texts.iter().map(|text| entry(EntryKind::HumanMessage { text: (*text).into() })).collect())
+    }
+
+    #[test]
+    fn an_unknown_outcome_notifies_the_view_and_clears_once_after_recovery() {
+        let project = "outcome-transitions";
+        let id = Uuid::new_v4();
+        with_slot(project, |slot| {
+            slot.loaded = true;
+            slot.text = "now".into();
+        });
+        begin_send(project);
+        with_slot(project, |slot| slot.pending = Some(pending(id, 1, "now")));
+        assert!(!outcome_unknown(project) && send_blocked(project));
+        // The send ends and its recovery read fails: nothing settles, so the outcome is unknown.
+        let before = revision(project);
+        end_send(project);
+        assert!(revision(project) > before, "the panel must be told the outcome became unknown");
+        assert!(outcome_unknown(project) && send_blocked(project));
+        // A stale poll without the message proves nothing; sending stays blocked.
+        assert_eq!(with_slot(project, |slot| settle_slot(slot, &history(id, &["earlier"]), false)), None);
+        assert!(outcome_unknown(project));
+        // "Check history" reads a history that holds the message.
+        let before = revision(project);
+        let saved = history(id, &["earlier", "now"]);
+        assert_eq!(with_slot(project, |slot| settle_slot(slot, &saved, true)), Some(true));
+        assert!(revision(project) > before, "the panel must be told the outcome is known");
+        assert!(!outcome_unknown(project) && !send_blocked(project));
+        // A second read of the same history settles nothing, so no message is restored or sent twice.
+        assert_eq!(with_slot(project, |slot| settle_slot(slot, &saved, true)), None);
+        assert_eq!(draft_text(project), "");
+    }
+
+    #[test]
+    fn a_repeated_identical_message_is_confirmed_only_by_an_entry_after_its_own_marker() {
+        let id = Uuid::new_v4();
+        let mut slot = Slot { text: "yes".into(), pending: Some(pending(id, 2, "yes")), ..Slot::default() };
+        // The earlier "yes" sits before the marker, so a stale read holding only it confirms nothing.
+        assert_eq!(settle_slot(&mut slot, &history(id, &["earlier", "yes"]), false), None);
+        assert_eq!(slot.text, "yes");
+        // A recorded failure for the unanswered earlier message may come first; the new message still counts.
+        let mut later = history(id, &["earlier", "yes"]);
+        later.conversation.entries.push(entry(EntryKind::HumanMessage { text: "other".into() }));
+        assert_eq!(settle_slot(&mut slot.clone(), &later, false), None);
+        later.conversation.entries.push(entry(EntryKind::HumanMessage { text: "yes".into() }));
+        assert_eq!(settle_slot(&mut slot, &later, false), Some(true));
+    }
+
+    #[test]
+    fn a_refused_write_then_a_reload_keeps_the_newer_stored_text() {
+        let mut slot = Slot { loaded: true, seq: 3, text: "local".into(), dirty: true, ..Slot::default() };
+        // The flush's handling of a refused write.
+        slot.loaded = false;
+        slot.refused = true;
+        // Typing after the refusal does not make the local text authoritative.
+        slot.text = "local and more".into();
+        let stored = ConversationDraft { seq: 9, text: "newer".into(), pending_send: None };
+        assert!(apply_stored(&mut slot, Some(stored)).is_err(), "the replacement is reported");
+        assert_eq!(slot.text, "newer");
+        assert!(!slot.dirty, "nothing is written over the newer draft");
+        assert_eq!(slot.seq, 9);
+        assert!(slot.loaded && !slot.refused);
+    }
+
+    #[test]
+    fn text_typed_before_the_first_read_wins_and_a_late_second_read_is_ignored() {
+        let mut slot = Slot { text: "typed".into(), dirty: true, ..Slot::default() };
+        let stored = |text: &str, seq| Some(ConversationDraft { seq, text: text.into(), pending_send: None });
+        assert!(apply_stored(&mut slot, stored("old", 4)).is_ok());
+        assert_eq!((slot.text.as_str(), slot.seq, slot.dirty), ("typed", 4, true));
+        // A duplicate mount whose read finishes later holds no newer truth than the first.
+        assert!(apply_stored(&mut slot, stored("older", 2)).is_ok());
+        assert_eq!((slot.text.as_str(), slot.seq), ("typed", 4));
+    }
+
+    #[test]
+    fn a_background_failure_is_shown_only_in_its_own_project() {
+        let (a_error, set_a_error) = signal(None::<String>);
+        let (b_error, set_b_error) = signal(None::<String>);
+        set_error_sink("errors-b", set_b_error);
+        show_background_error("errors-a", "A failed".into());
+        assert_eq!(b_error.get_untracked(), None);
+        // The failure waits for Project A's next view.
+        set_error_sink("errors-a", set_a_error);
+        assert_eq!(a_error.get_untracked().as_deref(), Some("A failed"));
+        assert_eq!(with_slot("errors-a", |slot| slot.error.clone()), None);
     }
 
     #[test]

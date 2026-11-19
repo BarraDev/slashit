@@ -16,10 +16,14 @@ pub fn ConversationSendSettings() -> impl IntoView {
     let (loaded, set_loaded) = signal(false);
     let (saving, set_saving) = signal(false);
     spawn_local(async move {
-        if let Ok(config) = conversation_service::get_conversations_config().await {
-            let _ = set_shortcut.try_set(config.send_shortcut);
+        // Until the stored value is read the default shown may be wrong, so the choice stays disabled.
+        match conversation_service::get_conversations_config().await {
+            Ok(config) => {
+                let _ = set_shortcut.try_set(config.send_shortcut);
+                let _ = set_loaded.try_set(true);
+            }
+            Err(error) => toast::error(format!("The send key setting could not be read. Reopen Settings to try again. {error}")),
         }
-        let _ = set_loaded.try_set(true);
     });
 
     let choose = move |choice: SendShortcut| {
@@ -33,10 +37,17 @@ pub fn ConversationSendSettings() -> impl IntoView {
                 Ok(saved) => { let _ = set_shortcut.try_set(saved.send_shortcut); }
                 Err(error) => {
                     // The save may have reached the file before the error. Show what the file holds.
-                    if let Ok(config) = conversation_service::get_conversations_config().await {
-                        let _ = set_shortcut.try_set(config.send_shortcut);
+                    match conversation_service::get_conversations_config().await {
+                        Ok(config) => {
+                            let _ = set_shortcut.try_set(config.send_shortcut);
+                            toast::error(format!("The send key could not be confirmed as saved. The choice shown is the one the settings file holds. {error}"));
+                        }
+                        // The file could not be read either, so neither choice is known to be stored. Offer no choice until Settings is reopened.
+                        Err(_) => {
+                            let _ = set_loaded.try_set(false);
+                            toast::error(format!("The send key could not be saved or read back. Reopen Settings to see the stored choice. {error}"));
+                        }
                     }
-                    toast::error(format!("The send key could not be confirmed as saved. The choice shown is the one the settings file holds. {error}"));
                 }
             }
             let _ = set_saving.try_set(false);

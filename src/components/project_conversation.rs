@@ -435,7 +435,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     composer::install_unload_flush();
     let (busy, set_busy) = signal(false);
     let (error, set_error) = signal(None::<String>);
-    composer::set_error_sink(set_error);
+    composer::set_error_sink(&pid, set_error);
     let (executions, set_executions) = signal(Vec::<ConversationExecution>::new());
     let (next_snapshot_request, set_next_snapshot_request) = signal(0u64);
     let (applied_snapshot_request, set_applied_snapshot_request) = signal(0u64);
@@ -535,9 +535,9 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             if let Err(error) = composer::flush(id).await { let _ = set_error.try_set(Some(error)); }
         });
     });
-    // Leaving the page writes whatever the debounce has not written yet.
+    // Leaving the page writes whatever the debounce has not written yet. A failure is kept for the Project's next view.
     let cleanup_id = pid.clone();
-    on_cleanup(move || { spawn_local(async move { let _ = composer::flush(cleanup_id).await; }); });
+    on_cleanup(move || spawn_local(composer::flush_in_background(cleanup_id)));
     // Clears the Stop request once the Run has ended, so the next Run is not shown as stopping.
     Effect::new(move |_| {
         if snapshot.with(|value| value.as_ref().is_some_and(|value| !value.coordinator_live)) {

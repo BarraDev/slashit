@@ -42,9 +42,19 @@ page change or a Project switch rebuilds the view without losing text.
 - One save chain runs per Project. A newer write waits for the one in flight,
   and the backend keeps only the highest sequence number, so an older
   asynchronous write cannot restore older text.
-- Leaving the page and the `pagehide` event flush unsaved text.
+- Leaving the page and the `pagehide` event start a write of unsaved text.
+  These writes are asynchronous: nothing waits for them, so a process that
+  exits at once can lose them.
 - Nothing is written before the stored draft has been read, so a sequence
-  number is never chosen from a stale view.
+  number is never chosen from a stale view. Text typed before that first read
+  is newer and is kept.
+- When the store refuses a write because it holds a higher sequence number,
+  that is, another writer saved a newer draft, nothing more is written or sent
+  for the Project. The next read, when the Project is reopened, replaces the
+  local text with the stored draft and says so.
+- A background write that keeps failing is shown in the composer of its own
+  Project. If that Project has no open view, the failure is shown when it is
+  next opened.
 
 ### Sending
 
@@ -60,7 +70,14 @@ page change or a Project switch rebuilds the view without losing text.
 5. When the history does not confirm the message and no send is in flight, the
    marker is dropped and the text stays for another send.
 6. When the history cannot be read after a failed send, the outcome is
-   unknown. Sending waits, and "Check history" reads it again.
+   unknown. Sending waits, and a "Check history" panel appears that reads it
+   again; the panel goes away once a read settles the send.
+
+The message is matched by its text, after the recorded entry count. Within one
+app, sends to a Project are serialized, so a matching entry is this send's. A
+Human message with the same text appended by another writer in the same
+window would be taken for it; only a per-send identifier stored with the
+message would rule that out.
 
 A message is never sent without a stored marker, so a crash after the send can
 still be settled from the history on the next start. Entries are append-only,
