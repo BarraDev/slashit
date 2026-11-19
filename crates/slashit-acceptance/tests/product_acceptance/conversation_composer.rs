@@ -176,3 +176,64 @@ async fn enter_sends_when_chosen_in_settings_and_the_choice_survives_restart() {
     }.await;
     context.finish(outcome);
 }
+
+const CONFLICT_PANEL: &str = "[data-testid=\"conversation-draft-conflict\"]";
+const CONFLICT_STORED: &str = "[data-testid=\"conversation-draft-conflict-stored\"]";
+const KEEP_LOCAL: &str = "[data-testid=\"conversation-keep-local-draft\"]";
+const SEND: &str = "[data-testid=\"conversation-send\"]";
+
+/// Wait until `selector` is absent from the page, as a state change may take a moment to render.
+async fn await_absent(driver: &WebDriver, selector: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let present = page(driver, "return document.querySelector(arguments[0]) !== null;", vec![Value::String(selector.to_string())]).await?;
+        if present != Value::Bool(true) { return Ok(()); }
+        if started.elapsed() > ui::ELEMENT_TIMEOUT {
+            bail!("{selector} is still on the page");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_saved_elsewhere_is_offered_for_choice_and_typed_text_is_never_overwritten() {
+    let context = TestContext::new("conversation_draft_conflict").expect("harness setup");
+    let _agent = coordinator_fixture(&context, "Unused.").expect("fake Claude");
+
+    let outcome = async {
+        let session = context.start_session("draft-conflict").await?;
+        let project_id = create_zero_task_project(session.driver(), "Draft Conflict").await?;
+        open_conversations(session.driver(), &project_id).await?;
+        let input = ui::visible(session.driver(), INPUT).await?;
+
+        // The first save of this session is sequence 1.
+        input.click().await?;
+        input.send_keys("Typed here").await?;
+        await_composer_text(session.driver(), "Typed here").await?;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // Another writer stores a newer draft for this Project.
+        ui::invoke(session.driver(), "save_conversation_draft", json!({
+            "projectId": project_id,
+            "draft": { "seq": 5, "text": "Saved elsewhere" }
+        })).await?;
+
+        // The next save is refused, and the stored draft is offered next to the typed text.
+        input.send_keys(" more").await?;
+        ui::visible(session.driver(), CONFLICT_PANEL).await.context("the draft conflict was not shown")?;
+        let stored = ui::visible(session.driver(), CONFLICT_STORED).await?.text().await?;
+        if !stored.contains("Saved elsewhere") { bail!("the conflict shows the wrong stored draft: {stored:?}"); }
+        await_composer_text(session.driver(), "Typed here more").await?;
+        let send_disabled = page(session.driver(), "return document.querySelector(arguments[0]).disabled;", vec![Value::String(SEND.to_string())]).await?;
+        if send_disabled != Value::Bool(true) { bail!("sending was not blocked during the conflict"); }
+
+        // Keeping the typed text writes it at the shown sequence and clears the conflict.
+        ui::visible(session.driver(), KEEP_LOCAL).await?.click().await?;
+        await_absent(session.driver(), CONFLICT_PANEL).await?;
+        await_composer_text(session.driver(), "Typed here more").await?;
+        let saved = ui::invoke(session.driver(), "get_conversation_draft", json!({ "projectId": project_id })).await?;
+        if saved["text"] != "Typed here more" { bail!("the typed text was not saved: {saved}"); }
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    context.finish(outcome);
+}
