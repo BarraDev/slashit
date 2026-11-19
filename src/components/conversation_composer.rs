@@ -12,6 +12,10 @@
 //! history it was sent after. The message is sent only once that marker is
 //! stored. The draft is cleared only when the history confirms the Human
 //! message was saved; a failed or ambiguous send keeps the text.
+//!
+//! Conflict rule: when the store refuses a write because it holds a newer draft,
+//! neither text replaces the other. Both are kept, writes and sends stop, and the
+//! Human chooses which one to keep.
 
 use crate::models::{ConversationDraft, ConversationEntryKind as EntryKind, ConversationPendingSend, ConversationSnapshot, SendShortcut};
 use crate::services::conversation_service;
@@ -127,12 +131,17 @@ struct Slot {
     pending: Option<ConversationPendingSend>,
     /// A send is in flight, from any view of this Project.
     sending: bool,
-    /// The store refused a write because it holds a newer draft. The next read adopts that draft.
+    /// The store refused a write because it holds a newer draft. `loaded` stays false,
+    /// so nothing is written or sent, until the Human resolves the conflict.
     refused: bool,
+    /// The newer stored draft that a refused write ran into, as last read. The local
+    /// text is kept alongside it, unwritten, until the Human picks one; see [`keep_stored`]
+    /// and [`resolve_keep_local`].
+    conflict: Option<ConversationDraft>,
     /// A background failure that no open view of this Project has shown yet.
     error: Option<String>,
-    /// Bumped when `sending`, `pending` or `loaded` changes, so a view that shows
-    /// [`send_blocked`] or [`outcome_unknown`] updates when they do.
+    /// Bumped when `sending`, `pending`, `loaded` or `conflict` changes, so a view that
+    /// shows [`send_blocked`], [`outcome_unknown`] or [`draft_conflict`] updates when they do.
     revision: ArcRwSignal<u64>,
 }
 
@@ -147,9 +156,9 @@ fn with_slot<R>(project: &str, f: impl FnOnce(&mut Slot) -> R) -> R {
     let (result, changed) = SLOTS.with(|slots| {
         let mut slots = slots.borrow_mut();
         let slot = slots.entry(project.to_string()).or_default();
-        let before = (slot.sending, slot.pending.clone(), slot.loaded);
+        let before = (slot.sending, slot.pending.clone(), slot.loaded, slot.conflict.clone());
         let result = f(slot);
-        let changed = (before != (slot.sending, slot.pending.clone(), slot.loaded)).then(|| slot.revision.clone());
+        let changed = (before != (slot.sending, slot.pending.clone(), slot.loaded, slot.conflict.clone())).then(|| slot.revision.clone());
         (result, changed)
     });
     // Notified after the borrow ends, so nothing that reacts can re-enter the slots.
@@ -169,18 +178,25 @@ pub fn draft_text(project: &str) -> String {
     with_slot(project, |slot| slot.text.clone())
 }
 
-/// Whether a send must wait: one is in flight or unconfirmed, or the stored
-/// draft has not been read yet. A send needs the draft loaded, because its
-/// marker cannot be written before the stored sequence is known.
+/// Whether a send must wait: one is in flight or unconfirmed, the stored draft
+/// has not been read yet, or a draft conflict is unresolved. A send needs the
+/// draft loaded, because its marker cannot be written before the stored sequence
+/// is known, and it must not proceed while the Human has not chosen a draft.
 pub fn send_blocked(project: &str) -> bool {
     track_send_state(project);
-    with_slot(project, |slot| slot.sending || slot.pending.is_some() || !slot.loaded)
+    with_slot(project, |slot| slot.sending || slot.pending.is_some() || !slot.loaded || slot.conflict.is_some())
 }
 
 /// Whether a send's outcome is unknown. Sending waits until the history shows it.
 pub fn outcome_unknown(project: &str) -> bool {
     track_send_state(project);
     with_slot(project, |slot| !slot.sending && slot.pending.is_some())
+}
+
+/// The newer stored text that conflicts with this composer's unsaved text, if any.
+pub fn draft_conflict(project: &str) -> Option<String> {
+    track_send_state(project);
+    with_slot(project, |slot| slot.conflict.as_ref().map(|stored| stored.text.clone()))
 }
 
 /// Show background save failures of `project` in the open composer. Replaced on every
@@ -255,33 +271,147 @@ pub async fn load_draft(project: &str) -> Result<(), String> {
 }
 
 /// Apply a completed read of the stored draft. Text typed before the first read is
-/// newer and kept. After a refused write the store is newer, so its text replaces the
-/// local text; the returned error says so.
+/// newer and kept. After a refused write neither text replaces the other: a stored
+/// draft with different text becomes the conflict the Human resolves.
 fn apply_stored(slot: &mut Slot, stored: Option<ConversationDraft>) -> Result<(), String> {
     // The first completed read is applied. A second read that finishes later may hold older text.
     if slot.loaded {
         return Ok(());
     }
-    let mut replaced = false;
+    if slot.refused {
+        if let Some(shown) = &slot.conflict {
+            // A read that finishes late, or finds no draft, never replaces the newer draft already shown.
+            if stored.as_ref().is_none_or(|stored| stored.seq < shown.seq) {
+                return Ok(());
+            }
+        }
+        match stored {
+            Some(stored) if stored.text != slot.text => {
+                slot.conflict = Some(stored);
+                return Ok(());
+            }
+            // Same text: nothing to choose. The local text and marker are written above the stored sequence.
+            Some(stored) => {
+                slot.seq = slot.seq.max(stored.seq);
+                slot.pending = slot.pending.take().or(stored.pending_send);
+            }
+            None => {}
+        }
+        slot.refused = false;
+        slot.conflict = None;
+        slot.dirty = true;
+        slot.loaded = true;
+        return Ok(());
+    }
     if let Some(stored) = stored {
         slot.seq = slot.seq.max(stored.seq);
-        if slot.refused {
-            replaced = slot.text != stored.text;
-            slot.text = stored.text;
-            slot.dirty = false;
-        } else if !slot.dirty {
+        if !slot.dirty {
             slot.text = stored.text;
         }
         if slot.pending.is_none() {
             slot.pending = stored.pending_send;
         }
     }
+    slot.loaded = true;
+    Ok(())
+}
+
+const CONFLICT_ERROR: &str = "A newer draft of this Project was saved elsewhere. Choose which version to keep.";
+
+/// The handling of a write the store refused because it holds a newer draft. Nothing
+/// is written or sent until the stored draft is read again and the conflict resolved.
+fn refuse(slot: &mut Slot) {
+    slot.loaded = false;
+    slot.refused = true;
+    slot.dirty = true;
+}
+
+/// Pending-send rule for both resolutions: the marker of this session's send wins,
+/// because its message may already be saved and only the marker can settle it;
+/// otherwise the stored draft's marker is carried. A resolution never drops a marker
+/// and never creates one, so it cannot lose or repeat a message.
+fn carried_marker(slot: &mut Slot, stored: &ConversationDraft) {
+    slot.pending = slot.pending.take().or_else(|| stored.pending_send.clone());
+}
+
+/// Resolve a conflict by keeping the stored draft. The local text is dropped from
+/// the composer and written nowhere. Returns `None` when there is no conflict or a
+/// keep-local write is deciding it; otherwise whether the marker still needs a write.
+fn keep_stored_slot(slot: &mut Slot) -> Option<bool> {
+    if slot.saving {
+        return None;
+    }
+    let stored = slot.conflict.take()?;
+    carried_marker(slot, &stored);
+    slot.text = stored.text.clone();
+    slot.seq = slot.seq.max(stored.seq);
+    slot.dirty = slot.pending != stored.pending_send;
     slot.refused = false;
     slot.loaded = true;
-    if replaced {
-        return Err("A newer draft saved elsewhere replaced the unsaved text in this composer.".to_string());
+    Some(slot.dirty)
+}
+
+/// Keep the stored draft of a Project. Returns the composer text to show, or `None`
+/// when nothing was resolved.
+pub fn keep_stored(project: &str) -> Option<String> {
+    let dirty = with_slot(project, keep_stored_slot)?;
+    if dirty {
+        arm_flush(project.to_string());
     }
-    Ok(())
+    Some(draft_text(project))
+}
+
+/// The keep-local write: the local text at the sequence of the stored draft the Human
+/// saw. The store accepts it only if nothing newer was written since, so it can never
+/// overwrite a draft the Human has not seen.
+fn begin_keep_local(slot: &mut Slot) -> Option<ConversationDraft> {
+    if slot.saving {
+        return None;
+    }
+    let stored = slot.conflict.clone()?;
+    carried_marker(slot, &stored);
+    slot.saving = true;
+    Some(ConversationDraft { seq: stored.seq, text: slot.text.clone(), pending_send: slot.pending.clone() })
+}
+
+/// Apply the store's answer to a keep-local write. A refusal or failure leaves the
+/// conflict open and the local text kept.
+fn finish_keep_local(slot: &mut Slot, written: &ConversationDraft, result: &Result<bool, String>) {
+    slot.saving = false;
+    if matches!(result, Ok(true)) {
+        slot.conflict = None;
+        slot.refused = false;
+        slot.loaded = true;
+        slot.seq = slot.seq.max(written.seq);
+        // Typing or a settled send during the write is newer than what was written.
+        slot.dirty = slot.text != written.text || slot.pending != written.pending_send;
+    }
+}
+
+/// Keep the local text of a Project over the stored draft. When another draft was
+/// stored after the one shown, the store refuses; the newer draft is read and shown
+/// as the conflict instead, and the error says so.
+pub async fn resolve_keep_local(project: String) -> Result<(), String> {
+    wait_for_write_slot(&project).await;
+    let Some(draft) = with_slot(&project, begin_keep_local) else { return Ok(()) };
+    let result = conversation_service::save_conversation_draft(project.clone(), draft.clone()).await;
+    let dirty = with_slot(&project, |slot| {
+        finish_keep_local(slot, &draft, &result);
+        slot.dirty && slot.loaded
+    });
+    match result {
+        Ok(true) => {
+            if dirty {
+                arm_flush(project);
+            }
+            Ok(())
+        }
+        Ok(false) => {
+            load_draft(&project).await?;
+            Err("Another draft was saved after the one shown. Choose again between your text and the newer draft.".to_string())
+        }
+        Err(error) => Err(format!("Your text could not be saved: {error}")),
+    }
 }
 
 async fn wait_for_write_slot(project: &str) {
@@ -294,20 +424,7 @@ async fn wait_for_write_slot(project: &str) {
 pub async fn flush(project: String) -> Result<(), String> {
     loop {
         wait_for_write_slot(&project).await;
-        // Not loaded means the marker cannot be stored yet. That must be an error, so a send never proceeds on Ok.
-        if !with_slot(&project, |slot| slot.loaded) {
-            return Err("The draft is not loaded yet. Wait for it to load before sending.".to_string());
-        }
-        let job = with_slot(&project, |slot| {
-            if !slot.dirty {
-                return None;
-            }
-            slot.dirty = false;
-            slot.saving = true;
-            slot.seq += 1;
-            Some(ConversationDraft { seq: slot.seq, text: slot.text.clone(), pending_send: slot.pending.clone() })
-        });
-        let Some(draft) = job else { return Ok(()) };
+        let Some(draft) = with_slot(&project, next_write)? else { return Ok(()) };
         let result = conversation_service::save_conversation_draft(project.clone(), draft).await;
         with_slot(&project, |slot| {
             slot.saving = false;
@@ -319,18 +436,36 @@ pub async fn flush(project: String) -> Result<(), String> {
         match result {
             Ok(true) => {}
             Ok(false) => {
-                // The store holds a newer draft than this session knows of. Reading it again
-                // (reopening the Project) adopts its sequence; until then nothing is written or sent.
-                with_slot(&project, |slot| {
-                    slot.loaded = false;
-                    slot.refused = true;
-                    slot.dirty = true;
-                });
-                return Err("The draft store holds a newer draft. Reopen the Project to load it before sending.".to_string());
+                // The store holds a newer draft than this session knows of. It is read now and,
+                // if its text differs, held next to the local text until the Human picks one.
+                with_slot(&project, refuse);
+                load_draft(&project).await?;
+                if with_slot(&project, |slot| slot.conflict.is_some()) {
+                    return Err(CONFLICT_ERROR.to_string());
+                }
             }
             Err(error) => return Err(format!("The draft could not be saved: {error}")),
         }
     }
+}
+
+/// The next write of a Project's draft, `None` when nothing changed, or why no write
+/// may run. Not loaded means the marker cannot be stored yet. That must be an error,
+/// so a send never proceeds on `Ok`.
+fn next_write(slot: &mut Slot) -> Result<Option<ConversationDraft>, String> {
+    if slot.conflict.is_some() {
+        return Err(CONFLICT_ERROR.to_string());
+    }
+    if !slot.loaded {
+        return Err("The draft is not loaded yet. Wait for it to load before sending.".to_string());
+    }
+    if !slot.dirty {
+        return Ok(None);
+    }
+    slot.dirty = false;
+    slot.saving = true;
+    slot.seq += 1;
+    Ok(Some(ConversationDraft { seq: slot.seq, text: slot.text.clone(), pending_send: slot.pending.clone() }))
 }
 
 /// Start a write of every Project's unsaved draft. Used when the page is being hidden or
@@ -344,6 +479,8 @@ pub fn flush_all() {
 
 /// Flush unsaved drafts when the page is hidden. The writes are asynchronous, so the
 /// webview may not finish them if the process exits first; that is why the debounce stays short.
+/// A Project with an unresolved draft conflict writes nothing: its local text lives only
+/// in memory and is lost when the app closes.
 pub fn install_unload_flush() {
     UNLOAD_HOOK.with(|hook| {
         if hook.borrow().is_some() {
@@ -609,20 +746,186 @@ mod tests {
         assert_eq!(settle_slot(&mut slot, &later, false), Some(true));
     }
 
+    fn stored(seq: u64, text: &str, marker: Option<ConversationPendingSend>) -> ConversationDraft {
+        ConversationDraft { seq, text: text.into(), pending_send: marker }
+    }
+
+    /// A slot whose write at sequence 4 the store refused, after which it read `newer`.
+    fn conflicted(project: &str, marker: Option<ConversationPendingSend>) {
+        with_slot(project, |slot| {
+            *slot = Slot { loaded: true, seq: 3, text: "local".into(), dirty: true, pending: marker, revision: slot.revision.clone(), ..Slot::default() };
+            let write = next_write(slot).unwrap().unwrap();
+            assert_eq!(write.seq, 4);
+            slot.saving = false;
+            refuse(slot);
+            apply_stored(slot, Some(stored(9, "newer", None))).unwrap();
+        });
+    }
+
     #[test]
-    fn a_refused_write_then_a_reload_keeps_the_newer_stored_text() {
-        let mut slot = Slot { loaded: true, seq: 3, text: "local".into(), dirty: true, ..Slot::default() };
-        // The flush's handling of a refused write.
-        slot.loaded = false;
-        slot.refused = true;
-        // Typing after the refusal does not make the local text authoritative.
-        slot.text = "local and more".into();
-        let stored = ConversationDraft { seq: 9, text: "newer".into(), pending_send: None };
-        assert!(apply_stored(&mut slot, Some(stored)).is_err(), "the replacement is reported");
-        assert_eq!(slot.text, "newer");
-        assert!(!slot.dirty, "nothing is written over the newer draft");
-        assert_eq!(slot.seq, 9);
-        assert!(slot.loaded && !slot.refused);
+    fn an_open_conflict_blocks_sending_even_when_the_draft_is_marked_loaded() {
+        let project = "conflict-blocks-send";
+        with_slot(project, |slot| {
+            slot.loaded = true;
+            slot.text = "mine".into();
+            slot.conflict = Some(ConversationDraft { seq: 5, text: "theirs".into(), pending_send: None });
+        });
+        assert!(send_blocked(project));
+        with_slot(project, |slot| slot.conflict = None);
+        assert!(!send_blocked(project));
+    }
+
+    #[test]
+    fn a_refused_write_keeps_the_local_text_and_holds_the_stored_draft_without_writing_or_sending() {
+        let project = "conflict-refusal";
+        conflicted(project, None);
+        assert_eq!(draft_text(project), "local");
+        assert_eq!(draft_conflict(project).as_deref(), Some("newer"));
+        assert!(send_blocked(project));
+        // Typing during the conflict stays local, and no write of any kind may start.
+        set_draft_text_in_slot(project, "local and more");
+        assert_eq!(with_slot(project, next_write), Err(CONFLICT_ERROR.to_string()));
+        assert_eq!(with_slot(project, |slot| (slot.seq, slot.saving)), (4, false));
+        // A remount re-reads the same stored draft; the local text is still not replaced.
+        with_slot(project, |slot| apply_stored(slot, Some(stored(9, "newer", None)))).unwrap();
+        assert_eq!(draft_text(project), "local and more");
+    }
+
+    fn set_draft_text_in_slot(project: &str, text: &str) {
+        with_slot(project, |slot| {
+            slot.text = text.into();
+            slot.dirty = true;
+        });
+    }
+
+    #[test]
+    fn keeping_the_local_text_writes_it_at_the_sequence_of_the_draft_shown() {
+        let project = "conflict-keep-local";
+        conflicted(project, None);
+        let write = with_slot(project, begin_keep_local).unwrap();
+        assert_eq!((write.seq, write.text.as_str()), (9, "local"));
+        // A second click while the write is out does not start another.
+        assert_eq!(with_slot(project, begin_keep_local), None);
+        assert_eq!(with_slot(project, keep_stored_slot), None);
+        with_slot(project, |slot| finish_keep_local(slot, &write, &Ok(true)));
+        assert_eq!(draft_conflict(project), None);
+        assert!(!send_blocked(project));
+        assert_eq!(with_slot(project, |slot| (slot.text.clone(), slot.seq, slot.dirty)), ("local".to_string(), 9, false));
+        // The next ordinary write is above the stored sequence.
+        set_draft_text_in_slot(project, "local!");
+        assert_eq!(with_slot(project, next_write).unwrap().unwrap().seq, 10);
+    }
+
+    #[test]
+    fn a_keep_local_write_refused_by_a_newer_draft_shows_that_draft_and_overwrites_nothing() {
+        let project = "conflict-keep-local-refused";
+        conflicted(project, None);
+        let write = with_slot(project, begin_keep_local).unwrap();
+        // Another writer stored seq 12 meanwhile, so the store refuses the write at 9.
+        with_slot(project, |slot| {
+            finish_keep_local(slot, &write, &Ok(false));
+            refuse(slot);
+            apply_stored(slot, Some(stored(12, "newest", None))).unwrap();
+        });
+        assert_eq!(draft_conflict(project).as_deref(), Some("newest"));
+        assert_eq!(draft_text(project), "local");
+        assert!(send_blocked(project));
+        // Choosing local again is checked against the newest draft shown.
+        assert_eq!(with_slot(project, begin_keep_local).unwrap().seq, 12);
+    }
+
+    #[test]
+    fn keeping_the_stored_draft_adopts_its_text_and_sequence_and_writes_nothing() {
+        let project = "conflict-keep-stored";
+        conflicted(project, None);
+        assert_eq!(keep_stored(project).as_deref(), Some("newer"));
+        assert_eq!(draft_conflict(project), None);
+        assert!(!send_blocked(project));
+        assert_eq!(with_slot(project, |slot| (slot.seq, slot.dirty)), (9, false));
+        // The discarded local text is not written: there is no write at all.
+        assert_eq!(with_slot(project, next_write), Ok(None));
+        // A second resolution finds no conflict and changes nothing.
+        assert_eq!(keep_stored(project), None);
+        assert_eq!(draft_text(project), "newer");
+    }
+
+    #[test]
+    fn a_newer_stored_draft_refreshes_an_open_conflict_and_an_older_read_never_does() {
+        let project = "conflict-refresh";
+        conflicted(project, None);
+        with_slot(project, |slot| apply_stored(slot, Some(stored(11, "newest", None)))).unwrap();
+        assert_eq!(draft_conflict(project).as_deref(), Some("newest"));
+        // A read that started earlier and finishes later holds an older draft.
+        with_slot(project, |slot| apply_stored(slot, Some(stored(9, "newer", None)))).unwrap();
+        with_slot(project, |slot| apply_stored(slot, None)).unwrap();
+        assert_eq!(draft_conflict(project).as_deref(), Some("newest"));
+        assert_eq!(keep_stored(project).as_deref(), Some("newest"));
+        assert_eq!(with_slot(project, |slot| slot.seq), 11);
+    }
+
+    #[test]
+    fn a_pending_marker_survives_either_resolution_and_keeps_sending_blocked() {
+        let id = Uuid::new_v4();
+        let marker = pending(id, 1, "local");
+        // Keep stored: the stored draft has no marker, so the carried one must be written.
+        conflicted("conflict-marker-stored", Some(marker.clone()));
+        assert_eq!(with_slot("conflict-marker-stored", keep_stored_slot), Some(true));
+        assert_eq!(with_slot("conflict-marker-stored", |slot| slot.pending.clone()), Some(marker.clone()));
+        assert!(send_blocked("conflict-marker-stored") && outcome_unknown("conflict-marker-stored"));
+        let write = with_slot("conflict-marker-stored", next_write).unwrap().unwrap();
+        assert_eq!((write.seq, write.pending_send), (10, Some(marker.clone())));
+        // Keep local: the marker is written with the local text.
+        conflicted("conflict-marker-local", Some(marker.clone()));
+        let write = with_slot("conflict-marker-local", begin_keep_local).unwrap();
+        assert_eq!(write.pending_send, Some(marker.clone()));
+        with_slot("conflict-marker-local", |slot| finish_keep_local(slot, &write, &Ok(true)));
+        assert!(send_blocked("conflict-marker-local"));
+        // A second resolution neither drops nor repeats the marker, and a settled send clears it once.
+        assert_eq!(with_slot("conflict-marker-local", begin_keep_local), None);
+        let saved = history(id, &["earlier", "local"]);
+        assert_eq!(with_slot("conflict-marker-local", |slot| settle_slot(slot, &saved, true)), Some(true));
+        assert_eq!(with_slot("conflict-marker-local", |slot| settle_slot(slot, &saved, true)), None);
+        assert!(!send_blocked("conflict-marker-local"));
+    }
+
+    #[test]
+    fn a_stored_marker_is_carried_when_this_session_has_none() {
+        let id = Uuid::new_v4();
+        let theirs = pending(id, 3, "newer");
+        let project = "conflict-marker-theirs";
+        with_slot(project, |slot| {
+            *slot = Slot { refused: true, text: "local".into(), dirty: true, revision: slot.revision.clone(), ..Slot::default() };
+            apply_stored(slot, Some(stored(9, "newer", Some(theirs.clone())))).unwrap();
+        });
+        let write = with_slot(project, begin_keep_local).unwrap();
+        assert_eq!(write.pending_send, Some(theirs.clone()));
+        with_slot(project, |slot| finish_keep_local(slot, &write, &Err("offline".into())));
+        // A failed write leaves the conflict open, the text local and the marker held.
+        assert_eq!(draft_conflict(project).as_deref(), Some("newer"));
+        assert_eq!(keep_stored(project).as_deref(), Some("newer"));
+        assert_eq!(with_slot(project, |slot| (slot.pending.clone(), slot.dirty)), (Some(theirs), false));
+    }
+
+    #[test]
+    fn a_conflict_in_one_project_leaves_another_untouched() {
+        conflicted("conflict-a", None);
+        with_slot("conflict-b", |slot| {
+            slot.loaded = true;
+            slot.text = "b".into();
+            slot.dirty = true;
+        });
+        assert!(!send_blocked("conflict-b"));
+        assert_eq!(draft_conflict("conflict-b"), None);
+        assert_eq!(with_slot("conflict-b", next_write).unwrap().unwrap().text, "b");
+        assert_eq!(draft_conflict("conflict-a").as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn a_refused_write_whose_stored_text_matches_resumes_writing_above_it() {
+        let mut slot = Slot { refused: true, seq: 3, text: "same".into(), dirty: true, ..Slot::default() };
+        apply_stored(&mut slot, Some(stored(9, "same", None))).unwrap();
+        assert!(slot.conflict.is_none() && slot.loaded && !slot.refused);
+        assert_eq!(next_write(&mut slot).unwrap().unwrap().seq, 10);
     }
 
     #[test]

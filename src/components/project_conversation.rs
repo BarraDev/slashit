@@ -780,6 +780,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let key_project = pid.clone();
     let button_project = pid.clone();
     let outcome_project = pid.clone();
+    let conflict_project = pid.clone();
     let on_key_down = move |event: web_sys::KeyboardEvent| {
         // The primary shortcut key is Cmd on macOS and Ctrl elsewhere.
         let primary = if composer::is_macos() { event.meta_key() } else { event.ctrl_key() };
@@ -953,6 +954,31 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         <p>"SlashIt could not confirm whether your last message was saved. Sending stays paused until the history is read."</p>
                         <button data-testid="conversation-check-outcome" class="shrink-0 rounded border border-amber-200/30 px-3 py-1" on:click=move |_| check_outcome.run(())>"Check history"</button>
                     </div>
+                })}
+                {move || composer::draft_conflict(&conflict_project).map(|stored| {
+                    let keep_local_project = conflict_project.clone();
+                    let keep_stored_project = conflict_project.clone();
+                    view! {
+                        <div data-testid="conversation-draft-conflict" role="alert" class="mt-2 shrink-0 space-y-2 rounded border border-amber-300/30 bg-amber-400/5 p-2 text-sm text-amber-100">
+                            <p>"A newer draft of this Project was saved elsewhere. Your text in the box above was not saved over it, and sending is paused until you choose which version to keep. Until you choose, your text is kept only while SlashIt is open."</p>
+                            <pre data-testid="conversation-draft-conflict-stored" class="max-h-32 overflow-auto whitespace-pre-wrap rounded bg-black/30 p-2 text-xs text-white/80">{stored}</pre>
+                            <div class="flex flex-wrap gap-2">
+                                <button data-testid="conversation-keep-local-draft" class="rounded border border-amber-200/30 px-3 py-1" on:click=move |_| {
+                                    let id = keep_local_project.clone();
+                                    spawn_local(async move {
+                                        let result = composer::resolve_keep_local(id).await;
+                                        let _ = set_error.try_set(result.err());
+                                    });
+                                }>"Keep my text (replaces the saved draft)"</button>
+                                <button data-testid="conversation-keep-stored-draft" class="rounded border border-amber-200/30 px-3 py-1" on:click=move |_| {
+                                    if let Some(text) = composer::keep_stored(&keep_stored_project) {
+                                        set_draft.set(text);
+                                        set_error.set(None);
+                                    }
+                                }>"Use the saved draft (discards my text)"</button>
+                            </div>
+                        </div>
+                    }
                 })}
                 {move || error.get().map(|message| view! { <p data-testid="conversation-error" class="mt-2 text-sm text-red-300">{message}</p> })}
             </section>

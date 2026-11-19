@@ -49,12 +49,40 @@ page change or a Project switch rebuilds the view without losing text.
   number is never chosen from a stale view. Text typed before that first read
   is newer and is kept.
 - When the store refuses a write because it holds a higher sequence number,
-  that is, another writer saved a newer draft, nothing more is written or sent
-  for the Project. The next read, when the Project is reopened, replaces the
-  local text with the stored draft and says so.
+  that is, another writer saved a newer draft, the composer reads the stored
+  draft at once. Neither text replaces the other; see "Draft conflicts".
 - A background write that keeps failing is shown in the composer of its own
   Project. If that Project has no open view, the failure is shown when it is
   next opened.
+
+### Draft conflicts
+
+A refused write never silently replaces text the Human typed.
+
+- If the stored draft has the same text, there is nothing to choose: the
+  composer adopts the stored sequence and writes above it.
+- Otherwise both versions are kept: the local text stays in the composer, and
+  a panel shows the stored draft. While the conflict is open, nothing is
+  written for the Project (including the debounced, view-disposal and
+  `pagehide` writes) and sending is blocked. Typing stays local.
+- "Keep my text" writes the local text at the sequence of the stored draft
+  shown. The store keeps a draft unless the stored sequence is higher, so the
+  write succeeds only if nothing was stored after the draft the Human saw. If
+  something was, the write is refused, the newer draft is read and shown, and
+  the Human chooses again. Nothing is overwritten unseen.
+- "Use the saved draft" puts the stored text in the composer and adopts its
+  sequence. The local text is discarded and written nowhere.
+- A later read never replaces the shown stored draft with an older one, and a
+  read that finds no draft leaves the conflict open.
+- Pending-send marker: both choices carry the same marker. This session's
+  marker wins, because its message may already be saved and only the marker
+  can settle it against the history; otherwise the stored draft's marker is
+  carried. A resolution never drops or creates a marker, so it cannot lose or
+  repeat a message, and sending stays blocked until the marker is settled.
+- The conflict lives in the process-wide cache of the Project, so it survives
+  a page change and a Project switch, and other Projects are unaffected. It
+  does not survive a restart: until the Human chooses, the local text is held
+  only in memory, and closing the app loses it. The panel says so.
 
 ### Sending
 
@@ -73,11 +101,31 @@ page change or a Project switch rebuilds the view without losing text.
    unknown. Sending waits, and a "Check history" panel appears that reads it
    again; the panel goes away once a read settles the send.
 
-The message is matched by its text, after the recorded entry count. Within one
-app, sends to a Project are serialized, so a matching entry is this send's. A
-Human message with the same text appended by another writer in the same
-window would be taken for it; only a per-send identifier stored with the
-message would rule that out.
+### Send confirmation is not exactly-once
+
+The message is matched by its text, after the recorded entry count. The
+failure this allows: a second writer appends a Human message with identical
+text between the read that recorded `entries_before` and the confirmation
+read. A send that actually failed is then confirmed, its marker is removed,
+and its text is cleared from the composer.
+
+What prevents a second writer today:
+
+- One live SlashIt process per state root. The desktop app claims the IPC
+  endpoint before it hydrates any state and exits if another instance (the
+  app or `slashitd`) holds it (`run` in `src-tauri/src/lib.rs`).
+- One window. The only window is built by `main_window::create`, and requests
+  for a new window are denied (`src-tauri/src/main_window.rs`).
+- `send_project_message` in `src-tauri/src/commands/conversation.rs` holds
+  the per-Project Conversation lock while it appends, and it is the only
+  production code that appends a `HumanMessage`.
+- The composer's `sending` and pending-marker gates allow one send per
+  Project at a time across every view of that Project.
+
+This is not a general exactly-once guarantee. A second writer to the same
+Conversation, a second window, or a second process on the same state would
+make the misconfirmation possible; any of them would require a per-send
+identifier stored with the message.
 
 A message is never sent without a stored marker, so a crash after the send can
 still be settled from the history on the next start. Entries are append-only,
@@ -92,6 +140,8 @@ which is what makes the entry count a sound reference.
   had not reached the disk. Text typed before that is kept. The webview may not
   finish a write during a normal shutdown either, so the last moments before a
   close are best effort.
+- During an unresolved draft conflict the local text is not written, so a
+  restart loses it.
 - A draft file that cannot be parsed blocks sending for that Project until the
   file is removed. This is deliberate: a send must never bypass the marker.
   The error names the file.
