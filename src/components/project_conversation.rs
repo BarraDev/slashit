@@ -435,6 +435,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     composer::install_unload_flush();
     let (busy, set_busy) = signal(false);
     let (error, set_error) = signal(None::<String>);
+    composer::set_error_sink(set_error);
     let (executions, set_executions) = signal(Vec::<ConversationExecution>::new());
     let (next_snapshot_request, set_next_snapshot_request) = signal(0u64);
     let (applied_snapshot_request, set_applied_snapshot_request) = signal(0u64);
@@ -460,7 +461,8 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             if current.as_ref() != Some(&value) {
                 let _ = set_executions.try_set(value.executions.clone());
                 // A send that this history confirms is settled here, so the composer does not keep its text.
-                if composer::settle_pending_send(&settle_id, &value) {
+                // A poll may be older than the send, so it can only confirm a saved message here.
+                if composer::settle_pending_send(&settle_id, &value, false) {
                     let _ = set_draft.try_set(composer::draft_text(&settle_id));
                 }
                 let _ = set_snapshot.try_set(Some(value));
@@ -520,9 +522,14 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                 Ok(value) => Ok(value),
                 Err(_) => conversation_service::open_project_conversation(id.clone()).await,
             };
+            let loaded_value = loaded.as_ref().ok().cloned();
             match loaded {
                 Ok(value) => publish.run((request, value)),
                 Err(error) => { let _ = set_error.try_set(Some(error)); }
+            }
+            // The read at start-up is fresh and no send is in flight, so it can settle a pending send either way.
+            if let Some(value) = loaded_value.as_ref() {
+                if composer::settle_pending_send(&id, value, true) { let _ = set_draft.try_set(composer::draft_text(&id)); }
             }
             let _ = set_draft.try_set(composer::draft_text(&id));
             if let Err(error) = composer::flush(id).await { let _ = set_error.try_set(Some(error)); }
@@ -633,7 +640,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             composer::end_send(&project);
             // Without a confirmed read the marker stays, and sending waits for the history to be read.
             if let Some(value) = known {
-                if composer::settle_pending_send(&project, &value) {
+                if composer::settle_pending_send(&project, &value, true) {
                     let _ = set_draft.try_set(composer::draft_text(&project));
                 }
             }
@@ -651,7 +658,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             match conversation_service::get_project_conversation(id.clone()).await {
                 Ok(value) => {
                     publish.run((request, value.clone()));
-                    if composer::settle_pending_send(&id, &value) {
+                    if composer::settle_pending_send(&id, &value, true) {
                         let _ = set_draft.try_set(composer::draft_text(&id));
                     }
                 }

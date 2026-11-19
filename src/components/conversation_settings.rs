@@ -8,27 +8,38 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 /// A radio group for the send key. The choice is saved to `config.toml` when it
-/// is made; if the save fails, the previous choice is restored and says so.
+/// is made. After a failed save the control shows what the file holds, and says so.
 #[component]
 pub fn ConversationSendSettings() -> impl IntoView {
     let (shortcut, set_shortcut) = signal(SendShortcut::default());
+    // The choice is offered only once the stored value is known, and one save runs at a time.
+    let (loaded, set_loaded) = signal(false);
+    let (saving, set_saving) = signal(false);
     spawn_local(async move {
         if let Ok(config) = conversation_service::get_conversations_config().await {
             let _ = set_shortcut.try_set(config.send_shortcut);
         }
+        let _ = set_loaded.try_set(true);
     });
 
     let choose = move |choice: SendShortcut| {
-        let previous = shortcut.get_untracked();
+        if saving.get_untracked() || !loaded.get_untracked() {
+            return;
+        }
+        set_saving.set(true);
         set_shortcut.set(choice);
         spawn_local(async move {
             match conversation_service::update_conversations_config(choice).await {
                 Ok(saved) => { let _ = set_shortcut.try_set(saved.send_shortcut); }
                 Err(error) => {
-                    let _ = set_shortcut.try_set(previous);
-                    toast::error(format!("Could not save the send key; it was not changed. {error}"));
+                    // The save may have reached the file before the error. Show what the file holds.
+                    if let Ok(config) = conversation_service::get_conversations_config().await {
+                        let _ = set_shortcut.try_set(config.send_shortcut);
+                    }
+                    toast::error(format!("The send key could not be confirmed as saved. The choice shown is the one the settings file holds. {error}"));
                 }
             }
+            let _ = set_saving.try_set(false);
         });
     };
 
@@ -43,6 +54,7 @@ pub fn ConversationSendSettings() -> impl IntoView {
                     data-testid="conversation-send-modifier-enter"
                     class="mt-1"
                     prop:checked=move || shortcut.get() == SendShortcut::ModifierEnter
+                    prop:disabled=move || !loaded.get() || saving.get()
                     on:change=move |_| choose(SendShortcut::ModifierEnter)
                 />
                 <span class="text-sm text-white/80">"Ctrl+Enter (Cmd+Enter on macOS). Enter adds a new line. This is the default."</span>
@@ -54,6 +66,7 @@ pub fn ConversationSendSettings() -> impl IntoView {
                     data-testid="conversation-send-enter"
                     class="mt-1"
                     prop:checked=move || shortcut.get() == SendShortcut::Enter
+                    prop:disabled=move || !loaded.get() || saving.get()
                     on:change=move |_| choose(SendShortcut::Enter)
                 />
                 <span class="text-sm text-white/80">"Enter. Shift+Enter adds a new line."</span>

@@ -821,12 +821,13 @@ pub async fn save_conversation_draft(
     state
         .storage
         .save_conversation_draft(project_id, &draft)
-        .map_err(|error| format!("The draft was not saved: {error}"))
+        .map_err(|error| format!("The draft could not be confirmed saved: {error}"))
 }
 
 /// The Conversation settings the composer reads on start.
 #[tauri::command]
 pub async fn get_conversations_config(
+    _gui: GuiMutation,
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::config::ConversationsConfig, String> {
     state

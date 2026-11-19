@@ -20,8 +20,13 @@ use gloo_timers::future::TimeoutFuture;
 use leptos::task::spawn_local;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use leptos::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
+
+/// Background writes that fail are retried this many times, this far apart, before the failure is shown.
+const BACKGROUND_SAVE_ATTEMPTS: u32 = 3;
+const BACKGROUND_RETRY_MS: u32 = 1_000;
 
 /// How long typing must pause before the draft is written. Bounds the loss on an
 /// abrupt crash to about this much typing; see the design note on drafts.
@@ -125,6 +130,8 @@ struct Slot {
 }
 
 thread_local! {
+    /// Where a background write's final failure is shown: the open composer's error line.
+    static ERROR_SINK: RefCell<Option<WriteSignal<Option<String>>>> = const { RefCell::new(None) };
     static SLOTS: RefCell<HashMap<String, Slot>> = RefCell::new(HashMap::new());
     static UNLOAD_HOOK: RefCell<Option<Closure<dyn FnMut()>>> = const { RefCell::new(None) };
 }
@@ -150,6 +157,12 @@ pub fn outcome_unknown(project: &str) -> bool {
     with_slot(project, |slot| !slot.sending && slot.pending.is_some())
 }
 
+/// Show background save failures in the open composer. Replaced on every mount, so a
+/// closed view's signal is never written.
+pub fn set_error_sink(sink: WriteSignal<Option<String>>) {
+    ERROR_SINK.with(|cell| *cell.borrow_mut() = Some(sink));
+}
+
 /// Record the composer text and schedule its write.
 pub fn set_draft_text(project: &str, text: String) {
     with_slot(project, |slot| {
@@ -166,11 +179,31 @@ fn arm_flush(project: String) {
     }
     Timeout::new(SAVE_DEBOUNCE_MS, move || {
         with_slot(&project, |slot| slot.timer_armed = false);
-        spawn_local(async move {
-            let _ = flush(project).await;
-        });
+        spawn_local(flush_in_background(project));
     })
     .forget();
+}
+
+/// A debounced write, retried a bounded number of times. A failure that persists is
+/// shown in the composer, so the text is never left unsaved without a warning.
+async fn flush_in_background(project: String) {
+    for attempt in 1..=BACKGROUND_SAVE_ATTEMPTS {
+        // Nothing is written before the stored draft is read; the load path flushes once it is.
+        if !with_slot(&project, |slot| slot.loaded) {
+            return;
+        }
+        match flush(project.clone()).await {
+            Ok(()) => return,
+            Err(error) if attempt == BACKGROUND_SAVE_ATTEMPTS => {
+                ERROR_SINK.with(|cell| {
+                    if let Some(sink) = *cell.borrow() {
+                        let _ = sink.try_set(Some(format!("{error} SlashIt will keep the text and try again on your next change.")));
+                    }
+                });
+            }
+            Err(_) => TimeoutFuture::new(BACKGROUND_RETRY_MS).await,
+        }
+    }
 }
 
 /// Read the saved draft of a Project once per session. Text typed before the
@@ -181,6 +214,10 @@ pub async fn load_draft(project: &str) -> Result<(), String> {
     }
     let stored = conversation_service::get_conversation_draft(project.to_string()).await?;
     with_slot(project, |slot| {
+        // The first completed read is applied. A second read that finishes later may hold older text.
+        if slot.loaded {
+            return;
+        }
         if let Some(stored) = stored {
             slot.seq = slot.seq.max(stored.seq);
             if !slot.dirty {
@@ -290,11 +327,13 @@ pub fn end_send(project: &str) {
 }
 
 /// Settle a pending send against the history. Clears the text and the marker
-/// when the history shows the Human message saved. When no send is in flight
-/// and the history does not show it, it was never saved, so the marker is
-/// dropped and the text stays for another send. Returns true when the composer
-/// text changed.
-pub fn settle_pending_send(project: &str, snapshot: &ConversationSnapshot) -> bool {
+/// when the history shows the Human message saved. The marker is dropped for
+/// a message that is absent only when `read_after_send` is true, meaning the
+/// snapshot was read after the send ended. A snapshot from an older read, such
+/// as a poll that began before the send, can predate the save and must not be
+/// taken as proof that the message was never sent. Returns true when the
+/// composer text changed.
+pub fn settle_pending_send(project: &str, snapshot: &ConversationSnapshot, read_after_send: bool) -> bool {
     let outcome = with_slot(project, |slot| {
         let pending = slot.pending.clone()?;
         if send_was_saved(snapshot, &pending) {
@@ -306,7 +345,7 @@ pub fn settle_pending_send(project: &str, snapshot: &ConversationSnapshot) -> bo
             slot.dirty = true;
             return Some(cleared.is_some());
         }
-        if !slot.sending {
+        if read_after_send && !slot.sending {
             slot.pending = None;
             slot.dirty = true;
             return Some(false);
@@ -415,6 +454,18 @@ mod tests {
         assert_eq!(send_hint(SendShortcut::Enter, true), "Enter sends. Shift+Enter adds a new line.");
         assert_eq!(shortcut_keys(SendShortcut::ModifierEnter, true), "Meta+Enter");
         assert_eq!(shortcut_keys(SendShortcut::Enter, false), "Enter");
+    }
+
+    #[test]
+    fn a_delayed_snapshot_that_predates_the_save_never_proves_the_message_absent() {
+        // The rule, as settle applies it: absence is conclusive only after a read taken after the send ended.
+        let id = Uuid::new_v4();
+        let before = vec![entry(EntryKind::HumanMessage { text: "earlier".into() })];
+        let marker = pending(id, before.len(), "now");
+        assert!(!send_was_saved(&snapshot(id, before.clone()), &marker));
+        let mut after = before.clone();
+        after.push(entry(EntryKind::HumanMessage { text: "now".into() }));
+        assert!(send_was_saved(&snapshot(id, after), &marker));
     }
 
     #[test]

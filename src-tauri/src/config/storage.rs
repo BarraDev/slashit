@@ -4730,9 +4730,15 @@ user_name = "Test"
         let (storage, _dir) = create_test_storage();
         let project = Uuid::new_v4();
         storage.create_primary_conversation(project).unwrap();
+        let document = storage.paths.conversation_file(
+            storage.load_primary_conversation(project).unwrap().unwrap().id,
+        );
         storage.save_conversation_draft(project, &draft(1, "unsent")).unwrap();
-        // The strict scan parses every `*.json`; the draft must not be one of them.
+        // Without the pointer, deletion takes the strict scan of every `*.json`; the draft must not be one of them.
+        std::fs::remove_file(storage.paths.primary_conversation_file(project)).unwrap();
         storage.mark_project_conversation_deletion_pending(project).unwrap();
         storage.delete_project_conversation(project).unwrap();
+        assert!(!document.exists(), "the Conversation document is removed by the scan");
+        assert!(storage.load_conversation_draft(project).unwrap().is_none());
     }
 }
