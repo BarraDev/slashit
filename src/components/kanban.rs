@@ -2714,6 +2714,19 @@ fn offers_pr_sync(task: &Task, pr_unavailable: bool) -> bool {
         }
 }
 
+/// Where the card menu opens, as fixed-position viewport coordinates. A click
+/// with `detail == 0` came from the keyboard (Enter or Space), so its pointer
+/// coordinates are not a position: Chromium and Firefox report (0, 0) and
+/// WebKitGTK reports synthetic values. Such a menu opens at the button's
+/// bottom-left corner instead, as a pointer click on that corner would.
+fn menu_anchor(detail: i32, pointer: (i32, i32), button_left_bottom: (f64, f64)) -> (i32, i32) {
+    if detail == 0 {
+        (button_left_bottom.0 as i32, button_left_bottom.1 as i32)
+    } else {
+        pointer
+    }
+}
+
 #[component]
 fn KanbanTaskCard(
     task: Task,
@@ -2787,8 +2800,11 @@ fn KanbanTaskCard(
         move |e: web_sys::MouseEvent| {
             e.prevent_default();
             e.stop_propagation();
-            // Position menu near the button
-            set_context_menu_pos.set((e.client_x(), e.client_y()));
+            // Position menu near the button, whether the click came from the mouse or the keyboard
+            let button = e.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok());
+            let rect = button.map(|b| b.get_bounding_client_rect());
+            let button_left_bottom = rect.map_or((0.0, 0.0), |r| (r.left(), r.bottom()));
+            set_context_menu_pos.set(menu_anchor(e.detail(), (e.client_x(), e.client_y()), button_left_bottom));
             set_context_menu_task.set(Some(task.clone()));
             set_show_context_menu.set(true);
         }
@@ -3336,6 +3352,18 @@ mod tests {
     use leptos::prelude::{GetUntracked, RwSignal, Set};
     use leptos::reactive::owner::Owner;
     use uuid::Uuid;
+
+    /// A keyboard activation of the card menu button reports no pointer
+    /// position (Chromium and Firefox send (0, 0); WebKitGTK sends synthetic
+    /// values). The menu must open at the button, not at the viewport corner.
+    #[test]
+    fn a_keyboard_opened_card_menu_sits_at_its_button_whatever_the_event_reports() {
+        let button = (612.0, 88.5);
+        assert_eq!(super::menu_anchor(0, (0, 0), button), (612, 88));
+        assert_eq!(super::menu_anchor(0, (430, 215), button), (612, 88));
+        // A mouse click keeps the pointer placement.
+        assert_eq!(super::menu_anchor(1, (640, 301), button), (640, 301));
+    }
 
     /// The dialog's state, created the way the board creates it.
     fn dialog(owner: &Owner) -> PrReviewDialog {
