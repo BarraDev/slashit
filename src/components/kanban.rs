@@ -3022,7 +3022,7 @@ fn KanbanTaskCard(
                 // 3-dot menu button (appears on hover)
                 <button
                     data-testid="task-card-menu"
-                    class="absolute top-2 right-2 p-1.5 rounded-md opacity-0 group-hover/card:opacity-100 hover:bg-white/10 z-10 transition-all"
+                    class="absolute top-2 right-2 p-1.5 rounded-md opacity-0 group-hover/card:opacity-100 focus-visible:opacity-100 hover:bg-white/10 z-10 transition-all"
                     on:click=on_menu_button_click
                     title="Task options"
                     aria-label="Task options"
@@ -3031,7 +3031,7 @@ fn KanbanTaskCard(
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
                     </svg>
                 </button>
-                <TaskCard task=task.clone() activity=live_activity run=live_run />
+                <TaskCard task=task.clone() activity=live_activity run=live_run>
                 // "Run now" for queued tasks: promote this exact card out of
                 // the queue without dragging it or opening the card's menu.
                 {
@@ -3049,7 +3049,7 @@ fn KanbanTaskCard(
                         let task_id = run_now_id;
                         let task_title = run_now_title;
                         view! {
-                            <div class="flex justify-end px-2 pb-1.5 -mt-1">
+                            <div class="contents">
                                 <button
                                     data-testid="task-card-run-now"
                                     disabled=move || pending.get()
@@ -3105,7 +3105,7 @@ fn KanbanTaskCard(
                         let task_id = task.id.to_string();
                         let task_title = task.title.clone();
                         view! {
-                            <div class="flex justify-end px-2 pb-1.5 -mt-1">
+                            <div class="contents">
                                 <button
                                     class="px-2 py-0.5 text-[10px] rounded bg-white/[0.06] text-white/50 hover:bg-white/10 hover:text-white/80 transition-colors"
                                     on:click=move |e: web_sys::MouseEvent| {
@@ -3189,7 +3189,7 @@ fn KanbanTaskCard(
                         let task_for_pr_review = task_for_pr_review.clone();
                         let task_for_sync_pr = task.clone();
                         view! {
-                            <div class="flex justify-end gap-1.5 px-2 pb-1.5 -mt-1">
+                            <div class="contents">
                                 {can_sync_pr.then(|| {
                                     let task_for_sync_pr = task_for_sync_pr.clone();
                                     view! {
@@ -3292,8 +3292,9 @@ fn KanbanTaskCard(
                     })
                     }
                 }
+            </TaskCard>
             </div>
-            
+
             // Drop indicator below task (shows when hovering on lower half)
             <div
                 class=move || {

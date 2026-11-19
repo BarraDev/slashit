@@ -16,6 +16,9 @@ pub fn TaskCard(
     /// working only from this, never from the task's status.
     #[prop(default = None)]
     run: Option<Signal<Option<AgentStatus>>>,
+    /// Actions for this card, shown inside the card's bottom row so they
+    /// belong to the card rather than floating beneath it.
+    children: Children,
 ) -> impl IntoView {
     let is_stuck = task.stuck_since.is_some();
     let show_review = matches!(task.status, TaskStatus::AiReview | TaskStatus::HumanReview);
@@ -251,7 +254,7 @@ pub fn TaskCard(
             })}
 
             // Model tag - cleaner bottom section
-            <div class="flex items-center gap-1.5 mt-2.5 pt-2.5 border-t border-white/[0.04]">
+            <div class="flex flex-wrap items-center gap-1.5 mt-2.5 pt-2.5 border-t border-white/[0.04]">
                 <span class="px-2 py-0.5 rounded-md bg-white/[0.04] text-[10px] text-white/40 font-mono truncate max-w-[90px]">
                     {if task.model == "default" || task.model.is_empty() { "auto".to_string() } else { task.model.clone() }}
                 </span>
@@ -270,6 +273,7 @@ pub fn TaskCard(
                         <span class="px-1.5 py-0.5 rounded-md bg-green-500/10 text-[10px] text-green-400">"WT"</span>
                     }
                 })}
+                <div class="ml-auto flex flex-wrap justify-end items-center gap-1.5">{children()}</div>
             </div>
         </div>
     }
