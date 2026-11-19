@@ -4,6 +4,7 @@
 //! This module handles persistent storage of application configuration,
 //! projects, repositories, and tasks.
 
+pub mod conversations;
 pub mod features;
 pub mod migration;
 pub mod paths;
@@ -15,6 +16,7 @@ pub mod workspace_registry;
 #[cfg(test)]
 mod task_board_schema_tests;
 
+pub use conversations::*;
 pub use queue::*;
 pub use storage::*;
 pub use workspace_registry::WorkspaceRegistry;

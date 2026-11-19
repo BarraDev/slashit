@@ -2,6 +2,7 @@
 use crate::config::paths::{AppPaths, ProjectKey};
 use crate::domain::task::ExternalRef;
 use crate::domain::{AgentConfig, Conversation, Project, Repository, Task};
+use super::conversations::ConversationDraft;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -209,6 +210,10 @@ pub struct AppConfig {
     pub worktree: WorktreeConfig,
     #[serde(default)]
     pub ui_preferences: UiPreferences,
+    /// The Project Conversation settings. Absent from older files, which load
+    /// as the defaults.
+    #[serde(default)]
+    pub conversations: crate::config::ConversationsConfig,
     /// The Queue settings. Absent from files written before they were
     /// persisted, which load as the defaults.
     #[serde(default)]
@@ -288,6 +293,7 @@ impl Default for AppConfig {
                 sidebar_width: 300,
             },
             queue: crate::config::QueueConfig::default(),
+            conversations: crate::config::ConversationsConfig::default(),
         }
     }
 }
@@ -381,6 +387,9 @@ pub struct Storage {
     /// do one at all), cleared by the next write whose directory sync
     /// succeeded. See [`Self::confirm_config_durable`].
     config_unconfirmed: Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes the read-check-write of a composer draft, so two saves cannot
+    /// interleave and let the older text win.
+    draft_tx: Arc<Mutex<()>>,
 }
 
 /// One durable Task cleanup retry record: the Project whose board file
@@ -460,6 +469,47 @@ impl Storage {
     /// preserve the pointer as the recovery reference. An already-absent
     /// document is a safe partial-cleanup state.
     pub fn delete_project_conversation(&self, project_id: Uuid) -> Result<()> {
+        self.delete_project_conversation_documents(project_id)?;
+        // The draft belongs to the Project, so it goes with it. A draft left
+        // behind by a crash here is harmless: the Project no longer lists it.
+        match fs::remove_file(self.paths.conversation_draft_file(project_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("Failed to remove Conversation draft"),
+        }
+    }
+
+    /// The composer draft of a Project, if one was saved.
+    pub fn load_conversation_draft(&self, project_id: Uuid) -> Result<Option<ConversationDraft>> {
+        let path = self.paths.conversation_draft_file(project_id);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("Failed to read Conversation draft {path:?}")),
+        };
+        let draft = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse Conversation draft {path:?}"))?;
+        Ok(Some(draft))
+    }
+
+    /// Save a composer draft unless a newer one is already stored. Returns
+    /// `false` when the draft was older and nothing changed.
+    pub fn save_conversation_draft(&self, project_id: Uuid, draft: &ConversationDraft) -> Result<bool> {
+        if project_id.is_nil() {
+            anyhow::bail!("Project identity must be valid");
+        }
+        draft.validate().map_err(anyhow::Error::msg)?;
+        let _guard = self.draft_tx.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.load_conversation_draft(project_id)?.is_some_and(|stored| stored.seq > draft.seq) {
+            return Ok(false);
+        }
+        let bytes = serde_json::to_vec_pretty(draft).context("Failed to serialize Conversation draft")?;
+        write_private_atomic(&self.paths.conversation_draft_file(project_id), &bytes)
+            .map_err(|e| write_failure(e, "atomically persist Conversation draft"))?;
+        Ok(true)
+    }
+
+    fn delete_project_conversation_documents(&self, project_id: Uuid) -> Result<()> {
         let pointer = self.paths.primary_conversation_file(project_id);
         match fs::symlink_metadata(&pointer) {
             Ok(metadata) if metadata.file_type().is_file() => {}
@@ -884,6 +934,7 @@ impl Storage {
             config_tx: Arc::new(Mutex::new(())),
             config_unconfirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             held_back: Arc::new(Mutex::new(HashSet::new())),
+            draft_tx: Arc::new(Mutex::new(())),
         }
     }
 
@@ -4635,5 +4686,53 @@ user_name = "Test"
             }
             _ => panic!("Expected JiraTicket"),
         }
+    }
+
+    fn draft(seq: u64, text: &str) -> ConversationDraft {
+        ConversationDraft { seq, text: text.into(), pending_send: None }
+    }
+
+    #[test]
+    fn a_draft_is_saved_and_reloaded_per_project() {
+        let (storage, _dir) = create_test_storage();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        assert!(storage.load_conversation_draft(first).unwrap().is_none());
+        assert!(storage.save_conversation_draft(first, &draft(1, "first project")).unwrap());
+        assert!(storage.save_conversation_draft(second, &draft(1, "second project")).unwrap());
+        assert_eq!(storage.load_conversation_draft(first).unwrap().unwrap().text, "first project");
+        assert_eq!(storage.load_conversation_draft(second).unwrap().unwrap().text, "second project");
+    }
+
+    #[test]
+    fn an_older_draft_write_never_replaces_a_newer_one() {
+        let (storage, _dir) = create_test_storage();
+        let project = Uuid::new_v4();
+        assert!(storage.save_conversation_draft(project, &draft(5, "newer")).unwrap());
+        assert!(!storage.save_conversation_draft(project, &draft(4, "older")).unwrap());
+        assert_eq!(storage.load_conversation_draft(project).unwrap().unwrap().text, "newer");
+        // An equal sequence is a repeat of the same write, so it is accepted.
+        assert!(storage.save_conversation_draft(project, &draft(5, "newer")).unwrap());
+    }
+
+    #[test]
+    fn a_draft_is_removed_with_its_project_conversation() {
+        let (storage, _dir) = create_test_storage();
+        let project = Uuid::new_v4();
+        storage.create_primary_conversation(project).unwrap();
+        storage.save_conversation_draft(project, &draft(1, "unsent")).unwrap();
+        storage.delete_project_conversation(project).unwrap();
+        assert!(storage.load_conversation_draft(project).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_draft_file_does_not_confuse_the_conversation_scan() {
+        let (storage, _dir) = create_test_storage();
+        let project = Uuid::new_v4();
+        storage.create_primary_conversation(project).unwrap();
+        storage.save_conversation_draft(project, &draft(1, "unsent")).unwrap();
+        // The strict scan parses every `*.json`; the draft must not be one of them.
+        storage.mark_project_conversation_deletion_pending(project).unwrap();
+        storage.delete_project_conversation(project).unwrap();
     }
 }

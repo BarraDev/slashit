@@ -378,6 +378,12 @@ impl AppPaths {
         self.conversations_dir().join(format!("{project_id}.primary"))
     }
 
+    /// The composer draft of a Project. The name carries no `.json` suffix on
+    /// purpose: the strict Conversation scan treats every `*.json` as a document.
+    pub fn conversation_draft_file(&self, project_id: Uuid) -> PathBuf {
+        self.conversations_dir().join(format!("{project_id}.draft"))
+    }
+
     /// Durable recovery records for Project deletions whose Conversation
     /// cleanup may not have completed before process exit.
     pub fn pending_project_conversation_deletion_file(&self, project_id: Uuid) -> PathBuf {

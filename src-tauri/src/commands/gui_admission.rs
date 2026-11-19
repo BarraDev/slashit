@@ -68,6 +68,8 @@ impl<'de, R: Runtime> CommandArg<'de, R> for GuiMutation {
 /// instance drains, and nothing waits for them.
 #[cfg(test)]
 const READ_ONLY: &[&str] = &[
+    "get_conversation_draft",
+    "get_conversations_config",
     "greet",
     "get_theme",
     "list_themes",
