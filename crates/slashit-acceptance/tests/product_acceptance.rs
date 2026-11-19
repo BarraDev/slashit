@@ -1446,6 +1446,13 @@ async fn open_drawer(driver: &WebDriver, task_id: &str, title: &str) -> Result<(
             if shown.prop("textContent").await.ok().flatten().as_deref() != Some(title) {
                 continue;
             }
+            // A card below its column's visible part is reached the way a person
+            // reaches it: by scrolling the column. Without this, a click was
+            // refused while the card's centre lay below the window.
+            if let Err(error) = card.scroll_into_view().await {
+                last_problem = error.to_string();
+                continue;
+            }
             // A probe that cannot be installed must not change the outcome.
             let probed = match card.to_json() {
                 Ok(element) => page(driver, CLICK_PROBE, vec![element]).await.is_ok(),
