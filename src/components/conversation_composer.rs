@@ -184,6 +184,14 @@ fn arm_flush(project: String) {
     .forget();
 }
 
+fn show_background_error(message: String) {
+    ERROR_SINK.with(|cell| {
+        if let Some(sink) = *cell.borrow() {
+            let _ = sink.try_set(Some(message));
+        }
+    });
+}
+
 /// A debounced write, retried a bounded number of times. A failure that persists is
 /// shown in the composer, so the text is never left unsaved without a warning.
 async fn flush_in_background(project: String) {
@@ -194,12 +202,10 @@ async fn flush_in_background(project: String) {
         }
         match flush(project.clone()).await {
             Ok(()) => return,
+            // A newer stored draft makes `flush` unload the slot. Retrying cannot help, so show it now.
+            Err(error) if !with_slot(&project, |slot| slot.loaded) => show_background_error(error),
             Err(error) if attempt == BACKGROUND_SAVE_ATTEMPTS => {
-                ERROR_SINK.with(|cell| {
-                    if let Some(sink) = *cell.borrow() {
-                        let _ = sink.try_set(Some(format!("{error} SlashIt will keep the text and try again on your next change.")));
-                    }
-                });
+                show_background_error(format!("{error} SlashIt will keep the text and try again on your next change."));
             }
             Err(_) => TimeoutFuture::new(BACKGROUND_RETRY_MS).await,
         }
@@ -334,29 +340,33 @@ pub fn end_send(project: &str) {
 /// taken as proof that the message was never sent. Returns true when the
 /// composer text changed.
 pub fn settle_pending_send(project: &str, snapshot: &ConversationSnapshot, read_after_send: bool) -> bool {
-    let outcome = with_slot(project, |slot| {
-        let pending = slot.pending.clone()?;
-        if send_was_saved(snapshot, &pending) {
-            slot.pending = None;
-            let cleared = text_after_saved_send(&slot.text, &pending.message);
-            if let Some(text) = &cleared {
-                slot.text = text.clone();
-            }
-            slot.dirty = true;
-            return Some(cleared.is_some());
-        }
-        if read_after_send && !slot.sending {
-            slot.pending = None;
-            slot.dirty = true;
-            return Some(false);
-        }
-        None
-    });
+    let outcome = with_slot(project, |slot| settle_slot(slot, snapshot, read_after_send));
     // The store must see the marker's removal too, so the write is scheduled on every change.
     if outcome.is_some() {
         arm_flush(project.to_string());
     }
     outcome.unwrap_or(false)
+}
+
+/// The settle rule on one Project's slot. `None` leaves the slot untouched; otherwise the
+/// marker is settled and the value says whether the composer text changed.
+fn settle_slot(slot: &mut Slot, snapshot: &ConversationSnapshot, read_after_send: bool) -> Option<bool> {
+    let pending = slot.pending.clone()?;
+    if send_was_saved(snapshot, &pending) {
+        slot.pending = None;
+        let cleared = text_after_saved_send(&slot.text, &pending.message);
+        if let Some(text) = &cleared {
+            slot.text = text.clone();
+        }
+        slot.dirty = true;
+        return Some(cleared.is_some());
+    }
+    if read_after_send && !slot.sending {
+        slot.pending = None;
+        slot.dirty = true;
+        return Some(false);
+    }
+    None
 }
 
 /// Stop a pending marker from waiting for a confirmation that never comes.
@@ -466,6 +476,38 @@ mod tests {
         let mut after = before.clone();
         after.push(entry(EntryKind::HumanMessage { text: "now".into() }));
         assert!(send_was_saved(&snapshot(id, after), &marker));
+    }
+
+    #[test]
+    fn an_absent_message_drops_the_marker_only_after_a_read_taken_after_the_send() {
+        let id = Uuid::new_v4();
+        let before = vec![entry(EntryKind::HumanMessage { text: "earlier".into() })];
+        let absent = snapshot(id, before.clone());
+        let mut slot = Slot { text: "now".into(), pending: Some(pending(id, before.len(), "now")), ..Slot::default() };
+        // A read that may predate the save leaves the marker in place.
+        assert_eq!(settle_slot(&mut slot, &absent, false), None);
+        assert!(slot.pending.is_some());
+        // A read taken while the send is still in flight is not conclusive either.
+        slot.sending = true;
+        assert_eq!(settle_slot(&mut slot, &absent, true), None);
+        assert!(slot.pending.is_some());
+        // Once the send has ended, the absence is conclusive and the text is kept.
+        slot.sending = false;
+        assert_eq!(settle_slot(&mut slot, &absent, true), Some(false));
+        assert!(slot.pending.is_none());
+        assert_eq!(slot.text, "now");
+    }
+
+    #[test]
+    fn a_saved_message_clears_the_text_and_the_marker_from_any_read() {
+        let id = Uuid::new_v4();
+        let before = vec![entry(EntryKind::HumanMessage { text: "earlier".into() })];
+        let mut after = before.clone();
+        after.push(entry(EntryKind::HumanMessage { text: "now".into() }));
+        let mut slot = Slot { text: "now".into(), pending: Some(pending(id, before.len(), "now")), ..Slot::default() };
+        assert_eq!(settle_slot(&mut slot, &snapshot(id, after), false), Some(true));
+        assert!(slot.pending.is_none());
+        assert_eq!(slot.text, "");
     }
 
     #[test]
