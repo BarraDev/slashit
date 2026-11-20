@@ -2810,6 +2810,8 @@ fn KanbanTaskCard(
         }
     };
 
+    // The card itself, without the action tabs below it: the drag ghost is this element.
+    let card_ref = NodeRef::<leptos::html::Div>::new();
     let on_drag_start = {
         let task_id = task_id.clone();
         let task_status = task_status.clone();
@@ -2817,7 +2819,15 @@ fn KanbanTaskCard(
             if let Some(dt) = e.data_transfer() {
                 dt.set_effect_allowed("move");
                 let _ = dt.set_data("text/plain", &task_id);
-                // Let browser use the default drag ghost — it captures the draggable element naturally
+                // The draggable element also holds the action tabs, so the browser's default
+                // ghost would include them. Ghost only the card, keeping the pointer on the same spot.
+                if let Some(card) = card_ref.get_untracked() {
+                    let rect = card.get_bounding_client_rect();
+                    let x = e.client_x() - rect.left() as i32;
+                    let y = e.client_y() - rect.top() as i32;
+                    let element: &web_sys::Element = card.as_ref();
+                    dt.set_drag_image(element, x, y);
+                }
             }
             dragged_task.set(Some((task_id.clone(), task_status.clone())));
             set_is_dragging.set(true);
@@ -3035,6 +3045,7 @@ fn KanbanTaskCard(
                 on:click=handle_click
                 on:contextmenu=on_context_menu
             >
+                <div node_ref=card_ref class="relative">
                 // 3-dot menu button (appears on hover)
                 <button
                     data-testid="task-card-menu"
@@ -3047,7 +3058,11 @@ fn KanbanTaskCard(
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
                     </svg>
                 </button>
-                <TaskCard task=task.clone() activity=live_activity run=live_run>
+                <TaskCard task=task.clone() activity=live_activity run=live_run />
+                </div>
+                // Action tabs below the card. They share the draggable element, so
+                // hover and drag styling move with the card; the drag ghost excludes them.
+                <div class="relative flex flex-wrap justify-end gap-1.5 px-2 pb-1.5 -mt-1 empty:hidden">
                 // "Run now" for queued tasks: promote this exact card out of
                 // the queue without dragging it or opening the card's menu.
                 {
@@ -3308,7 +3323,7 @@ fn KanbanTaskCard(
                     })
                     }
                 }
-            </TaskCard>
+                </div>
             </div>
 
             // Drop indicator below task (shows when hovering on lower half)
