@@ -2714,6 +2714,19 @@ fn offers_pr_sync(task: &Task, pr_unavailable: bool) -> bool {
         }
 }
 
+/// Where the card menu opens, as fixed-position viewport coordinates. A click
+/// with `detail == 0` came from the keyboard (Enter or Space), so its pointer
+/// coordinates are not a position: Chromium and Firefox report (0, 0) and
+/// WebKitGTK reports synthetic values. Such a menu opens at the button's
+/// bottom-left corner instead, as a pointer click on that corner would.
+fn menu_anchor(detail: i32, pointer: (i32, i32), button_left_bottom: (f64, f64)) -> (i32, i32) {
+    if detail == 0 {
+        (button_left_bottom.0 as i32, button_left_bottom.1 as i32)
+    } else {
+        pointer
+    }
+}
+
 #[component]
 fn KanbanTaskCard(
     task: Task,
@@ -2787,13 +2800,18 @@ fn KanbanTaskCard(
         move |e: web_sys::MouseEvent| {
             e.prevent_default();
             e.stop_propagation();
-            // Position menu near the button
-            set_context_menu_pos.set((e.client_x(), e.client_y()));
+            // Position menu near the button, whether the click came from the mouse or the keyboard
+            let button = e.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok());
+            let rect = button.map(|b| b.get_bounding_client_rect());
+            let button_left_bottom = rect.map_or((0.0, 0.0), |r| (r.left(), r.bottom()));
+            set_context_menu_pos.set(menu_anchor(e.detail(), (e.client_x(), e.client_y()), button_left_bottom));
             set_context_menu_task.set(Some(task.clone()));
             set_show_context_menu.set(true);
         }
     };
 
+    // The card itself, without the action tabs below it: the drag ghost is this element.
+    let card_ref = NodeRef::<leptos::html::Div>::new();
     let on_drag_start = {
         let task_id = task_id.clone();
         let task_status = task_status.clone();
@@ -2801,7 +2819,15 @@ fn KanbanTaskCard(
             if let Some(dt) = e.data_transfer() {
                 dt.set_effect_allowed("move");
                 let _ = dt.set_data("text/plain", &task_id);
-                // Let browser use the default drag ghost — it captures the draggable element naturally
+                // The draggable element also holds the action tabs, so the browser's default
+                // ghost would include them. Ghost only the card, keeping the pointer on the same spot.
+                if let Some(card) = card_ref.get_untracked() {
+                    let rect = card.get_bounding_client_rect();
+                    let x = e.client_x() - rect.left() as i32;
+                    let y = e.client_y() - rect.top() as i32;
+                    let element: &web_sys::Element = card.as_ref();
+                    dt.set_drag_image(element, x, y);
+                }
             }
             dragged_task.set(Some((task_id.clone(), task_status.clone())));
             set_is_dragging.set(true);
@@ -3019,10 +3045,11 @@ fn KanbanTaskCard(
                 on:click=handle_click
                 on:contextmenu=on_context_menu
             >
+                <div node_ref=card_ref class="relative">
                 // 3-dot menu button (appears on hover)
                 <button
                     data-testid="task-card-menu"
-                    class="absolute top-2 right-2 p-1.5 rounded-md opacity-0 group-hover/card:opacity-100 hover:bg-white/10 z-10 transition-all"
+                    class="absolute top-2 right-2 p-1.5 rounded-md opacity-0 group-hover/card:opacity-100 focus-visible:opacity-100 hover:bg-white/10 z-10 transition-all"
                     on:click=on_menu_button_click
                     title="Task options"
                     aria-label="Task options"
@@ -3032,6 +3059,10 @@ fn KanbanTaskCard(
                     </svg>
                 </button>
                 <TaskCard task=task.clone() activity=live_activity run=live_run />
+                </div>
+                // Action tabs below the card. They share the draggable element, so
+                // hover and drag styling move with the card; the drag ghost excludes them.
+                <div class="relative flex flex-wrap justify-end gap-1.5 px-2 pb-1.5 -mt-1 empty:hidden">
                 // "Run now" for queued tasks: promote this exact card out of
                 // the queue without dragging it or opening the card's menu.
                 {
@@ -3049,7 +3080,7 @@ fn KanbanTaskCard(
                         let task_id = run_now_id;
                         let task_title = run_now_title;
                         view! {
-                            <div class="flex justify-end px-2 pb-1.5 -mt-1">
+                            <div class="contents">
                                 <button
                                     data-testid="task-card-run-now"
                                     disabled=move || pending.get()
@@ -3105,7 +3136,7 @@ fn KanbanTaskCard(
                         let task_id = task.id.to_string();
                         let task_title = task.title.clone();
                         view! {
-                            <div class="flex justify-end px-2 pb-1.5 -mt-1">
+                            <div class="contents">
                                 <button
                                     class="px-2 py-0.5 text-[10px] rounded bg-white/[0.06] text-white/50 hover:bg-white/10 hover:text-white/80 transition-colors"
                                     on:click=move |e: web_sys::MouseEvent| {
@@ -3189,7 +3220,7 @@ fn KanbanTaskCard(
                         let task_for_pr_review = task_for_pr_review.clone();
                         let task_for_sync_pr = task.clone();
                         view! {
-                            <div class="flex justify-end gap-1.5 px-2 pb-1.5 -mt-1">
+                            <div class="contents">
                                 {can_sync_pr.then(|| {
                                     let task_for_sync_pr = task_for_sync_pr.clone();
                                     view! {
@@ -3292,8 +3323,9 @@ fn KanbanTaskCard(
                     })
                     }
                 }
+                </div>
             </div>
-            
+
             // Drop indicator below task (shows when hovering on lower half)
             <div
                 class=move || {
@@ -3335,6 +3367,18 @@ mod tests {
     use leptos::prelude::{GetUntracked, RwSignal, Set};
     use leptos::reactive::owner::Owner;
     use uuid::Uuid;
+
+    /// A keyboard activation of the card menu button reports no pointer
+    /// position (Chromium and Firefox send (0, 0); WebKitGTK sends synthetic
+    /// values). The menu must open at the button, not at the viewport corner.
+    #[test]
+    fn a_keyboard_opened_card_menu_sits_at_its_button_whatever_the_event_reports() {
+        let button = (612.0, 88.5);
+        assert_eq!(super::menu_anchor(0, (0, 0), button), (612, 88));
+        assert_eq!(super::menu_anchor(0, (430, 215), button), (612, 88));
+        // A mouse click keeps the pointer placement.
+        assert_eq!(super::menu_anchor(1, (640, 301), button), (640, 301));
+    }
 
     /// The dialog's state, created the way the board creates it.
     fn dialog(owner: &Owner) -> PrReviewDialog {

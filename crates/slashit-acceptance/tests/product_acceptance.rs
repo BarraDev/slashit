@@ -101,6 +101,8 @@ mod queue_settings;
 mod settings_appearance;
 #[path = "product_acceptance/update_notice.rs"]
 mod update_notice;
+#[path = "product_acceptance/kanban_card_menu.rs"]
+mod kanban_card_menu;
 #[path = "product_acceptance/run_now.rs"]
 mod run_now;
 #[path = "product_acceptance/stacked_tasks.rs"]
