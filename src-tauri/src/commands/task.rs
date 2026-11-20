@@ -241,6 +241,15 @@ pub(crate) async fn set_task_status(
     }) else {
         return Ok(None);
     };
+    // A removed Project's Tasks do not enter Queue. Read under the lease held
+    // above, so removal cannot happen between this check and the write.
+    let queue_refusal = match queue_refusal {
+        Some(refusal) => Some(refusal),
+        None => {
+            crate::lifecycle::removed_project_queue_refusal(&state.task.tasks, &state.project.projects, task_id, &status)
+                .await
+        }
+    };
 
     // A request for the column a queued Task already holds is answered with the
     // Task as it is. Nothing is reset, withdrawn or recorded, and nothing is
@@ -1021,6 +1030,11 @@ pub async fn reorder_task(
     if target_status == TaskStatus::Queue && old_status != TaskStatus::Queue {
         if let Some(refusal) = queue_refusal {
             return Err(refusal);
+        }
+        // A removed Project's Tasks do not enter Queue. The lease held above
+        // keeps removal from landing between this check and the write.
+        if crate::lifecycle::project_is_removed(&state.project.projects, project_id).await {
+            return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
         }
     }
 

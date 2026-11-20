@@ -148,6 +148,7 @@ async fn enqueue_durably(
     let verdict = crate::lifecycle::enqueue_current(
         &state.task.tasks,
         &state.storage,
+        &state.project.projects,
         &state.task_lifecycle_locks,
         running,
         task_id,
@@ -486,6 +487,7 @@ mod enqueue_parity {
         let verdict = crate::lifecycle::enqueue_leased(
             &live.task.tasks,
             &live.storage,
+            &live.project.projects,
             project_id,
             by_lifecycle,
             &TaskStatus::Backlog,
@@ -1211,6 +1213,7 @@ mod enqueue_front_doors {
         let verdict = crate::lifecycle::enqueue_current(
             &live.task.tasks,
             &live.storage,
+            &live.project.projects,
             &live.task_lifecycle_locks,
             None,
             lifecycle_id,

@@ -23145,7 +23145,7 @@ VERDICT: APPROVED"
             let digest = crate::queue::prompt::task_input_digest(&w.in_memory().await);
             let _lease = w.executor.lifecycle.acquire(id).await.unwrap();
             let moved = crate::lifecycle::enqueue_leased(
-                &w.executor.tasks, &w.executor.storage, project, id, &TaskStatus::Error,
+                &w.executor.tasks, &w.executor.storage, &w.executor.projects, project, id, &TaskStatus::Error,
                 Some(crate::lifecycle::InputApproval { id: Uuid::new_v4(), digest: &digest, request: None, checkout: None }),
             )
             .await
@@ -27613,6 +27613,7 @@ VERDICT: APPROVED"
                 crate::lifecycle::enqueue_leased(
                     &self.executor.tasks,
                     &self.executor.storage,
+                    &self.executor.projects,
                     self.project_id,
                     self.task_id,
                     &TaskStatus::Backlog,
@@ -27771,6 +27772,7 @@ VERDICT: APPROVED"
                 crate::lifecycle::enqueue_leased(
                     &fx.executor.tasks,
                     &fx.executor.storage,
+                    &fx.executor.projects,
                     fx.project_id,
                     fx.task_id,
                     &TaskStatus::Backlog,
@@ -27944,6 +27946,7 @@ VERDICT: APPROVED"
                 crate::lifecycle::enqueue_leased(
                     &fx.executor.tasks,
                     &fx.executor.storage,
+                    &fx.executor.projects,
                     fx.project_id,
                     fx.task_id,
                     &TaskStatus::Backlog,
@@ -27984,6 +27987,7 @@ VERDICT: APPROVED"
                 crate::lifecycle::enqueue_leased(
                     &fx.executor.tasks,
                     &fx.executor.storage,
+                    &fx.executor.projects,
                     fx.project_id,
                     fx.task_id,
                     &TaskStatus::Backlog,
@@ -28035,6 +28039,7 @@ VERDICT: APPROVED"
                 crate::lifecycle::enqueue_leased(
                     &fx.executor.tasks,
                     &fx.executor.storage,
+                    &fx.executor.projects,
                     fx.project_id,
                     fx.task_id,
                     &TaskStatus::Backlog,

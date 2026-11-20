@@ -906,11 +906,15 @@ impl EnqueueVerdict {
 fn queue_entry_check(
     task: &Task,
     project_id: Uuid,
+    project_removed: bool,
     seen_in: &TaskStatus,
     approval: Option<&InputApproval<'_>>,
 ) -> Result<(), EnqueueVerdict> {
     if task.project_id != project_id {
         return Err(EnqueueVerdict::OtherProject);
+    }
+    if project_removed {
+        return Err(EnqueueVerdict::Blocked(crate::domain::project::PROJECT_REMOVED_REFUSAL.into()));
     }
     if task.status == TaskStatus::Queue {
         return Err(EnqueueVerdict::AlreadyQueued(task.title.clone()));
@@ -1015,16 +1019,20 @@ pub fn is_repeated_queue_move(task: &Task, target: &TaskStatus) -> bool {
 pub async fn enqueue_leased(
     tasks: &Tasks,
     storage: &Storage,
+    projects: &RwLock<HashMap<Uuid, Project>>,
     project_id: Uuid,
     task_id: Uuid,
     seen_in: &TaskStatus,
     approval: Option<InputApproval<'_>>,
 ) -> Result<EnqueueVerdict, String> {
+    // Read under the caller's lease: removing a Project takes that lease for
+    // each of its Tasks before it writes `removed_at`, so this cannot go stale.
+    let project_removed = project_is_removed(projects, project_id).await;
     let verdict = std::sync::Mutex::new(EnqueueVerdict::Missing);
     let revise = |staged: &mut HashMap<Uuid, Task>| -> bool {
         let (found, changed) = match staged.get_mut(&task_id) {
             None => (EnqueueVerdict::Missing, false),
-            Some(task) => match queue_entry_check(task, project_id, seen_in, approval.as_ref()) {
+            Some(task) => match queue_entry_check(task, project_id, project_removed, seen_in, approval.as_ref()) {
                 Err(refusal) => (refusal, false),
                 Ok(()) => {
                     let from = task.status.clone();
@@ -1087,12 +1095,13 @@ pub async fn enqueue_leased(
 pub async fn enqueue_current(
     tasks: &Tasks,
     storage: &Storage,
+    projects: &RwLock<HashMap<Uuid, Project>>,
     locks: &TaskLifecycleLocks,
     running: Option<&dyn ExecutionOwnership>,
     task_id: Uuid,
 ) -> Result<EnqueueVerdict, String> {
     let _lease = locks.acquire(task_id).await?;
-    enqueue_current_held(tasks, storage, running, task_id, None).await
+    enqueue_current_held(tasks, storage, projects, running, task_id, None).await
 }
 
 /// [`enqueue_current`] for a front door that must not take a Task out of Human
@@ -1102,13 +1111,36 @@ pub async fn enqueue_current(
 pub async fn enqueue_current_refusing_human_review(
     tasks: &Tasks,
     storage: &Storage,
+    projects: &RwLock<HashMap<Uuid, Project>>,
     locks: &TaskLifecycleLocks,
     running: Option<&dyn ExecutionOwnership>,
     task_id: Uuid,
     refusal: &str,
 ) -> Result<EnqueueVerdict, String> {
     let _lease = locks.acquire(task_id).await?;
-    enqueue_current_held(tasks, storage, running, task_id, Some(refusal)).await
+    enqueue_current_held(tasks, storage, projects, running, task_id, Some(refusal)).await
+}
+
+/// Whether a Project is removed. A Project that is missing reads as not
+/// removed here; the Task's own Project check reports a missing one.
+pub async fn project_is_removed(projects: &RwLock<HashMap<Uuid, Project>>, project_id: Uuid) -> bool {
+    projects.read().await.get(&project_id).is_some_and(Project::is_removed)
+}
+
+/// The refusal for a status move of Task `task_id` to `target` when the Task's
+/// Project was removed. Only a move into Queue is refused here; every other
+/// move is decided by its own checks. The caller holds the Task's lease.
+pub async fn removed_project_queue_refusal(
+    tasks: &Tasks,
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    task_id: Uuid,
+    target: &TaskStatus,
+) -> Option<String> {
+    if *target != TaskStatus::Queue {
+        return None;
+    }
+    let project_id = tasks.read().await.get(&task_id)?.project_id;
+    project_is_removed(projects, project_id).await.then(|| crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string())
 }
 
 /// The body of [`enqueue_current`], for a caller that already holds the Task's
@@ -1116,6 +1148,7 @@ pub async fn enqueue_current_refusing_human_review(
 async fn enqueue_current_held(
     tasks: &Tasks,
     storage: &Storage,
+    projects: &RwLock<HashMap<Uuid, Project>>,
     running: Option<&dyn ExecutionOwnership>,
     task_id: Uuid,
     human_review_refusal: Option<&str>,
@@ -1132,12 +1165,17 @@ async fn enqueue_current_held(
         if let Some(reason) = task.queue_entry_refusal() {
             return Ok(EnqueueVerdict::Blocked(reason));
         }
+        // Refused before any owner is ended: a removed Project keeps its
+        // running owner, which is not this caller's to stop.
+        if project_is_removed(projects, task.project_id).await {
+            return Ok(EnqueueVerdict::Blocked(crate::domain::project::PROJECT_REMOVED_REFUSAL.into()));
+        }
         end_active_ownership(running, task_id).await?;
     }
     let Some(seen_in) = tasks.read().await.get(&task_id).map(|t| t.status.clone()) else {
         return Ok(EnqueueVerdict::Missing);
     };
-    enqueue_leased(tasks, storage, task.project_id, task_id, &seen_in, None).await
+    enqueue_leased(tasks, storage, projects, task.project_id, task_id, &seen_in, None).await
 }
 
 /// Select, amend and durably commit a task the caller does not yet have the id
@@ -4270,7 +4308,7 @@ mod tests {
         })
         .await;
 
-        let verdict = enqueue_current(&world.tasks, &world.storage, &world.authority, None, id)
+        let verdict = enqueue_current(&world.tasks, &world.storage, &world.projects, &world.authority, None, id)
             .await
             .expect("the enqueue is written");
         assert!(matches!(verdict, EnqueueVerdict::Queued(_)), "{verdict:?}");
@@ -4293,7 +4331,7 @@ mod tests {
         .await;
         assert!(world.task(id).await.human_review.is_approved(), "the fixture is approved");
 
-        enqueue_current(&world.tasks, &world.storage, &world.authority, None, id)
+        enqueue_current(&world.tasks, &world.storage, &world.projects, &world.authority, None, id)
             .await
             .expect("the enqueue is written");
 
@@ -4311,7 +4349,7 @@ mod tests {
         // Its Backlog position collides with a position already in Queue.
         let entering = add_task(&world, "entering", TaskStatus::Backlog, 1, |_| {}).await;
 
-        enqueue_current(&world.tasks, &world.storage, &world.authority, None, entering)
+        enqueue_current(&world.tasks, &world.storage, &world.projects, &world.authority, None, entering)
             .await
             .expect("the enqueue is written");
 
@@ -4366,6 +4404,7 @@ mod tests {
         let result = enqueue_leased(
             &world.tasks,
             &world.storage,
+            &world.projects,
             world.project_id,
             id,
             &TaskStatus::Backlog,
@@ -4393,6 +4432,7 @@ mod tests {
         let verdict = enqueue_leased(
             &world.tasks,
             &world.storage,
+            &world.projects,
             world.project_id,
             id,
             &TaskStatus::Backlog,
@@ -4415,6 +4455,7 @@ mod tests {
         let verdict = enqueue_leased(
             &world.tasks,
             &world.storage,
+            &world.projects,
             world.project_id,
             id,
             &TaskStatus::Backlog,
@@ -4434,8 +4475,8 @@ mod tests {
         let id = add_task(&world, "contested", TaskStatus::Backlog, 0, |_| {}).await;
 
         let (first, second) = tokio::join!(
-            enqueue_current(&world.tasks, &world.storage, &world.authority, None, id),
-            enqueue_current(&world.tasks, &world.storage, &world.authority, None, id),
+            enqueue_current(&world.tasks, &world.storage, &world.projects, &world.authority, None, id),
+            enqueue_current(&world.tasks, &world.storage, &world.projects, &world.authority, None, id),
         );
         let mut verdicts = [first.expect("first request"), second.expect("second request")];
         verdicts.sort_by_key(|v| matches!(v, EnqueueVerdict::AlreadyQueued(_)));
@@ -4462,6 +4503,7 @@ mod tests {
         let verdict = enqueue_current(
             &world.tasks,
             &world.storage,
+            &world.projects,
             &world.authority,
             Some(&owner),
             id,
@@ -4587,6 +4629,7 @@ mod tests {
         let verdict = enqueue_current(
             &world.tasks,
             &world.storage,
+            &world.projects,
             &world.authority,
             Some(&owner),
             id,
@@ -4614,13 +4657,43 @@ mod tests {
         ));
     }
 
+    /// A removed Project starts no work: its Task is not queued, and an owner
+    /// that is running for it is not ended by a request that will be refused.
+    #[tokio::test]
+    async fn a_removed_projects_task_is_not_queued_and_its_owner_is_left_alone() {
+        let world = world(true);
+        world.projects.write().await.get_mut(&world.project_id).expect("the Project").removed_at = Some(chrono::Utc::now());
+        let id = add_task(&world, "removed", TaskStatus::Backlog, 0, |_| {}).await;
+        let before = serde_json::to_value(world.task(id).await).unwrap();
+        let owner = OwnerThatRecordsEnding::default();
+
+        let verdict = enqueue_current(
+            &world.tasks,
+            &world.storage,
+            &world.projects,
+            &world.authority,
+            Some(&owner),
+            id,
+        )
+        .await
+        .expect("the refusal is answered");
+
+        assert!(
+            matches!(&verdict, EnqueueVerdict::Blocked(reason) if reason == crate::domain::project::PROJECT_REMOVED_REFUSAL),
+            "{verdict:?}"
+        );
+        assert!(!owner.ended.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(serde_json::to_value(world.task(id).await).unwrap(), before);
+        assert_eq!(serde_json::to_value(world.persisted(id)).unwrap(), before);
+    }
+
     #[tokio::test]
     async fn an_entry_the_board_file_refuses_is_reported_and_not_shown_as_queued() {
         let world = world(true);
         let id = add_task(&world, "backlog", TaskStatus::Backlog, 0, |_| {}).await;
         world.block_persistence();
 
-        let result = enqueue_current(&world.tasks, &world.storage, &world.authority, None, id).await;
+        let result = enqueue_current(&world.tasks, &world.storage, &world.projects, &world.authority, None, id).await;
 
         assert!(result.is_err(), "{result:?}");
         assert_eq!(world.task(id).await.status, TaskStatus::Backlog);
@@ -4637,7 +4710,7 @@ mod tests {
         let id = add_task(&world, "entering", TaskStatus::Backlog, 0, |_| {}).await;
 
         let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
-        let result = enqueue_current(&world.tasks, &world.storage, &world.authority, None, id).await;
+        let result = enqueue_current(&world.tasks, &world.storage, &world.projects, &world.authority, None, id).await;
         drop(fault);
 
         let error = result.expect_err("the durability is unconfirmed, so the caller is told");

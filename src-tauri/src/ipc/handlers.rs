@@ -1196,6 +1196,14 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         Some(found) => found,
         None => return IpcResponse::error(format!("Task {task_id} not found")),
     };
+    // A removed Project's Tasks do not enter Queue, from the CLI either. Read
+    // under the lease held above.
+    let queue_refusal = match queue_refusal {
+        Some(refusal) => Some(refusal),
+        None => {
+            crate::lifecycle::removed_project_queue_refusal(&ctx.tasks, &ctx.projects, task_uuid, &new_status).await
+        }
+    };
 
     // A Task in Human Review leaves that column only through the application's
     // own decision (approve, request changes, close, or the desktop queue
@@ -1550,6 +1558,7 @@ async fn handle_enqueue_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
     match crate::lifecycle::enqueue_current_refusing_human_review(
         &ctx.tasks,
         &ctx.storage,
+        &ctx.projects,
         &ctx.task_lifecycle_locks,
         running,
         task_uuid,

@@ -640,7 +640,7 @@ async fn enqueue_task(
     }
     Ok(
         match lifecycle::enqueue_leased(
-            scope.tasks, scope.storage, scope.project_id, task_id, from, Some(approval),
+            scope.tasks, scope.storage, scope.projects, scope.project_id, task_id, from, Some(approval),
         )
         .await?
         {

@@ -2726,6 +2726,7 @@ mod tests {
             let verdict = crate::lifecycle::enqueue_leased(
                 &b.state().task.tasks,
                 &b.state().storage,
+                &b.state().project.projects,
                 b.project_id,
                 b.task_id,
                 &TaskStatus::Done,
