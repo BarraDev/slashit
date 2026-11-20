@@ -133,9 +133,27 @@ mod workspace_tests {
     #[test]
     fn test_workspace_creation() {
         let root = WorkspaceRoot::from_trusted(PathBuf::from("/home/u/Repo/ps"));
-        let workspace = Workspace::new("ps".to_string(), root);
+        let workspace = Workspace::new("ps".to_string(), Some(root));
         assert_eq!(workspace.name, "ps");
-        assert_eq!(workspace.root_path.as_path(), Path::new("/home/u/Repo/ps"));
+        assert_eq!(workspace.root_path.as_ref().expect("a root").as_path(), Path::new("/home/u/Repo/ps"));
+    }
+
+    /// A grouping-only Workspace writes no root key, and an older record that
+    /// has one still loads with it, so existing `workspaces.toml` keeps its meaning.
+    #[test]
+    fn a_workspace_without_a_root_round_trips_and_an_older_root_still_loads() {
+        let grouping = Workspace::new("Clients".to_string(), None);
+        let text = toml::to_string(&grouping).expect("serializes");
+        assert!(!text.contains("root_path"), "{text}");
+        let back: Workspace = toml::from_str(&text).expect("loads");
+        assert!(back.root_path.is_none());
+
+        let older = format!(
+            "id = \"{}\"\nname = \"ps\"\nroot_path = \"/home/u/Repo/ps\"\ncreated_at = \"2026-01-01T00:00:00Z\"\nupdated_at = \"2026-01-01T00:00:00Z\"\n",
+            uuid::Uuid::new_v4()
+        );
+        let loaded: Workspace = toml::from_str(&older).expect("an older record loads");
+        assert_eq!(loaded.root_path.expect("kept").as_path(), Path::new("/home/u/Repo/ps"));
     }
 }
 

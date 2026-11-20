@@ -127,7 +127,7 @@ impl WorkspaceRegistry {
     pub fn contains_root(&self, root: &Path) -> bool {
         self.workspaces
             .values()
-            .any(|w| w.root_path.as_path() == root)
+            .any(|w| w.root_path.as_ref().is_some_and(|r| r.as_path() == root))
     }
 
     /// Delete the empty `.slashit/` directories left behind by earlier versions.
@@ -138,11 +138,8 @@ impl WorkspaceRegistry {
     pub fn clean_legacy_state_dirs(&self) -> usize {
         self.workspaces
             .values()
-            .filter(|w| {
-                StateMigrator::remove_empty_legacy_dir(
-                    &w.root_path.as_path().join(IN_PROJECT_DIR),
-                )
-            })
+            .filter_map(|w| w.root_path.as_ref())
+            .filter(|root| StateMigrator::remove_empty_legacy_dir(&root.as_path().join(IN_PROJECT_DIR)))
             .count()
     }
 
@@ -188,7 +185,7 @@ mod tests {
     fn workspace_in(root: &Path) -> Workspace {
         Workspace::new(
             "ws".to_string(),
-            crate::domain::WorkspaceRoot::try_new(root).expect("real dir must validate"),
+            Some(crate::domain::WorkspaceRoot::try_new(root).expect("real dir must validate")),
         )
     }
 

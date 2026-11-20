@@ -14,7 +14,7 @@ extern "C" {
 struct CreateArgs<'a> {
     name: &'a str,
     #[serde(rename = "rootPath")]
-    root_path: &'a str,
+    root_path: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -39,7 +39,7 @@ fn js_error_to_string(value: JsValue) -> String {
     })
 }
 
-pub async fn create_workspace(name: &str, root_path: &str) -> Result<Workspace, String> {
+pub async fn create_workspace(name: &str, root_path: Option<&str>) -> Result<Workspace, String> {
     let args = serde_wasm_bindgen::to_value(&CreateArgs { name, root_path })
         .map_err(|e| e.to_string())?;
     let result = JsFuture::from(invoke("create_workspace", args))

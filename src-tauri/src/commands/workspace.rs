@@ -29,22 +29,29 @@ pub async fn create_workspace(
     _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     name: String,
-    root_path: String,
+    root_path: Option<String>,
 ) -> Result<Workspace, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("Workspace name is required".to_string());
     }
 
-    let root = WorkspaceRoot::try_new(&root_path)?;
-    let workspace = Workspace::new(name, root.clone());
+    // No root makes a grouping-only Workspace, which changes no Worker's
+    // working directory. Only a path the person gave creates a root.
+    let root = match root_path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+        Some(path) => Some(WorkspaceRoot::try_new(&path)?),
+        None => None,
+    };
     let mut registry = state.workspace.registry.write().await;
-    if registry.contains_root(root.as_path()) {
-        return Err(format!(
-            "A workspace is already registered for {}",
-            root.as_path().display()
-        ));
+    if let Some(root) = &root {
+        if registry.contains_root(root.as_path()) {
+            return Err(format!(
+                "A workspace is already registered for {}",
+                root.as_path().display()
+            ));
+        }
     }
+    let workspace = Workspace::new(name, root);
     registry.upsert(workspace.clone()).map_err(|e| e.describe("save the workspace"))?;
     Ok(workspace)
 }

@@ -1960,7 +1960,7 @@ mod tests {
             .expect("a missing registry file should load empty");
         let workspace = crate::domain::Workspace::new(
             "ws".to_string(),
-            crate::domain::WorkspaceRoot::try_new(root.path()).expect("real dir must validate"),
+            Some(crate::domain::WorkspaceRoot::try_new(root.path()).expect("real dir must validate")),
         );
         let id = workspace.id;
         registry.upsert(workspace).expect("upsert should succeed");

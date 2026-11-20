@@ -92,7 +92,8 @@ impl Membership {
         let workspace_id = projects.get(&project_id).and_then(|p| p.scope.workspace_id());
         let root = workspace_id
             .and_then(|id| registry.get(&id))
-            .map(|ws| ws.root_path.as_path().to_path_buf());
+            .and_then(|ws| ws.root_path.as_ref())
+            .map(|root| root.as_path().to_path_buf());
         Self { project_id: Some(project_id), workspace_id, root }
     }
 }
@@ -8515,7 +8516,8 @@ impl TaskExecutor {
                 .read()
                 .await
                 .get(&id)
-                .map(|ws| ws.root_path.as_path().to_path_buf()),
+                .and_then(|ws| ws.root_path.as_ref())
+                .map(|root| root.as_path().to_path_buf()),
             None => None,
         };
         Membership { project_id: Some(project_id), workspace_id, root }
@@ -9456,7 +9458,7 @@ mod tests {
         let workspace_root = tempfile::TempDir::new().expect("workspace root tempdir");
         let workspace = Workspace::new(
             "ws".to_string(),
-            WorkspaceRoot::try_new(workspace_root.path()).expect("real dir must validate"),
+            Some(WorkspaceRoot::try_new(workspace_root.path()).expect("real dir must validate")),
         );
         let workspace_id = workspace.id;
 
@@ -9503,7 +9505,7 @@ mod tests {
             .expect("tempdir")
             .path()
             .join("gone");
-        let workspace = Workspace::new("ws".to_string(), WorkspaceRoot::from_trusted(vanished));
+        let workspace = Workspace::new("ws".to_string(), Some(WorkspaceRoot::from_trusted(vanished)));
         let workspace_id = workspace.id;
 
         let (mut registry, _reg_temp) = test_registry();

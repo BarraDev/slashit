@@ -194,7 +194,10 @@ fn WorkspaceItem(
     let (busy, set_busy) = signal(false);
     let (selected_to_attach, set_selected_to_attach) = signal(String::new());
     let ws_id = workspace.id;
-    let ws_path = workspace.root_path.clone();
+    let ws_path = workspace
+        .root_path
+        .clone()
+        .unwrap_or_else(|| "Grouping only: no shared agent context directory".to_string());
     let ws_path_for_detail = ws_path.clone();
     let ws_path_for_header = ws_path.clone();
     let ws_name = workspace.name.clone();
@@ -391,7 +394,7 @@ mod tests {
         Workspace {
             id: Uuid::new_v4(),
             name: "ws".to_string(),
-            root_path: "/tmp/ws".to_string(),
+            root_path: Some("/tmp/ws".to_string()),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

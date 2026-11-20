@@ -9,7 +9,10 @@ use uuid::Uuid;
 pub struct Workspace {
     pub id: Uuid,
     pub name: String,
-    pub root_path: String,
+    /// Advanced: the Shared Agent Context Directory. Absent for a Workspace
+    /// that only groups Projects.
+    #[serde(default)]
+    pub root_path: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }

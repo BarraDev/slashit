@@ -91,14 +91,15 @@ pub fn Workspaces() -> impl IntoView {
 
     let on_create = move |_| {
         let name = new_name.get();
-        let path = new_path.get();
-        if name.trim().is_empty() || path.trim().is_empty() {
-            toast::error("Name and root path are required".to_string());
+        let path = new_path.get().trim().to_string();
+        if name.trim().is_empty() {
+            toast::error("A workspace name is required".to_string());
             return;
         }
         set_creating.set(true);
         spawn_local(async move {
-            match workspace_service::create_workspace(&name, &path).await {
+            let root = (!path.is_empty()).then_some(path.as_str());
+            match workspace_service::create_workspace(&name, root).await {
                 Ok(_) => {
                     set_new_name.set(String::new());
                     set_new_path.set(String::new());
@@ -116,7 +117,7 @@ pub fn Workspaces() -> impl IntoView {
             <div>
                 <h1 class="text-2xl font-bold text-white/90">"Workspaces"</h1>
                 <p class="text-sm text-white/40 mt-1">
-                    "A workspace groups projects, and each project belongs to at most one workspace. When a task of a member project runs, its agent starts from the workspace root, so instruction files there, such as AGENTS.md, apply to every member."
+                    "A workspace groups projects; each project belongs to at most one workspace. A workspace needs no folder. Its optional Shared Agent Context Directory is advanced: when set, agents of member projects start there and read the instruction files it holds."
                 </p>
             </div>
 
@@ -131,7 +132,7 @@ pub fn Workspaces() -> impl IntoView {
                     />
                     <input
                         class="flex-1 px-3 py-2 rounded-lg bg-black/40 border border-white/10 text-white/90 placeholder-white/30 font-mono text-sm"
-                        placeholder="Root path (e.g. ~/Repo/ps)"
+                        placeholder="Shared Agent Context Directory (Advanced, optional)"
                         prop:value=move || new_path.get()
                         on:input=move |ev| set_new_path.set(event_target_value(&ev))
                     />
