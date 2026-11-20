@@ -5735,7 +5735,15 @@ impl TaskExecutor {
             Self::read_membership(&self.tasks, &self.projects, &self.workspace_registry, task_id)
                 .await;
         let (claude_cwd, claude_add_dirs) =
-            Self::launch_for_membership(&membership, &acquired.info.path);
+            match Self::launch_for_membership(&membership, &acquired.info.path) {
+                Ok(launch) => launch,
+                Err(refusal) => {
+                    self.worktree_manager
+                        .release_unrecorded(&repo_path, &acquired.info, acquired.created_at.as_deref())
+                        .await;
+                    return Err(refusal);
+                }
+            };
         let RunStart {
             working_dir,
             run,
@@ -8526,25 +8534,30 @@ impl TaskExecutor {
     /// Resolve agent launch context.
     ///
     /// If the task's project is attached to a workspace *and that
-    /// workspace's root still exists on disk*, return `(workspace_root,
+    /// workspace has a custom root that exists, return `(workspace_root,
     /// [task_working_dir])` so Claude runs from the workspace cwd with the
-    /// task tree exposed via `--add-dir`. Otherwise return
-    /// `(task_working_dir, [])` — the same fallback used when there is no
-    /// workspace at all. A registered root that has been unmounted, renamed,
-    /// or deleted must not fail the task: the task's own worktree is
-    /// unaffected by the workspace root disappearing, so launching from it
-    /// directly is strictly safer than erroring out from underneath a task
-    /// whose own working directory is still perfectly valid.
+    /// task tree exposed via `--add-dir`. A Workspace without a custom root
+    /// keeps the Worker in its Task Checkout, `(task_working_dir, [])`, so its
+    /// managed root never changes what a Worker can reach.
+    ///
+    /// A configured custom root that is missing refuses the start. Silently
+    /// running from the Task Checkout instead would change the Worker's
+    /// context without the person knowing. The Task Checkout is unaffected,
+    /// so the person restores the folder or changes the root and runs again.
     fn launch_for_membership(
         membership: &Membership,
         task_working_dir: &str,
-    ) -> (String, Vec<std::path::PathBuf>) {
-        match membership.root.as_ref().filter(|root| root.is_dir()) {
-            Some(root) => (
+    ) -> Result<(String, Vec<std::path::PathBuf>), String> {
+        match membership.root.as_ref() {
+            Some(root) if !root.is_dir() => Err(format!(
+                "The Workspace root {} is missing. Nothing was started. Restore the folder or change the Workspace root, then run this Task again.",
+                root.display()
+            )),
+            Some(root) => Ok((
                 root.to_string_lossy().to_string(),
                 vec![std::path::PathBuf::from(task_working_dir)],
-            ),
-            None => (task_working_dir.to_string(), Vec::new()),
+            )),
+            None => Ok((task_working_dir.to_string(), Vec::new())),
         }
     }
 
@@ -9478,7 +9491,7 @@ mod tests {
         let registry = Arc::new(RwLock::new(registry));
         let membership = TaskExecutor::read_membership(&tasks, &projects, &registry, task_id).await;
         let (root, extra_dirs) =
-            TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir");
+            TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir").unwrap();
 
         assert_eq!(
             root,
@@ -9495,12 +9508,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_workspace_launch_falls_back_to_task_dir_when_the_registered_root_is_missing() {
+    async fn resolve_workspace_launch_refuses_when_the_configured_root_is_missing() {
         // The registry holds a root that no longer exists on disk — e.g. an
         // unmounted drive, a rename, or a deleted folder — which
         // `WorkspaceRoot::from_trusted` allows (registry loads never
-        // re-validate). The task's own worktree is unaffected and must still
-        // be usable.
+        // re-validate). The Worker must not silently start in its Task Checkout
+        // instead, so the start is refused and says what is missing.
         let vanished = tempfile::TempDir::new()
             .expect("tempdir")
             .path()
@@ -9525,17 +9538,40 @@ mod tests {
 
         let registry = Arc::new(RwLock::new(registry));
         let membership = TaskExecutor::read_membership(&tasks, &projects, &registry, task_id).await;
-        let (root, extra_dirs) =
-            TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir");
+        let refusal = TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir")
+            .expect_err("a configured but missing workspace root must refuse the start");
 
-        assert_eq!(
-            root, "/tmp/task-working-dir",
-            "a missing workspace root must fall back to the task's own working directory"
-        );
         assert!(
-            extra_dirs.is_empty(),
-            "the fallback must match the no-workspace shape exactly (no --add-dir entries)"
+            refusal.contains("is missing") && refusal.contains("Nothing was started"),
+            "the refusal must say what is missing and that nothing started: {refusal}"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_launch_keeps_the_task_dir_for_a_workspace_without_a_custom_root() {
+        // A managed root is never a Worker's working directory: the Workspace
+        // without a custom root launches exactly as a standalone Project does.
+        let workspace = Workspace::new("ws".to_string(), None);
+        let workspace_id = workspace.id;
+        let (mut registry, _reg_temp) = test_registry();
+        registry.upsert(workspace).expect("upsert should succeed");
+
+        let project_id = Uuid::new_v4();
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            test_project(project_id, ProjectScope::InWorkspace { workspace_id }),
+        )])));
+        let task = create_test_task_full("t", project_id, TaskStatus::InProgress, 0);
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+
+        let registry = Arc::new(RwLock::new(registry));
+        let membership = TaskExecutor::read_membership(&tasks, &projects, &registry, task_id).await;
+        let (root, extra_dirs) =
+            TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir").unwrap();
+
+        assert_eq!(root, "/tmp/task-working-dir");
+        assert!(extra_dirs.is_empty());
     }
 
     fn test_storage() -> (crate::config::Storage, tempfile::TempDir) {

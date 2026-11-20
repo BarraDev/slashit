@@ -100,21 +100,33 @@ Only part of that exists today.
 
 **Current:**
 
-- A Workspace has an id, a name, and a root folder (`root_path`), and is
-  kept in a registry outside any Project.
+- A Workspace has an id and a name, and is kept in a registry outside any
+  Project. Its context root is either a custom folder the person chose
+  (`root_path`) or, by default, a SlashIt-managed folder at
+  `data/workspaces/<id>` under the application data directory. The managed
+  folder is created with the Workspace and again when a custom root is
+  cleared. Reading the root reports whether it exists and never creates it.
+  Creating a Workspace never asks for a folder and never writes into a
+  Project's repository. Setting a custom root only validates the folder.
+  Changing the root, or deleting a Workspace, never moves, overwrites or
+  deletes a folder; deleting leaves the managed folder in place.
 - Every Project is still created `Standalone`. A user can attach a
   standalone Project to a Workspace, and detach a member Project back to
   standalone, from the Workspaces page. Attaching a Project that already
   belongs to a Workspace is refused; detach it first. There is no
   aggregate view across a Workspace's member Projects yet beyond the
   membership list itself.
-- When a member Project's Task is executed and the Workspace root exists on
-  disk, the coding agent runs from the Workspace root, with the Task
-  Checkout added as the directory it edits. Instruction files in the
-  Workspace root (for example `AGENTS.md`) therefore act as shared agent
-  context for every member Project. If the root is missing, the run falls
-  back to the Task Checkout alone. Other agent runs, such as AI review and
-  PR review fixes, do not use the Workspace root.
+- When a member Project's Task is executed and the Workspace has a custom
+  root, the coding agent runs from that root, with the Task Checkout added as
+  the directory it edits. Instruction files in the custom root (for example
+  `AGENTS.md`) therefore act as shared agent context for every member Project.
+  A Workspace without a custom root leaves the Worker in its Task Checkout, as
+  a standalone Project is, so its managed folder never changes what a Worker
+  can reach. If a configured custom root is missing, the run is refused before
+  it starts and its Task Checkout is released. SlashIt does not fall back
+  silently: the person restores the folder or changes the root, then runs
+  again. Other agent runs, such as AI review and PR review fixes, do not use
+  the Workspace root.
 - **Execution and delivery boundary.** The agent may read anything it can
   reach, including the Workspace's instruction files and other member
   Projects. Its writes belong in the Task Checkout, and the coding prompt
