@@ -215,6 +215,7 @@ mod tests {
 
     /// Runs the real fixture with a `PATH` the test controls, so the `jq`
     /// behavior is set by the test and not by the runner.
+    #[cfg(target_os = "linux")]
     fn run_fixture(path: &str, marker: &Path) -> std::process::Output {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/claude");
         std::process::Command::new(script)
@@ -229,12 +230,14 @@ mod tests {
 
     /// The stub directory first, so its `jq` wins, then the system tools the
     /// fixture needs for everything else.
+    #[cfg(target_os = "linux")]
     fn with_system_tools(stub: &Path) -> String {
         format!("{}:/usr/bin:/bin", stub.display())
     }
 
     /// A directory holding one executable `jq` that exits with `status`, or no
     /// `jq` at all when `status` is `None`.
+    #[cfg(target_os = "linux")]
     fn jq_directory(name: &str, status: Option<u8>) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch(name);
@@ -247,6 +250,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_json_schema_run_without_jq_fails_and_names_jq() {
         let dir = jq_directory("no-jq", None);
         let marker = scratch("no-jq-markers");
@@ -259,6 +263,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_broken_jq_fails_the_run_instead_of_dropping_the_answer() {
         let dir = jq_directory("broken-jq", Some(3));
         let marker = scratch("broken-jq-markers");
@@ -270,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_prose_or_malformed_answer_gets_no_structured_output_and_is_not_an_error() {
         // jq status 2 is what the real tool reports for text that is not JSON.
         let dir = jq_directory("prose-jq", Some(2));
@@ -287,6 +293,7 @@ mod tests {
     /// journey that counts Worker runs calls. The reader must accept a marker
     /// directory that holds a written trace.
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_fake_agent_reader_accepts_a_written_trace() {
         let root = scratch("reader");
         let agent = crate::fake_agent::FakeAgent::install(&root).expect("install the fake agent");
