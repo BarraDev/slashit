@@ -350,8 +350,9 @@ jobs:
       # Artifact names carry the shard ID so three concurrent jobs cannot
       # overwrite each other's evidence. Shard 2 may contain harness evidence.
       # Only sanitized records are published: the timing index, each failed
-      # journey's result, and the start-failure summary. Page source,
-      # screenshots, native driver status, URLs and provider logs stay on the
+      # journey's result, the start-failure summary, and a failed Coordinator
+      # journey's counts-only diagnostics. Page source, screenshots, native
+      # driver status, URLs, provider logs, prompts and answers stay on the
       # runner. Keep this an allowlist; see crates/slashit-acceptance/README.md.
       - name: Preserve failure evidence
         if: failure()
@@ -362,6 +363,7 @@ jobs:
             target/acceptance/journey-timings*.jsonl
             target/acceptance/*/journey-result.json
             target/acceptance/*/*-start-summary.json
+            target/acceptance/*/coordinator-diagnostics.json
           if-no-files-found: warn
           retention-days: 7
 

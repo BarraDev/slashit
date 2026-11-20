@@ -288,7 +288,10 @@ async fn coordinator_queues_a_backlog_task_only_after_human_approval() {
 
         // 1. A rejected proposal changes nothing, and the Human saw what it would do.
         submit_message(driver, "Please get this started.").await?;
-        await_text(driver, proposal, &title).await?;
+        if let Err(error) = await_text(driver, proposal, &title).await {
+            record_coordinator_diagnostics(driver, &project_id, &agent, context.artifacts_dir()).await;
+            return Err(error);
+        }
         let shown = ui::visible(driver, proposal).await?.text().await?;
         let lowered = shown.to_lowercase();
         if !lowered.contains("queue task") || !lowered.contains("backlog → queue") || !lowered.contains("only queues the task") { bail!("the exact enqueue is not visible: {shown}"); }
@@ -300,7 +303,10 @@ async fn coordinator_queues_a_backlog_task_only_after_human_approval() {
 
         // 2. Approval queues the Task and nothing more.
         submit_message(driver, "Yes, please queue it.").await?;
-        await_text(driver, proposal, &title).await?;
+        if let Err(error) = await_text(driver, proposal, &title).await {
+            record_coordinator_diagnostics(driver, &project_id, &agent, context.artifacts_dir()).await;
+            return Err(error);
+        }
         ui::visible(driver, "[data-testid=\"project-action-approve\"]").await?.click().await?;
         await_text(driver, history, &format!("Task queued: {title}")).await?;
         let started = Instant::now();
@@ -344,6 +350,29 @@ async fn coordinator_queues_a_backlog_task_only_after_human_approval() {
         Ok::<_, anyhow::Error>(())
     }.await;
     context.finish(outcome);
+}
+
+/// Writes the sanitized Coordinator record for a journey that is failing while
+/// it waits for a proposal. It holds counts and fixed words only: the fake
+/// agent's claims and trace, the proposal cards on screen, and the number of
+/// actions the application persisted. It never reads prompts, answers or
+/// page sources. A failure to write it is reported and does not change the
+/// journey's own outcome.
+async fn record_coordinator_diagnostics(driver: &WebDriver, project_id: &str, agent: &FakeAgent, artifacts: &std::path::Path) {
+    let cards = super::page(driver, "return document.querySelectorAll('[data-testid=\"project-action-proposal\"]').length;", vec![])
+        .await
+        .ok()
+        .and_then(|value| value.as_u64())
+        .map(|count| count as usize);
+    let persisted = ui::invoke(driver, "get_project_conversation", json!({ "projectId": project_id }))
+        .await
+        .ok()
+        .and_then(|snapshot| snapshot["conversation"]["project_actions"].as_array().map(Vec::len));
+    let written = slashit_acceptance::coordinator_diagnostics::collect(agent.marker_dir(), cards, persisted)
+        .and_then(|diagnostics| slashit_acceptance::coordinator_diagnostics::write(artifacts, &diagnostics));
+    if let Err(error) = written {
+        eprintln!("[acceptance] could not write the Coordinator diagnostics: {error:#}");
+    }
 }
 
 /// A Human-approved queue shows its Task run in the Conversation: queued under
