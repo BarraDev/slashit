@@ -710,6 +710,97 @@ pub const DECISION_SCOPE: &str = "this_proposal_only";
 /// How the Coordinator must read decisions in `recent_history`.
 pub const HISTORY_SEMANTICS: &str = "A decision entry records the Human's answer to one specific earlier proposal and applies to that proposal only. It is not a standing instruction. A rejected proposal never forbids a later proposal. When the current message explicitly asks for the same or an equivalent change again, treat it as a new request and propose it again; SlashIt will ask for a new approval.";
 
+/// The JSON Schema a Coordinator's final answer must match, passed to Claude
+/// Code as `--json-schema`. It describes the eleven advertised variants and
+/// leaves out the retired `delegate_to_task`.
+///
+/// It stays inside Anthropic's strict structured-output subset: a top-level
+/// `anyOf` of discriminated objects (`oneOf` is unsupported), `const`
+/// discriminators, `additionalProperties: false`, and every property required,
+/// with an absent value written as `null`. Bounds such as limits and text
+/// lengths are not in the schema, so `parse_output` stays the authority on them.
+pub fn coordinator_output_schema() -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+
+    const STATUSES: [&str; 8] =
+        ["backlog", "queue", "in_progress", "ai_review", "human_review", "done", "pr_created", "error"];
+    const PRIORITIES: [&str; 4] = ["urgent", "high", "medium", "low"];
+    const CATEGORIES: [&str; 9] = [
+        "feature", "bug_fix", "refactoring", "documentation", "security", "performance", "ui_ux",
+        "infrastructure", "testing",
+    ];
+
+    fn branch(kind: &str, fields: Vec<(&str, Value)>) -> Value {
+        let mut properties = Map::new();
+        properties.insert("type".into(), json!({ "const": kind }));
+        for (name, schema) in fields {
+            properties.insert(name.into(), schema);
+        }
+        let required: Vec<String> = properties.keys().cloned().collect();
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false
+        })
+    }
+    fn optional_enum(values: &[&str]) -> Value {
+        let mut allowed: Vec<Value> = values.iter().map(|v| json!(v)).collect();
+        allowed.push(Value::Null);
+        json!({ "type": ["string", "null"], "enum": allowed })
+    }
+    let text = || json!({ "type": "string", "description": "Non-empty text" });
+    let optional_text = || json!({ "type": ["string", "null"] });
+    let task_id = || json!({ "type": "string", "description": "UUID of a Task in this Project" });
+    let optional_limit = |max: u8| {
+        json!({ "type": ["integer", "null"], "description": format!("1 to {max}, or null for the default") })
+    };
+
+    json!({
+        "anyOf": [
+            branch("reply", vec![("text", text())]),
+            branch("create_task", vec![
+                ("text", text()),
+                ("title", text()),
+                ("description", optional_text()),
+                ("priority", optional_enum(&PRIORITIES)),
+                ("category", optional_enum(&CATEGORIES)),
+            ]),
+            branch("edit_task", vec![
+                ("text", text()),
+                ("target_task_id", task_id()),
+                ("title", optional_text()),
+                ("description", optional_text()),
+                ("priority", optional_enum(&PRIORITIES)),
+                ("category", optional_enum(&CATEGORIES)),
+            ]),
+            branch("move_task", vec![
+                ("text", text()),
+                ("target_task_id", task_id()),
+                ("to", json!({ "const": "backlog" })),
+            ]),
+            branch("enqueue_task", vec![("text", text()), ("target_task_id", task_id())]),
+            branch("execute_request", vec![
+                ("text", text()),
+                ("target_task_id", task_id()),
+                ("request", text()),
+            ]),
+            branch("inspect_task", vec![("target_task_id", task_id())]),
+            branch("list_tasks", vec![
+                ("status", optional_enum(&STATUSES)),
+                ("limit", optional_limit(20)),
+                ("offset", json!({ "type": ["integer", "null"], "description": "0 or more, or null for 0" })),
+            ]),
+            branch("inspect_task_activity", vec![
+                ("target_task_id", task_id()),
+                ("limit", optional_limit(30)),
+            ]),
+            branch("inspect_task_pull_request", vec![("target_task_id", task_id())]),
+            branch("inspect_project", vec![]),
+        ]
+    })
+}
+
 fn is_retryable_failure(kind: &EntryKind) -> bool {
     matches!(kind, EntryKind::RunFailed { role: Role::Coordinator, retryable: true, .. })
 }
@@ -1259,5 +1350,198 @@ mod tests {
             EntryKind::CoordinatorReply { text: "done".into() },
         ]);
         assert_eq!(conversation.retryable_human_turn(), None);
+    }
+}
+
+#[cfg(test)]
+mod coordinator_schema_tests {
+    use super::*;
+    use serde_json::json;
+
+    const ADVERTISED: [&str; 11] = [
+        "reply", "create_task", "edit_task", "move_task", "enqueue_task", "execute_request",
+        "inspect_task", "list_tasks", "inspect_task_activity", "inspect_task_pull_request",
+        "inspect_project",
+    ];
+
+    /// Exhaustive on purpose: a new variant fails to compile here until it is
+    /// classified, so the schema cannot silently miss it.
+    fn advertised_name(output: &CoordinatorOutput) -> Option<&'static str> {
+        match output {
+            CoordinatorOutput::Reply { .. } => Some("reply"),
+            CoordinatorOutput::CreateTask { .. } => Some("create_task"),
+            CoordinatorOutput::EditTask { .. } => Some("edit_task"),
+            CoordinatorOutput::MoveTask { .. } => Some("move_task"),
+            CoordinatorOutput::EnqueueTask { .. } => Some("enqueue_task"),
+            CoordinatorOutput::ExecuteRequest { .. } => Some("execute_request"),
+            CoordinatorOutput::InspectTask { .. } => Some("inspect_task"),
+            CoordinatorOutput::ListTasks { .. } => Some("list_tasks"),
+            CoordinatorOutput::InspectTaskActivity { .. } => Some("inspect_task_activity"),
+            CoordinatorOutput::InspectTaskPullRequest { .. } => Some("inspect_task_pull_request"),
+            CoordinatorOutput::InspectProject {} => Some("inspect_project"),
+            CoordinatorOutput::DelegateToTask { .. } => None,
+        }
+    }
+
+    fn branches(schema: &serde_json::Value) -> &Vec<serde_json::Value> {
+        schema["anyOf"].as_array().expect("the top level is an anyOf of variants")
+    }
+
+    fn branch_for<'a>(schema: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        branches(schema)
+            .iter()
+            .find(|b| b["properties"]["type"]["const"] == name)
+            .unwrap_or_else(|| panic!("no schema branch for {name}"))
+    }
+
+    fn samples() -> Vec<CoordinatorOutput> {
+        let id = Uuid::new_v4();
+        vec![
+            CoordinatorOutput::Reply { text: "hi".into() },
+            CoordinatorOutput::CreateTask {
+                text: "why".into(),
+                title: "Title".into(),
+                description: None,
+                priority: Some(TaskPriority::High),
+                category: None,
+            },
+            CoordinatorOutput::EditTask {
+                text: "why".into(),
+                target_task_id: id,
+                title: Some("New".into()),
+                description: None,
+                priority: None,
+                category: Some(TaskCategory::UiUx),
+            },
+            CoordinatorOutput::MoveTask { text: "why".into(), target_task_id: id, to: TaskStatus::Backlog },
+            CoordinatorOutput::EnqueueTask { text: "why".into(), target_task_id: id },
+            CoordinatorOutput::ExecuteRequest {
+                text: "why".into(),
+                target_task_id: id,
+                request: "one more change".into(),
+            },
+            CoordinatorOutput::InspectTask { target_task_id: id },
+            CoordinatorOutput::ListTasks {
+                status: Some(TaskStatus::PrCreated),
+                limit: Some(5),
+                offset: Some(0),
+            },
+            CoordinatorOutput::InspectTaskActivity { target_task_id: id, limit: None },
+            CoordinatorOutput::InspectTaskPullRequest { target_task_id: id },
+            CoordinatorOutput::InspectProject {},
+            CoordinatorOutput::DelegateToTask {
+                text: "retired".into(),
+                target_task_id: id,
+                request: "retired".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn the_schema_has_exactly_the_eleven_advertised_variants() {
+        let schema = coordinator_output_schema();
+        let names: Vec<&str> = branches(&schema)
+            .iter()
+            .map(|b| b["properties"]["type"]["const"].as_str().expect("each branch has a const type"))
+            .collect();
+        assert_eq!(names, ADVERTISED);
+        assert!(!names.contains(&"delegate_to_task"));
+    }
+
+    #[test]
+    fn every_branch_is_closed_and_requires_every_property() {
+        for b in branches(&coordinator_output_schema()) {
+            assert_eq!(b["additionalProperties"], false, "{b}");
+            let mut required: Vec<&str> =
+                b["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            let mut properties: Vec<&str> = b["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+            required.sort_unstable();
+            properties.sort_unstable();
+            assert_eq!(required, properties, "{b}");
+        }
+    }
+
+    /// Only the strict-output keywords, anywhere in the document. Any other
+    /// keyword (`oneOf`, `minimum`, `maxLength`, `format`, ...) fails here, so
+    /// adding one is a deliberate change to the contract.
+    #[test]
+    fn the_schema_uses_only_the_strict_keyword_subset() {
+        const ALLOWED: [&str; 8] =
+            ["type", "properties", "required", "additionalProperties", "anyOf", "const", "enum", "description"];
+        fn walk(value: &serde_json::Value, path: &str) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        if key == "properties" {
+                            // The keys here are property names, not keywords; only their schemas are checked.
+                            for (name, schema) in child.as_object().expect("properties is an object") {
+                                walk(schema, &format!("{path}/properties/{name}"));
+                            }
+                            continue;
+                        }
+                        assert!(ALLOWED.contains(&key.as_str()), "{path}: keyword {key} is not in the strict subset");
+                        walk(child, &format!("{path}/{key}"));
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        walk(item, &format!("{path}/{i}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let schema = coordinator_output_schema();
+        walk(&schema, "");
+        assert_eq!(schema.as_object().unwrap().len(), 1, "the top level holds only the anyOf");
+    }
+
+    /// The wire form of every advertised variant matches its schema branch and
+    /// the domain parser accepts it, so the schema cannot drift from the enum.
+    #[test]
+    fn every_serialized_variant_matches_its_branch_and_parses() {
+        let schema = coordinator_output_schema();
+        for output in samples() {
+            let Some(name) = advertised_name(&output) else {
+                assert!(Conversation::parse_output(&serde_json::to_string(&output).unwrap()).is_ok());
+                continue;
+            };
+            let value = serde_json::to_value(&output).unwrap();
+            let b = branch_for(&schema, name);
+            let object = value.as_object().expect("a variant serializes to an object");
+            let properties = b["properties"].as_object().unwrap();
+            assert_eq!(
+                object.keys().collect::<std::collections::BTreeSet<_>>(),
+                properties.keys().collect::<std::collections::BTreeSet<_>>(),
+                "{name}: wire fields differ from the schema"
+            );
+            for (key, field) in object {
+                let schema_field = &properties[key];
+                if field.is_null() {
+                    let nullable = schema_field["type"].as_array().is_some_and(|t| t.contains(&json!("null")));
+                    assert!(nullable, "{name}.{key} is null but the schema does not allow null");
+                }
+                if let Some(allowed) = schema_field["enum"].as_array() {
+                    assert!(allowed.contains(field), "{name}.{key} = {field} is outside the schema enum");
+                }
+                if let Some(constant) = schema_field.get("const") {
+                    assert_eq!(field, constant, "{name}.{key} must equal its const");
+                }
+            }
+            let parsed = Conversation::parse_output(&value.to_string());
+            assert!(parsed.is_ok(), "{name} was refused by the domain: {parsed:?}");
+        }
+    }
+
+    #[test]
+    fn an_absent_optional_value_is_null_and_still_parses() {
+        let raw = r#"{"type":"create_task","text":"t","title":"x","description":null,"priority":null,"category":null}"#;
+        assert!(Conversation::parse_output(raw).is_ok());
+    }
+
+    #[test]
+    fn a_field_the_schema_forbids_is_refused_by_the_domain_too() {
+        let raw = r#"{"type":"reply","text":"hi","extra":1}"#;
+        assert!(Conversation::parse_output(raw).is_err());
     }
 }

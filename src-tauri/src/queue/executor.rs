@@ -5883,6 +5883,7 @@ impl TaskExecutor {
                 // The user's hooks, plugins and settings, and the project's own
                 // hooks, stay out of the run. The project's CLAUDE.md still loads.
                 isolate_customizations: true,
+                json_schema: None,
             }, lease)
             .await
             .map_err(|e| StartFailure::failed(e.to_string()))
@@ -7642,6 +7643,7 @@ impl TaskExecutor {
                         disable_mcp: true,
                         additional_dirs: Vec::new(),
                         isolate_customizations: false,
+                        json_schema: None,
                     },
                     None,
                     &mut cancelled_for_claude,
@@ -7872,6 +7874,7 @@ impl TaskExecutor {
                                         additional_dirs: Vec::new(),
                                         // As for the coding Worker: no user or project hooks or settings.
                                         isolate_customizations: true,
+                                        json_schema: None,
                                     },
                                     fix_lease,
                                     &mut cancelled,

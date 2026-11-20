@@ -260,6 +260,17 @@ pub fn restricted_unsupported_reason(stderr: &str) -> Option<String> {
     })
 }
 
+/// Why a CLI that rejects `--json-schema` cannot run a Coordinator turn, or
+/// `None` when the error is some other. There is no minimum version: the
+/// flag's introduction version is not established, so the message names none.
+pub fn json_schema_unsupported_reason(stderr: &str) -> Option<String> {
+    stderr.contains("unknown option '--json-schema'").then(|| {
+        "this Claude Code does not support --json-schema, which the Project Coordinator \
+         requires for structured output; update Claude Code to a version that supports it"
+            .to_string()
+    })
+}
+
 /// The most characters of a `result` event's `errors` a failure reason
 /// quotes.
 const RESULT_ERRORS_LIMIT: usize = 400;
@@ -499,6 +510,10 @@ pub struct ClaudeRunConfig {
     /// workspace. Filesystem access is not confined by this. Used by the
     /// coding Worker and the review-fix agent.
     pub isolate_customizations: bool,
+    /// Passed as `--json-schema`, so the final answer is validated against it
+    /// and read with [`ClaudeRunner::final_structured_output`]. Only the
+    /// Project Coordinator sets it.
+    pub json_schema: Option<serde_json::Value>,
 }
 
 /// Environment variables an isolated run pins in `--settings`. The project's
@@ -872,6 +887,10 @@ pub fn claude_args(
     if let Some(ref extra) = config.append_system_prompt {
         push("--append-system-prompt");
         push(extra);
+    }
+    if let Some(ref schema) = config.json_schema {
+        push("--json-schema");
+        push(&schema.to_string());
     }
 
     // From here on the arguments are pushed directly, not through `push`:
@@ -1374,6 +1393,25 @@ impl ClaudeRunner {
             .ok_or_else(|| "Claude result event did not contain textual semantic output".into())
     }
 
+    /// The final answer of a structured-output run: the `structured_output`
+    /// object of the authoritative final `result` event, as JSON text. A
+    /// missing, null or non-object value is an error. The free-form `result`
+    /// text is never used instead. Call after [`Self::wait`] succeeds.
+    pub async fn final_structured_output(&self) -> Result<String, String> {
+        let result = self.result_event.read().await;
+        let Some(event) = result.as_ref() else {
+            return Err("Claude completed without an authoritative result event".into());
+        };
+        if let Some(error) = result_failure_reason(event) {
+            return Err(error);
+        }
+        match event.get("structured_output") {
+            Some(value) if value.is_object() => Ok(value.to_string()),
+            Some(value) if !value.is_null() => Err("Claude structured output is not a JSON object".into()),
+            _ => Err("Claude result event did not contain structured output".into()),
+        }
+    }
+
     /// The verbatim stdout transcript (every line, newline-joined), for a
     /// caller that needs to reparse the raw `stream-json` stream under its
     /// own extraction/error-classification rules rather than this runner's
@@ -1636,6 +1674,9 @@ impl ClaudeRunner {
                 self.accumulated_output.write().await.push_str(&format!("\n--- STDERR ---\n{}", stderr_text));
             }
             if let Some(reason) = restricted_unsupported_reason(&stderr_text) {
+                return Err(reason);
+            }
+            if let Some(reason) = json_schema_unsupported_reason(&stderr_text) {
                 return Err(reason);
             }
             let result_event = self.result_event.read().await;
@@ -2113,6 +2154,7 @@ mod lease_launch_tests {
             disable_mcp: true,
             additional_dirs: Vec::new(),
             isolate_customizations: false,
+            json_schema: None,
         }
     }
 
@@ -2193,6 +2235,7 @@ mod args_tests {
             disable_mcp: false,
             additional_dirs: Vec::new(),
             isolate_customizations: false,
+            json_schema: None,
         }
     }
 
@@ -2206,6 +2249,29 @@ mod args_tests {
     pub(super) fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         let at = args.iter().position(|a| a == flag)?;
         args.get(at + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn json_schema_is_passed_only_when_a_run_asks_for_it() {
+        let schema = serde_json::json!({"anyOf": [{"type": "object"}]});
+        let plain = config(ToolAccess::ReadOnly);
+        assert_eq!(value_of(&args(&plain), "--json-schema"), None);
+
+        let structured = ClaudeRunConfig { json_schema: Some(schema.clone()), ..config(ToolAccess::ReadOnly) };
+        let argv = args(&structured);
+        assert_eq!(value_of(&argv, "--json-schema"), Some(schema.to_string().as_str()));
+        assert!(argv.contains(&"--restricted".to_string()), "a structured run stays read-only: {argv:?}");
+        assert!(argv.contains(&"-p".to_string()));
+    }
+
+    #[test]
+    fn a_cli_without_json_schema_is_named_without_a_version() {
+        let reason = json_schema_unsupported_reason("error: unknown option '--json-schema'\n")
+            .expect("the unknown-option error is recognised");
+        assert!(reason.contains("does not support --json-schema"), "{reason}");
+        assert!(!reason.contains("v2."), "no minimum version is invented: {reason}");
+        assert_eq!(json_schema_unsupported_reason("error: unknown option '--no-such-flag'"), None);
+        assert_eq!(json_schema_unsupported_reason(""), None);
     }
 
     /// The arguments of an isolated run, and the settings its `--settings` file
@@ -2436,6 +2502,7 @@ mod launch_policy_tests {
             disable_mcp: true,
             additional_dirs: vec![],
             isolate_customizations: false,
+            json_schema: None,
         }
     }
 
@@ -3088,6 +3155,7 @@ mod tests {
                 disable_mcp: false,
                 additional_dirs: Vec::new(),
                 isolate_customizations: false,
+                json_schema: None,
             }
         }
 
@@ -3305,6 +3373,48 @@ mod tests {
                 >= 2
         );
         assert_ne!(transcript, runner.final_result_text().await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_structured_answer_is_the_object_and_never_the_prose() {
+        let fixture = Fixture::new("structured_result");
+        let runner = fixture
+            .start_with(fixture.config_with_prompt("Coordinator turn", read_only()))
+            .await;
+        assert_eq!(bounded("structured answer", &runner).await, Ok(true));
+        let answer = runner.final_structured_output().await.expect("an object is the answer");
+        let answer: serde_json::Value = serde_json::from_str(&answer).expect("the answer is JSON");
+        assert_eq!(answer, serde_json::json!({"type": "reply", "text": "hello"}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prose_or_null_answer_is_refused_for_a_structured_run() {
+        for case in ["case: prose", "case: null"] {
+            let fixture = Fixture::new("structured_result");
+            let runner = fixture
+                .start_with(fixture.config_with_prompt(case, read_only()))
+                .await;
+            assert_eq!(bounded(case, &runner).await, Ok(true), "{case} exits successfully");
+            assert!(
+                runner.final_structured_output().await.is_err(),
+                "{case}: a missing or null structured answer must fail, not fall back to prose"
+            );
+            assert!(runner.final_result_text().await.is_ok(), "{case}: the prose is still there for other callers");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cli_without_json_schema_fails_a_structured_run_with_its_reason() {
+        let fixture = Fixture::new("no-json-schema");
+        let config = ClaudeRunConfig {
+            json_schema: Some(serde_json::json!({"anyOf": []})),
+            ..fixture.config_with_prompt("Coordinator turn", read_only())
+        };
+        let runner = fixture.start_with(config).await;
+        let error = bounded("structured run on an old CLI", &runner)
+            .await
+            .expect_err("a CLI that rejects --json-schema must fail the run");
+        assert_eq!(Some(error), json_schema_unsupported_reason("error: unknown option '--json-schema'"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4276,6 +4386,7 @@ mod tests {
                 disable_mcp: true,
                 additional_dirs: Vec::new(),
                 isolate_customizations: false,
+                json_schema: None,
             };
             let runner = ClaudeRunner::start_leased(config, None).await.expect("claude should start");
             let result = tokio::time::timeout(Duration::from_secs(120), runner.wait())
@@ -4317,6 +4428,7 @@ mod mode_mismatch_tests {
             disable_mcp: true,
             additional_dirs: Vec::new(),
             isolate_customizations: true,
+            json_schema: None,
         }
     }
 
@@ -4394,6 +4506,7 @@ mod child_environment_tests {
             disable_mcp: true,
             additional_dirs: Vec::new(),
             isolate_customizations: false,
+            json_schema: None,
         };
         let runner = ClaudeRunner::start_program(&program, config).await.expect("fixture should spawn");
         assert!(runner.wait().await.is_ok(), "fixture run should succeed");
