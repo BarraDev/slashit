@@ -764,6 +764,87 @@ async fn update_project_committed(
     }
 }
 
+/// The Project Rail's order and hidden Projects. Navigation state only: a
+/// hidden Project keeps its identity, repository, Tasks and history.
+#[tauri::command]
+pub async fn get_project_rail(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<crate::config::ProjectRailConfig, String> {
+    state
+        .storage
+        .load_config()
+        .map(|config| config.project_rail)
+        .map_err(|error| format!("Failed to read the Project Rail: {error}"))
+}
+
+/// Save the Project Rail's order and hidden Projects. A Project that is newly
+/// hidden is refused while it has outstanding work (queued, running, waiting
+/// for the user, or awaiting its pull request) or while its Conversation is
+/// replying: its Needs You count would leave the rail while that work still
+/// needs attention. The outstanding-work check and the save share one config
+/// transaction.
+#[tauri::command]
+pub async fn update_project_rail(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    order: Vec<String>,
+    hidden: Vec<String>,
+) -> Result<crate::config::ProjectRailConfig, String> {
+    let parse = |ids: Vec<String>| {
+        ids.iter()
+            .map(|id| Uuid::parse_str(id).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<Uuid>, String>>()
+    };
+    let requested = crate::config::ProjectRailConfig { order: parse(order)?, hidden: parse(hidden)? };
+    let names: HashMap<Uuid, String> = state
+        .project
+        .projects
+        .read()
+        .await
+        .iter()
+        .map(|(id, project)| (*id, project.name.clone()))
+        .collect();
+    let next = requested.normalized(|id| names.contains_key(id));
+
+    let tasks = state.task.tasks.read().await;
+    let mut refusal = None;
+    state
+        .storage
+        .update_config(|config| {
+            for id in next.hidden.iter().filter(|id| !config.project_rail.hidden.contains(id)) {
+                let name = names.get(id).map(String::as_str).unwrap_or("This Project");
+                let outstanding = tasks
+                    .values()
+                    .filter(|task| {
+                        task.project_id == *id
+                            && crate::config::project_rail::is_outstanding_work(&task.status)
+                    })
+                    .count();
+                if outstanding > 0 {
+                    refusal = Some(format!(
+                        "{name} cannot leave the Project Rail yet: {outstanding} Task(s) are \
+                         queued, running, waiting for you, or awaiting their pull request. \
+                         Finish or move them first."
+                    ));
+                    return;
+                }
+                if state.conversation.project_lock(*id).try_lock().is_err() {
+                    refusal = Some(format!(
+                        "{name} cannot leave the Project Rail while its Conversation is replying. \
+                         Wait for the reply to finish, then try again."
+                    ));
+                    return;
+                }
+            }
+            config.project_rail = next.clone();
+        })
+        .map_err(|error| error.describe("save the Project Rail"))?;
+    match refusal {
+        Some(message) => Err(message),
+        None => Ok(next),
+    }
+}
+
 #[tauri::command]
 pub async fn attach_project_to_workspace(
     _gui: GuiMutation,

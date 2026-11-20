@@ -1404,6 +1404,7 @@ mod tests {
         let seed_storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
+            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -1542,6 +1543,7 @@ mod tests {
         let seed_storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
+            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -1990,6 +1992,7 @@ mod tests {
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
+            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -2108,6 +2111,7 @@ mod tests {
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
+            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -2338,6 +2342,7 @@ mod tests {
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
+            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -2609,6 +2614,7 @@ mod tests {
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
+            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -2730,6 +2736,7 @@ mod tests {
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
+            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),

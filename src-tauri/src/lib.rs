@@ -509,6 +509,8 @@ pub fn run() {
             save_conversation_draft,
             get_conversations_config,
             update_conversations_config,
+            get_project_rail,
+            update_project_rail,
             add_to_queue,
             bulk_add_to_queue,
             get_queue_position,

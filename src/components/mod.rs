@@ -52,6 +52,7 @@ pub mod task_context_menu;
 pub mod custom_select;
 pub mod model_combobox;
 pub mod project_rail;
+pub mod project_organizer;
 pub mod conversation_composer;
 pub mod conversation_settings;
 pub mod project_conversation;

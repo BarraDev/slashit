@@ -8,6 +8,7 @@ pub mod conversations;
 pub mod features;
 pub mod migration;
 pub mod paths;
+pub mod project_rail;
 pub mod queue;
 pub mod storage;
 pub mod updates;
@@ -17,6 +18,7 @@ pub mod workspace_registry;
 mod task_board_schema_tests;
 
 pub use conversations::*;
+pub use project_rail::ProjectRailConfig;
 pub use queue::*;
 pub use storage::*;
 pub use workspace_registry::WorkspaceRegistry;

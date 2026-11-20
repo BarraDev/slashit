@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 
 pub mod project;
+pub mod project_rail;
 pub mod repository;
 pub mod task;
 pub mod workspace;
@@ -18,6 +19,7 @@ pub mod task_boards;
 pub mod conversation;
 
 pub use project::*;
+pub use project_rail::*;
 pub use repository::*;
 pub use task::*;
 pub use workspace::*;

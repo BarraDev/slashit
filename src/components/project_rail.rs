@@ -7,8 +7,9 @@ use leptos::callback::Callback;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use crate::models::Project;
-use crate::services::list_projects;
+use crate::models::{arrange, Project, ProjectRailConfig};
+use crate::services::{get_project_rail, list_projects};
+use crate::components::project_organizer::ProjectOrganizer;
 use crate::services::human_review_service::get_attention_summary;
 use crate::components::attention::BoardAttention;
 use crate::components::task_live::ResponseOrder;
@@ -30,6 +31,8 @@ pub fn ProjectRail(
     let (refresh_trigger, set_refresh_trigger) = signal(0u32);
     let (show_import_modal, set_show_import_modal) = signal(false);
     let export_phase = RwSignal::new(None::<ExportPhase>);
+    let rail = RwSignal::new(ProjectRailConfig::default());
+    let (show_organizer, set_show_organizer) = signal(false);
 
     // Load projects on mount and when refresh_trigger changes
     Effect::new(move |prev: Option<u32>| {
@@ -41,8 +44,23 @@ pub fn ProjectRail(
             if let Ok(ps) = list_projects().await {
                 set_projects.set(ps);
             }
+            if let Ok(config) = get_project_rail().await {
+                rail.set(config);
+            }
         });
         current
+    });
+
+    // A Project removed from the rail cannot stay selected: move the selection
+    // to the first visible Project, or clear it when none is visible.
+    Effect::new(move |_| {
+        let config = rail.get();
+        let (visible, _) = arrange(&projects.get(), &config);
+        let selected = selected_project.get_untracked();
+        if selected.is_empty() || !config.hidden.iter().any(|id| id.to_string() == selected) {
+            return;
+        }
+        set_selected_project.set(visible.first().map(|p| p.id.to_string()).unwrap_or_default());
     });
 
     // How many tasks need the user in each project. The open board's own
@@ -120,7 +138,8 @@ pub fn ProjectRail(
                 {move || {
                     let active = selected_project.get();
                     let is_expanded = hovered.get();
-                    projects.get().into_iter().map(|project| {
+                    let (visible, _) = arrange(&projects.get(), &rail.get());
+                    visible.into_iter().map(|project| {
                         let pid = project.id.to_string();
                         let pid_click = pid.clone();
                         let is_active = pid == active;
@@ -173,6 +192,22 @@ pub fn ProjectRail(
 
             // Add project button
             <div class="py-2 border-t border-white/5">
+                <button
+                    data-testid="rail-organize-projects"
+                    aria-label="Organize projects"
+                    on:click=move |_| set_show_organizer.set(true)
+                    class="rail-item"
+                    title="Organize projects: reorder, rename, or remove from the rail"
+                >
+                    <div class="rail-badge add">
+                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h10M4 18h7" />
+                        </svg>
+                    </div>
+                    {move || hovered.get().then(|| view! {
+                        <span class="rail-label">"Organize projects"</span>
+                    })}
+                </button>
                 <button
                     data-testid="rail-import-project"
                     aria-label="Import project"
@@ -236,6 +271,14 @@ pub fn ProjectRail(
                 on_list_changed=Callback::new(move |_| set_refresh_trigger.update(|t| *t += 1))
             />
             <ExportProjectModal phase=export_phase />
+
+            <ProjectOrganizer
+                show=show_organizer
+                set_show=set_show_organizer
+                projects=projects
+                rail=rail
+                on_saved=Callback::new(move |_| set_refresh_trigger.update(|t| *t += 1))
+            />
 
             <CreateProjectModal
                 show=show_create_modal
