@@ -52,6 +52,8 @@ pub mod task_context_menu;
 pub mod custom_select;
 pub mod model_combobox;
 pub mod project_rail;
+pub mod conversation_composer;
+pub mod conversation_settings;
 pub mod project_conversation;
 pub mod quit_dialog;
 pub mod diff_viewer;

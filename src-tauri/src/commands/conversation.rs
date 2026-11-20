@@ -793,6 +793,66 @@ pub async fn stop_project_conversation(
         .stop_project_run(conversation.id)
 }
 
+/// The composer draft of a Project, if one was saved.
+#[tauri::command]
+pub async fn get_conversation_draft(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<Option<crate::config::ConversationDraft>, String> {
+    let project_id = parse_id(&project_id, "Project id")?;
+    state
+        .storage
+        .load_conversation_draft(project_id)
+        .map_err(|error| format!("Failed to read the draft: {error}"))
+}
+
+/// Save a composer draft. Returns `false` when a newer draft is already stored,
+/// in which case the stored draft stands and the caller should reload it.
+#[tauri::command]
+pub async fn save_conversation_draft(
+    _gui: GuiMutation,
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    draft: crate::config::ConversationDraft,
+) -> Result<bool, String> {
+    let project_id = parse_id(&project_id, "Project id")?;
+    // A draft for a Project that no longer exists would be an orphan file.
+    project_after_lock(&state.project.projects, project_id).await?;
+    state
+        .storage
+        .save_conversation_draft(project_id, &draft)
+        .map_err(|error| format!("The draft could not be confirmed saved: {error}"))
+}
+
+/// The Conversation settings the composer reads on start.
+#[tauri::command]
+pub async fn get_conversations_config(
+    _gui: GuiMutation,
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::config::ConversationsConfig, String> {
+    state
+        .storage
+        .load_config()
+        .map(|config| config.conversations)
+        .map_err(|error| format!("Failed to read the Conversation settings: {error}"))
+}
+
+/// Save the Conversation settings and return what was saved.
+#[tauri::command]
+pub async fn update_conversations_config(
+    _gui: GuiMutation,
+    state: tauri::State<'_, AppState>,
+    send_shortcut: crate::config::SendShortcut,
+) -> Result<crate::config::ConversationsConfig, String> {
+    let next = crate::config::ConversationsConfig { send_shortcut };
+    let persisted = next.clone();
+    state
+        .storage
+        .update_config(move |config| config.conversations = persisted)
+        .map_err(|error| error.describe("save the Conversation settings"))?;
+    Ok(next)
+}
+
 #[tauri::command]
 pub async fn act_on_project_conversation(
     _gui: GuiMutation,

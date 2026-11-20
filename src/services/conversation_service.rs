@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-use crate::models::{ConversationExecution, ConversationHumanAction, ConversationSnapshot};
+use crate::models::{ConversationDraft, ConversationExecution, ConversationHumanAction, ConversationSnapshot, ConversationsConfig, SendShortcut};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -65,4 +65,35 @@ pub async fn stop_project_conversation(project_id: String) -> Result<(), String>
     let args = serde_wasm_bindgen::to_value(&ProjectArgs { project_id }).map_err(|error| error.to_string())?;
     let value = JsFuture::from(raw_invoke("stop_project_conversation", args)).await.map_err(|error| error.as_string().unwrap_or_else(|| format!("{error:?}")))?;
     serde_wasm_bindgen::from_value(value).map_err(|error| format!("Invalid stop response: {error}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DraftSaveArgs { project_id: String, draft: ConversationDraft }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SendShortcutArgs { send_shortcut: SendShortcut }
+
+async fn call<T: serde::de::DeserializeOwned>(promise: js_sys::Promise, what: &str) -> Result<T, String> {
+    let value = JsFuture::from(promise).await.map_err(|error| error.as_string().unwrap_or_else(|| format!("{error:?}")))?;
+    serde_wasm_bindgen::from_value(value).map_err(|error| format!("Invalid {what} response: {error}"))
+}
+
+/// The saved composer draft of a Project, if any.
+pub async fn get_conversation_draft(project_id: String) -> Result<Option<ConversationDraft>, String> {
+    let args = serde_wasm_bindgen::to_value(&ProjectArgs { project_id }).map_err(|error| error.to_string())?;
+    call(raw_invoke("get_conversation_draft", args), "draft").await
+}
+/// Save a draft. `Ok(false)` means the backend kept a newer draft; the caller must reload it.
+pub async fn save_conversation_draft(project_id: String, draft: ConversationDraft) -> Result<bool, String> {
+    let args = serde_wasm_bindgen::to_value(&DraftSaveArgs { project_id, draft }).map_err(|error| error.to_string())?;
+    call(raw_invoke("save_conversation_draft", args), "draft save").await
+}
+pub async fn get_conversations_config() -> Result<ConversationsConfig, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({})).map_err(|error| error.to_string())?;
+    call(raw_invoke("get_conversations_config", args), "Conversation settings").await
+}
+pub async fn update_conversations_config(send_shortcut: SendShortcut) -> Result<ConversationsConfig, String> {
+    let args = serde_wasm_bindgen::to_value(&SendShortcutArgs { send_shortcut }).map_err(|error| error.to_string())?;
+    call(raw_invoke("update_conversations_config", args), "Conversation settings").await
 }
