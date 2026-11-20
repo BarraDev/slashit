@@ -5678,6 +5678,7 @@ fn pr_helper_run_config(
         // user's and the repository's hooks, plugins and settings stay out of
         // it. Read-only helpers keep their existing configuration.
         isolate_customizations: can_edit,
+        json_schema: None,
     }
 }
 

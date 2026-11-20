@@ -477,6 +477,7 @@ async fn answer_human_message(
         session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
         system_prompt: Some(COORDINATOR_SYSTEM_PROMPT.into()),
         append_system_prompt: None, disable_mcp: true, additional_dirs: vec![], isolate_customizations: false,
+        json_schema: Some(crate::domain::conversation::coordinator_output_schema()),
     }).await;
     let (output, run_lease) = match answer {
         Ok(answer) => answer,
@@ -751,6 +752,7 @@ async fn run_with_cancellation(
 }
 
 /// Runs one read-only Coordinator provider under an existing Project Run lease.
+/// Its answer is the native structured output, never the free-form result text.
 async fn run_with_lease(
     lease: crate::queue::ProjectRunLease,
     config: ClaudeRunConfig,
@@ -762,7 +764,8 @@ async fn run_with_lease(
         tokio::select! {
             result = runner.wait() => {
                 result?;
-                runner.final_result_text().await
+                let structured = runner.final_structured_output().await?;
+                crate::domain::conversation::unwrap_coordinator_output(&structured)
             }
             _ = cancel_rx.changed() => {
                 let _ = runner.kill().await;
@@ -1145,6 +1148,7 @@ async fn continue_from_worker_result(
         session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
         system_prompt: Some(FOLLOW_UP_SYSTEM_PROMPT.into()),
         append_system_prompt: None, disable_mcp: true, additional_dirs: vec![], isolate_customizations: false,
+        json_schema: Some(crate::domain::conversation::coordinator_output_schema()),
     }).await?;
     match output {
         CoordinatorOutput::Reply { text } => {
@@ -1682,13 +1686,12 @@ mod tests {
         use tauri::Manager;
 
         /// A fake `claude` that logs each run's working directory, consumes its
-        /// prompt and prints `result` as the provider's final result.
-        fn coordinator_body(log: &std::path::Path, result: &str) -> String {
-            let escaped = result.replace('\\', "\\\\").replace('"', "\\\"");
+        /// prompt and prints `output`, wrapped as `{"output": ...}`, as the run's `structured_output`.
+        fn coordinator_body(log: &std::path::Path, output: &str) -> String {
             format!(
-                "cat >/dev/null\necho \"$PWD\" >> \"{}\"\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{}\"}}'\n",
+                "case \" $* \" in *' --json-schema '*) ;; *) printf '%s\\n' \"error: unknown option '--json-schema'\" >&2; exit 1 ;; esac\ncat >/dev/null\necho \"$PWD\" >> \"{}\"\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"structured_output\":{{\"output\":{}}}}}'\n",
                 log.display(),
-                escaped
+                output
             )
         }
 
@@ -2261,14 +2264,20 @@ mod tests {
             Proposal(&'static str),
             Fail,
             MaxTurns,
+            /// A structurally valid object that the domain refuses.
             Malformed,
+            /// A successful result with prose and no `structured_output`.
+            Prose(&'static str),
+            /// A successful result whose `structured_output` is null.
+            NullStructured,
             /// Fails, and makes `dir` read-only first, so the failure cannot be saved.
             FailAndFreeze(std::path::PathBuf),
         }
 
+        /// The run's final `result` event, with `output` wrapped as the `structured_output`
+        /// object the schema requires: `{"output": <output>}`.
         fn result_line(output: &str) -> String {
-            let escaped = output.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{escaped}\"}}'")
+            format!("printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"structured_output\":{{\"output\":{output}}}}}'")
         }
 
         fn step_shell(step: &Step) -> String {
@@ -2277,7 +2286,9 @@ mod tests {
                 Step::Proposal(json) => result_line(json),
                 Step::Fail => "printf '%s\\n' 'provider unavailable' >&2; exit 2".into(),
                 Step::MaxTurns => "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"errors\":[\"Reached maximum number of turns (4)\"]}'; exit 1".into(),
-                Step::Malformed => result_line("not json"),
+                Step::Malformed => result_line(r#"{"type":"reply"}"#),
+                Step::Prose(text) => format!("printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{text}\"}}'"),
+                Step::NullStructured => "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"structured_output\":null}'".into(),
                 Step::FailAndFreeze(dir) => format!("chmod -R a-w '{}'; printf '%s\\n' 'provider unavailable' >&2; exit 2", dir.display()),
             }
         }
@@ -2287,7 +2298,11 @@ mod tests {
         /// the last step repeat it.
         fn provider_body(log: &std::path::Path, steps: &[Step]) -> String {
             let log = log.display();
-            let mut body = format!("echo run >> '{log}'\nn=$(wc -l < '{log}')\ncat > '{log}.prompt.'$n\ncase $n in\n");
+            // Every Coordinator run must ask for structured output. A run that
+            // does not is refused the way an old CLI refuses the flag.
+            let mut body = format!(
+                "case \" $* \" in *' --json-schema '*) ;; *) printf '%s\\n' \"error: unknown option '--json-schema'\" >&2; exit 1 ;; esac\necho run >> '{log}'\nn=$(wc -l < '{log}')\ncat > '{log}.prompt.'$n\ncase $n in\n"
+            );
             for (index, step) in steps.iter().enumerate() {
                 body.push_str(&format!("{}) {} ;;\n", index + 1, step_shell(step)));
             }
@@ -2461,6 +2476,52 @@ mod tests {
             let message = failure_message(&conversation);
             assert!(message.contains("Invalid Coordinator JSON"), "{message}");
             assert!(conversation.retryable_human_turn().is_some());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_prose_only_or_null_answer_is_a_retryable_failure_that_records_nothing() {
+            for step in [Step::Prose("Sure, here it is."), Step::NullStructured] {
+                let fx = fixture(tempfile::tempdir().unwrap(), &[step]).await;
+                let conversation = send(&fx, "Status?").await.expect("recorded").conversation;
+                let message = failure_message(&conversation);
+                assert!(message.contains("did not contain structured output"), "{message}");
+                assert!(conversation.retryable_human_turn().is_some());
+                assert_eq!(count(&conversation, |kind| matches!(kind, EntryKind::CoordinatorReply { .. })), 0);
+                assert!(conversation.actions.is_empty() && conversation.project_actions.is_empty());
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_field_outside_the_contract_is_refused_and_proposes_nothing() {
+            let raw = r#"{"type":"create_task","text":"why","title":"New","extra":true}"#;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Proposal(raw)]).await;
+            let conversation = send(&fx, "Add a task").await.expect("recorded").conversation;
+            assert!(failure_message(&conversation).contains("Invalid Coordinator JSON"));
+            assert!(conversation.retryable_human_turn().is_some());
+            assert!(conversation.actions.is_empty() && conversation.project_actions.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_structurally_valid_proposal_the_domain_refuses_proposes_nothing() {
+            let raw = r#"{"type":"create_task","text":"why","title":""}"#;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Proposal(raw)]).await;
+            let conversation = send(&fx, "Add a task").await.expect("recorded").conversation;
+            let message = failure_message(&conversation);
+            assert!(message.contains("did not return a reply"), "{message}");
+            assert!(conversation.retryable_human_turn().is_some());
+            assert!(conversation.actions.is_empty() && conversation.project_actions.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_lookup_then_a_reply_is_one_message_and_one_reply() {
+            let lookup = r#"{"type":"inspect_project"}"#;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Proposal(lookup), Step::Reply("Here it is.")]).await;
+            let conversation = send(&fx, "What is this Project?").await.expect("the send succeeds").conversation;
+            assert_eq!(human_count(&conversation, "What is this Project?"), 1);
+            assert_eq!(count(&conversation, |kind| matches!(kind, EntryKind::CoordinatorReply { .. })), 1);
+            assert!(conversation.retryable_human_turn().is_none());
+            assert_eq!(fx.runs(), 2);
+            assert!(fx.prompt(2).contains("untrusted evidence"), "the lookup result reaches the second run");
         }
 
         #[tokio::test(flavor = "multi_thread")]

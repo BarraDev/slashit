@@ -61,6 +61,7 @@ pub mod wasm_names;
 // list -- anything here is a promise that the platform is implemented.
 #[cfg(target_os = "linux")]
 pub mod context;
+pub mod coordinator_diagnostics;
 #[cfg(target_os = "linux")]
 pub mod developer_tools;
 #[cfg(target_os = "linux")]

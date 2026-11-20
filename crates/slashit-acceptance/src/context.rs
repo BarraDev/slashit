@@ -138,6 +138,12 @@ impl TestContext {
         &self.state
     }
 
+    /// Where this journey's failure evidence is written. It is kept on failure
+    /// and removed on success.
+    pub fn artifacts_dir(&self) -> &Path {
+        &self.artifacts
+    }
+
     /// Set a variable every session started after this call launches the
     /// application with.
     ///

@@ -1,0 +1,6 @@
+#!/bin/sh
+# A CLI that predates --json-schema: it rejects the flag as an unknown option,
+# as the CLI rejects any flag it does not know.
+cat >/dev/null
+printf '%s\n' "error: unknown option '--json-schema'" >&2
+exit 1

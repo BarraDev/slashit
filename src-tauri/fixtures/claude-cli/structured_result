@@ -1,0 +1,15 @@
+#!/bin/sh
+# Models the final `result` event of a structured-output run. The prompt picks
+# the case: a prose-only answer, a null `structured_output`, or a structured
+# object. Every case carries prose in `result`, which a structured run must
+# never use as its answer.
+prompt=$(cat)
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-structured"}'
+case "$prompt" in
+  *'case: prose'*)
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"s-structured","result":"Just prose."}' ;;
+  *'case: null'*)
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"s-structured","result":"prose","structured_output":null}' ;;
+  *)
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"s-structured","result":"prose","structured_output":{"type":"reply","text":"hello"}}' ;;
+esac

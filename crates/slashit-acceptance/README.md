@@ -111,9 +111,27 @@ with an artifact from an earlier attempt. Failures before the test runner
 creates `target/acceptance` remain available in their GitHub Actions step logs.
 
 Publication policy: the CI failure artifact is an allowlist of
-`journey-timings*.jsonl`, `*/journey-result.json` and `*/*-start-summary.json`
-only. Page source, screenshots, native driver status, URLs, window titles and
-provider logs stay on the runner and are not uploaded. Each diagnostic
+`journey-timings*.jsonl`, `*/journey-result.json`, `*/*-start-summary.json` and
+`*/coordinator-diagnostics.json` only. Page source, screenshots, native driver
+status, URLs, window titles, provider logs, prompts and model answers stay on
+the runner and are not uploaded.
+
+`coordinator-diagnostics.json` is written only when a Coordinator journey fails
+while it waits for a proposal card. Its permitted content is fixed, and
+`coordinator_diagnostics::tests` fails if any other field appears:
+
+- `schema_version` (always `1`), `invoked` (a boolean), and `invocations` (a
+  count of the Coordinator runs the fake agent claimed).
+- `runs`: one entry per claimed run, with a `position` number, `scripted` set
+  to `found`, `missing` or `not_applicable`, and `structured` set to `object`,
+  `none` or `not_applicable`. A trace line outside that vocabulary is recorded
+  as `unrecognized` and its text is not copied.
+- `rendered_proposal_cards` (a count of proposal cards on screen) and
+  `persisted_actions` (a count of the actions the application stored). Either
+  is `null` when it could not be read.
+
+The fake agent writes the `runs` trace. Its only values are the same fixed
+words, so a run's answer, prompt, path or environment never reaches the record. Each diagnostic
 WebDriver call (URL, title, screenshot, page source) and the bounded
 WebDriver quit on a failed start is wrapped in a 10-second timeout and is
 never retried. The timeout drops the call's future; it does not bound the
