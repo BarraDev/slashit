@@ -2386,13 +2386,24 @@ impl TaskExecutor {
             return Ok(PromotionOutcome::NoCapacity);
         };
 
+        // Tasks of removed Projects are never promoted; read before the queue
+        // locks so the selection itself stays synchronous.
+        let removed: HashSet<Uuid> = self
+            .projects
+            .read()
+            .await
+            .values()
+            .filter(|project| project.is_removed())
+            .map(|project| project.id)
+            .collect();
         let mut reserved = self.reserved_permits.write().await;
         let manager = self.queue_manager.read().await;
+        let admits = |task: &Task| {
+            !removed.contains(&task.project_id) && start_lease_admits(&self.storage, task)
+        };
         let select = |tasks: &HashMap<Uuid, Task>| match choice {
-            PromotionChoice::Next => manager
-                .select_promotable(tasks, |task| start_lease_admits(&self.storage, task)),
-            PromotionChoice::Exact(task_id) => manager
-                .select_exact(tasks, task_id, |task| start_lease_admits(&self.storage, task)),
+            PromotionChoice::Next => manager.select_promotable(tasks, admits),
+            PromotionChoice::Exact(task_id) => manager.select_exact(tasks, task_id, admits),
         };
         let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
             if let Some(task) = staged.get_mut(&task_id) {
@@ -2488,6 +2499,21 @@ impl TaskExecutor {
     /// fix agent there and commits there -- so a terminalization that only
     /// looked at `running_handles` would happily remove a checkout an AI review
     /// was halfway through.
+    /// Whether the Project a Task belongs to has been removed. A removed
+    /// Project starts no work: promotion and execution both ask this.
+    async fn task_project_removed(&self, task_id: Uuid) -> bool {
+        let project_id = self.tasks.read().await.get(&task_id).map(|t| t.project_id);
+        match project_id {
+            Some(project_id) => self
+                .projects
+                .read()
+                .await
+                .get(&project_id)
+                .is_some_and(|project| project.is_removed()),
+            None => false,
+        }
+    }
+
     pub async fn is_task_running(&self, task_id: Uuid) -> bool {
         let running = self
             .running_handles
@@ -3286,6 +3312,9 @@ impl TaskExecutor {
         let Some(recorded) = state.as_recorded() else {
             return Ok(());
         };
+        if self.task_project_removed(task_id).await {
+            return Ok(());
+        }
         // Answers are applied once a whole batch has settled, so a newer
         // reading may have landed in the meantime, say an open after a
         // reopen. Only what the cache still says is acted on.
@@ -5412,6 +5441,14 @@ impl TaskExecutor {
                 StartRequest::Pending => Ok(false),
                 StartRequest::Direct | StartRequest::NewAttempt { .. } => {
                     Err(format!("task {task_id} already has an agent working on it"))
+                }
+            };
+        }
+        if self.task_project_removed(task_id).await {
+            return match request {
+                StartRequest::Pending => Ok(false),
+                StartRequest::Direct | StartRequest::NewAttempt { .. } => {
+                    Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string())
                 }
             };
         }
@@ -9403,6 +9440,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         }
     }
 

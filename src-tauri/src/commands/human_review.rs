@@ -1511,6 +1511,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
         (repo, project_id, base)
@@ -2458,6 +2459,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
         let mut task = create_test_task_full("stale in jj", project_id, TaskStatus::HumanReview, 0);

@@ -6518,6 +6518,7 @@ fn extract_text_from_stream_json(stdout: &str) -> String {
 
 async fn create_pr_inner(state: &crate::AppState, task_id: &str) -> Result<String, String> {
     let task_uuid = Uuid::parse_str(task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(state, task_uuid).await?;
 
     // Before anything below reads a branch name, pushes it, or asks GitHub
     // to open a pull request against it: end whatever execution, AI review/
@@ -14637,6 +14638,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             };
             let project_id = project.id;
             state

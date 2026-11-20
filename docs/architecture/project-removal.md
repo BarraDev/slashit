@@ -2,6 +2,15 @@
 
 **Status: Proposed. Not implemented. Not adopted. Section 12 marks which decisions are settled for phase 1 and which remain open.**
 
+**Phase 1 implementation (Project Rail, 2026-11-20) supersedes parts of this proposal.** The owner's decision is *Remove Project*, not *Hide Project*:
+
+- Removal sets one durable marker on the Project record, `removed_at` (`domain/project.rs`). The Project keeps its id, repository, Tasks, Conversation, history and checkouts. Nothing is deleted, and `delete_project` is not used.
+- Admission boundaries refuse a removed Project: Conversation reads and sends, Task creation, promotion, execution start, worktree creation, worker new-attempt authorization, file reads, the PR creation helper, background PR state writes, attach, rename, and the active listings. Queue entry through the status commands is not refused at its own call sites; promotion and execution never start a removed Project's Task.
+- Removal takes the Conversation lock, the Project gate in write, and every Task lease, in the order deletion uses. It re-checks the refusals under the board and Project locks before it commits.
+- The refusal covers only work that needs the executor or the user: Queue, In Progress, AI Review and Human Review, plus the durable markers deletion already checks. Done, Error, PR-created and Backlog Tasks without a checkout do not block removal.
+- Restore-by-ID is not built. Opening the same folder again finds the removed Project by its canonical folder and returns it unchanged, instead of creating a second one. Repository-less Projects cannot be removed, because they could never be reopened.
+- The hide-specific items below (`hidden_at`, the restore-by-ID UI, the Settings "Removed Projects" area) are not part of phase 1.
+
 This document replaces the earlier version of this proposal, which described a true archive. It describes logical hide only. Permanent deletion and moved-folder recovery are deferred (section 9). No code, configuration, or test is changed by this document.
 
 ## Labels

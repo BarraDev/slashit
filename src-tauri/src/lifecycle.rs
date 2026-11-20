@@ -684,6 +684,21 @@ pub async fn create(
 /// [`create`] for a Task whose content must be checked against the Project's
 /// Tasks under the same write. `build` sees exactly the Tasks `create` would
 /// stage, and a refusal from it writes nothing.
+/// The admission check for any new work on a Project: the Project must exist
+/// and must be active. A removed Project is inactive, so it refuses here the
+/// same way a missing one does. `missing` words the refusal for an unknown id.
+pub async fn refuse_inactive_project(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    project_id: Uuid,
+    missing: impl FnOnce() -> String,
+) -> Result<(), String> {
+    match projects.read().await.get(&project_id) {
+        None => Err(missing()),
+        Some(project) if project.is_removed() => Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string()),
+        Some(_) => Ok(()),
+    }
+}
+
 pub async fn create_checked(
     gate: &ProjectLifecycleGate,
     tasks: &Tasks,
@@ -709,11 +724,10 @@ pub async fn create_checked(
     // does not happen. The small read under this write guard is the ordered
     // side of the pair -- no code knowingly holds a Project lock and then
     // waits on the Task map, which the review contract this file relies on.
-    if !projects.read().await.contains_key(&project_id) {
-        return Err(format!(
-            "Project {project_id} does not exist or was deleted, so no Task can be created for it"
-        ));
-    }
+    refuse_inactive_project(projects, project_id, || {
+        format!("Project {project_id} does not exist or was deleted, so no Task can be created for it")
+    })
+    .await?;
 
     let mut staged = stage_project(&tasks_w, project_id);
     let task = build(&staged)?;
@@ -747,12 +761,13 @@ pub async fn create_batch(
     // The same under-lock existence check [`create`] does, for the same
     // reason: a Project removed while the batch was waiting must not get its
     // Task file back.
-    if !projects.read().await.contains_key(&project_id) {
-        return Err(format!(
+    refuse_inactive_project(projects, project_id, || {
+        format!(
             "Project {project_id} does not exist or was deleted, so no Task can be imported \
              into it"
-        ));
-    }
+        )
+    })
+    .await?;
 
     let mut staged = stage_project(&tasks_w, project_id);
     for task in new_tasks {
@@ -2027,6 +2042,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
 
         World {
@@ -4125,6 +4141,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
         let ok = create(

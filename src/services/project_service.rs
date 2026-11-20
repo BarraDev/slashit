@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::models::*;
-use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -52,29 +51,6 @@ pub async fn list_projects() -> Result<Vec<Project>, String> {
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
-/// The Project Rail's order and hidden Projects.
-pub async fn get_project_rail() -> Result<ProjectRailConfig, String> {
-    let args = serde_wasm_bindgen::to_value(&serde_json::json!({})).map_err(|e| e.to_string())?;
-    let response = invoke_checked("get_project_rail", args).await?;
-    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
-}
-
-/// Save the Project Rail. A refused hide arrives as `Err` with the reason.
-pub async fn update_project_rail(order: Vec<Uuid>, hidden: Vec<Uuid>) -> Result<ProjectRailConfig, String> {
-    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
-        "order": order.iter().map(Uuid::to_string).collect::<Vec<_>>(),
-        "hidden": hidden.iter().map(Uuid::to_string).collect::<Vec<_>>(),
-    })).map_err(|e| e.to_string())?;
-    let response = invoke_checked("update_project_rail", args).await?;
-    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
-}
-
-/// Rename a Project's display name. The repository and its directory are not touched.
-pub async fn rename_project(id: String, name: String) -> Result<(), String> {
-    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "id": id, "name": name })).map_err(|e| e.to_string())?;
-    invoke_checked("update_project", args).await.map(|_| ())
-}
-
 pub async fn get_project(id: String) -> Result<Option<Project>, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "id": id })).unwrap();
     let response = invoke("get_project", args).await;
@@ -109,4 +85,26 @@ pub async fn detach_project_from_workspace(project_id: String) -> Result<Project
 
     let response = invoke_checked("detach_project_from_workspace", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// Rename a Project's displayed name. The repository folder is not changed.
+pub async fn rename_project(project_id: String, name: String) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "id": project_id,
+        "name": name,
+    })).unwrap();
+
+    invoke_checked("update_project", args).await?;
+    Ok(())
+}
+
+/// Remove a Project from SlashIt's active Projects. Its folder, Tasks, history
+/// and identity are kept; opening the same folder again brings it back.
+pub async fn remove_project(project_id: String) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "id": project_id,
+    })).unwrap();
+
+    invoke_checked("remove_project", args).await?;
+    Ok(())
 }

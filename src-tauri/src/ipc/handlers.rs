@@ -174,6 +174,7 @@ async fn handle_list_projects(ctx: &IpcContext) -> IpcResponse {
     let repositories = ctx.repositories.read().await;
     let summaries: Vec<ProjectSummary> = projects
         .values()
+        .filter(|p| !p.is_removed())
         .map(|p| ProjectSummary {
             id: p.id.to_string(),
             name: p.name.clone(),
@@ -1784,6 +1785,7 @@ pub(super) mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 
@@ -1911,6 +1913,7 @@ pub(super) mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 
@@ -2067,6 +2070,7 @@ pub(super) mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 
@@ -2152,6 +2156,7 @@ pub(super) mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
         ctx.projects.write().await.insert(
             with_repo_id,
@@ -3012,6 +3017,7 @@ mod task_configuration_writes {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         }
     }
 
@@ -3646,6 +3652,7 @@ mod import_lock_order {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         }
     }
 

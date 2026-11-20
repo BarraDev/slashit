@@ -34,6 +34,9 @@ async fn project_root_for(
     let local_path = {
         let projects = state.project.projects.read().await;
         let project = projects.get(&id).ok_or("Project not found")?;
+        if project.is_removed() {
+            return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+        }
         let repositories = state.repository.repositories.read().await;
         project
             .repository_path(&repositories)

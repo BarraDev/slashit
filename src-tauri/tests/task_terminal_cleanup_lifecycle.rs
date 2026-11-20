@@ -487,6 +487,7 @@ async fn build_fixture(name: &str) -> (Fixture, AppState) {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         },
     );
 

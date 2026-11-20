@@ -98,7 +98,8 @@ pub fn CreateProjectModal(
                                 // Create project with the new repository
                                 match create_project(project_name.clone(), Some(repo.id.to_string()), AgentType::ClaudeCode).await {
                                     Ok(project) => {
-                                        toast::success(format!("Project '{}' created successfully!", project_name));
+                                        // Opening a folder that a removed Project used returns that Project.
+                                        toast::success(format!("Project '{}' is open.", project_name));
                                         announce_setup_needed(&project).await;
                                         set_show_clone.set(false);
                                         if let Some(callback) = on_created {

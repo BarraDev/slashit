@@ -1,219 +1,279 @@
 // SPDX-License-Identifier: MPL-2.0
-//! The Organize Projects panel: reorder, rename, remove from the rail and
-//! restore. Edits are a draft until Save; Cancel discards them.
-
-use std::collections::HashMap;
+//! Organize Projects: rename a Project's displayed name, or remove it from
+//! SlashIt. Each action is saved on its own and reports its own result.
+//! Nothing on disk is changed by either action.
 
 use leptos::callback::Callback;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use uuid::Uuid;
 
-use crate::models::{arrange, Project, ProjectRailConfig};
-use crate::services::{rename_project, update_project_rail};
-
-/// Move `index` one place up or down within `order`, if that stays in range.
-fn step(order: &mut [Uuid], index: usize, down: bool) {
-    let target = if down { index + 1 } else { index.wrapping_sub(1) };
-    if index < order.len() && target < order.len() {
-        order.swap(index, target);
-    }
-}
+use crate::components::toast;
+use crate::models::Project;
+use crate::services::{list_projects, remove_project, rename_project};
 
 #[component]
 pub fn ProjectOrganizer(
     #[prop(into)] show: Signal<bool>,
     set_show: WriteSignal<bool>,
-    #[prop(into)] projects: Signal<Vec<Project>>,
-    #[prop(into)] rail: Signal<ProjectRailConfig>,
-    on_saved: Callback<()>,
+    selected_project: Signal<String>,
+    set_selected_project: WriteSignal<String>,
+    on_changed: Callback<()>,
 ) -> impl IntoView {
-    let draft_order = RwSignal::new(Vec::<Uuid>::new());
-    let draft_hidden = RwSignal::new(Vec::<Uuid>::new());
-    let draft_names = RwSignal::new(HashMap::<Uuid, String>::new());
-    let error = RwSignal::new(None::<String>);
-    let saving = RwSignal::new(false);
+    let projects = RwSignal::new(Vec::<Project>::new());
+    let load_error = RwSignal::new(None::<String>);
+    let action_error = RwSignal::new(None::<String>);
 
-    // Start each opening from the saved state, so an earlier cancel leaves nothing behind.
-    Effect::new(move |prev: Option<bool>| {
-        let open = show.get();
-        if open && prev != Some(true) {
-            let (visible, hidden) = arrange(&projects.get_untracked(), &rail.get_untracked());
-            draft_order.set(visible.iter().map(|p| p.id).collect());
-            draft_hidden.set(hidden.iter().map(|p| p.id).collect());
-            draft_names.set(projects.get_untracked().into_iter().map(|p| (p.id, p.name)).collect());
-            error.set(None);
-        }
-        open
-    });
-
-    let save = move |_| {
-        if saving.get_untracked() {
-            return;
-        }
-        let names = draft_names.get_untracked();
-        let mut renames = Vec::new();
-        for project in projects.get_untracked() {
-            let wanted = names.get(&project.id).map(|n| n.trim().to_string()).unwrap_or_default();
-            if wanted.is_empty() {
-                error.set(Some(format!("“{}” needs a name.", project.name)));
-                return;
-            }
-            if wanted != project.name {
-                renames.push((project.id, wanted));
-            }
-        }
-        let order = draft_order.get_untracked();
-        let hidden = draft_hidden.get_untracked();
-        saving.set(true);
-        error.set(None);
+    let reload = move || {
         spawn_local(async move {
-            // Renames first. A failed rename stops the save here, so no rail
-            // change is applied on top of a half-applied draft.
-            for (id, name) in renames {
-                if let Err(e) = rename_project(id.to_string(), name).await {
-                    error.set(Some(format!("The name could not be saved: {e}")));
-                    on_saved.run(());
-                    saving.set(false);
-                    return;
+            match list_projects().await {
+                Ok(list) => {
+                    projects.set(list);
+                    load_error.set(None);
                 }
+                Err(e) => load_error.set(Some(format!("Could not read the Projects: {e}"))),
             }
-            match update_project_rail(order, hidden).await {
-                Ok(_) => {
-                    set_show.set(false);
-                    on_saved.run(());
-                }
-                Err(e) => error.set(Some(format!("The rail could not be saved. {e}"))),
-            }
-            saving.set(false);
         });
     };
 
-    let name_of = move |id: Uuid| {
-        draft_names.with(|names| names.get(&id).cloned().unwrap_or_default())
-    };
+    // Read the list each time the panel opens, so it never shows a stale name.
+    Effect::new(move |_| {
+        if show.get() {
+            action_error.set(None);
+            reload();
+        }
+    });
+
+    let close = move || set_show.set(false);
 
     view! {
         <Show when=move || show.get()>
-            <div
-                class="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
-                data-testid="organize-projects-dialog"
-            >
+            <div class="fixed inset-0 z-50 flex items-center justify-center p-4">
                 <div
+                    class="absolute inset-0 bg-black/60 backdrop-blur-sm"
+                    on:click=move |_| close()
+                ></div>
+
+                <div
+                    data-testid="project-organizer"
                     role="dialog"
                     aria-modal="true"
-                    aria-labelledby="organize-projects-title"
-                    class="w-[min(520px,92vw)] max-h-[85vh] overflow-y-auto rounded-xl bg-zinc-900 border border-white/10 p-5 text-white"
+                    aria-labelledby="project-organizer-title"
+                    class="relative w-full max-w-xl bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl"
+                    on:click=move |e| e.stop_propagation()
+                    on:keydown=move |e| {
+                        if e.key() == "Escape" {
+                            close();
+                        }
+                    }
                 >
-                    <h2 id="organize-projects-title" class="text-lg font-semibold">"Organize Projects"</h2>
-                    <p class="text-sm text-white/60 mt-1">
-                        "Removing a Project from the rail keeps its repository, Tasks and history. Nothing is deleted."
-                    </p>
+                    <div class="flex items-center justify-between p-6 border-b border-white/5">
+                        <div>
+                            <h2 id="project-organizer-title" class="text-lg font-semibold text-white/90">"Organize Projects"</h2>
+                            <p class="text-xs text-white/40 mt-1">
+                                "Renaming changes only the name shown here. Removing a Project keeps its folder, Tasks and history."
+                            </p>
+                        </div>
+                        <button
+                            type="button"
+                            aria-label="Close"
+                            on:click=move |_| close()
+                            class="p-2 rounded-lg hover:bg-white/5 text-white/40 hover:text-white/60 transition-colors"
+                        >
+                            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </div>
 
-                    <h3 class="text-xs uppercase tracking-wide text-white/40 mt-4 mb-2">"On the rail"</h3>
-                    {move || {
-                        let order = draft_order.get();
-                        if order.is_empty() {
-                            view! {
-                                <p class="text-sm text-white/50" data-testid="organize-empty-rail">
-                                    "No Projects are on the rail. Restore one below."
+                    <div class="p-6 space-y-3 max-h-[60vh] overflow-y-auto">
+                        {move || action_error.get().map(|message| view! {
+                            <div role="alert" data-testid="project-organizer-error" class="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
+                                {message}
+                            </div>
+                        })}
+                        {move || load_error.get().map(|message| view! {
+                            <div role="alert" class="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
+                                {message}
+                            </div>
+                        })}
+
+                        <Show
+                            when=move || !projects.with(Vec::is_empty)
+                            fallback=move || view! {
+                                <p data-testid="project-organizer-empty" class="text-sm text-white/50">
+                                    "No Projects are open. Open a folder to add one."
                                 </p>
-                            }.into_any()
-                        } else {
-                            let last = order.len() - 1;
-                            view! {
-                                <ul class="flex flex-col gap-2">
-                                    {order.into_iter().enumerate().map(|(index, id)| {
-                                        view! {
-                                            <li class="flex items-center gap-2" data-testid="organize-row">
-                                                <input
-                                                    type="text"
-                                                    aria-label=format!("Display name for position {}", index + 1)
-                                                    class="flex-1 min-w-0 rounded bg-black/40 border border-white/10 px-2 py-1 text-sm"
-                                                    prop:value=move || name_of(id)
-                                                    on:input=move |ev| {
-                                                        let value = event_target_value(&ev);
-                                                        draft_names.update(|names| { names.insert(id, value); });
-                                                    }
-                                                />
-                                                <button
-                                                    type="button"
-                                                    class="px-2 py-1 text-sm rounded bg-white/5 hover:bg-white/10 disabled:opacity-30"
-                                                    aria-label="Move up"
-                                                    disabled=index == 0
-                                                    on:click=move |_| draft_order.update(|o| step(o, index, false))
-                                                >"Up"</button>
-                                                <button
-                                                    type="button"
-                                                    class="px-2 py-1 text-sm rounded bg-white/5 hover:bg-white/10 disabled:opacity-30"
-                                                    aria-label="Move down"
-                                                    disabled=index == last
-                                                    on:click=move |_| draft_order.update(|o| step(o, index, true))
-                                                >"Down"</button>
-                                                <button
-                                                    type="button"
-                                                    class="px-2 py-1 text-sm rounded bg-white/5 hover:bg-white/10"
-                                                    on:click=move |_| {
-                                                        draft_order.update(|o| o.retain(|x| *x != id));
-                                                        draft_hidden.update(|h| h.push(id));
-                                                    }
-                                                >"Remove from rail"</button>
-                                            </li>
-                                        }
-                                    }).collect::<Vec<_>>()}
-                                </ul>
-                            }.into_any()
-                        }
-                    }}
-
-                    <h3 class="text-xs uppercase tracking-wide text-white/40 mt-5 mb-2">"Removed from the rail"</h3>
-                    {move || {
-                        let hidden = draft_hidden.get();
-                        if hidden.is_empty() {
-                            view! { <p class="text-sm text-white/50">"No Projects are removed."</p> }.into_any()
-                        } else {
-                            view! {
-                                <ul class="flex flex-col gap-2">
-                                    {hidden.into_iter().map(|id| {
-                                        view! {
-                                            <li class="flex items-center gap-2" data-testid="organize-hidden-row">
-                                                <span class="flex-1 min-w-0 truncate text-sm">{move || name_of(id)}</span>
-                                                <button
-                                                    type="button"
-                                                    class="px-2 py-1 text-sm rounded bg-white/5 hover:bg-white/10"
-                                                    on:click=move |_| {
-                                                        draft_hidden.update(|h| h.retain(|x| *x != id));
-                                                        draft_order.update(|o| o.push(id));
-                                                    }
-                                                >"Restore"</button>
-                                            </li>
-                                        }
-                                    }).collect::<Vec<_>>()}
-                                </ul>
-                            }.into_any()
-                        }
-                    }}
-
-                    {move || error.get().map(|message| view! {
-                        <p role="alert" class="mt-4 text-sm text-red-300" data-testid="organize-error">{message}</p>
-                    })}
-
-                    <div class="flex justify-end gap-2 mt-5">
-                        <button
-                            type="button"
-                            class="px-3 py-1.5 text-sm rounded bg-white/5 hover:bg-white/10"
-                            on:click=move |_| set_show.set(false)
-                        >"Cancel"</button>
-                        <button
-                            type="button"
-                            data-testid="organize-save"
-                            class="px-3 py-1.5 text-sm rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50"
-                            disabled=move || saving.get()
-                            on:click=save
-                        >"Save"</button>
+                            }
+                        >
+                            <ul class="space-y-3" data-testid="project-organizer-list">
+                                <For
+                                    each=move || projects.get()
+                                    key=|project| project.id
+                                    let:project
+                                >
+                                    <ProjectRow
+                                        project=project
+                                        action_error=action_error
+                                        selected_project=selected_project
+                                        set_selected_project=set_selected_project
+                                        on_changed=on_changed
+                                        reload=Callback::new(move |()| reload())
+                                    />
+                                </For>
+                            </ul>
+                        </Show>
                     </div>
                 </div>
             </div>
         </Show>
+    }
+}
+
+/// One Project's row. Its rename and remove actions are independent: a failed
+/// rename leaves the name as it was, and a failed remove leaves the Project in
+/// the rail.
+#[component]
+fn ProjectRow(
+    project: Project,
+    action_error: RwSignal<Option<String>>,
+    selected_project: Signal<String>,
+    set_selected_project: WriteSignal<String>,
+    on_changed: Callback<()>,
+    reload: Callback<()>,
+) -> impl IntoView {
+    let id: Uuid = project.id;
+    // The name as the backend last confirmed it, and what the user is typing.
+    let saved = RwSignal::new(project.name.clone());
+    let draft = RwSignal::new(project.name.clone());
+    let saving = RwSignal::new(false);
+    let confirming = RwSignal::new(false);
+    let removing = RwSignal::new(false);
+
+    let can_save = move || {
+        let typed = draft.get();
+        let typed = typed.trim();
+        !saving.get() && !typed.is_empty() && typed != saved.get()
+    };
+
+    let on_rename = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        let name = draft.get_untracked().trim().to_string();
+        if name.is_empty() {
+            action_error.set(Some("A Project needs a name.".to_string()));
+            return;
+        }
+        saving.set(true);
+        spawn_local(async move {
+            match rename_project(id.to_string(), name.clone()).await {
+                Ok(()) => {
+                    // The row can be unmounted while the request is in flight
+                    // (the panel closed), so every write from here uses try_set.
+                    let _ = saved.try_set(name.clone());
+                    let _ = draft.try_set(name.clone());
+                    action_error.set(None);
+                    toast::success(format!("Renamed to '{name}'. The folder was not changed."));
+                    on_changed.run(());
+                }
+                Err(e) => {
+                    action_error.set(Some(format!("Could not rename the Project: {e}")));
+                }
+            }
+            let _ = saving.try_set(false);
+        });
+    };
+
+    let on_remove = move |_| {
+        removing.set(true);
+        spawn_local(async move {
+            match remove_project(id.to_string()).await {
+                Ok(()) => {
+                    let name = saved.get_untracked();
+                    action_error.set(None);
+                    if selected_project.get_untracked() == id.to_string() {
+                        // The selected Project left; select the first one still active, if any.
+                        let remaining = list_projects().await.unwrap_or_default();
+                        set_selected_project
+                            .set(remaining.first().map(|p| p.id.to_string()).unwrap_or_default());
+                    }
+                    toast::success(format!(
+                        "Removed '{name}' from SlashIt. Open its folder to use it again."
+                    ));
+                    reload.run(());
+                    on_changed.run(());
+                    // Stop before the row is gone; try_set above covers the rest.
+                }
+                Err(e) => {
+                    let _ = confirming.try_set(false);
+                    action_error.set(Some(format!(
+                        "'{}' was not removed. {e}",
+                        saved.get_untracked()
+                    )));
+                }
+            }
+            let _ = removing.try_set(false);
+        });
+    };
+
+    view! {
+        <li data-testid="project-organizer-row" class="rounded-lg border border-white/10 bg-white/[0.02] p-3">
+            <form class="flex items-center gap-2" on:submit=on_rename>
+                <label class="sr-only" for=format!("rename-{id}")>"Project name"</label>
+                <input
+                    id=format!("rename-{id}")
+                    data-testid="project-organizer-name"
+                    type="text"
+                    maxlength="120"
+                    prop:value=move || draft.get()
+                    on:input=move |e| draft.set(event_target_value(&e))
+                    disabled=move || saving.get() || removing.get()
+                    class="flex-1 min-w-0 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm text-white/90 focus:outline-none focus:border-blue-400"
+                />
+                <button
+                    type="submit"
+                    data-testid="project-organizer-save"
+                    disabled=move || !can_save()
+                    class="px-3 py-2 rounded-lg text-sm bg-blue-500 hover:bg-blue-600 text-white disabled:bg-white/5 disabled:text-white/30 transition-colors"
+                >
+                    {move || if saving.get() { "Saving..." } else { "Save name" }}
+                </button>
+                <button
+                    type="button"
+                    data-testid="project-organizer-remove"
+                    disabled=move || saving.get() || removing.get() || confirming.get()
+                    on:click=move |_| confirming.set(true)
+                    class="px-3 py-2 rounded-lg text-sm text-red-300 hover:bg-red-500/10 disabled:text-white/30 transition-colors"
+                >
+                    "Remove"
+                </button>
+            </form>
+
+            {move || confirming.get().then(|| view! {
+                <div data-testid="project-organizer-confirm" class="mt-3 flex flex-wrap items-center justify-between gap-2 text-sm text-white/70">
+                    <span>
+                        {move || format!("Remove '{}' from SlashIt? Its folder, Tasks and history stay as they are.", saved.get())}
+                    </span>
+                    <span class="flex gap-2">
+                        <button
+                            type="button"
+                            disabled=move || removing.get()
+                            on:click=move |_| confirming.set(false)
+                            class="px-3 py-1.5 rounded-lg text-white/70 hover:bg-white/5 transition-colors"
+                        >
+                            "Cancel"
+                        </button>
+                        <button
+                            type="button"
+                            data-testid="project-organizer-confirm-remove"
+                            disabled=move || removing.get()
+                            on:click=on_remove
+                            class="px-3 py-1.5 rounded-lg bg-red-500/80 hover:bg-red-500 text-white disabled:bg-white/5 transition-colors"
+                        >
+                            {move || if removing.get() { "Removing..." } else { "Remove from SlashIt" }}
+                        </button>
+                    </span>
+                </div>
+            })}
+        </li>
     }
 }

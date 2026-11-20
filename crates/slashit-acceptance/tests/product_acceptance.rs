@@ -91,6 +91,8 @@ mod pr_comment_review;
 mod pr_comment_analyze;
 #[path = "product_acceptance/project_rail.rs"]
 mod project_rail;
+#[path = "product_acceptance/project_removal.rs"]
+mod project_removal;
 #[path = "product_acceptance/portable_import.rs"]
 mod portable_import;
 #[path = "product_acceptance/terminal_lifecycle.rs"]

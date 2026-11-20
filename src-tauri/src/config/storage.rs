@@ -218,10 +218,6 @@ pub struct AppConfig {
     /// persisted, which load as the defaults.
     #[serde(default)]
     pub queue: crate::config::QueueConfig,
-    /// Which Projects the Project Rail shows, and their order. Absent from
-    /// older files, which load as the defaults.
-    #[serde(default)]
-    pub project_rail: crate::config::ProjectRailConfig,
 }
 
 /// How SlashIt places the worktrees it creates.
@@ -298,7 +294,6 @@ impl Default for AppConfig {
             },
             queue: crate::config::QueueConfig::default(),
             conversations: crate::config::ConversationsConfig::default(),
-            project_rail: crate::config::ProjectRailConfig::default(),
         }
     }
 }
@@ -3574,6 +3569,7 @@ baz = 123
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         }
     }
 
@@ -3626,6 +3622,7 @@ baz = 123
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
         config.projects.insert(project_id.to_string(), project);
         
@@ -4125,6 +4122,7 @@ user_name = "Test"
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 
@@ -4221,6 +4219,7 @@ user_name = "Test"
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
 
         let mut config = AppConfig::default();

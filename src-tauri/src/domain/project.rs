@@ -107,9 +107,27 @@ pub struct Project {
     pub agent_config: AgentConfig,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// When the Project was removed from SlashIt's active Projects, if it was.
+    ///
+    /// A removed Project keeps its id, repository, Tasks, Conversation and
+    /// history. It is inactive: every admission boundary refuses new work for
+    /// it, and it is listed nowhere. Opening its folder again clears this and
+    /// returns the same Project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// The refusal every admission boundary gives for a removed Project.
+pub const PROJECT_REMOVED_REFUSAL: &str =
+    "This Project was removed from SlashIt. Open its folder again to use it.";
+
 impl Project {
+    /// Whether this Project is inactive. Admission boundaries check this, not
+    /// a UI filter, so a removed Project starts no work from any front door.
+    pub fn is_removed(&self) -> bool {
+        self.removed_at.is_some()
+    }
+
     /// This project's repository's local checkout path, if it has a
     /// repository and that repository is still known.
     ///

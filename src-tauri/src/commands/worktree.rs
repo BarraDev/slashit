@@ -49,6 +49,9 @@ pub(crate) async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid
 
         let projects = state.project.projects.read().await;
         let project = projects.get(&project_id).ok_or("Project not found")?;
+        if project.is_removed() {
+            return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+        }
         let repo_id = project.repository_id.ok_or("No repository linked")?;
         drop(projects);
 
@@ -266,6 +269,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             };
             let project_id = project.id;
             state.project.projects.write().await.insert(project_id, project);
@@ -665,6 +669,7 @@ mod tests {
                     },
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
+                    removed_at: None,
                 },
             );
 

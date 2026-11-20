@@ -1272,6 +1272,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
         config
@@ -1390,6 +1391,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
         let project_id = project.id;
 
@@ -1404,7 +1406,6 @@ mod tests {
         let seed_storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
-            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -1529,6 +1530,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
         let project_id = project.id;
 
@@ -1543,7 +1545,6 @@ mod tests {
         let seed_storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
-            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -1950,6 +1951,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
 
         let mut task = crate::test_helpers::create_test_task("A task");
@@ -1992,7 +1994,6 @@ mod tests {
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
-            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -2085,6 +2086,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
         let stale = tmp
             .path()
@@ -2111,7 +2113,6 @@ mod tests {
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
-            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -2195,6 +2196,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
         let stale = tmp
             .path()
@@ -2325,6 +2327,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
 
         // `InProgress` with an idle phase, which is exactly what the queue
@@ -2342,7 +2345,6 @@ mod tests {
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
-            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -2597,6 +2599,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
 
         let recorded_path = tmp
@@ -2614,7 +2617,6 @@ mod tests {
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
-            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -2723,6 +2725,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
 
         let mut task = crate::test_helpers::create_test_task("checkout vanished");
@@ -2736,7 +2739,6 @@ mod tests {
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig {
             conversations: Default::default(),
-            project_rail: Default::default(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             agent_configs: HashMap::new(),
@@ -3230,6 +3232,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig::default();
