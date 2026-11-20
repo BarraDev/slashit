@@ -21,6 +21,7 @@ pub fn ProjectOrganizer(
     set_show: WriteSignal<bool>,
     selected_project: Signal<String>,
     set_selected_project: WriteSignal<String>,
+    selected_workspace: Signal<String>,
     on_changed: Callback<()>,
 ) -> impl IntoView {
     let projects = RwSignal::new(Vec::<Project>::new());
@@ -120,6 +121,7 @@ pub fn ProjectOrganizer(
                                         action_error=action_error
                                         selected_project=selected_project
                                         set_selected_project=set_selected_project
+                                        selected_workspace=selected_workspace
                                         on_changed=on_changed
                                         reload=Callback::new(move |()| reload())
                                     />
@@ -144,6 +146,7 @@ fn ProjectRow(
     action_error: RwSignal<Option<String>>,
     selected_project: Signal<String>,
     set_selected_project: WriteSignal<String>,
+    selected_workspace: Signal<String>,
     on_changed: Callback<()>,
     reload: Callback<()>,
 ) -> impl IntoView {
@@ -196,10 +199,14 @@ fn ProjectRow(
                     let name = saved.get_untracked();
                     action_error.set(None);
                     if selected_project.get_untracked() == id.to_string() {
-                        // The selected Project left; select the first one still active, if any.
-                        let remaining = list_projects().await.unwrap_or_default();
-                        set_selected_project
-                            .set(remaining.first().map(|p| p.id.to_string()).unwrap_or_default());
+                        // In Workspace context the Project is only a stale id, so clearing it
+                        // must not switch context. In Project context, pick the next active one.
+                        let next = if selected_workspace.get_untracked().is_empty() {
+                            list_projects().await.unwrap_or_default().first().map(|p| p.id.to_string())
+                        } else {
+                            None
+                        };
+                        set_selected_project.set(next.unwrap_or_default());
                     }
                     toast::success(format!(
                         "Removed '{name}' from SlashIt. Open its folder to use it again."

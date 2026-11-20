@@ -435,6 +435,7 @@ pub fn ProjectRail(
                 set_show=set_show_organizer
                 selected_project=selected_project
                 set_selected_project=set_selected_project
+                selected_workspace=selected_workspace
                 on_changed=Callback::new(move |_| set_refresh_trigger.update(|t| *t += 1))
             />
         </div>

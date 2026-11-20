@@ -144,12 +144,13 @@ pub fn App() -> impl IntoView {
         persist_selected_project(&project);
     });
 
-    // Choosing a Project leaves Workspace context. The first run only records
-    // the value, so a restored Workspace selection survives startup.
+    // Choosing a Project leaves Workspace context. Clearing the Project (for
+    // example after removing it) does not, and the first run only records the
+    // value, so a restored Workspace selection survives startup.
     Effect::new(move |prev: Option<String>| {
         let project = selected_project.get();
         if let Some(prev) = prev {
-            if prev != project {
+            if prev != project && !project.is_empty() {
                 set_selected_workspace.set(String::new());
             }
         }
@@ -201,7 +202,11 @@ pub fn App() -> impl IntoView {
                     move || {
                         // Workspace context shows the Workspace's own page. Project
                         // pages are not rendered here, because they belong to one Project.
-                        if !selected_workspace.get().is_empty() {
+                        // Global pages stay reachable, and get no Project id, so a
+                        // stale selection is never shown as the current Project.
+                        let page = current_page.get();
+                        let in_workspace = !selected_workspace.get().is_empty();
+                        if in_workspace && page != "settings" && page != "mcp" {
                             return view! {
                                 <WorkspaceHome
                                     workspace_id=selected_workspace
@@ -210,14 +215,15 @@ pub fn App() -> impl IntoView {
                                 />
                             }.into_any();
                         }
-                        match current_page.get().as_str() {
+                        let project_id = if in_workspace { String::new() } else { selected_project.get() };
+                        match page.as_str() {
                         "conversations" => view! { <Conversations project_id=selected_project.get() /> }.into_any(),
                         "dashboard" => view! { <Dashboard project_id=selected_project.get() /> }.into_any(),
                         "agent" => view! { <Agent project_id=selected_project.get() /> }.into_any(),
                         "roadmap" => view! { <Roadmap project_id=selected_project.get() /> }.into_any(),
                         "ideation" => view! { <Ideation project_id=selected_project.get() /> }.into_any(),
                         "context" => view! { <Context project_id=selected_project.get() /> }.into_any(),
-                        "settings" => view! { <Settings project_id=selected_project.get() /> }.into_any(),
+                        "settings" => view! { <Settings project_id=project_id /> }.into_any(),
                         "insights" => view! { <Insights project_id=selected_project.get() /> }.into_any(),
                         "changelog" => view! { <Changelog project_id=selected_project.get() /> }.into_any(),
                         "mcp" => view! { <McpOverview /> }.into_any(),
