@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::components::attention::AttentionChip;
+use crate::components::markdown::render_chat_markdown;
 use crate::components::task_activity::{compact_time, local_offset_at, OffsetAt};
 use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationExecution, ConversationExecutionResult, ConversationExecutionState, ConversationFieldChange, ConversationHumanAction, ConversationProjectAction, ConversationProjectActionOutcome, ConversationProjectActionStatus, ConversationRole, ConversationSnapshot, ConversationTaskMutation};
 use crate::services::conversation_service;
@@ -291,6 +292,50 @@ fn approval_effect_note(mutation: &ConversationTaskMutation) -> &'static str {
         ConversationTaskMutation::EnqueueTask { .. } | ConversationTaskMutation::ExecuteRequest { .. } => "Approving queues this Task. SlashIt's scheduler decides when its run starts.",
         _ => "Approving only changes this Task's record. It does not start any work.",
     }
+}
+
+/// The text and kind of one history row, from its entry. Compared by value, so a refresh that leaves the row unchanged does not rebuild it.
+#[derive(Clone, PartialEq)]
+struct EntryEvent {
+    testid: &'static str,
+    role: &'static str,
+    text: String,
+    markdown: bool,
+}
+
+fn entry_event(value: &ConversationSnapshot, id: Uuid) -> Option<EntryEvent> {
+    let entry = value.conversation.entries.iter().find(|entry| entry.id == id)?;
+    let actions = &value.conversation.actions;
+    let project_actions = &value.conversation.project_actions;
+    // Only the Coordinator's prose is Markdown. Human text stays as typed.
+    let markdown = matches!(entry.kind, ConversationEntryKind::CoordinatorReply { .. });
+    let (testid, text) = match entry.kind.clone() {
+        ConversationEntryKind::HumanMessage { text } | ConversationEntryKind::CoordinatorReply { text } => ("conversation-message", Some(text)),
+        ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {} (Task {}): {}", action.target_task_title, action.target_task_id, action.request)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
+        ConversationEntryKind::ActionDecision { approved, request, .. } => ("conversation-action-event", Some(if approved { format!("You approved the Worker request: {}", request.unwrap_or_default()) } else { "You rejected the proposed Task work.".to_string() })),
+        ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
+        ConversationEntryKind::WorkerResult { result, .. } => ("conversation-worker-result", Some(result)),
+        ConversationEntryKind::ActionWithdrawn { .. } => ("conversation-action-event", Some("You withdrew an earlier approval of a retired direct delegation. Nothing was started.".to_string())),
+        ConversationEntryKind::RunFailed { message, .. } => ("conversation-run-failed", Some(message)),
+        ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", Some(project_action_event_text(kind, project_actions).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
+    };
+    let text = text?;
+    let role = match entry.role { ConversationRole::Human => "You", ConversationRole::Coordinator => "Coordinator", ConversationRole::Worker => "Worker" };
+    Some(EntryEvent { testid, role, text, markdown })
+}
+
+fn entry_when(value: &ConversationSnapshot, id: Uuid) -> Option<String> {
+    let entry = value.conversation.entries.iter().find(|entry| entry.id == id)?;
+    entry_time(&entry.created_at, Utc::now(), &local_offset_at)
+}
+
+/// The run that an applied Project Action started, shown beside the event that applied it.
+fn applied_card(value: &ConversationSnapshot, executions: &[ConversationExecution], id: Uuid) -> Option<AnyView> {
+    let entry = value.conversation.entries.iter().find(|entry| entry.id == id)?;
+    let ConversationEntryKind::ProjectActionApplied { action_id, .. } = &entry.kind else { return None; };
+    let execution = executions.iter().find(|execution| execution.action_id == *action_id)?.clone();
+    let approval = approval_text(value.conversation.project_actions.iter().find(|action| action.id == execution.action_id));
+    Some(execution_card(execution, approval).into_any())
 }
 
 /// One Task run started by an approved action, shown beside that action's
@@ -628,34 +673,29 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                     {move || snapshot.get().is_some_and(|value| value.conversation.entries.is_empty()).then(|| view! {
                         <p data-testid="conversation-empty" class="text-sm text-white/50">"No messages yet. Ask the Coordinator about this Project or its Tasks. It can propose changes, and you approve each one before SlashIt applies it."</p>
                     })}
-                    {move || snapshot.get().map(|value| {
-                        let actions = value.conversation.actions;
-                        let project_actions = value.conversation.project_actions;
-                        let executions = executions.get();
-                        let now = Utc::now();
-                        value.conversation.entries.into_iter().flat_map(|entry| {
-                            let when = entry_time(&entry.created_at, now, &local_offset_at);
-                            let applied = match &entry.kind { ConversationEntryKind::ProjectActionApplied { action_id, .. } => Some(*action_id), _ => None };
-                            let (testid, text) = match entry.kind {
-                                ConversationEntryKind::HumanMessage { text } | ConversationEntryKind::CoordinatorReply { text } => ("conversation-message", Some(text)),
-                                ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {} (Task {}): {}", action.target_task_title, action.target_task_id, action.request)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
-                                ConversationEntryKind::ActionDecision { approved, request, .. } => ("conversation-action-event", Some(if approved { format!("You approved the Worker request: {}", request.unwrap_or_default()) } else { "You rejected the proposed Task work.".to_string() })),
-                                ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", Some(actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title)).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
-                                ConversationEntryKind::WorkerResult { result, .. } => ("conversation-worker-result", Some(result)),
-                                ConversationEntryKind::ActionWithdrawn { .. } => ("conversation-action-event", Some("You withdrew an earlier approval of a retired direct delegation. Nothing was started.".to_string())),
-                                ConversationEntryKind::RunFailed { message, .. } => ("conversation-run-failed", Some(message)),
-                                ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", Some(project_action_event_text(kind, &project_actions).unwrap_or_else(|| MISSING_RECORD_TEXT.to_string()))),
-                            };
-                            let role = match entry.role { ConversationRole::Human => "You", ConversationRole::Coordinator => "Coordinator", ConversationRole::Worker => "Worker" };
-                            let event = text.map(|text| view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 flex items-baseline justify-between gap-2 text-xs font-medium text-white/50"><span>{role}</span><span data-testid="conversation-entry-time" class="font-normal text-white/40">{when}</span></div><div class="whitespace-pre-wrap text-sm text-white/90">{text}</div></article> }.into_any());
-                            // The run an approval started appears beside the event that applied it, so the history keeps it after the proposal card is gone.
-                            let card = applied.and_then(|action_id| executions.iter().find(|execution| execution.action_id == action_id).cloned()).map(|execution| {
-                                let approval = approval_text(project_actions.iter().find(|action| action.id == execution.action_id));
-                                execution_card(execution, approval).into_any()
-                            });
-                            event.into_iter().chain(card).collect::<Vec<_>>()
-                        }).collect_view()
-                    })}
+                    <For
+                        each=move || snapshot.with(|value| value.as_ref().map(|value| value.conversation.entries.iter().map(|entry| entry.id).collect::<Vec<_>>()).unwrap_or_default())
+                        key=|id| *id
+                        children=move |id| {
+                            // A row's record is a memo, so a refresh that leaves the row unchanged keeps its DOM: a link in a reply keeps keyboard focus.
+                            let event = Memo::new(move |_| snapshot.with(|value| value.as_ref().and_then(|value| entry_event(value, id))));
+                            let when = Memo::new(move |_| snapshot.with(|value| value.as_ref().and_then(|value| entry_when(value, id))));
+                            view! {
+                                <div class="space-y-2">
+                                    {move || event.get().map(|event| {
+                                        let body = if event.markdown {
+                                            view! { <div class="prose prose-sm prose-invert max-w-none break-words text-white/90 prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0 prose-headings:my-2 prose-pre:my-2 prose-pre:bg-black/40 prose-pre:text-xs prose-code:text-xs prose-code:before:hidden prose-code:after:hidden" inner_html=render_chat_markdown(&event.text)></div> }.into_any()
+                                        } else {
+                                            view! { <div class="whitespace-pre-wrap text-sm text-white/90">{event.text}</div> }.into_any()
+                                        };
+                                        view! { <article data-testid=event.testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 flex items-baseline justify-between gap-2 text-xs font-medium text-white/50"><span>{event.role}</span><span data-testid="conversation-entry-time" class="font-normal text-white/40">{move || when.get()}</span></div>{body}</article> }
+                                    })}
+                                    // The run an approval started appears beside the event that applied it, so the history keeps it after the proposal card is gone.
+                                    {move || snapshot.with(|value| value.as_ref().and_then(|value| executions.with(|executions| applied_card(value, executions, id))))}
+                                </div>
+                            }
+                        }
+                    />
                 </div>
                 {move || {
                     (!following_latest.get() && snapshot.get().is_some_and(|value| !value.conversation.entries.is_empty())).then(|| view! {

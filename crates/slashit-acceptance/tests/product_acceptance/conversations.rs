@@ -480,6 +480,47 @@ async fn a_failed_coordinator_turn_survives_restart_and_is_retried_once() {
     context.finish(outcome);
 }
 
+/// A Coordinator reply is shown as formatted Markdown, so its markers are not
+/// visible text. The Human message is shown exactly as typed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coordinator_reply_renders_markdown_and_a_human_message_stays_literal() {
+    const HUMAN: &str = "Keep **this** literal.";
+    const REPLY: &str = "**Bold project** has two parts:\n- first `code` item\n- second item";
+    let context = TestContext::new("project_conversation_markdown_reply").expect("harness setup");
+    let root = context.state().path().to_path_buf();
+    let agent = FakeAgent::install(&root).expect("install fake Claude");
+    context.set_child_env("PATH", agent.path_value().to_os_string());
+    context.set_child_env(
+        fake_agent::MARKER_DIR_VAR,
+        agent.marker_dir().as_os_str().to_os_string(),
+    );
+    context.set_child_env(
+        fake_agent::COORDINATOR_OUTPUT_VAR,
+        json!({"type":"reply","text":REPLY}).to_string(),
+    );
+
+    let outcome = async {
+        let session = context.start_session("markdown-reply").await?;
+        let project_id = created_id(ui::invoke(session.driver(), "create_project", json!({
+            "name":"Markdown Reply Conversation", "repositoryId":Value::Null, "agentType":"claude_code"
+        })).await?, "create_project")?;
+        open_conversations(session.driver(), &project_id).await?;
+        send_message(session.driver(), HUMAN, "second item").await?;
+
+        let history = text_of(session.driver(), "[data-testid=\"conversation-history\"]").await?.unwrap_or_default();
+        if !history.contains(HUMAN) { bail!("the Human message was not shown as typed: {history}"); }
+        if !history.contains("Bold project has two parts:") || !history.contains("first code item") { bail!("the Coordinator reply text is missing: {history}"); }
+        if history.contains("**Bold") || history.contains("`code`") { bail!("a Markdown marker is shown literally: {history}"); }
+        let strong = super::page(session.driver(), "return Array.from(document.querySelectorAll('[data-testid=\"conversation-message\"] strong'), element => element.textContent);", vec![]).await?;
+        if strong != json!(["Bold project"]) { bail!("the reply's bold text is not rendered as emphasis: {strong}"); }
+        let items = super::page(session.driver(), "return Array.from(document.querySelectorAll('[data-testid=\"conversation-message\"] li'), element => element.textContent);", vec![]).await?;
+        if items != json!(["first code item", "second item"]) { bail!("the reply's list is not rendered as list items: {items}"); }
+        context.close_session(session, "markdown-reply", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    context.finish(outcome);
+}
+
 /// Open the Conversations page from the Project navigation.
 ///
 /// The last page is restored on reload, so a restarted session may already be
