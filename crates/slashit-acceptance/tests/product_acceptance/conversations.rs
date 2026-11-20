@@ -427,11 +427,13 @@ async fn a_failed_coordinator_turn_survives_restart_and_is_retried_once() {
         fake_agent::MARKER_DIR_VAR,
         agent.marker_dir().as_os_str().to_os_string(),
     );
-    // The first Coordinator run answers with text that is not the JSON contract.
-    // The fixture answers every later run with a valid reply.
+    // The first Coordinator run answers with an object the domain parser refuses
+    // (a reply without its text). Plain prose never becomes structured output, so
+    // it fails earlier, as "did not contain structured output". The fixture
+    // answers every later run with a valid reply.
     let scripted = agent.marker_dir().join(".coordinator-output");
     std::fs::create_dir_all(&scripted).expect("create the scripted output directory");
-    std::fs::write(scripted.join("1"), "this is not the JSON contract").expect("script the malformed run");
+    std::fs::write(scripted.join("1"), r#"{"type":"reply"}"#).expect("script the malformed run");
 
     let outcome = async {
         let session = context.start_session("failed-turn").await?;

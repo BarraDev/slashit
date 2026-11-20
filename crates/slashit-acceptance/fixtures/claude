@@ -38,6 +38,7 @@ mode=""
 has_tools=""
 is_run=""
 is_coding=""
+has_schema=""
 for arg in "$@"; do
     if [ -n "$take_next" ]; then
         session="$arg"
@@ -62,6 +63,7 @@ for arg in "$@"; do
         --allowedTools) take_tools="yes" ;;
         --permission-mode) take_mode="yes" ;;
         -p) is_run="yes" ;;
+        --json-schema) has_schema="yes" ;;
     esac
 done
 
@@ -288,5 +290,15 @@ elif [ -n "$is_run" ] && grep -q '"approved_request"' "$prompt_file" 2>/dev/null
     result="fake Worker completed approved work"
 fi
 escaped_result=$(printf '%s' "$result" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
-printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","result":"%s"}\n' "$session" "$escaped_result"
+# A structured-output run gets the answer as a wrapped object, as the real CLI
+# does under --json-schema. Prose and malformed text get no structured_output.
+structured_output=""
+if [ -n "$has_schema" ]; then
+    structured_output=$(printf '%s' "$result" | jq -ce 'select(type == "object") | {output: .}' 2>/dev/null) || structured_output=""
+fi
+if [ -n "$structured_output" ]; then
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","result":"%s","structured_output":%s}\n' "$session" "$escaped_result" "$structured_output"
+else
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","result":"%s"}\n' "$session" "$escaped_result"
+fi
 exit 0

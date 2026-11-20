@@ -714,8 +714,14 @@ pub const HISTORY_SEMANTICS: &str = "A decision entry records the Human's answer
 /// Code as `--json-schema`. It describes the eleven advertised variants and
 /// leaves out the retired `delegate_to_task`.
 ///
-/// It stays inside Anthropic's strict structured-output subset: a top-level
-/// `anyOf` of discriminated objects (`oneOf` is unsupported), `const`
+/// The root is an object whose only property, the required `output`, holds the
+/// `anyOf` of variants. Claude Code passes this schema unchanged as a tool input
+/// schema, and the API rejects a root `anyOf` there, so the variants sit one
+/// level down. A Coordinator answer is therefore `{"output": <variant>}`, and
+/// the caller unwraps it before `parse_output`.
+///
+/// Inside the wrapper it stays in Anthropic's strict structured-output subset:
+/// an `anyOf` of discriminated objects (`oneOf` is unsupported), `const`
 /// discriminators, `additionalProperties: false`, and every property required,
 /// with an absent value written as `null`. Bounds such as limits and text
 /// lengths are not in the schema, so `parse_output` stays the authority on them.
@@ -756,7 +762,7 @@ pub fn coordinator_output_schema() -> serde_json::Value {
         json!({ "type": ["integer", "null"], "description": format!("1 to {max}, or null for the default") })
     };
 
-    json!({
+    let any_of = json!({
         "anyOf": [
             branch("reply", vec![("text", text())]),
             branch("create_task", vec![
@@ -798,7 +804,25 @@ pub fn coordinator_output_schema() -> serde_json::Value {
             branch("inspect_task_pull_request", vec![("target_task_id", task_id())]),
             branch("inspect_project", vec![]),
         ]
+    });
+    json!({
+        "type": "object",
+        "properties": { "output": any_of },
+        "required": ["output"],
+        "additionalProperties": false
     })
+}
+
+/// Unwraps the `output` object of a Coordinator structured-output answer, so
+/// `parse_output` sees one variant. A missing wrapper is an error, never a
+/// bare variant passed through.
+pub fn unwrap_coordinator_output(structured: &str) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(structured).map_err(|error| format!("Invalid Coordinator JSON: {error}"))?;
+    match value.get("output") {
+        Some(output) if output.is_object() => Ok(output.to_string()),
+        _ => Err("Coordinator structured output has no output object".into()),
+    }
 }
 
 fn is_retryable_failure(kind: &EntryKind) -> bool {
@@ -1384,7 +1408,7 @@ mod coordinator_schema_tests {
     }
 
     fn branches(schema: &serde_json::Value) -> &Vec<serde_json::Value> {
-        schema["anyOf"].as_array().expect("the top level is an anyOf of variants")
+        schema["properties"]["output"]["anyOf"].as_array().expect("the output property is an anyOf of variants")
     }
 
     fn branch_for<'a>(schema: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
@@ -1493,7 +1517,19 @@ mod coordinator_schema_tests {
         }
         let schema = coordinator_output_schema();
         walk(&schema, "");
-        assert_eq!(schema.as_object().unwrap().len(), 1, "the top level holds only the anyOf");
+        assert_eq!(schema["type"], "object", "the root must be an object for a tool input schema");
+        assert_eq!(schema["required"], serde_json::json!(["output"]));
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 1, "the root holds only the output wrapper");
+    }
+
+    #[test]
+    fn unwrap_extracts_the_variant_and_refuses_a_bare_variant() {
+        let wrapped = r#"{"output":{"type":"reply","text":"hi"}}"#;
+        let unwrapped = unwrap_coordinator_output(wrapped).expect("the wrapper is removed");
+        assert!(matches!(Conversation::parse_output(&unwrapped), Ok(CoordinatorOutput::Reply { .. })));
+        assert!(unwrap_coordinator_output(r#"{"type":"reply","text":"hi"}"#).is_err());
+        assert!(unwrap_coordinator_output(r#"{"output":"hi"}"#).is_err());
+        assert!(unwrap_coordinator_output("not json").is_err());
     }
 
     /// The wire form of every advertised variant matches its schema branch and

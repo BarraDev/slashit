@@ -764,7 +764,8 @@ async fn run_with_lease(
         tokio::select! {
             result = runner.wait() => {
                 result?;
-                runner.final_structured_output().await
+                let structured = runner.final_structured_output().await?;
+                crate::domain::conversation::unwrap_coordinator_output(&structured)
             }
             _ = cancel_rx.changed() => {
                 let _ = runner.kill().await;
@@ -1685,10 +1686,10 @@ mod tests {
         use tauri::Manager;
 
         /// A fake `claude` that logs each run's working directory, consumes its
-        /// prompt and prints `output` as the run's `structured_output`.
+        /// prompt and prints `output`, wrapped as `{"output": ...}`, as the run's `structured_output`.
         fn coordinator_body(log: &std::path::Path, output: &str) -> String {
             format!(
-                "case \" $* \" in *' --json-schema '*) ;; *) printf '%s\\n' \"error: unknown option '--json-schema'\" >&2; exit 1 ;; esac\ncat >/dev/null\necho \"$PWD\" >> \"{}\"\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"structured_output\":{}}}'\n",
+                "case \" $* \" in *' --json-schema '*) ;; *) printf '%s\\n' \"error: unknown option '--json-schema'\" >&2; exit 1 ;; esac\ncat >/dev/null\necho \"$PWD\" >> \"{}\"\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"structured_output\":{{\"output\":{}}}}}'\n",
                 log.display(),
                 output
             )
@@ -2273,9 +2274,10 @@ mod tests {
             FailAndFreeze(std::path::PathBuf),
         }
 
-        /// The run's final `result` event, with `output` as its `structured_output`.
+        /// The run's final `result` event, with `output` wrapped as the `structured_output`
+        /// object the schema requires: `{"output": <output>}`.
         fn result_line(output: &str) -> String {
-            format!("printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"structured_output\":{output}}}'")
+            format!("printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"structured_output\":{{\"output\":{output}}}}}'")
         }
 
         fn step_shell(step: &Step) -> String {
@@ -2286,7 +2288,7 @@ mod tests {
                 Step::MaxTurns => "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"errors\":[\"Reached maximum number of turns (4)\"]}'; exit 1".into(),
                 Step::Malformed => result_line(r#"{"type":"reply"}"#),
                 Step::Prose(text) => format!("printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{text}\"}}'"),
-                Step::NullStructured => result_line("null"),
+                Step::NullStructured => "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"structured_output\":null}'".into(),
                 Step::FailAndFreeze(dir) => format!("chmod -R a-w '{}'; printf '%s\\n' 'provider unavailable' >&2; exit 2", dir.display()),
             }
         }
