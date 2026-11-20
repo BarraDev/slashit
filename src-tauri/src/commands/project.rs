@@ -151,6 +151,18 @@ pub async fn create_project(
     create_project_committed(&state.project.projects, &state.storage, project).await
 }
 
+/// Refuses a Project-scoped mutation when the Project has been removed. An
+/// unknown id is left to the caller, which already reports it.
+pub(crate) async fn refuse_if_project_removed(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    project_id: Uuid,
+) -> Result<(), String> {
+    if crate::lifecycle::project_is_removed(projects, project_id).await {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
+    Ok(())
+}
+
 /// Refuses work on a Task whose Project has been removed. Callers that start
 /// from a Task id rather than a Project id use this.
 pub(crate) async fn refuse_if_task_project_removed(
@@ -3295,6 +3307,24 @@ mod tests {
             0,
             "the deleted Project's Task file was not recreated"
         );
+    }
+
+    /// The shared Project-scoped guard refuses only a removed Project. An active
+    /// or unknown id passes, so the caller's own not-found handling still applies.
+    #[tokio::test]
+    async fn refuse_if_project_removed_refuses_only_a_removed_project() {
+        let mut removed = make_test_project(Uuid::new_v4());
+        removed.removed_at = Some(chrono::Utc::now());
+        let active = make_test_project(Uuid::new_v4());
+        let (removed_id, active_id) = (removed.id, active.id);
+        let projects = RwLock::new(HashMap::from([(removed_id, removed), (active_id, active)]));
+
+        assert_eq!(
+            refuse_if_project_removed(&projects, removed_id).await,
+            Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string())
+        );
+        assert!(refuse_if_project_removed(&projects, active_id).await.is_ok());
+        assert!(refuse_if_project_removed(&projects, Uuid::new_v4()).await.is_ok());
     }
 
     /// A removed Project is inactive: creating a Task for it is refused, and no

@@ -51,6 +51,10 @@ pub async fn spawn_pty(
     let cols = cols.unwrap_or(80);
     let rows = rows.unwrap_or(24);
     let name = name.unwrap_or_else(|| "Terminal".to_string());
+    if let Some(id) = project_id.as_deref() {
+        let id = Uuid::parse_str(id).map_err(|e| e.to_string())?;
+        crate::commands::project::refuse_if_project_removed(&state.project.projects, id).await?;
+    }
 
     println!("[PTY Backend] spawn_pty: name={}, size={}x{}, wd={:?}", name, cols, rows, working_directory);
 

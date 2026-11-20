@@ -110,6 +110,7 @@ pub async fn approve_task(
     tip: Option<String>,
 ) -> Result<ApprovalOutcome, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     approve(&state, task_id, create_pr, tip.as_deref()).await
 }
 
@@ -122,6 +123,7 @@ pub async fn create_approved_task_pr(
     task_id: String,
 ) -> Result<ApprovalOutcome, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     retry_delivery(&state, task_id).await
 }
 
@@ -140,6 +142,7 @@ pub async fn complete_task_locally(
     without_pull_request: Option<bool>,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     complete_locally(&state, task_id, without_pull_request.unwrap_or(false)).await
 }
 
@@ -157,6 +160,7 @@ pub async fn request_task_changes(
     feedback: String,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     request_changes(&state, task_id, &feedback).await
 }
 
@@ -445,6 +449,7 @@ pub async fn approve_task_again(
     tip: String,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     approve_again(&state, task_id, &tip).await
 }
 

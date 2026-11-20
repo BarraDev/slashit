@@ -612,6 +612,7 @@ pub(crate) async fn accept_result(
         return refused("Only a Worker waiting in recovery can be accepted.");
     }
     let task_id = request.task_id;
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, request.project_id).await?;
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
     let task = state

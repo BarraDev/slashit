@@ -95,6 +95,9 @@ async fn resolve_project_root(
             .cloned()
             .ok_or_else(|| format!("Project {project_id} not found"))?
     };
+    if project.is_removed() {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
 
     let repository_id = project
         .repository_id

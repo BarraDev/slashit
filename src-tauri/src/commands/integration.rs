@@ -184,6 +184,7 @@ pub async fn integrate_task_locally(
     confirmation: IntegrationConfirmation,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     integrate(&state, task_id, confirmation).await
 }
 
@@ -199,6 +200,7 @@ pub async fn complete_and_integrate_task(
     confirmation: IntegrationConfirmation,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     complete_and_integrate(&state, task_id, confirmation).await
 }
 
@@ -210,6 +212,7 @@ pub async fn reconfirm_approved_tip(
     tip: String,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     reconfirm(&state, task_id, &tip).await
 }
 
@@ -220,6 +223,7 @@ pub async fn resume_local_integration(
     task_id: String,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     resume(&state, task_id).await
 }
 
@@ -230,6 +234,7 @@ pub async fn discard_local_integration(
     task_id: String,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     discard(&state, task_id).await
 }
 
