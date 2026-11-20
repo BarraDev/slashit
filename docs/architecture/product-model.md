@@ -110,12 +110,19 @@ Only part of that exists today.
   Project's repository. Setting a custom root only validates the folder.
   Changing the root, or deleting a Workspace, never moves, overwrites or
   deletes a folder; deleting leaves the managed folder in place.
-- Every Project is still created `Standalone`. A user can attach a
-  standalone Project to a Workspace, and detach a member Project back to
-  standalone, from the Workspaces page. Attaching a Project that already
-  belongs to a Workspace is refused; detach it first. There is no
-  aggregate view across a Workspace's member Projects yet beyond the
-  membership list itself.
+- Every Project is still created `Standalone`. A user attaches a standalone
+  Project to a Workspace, moves it to another Workspace, or detaches it back
+  to standalone from Organize Projects in the Project Rail. Attaching a
+  Project that already belongs to a Workspace is refused; detach it first.
+  The Workspaces entry in the main sidebar is retired. The rail groups each
+  Workspace's active member Projects under it. The chevron expands or
+  collapses the group, and the name enters Workspace context, which shows the
+  Workspace's root and its member Projects. Workspace context offers no
+  Project tools (Kanban, terminals, Project settings) and no Workspace
+  Conversation yet. There is no aggregate view across member Projects beyond
+  that list.
+- A Project that names a Workspace missing from the registry stays in the
+  rail under "Unresolved membership" until it is repaired in Organize Projects.
 - When a member Project's Task is executed and the Workspace has a custom
   root, the coding agent runs from that root, with the Task Checkout added as
   the directory it edits. Instruction files in the custom root (for example

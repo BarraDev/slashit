@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
-//! Organize Projects: rename a Project's displayed name, or remove it from
-//! SlashIt. Each action is saved on its own and reports its own result.
-//! Nothing on disk is changed by either action.
+//! Organize Projects: rename a Project's displayed name, remove it from
+//! SlashIt, and manage Workspaces (create them, attach or detach Projects).
+//! Each action is saved on its own and reports its own result. Renaming and
+//! removing change nothing on disk; a Workspace's root is created only when
+//! the Workspace is created.
 
 use leptos::callback::Callback;
 use leptos::prelude::*;
@@ -9,6 +11,7 @@ use leptos::task::spawn_local;
 use uuid::Uuid;
 
 use crate::components::toast;
+use crate::components::workspace_management::WorkspaceManagement;
 use crate::models::Project;
 use crate::services::{list_projects, remove_project, rename_project};
 
@@ -71,7 +74,7 @@ pub fn ProjectOrganizer(
                         <div>
                             <h2 id="project-organizer-title" class="text-lg font-semibold text-white/90">"Organize Projects"</h2>
                             <p class="text-xs text-white/40 mt-1">
-                                "Renaming changes only the name shown here. Removing a Project keeps its folder, Tasks and history."
+                                "Renaming changes only the name shown here. Removing a Project keeps its folder, Tasks and history. Workspaces group Projects."
                             </p>
                         </div>
                         <button
@@ -123,6 +126,8 @@ pub fn ProjectOrganizer(
                                 </For>
                             </ul>
                         </Show>
+
+                        <WorkspaceManagement on_changed=on_changed />
                     </div>
                 </div>
             </div>

@@ -220,6 +220,80 @@ button:focus:not(:focus-visible) {
   color: #fbbf24;
 }
 
+/* Workspace groups: a chevron (expands members) beside the Workspace's own
+   select control. The chevron is narrow so the 48px strip still fits. */
+.rail-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.rail-workspace-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 4px;
+}
+
+.rail-toggle {
+  flex: 0 0 14px;
+  width: 14px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: rgba(255,255,255,0.35);
+  cursor: pointer;
+}
+
+.rail-toggle:hover {
+  color: rgba(255,255,255,0.7);
+}
+
+.rail-toggle svg {
+  transition: transform 0.15s;
+}
+
+.rail-toggle svg.rotate-90 {
+  transform: rotate(90deg);
+}
+
+.rail-workspace {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.rail-item.rail-member {
+  padding-left: 22px;
+}
+
+.rail-badge.workspace {
+  border-radius: 10px;
+  border-style: dashed;
+  border-color: rgba(255,255,255,0.12);
+}
+
+.rail-badge.warn {
+  background: rgba(248,113,113,0.15);
+  color: #fca5a5;
+}
+
+.rail-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #fca5a5;
+}
+
+.rail-separator {
+  height: 1px;
+  margin: 6px 10px;
+  background: rgba(255,255,255,0.08);
+}
+
 .rail-active-indicator {
   position: absolute;
   left: 0;

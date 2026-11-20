@@ -26,6 +26,8 @@ pub mod worker_recovery;
 pub mod new_attempt;
 pub mod close_without_merge_dialog;
 pub mod workspace_panel;
+pub mod workspace_management;
+pub mod workspace_home;
 pub mod log_viewer;
 pub mod markdown;
 pub mod badge;

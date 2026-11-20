@@ -16,3 +16,13 @@ pub struct Workspace {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
+
+/// The effective root of a Workspace. Mirrors `WorkspaceRootInfo` in
+/// `src-tauri/src/commands/workspace.rs`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceRootInfo {
+    pub path: String,
+    /// True for an advanced custom root; false for the SlashIt-managed one.
+    pub custom: bool,
+    pub exists: bool,
+}

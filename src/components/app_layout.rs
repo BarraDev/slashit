@@ -12,8 +12,13 @@ pub fn AppLayout(
     on_navigate: Callback<String>,
     #[prop(into)] selected_project: Signal<String>,
     set_selected_project: WriteSignal<String>,
+    #[prop(into)] selected_workspace: Signal<String>,
+    set_selected_workspace: WriteSignal<String>,
     children: Children,
 ) -> impl IntoView {
+    // Project chrome (tabs, context bar) names the selected Project, so it is
+    // hidden in Workspace context, where that Project is not the subject.
+    let workspace_mode = Signal::derive(move || !selected_workspace.get().is_empty());
     let (ctx_name, set_ctx_name) = signal(String::new());
     let (ctx_path, set_ctx_path) = signal(String::new());
     let (use_rail, set_use_rail) = signal(true); // default: show rail
@@ -58,6 +63,8 @@ pub fn AppLayout(
                     <ProjectRail
                         selected_project=selected_project
                         set_selected_project=set_selected_project
+                        selected_workspace=selected_workspace
+                        set_selected_workspace=set_selected_workspace
                     />
                 </div>
             </Show>
@@ -66,17 +73,18 @@ pub fn AppLayout(
                 on_navigate=on_navigate
                 selected_project=selected_project
                 set_selected_project=set_selected_project
+                selected_workspace=selected_workspace
             />
             <div class="flex-1 flex flex-col overflow-hidden bg-gradient-to-br from-transparent via-blue-500/[0.02] to-purple-500/[0.02]">
                 // Show ProjectTabs when use_rail is false
-                <Show when=move || !use_rail.get()>
+                <Show when=move || !use_rail.get() && !workspace_mode.get()>
                     <ProjectTabs
                         selected_project=selected_project
                         set_selected_project=set_selected_project
                     />
                 </Show>
                 // Project context bar — hidden when Rail sidebar is active (redundant)
-                <Show when=move || !use_rail.get()>
+                <Show when=move || !use_rail.get() && !workspace_mode.get()>
                     {move || {
                         let name = ctx_name.get();
                         if name.is_empty() {

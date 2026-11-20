@@ -73,3 +73,12 @@ pub async fn delete_workspace(workspace_id: &str) -> Result<bool, String> {
         .map_err(js_error_to_string)?;
     serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
 }
+
+pub async fn get_workspace_root(workspace_id: &str) -> Result<crate::models::workspace::WorkspaceRootInfo, String> {
+    let args = serde_wasm_bindgen::to_value(&IdArgs { workspace_id })
+        .map_err(|e| e.to_string())?;
+    let result = JsFuture::from(invoke("get_workspace_root", args))
+        .await
+        .map_err(js_error_to_string)?;
+    serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
+}
