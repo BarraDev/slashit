@@ -2,7 +2,11 @@
 use crate::components::custom_select::{CustomSelect, SelectOption};
 use crate::components::toast;
 use crate::models::{Project, ProjectScope, Workspace};
-use crate::services::{attach_project_to_workspace, detach_project_from_workspace};
+use crate::services::{attach_project_to_workspace, detach_project_from_workspace, workspace_service};
+
+/// The Move option that makes a member standalone rather than moving it to
+/// another Workspace. Not a Workspace id, so it cannot collide with one.
+const STANDALONE: &str = "__standalone__";
 use leptos::callback::Callback;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -79,7 +83,7 @@ pub fn WorkspacePanel(
                     each=move || workspaces.get()
                     key=|w| w.id
                     children=move |w| view! {
-                        <WorkspaceItem workspace=w projects=projects on_membership_change=on_membership_change />
+                        <WorkspaceItem workspace=w workspaces=workspaces projects=projects on_membership_change=on_membership_change />
                     }
                 />
             </div>
@@ -184,9 +188,16 @@ fn UnresolvedMemberships(
     }
 }
 
+/// The label for a Workspace's root, shown in the header and details.
+fn root_label(root: &Option<String>) -> String {
+    root.clone()
+        .unwrap_or_else(|| "Grouping only: no shared agent context directory".to_string())
+}
+
 #[component]
 fn WorkspaceItem(
     workspace: Workspace,
+    workspaces: ReadSignal<Vec<Workspace>>,
     projects: ReadSignal<Vec<Project>>,
     on_membership_change: Callback<()>,
 ) -> impl IntoView {
@@ -194,13 +205,94 @@ fn WorkspaceItem(
     let (busy, set_busy) = signal(false);
     let (selected_to_attach, set_selected_to_attach) = signal(String::new());
     let ws_id = workspace.id;
-    let ws_path = workspace
-        .root_path
-        .clone()
-        .unwrap_or_else(|| "Grouping only: no shared agent context directory".to_string());
-    let ws_path_for_detail = ws_path.clone();
-    let ws_path_for_header = ws_path.clone();
-    let ws_name = workspace.name.clone();
+    // Name and root are shown from signals, because a rename or root change
+    // keeps this row mounted (the list is keyed by id).
+    let (shown_name, set_shown_name) = signal(workspace.name.clone());
+    let (shown_root, set_shown_root) = signal(workspace.root_path.clone());
+    let name_draft = RwSignal::new(workspace.name.clone());
+    let root_draft = RwSignal::new(workspace.root_path.clone().unwrap_or_default());
+
+    let on_rename = move |_| {
+        let name = name_draft.get().trim().to_string();
+        if name.is_empty() {
+            toast::error("A workspace name is required".to_string());
+            return;
+        }
+        set_busy.set(true);
+        spawn_local(async move {
+            match workspace_service::rename_workspace(&ws_id.to_string(), &name).await {
+                Ok(saved) => {
+                    set_shown_name.set(saved.name.clone());
+                    name_draft.set(saved.name);
+                    toast::success("Workspace renamed".to_string());
+                    on_membership_change.run(());
+                }
+                Err(e) => toast::error(format!("Failed to rename workspace: {}", e)),
+            }
+            set_busy.set(false);
+        });
+    };
+
+    // `path` is the custom root to set, or None to return to the managed root.
+    let set_root = move |path: Option<String>| {
+        set_busy.set(true);
+        spawn_local(async move {
+            match workspace_service::set_workspace_root(&ws_id.to_string(), path.as_deref()).await {
+                Ok(saved) => {
+                    root_draft.set(saved.root_path.clone().unwrap_or_default());
+                    set_shown_root.set(saved.root_path);
+                    toast::success("Workspace root saved; existing folders were not moved".to_string());
+                    on_membership_change.run(());
+                }
+                Err(e) => toast::error(format!("Failed to set workspace root: {}", e)),
+            }
+            set_busy.set(false);
+        });
+    };
+
+    let on_save_root = move |_| {
+        let path = root_draft.get().trim().to_string();
+        if path.is_empty() {
+            toast::error("Enter a folder, or use the managed root".to_string());
+            return;
+        }
+        set_root(Some(path));
+    };
+
+    // Moving a member is a detach followed by an attach, each saved on its own.
+    // If the attach is refused, the Project is left standalone and says so.
+    let move_member = move |project_id: String, project_name: String, target: String| {
+        set_busy.set(true);
+        spawn_local(async move {
+            match detach_project_from_workspace(project_id.clone()).await {
+                Err(e) => toast::error(format!("Failed to move project: {}", e)),
+                Ok(_) if target == STANDALONE => {
+                    toast::success(format!("Moved {} to standalone", project_name));
+                }
+                Ok(_) => match attach_project_to_workspace(project_id, target.clone()).await {
+                    Ok(_) => toast::success(format!("Moved {} to another workspace", project_name)),
+                    Err(e) => toast::error(format!(
+                        "{} is now standalone; it could not join the workspace: {}",
+                        project_name, e
+                    )),
+                },
+            }
+            on_membership_change.run(());
+            set_busy.set(false);
+        });
+    };
+
+    let move_options = move || {
+        let mut options = vec![SelectOption::new(STANDALONE, "Standalone")];
+        options.extend(
+            workspaces
+                .get()
+                .into_iter()
+                .filter(|w| w.id != ws_id)
+                .map(|w| SelectOption::new(w.id.to_string(), w.name)),
+        );
+        options
+    };
 
     let members = move || {
         projects
@@ -279,8 +371,8 @@ fn WorkspaceItem(
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
                     </svg>
                     <div class="flex-1 min-w-0 text-left">
-                        <h3 class="font-medium text-white/90 truncate">{ws_name}</h3>
-                        <p class="text-xs text-white/40 truncate font-mono mt-0.5">{ws_path_for_header}</p>
+                        <h3 class="font-medium text-white/90 truncate" data-testid="workspace-name">{move || shown_name.get()}</h3>
+                        <p class="text-xs text-white/40 truncate font-mono mt-0.5" data-testid="workspace-root-label">{move || root_label(&shown_root.get())}</p>
                     </div>
                 </div>
                 <span class="px-2 py-0.5 rounded text-xs font-medium bg-white/5 text-white/40">
@@ -297,7 +389,52 @@ fn WorkspaceItem(
                         </div>
                         <div class="flex items-center justify-between text-sm">
                             <span class="text-white/40">"Path:"</span>
-                            <span class="text-white/70 font-mono text-xs truncate ml-4">{ws_path_for_detail.clone()}</span>
+                            <span class="text-white/70 font-mono text-xs truncate ml-4">{move || root_label(&shown_root.get())}</span>
+                        </div>
+                    </div>
+
+                    <div class="space-y-2" data-testid="workspace-settings">
+                        <h4 class="text-xs font-medium text-white/40 uppercase tracking-wide">"Name and root"</h4>
+                        <div class="flex gap-2">
+                            <input
+                                data-testid="workspace-rename-input"
+                                class="flex-1 px-3 py-2 rounded-lg bg-black/40 border border-white/10 text-white/90 text-sm"
+                                prop:value=move || name_draft.get()
+                                on:input=move |ev| name_draft.set(event_target_value(&ev))
+                            />
+                            <button
+                                data-testid="workspace-rename-save"
+                                disabled=move || busy.get()
+                                on:click=on_rename
+                                class="px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-white/70 text-sm transition-colors disabled:opacity-50"
+                            >
+                                "Save name"
+                            </button>
+                        </div>
+                        <div class="flex gap-2">
+                            <input
+                                data-testid="workspace-root-input"
+                                class="flex-1 px-3 py-2 rounded-lg bg-black/40 border border-white/10 text-white/90 font-mono text-sm"
+                                placeholder="Custom root folder (empty uses the managed root)"
+                                prop:value=move || root_draft.get()
+                                on:input=move |ev| root_draft.set(event_target_value(&ev))
+                            />
+                            <button
+                                data-testid="workspace-root-save"
+                                disabled=move || busy.get()
+                                on:click=on_save_root
+                                class="px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-white/70 text-sm transition-colors disabled:opacity-50"
+                            >
+                                "Save root"
+                            </button>
+                            <button
+                                data-testid="workspace-root-managed"
+                                disabled=move || busy.get() || shown_root.get().is_none()
+                                on:click=move |_| set_root(None)
+                                class="px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-white/70 text-sm transition-colors disabled:opacity-50"
+                            >
+                                "Use managed root"
+                            </button>
                         </div>
                     </div>
 
@@ -311,22 +448,37 @@ fn WorkspaceItem(
                                 children=move |p| {
                                     let name = p.name.clone();
                                     let name_for_detach = name.clone();
+                                    let name_for_move = name.clone();
                                     let pid = p.id.to_string();
+                                    let pid_for_move = pid.clone();
                                     let member_testid = format!("workspace-member-{}", pid);
                                     view! {
                                         <div
                                             data-testid=member_testid
-                                            class="flex items-center justify-between px-3 py-2 rounded-lg bg-white/[0.03]"
+                                            class="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-white/[0.03]"
                                         >
                                             <span class="text-sm text-white/80 truncate">{name}</span>
-                                            <button
-                                                data-testid="workspace-detach"
-                                                disabled=move || busy.get()
-                                                on:click=move |_| on_detach(pid.clone(), name_for_detach.clone())
-                                                class="text-xs px-2 py-1 rounded bg-white/5 hover:bg-red-500/20 hover:text-red-300 text-white/50 transition-colors disabled:opacity-50"
-                                            >
-                                                "Detach"
-                                            </button>
+                                            <div class="flex items-center gap-2 shrink-0">
+                                                <div class="w-40" data-testid="workspace-move">
+                                                    <CustomSelect
+                                                        options=move_options()
+                                                        selected=Signal::derive(String::new)
+                                                        on_change=Callback::new(move |target: String| {
+                                                            move_member(pid_for_move.clone(), name_for_move.clone(), target)
+                                                        })
+                                                        placeholder="Move to...".to_string()
+                                                        disabled=busy.get()
+                                                    />
+                                                </div>
+                                                <button
+                                                    data-testid="workspace-detach"
+                                                    disabled=move || busy.get()
+                                                    on:click=move |_| on_detach(pid.clone(), name_for_detach.clone())
+                                                    class="text-xs px-2 py-1 rounded bg-white/5 hover:bg-red-500/20 hover:text-red-300 text-white/50 transition-colors disabled:opacity-50"
+                                                >
+                                                    "Detach"
+                                                </button>
+                                            </div>
                                         </div>
                                     }
                                 }
