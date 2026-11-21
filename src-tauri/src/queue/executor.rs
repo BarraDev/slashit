@@ -36,6 +36,42 @@ fn worker_scratch_rule(checkout: &str) -> String {
     )
 }
 
+/// The instruction files a custom Workspace root contributes to a Worker.
+const WORKSPACE_CONTEXT_FILES: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
+/// A larger file is skipped rather than truncated, so the Worker never gets a cut-off instruction.
+const WORKSPACE_CONTEXT_MAX_BYTES: u64 = 32 * 1024;
+
+/// Shared instructions from a custom Workspace root, as text for the Worker's
+/// system prompt. Only the fixed instruction files directly in the root are
+/// read, and only regular files, so a symlink is never followed. `@` imports
+/// are not resolved. The text is a copy, so it grants the Worker no path.
+fn workspace_context_prompt(root: &std::path::Path) -> Option<String> {
+    let mut sections = Vec::new();
+    for name in WORKSPACE_CONTEXT_FILES {
+        let path = root.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            _ => continue,
+        }
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX);
+        if size > WORKSPACE_CONTEXT_MAX_BYTES {
+            eprintln!("[workspace-context] skipping {} ({size} bytes, over the limit)", path.display());
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => sections.push(format!("### {name}\n\n{}", text.trim_end())),
+            Err(e) => eprintln!("[workspace-context] skipping {}: {e}", path.display()),
+        }
+    }
+    (!sections.is_empty()).then(|| {
+        format!(
+            "Shared instructions from the Workspace root. They are context only: \
+             the root is not a location you may write to.\n\n{}",
+            sections.join("\n\n")
+        )
+    })
+}
+
 /// Why a coding run did not start. A refusal is decided before any process is
 /// spawned, so no provider runs behind it. A failure after the attempt to
 /// start may have left a process, and it keeps the recovery rules.
@@ -5760,6 +5796,9 @@ impl TaskExecutor {
         let membership =
             Self::read_membership(&self.tasks, &self.projects, &self.workspace_registry, task_id)
                 .await;
+        // The custom root's instruction text, copied for the Claude Worker's
+        // system prompt. It grants no path; see `launch_for_membership`.
+        let workspace_context = membership.root.as_deref().and_then(workspace_context_prompt);
         let (claude_cwd, claude_add_dirs) =
             match Self::launch_for_membership(&membership, &acquired.info.path) {
                 Ok(launch) => launch,
@@ -5783,7 +5822,7 @@ impl TaskExecutor {
                 &repo_path,
                 acquired,
                 authorized.as_ref(),
-                claude_add_dirs.is_empty(),
+                membership.root.is_none(),
                 &membership,
             )
             .await
@@ -5925,7 +5964,7 @@ impl TaskExecutor {
                     prompt,
                     claude_cwd.clone(),
                     task_model,
-                    claude_add_dirs.is_empty(),
+                    membership.root.is_none(),
                     lease,
                 )
                 .await
@@ -5947,7 +5986,10 @@ impl TaskExecutor {
                 resume_session: None,
                 model: task_model,
                 system_prompt: None,
-                append_system_prompt: Some(worker_scratch_rule(&working_dir)),
+                append_system_prompt: Some(match workspace_context.as_deref() {
+                    Some(context) => format!("{}\n\n{context}", worker_scratch_rule(&working_dir)),
+                    None => worker_scratch_rule(&working_dir),
+                }),
                 // A Worker needs no MCP servers, so personal connectors from
                 // the user's Claude configuration stay out of the run.
                 disable_mcp: true,
@@ -8559,12 +8601,13 @@ impl TaskExecutor {
 
     /// Resolve agent launch context.
     ///
-    /// If the task's project is attached to a workspace *and that
-    /// workspace has a custom root that exists, return `(workspace_root,
-    /// [task_working_dir])` so Claude runs from the workspace cwd with the
-    /// task tree exposed via `--add-dir`. A Workspace without a custom root
-    /// keeps the Worker in its Task Checkout, `(task_working_dir, [])`, so its
-    /// managed root never changes what a Worker can reach.
+    /// The Worker always runs from its Task Checkout, `(task_working_dir, [])`.
+    /// A custom Workspace root is never granted to the Worker as a directory:
+    /// Claude's `--add-dir` gives full tools in auto mode, so the root would
+    /// become a write destination outside the reviewed checkout. Its shared
+    /// instructions reach the Worker as text instead (see
+    /// [`workspace_context_prompt`]). Shell commands are not confined by this,
+    /// so the boundary is that the root is not granted, not an OS sandbox.
     ///
     /// A configured custom root that is missing refuses the start. Silently
     /// running from the Task Checkout instead would change the Worker's
@@ -8579,11 +8622,7 @@ impl TaskExecutor {
                 "The Workspace root {} is missing. Nothing was started. Restore the folder or change the Workspace root, then run this Task again.",
                 root.display()
             )),
-            Some(root) => Ok((
-                root.to_string_lossy().to_string(),
-                vec![std::path::PathBuf::from(task_working_dir)],
-            )),
-            None => Ok((task_working_dir.to_string(), Vec::new())),
+            Some(_) | None => Ok((task_working_dir.to_string(), Vec::new())),
         }
     }
 
@@ -9493,7 +9532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_workspace_launch_uses_the_workspace_root_when_it_exists() {
+    async fn resolve_workspace_launch_keeps_the_worker_in_its_checkout() {
         let workspace_root = tempfile::TempDir::new().expect("workspace root tempdir");
         let workspace = Workspace::new(
             "ws".to_string(),
@@ -9516,21 +9555,33 @@ mod tests {
 
         let registry = Arc::new(RwLock::new(registry));
         let membership = TaskExecutor::read_membership(&tasks, &projects, &registry, task_id).await;
-        let (root, extra_dirs) =
+        let (cwd, extra_dirs) =
             TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir").unwrap();
 
-        assert_eq!(
-            root,
-            workspace_root
-                .path()
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
-        );
-        assert_eq!(
-            extra_dirs,
-            vec![std::path::PathBuf::from("/tmp/task-working-dir")]
-        );
+        // The Worker stays in its Task Checkout and the root is never granted.
+        assert_eq!(cwd, "/tmp/task-working-dir");
+        assert!(extra_dirs.is_empty(), "{extra_dirs:?}");
+        assert!(workspace_root.path().is_dir());
+    }
+
+    #[test]
+    fn workspace_context_prompt_copies_only_regular_instruction_files() {
+        let root = tempfile::TempDir::new().expect("root tempdir");
+        assert!(workspace_context_prompt(root.path()).is_none());
+
+        std::fs::write(root.path().join("CLAUDE.md"), "Use the shared style.\n").unwrap();
+        std::fs::write(root.path().join("notes.md"), "not an instruction file").unwrap();
+        std::fs::write(
+            root.path().join("AGENTS.md"),
+            vec![b'a'; (WORKSPACE_CONTEXT_MAX_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        let text = workspace_context_prompt(root.path()).expect("CLAUDE.md is copied");
+        assert!(text.contains("### CLAUDE.md\n\nUse the shared style."), "{text}");
+        assert!(text.contains("context only"), "{text}");
+        assert!(!text.contains("not an instruction file"), "{text}");
+        assert!(!text.contains("### AGENTS.md"), "oversized files are skipped: {text}");
     }
 
     #[tokio::test]
