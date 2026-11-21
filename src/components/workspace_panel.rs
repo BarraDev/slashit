@@ -91,7 +91,15 @@ pub fn WorkspacePanel(
 
             <Show when=move || workspaces.with(Vec::is_empty)>
                 <div class="p-8 text-center">
-                    <p class="text-white/40 text-sm">"No workspaces configured"</p>
+                    // A failed registry read leaves the list empty too; say so
+                    // rather than implying that no Workspaces exist.
+                    <p class="text-white/40 text-sm">
+                        {move || if workspaces_loaded.get() {
+                            "No workspaces configured"
+                        } else {
+                            "Workspaces could not be loaded"
+                        }}
+                    </p>
                 </div>
             </Show>
 
@@ -491,7 +499,7 @@ fn WorkspaceItem(
                                             <div class="flex items-center gap-2 shrink-0">
                                                 <div class="w-40" data-testid="workspace-move">
                                                     <CustomSelect
-                                                        options=move_options()
+                                                        options=move || move_options()
                                                         selected=Signal::derive(String::new)
                                                         on_change=Callback::new(move |target: String| {
                                                             move_member(pid_for_move.clone(), name_for_move.clone(), target)
@@ -530,7 +538,7 @@ fn WorkspaceItem(
                             <div class="flex items-start gap-2" data-testid="workspace-attach">
                                 <div class="flex-1">
                                     <CustomSelect
-                                        options=eligible_options()
+                                        options=move || eligible_options()
                                         selected=Signal::derive(move || selected_to_attach.get())
                                         on_change=Callback::new(move |v| set_selected_to_attach.set(v))
                                         placeholder="Select a project...".to_string()

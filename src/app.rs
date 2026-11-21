@@ -142,6 +142,27 @@ pub fn App() -> impl IntoView {
         true
     });
     
+    // Clear a persisted Workspace that no longer exists. Other errors keep the
+    // selection, because they may be temporary.
+    Effect::new(move |prev: Option<bool>| {
+        if prev.is_some() {
+            return true;
+        }
+        let workspace_id = selected_workspace.get_untracked();
+        if !workspace_id.is_empty() {
+            spawn_local(async move {
+                if let Err(e) = crate::services::workspace_service::get_workspace(&workspace_id).await {
+                    if e == "Workspace not found" {
+                        set_selected_workspace.set(String::new());
+                    } else {
+                        leptos::logging::warn!("[App] Error validating workspace {}: {}", workspace_id, e);
+                    }
+                }
+            });
+        }
+        true
+    });
+
     // Persist selected project whenever it changes
     Effect::new(move |_| {
         let project = selected_project.get();

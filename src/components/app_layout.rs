@@ -55,8 +55,9 @@ pub fn AppLayout(
 
     view! {
         <div class="flex h-screen bg-[#08080C] text-white">
-            // Show ProjectRail when use_rail is true
-            <Show when=move || use_rail.get()>
+            // Show ProjectRail when use_rail is true. It also stays visible in
+            // Workspace context: it is the only way back to Projects there.
+            <Show when=move || use_rail.get() || workspace_mode.get()>
                 // The slot is the only flex item. The rail itself expands as
                 // an overlay, so its labels never move the rest of the app.
                 <div class="project-rail-slot">

@@ -25,9 +25,10 @@ impl SelectOption {
 /// of the dropdown appearance including the options list.
 #[component]
 pub fn CustomSelect(
-    /// The list of options to display in the dropdown
+    /// The options to display. Read reactively, so a list that changes after
+    /// the select rendered (a new Workspace, a detached Project) is not stale.
     #[prop(into)]
-    options: Vec<SelectOption>,
+    options: Signal<Vec<SelectOption>>,
     /// Signal containing the currently selected value
     #[prop(into)]
     selected: Signal<String>,
@@ -44,8 +45,6 @@ pub fn CustomSelect(
 ) -> impl IntoView {
     let (is_open, set_is_open) = signal(false);
     
-    // Store options in a signal for reactive access
-    let options_signal = StoredValue::new(options);
     let placeholder_signal = StoredValue::new(placeholder);
     
     // Get the label for the currently selected value
@@ -54,7 +53,7 @@ pub fn CustomSelect(
         if val.is_empty() {
             return placeholder_signal.get_value();
         }
-        options_signal.get_value()
+        options.get()
             .iter()
             .find(|o| o.value == val)
             .map(|o| o.label.clone())
@@ -183,7 +182,7 @@ pub fn CustomSelect(
                     role="listbox"
                 >
                     {move || {
-                        options_signal.get_value().into_iter().map(|opt| {
+                        options.get().into_iter().map(|opt| {
                             let value = opt.value.clone();
                             let label = opt.label.clone();
                             let is_selected = selected.get() == value;
