@@ -700,7 +700,7 @@ pub(crate) async fn integrate(
 ) -> Result<Task, String> {
     let project_id = current(state, task_id).await?.project_id;
     let _target = state.task_lifecycle_locks.acquire(target_lock_id(project_id, &confirmed.target_branch)).await?;
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await?;
     if task.local_integration.as_ref().is_some_and(|r| r.is_pending()) {
@@ -721,7 +721,7 @@ pub(crate) async fn complete_and_integrate(
 ) -> Result<Task, String> {
     let project_id = current(state, task_id).await?.project_id;
     let _target = state.task_lifecycle_locks.acquire(target_lock_id(project_id, &confirmed.target_branch)).await?;
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await?;
     if task.completed_locally() {
@@ -1011,7 +1011,7 @@ pub(crate) async fn resume(state: &crate::AppState, task_id: Uuid) -> Result<Tas
         .filter(|r| r.is_pending())
         .ok_or("This task has no pending integration.")?;
     let _target = state.task_lifecycle_locks.acquire(target_lock_id(task.project_id, &record.target_branch)).await?;
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
     resume_locked(state, task_id).await
 }
 
@@ -1076,7 +1076,7 @@ pub(crate) async fn discard(state: &crate::AppState, task_id: Uuid) -> Result<Ta
         .filter(|r| r.is_pending())
         .ok_or("This task has no pending integration.")?;
     let _target = state.task_lifecycle_locks.acquire(target_lock_id(task.project_id, &record.target_branch)).await?;
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await?;
     let record = task
@@ -1101,7 +1101,7 @@ pub(crate) async fn discard(state: &crate::AppState, task_id: Uuid) -> Result<Ta
 /// approval that did not record it. The branch must still be at exactly that
 /// commit.
 pub(crate) async fn reconfirm(state: &crate::AppState, task_id: Uuid, tip: &str) -> Result<Task, String> {
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
     let task = current(state, task_id).await?;
     eligible(state, &task, Intent::of(&task)).await?;
     if task.human_review.approved_tip().is_some() {

@@ -540,7 +540,7 @@ async fn move_task(
     if !coordinator_may_move(from, to) {
         return Ok(Execution::Refused("That move is not available to the Coordinator".into()));
     }
-    let _lease = scope.locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task_in(scope.locks, scope.tasks, scope.projects, task_id).await?;
     let check = Mutex::new(MoveCheck::Missing);
     let revise = |staged: &mut HashMap<Uuid, Task>| -> bool {
         let verdict;
@@ -622,7 +622,7 @@ async fn enqueue_task(
     if *from != TaskStatus::Backlog {
         return Ok(Execution::Refused("The Coordinator can only queue a Backlog Task".into()));
     }
-    let _lease = scope.locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task_in(scope.locks, scope.tasks, scope.projects, task_id).await?;
     // Git is read only once the lease is held, so the observation is made for
     // the write that follows it. A Task no longer in Backlog is left to the
     // queue below, which answers a retry of this same approval.

@@ -274,7 +274,7 @@ pub async fn run_queued_task(
     state.start_guard.check().await.map_err(|block| block.to_string())?;
     let executor = state.executor.get().ok_or_else(|| NO_EXECUTOR_PROMOTION.to_string())?;
 
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
 
     // Read under the lease: whatever the caller saw may no longer be true.
     let Some(task) = state.task.tasks.read().await.get(&task_id).cloned() else {

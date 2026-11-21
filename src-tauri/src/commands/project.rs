@@ -189,6 +189,40 @@ pub(crate) async fn refuse_if_task_project_removed(
     Ok(())
 }
 
+/// Takes a Task's lifecycle lease and refuses if its Project is removed.
+///
+/// Removal holds this lease while it writes `removed_at`, so a mutation that
+/// checks here and writes before releasing the lease cannot land on a removed
+/// Project. A check made before the lease does not have that guarantee.
+pub(crate) async fn lease_active_task(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<crate::lifecycle::LifecycleLease, String> {
+    lease_active_task_in(
+        &state.task_lifecycle_locks,
+        &state.task.tasks,
+        &state.project.projects,
+        task_id,
+    )
+    .await
+}
+
+/// [`lease_active_task`] for a caller that holds the pieces rather than the
+/// whole `AppState`, such as the IPC context.
+pub(crate) async fn lease_active_task_in(
+    locks: &crate::lifecycle::TaskLifecycleLocks,
+    tasks: &crate::lifecycle::Tasks,
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    task_id: Uuid,
+) -> Result<crate::lifecycle::LifecycleLease, String> {
+    let lease = locks.acquire(task_id).await?;
+    let project_id = tasks.read().await.get(&task_id).map(|t| t.project_id);
+    if let Some(project_id) = project_id {
+        refuse_if_project_removed(projects, project_id).await?;
+    }
+    Ok(lease)
+}
+
 /// Refuses a second active Project on one repository. The folder is already
 /// open as that Project, so a second one would give two boards and two
 /// Conversations for the same checkout.
@@ -1164,6 +1198,26 @@ pub async fn detach_project_from_workspace(
     project_id: String,
 ) -> Result<Project, String> {
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
+    refuse_if_project_removed(&state.project.projects, project_id).await?;
+    // Idle means the same as removal: no active execution, queued work, pending
+    // review, recovery or delivery. Checked under the Project gate and the Task
+    // board, taken before the projects write, the order removal uses.
+    let running = state
+        .executor
+        .get()
+        .map(|executor| executor.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+    let _gate = state.task.project_gate.write(project_id).await;
+    let durable = state.storage.load_project_tasks(project_id).map_err(|e| {
+        format!("This Project's Task records cannot be read, so SlashIt cannot prove it is idle. Nothing was changed: {e}")
+    })?;
+    let tasks_r = state.task.tasks.read().await;
+    if let Some(message) =
+        first_remove_refusal(&durable, &tasks_r, project_id, running, Some(&state.task.deliveries)).await
+    {
+        return Err(format!(
+            "This Project cannot leave its Workspace yet: {message}. Nothing was changed."
+        ));
+    }
     detach_project_from_workspace_committed(&state.project.projects, &state.storage, project_id).await
 }
 
@@ -2391,6 +2445,47 @@ mod tests {
                 .exists(),
             "no Conversation cleanup record is owed for a deletion that never began"
         );
+    }
+
+    /// A removal holds a Task's lease while it writes `removed_at`. A mutation
+    /// that asks for the lease while the removal holds it can only proceed after
+    /// the removal's write, so it must see the Project as removed. Holding the
+    /// lease first makes this order deterministic, whatever the scheduler does.
+    #[tokio::test]
+    async fn a_mutation_waiting_on_a_removal_is_refused_by_the_removed_project() {
+        let project_id = Uuid::new_v4();
+        let task = crate::test_helpers::create_test_task_full("waits", project_id, crate::domain::TaskStatus::Backlog, 0);
+        let task_id = task.id;
+        let locks = Arc::new(crate::lifecycle::TaskLifecycleLocks::new());
+        let tasks: crate::lifecycle::Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let projects = Arc::new(RwLock::new(HashMap::from([(project_id, make_test_project(project_id))])));
+
+        let removal_lease = locks.acquire(task_id).await.expect("the removal takes the lease");
+        let mutation = {
+            let (locks, tasks, projects) = (locks.clone(), tasks.clone(), projects.clone());
+            tokio::spawn(async move {
+                lease_active_task_in(&locks, &tasks, &projects, task_id).await.map(|_| ())
+            })
+        };
+        projects.write().await.get_mut(&project_id).expect("the Project").removed_at = Some(chrono::Utc::now());
+        drop(removal_lease);
+
+        assert_eq!(
+            mutation.await.expect("the mutation finishes"),
+            Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_active_task_in_passes_a_mutation_of_an_active_project() {
+        let project_id = Uuid::new_v4();
+        let task = crate::test_helpers::create_test_task_full("active", project_id, crate::domain::TaskStatus::Backlog, 0);
+        let task_id = task.id;
+        let locks = crate::lifecycle::TaskLifecycleLocks::new();
+        let tasks: crate::lifecycle::Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let projects = RwLock::new(HashMap::from([(project_id, make_test_project(project_id))]));
+
+        assert!(lease_active_task_in(&locks, &tasks, &projects, task_id).await.is_ok());
     }
 
     #[tokio::test]

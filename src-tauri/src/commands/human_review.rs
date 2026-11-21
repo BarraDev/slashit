@@ -458,7 +458,7 @@ pub(crate) async fn approve_again(
     task_id: Uuid,
     tip: &str,
 ) -> Result<Task, String> {
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await.ok_or("Task not found")?;
     check_reviewable(&task, "approved again")?;
@@ -632,7 +632,7 @@ pub(crate) async fn complete_locally(
     task_id: Uuid,
     without_pull_request: bool,
 ) -> Result<Task, String> {
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await.ok_or("Task not found")?;
     if task.completed_locally() {
@@ -726,7 +726,7 @@ async fn record_approval(
     task_id: Uuid,
     shown_tip: Option<&str>,
 ) -> Result<Task, String> {
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await.ok_or("Task not found")?;
     check_reviewable(&task, "approved")?;
@@ -784,7 +784,7 @@ async fn request_changes(
         ));
     }
 
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await.ok_or("Task not found")?;
     check_reviewable(&task, "sent back with changes")?;

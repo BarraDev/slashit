@@ -294,11 +294,14 @@ pub enum TerminalizeRefusal {
     /// of a Git operation that may already have moved its target branch, and
     /// removing the task removes the only copy of it.
     DeleteBlockedByIntegration,
+    /// The task's Project was removed. A removed Project's Tasks are read-only.
+    ProjectRemoved,
 }
 
 impl std::fmt::Display for TerminalizeRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ProjectRemoved => write!(f, "{}", crate::domain::project::PROJECT_REMOVED_REFUSAL),
             Self::TaskNotFound => write!(f, "task not found"),
             Self::Busy(m) => write!(f, "{m}"),
             Self::ExecutionActive => write!(
@@ -1347,6 +1350,7 @@ pub async fn delete(ctx: TerminalizeCtx<'_>, task_id: Uuid) -> Result<bool, Term
 
     // Kept before `ctx` is handed to the terminalization, which consumes it.
     let tasks = ctx.tasks;
+    let projects = ctx.projects;
     let storage = ctx.storage;
 
     // Re-read under the lease: anything sampled before waiting for it is a
@@ -1355,6 +1359,16 @@ pub async fn delete(ctx: TerminalizeCtx<'_>, task_id: Uuid) -> Result<bool, Term
         let tasks_r = tasks.read().await;
         match tasks_r.get(&task_id) {
             Some(task) => {
+                // A removed Project's Tasks are read-only, and removal holds this
+                // lease while it writes `removed_at`.
+                if projects
+                    .read()
+                    .await
+                    .get(&task.project_id)
+                    .is_some_and(|p| p.is_removed())
+                {
+                    return Err(TerminalizeRefusal::ProjectRemoved);
+                }
                 // Before the terminalization below, which only recognizes an
                 // unfinished integration in the two statuses that offer a
                 // Resume. Nothing has been touched when this answers.
@@ -1503,6 +1517,14 @@ impl ProjectLifecycleGate {
 pub fn project_deletion_refusal(task: &Task) -> Option<String> {
     let title = task.title.as_str();
     let id = task.id;
+    // Recovery state is durable evidence: removal must not discard it, even
+    // when no provider process is running.
+    if task.worker_recovery_refusal().is_some() {
+        return Some(format!(
+            "task {title:?} ({id}) is waiting on an unresolved Worker recovery; resolve or \
+             safely finalize that recovery before deleting the Project"
+        ));
+    }
     if task
         .local_integration
         .as_ref()
@@ -1598,6 +1620,17 @@ pub async fn terminalize_leased(
         let task = tasks
             .get(&task_id)
             .ok_or(TerminalizeRefusal::TaskNotFound)?;
+        // A removed Project's Tasks are read-only, whatever the origin. Removal
+        // holds this lease while it writes `removed_at`, so this answer is current.
+        if ctx
+            .projects
+            .read()
+            .await
+            .get(&task.project_id)
+            .is_some_and(|p| p.is_removed())
+        {
+            return Err(TerminalizeRefusal::ProjectRemoved);
+        }
         // Before anything else, whatever the origin: a merged pull request, a
         // card dragged to Done, a delete and an explicit cleanup all end here,
         // and every one of them would remove the checkout and branch that the

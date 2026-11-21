@@ -1142,7 +1142,7 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
     if matches!(new_status, crate::domain::TaskStatus::Done) {
         // Taken under the lease, and decided on the status read under it, as the
         // desktop's close is, so the refusal comes before terminalization begins.
-        let _lease = match ctx.task_lifecycle_locks.acquire(task_uuid).await {
+        let _lease = match crate::commands::project::lease_active_task_in(&ctx.task_lifecycle_locks, &ctx.tasks, &ctx.projects, task_uuid).await {
             Ok(lease) => lease,
             Err(e) => return IpcResponse::error(e),
         };
@@ -1174,7 +1174,7 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         };
     }
 
-    let _lease = match ctx.task_lifecycle_locks.acquire(task_uuid).await {
+    let _lease = match crate::commands::project::lease_active_task_in(&ctx.task_lifecycle_locks, &ctx.tasks, &ctx.projects, task_uuid).await {
         Ok(lease) => lease,
         Err(e) => return IpcResponse::error(e),
     };
@@ -1365,6 +1365,18 @@ async fn handle_edit_task(
         Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
     };
 
+    let _lease = match crate::commands::project::lease_active_task_in(
+        &ctx.task_lifecycle_locks,
+        &ctx.tasks,
+        &ctx.projects,
+        task_uuid,
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(e) => return IpcResponse::error(e),
+    };
+
     let amend = move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             if let Some(t) = title.clone() {
@@ -1438,6 +1450,8 @@ async fn handle_set_task_model(ctx: &IpcContext, task_id: String, model: String)
     };
     match crate::commands::task::set_task_model_and_review_mode(
         &ctx.tasks,
+        &ctx.projects,
+        &ctx.task_lifecycle_locks,
         &ctx.storage,
         task_uuid,
         Some(model),
@@ -1478,6 +1492,8 @@ async fn handle_set_task_review_mode(
     };
     match crate::commands::task::set_task_model_and_review_mode(
         &ctx.tasks,
+        &ctx.projects,
+        &ctx.task_lifecycle_locks,
         &ctx.storage,
         task_uuid,
         None,
@@ -1510,6 +1526,7 @@ async fn handle_set_task_dependencies(
     };
     match crate::commands::task::set_task_dependencies_via(
         &ctx.tasks,
+        &ctx.projects,
         &ctx.storage,
         &ctx.task_lifecycle_locks,
         task_uuid,

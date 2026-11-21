@@ -3644,6 +3644,18 @@ impl TaskExecutor {
                 message: Some("PR merged — task complete".to_string()),
             }),
 
+            // The Project was removed before the removal's lease was taken, so
+            // nothing was written. A removed Project's Tasks are read-only, so
+            // the ref is not latched here; later polls skip the removed Project
+            // by their own check.
+            Err(refusal @ crate::lifecycle::TerminalizeRefusal::ProjectRemoved) => {
+                self.events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Warn,
+                    message: format!("The pull request is merged, but the task was not finished: {refusal}"),
+                })
+            }
+
             // Answered, and the merge is durable: `record_first` reached the
             // disk in the write that announced the cleanup, before anything
             // destructive ran. The poll above excludes a ref it has already

@@ -19,7 +19,7 @@ pub(crate) async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid
     // waits behind any cleanup, terminalization or delete already running for
     // the same task. Without this, a create could hand back the very directory
     // a removal is midway through deleting.
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     // Creating a checkout is what grows the disk, so it waits while new work
     // is paused for disk space, before anything is read or created.
@@ -136,7 +136,7 @@ pub async fn cleanup_worktree(
 ) -> Result<(), String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
 
     let current_status = {
         let tasks = state.task.tasks.read().await;
