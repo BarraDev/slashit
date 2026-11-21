@@ -39,6 +39,32 @@ enum SettingsTab {
     Updates,
 }
 
+/// The tabs offered in the current context. Repository and Storage act on one
+/// Project, so they are hidden outside Project context.
+fn visible_tabs(has_project: bool) -> Vec<SettingsTab> {
+    [
+        SettingsTab::General,
+        SettingsTab::Repository,
+        SettingsTab::Storage,
+        SettingsTab::Queue,
+        SettingsTab::Jujutsu,
+        SettingsTab::Theme,
+        SettingsTab::Updates,
+    ]
+    .into_iter()
+    .filter(|tab| has_project || !matches!(tab, SettingsTab::Repository | SettingsTab::Storage))
+    .collect()
+}
+
+/// The active tab when the context changes: kept when still offered, otherwise General.
+fn tab_for_context(active: SettingsTab, has_project: bool) -> SettingsTab {
+    if visible_tabs(has_project).contains(&active) {
+        active
+    } else {
+        SettingsTab::General
+    }
+}
+
 impl SettingsTab {
     fn title(&self) -> &'static str {
         match self {
@@ -85,20 +111,15 @@ pub fn Settings(
     let show_about = RwSignal::new(false);
 
     // Repository and Storage act on one Project. Outside Project context they are
-    // hidden rather than shown as Workspace settings.
+    // hidden rather than shown as Workspace settings. A Project removed or
+    // selected while Settings is open updates the rail and moves a hidden tab.
     let has_project = Signal::derive(move || !project_id.get().is_empty());
-    let tabs: Vec<SettingsTab> = [
-        SettingsTab::General,
-        SettingsTab::Repository,
-        SettingsTab::Storage,
-        SettingsTab::Queue,
-        SettingsTab::Jujutsu,
-        SettingsTab::Theme,
-        SettingsTab::Updates,
-    ]
-    .into_iter()
-    .filter(|tab| has_project.get_untracked() || !matches!(tab, SettingsTab::Repository | SettingsTab::Storage))
-    .collect();
+    Effect::new(move |_| {
+        let fallback = tab_for_context(active_tab.get(), has_project.get());
+        if fallback != active_tab.get_untracked() {
+            set_active_tab.set(fallback);
+        }
+    });
 
     let (diff_collapsed, set_diff_collapsed) = signal({
         web_sys::window()
@@ -113,7 +134,7 @@ pub fn Settings(
             <div class="mb-6">
                 <h1 class="text-2xl font-bold text-white/90">"Settings"</h1>
                 <p class="text-sm text-white/40 mt-1">
-                    {if has_project.get() {
+                    {move || if has_project.get() {
                         "Application preferences, and settings for the selected Project"
                     } else {
                         "Application preferences. Select a Project to configure its repository and storage."
@@ -125,7 +146,7 @@ pub fn Settings(
                 <div class="w-64 shrink-0">
                     <div class="border border-white/10 rounded-xl bg-white/[0.02] overflow-hidden">
                         <div class="p-2 space-y-1">
-                            {tabs.into_iter().map(|tab| {
+                            {move || visible_tabs(has_project.get()).into_iter().map(|tab| {
                                 let tab_clone = tab;
                                 view! {
                                     <button
@@ -612,4 +633,43 @@ fn UpdatesTab() -> impl IntoView {
         </div>
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_tabs_are_hidden_outside_project_context() {
+        let without = visible_tabs(false);
+
+        assert!(!without.contains(&SettingsTab::Repository));
+        assert!(!without.contains(&SettingsTab::Storage));
+        assert!(
+            without.contains(&SettingsTab::General),
+            "application settings stay available"
+        );
+        assert!(visible_tabs(true).contains(&SettingsTab::Storage));
+    }
+
+    #[test]
+    fn a_removed_project_moves_a_project_tab_to_general_and_keeps_other_tabs() {
+        assert_eq!(
+            tab_for_context(SettingsTab::Storage, false),
+            SettingsTab::General
+        );
+        assert_eq!(
+            tab_for_context(SettingsTab::Repository, false),
+            SettingsTab::General
+        );
+        assert_eq!(
+            tab_for_context(SettingsTab::Queue, false),
+            SettingsTab::Queue
+        );
+        assert_eq!(
+            tab_for_context(SettingsTab::Storage, true),
+            SettingsTab::Storage,
+            "a valid tab is preserved"
+        );
+    }
 }

@@ -496,6 +496,8 @@ pub async fn update_task_metadata(
             }
         }
     };
+    // Like every Task edit, this takes the Task's lease, which refuses a removed Project.
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
@@ -3877,6 +3879,77 @@ mod task_dependency_contract {
         }
 
         assert_eq!(both_copies(&app, project_id, legacy.id).await, before);
+    }
+
+    /// A removed Project's Task is read-only: a title edit, a metadata edit and
+    /// a dependency edit are each refused, and the stored Task does not change.
+    /// The control at the end shows the same title edit succeeds once the
+    /// Project is active again, so the refusal is caused by the removal.
+    #[tokio::test]
+    async fn a_removed_projects_task_refuses_title_metadata_and_dependency_edits() {
+        let project_id = Uuid::new_v4();
+        let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
+        let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
+        let (_tmp, _paths, app) =
+            app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
+        let state = app.state::<crate::AppState>();
+        state
+            .project
+            .projects
+            .write()
+            .await
+            .get_mut(&project_id)
+            .unwrap()
+            .removed_at = Some(chrono::Utc::now());
+        let before = both_copies(&app, project_id, child.id).await;
+
+        let title = update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            edit_of(child.id, None, None),
+        )
+        .await
+        .expect_err("a title edit is refused for a removed Project");
+        assert_eq!(title, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        let metadata = update_task_metadata(
+            GuiMutation::untracked(),
+            app.state(),
+            child.id.to_string(),
+            None,
+            Some(TaskPriority::High),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a metadata edit is refused for a removed Project");
+        assert_eq!(metadata, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        let dependency = set(&app, child.id, vec![parent.id])
+            .await
+            .expect_err("a dependency edit is refused");
+        assert_eq!(dependency, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        assert_eq!(
+            both_copies(&app, project_id, child.id).await,
+            before,
+            "nothing was written"
+        );
+
+        state
+            .project
+            .projects
+            .write()
+            .await
+            .get_mut(&project_id)
+            .unwrap()
+            .removed_at = None;
+        update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            edit_of(child.id, None, None),
+        )
+        .await
+        .expect("an active Project's Task is edited")
+        .expect("the task exists");
     }
 
     #[tokio::test]

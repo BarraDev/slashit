@@ -15311,6 +15311,103 @@ mod tests {
                     .unwrap_or_else(|_| panic!("an active Project's Task links its pull request"));
             }
 
+            /// Syncing review replies refuses a removed Project under the Task lease,
+            /// before any GitHub call: the fake `gh` records no invocation at all.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn syncing_review_replies_for_a_removed_project_makes_no_github_call() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", "{}");
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-sync-removed"), TaskStatus::Done).await;
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let refusal = sync_pr_review_replies(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                    Vec::new(),
+                )
+                .await
+                .expect_err("a removed Project's review replies are not synced");
+
+                assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                assert_eq!(mock.read_log(), "", "no GitHub call was made");
+            }
+
+            /// A GitHub state change for a removed Project's Task is read, then
+            /// refused under the lease: the Task record and its evidence are unchanged.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refreshing_a_removed_projects_pull_request_records_nothing() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup("unused", r#"{"state":"CLOSED"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    "/tmp",
+                    Some("task-refresh-removed"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let url = "https://github.com/testorg/testrepo/pull/19";
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.pr_url = Some(url.to_string());
+                    task.external_refs
+                        .push(crate::domain::task::ExternalRef::GithubPr {
+                            url: url.to_string(),
+                            number: 19,
+                            repo: "testorg/testrepo".to_string(),
+                            state: None,
+                            merge_commit: None,
+                        });
+                }
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let refusal = refresh_task_pr_state(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                )
+                .await
+                .expect_err("a removed Project's pull request state is not recorded");
+
+                assert!(
+                    refusal.contains(crate::domain::project::PROJECT_REMOVED_REFUSAL),
+                    "{refusal}"
+                );
+                let after = app
+                    .state::<crate::AppState>()
+                    .task
+                    .tasks
+                    .read()
+                    .await
+                    .get(&task_id)
+                    .unwrap()
+                    .clone();
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "a refused refresh changes no Task state or evidence"
+                );
+            }
+
             /// The gate's Human Review rule applies to every Task in Human Review
             /// that is not approved, whether or not a commit was bound, and to
             /// nothing else. A locked task map is refused, not assumed.

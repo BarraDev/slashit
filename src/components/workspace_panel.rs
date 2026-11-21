@@ -189,6 +189,18 @@ fn UnresolvedMemberships(
     }
 }
 
+/// Notice for a move whose detach failed. The detach may still have been saved,
+/// so the notice points at the list rather than asserting a membership.
+fn move_detach_failure(project_name: &str, error: &str) -> String {
+    format!("Could not move {project_name}: {error}. The list shows its current workspace.")
+}
+
+/// Notice for a move whose attach failed after the detach. The Project may be
+/// standalone or in another Workspace; only the refreshed list can say which.
+fn move_attach_failure(project_name: &str, error: &str) -> String {
+    format!("Could not add {project_name} to the workspace: {error}. The list shows its current workspace; it may be standalone.")
+}
+
 /// The folder a Workspace uses, for its header: the effective path, marked when
 /// it is missing. A Workspace without a custom root still has its managed
 /// folder, so this never says it has no folder.
@@ -303,21 +315,25 @@ fn WorkspaceItem(
     };
 
     // Moving a member is a detach followed by an attach, each saved on its own.
-    // If the attach is refused, the Project is left standalone and says so.
+    // A failed step can still have been saved (the backend reports an unconfirmed
+    // save as an error), so a failure never claims the resulting membership. The
+    // list is reloaded afterwards and shows where the Project actually is; nothing
+    // is retried automatically.
     let move_member = move |project_id: String, project_name: String, target: String| {
+        // The select's `disabled` is a snapshot, so the guard is here: one move at a time.
+        if busy.get_untracked() {
+            return;
+        }
         set_busy.set(true);
         spawn_local(async move {
             match detach_project_from_workspace(project_id.clone()).await {
-                Err(e) => toast::error(format!("Failed to move project: {}", e)),
+                Err(e) => toast::error(move_detach_failure(&project_name, &e)),
                 Ok(_) if target == STANDALONE => {
                     toast::success(format!("Moved {} to standalone", project_name));
                 }
                 Ok(_) => match attach_project_to_workspace(project_id, target.clone()).await {
                     Ok(_) => toast::success(format!("Moved {} to another workspace", project_name)),
-                    Err(e) => toast::error(format!(
-                        "{} is now standalone; it could not join the workspace: {}",
-                        project_name, e
-                    )),
+                    Err(e) => toast::error(move_attach_failure(&project_name, &e)),
                 },
             }
             on_membership_change.run(());
@@ -569,7 +585,15 @@ fn WorkspaceItem(
 
 #[cfg(test)]
 mod tests {
-    use super::{unresolved_members, TASK_BOUNDARY_NOTE};
+    use super::{move_attach_failure, move_detach_failure, unresolved_members, TASK_BOUNDARY_NOTE};
+
+    #[test]
+    fn a_failed_move_step_never_claims_a_membership_it_did_not_confirm() {
+        let attach = move_attach_failure("Api", "disk full");
+        assert!(attach.contains("may be standalone"), "{attach}");
+        assert!(!attach.contains("is now standalone"), "{attach}");
+        assert!(move_detach_failure("Api", "disk full").contains("shows its current workspace"));
+    }
     use crate::models::{AgentType, Project, ProjectScope, Workspace};
     use uuid::Uuid;
 

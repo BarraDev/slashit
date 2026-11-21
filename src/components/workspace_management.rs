@@ -112,12 +112,18 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
                     reload_membership();
                     on_changed.run(());
                 }
-                Err(e) => {
-                    // The backend can publish a Workspace and still report a failed
-                    // save. Reload so that such a Workspace is shown rather than hidden;
-                    // the draft stays, so a retry is the person's explicit choice.
+                Err(failure) => {
+                    // The backend can publish a Workspace and still report an
+                    // unconfirmed save. Reload so that it is shown, and clear the
+                    // draft only in that case so a retry cannot duplicate it.
+                    let (clear_draft, notice) =
+                        workspace_service::creation_failure_notice(&failure);
+                    if clear_draft {
+                        let _ = set_new_name.try_set(String::new());
+                        let _ = set_new_path.try_set(String::new());
+                    }
                     reload_membership();
-                    toast::error(format!("Failed to create workspace: {}", e));
+                    toast::error(notice);
                 }
             }
             let _ = set_creating.try_set(false);

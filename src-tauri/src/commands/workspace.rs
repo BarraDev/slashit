@@ -77,32 +77,50 @@ fn root_owner<'a>(
     })
 }
 
+/// A Workspace that was not created. `workspace` is set only when the registry
+/// already holds it (its save was published but not confirmed durable), so the
+/// caller shows that Workspace instead of creating a second one.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CreateWorkspaceFailure {
+    pub message: String,
+    pub workspace: Option<Workspace>,
+}
+
 pub(crate) async fn create_workspace_core(
     registry: &RwLock<WorkspaceRegistry>,
     paths: &AppPaths,
     name: String,
     root_path: Option<String>,
-) -> Result<Workspace, String> {
+) -> Result<Workspace, CreateWorkspaceFailure> {
+    let refused = |message: String| CreateWorkspaceFailure {
+        message,
+        workspace: None,
+    };
     let name = name.trim().to_string();
     if name.is_empty() {
-        return Err("Workspace name is required".to_string());
+        return Err(refused("Workspace name is required".to_string()));
     }
-    let root = custom_root(root_path)?;
+    let root = custom_root(root_path).map_err(refused)?;
     let mut registry = registry.write().await;
     if let Some(root) = &root {
         if root_owner(&registry, paths, root.as_path(), None).is_some() {
-            return Err(format!(
+            return Err(refused(format!(
                 "A workspace is already registered for {}",
                 root.as_path().display()
-            ));
+            )));
         }
     }
     let workspace = Workspace::new(name, root);
     if workspace.root_path.is_none() {
-        ensure_managed_root(paths, workspace.id)?;
+        ensure_managed_root(paths, workspace.id).map_err(refused)?;
     }
-    registry.upsert(workspace.clone()).map_err(|e| e.describe("save the workspace"))?;
-    Ok(workspace)
+    match registry.upsert(workspace.clone()) {
+        Ok(()) => Ok(workspace),
+        Err(error) => Err(CreateWorkspaceFailure {
+            message: error.describe("save the workspace"),
+            workspace: error.is_published().then_some(workspace),
+        }),
+    }
 }
 
 #[tauri::command]
@@ -111,7 +129,7 @@ pub async fn create_workspace(
     state: tauri::State<'_, crate::AppState>,
     name: String,
     root_path: Option<String>,
-) -> Result<Workspace, String> {
+) -> Result<Workspace, CreateWorkspaceFailure> {
     create_workspace_core(&state.workspace.registry, &state.paths, name, root_path).await
 }
 
@@ -467,7 +485,8 @@ mod tests {
         let refusal = create_workspace_core(&registry, &paths, "Third".into(), Some(managed.display().to_string()))
             .await
             .expect_err("creating over another Workspace's managed folder is refused");
-        assert!(refusal.contains("already registered"), "{refusal}");
+        assert!(refusal.message.contains("already registered"), "{}", refusal.message);
+        assert!(refusal.workspace.is_none(), "nothing was created");
 
         // A distinct folder is still accepted for the same Workspace.
         let elsewhere = temp.path().join("elsewhere");
@@ -503,5 +522,63 @@ mod tests {
         assert_eq!(renamed.name, "New name");
         assert_eq!(renamed.root_path, workspace.root_path);
         assert!(rename_workspace_core(&registry, workspace.id, "  ".into()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_save_that_fails_before_publication_creates_nothing_and_reports_no_workspace() {
+        let (_temp, paths, registry) = fixture();
+        let _fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+
+        let failure = create_workspace_core(&registry, &paths, "Client".into(), None)
+            .await
+            .expect_err("the save did not happen");
+
+        assert!(
+            failure.workspace.is_none(),
+            "nothing was created, so there is nothing to show"
+        );
+        assert!(
+            registry.read().await.all().next().is_none(),
+            "memory did not change"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_save_reports_the_created_workspace_once_and_reconciles_without_a_second_one(
+    ) {
+        let (_temp, paths, registry) = fixture();
+        let path = paths.workspaces_file();
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+
+        let failure = create_workspace_core(&registry, &paths, "Client".into(), None)
+            .await
+            .expect_err("durability is unconfirmed");
+        drop(fault);
+
+        let created = failure
+            .workspace
+            .expect("the registry holds the Workspace, so it must be reported");
+        assert!(
+            registry.read().await.get(&created.id).is_some(),
+            "memory follows the file"
+        );
+        let reloaded = WorkspaceRegistry::load_from(path).unwrap();
+        assert!(
+            reloaded.get(&created.id).is_some(),
+            "a restart sees the same Workspace"
+        );
+
+        let listed: Vec<_> = registry.read().await.all().map(|w| w.id).collect();
+        assert_eq!(
+            listed,
+            vec![created.id],
+            "a reload lists exactly one Workspace"
+        );
     }
 }
