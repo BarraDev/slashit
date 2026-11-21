@@ -39,6 +39,7 @@ pub async fn create_session(
 ) -> Result<ChatSession, String> {
     let id = Uuid::new_v4();
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, project_id).await?;
     let now = chrono::Utc::now();
 
     let session = ChatSession {

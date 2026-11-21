@@ -75,6 +75,7 @@ fn project(id: Uuid, repository_id: Option<Uuid>) -> Project {
         },
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        removed_at: None,
     }
 }
 

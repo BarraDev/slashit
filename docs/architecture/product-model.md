@@ -100,21 +100,69 @@ Only part of that exists today.
 
 **Current:**
 
-- A Workspace has an id, a name, and a root folder (`root_path`), and is
-  kept in a registry outside any Project.
-- Every Project is still created `Standalone`. A user can attach a
-  standalone Project to a Workspace, and detach a member Project back to
-  standalone, from the Workspaces page. Attaching a Project that already
-  belongs to a Workspace is refused; detach it first. There is no
-  aggregate view across a Workspace's member Projects yet beyond the
-  membership list itself.
-- When a member Project's Task is executed and the Workspace root exists on
-  disk, the coding agent runs from the Workspace root, with the Task
-  Checkout added as the directory it edits. Instruction files in the
-  Workspace root (for example `AGENTS.md`) therefore act as shared agent
-  context for every member Project. If the root is missing, the run falls
-  back to the Task Checkout alone. Other agent runs, such as AI review and
-  PR review fixes, do not use the Workspace root.
+- A Workspace has an id and a name, and is kept in a registry outside any
+  Project. Its context root is either a custom folder the person chose
+  (`root_path`) or, by default, a SlashIt-managed folder at
+  `data/workspaces/<id>` under the application data directory. The managed
+  folder is created with the Workspace and again when a custom root is
+  cleared. Reading the root reports whether it exists and never creates it.
+  Creating a Workspace never asks for a folder and never writes into a
+  Project's repository. Setting a custom root only validates the folder.
+  Changing the root, or deleting a Workspace, never moves, overwrites or
+  deletes a folder; deleting leaves the managed folder in place.
+- Every Project is still created `Standalone`. Organize Projects in the Project
+  Rail is the management surface. It creates a Workspace, renames it, sets or
+  clears its custom root, attaches a standalone Project, detaches a member back
+  to standalone, moves a member to another Workspace, renames a Project and
+  removes a Project from SlashIt. Each action is saved on its own. A move is a
+  detach followed by an attach; if the attach is refused, the Project stays
+  standalone and the message says so. The backend refuses attaching a Project
+  that already belongs to a Workspace, so the UI always detaches first. There
+  is no drag-and-drop and no ordering preference.
+- The Workspaces entry in the main sidebar is retired. The rail groups each
+  Workspace's active member Projects under it. The chevron expands or
+  collapses the group; that state is kept in memory only. The name enters
+  Workspace context, which shows the Workspace's root and its member Projects.
+  A Workspace with no active members stays reachable.
+- Navigation scope. In Workspace context the content area shows the Workspace
+  home, plus the global pages Settings and MCP. Project pages (Kanban,
+  terminals, Project settings) are not shown. Settings receives no Project id
+  in that context, so the last selected Project's storage is not presented as
+  the Workspace's. Choosing a Project leaves Workspace context. Removing a
+  Project changes the selection only when that Project was the selected one in
+  Project context. A Workspace has no Conversation yet, and there is no
+  aggregate view across member Projects beyond that list.
+- Removing a Project is not deletion. The removal sets `removed_at` and nothing
+  else: the Project keeps its id, Repository association, configuration,
+  Tasks, Conversations, history, worktrees, branches, files and its Workspace
+  membership record. Removed Projects are left out of the active Project list
+  and refuse new work at every front door. Removal is refused, with the reason
+  listed, while a Task is queued, running, in AI review or Human Review, or a
+  delivery is in flight. The UI does not call `delete_project`.
+- A Project that names a Workspace missing from the registry stays in the
+  rail under "Unresolved membership" until it is repaired in Organize Projects.
+- When a member Project's Task is executed and the Workspace has a custom
+  root, the coding agent runs from that root, with the Task Checkout added as
+  the directory it edits. Instruction files in the custom root (for example
+  `AGENTS.md`) therefore act as shared agent context for every member Project.
+  A Workspace without a custom root leaves the Worker in its Task Checkout, as
+  a standalone Project is, so its managed folder never changes what a Worker
+  can reach. If a configured custom root is missing, the run is refused before
+  it starts and its Task Checkout is released. SlashIt does not fall back
+  silently: the person restores the folder or changes the root, then runs
+  again. Other agent runs, such as AI review and PR review fixes, do not use
+  the Workspace root.
+- **Verified execution limits (as of this increment).** Only a custom root
+  reaches a Claude Code Worker. The managed root is created and reported, but
+  the Worker launch does not read it, so today it does not change what any run
+  sees. An OpenCode Task in a Workspace that needs the Task Checkout as an extra
+  directory is refused before it starts, so OpenCode has no Workspace-root
+  parity yet. Claude Code's `--add-dir` exposes the checkout, and the Workspace
+  root's instruction files load through `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD`.
+  Neither the root nor a prompt confines writes: the agent can edit any file
+  its process can reach, and SlashIt's delivery covers only the Task Checkout.
+  Making the managed root a real launch context, and giving OpenCode a parity
+  path, are open decisions, not implemented behavior.
 - **Execution and delivery boundary.** The agent may read anything it can
   reach, including the Workspace's instruction files and other member
   Projects. Its writes belong in the Task Checkout, and the coding prompt

@@ -132,6 +132,7 @@ const READ_ONLY: &[&str] = &[
     "get_workflow_logs",
     "list_workspaces",
     "get_workspace",
+    "get_workspace_root",
     "list_pty_sessions",
     "get_pty_scrollback",
     "get_active_process_count",

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
+//! Workspace creation and membership, shown inside Organize Projects. This is
+//! the one place that creates Workspaces and attaches or detaches Projects.
+
 use crate::components::toast;
 use crate::components::workspace_panel::WorkspacePanel;
 use crate::models::{project::Project, workspace::Workspace};
@@ -8,10 +11,10 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 #[component]
-pub fn Workspaces() -> impl IntoView {
+pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
     let (workspaces, set_workspaces) = signal::<Vec<Workspace>>(Vec::new());
     // Whether `workspaces` is the registry as last read, rather than the
-    // empty list the page starts with or falls back to on a load error. Only
+    // empty list the view starts with or falls back to on a load error. Only
     // a loaded list can prove a Project's Workspace is missing.
     let (workspaces_loaded, set_workspaces_loaded) = signal(false);
     let (projects, set_projects) = signal::<Vec<Project>>(Vec::new());
@@ -51,8 +54,6 @@ pub fn Workspaces() -> impl IntoView {
         }
     };
 
-    let reload = move || spawn_local(load_workspaces());
-
     // The registry is read first and the projects after it, never both at
     // once. A project list newer than the registry could name a Workspace
     // another client just created, and that Project would briefly show as
@@ -77,7 +78,10 @@ pub fn Workspaces() -> impl IntoView {
 
     Effect::new(move |_| reload_membership());
 
-    let on_membership_change = Callback::new(move |()| reload_membership());
+    let on_membership_change = Callback::new(move |()| {
+        reload_membership();
+        on_changed.run(());
+    });
 
     let on_pick_folder = move |_| {
         spawn_local(async move {
@@ -91,19 +95,21 @@ pub fn Workspaces() -> impl IntoView {
 
     let on_create = move |_| {
         let name = new_name.get();
-        let path = new_path.get();
-        if name.trim().is_empty() || path.trim().is_empty() {
-            toast::error("Name and root path are required".to_string());
+        let path = new_path.get().trim().to_string();
+        if name.trim().is_empty() {
+            toast::error("A workspace name is required".to_string());
             return;
         }
         set_creating.set(true);
         spawn_local(async move {
-            match workspace_service::create_workspace(&name, &path).await {
+            let root = (!path.is_empty()).then_some(path.as_str());
+            match workspace_service::create_workspace(&name, root).await {
                 Ok(_) => {
                     set_new_name.set(String::new());
                     set_new_path.set(String::new());
                     toast::success("Workspace created".to_string());
-                    reload();
+                    reload_membership();
+                    on_changed.run(());
                 }
                 Err(e) => toast::error(format!("Failed to create workspace: {}", e)),
             }
@@ -112,43 +118,46 @@ pub fn Workspaces() -> impl IntoView {
     };
 
     view! {
-        <div class="space-y-6">
-            <div>
-                <h1 class="text-2xl font-bold text-white/90">"Workspaces"</h1>
-                <p class="text-sm text-white/40 mt-1">
-                    "A workspace groups projects, and each project belongs to at most one workspace. When a task of a member project runs, its agent starts from the workspace root, so instruction files there, such as AGENTS.md, apply to every member."
+        <div class="space-y-4" data-testid="workspace-management">
+            <div class="border-t border-white/10 pt-4 space-y-3">
+                <h3 class="font-semibold text-white/80">"Workspaces"</h3>
+                <p class="text-xs text-white/40">
+                    "A workspace groups projects; each project belongs to at most one workspace. A workspace needs no folder. Its optional Shared Agent Context Directory is advanced: when set, agents of member projects start there and read the instruction files it holds."
                 </p>
-            </div>
-
-            <div class="border border-white/10 rounded-xl bg-white/[0.02] p-4 space-y-3">
-                <h2 class="font-semibold text-white/80">"Add Workspace"</h2>
-                <div class="flex gap-2">
+                <div class="flex flex-wrap gap-2">
                     <input
-                        class="flex-1 px-3 py-2 rounded-lg bg-black/40 border border-white/10 text-white/90 placeholder-white/30"
+                        data-testid="workspace-name-input"
+                        class="flex-1 min-w-[10rem] px-3 py-2 rounded-lg bg-black/40 border border-white/10 text-white/90 placeholder-white/30"
                         placeholder="Workspace name"
                         prop:value=move || new_name.get()
                         on:input=move |ev| set_new_name.set(event_target_value(&ev))
                     />
-                    <input
-                        class="flex-1 px-3 py-2 rounded-lg bg-black/40 border border-white/10 text-white/90 placeholder-white/30 font-mono text-sm"
-                        placeholder="Root path (e.g. ~/Repo/ps)"
-                        prop:value=move || new_path.get()
-                        on:input=move |ev| set_new_path.set(event_target_value(&ev))
-                    />
                     <button
-                        on:click=on_pick_folder
-                        class="px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-white/70 transition-colors"
-                    >
-                        "Browse..."
-                    </button>
-                    <button
+                        data-testid="workspace-create"
                         on:click=on_create
                         disabled=move || creating.get()
                         class="px-4 py-2 rounded-lg bg-yellow-500 hover:bg-yellow-600 text-black font-medium disabled:opacity-50 transition-colors"
                     >
-                        {move || if creating.get() { "Creating..." } else { "Create" }}
+                        {move || if creating.get() { "Creating..." } else { "Create workspace" }}
                     </button>
                 </div>
+                <details class="text-sm text-white/50">
+                    <summary class="cursor-pointer">"Advanced: Shared Agent Context Directory"</summary>
+                    <div class="flex gap-2 mt-2">
+                        <input
+                            class="flex-1 px-3 py-2 rounded-lg bg-black/40 border border-white/10 text-white/90 placeholder-white/30 font-mono text-sm"
+                            placeholder="Shared Agent Context Directory (optional)"
+                            prop:value=move || new_path.get()
+                            on:input=move |ev| set_new_path.set(event_target_value(&ev))
+                        />
+                        <button
+                            on:click=on_pick_folder
+                            class="px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-white/70 transition-colors"
+                        >
+                            "Browse..."
+                        </button>
+                    </div>
+                </details>
             </div>
 
             <WorkspacePanel

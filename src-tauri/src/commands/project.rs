@@ -123,6 +123,16 @@ pub async fn create_project(
         Some(id) => state.repository.repositories.read().await.get(&id).map(|r| r.local_path.clone()),
         None => None,
     };
+    // A folder that already has an active Project is refused before the
+    // reopen below, which would otherwise bring back a removed one beside it.
+    refuse_second_active_project(&*state.project.projects.read().await, repository_id)?;
+    // Opening the folder of a removed Project returns that Project, with its
+    // id, name, Tasks and Conversation, instead of creating a second one.
+    if let Some(folder) = repository_path.as_deref() {
+        if let Some(reopened) = reopen_removed_project_for_folder(&state, folder).await? {
+            return Ok(reopened);
+        }
+    }
     let base = crate::commands::repository_setup::captured_base(repository_path.as_deref()).await;
 
     let project = Project {
@@ -138,9 +148,334 @@ pub async fn create_project(
         agent_config,
         created_at: now,
         updated_at: now,
+        removed_at: None,
     };
 
     create_project_committed(&state.project.projects, &state.storage, project).await
+}
+
+/// Refuses a Project-scoped mutation when the Project has been removed. An
+/// unknown id is left to the caller, which already reports it.
+pub(crate) async fn refuse_if_project_removed(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    project_id: Uuid,
+) -> Result<(), String> {
+    if crate::lifecycle::project_is_removed(projects, project_id).await {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
+    Ok(())
+}
+
+/// Refuses work on a Task whose Project has been removed. Callers that start
+/// from a Task id rather than a Project id use this.
+pub(crate) async fn refuse_if_task_project_removed(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<(), String> {
+    let project_id = state.task.tasks.read().await.get(&task_id).map(|t| t.project_id);
+    let Some(project_id) = project_id else {
+        return Ok(());
+    };
+    let removed = state
+        .project
+        .projects
+        .read()
+        .await
+        .get(&project_id)
+        .is_some_and(|project| project.is_removed());
+    if removed {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
+    Ok(())
+}
+
+/// Takes a Task's lifecycle lease and refuses if its Project is removed.
+///
+/// Removal holds this lease while it writes `removed_at`, so a mutation that
+/// checks here and writes before releasing the lease cannot land on a removed
+/// Project. A check made before the lease does not have that guarantee.
+pub(crate) async fn lease_active_task(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<crate::lifecycle::LifecycleLease, String> {
+    lease_active_task_in(
+        &state.task_lifecycle_locks,
+        &state.task.tasks,
+        &state.project.projects,
+        task_id,
+    )
+    .await
+}
+
+/// [`lease_active_task`] for a caller that holds the pieces rather than the
+/// whole `AppState`, such as the IPC context.
+pub(crate) async fn lease_active_task_in(
+    locks: &crate::lifecycle::TaskLifecycleLocks,
+    tasks: &crate::lifecycle::Tasks,
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    task_id: Uuid,
+) -> Result<crate::lifecycle::LifecycleLease, String> {
+    let lease = locks.acquire(task_id).await?;
+    let project_id = tasks.read().await.get(&task_id).map(|t| t.project_id);
+    if let Some(project_id) = project_id {
+        refuse_if_project_removed(projects, project_id).await?;
+    }
+    Ok(lease)
+}
+
+/// Refuses a second active Project on one repository. The folder is already
+/// open as that Project, so a second one would give two boards and two
+/// Conversations for the same checkout.
+fn refuse_second_active_project(
+    projects: &HashMap<Uuid, Project>,
+    repository_id: Option<Uuid>,
+) -> Result<(), String> {
+    let Some(repository_id) = repository_id else {
+        return Ok(());
+    };
+    match projects
+        .values()
+        .find(|p| !p.is_removed() && p.repository_id == Some(repository_id))
+    {
+        Some(active) => Err(format!(
+            "This folder is already open as Project '{}'. Nothing was changed.",
+            active.name
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The removed Project whose repository is the given folder, if any. The
+/// most recently removed one wins when several match.
+async fn reopen_removed_project_for_folder(
+    state: &crate::AppState,
+    folder: &str,
+) -> Result<Option<Project>, String> {
+    let candidate = {
+        let projects = state.project.projects.read().await;
+        let repositories = state.repository.repositories.read().await;
+        removed_project_for_folder(&projects, &repositories, folder)
+    };
+    let Some(id) = candidate else {
+        return Ok(None);
+    };
+    // The gate excludes a concurrent removal of the same Project, so the
+    // reopen and a removal cannot both decide from the same state.
+    let _gate = state.task.project_gate.write(id).await;
+    reopen_project_committed(&state.project.projects, &state.storage, id)
+        .await
+        .map(Some)
+}
+
+/// The removed Project whose repository is `folder`. The most recently removed
+/// one wins when several match. Compares canonical paths, so a folder opened
+/// through another spelling of its path still finds its Project.
+pub(crate) fn removed_project_for_folder(
+    projects: &HashMap<Uuid, Project>,
+    repositories: &HashMap<Uuid, crate::domain::Repository>,
+    folder: &str,
+) -> Option<Uuid> {
+    let wanted = canonical_folder(folder);
+    projects
+        .values()
+        .filter(|project| project.is_removed())
+        .filter_map(|project| {
+            let path = project.repository_path(repositories)?;
+            (canonical_folder(&path) == wanted).then_some((project.removed_at, project.id))
+        })
+        .max()
+        .map(|(_, id)| id)
+}
+
+fn canonical_folder(path: &str) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
+}
+
+/// Clears a Project's removal and persists it. The Project is returned as it
+/// was before removal, with the same id and data. An already active Project
+/// is returned unchanged.
+async fn reopen_project_committed(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    storage: &Storage,
+    id: Uuid,
+) -> Result<Project, String> {
+    let mut projects_w = projects.write().await;
+    // Checked under the write lock: an active Project may have been opened for
+    // the same folder since the caller looked, and reopening must not add a second.
+    if let Some(removed) = projects_w.get(&id).filter(|p| p.is_removed()) {
+        refuse_second_active_project(&projects_w, removed.repository_id)?;
+    }
+    let mut proposed = projects_w.clone();
+    let project = proposed
+        .get_mut(&id)
+        .ok_or_else(|| "This Project no longer exists.".to_string())?;
+    if !project.is_removed() {
+        return Ok(project.clone());
+    }
+    project.removed_at = None;
+    project.updated_at = chrono::Utc::now();
+    let result = project.clone();
+
+    let outcome = try_persist_projects(storage, &proposed);
+    crate::config::adopt_published(&mut *projects_w, proposed, outcome)
+        .map_err(|e| e.describe("reopen project"))?;
+    Ok(result)
+}
+
+/// Removes a Project from SlashIt's active Projects. Nothing is deleted: the
+/// Project's repository, files, Tasks, Conversation, history and checkouts stay
+/// as they are, and opening the same folder later brings it back.
+///
+/// Removal is refused while work cannot be safely detached (see
+/// [`remove_project_committed`]). It takes the same locks as deletion, in the
+/// same order, so no run, Task creation or lifecycle transition can interleave
+/// with the refusal check and the commit.
+#[tauri::command]
+pub async fn remove_project(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+) -> Result<(), String> {
+    let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let running = state
+        .executor
+        .get()
+        .map(|executor| executor.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+    let _conversation_guard = lock_project_conversation_for_deletion(
+        &state.conversation,
+        &state.storage,
+        id,
+        |conversation_id| {
+            state
+                .executor
+                .get()
+                .is_some_and(|executor| executor.project_run_is_live(conversation_id))
+        },
+    )
+    .await?;
+    let _gate = state.task.project_gate.write(id).await;
+    let _task_leases = crate::lifecycle::hold_project_task_leases(
+        &state.task_lifecycle_locks,
+        &state.task.tasks,
+        id,
+    )
+    .await?;
+    remove_project_committed(
+        &state.project.projects,
+        &state.repository.repositories,
+        &state.task.tasks,
+        &state.storage,
+        running,
+        Some(&state.task.deliveries),
+        id,
+    )
+    .await
+}
+
+/// Core of [`remove_project`]. The caller holds, in order, the Conversation
+/// lock, the gate in write and every Task lease of the Project.
+///
+/// Refusals come first and change nothing. A Project is refused when:
+/// - it has no repository folder SlashIt can reopen it by;
+/// - a Task is queued, running, or waiting for a decision (the statuses that
+///   need the executor or the user);
+/// - a Task has an agent running, a pull request being opened, or durable
+///   unfinished work (the same checks deletion makes).
+///
+/// A Task that is only Done, Error or PrCreated, without a checkout or
+/// unfinished work, does not block removal.
+async fn remove_project_committed(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    repositories: &RwLock<HashMap<Uuid, crate::domain::Repository>>,
+    tasks: &crate::lifecycle::Tasks,
+    storage: &Storage,
+    running: Option<&dyn crate::lifecycle::ExecutionOwnership>,
+    deliveries: Option<&crate::commands::human_review::DeliveriesInFlight>,
+    id: Uuid,
+) -> Result<(), String> {
+    let (already_removed, repository_path) = {
+        let projects_r = projects.read().await;
+        let project = projects_r
+            .get(&id)
+            .ok_or_else(|| "This Project no longer exists.".to_string())?;
+        let repositories_r = repositories.read().await;
+        (project.is_removed(), project.repository_path(&repositories_r))
+    };
+    if already_removed {
+        return Ok(());
+    }
+    if repository_path.is_none() {
+        return Err(
+            "This Project cannot be removed: it has no folder that SlashIt can open again \
+             later. Nothing was changed."
+                .to_string(),
+        );
+    }
+
+    let durable = storage.load_project_tasks(id).map_err(|e| {
+        format!(
+            "This Project's Task records cannot be read, so SlashIt cannot prove that removing \
+             it is safe. Nothing was changed: {e}"
+        )
+    })?;
+    let tasks_w = tasks.write().await;
+    if let Some(message) = first_remove_refusal(&durable, &tasks_w, id, running, deliveries).await {
+        return Err(format!("This Project cannot be removed yet: {message}. Nothing was changed."));
+    }
+
+    // A delivery marker can be raised without the board guard, so the check is
+    // repeated once the Project map is held and before anything is written.
+    let mut projects_w = projects.write().await;
+    if let Some(message) = first_remove_refusal(&durable, &tasks_w, id, running, deliveries).await {
+        return Err(format!("This Project cannot be removed yet: {message}. Nothing was changed."));
+    }
+    let mut proposed = projects_w.clone();
+    let project = proposed
+        .get_mut(&id)
+        .ok_or_else(|| "This Project no longer exists.".to_string())?;
+    let now = chrono::Utc::now();
+    project.removed_at = Some(now);
+    project.updated_at = now;
+
+    let outcome = try_persist_projects(storage, &proposed);
+    crate::config::adopt_published(&mut *projects_w, proposed, outcome)
+        .map_err(|e| e.describe("remove project"))?;
+    Ok(())
+}
+
+/// Why one Task keeps its Project from being removed, if anything does.
+async fn remove_refusal_for_task(
+    task: &Task,
+    running: Option<&dyn crate::lifecycle::ExecutionOwnership>,
+    deliveries: Option<&crate::commands::human_review::DeliveriesInFlight>,
+) -> Option<String> {
+    use crate::domain::TaskStatus::{AiReview, HumanReview, InProgress, Queue};
+    let title = &task.title;
+    match task.status {
+        Queue => {
+            return Some(format!("task {title:?} is in Queue; move it out of Queue first"))
+        }
+        InProgress => {
+            return Some(format!(
+                "task {title:?} is in progress; stop it first"
+            ))
+        }
+        AiReview => {
+            return Some(format!(
+                "task {title:?} is in AI review; wait for the review to finish"
+            ))
+        }
+        HumanReview => {
+            return Some(format!(
+                "task {title:?} is waiting for your review decision; approve or request changes first"
+            ))
+        }
+        _ => {}
+    }
+    if let Some(message) = live_work_refusal(task, running, deliveries).await {
+        return Some(message);
+    }
+    crate::lifecycle::project_deletion_refusal(task)
 }
 
 /// Core of [`create_project`], taking the raw map and storage so tests can
@@ -158,6 +493,9 @@ async fn create_project_committed(
     project: Project,
 ) -> Result<Project, String> {
     let mut projects_w = projects.write().await;
+    // Checked under the same write lock as the insert, so two concurrent
+    // opens of one folder cannot both pass the check.
+    refuse_second_active_project(&projects_w, project.repository_id)?;
     let mut proposed = projects_w.clone();
     proposed.insert(project.id, project.clone());
 
@@ -167,12 +505,29 @@ async fn create_project_committed(
     Ok(project)
 }
 
+/// The first reason any Task of the Project stops its removal, or `None`.
+async fn first_remove_refusal(
+    durable: &[Task],
+    tasks: &HashMap<Uuid, Task>,
+    id: Uuid,
+    running: Option<&dyn crate::lifecycle::ExecutionOwnership>,
+    deliveries: Option<&crate::commands::human_review::DeliveriesInFlight>,
+) -> Option<String> {
+    for task in durable.iter().chain(tasks.values().filter(|t| t.project_id == id)) {
+        if let Some(message) = remove_refusal_for_task(task, running, deliveries).await {
+            return Some(message);
+        }
+    }
+    None
+}
+
+/// Active Projects only: a removed Project is listed nowhere.
 #[tauri::command]
 pub async fn list_projects(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<Project>, String> {
     let projects = state.project.projects.read().await;
-    Ok(projects.values().cloned().collect())
+    Ok(projects.values().filter(|p| !p.is_removed()).cloned().collect())
 }
 
 #[tauri::command]
@@ -182,7 +537,7 @@ pub async fn get_project(
 ) -> Result<Option<Project>, String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     let projects = state.project.projects.read().await;
-    Ok(projects.get(&id).cloned())
+    Ok(projects.get(&id).filter(|p| !p.is_removed()).cloned())
 }
 
 #[tauri::command]
@@ -265,7 +620,7 @@ async fn lock_project_conversation_for_deletion(
         .map_err(|error| error.to_string())?
     {
         if project_run_is_live(conversation.id) {
-            return Err("Stop the active Project Conversation Run before deleting this Project".into());
+            return Err("Stop the active Project Conversation Run before removing or deleting this Project".into());
         }
     }
     Ok(guard)
@@ -742,7 +1097,14 @@ async fn update_project_committed(
     let mut proposed = projects_w.clone();
 
     if let Some(project) = proposed.get_mut(&id) {
+        if project.is_removed() {
+            return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+        }
         if let Some(name) = name {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return Err("A Project needs a name.".to_string());
+            }
             project.name = name;
         }
         if let Some(repository_id) = repository_id {
@@ -813,6 +1175,9 @@ async fn attach_project_to_workspace_committed(
     let project = proposed
         .get_mut(&project_id)
         .ok_or_else(|| "Project not found".to_string())?;
+    if project.is_removed() {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
     if !matches!(project.scope, ProjectScope::Standalone) {
         return Err("Project already belongs to a workspace; detach it first".to_string());
     }
@@ -833,6 +1198,26 @@ pub async fn detach_project_from_workspace(
     project_id: String,
 ) -> Result<Project, String> {
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
+    refuse_if_project_removed(&state.project.projects, project_id).await?;
+    // Idle means the same as removal: no active execution, queued work, pending
+    // review, recovery or delivery. Checked under the Project gate and the Task
+    // board, taken before the projects write, the order removal uses.
+    let running = state
+        .executor
+        .get()
+        .map(|executor| executor.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+    let _gate = state.task.project_gate.write(project_id).await;
+    let durable = state.storage.load_project_tasks(project_id).map_err(|e| {
+        format!("This Project's Task records cannot be read, so SlashIt cannot prove it is idle. Nothing was changed: {e}")
+    })?;
+    let tasks_r = state.task.tasks.read().await;
+    if let Some(message) =
+        first_remove_refusal(&durable, &tasks_r, project_id, running, Some(&state.task.deliveries)).await
+    {
+        return Err(format!(
+            "This Project cannot leave its Workspace yet: {message}. Nothing was changed."
+        ));
+    }
     detach_project_from_workspace_committed(&state.project.projects, &state.storage, project_id).await
 }
 
@@ -850,6 +1235,10 @@ async fn detach_project_from_workspace_committed(
     let project = proposed
         .get_mut(&project_id)
         .ok_or_else(|| "Project not found".to_string())?;
+    // A removed Project keeps its Workspace membership; only reopening it changes that.
+    if project.is_removed() {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
     if matches!(project.scope, ProjectScope::Standalone) {
         return Err("Project is not attached to a workspace".to_string());
     }
@@ -872,7 +1261,7 @@ pub async fn get_project_path(
     let id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
 
     let projects = state.project.projects.read().await;
-    let Some(project) = projects.get(&id) else {
+    let Some(project) = projects.get(&id).filter(|p| !p.is_removed()) else {
         return Ok(None);
     };
     let repositories = state.repository.repositories.read().await;
@@ -1012,6 +1401,7 @@ mod tests {
             agent_config: get_default_agent_config(&AgentType::ClaudeCode),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         }
     }
 
@@ -1495,6 +1885,87 @@ mod tests {
         assert!(on_disk.projects.contains_key(&other.id.to_string()));
     }
 
+    #[tokio::test]
+    async fn a_second_active_project_on_one_repository_is_refused_and_another_repository_is_not() {
+        let (storage, _temp) = create_test_storage();
+        let repository = Uuid::new_v4();
+        let mut first = make_test_project(Uuid::new_v4());
+        first.repository_id = Some(repository);
+        let projects = RwLock::new(HashMap::from([(first.id, first.clone())]));
+
+        let mut second = make_test_project(Uuid::new_v4());
+        second.repository_id = Some(repository);
+        let message = create_project_committed(&projects, &storage, second).await.unwrap_err();
+        assert!(message.contains("already open"), "{message}");
+        assert_eq!(projects.read().await.len(), 1, "a refused Project must not be inserted");
+
+        let mut other = make_test_project(Uuid::new_v4());
+        other.repository_id = Some(Uuid::new_v4());
+        create_project_committed(&projects, &storage, other).await.unwrap();
+    }
+
+    #[test]
+    fn a_removed_project_on_a_repository_does_not_block_a_new_active_one() {
+        let repository = Uuid::new_v4();
+        let mut removed = make_test_project(Uuid::new_v4());
+        removed.repository_id = Some(repository);
+        removed.removed_at = Some(chrono::Utc::now());
+        let projects = HashMap::from([(removed.id, removed)]);
+        assert!(refuse_second_active_project(&projects, Some(repository)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn reopening_a_removed_project_is_refused_when_an_active_one_already_holds_its_repository() {
+        let (storage, _temp) = create_test_storage();
+        let repository = Uuid::new_v4();
+        let mut removed = make_test_project(Uuid::new_v4());
+        removed.repository_id = Some(repository);
+        removed.removed_at = Some(chrono::Utc::now());
+        let mut active = make_test_project(Uuid::new_v4());
+        active.repository_id = Some(repository);
+        let removed_id = removed.id;
+        let projects = RwLock::new(HashMap::from([(removed_id, removed), (active.id, active)]));
+
+        let message = reopen_project_committed(&projects, &storage, removed_id).await.unwrap_err();
+        assert!(message.contains("already open"), "{message}");
+        assert!(projects.read().await[&removed_id].is_removed(), "the refused Project stays removed");
+    }
+
+    /// Reopening a removed folder and opening it as a new Project race on the
+    /// same repository. Whichever commits first, exactly one Project is active
+    /// for the folder afterwards, and the reopened one keeps its id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reopen_and_a_new_open_of_one_folder_leave_exactly_one_active_project() {
+        let (storage, _temp) = create_test_storage();
+        storage.save_config(&AppConfig::default()).unwrap();
+        let repository = Uuid::new_v4();
+        let mut removed = make_test_project(Uuid::new_v4());
+        removed.repository_id = Some(repository);
+        removed.removed_at = Some(chrono::Utc::now());
+        let removed_id = removed.id;
+        let mut fresh = make_test_project(Uuid::new_v4());
+        fresh.repository_id = Some(repository);
+        let projects = RwLock::new(HashMap::from([(removed_id, removed)]));
+
+        let (reopened, created) = tokio::join!(
+            reopen_project_committed(&projects, &storage, removed_id),
+            create_project_committed(&projects, &storage, fresh),
+        );
+
+        let map = projects.read().await;
+        let active: Vec<Uuid> = map
+            .values()
+            .filter(|p| !p.is_removed() && p.repository_id == Some(repository))
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(active.len(), 1, "exactly one active Project per folder, got {active:?}");
+        match (&reopened, &created) {
+            (Ok(project), Err(_)) => assert_eq!(project.id, removed_id, "the reopened identity is kept"),
+            (Err(_), Ok(project)) => assert_eq!(active, vec![project.id]),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
     /// Project deletion whose config write replaced the file without
     /// confirming it: nothing destructive may run, the evidence is kept, and
     /// the retried deletion is what finishes it once the file is confirmed.
@@ -1673,7 +2144,7 @@ mod tests {
             .expect("a missing registry file should load empty");
         let workspace = crate::domain::Workspace::new(
             "ws".to_string(),
-            crate::domain::WorkspaceRoot::try_new(root.path()).expect("real dir must validate"),
+            Some(crate::domain::WorkspaceRoot::try_new(root.path()).expect("real dir must validate")),
         );
         let id = workspace.id;
         registry.upsert(workspace).expect("upsert should succeed");
@@ -1974,6 +2445,47 @@ mod tests {
                 .exists(),
             "no Conversation cleanup record is owed for a deletion that never began"
         );
+    }
+
+    /// A removal holds a Task's lease while it writes `removed_at`. A mutation
+    /// that asks for the lease while the removal holds it can only proceed after
+    /// the removal's write, so it must see the Project as removed. Holding the
+    /// lease first makes this order deterministic, whatever the scheduler does.
+    #[tokio::test]
+    async fn a_mutation_waiting_on_a_removal_is_refused_by_the_removed_project() {
+        let project_id = Uuid::new_v4();
+        let task = crate::test_helpers::create_test_task_full("waits", project_id, crate::domain::TaskStatus::Backlog, 0);
+        let task_id = task.id;
+        let locks = Arc::new(crate::lifecycle::TaskLifecycleLocks::new());
+        let tasks: crate::lifecycle::Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let projects = Arc::new(RwLock::new(HashMap::from([(project_id, make_test_project(project_id))])));
+
+        let removal_lease = locks.acquire(task_id).await.expect("the removal takes the lease");
+        let mutation = {
+            let (locks, tasks, projects) = (locks.clone(), tasks.clone(), projects.clone());
+            tokio::spawn(async move {
+                lease_active_task_in(&locks, &tasks, &projects, task_id).await.map(|_| ())
+            })
+        };
+        projects.write().await.get_mut(&project_id).expect("the Project").removed_at = Some(chrono::Utc::now());
+        drop(removal_lease);
+
+        assert_eq!(
+            mutation.await.expect("the mutation finishes"),
+            Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_active_task_in_passes_a_mutation_of_an_active_project() {
+        let project_id = Uuid::new_v4();
+        let task = crate::test_helpers::create_test_task_full("active", project_id, crate::domain::TaskStatus::Backlog, 0);
+        let task_id = task.id;
+        let locks = crate::lifecycle::TaskLifecycleLocks::new();
+        let tasks: crate::lifecycle::Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let projects = RwLock::new(HashMap::from([(project_id, make_test_project(project_id))]));
+
+        assert!(lease_active_task_in(&locks, &tasks, &projects, task_id).await.is_ok());
     }
 
     #[tokio::test]
@@ -3010,6 +3522,69 @@ mod tests {
         );
     }
 
+    /// The shared Project-scoped guard refuses only a removed Project. An active
+    /// or unknown id passes, so the caller's own not-found handling still applies.
+    #[tokio::test]
+    async fn refuse_if_project_removed_refuses_only_a_removed_project() {
+        let mut removed = make_test_project(Uuid::new_v4());
+        removed.removed_at = Some(chrono::Utc::now());
+        let active = make_test_project(Uuid::new_v4());
+        let (removed_id, active_id) = (removed.id, active.id);
+        let projects = RwLock::new(HashMap::from([(removed_id, removed), (active_id, active)]));
+
+        assert_eq!(
+            refuse_if_project_removed(&projects, removed_id).await,
+            Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string())
+        );
+        assert!(refuse_if_project_removed(&projects, active_id).await.is_ok());
+        assert!(refuse_if_project_removed(&projects, Uuid::new_v4()).await.is_ok());
+    }
+
+    /// A removed Project is inactive: creating a Task for it is refused, and no
+    /// Task file is written. Removal keeps the Project's record, so the check is
+    /// on the Project, not on whether the record exists.
+    #[tokio::test]
+    async fn task_creation_for_a_removed_project_is_refused_and_writes_nothing() {
+        let (storage, _temp) = create_test_storage();
+        let mut project = make_test_project(Uuid::new_v4());
+        project.removed_at = Some(chrono::Utc::now());
+        let id = project.id;
+        storage.save_config(&AppConfig::default()).unwrap();
+        let projects = RwLock::new(HashMap::from([(id, project)]));
+        let tasks = board(vec![]);
+        let gate = crate::lifecycle::ProjectLifecycleGate::new();
+
+        let created = crate::lifecycle::create(&gate, &tasks, &projects, &storage, id, |existing| {
+            let tags = crate::domain::NewTask {
+                reviewer_model: None,
+                id: Uuid::new_v4(),
+                project_id: id,
+                title: "Refused".to_string(),
+                description: None,
+                model: "test".to_string(),
+                planning_mode: false,
+                dependencies: Vec::new(),
+                category: Default::default(),
+                priority: Default::default(),
+                complexity: Default::default(),
+                impact: Default::default(),
+                security_severity: Default::default(),
+                github_issue_url: None,
+                gitlab_issue_url: None,
+                linear_ticket_id: None,
+            };
+            crate::domain::Task::new_backlog(existing, tags)
+        })
+        .await;
+
+        assert_eq!(
+            created.expect_err("a removed Project admits no Task"),
+            crate::domain::project::PROJECT_REMOVED_REFUSAL
+        );
+        assert!(tasks.read().await.is_empty(), "no Task entered the board");
+        assert_eq!(storage.load_project_tasks(id).unwrap().len(), 0, "no Task file was written");
+    }
+
     /// A Tauri-flavored creation for same project id must be blocked while
     /// the deletion commits. Since deletion holds the shared board's write
     /// guard from the project removal to memory cleanup, awaiting a create
@@ -3226,5 +3801,351 @@ mod tests {
             .paths()
             .pending_project_conversation_deletion_file(id)
             .exists());
+    }
+
+    fn make_test_repository(folder: &std::path::Path) -> crate::domain::Repository {
+        crate::domain::Repository {
+            id: Uuid::new_v4(),
+            local_path: folder.to_string_lossy().to_string(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A Project with a folder, a board of the given Tasks, and storage that
+    /// can persist. Returns everything a removal or reopen commits against.
+    async fn project_with_folder(
+        tasks: Vec<Task>,
+    ) -> (
+        Storage,
+        TempDir,
+        RwLock<HashMap<Uuid, Project>>,
+        RwLock<HashMap<Uuid, crate::domain::Repository>>,
+        Uuid,
+    ) {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("repo");
+        std::fs::create_dir_all(&folder).unwrap();
+        let repository = make_test_repository(&folder);
+        let mut project = make_test_project(Uuid::new_v4());
+        project.repository_id = Some(repository.id);
+        let id = project.id;
+        storage.save_project_tasks(id, &tasks).unwrap();
+        let projects = RwLock::new(HashMap::from([(id, project)]));
+        let repositories = RwLock::new(HashMap::from([(repository.id, repository)]));
+        (storage, temp, projects, repositories, id)
+    }
+
+    #[tokio::test]
+    async fn removing_an_idle_project_keeps_its_identity_and_persists_the_marker() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let tasks = board(vec![]);
+
+        remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+            .await
+            .expect("an idle Project can be removed");
+
+        let removed = projects.read().await.get(&id).cloned().expect("the Project is kept");
+        assert!(removed.is_removed(), "memory holds the removal");
+        let on_disk = storage.load_config().unwrap().projects.get(&id.to_string()).cloned();
+        assert!(on_disk.is_some_and(|p| p.removed_at.is_some()), "the removal is on disk");
+    }
+
+    #[tokio::test]
+    async fn removal_is_refused_while_a_task_is_queued_and_changes_nothing() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let queued = crate::test_helpers::create_test_task_full(
+            "Waiting",
+            id,
+            crate::domain::TaskStatus::Queue,
+            0,
+        );
+        let tasks = board(vec![queued]);
+
+        let refusal = remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+            .await
+            .expect_err("a queued Task must stop removal");
+
+        assert!(refusal.contains("in Queue"), "the refusal names the cause: {refusal}");
+        assert!(!projects.read().await[&id].is_removed(), "nothing was changed");
+    }
+
+    #[tokio::test]
+    async fn removal_is_refused_for_a_project_without_a_folder_to_reopen() {
+        let (storage, _temp) = create_test_storage();
+        let project = make_test_project(Uuid::new_v4());
+        let id = project.id;
+        let projects = RwLock::new(HashMap::from([(id, project)]));
+        let repositories = RwLock::new(HashMap::new());
+        let tasks = board(vec![]);
+
+        let refusal = remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+            .await
+            .expect_err("a Project that cannot be reopened must not be removed");
+
+        assert!(refusal.contains("no folder"), "{refusal}");
+        assert!(!projects.read().await[&id].is_removed());
+    }
+
+    #[tokio::test]
+    async fn reopening_the_same_folder_returns_the_original_project_unchanged() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let backlog = crate::test_helpers::create_test_task_full(
+            "Kept",
+            id,
+            crate::domain::TaskStatus::Backlog,
+            0,
+        );
+        storage.save_project_tasks(id, std::slice::from_ref(&backlog)).unwrap();
+        let original_name = projects.read().await[&id].name.clone();
+        let tasks = board(vec![backlog]);
+        remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+            .await
+            .unwrap();
+        let folder = projects.read().await[&id]
+            .repository_path(&*repositories.read().await)
+            .unwrap();
+
+        let found = removed_project_for_folder(&*projects.read().await, &*repositories.read().await, &folder);
+        assert_eq!(found, Some(id), "the folder finds its removed Project");
+
+        let reopened = reopen_project_committed(&projects, &storage, id).await.unwrap();
+
+        assert_eq!(reopened.id, id, "same identity");
+        assert_eq!(reopened.name, original_name, "same name");
+        assert!(!reopened.is_removed(), "active again");
+        assert_eq!(projects.read().await.len(), 1, "no duplicate Project");
+        assert_eq!(storage.load_project_tasks(id).unwrap().len(), 1, "Tasks survive");
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_no_removed_project_uses_finds_nothing() {
+        let (_storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let folder = projects.read().await[&id].repository_path(&*repositories.read().await).unwrap();
+        // Active, not removed: the folder must not be treated as a reopen.
+        assert_eq!(
+            removed_project_for_folder(&*projects.read().await, &*repositories.read().await, &folder),
+            None
+        );
+    }
+
+    #[test]
+    fn the_removal_marker_is_absent_from_the_file_until_set() {
+        let project = make_test_project(Uuid::new_v4());
+        let text = toml::to_string(&project).unwrap();
+        assert!(!text.contains("removed_at"), "an active Project keeps the old shape");
+        let parsed: Project = toml::from_str(&text).unwrap();
+        assert!(!parsed.is_removed());
+    }
+
+    /// Puts `id` into a Workspace in memory and on disk, the way attach does.
+    async fn attach_for_test(
+        projects: &RwLock<HashMap<Uuid, Project>>,
+        storage: &Storage,
+        id: Uuid,
+        workspace_id: Uuid,
+    ) {
+        let mut w = projects.write().await;
+        w.get_mut(&id).unwrap().scope = ProjectScope::InWorkspace { workspace_id };
+        storage.save_config(&{
+            let mut config = storage.load_config().unwrap();
+            config.projects = w.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            config
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_a_workspace_member_keeps_its_membership_and_an_unrelated_standalone_project() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let workspace_id = Uuid::new_v4();
+        attach_for_test(&projects, &storage, id, workspace_id).await;
+        let standalone = make_test_project(Uuid::new_v4());
+        let standalone_id = standalone.id;
+        projects.write().await.insert(standalone_id, standalone);
+        let tasks = board(vec![]);
+
+        remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+            .await
+            .expect("an idle member can be removed");
+
+        let memory = projects.read().await;
+        assert!(memory[&id].is_removed());
+        assert_eq!(memory[&id].scope.workspace_id(), Some(workspace_id), "membership kept in memory");
+        assert!(!memory[&standalone_id].is_removed(), "the unrelated Project stays active");
+        assert_eq!(memory[&standalone_id].scope.workspace_id(), None);
+        drop(memory);
+        let on_disk = storage.load_config().unwrap().projects;
+        assert_eq!(
+            on_disk[&id.to_string()].scope.workspace_id(),
+            Some(workspace_id),
+            "membership kept on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn detaching_a_removed_member_is_refused_and_changes_nothing() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let workspace_id = Uuid::new_v4();
+        attach_for_test(&projects, &storage, id, workspace_id).await;
+        remove_project_committed(&projects, &repositories, &board(vec![]), &storage, None, None, id)
+            .await
+            .unwrap();
+        let before = projects.read().await[&id].clone();
+
+        let refusal = detach_project_from_workspace_committed(&projects, &storage, id)
+            .await
+            .expect_err("a removed member must not be detached");
+
+        assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        let after = projects.read().await[&id].clone();
+        assert_eq!(after.scope.workspace_id(), Some(workspace_id), "scope unchanged");
+        assert_eq!(after.removed_at, before.removed_at, "removal unchanged");
+        let on_disk = storage.load_config().unwrap().projects;
+        assert_eq!(on_disk[&id.to_string()].scope.workspace_id(), Some(workspace_id));
+    }
+
+    #[tokio::test]
+    async fn reopening_a_removed_member_restores_it_to_its_original_workspace() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let workspace_id = Uuid::new_v4();
+        attach_for_test(&projects, &storage, id, workspace_id).await;
+        remove_project_committed(&projects, &repositories, &board(vec![]), &storage, None, None, id)
+            .await
+            .unwrap();
+
+        let reopened = reopen_project_committed(&projects, &storage, id).await.unwrap();
+
+        assert_eq!(reopened.id, id, "the original UUID");
+        assert!(!reopened.is_removed());
+        assert_eq!(reopened.scope.workspace_id(), Some(workspace_id), "the original Workspace");
+    }
+
+    #[tokio::test]
+    async fn detach_and_removal_interleaved_in_either_order_never_detach_a_removed_project() {
+        // The projects map's write lock orders the two mutations. Both join orders
+        // are exercised, so either future can take the lock first.
+        for detach_first in [true, false] {
+            let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+            let workspace_id = Uuid::new_v4();
+            attach_for_test(&projects, &storage, id, workspace_id).await;
+            let tasks = board(vec![]);
+
+            let (detached, removed) = if detach_first {
+                tokio::join!(
+                    detach_project_from_workspace_committed(&projects, &storage, id),
+                    remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id),
+                )
+            } else {
+                let (r, d) = tokio::join!(
+                    remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id),
+                    detach_project_from_workspace_committed(&projects, &storage, id),
+                );
+                (d, r)
+            };
+
+            let memory = projects.read().await.get(&id).cloned().unwrap();
+            removed.expect("removal of an idle member succeeds in either order");
+            assert!(memory.is_removed());
+            match detached {
+                // Detach won the lock first: the Project was active then, so it is standalone.
+                Ok(_) => assert_eq!(memory.scope.workspace_id(), None, "order {detach_first}"),
+                // Removal won: the detach must have been refused and left the membership.
+                Err(reason) => {
+                    assert_eq!(reason, crate::domain::project::PROJECT_REMOVED_REFUSAL, "order {detach_first}");
+                    assert_eq!(memory.scope.workspace_id(), Some(workspace_id), "order {detach_first}");
+                }
+            }
+        }
+    }
+
+    /// Removal holds every Task lease from before its refusals until its
+    /// commit. A Queue entry that starts meanwhile must wait for those leases,
+    /// and once removal has committed it must be refused and end nothing.
+    #[tokio::test]
+    async fn a_queue_entry_started_during_a_removal_waits_and_is_then_refused() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let backlog = crate::test_helpers::create_test_task_full(
+            "waiting",
+            id,
+            crate::domain::TaskStatus::Backlog,
+            0,
+        );
+        let task_id = backlog.id;
+        let tasks = board(vec![backlog]);
+        let locks = crate::lifecycle::TaskLifecycleLocks::new();
+
+        // The removal's lock sequence up to its commit: the leases are held.
+        let leases = crate::lifecycle::hold_project_task_leases(&locks, &tasks, id)
+            .await
+            .expect("no other lifecycle operation owns the Task");
+        let entry = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            crate::lifecycle::enqueue_current(&tasks, &storage, &projects, &locks, None, task_id),
+        )
+        .await;
+        assert!(
+            entry.is_err(),
+            "the Queue entry must wait for the removal's lease"
+        );
+
+        remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+            .await
+            .expect("an idle Project is removed");
+        drop(leases);
+
+        let verdict =
+            crate::lifecycle::enqueue_current(&tasks, &storage, &projects, &locks, None, task_id)
+                .await
+                .expect("the refusal is answered");
+        assert!(
+            matches!(&verdict, crate::lifecycle::EnqueueVerdict::Blocked(reason)
+                if reason == crate::domain::project::PROJECT_REMOVED_REFUSAL),
+            "{verdict:?}"
+        );
+        assert_eq!(
+            tasks.read().await[&task_id].status,
+            crate::domain::TaskStatus::Backlog
+        );
+        assert!(projects.read().await[&id].is_removed());
+    }
+
+    /// The reverse order: a Task that entered Queue first makes the removal
+    /// refuse, so removal cannot bypass the queue guard.
+    #[tokio::test]
+    async fn a_removal_after_a_queue_entry_is_refused_and_changes_nothing() {
+        let mut backlog = crate::test_helpers::create_test_task_full(
+            "queued first",
+            Uuid::nil(),
+            crate::domain::TaskStatus::Backlog,
+            0,
+        );
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        backlog.project_id = id;
+        let task_id = backlog.id;
+        let tasks = board(vec![backlog]);
+        let locks = crate::lifecycle::TaskLifecycleLocks::new();
+
+        let verdict =
+            crate::lifecycle::enqueue_current(&tasks, &storage, &projects, &locks, None, task_id)
+                .await
+                .expect("the entry is answered");
+        assert!(
+            matches!(verdict, crate::lifecycle::EnqueueVerdict::Queued(_)),
+            "{verdict:?}"
+        );
+
+        let refused =
+            remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+                .await;
+        assert!(refused.is_err(), "a queued Task blocks removal");
+        assert!(
+            !projects.read().await[&id].is_removed(),
+            "memory keeps the Project active"
+        );
+        assert_eq!(
+            tasks.read().await[&task_id].status,
+            crate::domain::TaskStatus::Queue
+        );
     }
 }

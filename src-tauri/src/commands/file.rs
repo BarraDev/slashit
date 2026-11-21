@@ -34,6 +34,9 @@ async fn project_root_for(
     let local_path = {
         let projects = state.project.projects.read().await;
         let project = projects.get(&id).ok_or("Project not found")?;
+        if project.is_removed() {
+            return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+        }
         let repositories = state.repository.repositories.read().await;
         project
             .repository_path(&repositories)
@@ -149,15 +152,18 @@ pub async fn read_file(
 #[tauri::command]
 pub async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    
-    app.dialog()
-        .file()
-        .set_title("Select Repository Folder")
-        .pick_folder(move |folder_path| {
-            let result = folder_path.map(|p| p.to_string());
-            let _ = tx.send(result);
-        });
-    
+
+    let mut dialog = app.dialog().file().set_title("Select Repository Folder");
+    // Start in the home folder: GTK otherwise opens on the empty Recent view,
+    // where nothing can be selected.
+    if let Some(home) = dirs::home_dir() {
+        dialog = dialog.set_directory(home);
+    }
+    dialog.pick_folder(move |folder_path| {
+        let result = folder_path.map(|p| p.to_string());
+        let _ = tx.send(result);
+    });
+
     match rx.await {
         Ok(Some(path)) => Ok(Some(path)),
         Ok(None) => Ok(None), // User cancelled

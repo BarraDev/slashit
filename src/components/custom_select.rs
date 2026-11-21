@@ -178,7 +178,7 @@ pub fn CustomSelect(
             // Dropdown menu
             <Show when=move || is_open.get()>
                 <div 
-                    class="absolute z-50 w-full mt-1 py-1 rounded-lg bg-[#1a1a1a] border border-white/10 shadow-xl max-h-60 overflow-auto animate-fade-in"
+                    class="w-full mt-1 py-1 rounded-lg bg-[#1a1a1a] border border-white/10 shadow-xl max-h-60 overflow-auto animate-fade-in"
                     role="listbox"
                 >
                     {move || {

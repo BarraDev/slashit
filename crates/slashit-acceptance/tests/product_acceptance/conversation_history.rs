@@ -17,7 +17,7 @@ const MESSAGE: &str = "[data-testid=\"conversation-message\"]";
 const EVENT: &str = "[data-testid=\"conversation-action-event\"]";
 const TIME: &str = "[data-testid=\"conversation-entry-time\"]";
 const JUMP: &str = "[data-testid=\"conversation-jump-latest\"]";
-const SETTINGS_HEADING: &str = "Configure your application preferences";
+const SETTINGS_GENERAL_TAB: &str = "[data-testid=\"settings-tab-general\"]";
 const CONTEXT_HEADING: &str = "Context Files";
 
 /// Completed question-and-answer turns in the long history. Each turn is two
@@ -483,7 +483,7 @@ async fn keyboard_shortcuts_as_the_running_webview_handles_them() {
         await_text(driver, "main", CONTEXT_HEADING).await.context("Ctrl+4 did not open the Context page")?;
 
         press_ctrl(driver, ',').await?;
-        await_text(driver, "main", SETTINGS_HEADING).await.context("Ctrl+, did not open Settings")?;
+        ui::visible(driver, SETTINGS_GENERAL_TAB).await.context("Ctrl+, did not open Settings")?;
 
         context.close_session(session, "keyboard", &Ok(())).await?;
         Ok::<_, anyhow::Error>(())

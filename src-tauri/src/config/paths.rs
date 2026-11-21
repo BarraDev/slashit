@@ -316,6 +316,13 @@ impl AppPaths {
         self.config_dir.join("workspaces.toml")
     }
 
+    /// The SlashIt-managed root of one Workspace: the effective root when the
+    /// Workspace has no custom folder. Application-owned, so it never lands in
+    /// a Project's repository.
+    pub fn workspace_managed_root(&self, workspace_id: Uuid) -> PathBuf {
+        self.data_dir.join("workspaces").join(workspace_id.to_string())
+    }
+
     /// Daemon credentials. Separate from `config.toml` so it can be locked to
     /// 0600 independently and excluded from any future config export.
     pub fn credentials_file(&self) -> PathBuf {

@@ -41,7 +41,9 @@ pub async fn create_project(name: String, repository_id: Option<String>, agent_t
         "agentType": agent_type,
     })).unwrap();
 
-    let response = invoke("create_project", args).await;
+    // `invoke` traps on a refused create, which aborted the caller silently:
+    // no message, and the dialog stayed open. The refusal must come back as Err.
+    let response = invoke_checked("create_project", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
@@ -85,4 +87,26 @@ pub async fn detach_project_from_workspace(project_id: String) -> Result<Project
 
     let response = invoke_checked("detach_project_from_workspace", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// Rename a Project's displayed name. The repository folder is not changed.
+pub async fn rename_project(project_id: String, name: String) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "id": project_id,
+        "name": name,
+    })).unwrap();
+
+    invoke_checked("update_project", args).await?;
+    Ok(())
+}
+
+/// Remove a Project from SlashIt's active Projects. Its folder, Tasks, history
+/// and identity are kept; opening the same folder again brings it back.
+pub async fn remove_project(project_id: String) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "id": project_id,
+    })).unwrap();
+
+    invoke_checked("remove_project", args).await?;
+    Ok(())
 }

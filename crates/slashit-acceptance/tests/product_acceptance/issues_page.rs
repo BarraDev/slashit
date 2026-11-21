@@ -49,9 +49,11 @@ async fn issues_journey(context: &TestContext) -> Result<()> {
     let (_agent, gh) = install_fakes(context, &root)?;
     script_issues(&gh)?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
+    let other_folder = root.join("other-project");
+    std::fs::create_dir_all(&other_folder)?;
 
     let session = context.start_session("issues-page").await?;
-    let outcome = browse_link_create(session.driver(), &gh, &repository).await;
+    let outcome = browse_link_create(session.driver(), &gh, &repository, &other_folder).await;
     context
         .close_session(session, "issues-page", &outcome)
         .await?;
@@ -97,7 +99,7 @@ fn script_issues(gh: &FakeGh) -> Result<()> {
     Ok(())
 }
 
-async fn browse_link_create(driver: &WebDriver, gh: &FakeGh, repository: &GitFixture) -> Result<()> {
+async fn browse_link_create(driver: &WebDriver, gh: &FakeGh, repository: &GitFixture, other_folder: &Path) -> Result<()> {
     ui::assert_frontend_is_real(driver).await?;
     let Prerequisites { project_id, task_id, title } =
         create_prerequisites(driver, repository, "Issues page", "Never runs.").await?;
@@ -318,26 +320,27 @@ async fn browse_link_create(driver: &WebDriver, gh: &FakeGh, repository: &GitFix
         bail!("the created Task does not link Issue 3: {created}");
     }
 
-    open_task_in_other_project(driver, &project_id).await
+    open_task_in_other_project(driver, other_folder).await
 }
 
 /// A Task in another Project is linked from the Issues page and opened there.
 /// The page switches the selected Project and the drawer opens on that board.
-async fn open_task_in_other_project(driver: &WebDriver, project_id: &str) -> Result<()> {
-    let listed = ui::invoke(driver, "list_projects", json!({})).await?;
-    let repository_id = listed
-        .as_array()
-        .context("list_projects did not answer with a list")?
-        .iter()
-        .find(|p| p["id"] == json!(project_id))
-        .and_then(|p| p["repository_id"].as_str())
-        .context("the first Project has no repository")?
-        .to_string();
+async fn open_task_in_other_project(driver: &WebDriver, other_folder: &Path) -> Result<()> {
+    // One folder is one active Project, so the other Project gets a folder of its own.
+    let other_repository = created_id(
+        ui::invoke(
+            driver,
+            "create_repository",
+            json!({ "localPath": other_folder, "remoteUrl": Value::Null, "initialize": Value::Null }),
+        )
+        .await?,
+        "create_repository",
+    )?;
     let other_project = created_id(
         ui::invoke(
             driver,
             "create_project",
-            json!({ "name": "Acceptance Other Project", "repositoryId": repository_id, "agentType": "claude_code" }),
+            json!({ "name": "Acceptance Other Project", "repositoryId": other_repository, "agentType": "claude_code" }),
         )
         .await?,
         "create_project",

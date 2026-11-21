@@ -30,6 +30,9 @@ async fn project_and_path(
         .get(&project_id)
         .cloned()
         .ok_or_else(|| format!("Project {project_id} not found"))?;
+    if project.is_removed() {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
     let repository_id = project
         .repository_id
         .ok_or_else(|| format!("Project {} has no repository folder linked", project.name))?;
@@ -309,6 +312,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
         Fx {

@@ -5941,6 +5941,9 @@ async fn reserve_task_admitted_as(
 ) -> Result<Option<crate::queue::PrHelperLease>, String> {
     let approval_required = admission == PrSideEffectAdmission::RequiresApproval;
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    // Under the lease, which removal holds for every Task of the Project, so
+    // a removal cannot commit between this check and the reservation.
+    crate::commands::project::refuse_if_task_project_removed(state, task_id).await?;
     refuse_while_republish_pending(state, task_id).await?;
     // A pull request moves the task to PR Created, out of the column its
     // unfinished local integration is resumed from. Refused before any
@@ -6054,6 +6057,7 @@ async fn reserve_task_for_republish(
     task_id: Uuid,
 ) -> Result<Option<crate::queue::PrHelperLease>, String> {
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    crate::commands::project::refuse_if_task_project_removed(state, task_id).await?;
     match state.executor.get() {
         Some(executor) => executor
             .begin_republish_under_lease(task_id)
@@ -6518,6 +6522,7 @@ fn extract_text_from_stream_json(stdout: &str) -> String {
 
 async fn create_pr_inner(state: &crate::AppState, task_id: &str) -> Result<String, String> {
     let task_uuid = Uuid::parse_str(task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(state, task_uuid).await?;
 
     // Before anything below reads a branch name, pushes it, or asks GitHub
     // to open a pull request against it: end whatever execution, AI review/
@@ -14637,6 +14642,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             };
             let project_id = project.id;
             state
@@ -15222,6 +15228,43 @@ mod tests {
                     "admission records no decision"
                 );
                 assert_eq!(after.status, TaskStatus::HumanReview);
+            }
+
+            /// A removed Project admits no pull request side effect: neither an
+            /// explicit publication, nor a republish, nor a recovery. The Task
+            /// itself is Done here, so only the Project decides.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_removed_projects_task_admits_no_pull_request_side_effect() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-removed"),
+                    TaskStatus::Done,
+                )
+                .await;
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+
+                let publication = reserve_task_for_explicit_publication(&state, task_id)
+                    .await
+                    .err()
+                    .expect("explicit publication refuses a removed Project's Task");
+                assert_eq!(publication, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                let republish = reserve_task_for_republish(&state, task_id)
+                    .await
+                    .err()
+                    .expect("republish refuses a removed Project's Task");
+                assert_eq!(republish, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                let generic = reserve_task_for_pr_side_effect(&state, task_id)
+                    .await
+                    .err()
+                    .expect("the generic admission refuses a removed Project's Task");
+                assert_eq!(generic, crate::domain::project::PROJECT_REMOVED_REFUSAL);
             }
 
             /// The gate's Human Review rule applies to every Task in Human Review

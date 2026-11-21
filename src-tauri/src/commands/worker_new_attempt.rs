@@ -277,6 +277,16 @@ async fn prepare(
             "The Task has an unfinished cleanup, restack, integration or pull request.".into(),
         );
     }
+    if state
+        .project
+        .projects
+        .read()
+        .await
+        .get(&task.project_id)
+        .is_some_and(|project| project.is_removed())
+    {
+        refusals.push(crate::domain::project::PROJECT_REMOVED_REFUSAL.into());
+    }
     if let Some(executor) = state.executor.get() {
         if crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), task.id).await {
             refusals.push("An execution or review currently owns this Task.".into());
@@ -721,6 +731,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 

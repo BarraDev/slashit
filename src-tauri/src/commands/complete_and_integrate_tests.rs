@@ -129,6 +129,7 @@ async fn fixture_with(detach: bool, remote: Option<&str>) -> Fx {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         },
     );
 

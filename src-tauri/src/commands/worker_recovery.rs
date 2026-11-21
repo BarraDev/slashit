@@ -613,6 +613,8 @@ pub(crate) async fn accept_result(
     }
     let task_id = request.task_id;
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    // Checked under the lease: removal holds this lease while it writes `removed_at`.
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, request.project_id).await?;
 
     let task = state
         .task
@@ -1016,6 +1018,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 
@@ -1128,6 +1131,40 @@ mod tests {
             "no ref, registration or index changed"
         );
         assert_eq!(fx.on_disk().worker_handoff, before.2.worker_handoff);
+    }
+
+    /// Removal holds the Task's lease while it writes `removed_at`. An accept
+    /// that asks for the lease during that window can only proceed after the
+    /// removal has committed, so it must refuse and leave the Task as found.
+    #[tokio::test]
+    async fn an_accept_waiting_on_a_removal_is_refused_and_writes_nothing() {
+        let fx = fixture().await;
+        let task_id = fx.task_id;
+        let before = fx.state.task.tasks.read().await.get(&task_id).cloned().expect("the Task");
+        let removal = fx
+            .state
+            .task_lifecycle_locks
+            .acquire(task_id)
+            .await
+            .expect("the removal takes the lease");
+
+        let removal_side = async {
+            tokio::task::yield_now().await;
+            fx.state.project.projects.write().await.get_mut(&fx.project_id).expect("the Project").removed_at =
+                Some(chrono::Utc::now());
+            drop(removal);
+        };
+        let (_, outcome) = tokio::join!(removal_side, accept_result(&fx.state, fx.request(task_id)));
+
+        assert!(outcome.is_err(), "the accept must be refused, got {outcome:?}");
+        assert_eq!(outcome.unwrap_err(), crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        let after = fx.state.task.tasks.read().await.get(&task_id).cloned().expect("the Task");
+        assert_eq!(after.status, before.status);
+        assert_eq!(
+            format!("{:?}", after.worker_handoff),
+            format!("{:?}", before.worker_handoff),
+            "a refused accept leaves the Worker handoff exactly as found"
+        );
     }
 
     #[tokio::test]

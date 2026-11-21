@@ -46,23 +46,29 @@ impl AsRef<Path> for WorkspaceRoot {
     }
 }
 
-/// A product-level container over several projects.
+/// A named group of Projects.
 ///
-/// The workspace folder is what agents are launched from (cwd). It holds
-/// shared instruction files (`AGENTS.md`, `CLAUDE.md`, `.agents/`, etc.).
 /// Membership is not tracked here; a Project names the Workspace it belongs
 /// to via `ProjectScope`.
+///
+/// `root_path` is an advanced, optional Shared Agent Context Directory. When
+/// it is set, a Worker of a member Project starts from that folder and the
+/// Task Checkout is exposed with `--add-dir`. When it is absent, the Workspace
+/// is grouping only and Workers start from their own Task Checkout as before.
+/// Records written before the root became optional still carry it and keep
+/// their meaning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Uuid,
     pub name: String,
-    pub root_path: WorkspaceRoot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<WorkspaceRoot>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl Workspace {
-    pub fn new(name: String, root_path: WorkspaceRoot) -> Self {
+    pub fn new(name: String, root_path: Option<WorkspaceRoot>) -> Self {
         let now = chrono::Utc::now();
         Self {
             id: Uuid::new_v4(),

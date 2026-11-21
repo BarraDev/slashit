@@ -14,7 +14,7 @@ extern "C" {
 struct CreateArgs<'a> {
     name: &'a str,
     #[serde(rename = "rootPath")]
-    root_path: &'a str,
+    root_path: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -39,7 +39,7 @@ fn js_error_to_string(value: JsValue) -> String {
     })
 }
 
-pub async fn create_workspace(name: &str, root_path: &str) -> Result<Workspace, String> {
+pub async fn create_workspace(name: &str, root_path: Option<&str>) -> Result<Workspace, String> {
     let args = serde_wasm_bindgen::to_value(&CreateArgs { name, root_path })
         .map_err(|e| e.to_string())?;
     let result = JsFuture::from(invoke("create_workspace", args))
@@ -51,6 +51,33 @@ pub async fn create_workspace(name: &str, root_path: &str) -> Result<Workspace, 
 pub async fn list_workspaces() -> Result<Vec<Workspace>, String> {
     let args = serde_wasm_bindgen::to_value(&Empty).map_err(|e| e.to_string())?;
     let result = JsFuture::from(invoke("list_workspaces", args))
+        .await
+        .map_err(js_error_to_string)?;
+    serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
+}
+
+/// Renames a Workspace. Membership and its root are unchanged.
+pub async fn rename_workspace(workspace_id: &str, name: &str) -> Result<Workspace, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "workspaceId": workspace_id,
+        "name": name,
+    }))
+    .map_err(|e| e.to_string())?;
+    let result = JsFuture::from(invoke("rename_workspace", args))
+        .await
+        .map_err(js_error_to_string)?;
+    serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
+}
+
+/// Sets a Workspace's custom root, or returns it to the managed root when
+/// `root_path` is `None`. Existing folders are never moved or deleted.
+pub async fn set_workspace_root(workspace_id: &str, root_path: Option<&str>) -> Result<Workspace, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "workspaceId": workspace_id,
+        "rootPath": root_path,
+    }))
+    .map_err(|e| e.to_string())?;
+    let result = JsFuture::from(invoke("set_workspace_root", args))
         .await
         .map_err(js_error_to_string)?;
     serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
@@ -69,6 +96,15 @@ pub async fn delete_workspace(workspace_id: &str) -> Result<bool, String> {
     let args = serde_wasm_bindgen::to_value(&IdArgs { workspace_id })
         .map_err(|e| e.to_string())?;
     let result = JsFuture::from(invoke("delete_workspace", args))
+        .await
+        .map_err(js_error_to_string)?;
+    serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
+}
+
+pub async fn get_workspace_root(workspace_id: &str) -> Result<crate::models::workspace::WorkspaceRootInfo, String> {
+    let args = serde_wasm_bindgen::to_value(&IdArgs { workspace_id })
+        .map_err(|e| e.to_string())?;
+    let result = JsFuture::from(invoke("get_workspace_root", args))
         .await
         .map_err(js_error_to_string)?;
     serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())

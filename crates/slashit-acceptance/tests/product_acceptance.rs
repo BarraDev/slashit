@@ -91,6 +91,8 @@ mod pr_comment_review;
 mod pr_comment_analyze;
 #[path = "product_acceptance/project_rail.rs"]
 mod project_rail;
+#[path = "product_acceptance/project_removal.rs"]
+mod project_removal;
 #[path = "product_acceptance/portable_import.rs"]
 mod portable_import;
 #[path = "product_acceptance/terminal_lifecycle.rs"]
@@ -3973,13 +3975,14 @@ async fn clean_up_beside_a_bystander(
 
 // ---------------------------------------------------------------------------
 // Workspace membership: attaching a Project to a Workspace and detaching it
-// again, driven through the Workspaces page.
+// again, driven through Organize Projects, where Workspaces are managed.
 // ---------------------------------------------------------------------------
 
 /// How long the Workspaces page gets to reflect a membership change or show
 /// its toast. Both are one IPC round trip and one re-render away.
 const MEMBERSHIP_DEADLINE: Duration = Duration::from_secs(20);
-const NAV_WORKSPACES: &str = "[data-testid=\"nav-workspaces\"]";
+const RAIL_ORGANIZE: &str = "[data-testid=\"rail-organize-projects\"]";
+const ORGANIZER: &str = "[data-testid=\"project-organizer\"]";
 
 /// Prove that a Project can be attached to a Workspace from the Workspaces
 /// page, that the membership survives a full application restart, and that
@@ -4166,14 +4169,17 @@ async fn detach_after_restart(driver: &WebDriver, fixture: &MembershipFixture) -
     Ok(())
 }
 
-/// Navigate to the Workspaces page and expand one workspace.
+/// Open Organize Projects from the Project Rail and expand one workspace.
 async fn open_workspace(driver: &WebDriver, workspace_id: &str) -> Result<WebElement> {
     ui::assert_frontend_is_real(driver).await?;
-    ui::visible(driver, NAV_WORKSPACES)
+    ui::visible(driver, RAIL_ORGANIZE)
         .await?
         .click()
         .await
-        .context("could not open the Workspaces page")?;
+        .context("could not open Organize Projects")?;
+    ui::visible(driver, ORGANIZER)
+        .await
+        .context("Organize Projects did not open")?;
     let item_selector = format!("[data-testid=\"workspace-{workspace_id}\"]");
     let item = ui::visible(driver, &item_selector)
         .await
@@ -4329,10 +4335,23 @@ async fn choose_and_attach(item: &WebElement, project_name: &str) -> Result<()> 
         .with_context(|| {
             format!("the dropdown does not offer {project_name:?}; it offers {names:?}")
         })?;
-    option
-        .click()
-        .await
-        .context("could not choose the project")?;
+    // The option fades in with its dropdown. Its text can be readable before WebDriver
+    // will click it, so wait for it to be displayed as well.
+    let started = Instant::now();
+    while !option.is_displayed().await.context("could not read the option's display state")? {
+        if started.elapsed() > MEMBERSHIP_DEADLINE {
+            bail!("the option for {project_name:?} was never displayed within {}s", MEMBERSHIP_DEADLINE.as_secs());
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    // The dropdown list scrolls inside the dialog, so bring the option into view first.
+    option.scroll_into_view().await.context("could not scroll the option into view")?;
+    if let Err(error) = option.click().await {
+        let rect = option.rect().await.ok();
+        return Err(anyhow::Error::new(error).context(format!(
+            "could not choose the project: option rect {rect:?}"
+        )));
+    }
     item.find(By::Css("[data-testid=\"workspace-attach-submit\"]"))
         .await
         .context("the workspace has no Attach button")?

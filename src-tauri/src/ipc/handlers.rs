@@ -174,6 +174,7 @@ async fn handle_list_projects(ctx: &IpcContext) -> IpcResponse {
     let repositories = ctx.repositories.read().await;
     let summaries: Vec<ProjectSummary> = projects
         .values()
+        .filter(|p| !p.is_removed())
         .map(|p| ProjectSummary {
             id: p.id.to_string(),
             name: p.name.clone(),
@@ -1141,7 +1142,7 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
     if matches!(new_status, crate::domain::TaskStatus::Done) {
         // Taken under the lease, and decided on the status read under it, as the
         // desktop's close is, so the refusal comes before terminalization begins.
-        let _lease = match ctx.task_lifecycle_locks.acquire(task_uuid).await {
+        let _lease = match crate::commands::project::lease_active_task_in(&ctx.task_lifecycle_locks, &ctx.tasks, &ctx.projects, task_uuid).await {
             Ok(lease) => lease,
             Err(e) => return IpcResponse::error(e),
         };
@@ -1173,7 +1174,7 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         };
     }
 
-    let _lease = match ctx.task_lifecycle_locks.acquire(task_uuid).await {
+    let _lease = match crate::commands::project::lease_active_task_in(&ctx.task_lifecycle_locks, &ctx.tasks, &ctx.projects, task_uuid).await {
         Ok(lease) => lease,
         Err(e) => return IpcResponse::error(e),
     };
@@ -1194,6 +1195,14 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
     {
         Some(found) => found,
         None => return IpcResponse::error(format!("Task {task_id} not found")),
+    };
+    // A removed Project's Tasks do not enter Queue, from the CLI either. Read
+    // under the lease held above.
+    let queue_refusal = match queue_refusal {
+        Some(refusal) => Some(refusal),
+        None => {
+            crate::lifecycle::removed_project_queue_refusal(&ctx.tasks, &ctx.projects, task_uuid, &new_status).await
+        }
     };
 
     // A Task in Human Review leaves that column only through the application's
@@ -1356,6 +1365,18 @@ async fn handle_edit_task(
         Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
     };
 
+    let _lease = match crate::commands::project::lease_active_task_in(
+        &ctx.task_lifecycle_locks,
+        &ctx.tasks,
+        &ctx.projects,
+        task_uuid,
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(e) => return IpcResponse::error(e),
+    };
+
     let amend = move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             if let Some(t) = title.clone() {
@@ -1429,6 +1450,8 @@ async fn handle_set_task_model(ctx: &IpcContext, task_id: String, model: String)
     };
     match crate::commands::task::set_task_model_and_review_mode(
         &ctx.tasks,
+        &ctx.projects,
+        &ctx.task_lifecycle_locks,
         &ctx.storage,
         task_uuid,
         Some(model),
@@ -1469,6 +1492,8 @@ async fn handle_set_task_review_mode(
     };
     match crate::commands::task::set_task_model_and_review_mode(
         &ctx.tasks,
+        &ctx.projects,
+        &ctx.task_lifecycle_locks,
         &ctx.storage,
         task_uuid,
         None,
@@ -1501,6 +1526,7 @@ async fn handle_set_task_dependencies(
     };
     match crate::commands::task::set_task_dependencies_via(
         &ctx.tasks,
+        &ctx.projects,
         &ctx.storage,
         &ctx.task_lifecycle_locks,
         task_uuid,
@@ -1549,6 +1575,7 @@ async fn handle_enqueue_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
     match crate::lifecycle::enqueue_current_refusing_human_review(
         &ctx.tasks,
         &ctx.storage,
+        &ctx.projects,
         &ctx.task_lifecycle_locks,
         running,
         task_uuid,
@@ -1784,6 +1811,7 @@ pub(super) mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 
@@ -1911,6 +1939,7 @@ pub(super) mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 
@@ -2067,6 +2096,7 @@ pub(super) mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 
@@ -2152,6 +2182,7 @@ pub(super) mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
         ctx.projects.write().await.insert(
             with_repo_id,
@@ -3012,6 +3043,7 @@ mod task_configuration_writes {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         }
     }
 
@@ -3646,6 +3678,7 @@ mod import_lock_order {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         }
     }
 

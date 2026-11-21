@@ -79,6 +79,7 @@ pub async fn import_jira_issues(
     target_project_id: String,
 ) -> Result<Vec<Task>, String> {
     let project_id = Uuid::parse_str(&target_project_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, project_id).await?;
 
     let jql = jql_filter.unwrap_or_else(|| {
         format!(

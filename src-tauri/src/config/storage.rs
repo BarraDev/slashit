@@ -3569,6 +3569,7 @@ baz = 123
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         }
     }
 
@@ -3621,6 +3622,7 @@ baz = 123
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
         config.projects.insert(project_id.to_string(), project);
         
@@ -4120,6 +4122,7 @@ user_name = "Test"
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 
@@ -4216,6 +4219,7 @@ user_name = "Test"
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         };
 
         let mut config = AppConfig::default();

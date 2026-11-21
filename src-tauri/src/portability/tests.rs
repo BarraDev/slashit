@@ -91,6 +91,7 @@ pub(super) fn project(repository: Option<Uuid>) -> Project {
         },
         created_at: at(),
         updated_at: at(),
+        removed_at: None,
     }
 }
 

@@ -306,6 +306,7 @@ pub async fn create_task_from_issue(
     project_id: String,
 ) -> Result<Task, String> {
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, project_id).await?;
     let address = crate::domain::github_issue_link::parse_issue_url(&format!(
         "https://github.com/{repo}/issues/{issue_number}"
     ))?;
@@ -782,6 +783,7 @@ mod issue_create_tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
         project_id

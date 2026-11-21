@@ -12,8 +12,12 @@ pub fn Sidebar(
     on_navigate: Callback<String>,
     #[prop(into)] selected_project: Signal<String>,
     set_selected_project: WriteSignal<String>,
+    #[prop(into)] selected_workspace: Signal<String>,
 ) -> impl IntoView {
     let (collapsed, set_collapsed) = signal(false);
+    // In Workspace context the Project pages are hidden: they would show one
+    // member Project under the Workspace's name.
+    let workspace_mode = Signal::derive(move || !selected_workspace.get().is_empty());
 
     // Active project info
     let (project_name, set_project_name) = signal(String::new());
@@ -138,7 +142,7 @@ pub fn Sidebar(
             {move || {
                 let name = project_name.get();
                 let path = project_path.get();
-                if name.is_empty() {
+                if name.is_empty() || workspace_mode.get() {
                     view! { <div></div> }.into_any()
                 } else if collapsed.get() {
                     // Collapsed: show colored dot with tooltip
@@ -175,6 +179,7 @@ pub fn Sidebar(
                 "flex-1 space-y-1 overflow-y-auto {}",
                 if collapsed.get() { "p-1.5" } else { "p-3" }
             )>
+                <Show when=move || !workspace_mode.get()>
                 <SidebarNavItem
                     page="conversations".to_string()
                     current_page=current_page
@@ -249,18 +254,6 @@ pub fn Sidebar(
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" />
                     </svg>
                 </SidebarNavItem>
-                <SidebarNavItem
-                    page="workspaces".to_string()
-                    current_page=current_page
-                    on_navigate=on_navigate
-                    label="Workspaces".to_string()
-                    shortcut="".to_string()
-                    collapsed=collapsed
-                >
-                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-                    </svg>
-                </SidebarNavItem>
                 {page_offered("worktrees").then(|| view! {
                     <SidebarNavItem
                         page="worktrees".to_string()
@@ -299,6 +292,7 @@ pub fn Sidebar(
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
                     </svg>
                 </SidebarNavItem>
+                </Show>
                 <SidebarNavItem
                     page="settings".to_string()
                     current_page=current_page

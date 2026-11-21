@@ -36,10 +36,34 @@ async fn storage_journey(context: &TestContext) -> Result<()> {
 }
 
 async fn measure_and_refresh(driver: &WebDriver, context: &TestContext) -> Result<()> {
+    // Outside Project context Storage is hidden, not shown empty.
     page(
         driver,
-        "localStorage.setItem('slashit_current_page', 'settings'); return true;",
+        "localStorage.removeItem('slashit_selected_project'); \
+         localStorage.setItem('slashit_current_page', 'settings'); return true;",
         vec![],
+    )
+    .await?;
+    driver.refresh().await?;
+    ui::assert_frontend_is_real(driver).await?;
+    ui::visible(driver, "[data-testid=\"settings-tab-general\"]").await?;
+    ui::assert_absent(driver, SETTINGS_STORAGE_TAB).await?;
+
+    // Storage belongs to one Project's Settings, so select a Project as the rail does.
+    let project_id = created_id(
+        ui::invoke(
+            driver,
+            "create_project",
+            json!({ "name": "Storage Journey", "repositoryId": Value::Null, "agentType": "claude_code" }),
+        )
+        .await?,
+        "create_project",
+    )?;
+    page(
+        driver,
+        "localStorage.setItem('slashit_current_page', 'settings'); \
+         localStorage.setItem('slashit_selected_project', arguments[0]); return true;",
+        vec![json!(project_id)],
     )
     .await?;
     driver.refresh().await?;
