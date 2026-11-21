@@ -1873,6 +1873,41 @@ mod tests {
         assert!(projects.read().await[&removed_id].is_removed(), "the refused Project stays removed");
     }
 
+    /// Reopening a removed folder and opening it as a new Project race on the
+    /// same repository. Whichever commits first, exactly one Project is active
+    /// for the folder afterwards, and the reopened one keeps its id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reopen_and_a_new_open_of_one_folder_leave_exactly_one_active_project() {
+        let (storage, _temp) = create_test_storage();
+        storage.save_config(&AppConfig::default()).unwrap();
+        let repository = Uuid::new_v4();
+        let mut removed = make_test_project(Uuid::new_v4());
+        removed.repository_id = Some(repository);
+        removed.removed_at = Some(chrono::Utc::now());
+        let removed_id = removed.id;
+        let mut fresh = make_test_project(Uuid::new_v4());
+        fresh.repository_id = Some(repository);
+        let projects = RwLock::new(HashMap::from([(removed_id, removed)]));
+
+        let (reopened, created) = tokio::join!(
+            reopen_project_committed(&projects, &storage, removed_id),
+            create_project_committed(&projects, &storage, fresh),
+        );
+
+        let map = projects.read().await;
+        let active: Vec<Uuid> = map
+            .values()
+            .filter(|p| !p.is_removed() && p.repository_id == Some(repository))
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(active.len(), 1, "exactly one active Project per folder, got {active:?}");
+        match (&reopened, &created) {
+            (Ok(project), Err(_)) => assert_eq!(project.id, removed_id, "the reopened identity is kept"),
+            (Err(_), Ok(project)) => assert_eq!(active, vec![project.id]),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
     /// Project deletion whose config write replaced the file without
     /// confirming it: nothing destructive may run, the evidence is kept, and
     /// the retried deletion is what finishes it once the file is confirmed.
