@@ -453,4 +453,24 @@ mod tests {
         // The chosen local branch still works with that origin/HEAD.
         assert_eq!(source_of(&report(&fx.state, fx.project_id).await.unwrap()), "Local");
     }
+
+    #[tokio::test]
+    async fn recording_a_base_on_a_removed_project_is_refused_and_changes_nothing() {
+        let fx = fixture().await;
+        let base = Some(ProjectBase::LocalBranch { branch: "trunk".into() });
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().removed_at =
+            Some(chrono::Utc::now());
+        let removed = fx.state.project.projects.read().await[&fx.project_id].clone();
+
+        let refused = record_project_base(&fx.state, fx.project_id, base.clone()).await.unwrap_err();
+        assert_eq!(refused, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        let after = fx.state.project.projects.read().await[&fx.project_id].clone();
+        assert_eq!(after.base, removed.base, "a removed Project gains no base");
+        assert_eq!(after.updated_at, removed.updated_at, "a refused write leaves updated_at alone");
+
+        // An active Project records the same base: the refusal is the removal, not the call.
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().removed_at = None;
+        record_project_base(&fx.state, fx.project_id, base.clone()).await.unwrap();
+        assert_eq!(fx.state.project.projects.read().await[&fx.project_id].base, base);
+    }
 }

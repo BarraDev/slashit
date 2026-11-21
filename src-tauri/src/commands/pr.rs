@@ -15266,6 +15266,51 @@ mod tests {
                 assert_eq!(generic, crate::domain::project::PROJECT_REMOVED_REFUSAL);
             }
 
+            /// Linking a pull request is the path `sync_existing_pr` takes with no
+            /// reservation at all, so the lease check is the only guard it has.
+            /// A removed Project's Task records nothing, and an active one links.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn linking_a_pull_request_refuses_a_removed_project_without_recording_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-link-removed"),
+                    TaskStatus::InProgress,
+                )
+                .await;
+                let pr_url = "https://github.com/BarraDev/slashit/pull/9001";
+                let before = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+                match link_pr_to_task_reserved(&state, task_id, pr_url, None).await {
+                    Err(PrLinkFailure::NotRecorded(message)) => assert_eq!(
+                        message,
+                        crate::domain::project::PROJECT_REMOVED_REFUSAL
+                    ),
+                    Err(_) => panic!("a removed Project's link was not refused as NotRecorded"),
+                    Ok(()) => panic!("a removed Project's Task accepted a pull request link"),
+                }
+                let after = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "a refused link changes no Task state or evidence"
+                );
+
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = None;
+                }
+                link_pr_to_task_reserved(&state, task_id, pr_url, None)
+                    .await
+                    .unwrap_or_else(|_| panic!("an active Project's Task links its pull request"));
+            }
+
             /// The gate's Human Review rule applies to every Task in Human Review
             /// that is not approved, whether or not a commit was bound, and to
             /// nothing else. A locked task map is refused, not assumed.

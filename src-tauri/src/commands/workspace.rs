@@ -451,6 +451,32 @@ mod tests {
             .expect("re-setting a Workspace's own root is accepted");
     }
 
+    /// A Workspace without a custom root reads its managed folder, so that
+    /// folder is owned too: another Workspace cannot claim it as a custom root.
+    #[tokio::test]
+    async fn a_folder_that_is_another_workspaces_managed_folder_is_refused() {
+        let (temp, paths, registry) = fixture();
+        let owner = create_workspace_core(&registry, &paths, "Owner".into(), None).await.unwrap();
+        let managed = paths.workspace_managed_root(owner.id);
+        let other = create_workspace_core(&registry, &paths, "Other".into(), None).await.unwrap();
+
+        let refusal = set_workspace_root_core(&registry, &paths, other.id, Some(managed.display().to_string()))
+            .await
+            .expect_err("a managed folder read by another Workspace cannot become a custom root");
+        assert!(refusal.contains("Owner"), "{refusal}");
+        let refusal = create_workspace_core(&registry, &paths, "Third".into(), Some(managed.display().to_string()))
+            .await
+            .expect_err("creating over another Workspace's managed folder is refused");
+        assert!(refusal.contains("already registered"), "{refusal}");
+
+        // A distinct folder is still accepted for the same Workspace.
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        set_workspace_root_core(&registry, &paths, other.id, Some(elsewhere.display().to_string()))
+            .await
+            .expect("a folder no other Workspace reads is accepted");
+    }
+
     #[tokio::test]
     async fn clearing_the_custom_root_returns_to_the_managed_root_without_deleting_anything() {
         let (temp, paths, registry) = fixture();

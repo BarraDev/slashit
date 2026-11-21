@@ -71,8 +71,15 @@ pub fn WorkspaceHome(
                             } else {
                                 "Workspace directory (managed by SlashIt)"
                             };
-                            let missing = (!root.exists).then(|| view! {
-                                <span class="text-red-300">" Missing: agents of member Projects cannot start here until it exists."</span>
+                            // A missing custom root stops member Workers from starting there. The
+                            // managed folder is not read by Workers, so its absence is reported alone.
+                            let missing = (!root.exists).then(|| {
+                                let text = if root.custom {
+                                    " Missing: agents of member Projects cannot start here until it exists."
+                                } else {
+                                    " Missing: the managed folder is not on disk."
+                                };
+                                view! { <span class="text-red-300">{text}</span> }
                             });
                             let shown = short_path(&root.path);
                             view! {

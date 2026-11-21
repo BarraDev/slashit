@@ -232,10 +232,23 @@ fn WorkspaceItem(
     // The effective folder, from the backend: the custom root, or the managed
     // folder SlashIt created for this Workspace.
     let root_info = RwSignal::new(None::<WorkspaceRootInfo>);
+    // Overlapping lookups (mount and after a save) apply only the newest reply, so an
+    // older reply cannot replace the root a save just displayed.
+    let root_read = StoredValue::new(0u64);
     let load_root_info = move || {
+        let Some(read) = root_read.try_update_value(|n| {
+            *n += 1;
+            *n
+        }) else {
+            return;
+        };
         spawn_local(async move {
-            if let Ok(info) = workspace_service::get_workspace_root(&ws_id.to_string()).await {
-                root_info.set(Some(info));
+            let result = workspace_service::get_workspace_root(&ws_id.to_string()).await;
+            if root_read.try_get_value() != Some(read) {
+                return;
+            }
+            if let Ok(info) = result {
+                let _ = root_info.try_set(Some(info));
             }
         });
     };

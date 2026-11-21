@@ -37,7 +37,8 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
         let read = next(workspaces_read);
         async move {
             let result = workspace_service::list_workspaces().await;
-            if workspaces_read.get_value() != read {
+            // try_get_value: the organizer may have closed during the await.
+            if workspaces_read.try_get_value() != Some(read) {
                 return;
             }
             match result {
@@ -63,7 +64,7 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
             load_workspaces().await;
             let read = next(projects_read);
             let result = list_projects().await;
-            if projects_read.get_value() != read {
+            if projects_read.try_get_value() != Some(read) {
                 return;
             }
             match result {
@@ -105,15 +106,21 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
             let root = (!path.is_empty()).then_some(path.as_str());
             match workspace_service::create_workspace(&name, root).await {
                 Ok(_) => {
-                    set_new_name.set(String::new());
-                    set_new_path.set(String::new());
+                    let _ = set_new_name.try_set(String::new());
+                    let _ = set_new_path.try_set(String::new());
                     toast::success("Workspace created".to_string());
                     reload_membership();
                     on_changed.run(());
                 }
-                Err(e) => toast::error(format!("Failed to create workspace: {}", e)),
+                Err(e) => {
+                    // The backend can publish a Workspace and still report a failed
+                    // save. Reload so that such a Workspace is shown rather than hidden;
+                    // the draft stays, so a retry is the person's explicit choice.
+                    reload_membership();
+                    toast::error(format!("Failed to create workspace: {}", e));
+                }
             }
-            set_creating.set(false);
+            let _ = set_creating.try_set(false);
         });
     };
 

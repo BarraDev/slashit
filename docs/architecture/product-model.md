@@ -132,8 +132,8 @@ Only part of that exists today.
   Project changes the selection only when that Project was the selected one in
   Project context. A Workspace has no Conversation yet, and there is no
   aggregate view across member Projects beyond that list.
-- Removing a Project is not deletion. The removal sets `removed_at` and nothing
-  else: the Project keeps its id, Repository association, configuration,
+- Removing a Project is not deletion. The removal sets `removed_at` and
+  `updated_at` and nothing else: the Project keeps its id, Repository association, configuration,
   Tasks, Conversations, history, worktrees, branches, files and its Workspace
   membership record. Removed Projects are left out of the active Project list
   and refuse new work at every front door. Removal is refused, with the reason
