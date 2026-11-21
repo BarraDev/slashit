@@ -183,6 +183,11 @@ pub struct OpenCodeRunConfig {
     /// without one would use OpenCode's own default, which SlashIt does not
     /// choose and may bill, so [`OpenCodeRunner::start`] refuses it.
     pub model: Option<String>,
+    /// Extra directories the session is given, sent only when the agent
+    /// advertises `additionalDirectories`. A grant is not a sandbox. Production
+    /// passes none: the policy denies `external_directory`, so an OpenCode run
+    /// with a Workspace root is still refused until that grant is verified.
+    pub additional_dirs: Vec<std::path::PathBuf>,
 }
 
 /// A running OpenCode session. Dropping it ends the process and its group.
@@ -278,7 +283,7 @@ impl OpenCodeRunner {
             .map_err(|e| e.to_string())?;
         connection.initialize().await.map_err(|e| e.to_string())?;
         let session = connection
-            .new_session(&config.working_dir)
+            .new_session_with_dirs(&config.working_dir, &config.additional_dirs)
             .await
             .map_err(|e| e.to_string())?;
         // The model is selected before the prompt is sent, and the run stops
@@ -618,6 +623,7 @@ mod tests {
         OpenCodeRunConfig {
             prompt: "make the change".into(),
             working_dir: std::env::temp_dir(),
+            additional_dirs: Vec::new(),
             program: debug_dir
                 .join("acp_fixture_agent")
                 .to_string_lossy()

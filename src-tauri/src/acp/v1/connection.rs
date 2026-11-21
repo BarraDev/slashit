@@ -56,6 +56,8 @@ pub enum AcpError {
     NotInitialized,
     #[error("the agent did not return a usable session identifier")]
     InvalidSessionId,
+    #[error("the agent does not accept additional directories, so this session cannot be given them")]
+    AdditionalDirectoriesUnsupported,
     #[error("{method} failed with JSON-RPC error {code}: {message}")]
     Rpc {
         method: &'static str,
@@ -307,12 +309,33 @@ impl Connection {
     }
 
     /// Creates a session. The working directory must be absolute, and the
-    /// agent's session identifier is stored without interpretation.
-    pub async fn new_session(&self, cwd: &Path) -> Result<SessionRef, AcpError> {
+    /// agent's session identifier is stored without interpretation. Extra
+    /// directories are sent only when the agent advertised
+    /// `additionalDirectories`, so an agent without it is refused rather than
+    /// started without them. The grant is not a sandbox: the agent decides what
+    /// it does with it.
+    pub async fn new_session_with_dirs(
+        &self,
+        cwd: &Path,
+        additional_dirs: &[PathBuf],
+    ) -> Result<SessionRef, AcpError> {
         self.require_initialized()?;
+        if !additional_dirs.is_empty() {
+            let supported = process::lock(&self.shared().state)
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.additional_directories);
+            if !supported {
+                return Err(AcpError::AdditionalDirectoriesUnsupported);
+            }
+        }
         let cwd_text = absolute_cwd(cwd)?;
+        let dirs = additional_dirs
+            .iter()
+            .map(|dir| absolute_cwd(dir).map(str::to_string))
+            .collect::<Result<Vec<String>, AcpError>>()?;
         let result = self
-            .request("session/new", json!({"cwd": cwd_text, "mcpServers": []}))
+            .request("session/new", session_new_params(cwd_text, &dirs))
             .await?;
         let id = result
             .get("sessionId")
@@ -536,6 +559,16 @@ impl Connection {
             )),
         }
     }
+}
+
+/// The `session/new` params. The field is omitted when there are no extra
+/// directories, so the request is byte-for-byte the v1 one in that case.
+pub(super) fn session_new_params(cwd: &str, additional_dirs: &[String]) -> Value {
+    let mut params = json!({"cwd": cwd, "mcpServers": []});
+    if !additional_dirs.is_empty() {
+        params["additionalDirectories"] = json!(additional_dirs);
+    }
+    params
 }
 
 fn absolute_cwd(cwd: &Path) -> Result<&str, AcpError> {

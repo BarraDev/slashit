@@ -156,6 +156,7 @@ async fn start_opencode_run(
             program: crate::agents::opencode_run::OPENCODE_PROGRAM.to_string(),
             args: vec!["acp".to_string()],
             model,
+            additional_dirs: Vec::new(),
         },
         lease,
     )

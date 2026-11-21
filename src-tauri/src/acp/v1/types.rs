@@ -25,6 +25,8 @@ pub struct AgentCapabilities {
     pub load_session: bool,
     pub resume_session: bool,
     pub close_session: bool,
+    /// `sessionCapabilities.additionalDirectories` is present and not `false`/`null`.
+    pub additional_directories: bool,
     pub auth_method_count: usize,
 }
 
@@ -51,6 +53,9 @@ pub fn parse_initialize_result(result: &Value) -> Result<(u64, AgentCapabilities
         close_session: session
             .and_then(|caps| caps.get("close"))
             .is_some_and(|close| !close.is_null() && close.as_bool() != Some(false)),
+        additional_directories: session
+            .and_then(|caps| caps.get("additionalDirectories"))
+            .is_some_and(|dirs| !dirs.is_null() && dirs.as_bool() != Some(false)),
         auth_method_count: result
             .get("authMethods")
             .and_then(Value::as_array)
