@@ -82,6 +82,22 @@ pub fn Settings(
 
     let show_about = RwSignal::new(false);
 
+    // Repository and Storage act on one Project. Outside Project context they are
+    // hidden rather than shown as Workspace settings.
+    let has_project = !project_id.is_empty();
+    let tabs: Vec<SettingsTab> = [
+        SettingsTab::General,
+        SettingsTab::Repository,
+        SettingsTab::Storage,
+        SettingsTab::Queue,
+        SettingsTab::Jujutsu,
+        SettingsTab::Theme,
+        SettingsTab::Updates,
+    ]
+    .into_iter()
+    .filter(|tab| has_project || !matches!(tab, SettingsTab::Repository | SettingsTab::Storage))
+    .collect();
+
     let (diff_collapsed, set_diff_collapsed) = signal({
         web_sys::window()
             .and_then(|w| w.local_storage().ok().flatten())
@@ -94,22 +110,20 @@ pub fn Settings(
         <div class="space-y-6">
             <div class="mb-6">
                 <h1 class="text-2xl font-bold text-white/90">"Settings"</h1>
-                <p class="text-sm text-white/40 mt-1">"Configure your application preferences"</p>
+                <p class="text-sm text-white/40 mt-1">
+                    {if has_project {
+                        "Application preferences, and settings for the selected Project"
+                    } else {
+                        "Application preferences. Select a Project to configure its repository and storage."
+                    }}
+                </p>
             </div>
 
             <div class="flex gap-6">
                 <div class="w-64 shrink-0">
                     <div class="border border-white/10 rounded-xl bg-white/[0.02] overflow-hidden">
                         <div class="p-2 space-y-1">
-                            {[
-                                SettingsTab::General,
-                                SettingsTab::Repository,
-                                SettingsTab::Storage,
-                                SettingsTab::Queue,
-                                SettingsTab::Jujutsu,
-                                SettingsTab::Theme,
-                                SettingsTab::Updates,
-                            ].into_iter().map(|tab| {
+                            {tabs.into_iter().map(|tab| {
                                 let tab_clone = tab;
                                 view! {
                                     <button
