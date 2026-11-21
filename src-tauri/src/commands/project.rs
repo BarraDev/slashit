@@ -266,6 +266,11 @@ async fn reopen_project_committed(
     id: Uuid,
 ) -> Result<Project, String> {
     let mut projects_w = projects.write().await;
+    // Checked under the write lock: an active Project may have been opened for
+    // the same folder since the caller looked, and reopening must not add a second.
+    if let Some(removed) = projects_w.get(&id).filter(|p| p.is_removed()) {
+        refuse_second_active_project(&projects_w, removed.repository_id)?;
+    }
     let mut proposed = projects_w.clone();
     let project = proposed
         .get_mut(&id)
@@ -1849,6 +1854,23 @@ mod tests {
         removed.removed_at = Some(chrono::Utc::now());
         let projects = HashMap::from([(removed.id, removed)]);
         assert!(refuse_second_active_project(&projects, Some(repository)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn reopening_a_removed_project_is_refused_when_an_active_one_already_holds_its_repository() {
+        let (storage, _temp) = create_test_storage();
+        let repository = Uuid::new_v4();
+        let mut removed = make_test_project(Uuid::new_v4());
+        removed.repository_id = Some(repository);
+        removed.removed_at = Some(chrono::Utc::now());
+        let mut active = make_test_project(Uuid::new_v4());
+        active.repository_id = Some(repository);
+        let removed_id = removed.id;
+        let projects = RwLock::new(HashMap::from([(removed_id, removed), (active.id, active)]));
+
+        let message = reopen_project_committed(&projects, &storage, removed_id).await.unwrap_err();
+        assert!(message.contains("already open"), "{message}");
+        assert!(projects.read().await[&removed_id].is_removed(), "the refused Project stays removed");
     }
 
     /// Project deletion whose config write replaced the file without

@@ -107,8 +107,25 @@ pub fn CreateProjectModal(
                                         }
                                     }
                                     Err(e) => {
-                                        toast::error(format!("Failed to create project: {}", e));
-                                        leptos::logging::error!("Failed to create project: {}", e);
+                                        // The folder may already be open as an active Project. Opening it
+                                        // then selects that Project rather than failing.
+                                        let existing = crate::services::list_projects()
+                                            .await
+                                            .ok()
+                                            .and_then(|projects| projects.into_iter().find(|p| p.repository_id == Some(repo.id)));
+                                        match existing {
+                                            Some(project) => {
+                                                toast::info(format!("Project '{}' is already open.", project.name));
+                                                set_show_clone.set(false);
+                                                if let Some(callback) = on_created {
+                                                    callback.run(project);
+                                                }
+                                            }
+                                            None => {
+                                                toast::error(format!("Failed to create project: {}", e));
+                                                leptos::logging::error!("Failed to create project: {}", e);
+                                            }
+                                        }
                                     }
                                 }
                             }

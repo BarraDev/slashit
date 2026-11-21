@@ -213,6 +213,18 @@ async fn create_repository_committed(
     repository: Repository,
 ) -> Result<Repository, String> {
     let mut repositories_w = repositories.write().await;
+    // Opening a folder that is already registered returns its Repository, so the
+    // folder keeps one identity. Checked under the write lock so concurrent opens
+    // of one folder cannot each mint a record. A remote-backed request still
+    // registers its own record, as before.
+    if repository.remote_url.is_none() {
+        let wanted = std::fs::canonicalize(&repository.local_path).ok();
+        if let Some(existing) = repositories_w.values().find(|r| {
+            wanted.is_some() && std::fs::canonicalize(&r.local_path).ok() == wanted
+        }) {
+            return Ok(existing.clone());
+        }
+    }
     let mut proposed = repositories_w.clone();
     proposed.insert(repository.id, repository.clone());
 
@@ -351,6 +363,24 @@ mod tests {
             repositories.read().await.is_empty(),
             "memory must not contain a repository disk never recorded"
         );
+    }
+
+    #[tokio::test]
+    async fn opening_a_folder_that_is_already_registered_returns_its_repository() {
+        let (storage, _temp) = create_test_storage();
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().to_string_lossy().to_string();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+
+        let mut first = make_test_repository(Uuid::new_v4());
+        first.local_path = path.clone();
+        let mut second = make_test_repository(Uuid::new_v4());
+        second.local_path = path;
+        let registered = create_repository_committed(&repositories, &storage, first).await.unwrap();
+        let reopened = create_repository_committed(&repositories, &storage, second).await.unwrap();
+
+        assert_eq!(reopened.id, registered.id, "the folder keeps its first identity");
+        assert_eq!(repositories.read().await.len(), 1, "no second record is minted");
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
