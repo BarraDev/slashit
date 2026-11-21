@@ -1049,6 +1049,42 @@ mod tests {
         panic!("the Task did not reach {wanted:?}");
     }
 
+    /// A request for changes that waits on a removal's lease can only proceed
+    /// after the removal has committed `removed_at`, so it must refuse and
+    /// leave the Task and its review record as they were.
+    #[tokio::test]
+    async fn a_request_for_changes_waiting_on_a_removal_is_refused_and_writes_nothing() {
+        let (tmp, state) = test_state().await;
+        let (project_id, task_id) = seed_in_review(&state, &tmp).await;
+        let before = state.task.tasks.read().await[&task_id].clone();
+        let removal = state
+            .task_lifecycle_locks
+            .acquire(task_id)
+            .await
+            .expect("the removal takes the lease");
+
+        let removal_side = async {
+            tokio::task::yield_now().await;
+            state.project.projects.write().await.get_mut(&project_id).expect("the Project").removed_at =
+                Some(chrono::Utc::now());
+            drop(removal);
+        };
+        let (_, outcome) =
+            tokio::join!(removal_side, request_changes(&state, task_id, "Also count lines."));
+
+        assert_eq!(
+            outcome.expect_err("the request must be refused"),
+            crate::domain::project::PROJECT_REMOVED_REFUSAL
+        );
+        let after = state.task.tasks.read().await[&task_id].clone();
+        assert_eq!(after.status, before.status);
+        assert_eq!(
+            format!("{:?}", after.human_review),
+            format!("{:?}", before.human_review),
+            "a refused request leaves the review record exactly as found"
+        );
+    }
+
     /// Two review cycles, then an approval whose pull request fails twice:
     /// the timeline read from the task file shows each decision once, in
     /// order, and the failed deliveries as failures, never as approvals.

@@ -3409,6 +3409,10 @@ impl TaskExecutor {
         if self.tasks.read().await.get(&task_id).is_some_and(|t| t.cleanup_in_flight) {
             return Err(format!("Pull request #{} merge commit was not recorded: Task cleanup is in flight; refresh once it finishes", key.number));
         }
+        // Checked under the lease: removal holds it while it writes `removed_at`.
+        if self.task_project_removed(task_id).await {
+            return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+        }
         let key_owned = key.clone();
         let commit_owned = commit.to_string();
         let backfill = move |staged: &mut HashMap<Uuid, Task>| {
@@ -3464,6 +3468,15 @@ impl TaskExecutor {
         key: &crate::pr_status::PrKey,
         state: &str,
     ) {
+        // Declined while another transition holds the task: the next poll
+        // observes the same state again, so nothing is lost.
+        let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
+            return;
+        };
+        // Checked under the lease: removal holds it while it writes `removed_at`.
+        if self.task_project_removed(task_id).await {
+            return;
+        }
         let state_owned = state.to_string();
         let key_owned = key.clone();
         let revise = move |staged: &mut HashMap<Uuid, Task>| {
@@ -10677,6 +10690,46 @@ mod tests {
             "the failure must be surfaced, not silently swallowed; recorded events: {:?}",
             recording.recorded()
         );
+    }
+
+    /// A poll observation must not write to a Task while a removal holds its
+    /// lease, and must not write after the removal has committed. The removal
+    /// writes `removed_at` under that lease, so the observation either declines
+    /// (lease busy) or is refused by the removed Project; both leave the Task as
+    /// it was.
+    #[tokio::test]
+    async fn a_pr_observation_during_or_after_a_removal_writes_nothing() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let (id, project_id) = task_with_open_pr(&executor, None).await;
+        executor
+            .projects
+            .write()
+            .await
+            .insert(project_id, test_project(project_id, ProjectScope::Standalone));
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let before = executor.tasks.read().await.get(&id).cloned().expect("task");
+
+        let removal = executor.lifecycle.try_acquire(id).await.expect("the removal takes the lease");
+        executor.record_pr_poll_state(id, &key, "CLOSED").await;
+        assert_eq!(
+            format!("{:?}", executor.tasks.read().await[&id].external_refs),
+            format!("{:?}", before.external_refs),
+            "an observation while the removal holds the lease writes nothing"
+        );
+        executor.projects.write().await.get_mut(&project_id).expect("the Project").removed_at =
+            Some(chrono::Utc::now());
+        drop(removal);
+
+        executor.record_pr_poll_state(id, &key, "CLOSED").await;
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            format!("{:?}", after.external_refs),
+            format!("{:?}", before.external_refs),
+            "an observation after the removal committed writes nothing"
+        );
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.error_message, before.error_message);
     }
 
     /// A closure observation whose directory sync failed has still been

@@ -1577,10 +1577,13 @@ pub async fn hold_project_task_leases(
     tasks: &Tasks,
     project_id: Uuid,
 ) -> Result<Vec<LifecycleLease>, String> {
-    let ids = {
+    let mut ids = {
         let tasks_r = tasks.read().await;
         project_task_ids(&tasks_r, project_id)
     };
+    // Every caller takes the set in one order. Two callers that each hold part
+    // of the set in map order could otherwise wait on each other until timeout.
+    ids.sort_unstable();
     let mut leases = Vec::with_capacity(ids.len());
     for id in &ids {
         match authority.acquire(*id).await {
