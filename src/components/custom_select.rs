@@ -37,9 +37,10 @@ pub fn CustomSelect(
     /// Placeholder text shown when no option is selected
     #[prop(default = "Select...".to_string())]
     placeholder: String,
-    /// Whether the select is disabled
-    #[prop(default = false)]
-    disabled: bool,
+    /// Whether the select is disabled. Read reactively: a busy state that starts
+    /// after the select rendered must still disable it.
+    #[prop(into)]
+    disabled: Signal<bool>,
 ) -> impl IntoView {
     let (is_open, set_is_open) = signal(false);
     
@@ -131,17 +132,17 @@ pub fn CustomSelect(
             // Trigger button
             <button
                 type="button"
-                disabled=disabled
+                disabled=move || disabled.get()
                 on:click=move |ev: web_sys::MouseEvent| {
                     ev.stop_propagation();
-                    if !disabled {
+                    if !disabled.get_untracked() {
                         set_is_open.update(|v| *v = !*v);
                     }
                 }
                 on:keydown=on_keydown
                 class=move || format!(
                     "w-full px-3 py-2 rounded-lg border text-left flex items-center justify-between transition-all duration-150 {}",
-                    if disabled {
+                    if disabled.get() {
                         "bg-white/5 border-white/10 text-white/40 cursor-not-allowed"
                     } else if is_open.get() {
                         "bg-white/10 border-blue-500/50 text-white/90 ring-2 ring-blue-500/50"

@@ -497,7 +497,7 @@ fn WorkspaceItem(
                                                             move_member(pid_for_move.clone(), name_for_move.clone(), target)
                                                         })
                                                         placeholder="Move to...".to_string()
-                                                        disabled=busy.get()
+                                                        disabled=Signal::derive(move || busy.get())
                                                     />
                                                 </div>
                                                 <button
@@ -534,7 +534,7 @@ fn WorkspaceItem(
                                         selected=Signal::derive(move || selected_to_attach.get())
                                         on_change=Callback::new(move |v| set_selected_to_attach.set(v))
                                         placeholder="Select a project...".to_string()
-                                        disabled=busy.get()
+                                        disabled=Signal::derive(move || busy.get())
                                     />
                                 </div>
                                 <button
