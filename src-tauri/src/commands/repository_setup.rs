@@ -60,6 +60,11 @@ pub(crate) async fn record_project_base(
     let project = proposed
         .get_mut(&project_id)
         .ok_or_else(|| format!("Project {project_id} not found"))?;
+    // Checked under the write lock, after the caller's awaits: a removal that
+    // landed in between must not gain a base.
+    if project.is_removed() {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
     project.base = base;
     project.updated_at = chrono::Utc::now();
     let outcome = crate::commands::project::try_persist_projects(&state.storage, &proposed);

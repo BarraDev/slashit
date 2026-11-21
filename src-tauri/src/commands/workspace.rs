@@ -57,6 +57,26 @@ fn ensure_managed_root(paths: &AppPaths, workspace_id: Uuid) -> Result<std::path
 
 /// Creates a Workspace. Without a custom root it gets its managed root at once,
 /// so the Workspace has an execution context from the start.
+/// The Workspace that already reads `root`: its custom root, or its managed
+/// folder when it has none. `except` is the Workspace being changed.
+fn root_owner<'a>(
+    registry: &'a WorkspaceRegistry,
+    paths: &AppPaths,
+    root: &std::path::Path,
+    except: Option<Uuid>,
+) -> Option<&'a Workspace> {
+    registry.all().find(|w| {
+        if Some(w.id) == except {
+            return false;
+        }
+        let effective = match &w.root_path {
+            Some(custom) => custom.as_path().to_path_buf(),
+            None => paths.workspace_managed_root(w.id),
+        };
+        effective.as_path() == root
+    })
+}
+
 pub(crate) async fn create_workspace_core(
     registry: &RwLock<WorkspaceRegistry>,
     paths: &AppPaths,
@@ -70,7 +90,7 @@ pub(crate) async fn create_workspace_core(
     let root = custom_root(root_path)?;
     let mut registry = registry.write().await;
     if let Some(root) = &root {
-        if registry.contains_root(root.as_path()) {
+        if root_owner(&registry, paths, root.as_path(), None).is_some() {
             return Err(format!(
                 "A workspace is already registered for {}",
                 root.as_path().display()
@@ -111,9 +131,7 @@ pub(crate) async fn set_workspace_root_core(
         .cloned()
         .ok_or_else(|| "Workspace not found".to_string())?;
     if let Some(root) = &root {
-        let owner = registry.all().find(|w| {
-            w.id != workspace_id && w.root_path.as_ref().is_some_and(|r| r.as_path() == root.as_path())
-        });
+        let owner = root_owner(&registry, paths, root.as_path(), Some(workspace_id));
         if let Some(owner) = owner {
             return Err(format!(
                 "The folder {} already belongs to the Workspace \"{}\"",

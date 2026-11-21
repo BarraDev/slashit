@@ -73,7 +73,9 @@ pub fn ProjectRail(
             // older registry does not have yet.
             let ws = list_workspaces().await;
             let ps = list_projects().await;
-            if reads.get_value() != read {
+            // try_get_value: the rail may have unmounted during the awaits. A
+            // disposed counter then reads as None, which drops the reply.
+            if reads.try_get_value() != Some(read) {
                 return;
             }
             workspaces.set(Some(ws));

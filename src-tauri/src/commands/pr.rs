@@ -3636,7 +3636,8 @@ pub async fn sync_pr_review_replies(
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     // Held for the whole publication, so Apply, Analyze and another Sync cannot
     // overlap it, and the plan read below is the plan this call updates.
-    let _lease = state.task_lifecycle_locks.acquire(task_uuid).await?;
+    // Refuses a removed Project under the lease, before any GitHub call.
+    let _lease = crate::commands::project::lease_active_task(&state, task_uuid).await?;
     refuse_sync_while_pr_helper_runs(&state, task_uuid)?;
     // The checkout when the task still has one; the repository otherwise,
     // which holds the same remote-tracking refs and is only asked where the
@@ -9012,10 +9013,10 @@ async fn link_pr_to_task_reserved(
             tokio::select! {
                 biased;
                 _ = wait_for_cancel(&mut cancel) => return Err(not_linked()),
-                lease = state.task_lifecycle_locks.acquire(task_uuid) => lease,
+                lease = crate::commands::project::lease_active_task(state, task_uuid) => lease,
             }
         }
-        None => state.task_lifecycle_locks.acquire(task_uuid).await,
+        None => crate::commands::project::lease_active_task(state, task_uuid).await,
     };
     let _lease = acquired.map_err(PrLinkFailure::NotRecorded)?;
     drop(reservation);
@@ -9396,9 +9397,7 @@ pub async fn refresh_task_pr_state(
     // below -- the two halves are one thing the user asked for, and dropping
     // the lease between them let another transition take the task and turned
     // this operation into a `Busy` race against itself.
-    let _lease = state
-        .task_lifecycle_locks
-        .acquire(task_uuid)
+    let _lease = crate::commands::project::lease_active_task(&state, task_uuid)
         .await
         .map_err(|e| format!("recording the pull request state failed: {e}"))?;
 

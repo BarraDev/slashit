@@ -125,7 +125,7 @@ pub async fn create_project(
     };
     // A folder that already has an active Project is refused before the
     // reopen below, which would otherwise bring back a removed one beside it.
-    refuse_second_active_project(&*state.project.projects.read().await, repository_id)?;
+    refuse_second_active_project(&*state.project.projects.read().await, repository_id, None)?;
     // Opening the folder of a removed Project returns that Project, with its
     // id, name, Tasks and Conversation, instead of creating a second one.
     if let Some(folder) = repository_path.as_deref() {
@@ -229,15 +229,15 @@ pub(crate) async fn lease_active_task_in(
 fn refuse_second_active_project(
     projects: &HashMap<Uuid, Project>,
     repository_id: Option<Uuid>,
+    except: Option<Uuid>,
 ) -> Result<(), String> {
     let Some(repository_id) = repository_id else {
         return Ok(());
     };
-    match projects
-        .values()
-        .find(|p| !p.is_removed() && p.repository_id == Some(repository_id))
-    {
-        Some(active) => Err(format!(
+    match projects.iter().find(|(id, p)| {
+        Some(**id) != except && !p.is_removed() && p.repository_id == Some(repository_id)
+    }) {
+        Some((_, active)) => Err(format!(
             "This folder is already open as Project '{}'. Nothing was changed.",
             active.name
         )),
@@ -303,7 +303,7 @@ async fn reopen_project_committed(
     // Checked under the write lock: an active Project may have been opened for
     // the same folder since the caller looked, and reopening must not add a second.
     if let Some(removed) = projects_w.get(&id).filter(|p| p.is_removed()) {
-        refuse_second_active_project(&projects_w, removed.repository_id)?;
+        refuse_second_active_project(&projects_w, removed.repository_id, None)?;
     }
     let mut proposed = projects_w.clone();
     let project = proposed
@@ -495,7 +495,7 @@ async fn create_project_committed(
     let mut projects_w = projects.write().await;
     // Checked under the same write lock as the insert, so two concurrent
     // opens of one folder cannot both pass the check.
-    refuse_second_active_project(&projects_w, project.repository_id)?;
+    refuse_second_active_project(&projects_w, project.repository_id, None)?;
     let mut proposed = projects_w.clone();
     proposed.insert(project.id, project.clone());
 
@@ -1108,7 +1108,11 @@ async fn update_project_committed(
             project.name = name;
         }
         if let Some(repository_id) = repository_id {
-            project.repository_id = Uuid::parse_str(&repository_id).ok();
+            let repository_id = Uuid::parse_str(&repository_id).ok();
+            // Under the write lock, excluding this Project: its own repository
+            // is not a conflict.
+            refuse_second_active_project(&projects_w, repository_id, Some(id))?;
+            project.repository_id = repository_id;
         }
         if let Some(agent_type) = agent_type {
             project.agent_type = agent_type.clone();
@@ -1911,7 +1915,34 @@ mod tests {
         removed.repository_id = Some(repository);
         removed.removed_at = Some(chrono::Utc::now());
         let projects = HashMap::from([(removed.id, removed)]);
-        assert!(refuse_second_active_project(&projects, Some(repository)).is_ok());
+        assert!(refuse_second_active_project(&projects, Some(repository), None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn updating_a_project_onto_another_active_repository_is_refused_and_keeps_its_own() {
+        let (storage, _temp) = create_test_storage();
+        let repository = Uuid::new_v4();
+        let mut holder = make_test_project(Uuid::new_v4());
+        holder.repository_id = Some(repository);
+        let holder_id = holder.id;
+        let other = make_test_project(Uuid::new_v4());
+        let other_id = other.id;
+        let projects = RwLock::new(HashMap::from([(holder_id, holder), (other_id, other)]));
+
+        let message = update_project_committed(
+            &projects, &storage, other_id, None, Some(repository.to_string()), None,
+        )
+        .await
+        .unwrap_err();
+        assert!(message.contains("already open"), "{message}");
+        assert_eq!(projects.read().await[&other_id].repository_id, None);
+
+        // The holder keeps its own repository: it is not a conflict with itself.
+        update_project_committed(
+            &projects, &storage, holder_id, None, Some(repository.to_string()), None,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -107,12 +107,17 @@ pub fn CreateProjectModal(
                                         }
                                     }
                                     Err(e) => {
-                                        // The folder may already be open as an active Project. Opening it
-                                        // then selects that Project rather than failing.
-                                        let existing = crate::services::list_projects()
-                                            .await
-                                            .ok()
-                                            .and_then(|projects| projects.into_iter().find(|p| p.repository_id == Some(repo.id)));
+                                        // Only the explicit duplicate-open refusal selects the existing Project.
+                                        // Any other failure, including one reported after the Project was
+                                        // saved, is shown as the error it is.
+                                        let existing = if e.contains("already open as Project") {
+                                            crate::services::list_projects()
+                                                .await
+                                                .ok()
+                                                .and_then(|projects| projects.into_iter().find(|p| p.repository_id == Some(repo.id)))
+                                        } else {
+                                            None
+                                        };
                                         match existing {
                                             Some(project) => {
                                                 toast::info(format!("Project '{}' is already open.", project.name));

@@ -124,12 +124,6 @@ impl WorkspaceRegistry {
         self.workspaces.values()
     }
 
-    pub fn contains_root(&self, root: &Path) -> bool {
-        self.workspaces
-            .values()
-            .any(|w| w.root_path.as_ref().is_some_and(|r| r.as_path() == root))
-    }
-
     /// Delete the empty `.slashit/` directories left behind by earlier versions.
     ///
     /// Only provably-empty directories are removed, so a workspace that has

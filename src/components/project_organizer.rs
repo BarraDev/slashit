@@ -28,14 +28,25 @@ pub fn ProjectOrganizer(
     let load_error = RwSignal::new(None::<String>);
     let action_error = RwSignal::new(None::<String>);
 
+    // Overlapping reloads (on open, after a removal) apply only the newest reply,
+    // and a reply that arrives after the panel closed is dropped.
+    let reload_seq = StoredValue::new(0u64);
     let reload = move || {
+        reload_seq.update_value(|n| *n += 1);
+        let seq = reload_seq.get_value();
         spawn_local(async move {
-            match list_projects().await {
+            let result = list_projects().await;
+            if reload_seq.try_get_value() != Some(seq) {
+                return;
+            }
+            match result {
                 Ok(list) => {
-                    projects.set(list);
-                    load_error.set(None);
+                    let _ = projects.try_set(list);
+                    let _ = load_error.try_set(None);
                 }
-                Err(e) => load_error.set(Some(format!("Could not read the Projects: {e}"))),
+                Err(e) => {
+                    let _ = load_error.try_set(Some(format!("Could not read the Projects: {e}")));
+                }
             }
         });
     };
@@ -195,12 +206,14 @@ fn ProjectRow(
 
     let on_remove = move |_| {
         removing.set(true);
+        // Read before the await: the row's signals are disposed if the panel closes mid-request.
+        let name = saved.get_untracked();
+        let id_text = id.to_string();
         spawn_local(async move {
-            match remove_project(id.to_string()).await {
+            match remove_project(id_text.clone()).await {
                 Ok(()) => {
-                    let name = saved.get_untracked();
-                    action_error.set(None);
-                    if selected_project.get_untracked() == id.to_string() {
+                    let _ = action_error.try_set(None);
+                    if selected_project.get_untracked() == id_text {
                         // In Workspace context the Project is only a stale id, so clearing it
                         // must not switch context. In Project context, pick the next active one.
                         let next = if selected_workspace.get_untracked().is_empty() {
@@ -208,7 +221,10 @@ fn ProjectRow(
                         } else {
                             None
                         };
-                        set_selected_project.set(next.unwrap_or_default());
+                        // A selection made while the fallback was read wins over it.
+                        if selected_project.get_untracked() == id_text {
+                            set_selected_project.set(next.unwrap_or_default());
+                        }
                     }
                     toast::success(format!(
                         "Removed '{name}' from SlashIt. Open its folder to use it again."
@@ -219,10 +235,7 @@ fn ProjectRow(
                 }
                 Err(e) => {
                     let _ = confirming.try_set(false);
-                    action_error.set(Some(format!(
-                        "'{}' was not removed. {e}",
-                        saved.get_untracked()
-                    )));
+                    let _ = action_error.try_set(Some(format!("'{name}' was not removed. {e}")));
                 }
             }
             let _ = removing.try_set(false);

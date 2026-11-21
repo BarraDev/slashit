@@ -96,8 +96,12 @@ pub async fn rename_project(project_id: String, name: String) -> Result<(), Stri
         "name": name,
     })).unwrap();
 
-    invoke_checked("update_project", args).await?;
-    Ok(())
+    let response = invoke_checked("update_project", args).await?;
+    // The backend answers None when the Project no longer exists: not a rename.
+    let updated: Option<Project> = serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())?;
+    updated
+        .map(|_| ())
+        .ok_or_else(|| "This Project no longer exists.".to_string())
 }
 
 /// Remove a Project from SlashIt's active Projects. Its folder, Tasks, history

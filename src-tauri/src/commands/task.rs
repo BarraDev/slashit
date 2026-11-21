@@ -850,12 +850,9 @@ pub async fn update_task(
         .as_deref()
         .map(crate::domain::task_dependencies::parse_requested)
         .transpose()?;
-    // A dependency change takes the lease `set_task_dependencies` takes, so it
-    // serializes with the same lifecycle operations.
-    let _lease = match dependencies {
-        Some(_) => Some(crate::commands::project::lease_active_task(&state, task_id).await?),
-        None => None,
-    };
+    // Every edit takes the Task's lease and refuses a removed Project under it,
+    // so no field can be written to a Task that is read-only by removal.
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     if let Some(requested) = &dependencies {
         // Checked against every Task first, so a Task of another Project is
         // named as such. The write checks the staged Tasks again.
