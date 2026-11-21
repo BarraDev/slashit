@@ -90,6 +90,10 @@ pub fn App() -> impl IntoView {
     // Workspace context is separate from the selected Project: entering a
     // Workspace leaves the Project selection as it was.
     let (selected_workspace, set_selected_workspace) = signal(get_persisted_selected_workspace());
+    // Bumped after each membership change, so an open Workspace page reloads its members.
+    let (membership_version, set_membership_version) = signal(0u32);
+    provide_context(membership_version);
+    provide_context(set_membership_version);
 
     // Provide current page as global context so components can react to navigation
     // even if they are kept alive/cached by Leptos.
@@ -138,6 +142,27 @@ pub fn App() -> impl IntoView {
         true
     });
     
+    // Clear a persisted Workspace that no longer exists. Other errors keep the
+    // selection, because they may be temporary.
+    Effect::new(move |prev: Option<bool>| {
+        if prev.is_some() {
+            return true;
+        }
+        let workspace_id = selected_workspace.get_untracked();
+        if !workspace_id.is_empty() {
+            spawn_local(async move {
+                if let Err(e) = crate::services::workspace_service::get_workspace(&workspace_id).await {
+                    if e == "Workspace not found" {
+                        set_selected_workspace.set(String::new());
+                    } else {
+                        leptos::logging::warn!("[App] Error validating workspace {}: {}", workspace_id, e);
+                    }
+                }
+            });
+        }
+        true
+    });
+
     // Persist selected project whenever it changes
     Effect::new(move |_| {
         let project = selected_project.get();

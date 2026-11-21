@@ -58,6 +58,16 @@ pub fn ProjectRail(
     let (hovered, set_hovered) = signal(false);
     let (show_create_modal, set_show_create_modal) = signal(false);
     let (refresh_trigger, set_refresh_trigger) = signal(0u32);
+    // Every rail reload follows a registry change, so an open Workspace page
+    // reloads its member list too. The first run only records the value.
+    let set_membership_version = expect_context::<WriteSignal<u32>>();
+    Effect::new(move |prev: Option<u32>| {
+        let current = refresh_trigger.get();
+        if prev.is_some() {
+            set_membership_version.update(|v| *v += 1);
+        }
+        current
+    });
     let (show_import_modal, set_show_import_modal) = signal(false);
     let (show_organizer, set_show_organizer) = signal(false);
     let export_phase = RwSignal::new(None::<ExportPhase>);

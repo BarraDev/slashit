@@ -143,8 +143,11 @@ Only part of that exists today.
   rail under "Unresolved membership" until it is repaired in Organize Projects.
 - When a member Project's Task is executed and the Workspace has a custom
   root, the coding agent runs from that root, with the Task Checkout added as
-  the directory it edits. Instruction files in the custom root (for example
-  `AGENTS.md`) therefore act as shared agent context for every member Project.
+  the directory it edits. Claude Code loads the root's `CLAUDE.md` as its
+  working-directory instructions; it does not read a root-level `AGENTS.md`
+  unless a `CLAUDE.md` imports it. OpenCode gets no custom root: a member
+  Project's OpenCode Task is refused before it starts, not run from the root.
+  Additional-directory grants are not an OS sandbox.
   A Workspace without a custom root leaves the Worker in its Task Checkout, as
   a standalone Project is, so its managed folder never changes what a Worker
   can reach. If a configured custom root is missing, the run is refused before

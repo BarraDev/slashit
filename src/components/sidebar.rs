@@ -55,8 +55,12 @@ pub fn Sidebar(
         spawn_local(async move {
             match list_projects().await {
                 Ok(ps) => {
-                    // Auto-select first project if none selected
-                    if selected_project.get().is_empty() && !ps.is_empty() {
+                    // Auto-select first project if none selected. A restored Workspace
+                    // keeps its context: selecting a Project would leave it.
+                    if selected_project.get().is_empty()
+                        && selected_workspace.get_untracked().is_empty()
+                        && !ps.is_empty()
+                    {
                         set_selected_project.set(ps[0].id.to_string());
                     }
                 }
