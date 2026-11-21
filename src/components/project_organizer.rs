@@ -90,7 +90,9 @@ pub fn ProjectOrganizer(
                         </button>
                     </div>
 
-                    <div class="p-6 space-y-3 max-h-[60vh] overflow-y-auto">
+                    // Only the Project list scrolls. A scrolling body would clip the
+                    // Workspace attach dropdown, which opens below its trigger.
+                    <div class="p-6 space-y-3">
                         {move || action_error.get().map(|message| view! {
                             <div role="alert" data-testid="project-organizer-error" class="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
                                 {message}
@@ -110,7 +112,7 @@ pub fn ProjectOrganizer(
                                 </p>
                             }
                         >
-                            <ul class="space-y-3" data-testid="project-organizer-list">
+                            <ul class="space-y-3 max-h-[40vh] overflow-y-auto" data-testid="project-organizer-list">
                                 <For
                                     each=move || projects.get()
                                     key=|project| project.id
