@@ -3963,4 +3963,94 @@ mod tests {
             }
         }
     }
+
+    /// Removal holds every Task lease from before its refusals until its
+    /// commit. A Queue entry that starts meanwhile must wait for those leases,
+    /// and once removal has committed it must be refused and end nothing.
+    #[tokio::test]
+    async fn a_queue_entry_started_during_a_removal_waits_and_is_then_refused() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let backlog = crate::test_helpers::create_test_task_full(
+            "waiting",
+            id,
+            crate::domain::TaskStatus::Backlog,
+            0,
+        );
+        let task_id = backlog.id;
+        let tasks = board(vec![backlog]);
+        let locks = crate::lifecycle::TaskLifecycleLocks::new();
+
+        // The removal's lock sequence up to its commit: the leases are held.
+        let leases = crate::lifecycle::hold_project_task_leases(&locks, &tasks, id)
+            .await
+            .expect("no other lifecycle operation owns the Task");
+        let entry = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            crate::lifecycle::enqueue_current(&tasks, &storage, &projects, &locks, None, task_id),
+        )
+        .await;
+        assert!(
+            entry.is_err(),
+            "the Queue entry must wait for the removal's lease"
+        );
+
+        remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+            .await
+            .expect("an idle Project is removed");
+        drop(leases);
+
+        let verdict =
+            crate::lifecycle::enqueue_current(&tasks, &storage, &projects, &locks, None, task_id)
+                .await
+                .expect("the refusal is answered");
+        assert!(
+            matches!(&verdict, crate::lifecycle::EnqueueVerdict::Blocked(reason)
+                if reason == crate::domain::project::PROJECT_REMOVED_REFUSAL),
+            "{verdict:?}"
+        );
+        assert_eq!(
+            tasks.read().await[&task_id].status,
+            crate::domain::TaskStatus::Backlog
+        );
+        assert!(projects.read().await[&id].is_removed());
+    }
+
+    /// The reverse order: a Task that entered Queue first makes the removal
+    /// refuse, so removal cannot bypass the queue guard.
+    #[tokio::test]
+    async fn a_removal_after_a_queue_entry_is_refused_and_changes_nothing() {
+        let mut backlog = crate::test_helpers::create_test_task_full(
+            "queued first",
+            Uuid::nil(),
+            crate::domain::TaskStatus::Backlog,
+            0,
+        );
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        backlog.project_id = id;
+        let task_id = backlog.id;
+        let tasks = board(vec![backlog]);
+        let locks = crate::lifecycle::TaskLifecycleLocks::new();
+
+        let verdict =
+            crate::lifecycle::enqueue_current(&tasks, &storage, &projects, &locks, None, task_id)
+                .await
+                .expect("the entry is answered");
+        assert!(
+            matches!(verdict, crate::lifecycle::EnqueueVerdict::Queued(_)),
+            "{verdict:?}"
+        );
+
+        let refused =
+            remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+                .await;
+        assert!(refused.is_err(), "a queued Task blocks removal");
+        assert!(
+            !projects.read().await[&id].is_removed(),
+            "memory keeps the Project active"
+        );
+        assert_eq!(
+            tasks.read().await[&task_id].status,
+            crate::domain::TaskStatus::Queue
+        );
+    }
 }
