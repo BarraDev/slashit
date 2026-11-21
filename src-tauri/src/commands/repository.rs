@@ -159,6 +159,17 @@ async fn create_repository_core(
         return Err(format!("'{}' is not a directory", local_path));
     }
 
+    // Answered before any version-control side effect, so a folder that is
+    // already registered is never initialized a second time. The committed step
+    // below repeats this check under the write lock.
+    if let Some(existing) = registered_repository_for(
+        &*repositories.read().await,
+        &canonical_or_raw(&path),
+        remote_url.as_deref(),
+    )? {
+        return Ok(existing);
+    }
+
     let git_freshly_initialized = ensure_vcs_initialized(&path, initialize, expected_files).await?;
 
     let id = Uuid::new_v4();
@@ -213,17 +224,14 @@ async fn create_repository_committed(
     repository: Repository,
 ) -> Result<Repository, String> {
     let mut repositories_w = repositories.write().await;
-    // Opening a folder that is already registered returns its Repository, so the
-    // folder keeps one identity. Checked under the write lock so concurrent opens
-    // of one folder cannot each mint a record. A remote-backed request still
-    // registers its own record, as before.
-    if repository.remote_url.is_none() {
-        let wanted = std::fs::canonicalize(&repository.local_path).ok();
-        if let Some(existing) = repositories_w.values().find(|r| {
-            wanted.is_some() && std::fs::canonicalize(&r.local_path).ok() == wanted
-        }) {
-            return Ok(existing.clone());
-        }
+    // Checked under the write lock so concurrent registrations of one folder
+    // cannot each mint a record. A folder keeps one Repository UUID whether or
+    // not the call supplies a remote.
+    let canonical = canonical_or_raw(Path::new(&repository.local_path));
+    if let Some(existing) =
+        registered_repository_for(&repositories_w, &canonical, repository.remote_url.as_deref())?
+    {
+        return Ok(existing);
     }
     let mut proposed = repositories_w.clone();
     proposed.insert(repository.id, repository.clone());
@@ -232,6 +240,37 @@ async fn create_repository_committed(
     crate::config::adopt_published(&mut *repositories_w, proposed, outcome)
         .map_err(|e| e.describe("persist repository"))?;
     Ok(repository)
+}
+
+fn canonical_or_raw(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The Repository already registered for the canonical folder `canonical`, if
+/// any. Returned when `remote_url` is absent or equal to the stored remote. A
+/// different remote, including a supplied remote where none is stored, is refused
+/// and nothing is overwritten or populated.
+fn registered_repository_for(
+    repositories: &HashMap<Uuid, Repository>,
+    canonical: &Path,
+    remote_url: Option<&str>,
+) -> Result<Option<Repository>, String> {
+    let Some(existing) = repositories
+        .values()
+        .find(|r| canonical_or_raw(Path::new(&r.local_path)) == canonical)
+    else {
+        return Ok(None);
+    };
+    match remote_url {
+        Some(url) if existing.remote_url.as_deref() != Some(url) => Err(format!(
+            "'{}' is already registered as repository {} with remote {}. The supplied remote '{}' conflicts with it, and the existing record was not changed.",
+            canonical.display(),
+            existing.id,
+            existing.remote_url.as_deref().unwrap_or("(none)"),
+            url
+        )),
+        _ => Ok(Some(existing.clone())),
+    }
 }
 
 #[tauri::command]
@@ -711,5 +750,101 @@ mod tests {
             repositories.read().await.is_empty(),
             "memory must not contain a repository disk never recorded"
         );
+    }
+
+    fn repo_at(path: &std::path::Path, remote: Option<&str>) -> Repository {
+        let mut repository = make_test_repository(Uuid::new_v4());
+        repository.local_path = path.display().to_string();
+        repository.remote_url = remote.map(str::to_string);
+        repository
+    }
+
+    #[tokio::test]
+    async fn a_supplied_remote_reuses_the_folder_repository_when_it_matches() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("repo");
+        std::fs::create_dir_all(&folder).unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+
+        let first = create_repository_committed(&repositories, &storage, repo_at(&folder, Some("https://github.com/a/one")))
+            .await
+            .unwrap();
+        let again = create_repository_committed(&repositories, &storage, repo_at(&folder, Some("https://github.com/a/one")))
+            .await
+            .unwrap();
+
+        assert_eq!(again.id, first.id, "one folder, one identity, even with a remote");
+        assert_eq!(repositories.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_different_remote_is_an_explicit_conflict_and_the_record_is_unchanged() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("repo");
+        std::fs::create_dir_all(&folder).unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let first = create_repository_committed(&repositories, &storage, repo_at(&folder, Some("https://github.com/a/one")))
+            .await
+            .unwrap();
+
+        let err = create_repository_committed(&repositories, &storage, repo_at(&folder, Some("https://github.com/a/two")))
+            .await
+            .expect_err("a conflicting remote must be refused");
+
+        assert!(err.contains("conflicts"), "{err}");
+        let map = repositories.read().await;
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&first.id].remote_url.as_deref(), Some("https://github.com/a/one"));
+    }
+
+    #[tokio::test]
+    async fn a_stored_folder_without_a_remote_is_not_populated_by_a_later_remote() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("repo");
+        std::fs::create_dir_all(&folder).unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let first = create_repository_committed(&repositories, &storage, repo_at(&folder, None)).await.unwrap();
+
+        let err = create_repository_committed(&repositories, &storage, repo_at(&folder, Some("https://github.com/a/one")))
+            .await
+            .expect_err("a supplied remote is not silently written onto a stored record");
+
+        assert!(err.contains("conflicts"), "{err}");
+        let map = repositories.read().await;
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&first.id].remote_url, None, "the stored record keeps no remote");
+    }
+
+    #[tokio::test]
+    async fn distinct_checkouts_of_one_remote_stay_distinct_repositories() {
+        let (storage, temp) = create_test_storage();
+        let one = temp.path().join("checkout-one");
+        let two = temp.path().join("checkout-two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let remote = Some("https://github.com/a/shared");
+
+        let a = create_repository_committed(&repositories, &storage, repo_at(&one, remote)).await.unwrap();
+        let b = create_repository_committed(&repositories, &storage, repo_at(&two, remote)).await.unwrap();
+
+        assert_ne!(a.id, b.id);
+        assert_eq!(repositories.read().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_registration_of_one_folder_mints_a_single_repository() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("repo");
+        std::fs::create_dir_all(&folder).unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+
+        let (a, b) = tokio::join!(
+            create_repository_committed(&repositories, &storage, repo_at(&folder, None)),
+            create_repository_committed(&repositories, &storage, repo_at(&folder, None)),
+        );
+
+        assert_eq!(a.unwrap().id, b.unwrap().id);
+        assert_eq!(repositories.read().await.len(), 1);
     }
 }

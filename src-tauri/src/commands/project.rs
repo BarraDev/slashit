@@ -1181,6 +1181,10 @@ async fn detach_project_from_workspace_committed(
     let project = proposed
         .get_mut(&project_id)
         .ok_or_else(|| "Project not found".to_string())?;
+    // A removed Project keeps its Workspace membership; only reopening it changes that.
+    if project.is_removed() {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
     if matches!(project.scope, ProjectScope::Standalone) {
         return Err("Project is not attached to a workspace".to_string());
     }
@@ -3838,5 +3842,125 @@ mod tests {
         assert!(!text.contains("removed_at"), "an active Project keeps the old shape");
         let parsed: Project = toml::from_str(&text).unwrap();
         assert!(!parsed.is_removed());
+    }
+
+    /// Puts `id` into a Workspace in memory and on disk, the way attach does.
+    async fn attach_for_test(
+        projects: &RwLock<HashMap<Uuid, Project>>,
+        storage: &Storage,
+        id: Uuid,
+        workspace_id: Uuid,
+    ) {
+        let mut w = projects.write().await;
+        w.get_mut(&id).unwrap().scope = ProjectScope::InWorkspace { workspace_id };
+        storage.save_config(&{
+            let mut config = storage.load_config().unwrap();
+            config.projects = w.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            config
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_a_workspace_member_keeps_its_membership_and_an_unrelated_standalone_project() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let workspace_id = Uuid::new_v4();
+        attach_for_test(&projects, &storage, id, workspace_id).await;
+        let standalone = make_test_project(Uuid::new_v4());
+        let standalone_id = standalone.id;
+        projects.write().await.insert(standalone_id, standalone);
+        let tasks = board(vec![]);
+
+        remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+            .await
+            .expect("an idle member can be removed");
+
+        let memory = projects.read().await;
+        assert!(memory[&id].is_removed());
+        assert_eq!(memory[&id].scope.workspace_id(), Some(workspace_id), "membership kept in memory");
+        assert!(!memory[&standalone_id].is_removed(), "the unrelated Project stays active");
+        assert_eq!(memory[&standalone_id].scope.workspace_id(), None);
+        drop(memory);
+        let on_disk = storage.load_config().unwrap().projects;
+        assert_eq!(
+            on_disk[&id.to_string()].scope.workspace_id(),
+            Some(workspace_id),
+            "membership kept on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn detaching_a_removed_member_is_refused_and_changes_nothing() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let workspace_id = Uuid::new_v4();
+        attach_for_test(&projects, &storage, id, workspace_id).await;
+        remove_project_committed(&projects, &repositories, &board(vec![]), &storage, None, None, id)
+            .await
+            .unwrap();
+        let before = projects.read().await[&id].clone();
+
+        let refusal = detach_project_from_workspace_committed(&projects, &storage, id)
+            .await
+            .expect_err("a removed member must not be detached");
+
+        assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        let after = projects.read().await[&id].clone();
+        assert_eq!(after.scope.workspace_id(), Some(workspace_id), "scope unchanged");
+        assert_eq!(after.removed_at, before.removed_at, "removal unchanged");
+        let on_disk = storage.load_config().unwrap().projects;
+        assert_eq!(on_disk[&id.to_string()].scope.workspace_id(), Some(workspace_id));
+    }
+
+    #[tokio::test]
+    async fn reopening_a_removed_member_restores_it_to_its_original_workspace() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let workspace_id = Uuid::new_v4();
+        attach_for_test(&projects, &storage, id, workspace_id).await;
+        remove_project_committed(&projects, &repositories, &board(vec![]), &storage, None, None, id)
+            .await
+            .unwrap();
+
+        let reopened = reopen_project_committed(&projects, &storage, id).await.unwrap();
+
+        assert_eq!(reopened.id, id, "the original UUID");
+        assert!(!reopened.is_removed());
+        assert_eq!(reopened.scope.workspace_id(), Some(workspace_id), "the original Workspace");
+    }
+
+    #[tokio::test]
+    async fn detach_and_removal_interleaved_in_either_order_never_detach_a_removed_project() {
+        // The projects map's write lock orders the two mutations. Both join orders
+        // are exercised, so either future can take the lock first.
+        for detach_first in [true, false] {
+            let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+            let workspace_id = Uuid::new_v4();
+            attach_for_test(&projects, &storage, id, workspace_id).await;
+            let tasks = board(vec![]);
+
+            let (detached, removed) = if detach_first {
+                tokio::join!(
+                    detach_project_from_workspace_committed(&projects, &storage, id),
+                    remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id),
+                )
+            } else {
+                let (r, d) = tokio::join!(
+                    remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id),
+                    detach_project_from_workspace_committed(&projects, &storage, id),
+                );
+                (d, r)
+            };
+
+            let memory = projects.read().await.get(&id).cloned().unwrap();
+            removed.expect("removal of an idle member succeeds in either order");
+            assert!(memory.is_removed());
+            match detached {
+                // Detach won the lock first: the Project was active then, so it is standalone.
+                Ok(_) => assert_eq!(memory.scope.workspace_id(), None, "order {detach_first}"),
+                // Removal won: the detach must have been refused and left the membership.
+                Err(reason) => {
+                    assert_eq!(reason, crate::domain::project::PROJECT_REMOVED_REFUSAL, "order {detach_first}");
+                    assert_eq!(memory.scope.workspace_id(), Some(workspace_id), "order {detach_first}");
+                }
+            }
+        }
     }
 }

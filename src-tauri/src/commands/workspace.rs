@@ -317,6 +317,18 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_member_still_blocks_deleting_its_workspace() {
+        // Removal keeps the membership, so the reference must still be reported.
+        let workspace_id = Uuid::new_v4();
+        let mut removed = project("removed-member", ProjectScope::InWorkspace { workspace_id });
+        removed.removed_at = Some(chrono::Utc::now());
+        let mut projects = HashMap::new();
+        projects.insert(removed.id, removed);
+
+        assert_eq!(projects_referencing(&projects, workspace_id), vec!["removed-member".to_string()]);
+    }
+
+    #[test]
     fn no_projects_reference_an_unrelated_or_standalone_workspace() {
         let workspace_id = Uuid::new_v4();
         let other_workspace_id = Uuid::new_v4();
