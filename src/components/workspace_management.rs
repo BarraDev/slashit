@@ -151,7 +151,7 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
             <div class="border-t border-white/10 pt-4 space-y-3">
                 <h3 class="font-semibold text-white/80">"Workspaces"</h3>
                 <p class="text-xs text-white/40">
-                    "A workspace groups projects; each project belongs to at most one workspace. A workspace needs no folder. Its optional Shared Agent Context Directory is advanced: when set, agents of member projects start there and read the instruction files it holds."
+                    "A workspace groups projects; each project belongs to at most one workspace. A workspace needs no folder. Its optional Shared Agent Context Directory is advanced: when set, the CLAUDE.md and AGENTS.md it holds are copied as context into the agent runs of member projects."
                 </p>
                 <div class="flex flex-wrap gap-2">
                     <input

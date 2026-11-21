@@ -158,6 +158,7 @@ async fn run_listing(
         .envs(crate::agents::opencode_run::opencode_spawn_env(
             std::env::vars_os(),
             config_path,
+            None,
         ))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

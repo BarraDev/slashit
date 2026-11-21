@@ -151,31 +151,26 @@ Only part of that exists today.
   path is the recovery, as before.
 - A Project that names a Workspace missing from the registry stays in the
   rail under "Unresolved membership" until it is repaired in Organize Projects.
-- When a member Project's Task is executed and the Workspace has a custom
-  root, the coding agent runs from that root, with the Task Checkout added as
-  the directory it edits. Instruction files in the custom root therefore act
-  as shared agent context for every member Project: Claude Code reads
-  `CLAUDE.md` there, and OpenCode reads `AGENTS.md`.
-  A Workspace without a custom root leaves the Worker in its Task Checkout, as
-  a standalone Project is, so its managed folder never changes what a Worker
-  can reach. If a configured custom root is missing, the run is refused before
-  it starts and its Task Checkout is released. The Task is recorded as an
-  Error that names the missing folder, so it holds no execution capacity and no
-  later pass starts it. SlashIt does not fall back silently: the person
-  restores the folder or changes the root, then moves the Task back to Queue to
-  run it. Other agent runs, such as AI review and PR review fixes, do not use
-  the Workspace root.
-- **Verified execution limits (as of this increment).** Only a custom root
-  reaches a Claude Code Worker. The managed root is created and reported, but
-  the Worker launch does not read it, so today it does not change what any run
-  sees. An OpenCode Task in a Workspace that needs the Task Checkout as an extra
-  directory is refused before it starts, so OpenCode has no Workspace-root
-  parity yet. Claude Code's `--add-dir` exposes the checkout, and the Workspace
-  root's instruction files load through `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD`.
-  Neither the root nor a prompt confines writes: the agent can edit any file
-  its process can reach, and SlashIt's delivery covers only the Task Checkout.
-  Making the managed root a real launch context, and giving OpenCode a parity
-  path, are open decisions, not implemented behavior.
+- When a member Project's Task is executed, the coding agent runs from its
+  Task Checkout, as a standalone Project's does. If the Workspace has a custom
+  root, that root's `CLAUDE.md` and `AGENTS.md` are copied as text into Claude
+  Code's appended system prompt and into OpenCode's
+  `slashit-workspace-instructions.md`, in a per-run configuration directory. The
+  copy takes regular files only: a symbolic link is left out, and so is a file
+  over 32 KiB or one that is not UTF-8. `@` imports are not resolved. The copy
+  grants the Worker no path. A Workspace without a custom root adds no context.
+  If a configured custom root is missing, the run is refused before it starts
+  and its Task Checkout is released. SlashIt does not fall back silently: the
+  person restores the folder or changes the root, then runs again. Other agent
+  runs, such as AI review and PR review fixes, do not use the Workspace root.
+- **Verified execution limits (as of this increment).** No coding Worker is
+  granted the Workspace root as a working directory or as an `--add-dir`.
+  OpenCode keeps `external_directory` denied. ACP sends additional directories
+  only to an agent that advertises the capability, and no coding run sends any.
+  Neither the root nor a prompt confines writes: the shell is not an OS sandbox,
+  and SlashIt's delivery covers only the Task Checkout. The managed root is
+  created and reported, but no run reads it; making it a launch context is an
+  open decision.
 - **Execution and delivery boundary.** The agent may read anything it can
   reach, including the Workspace's instruction files and other member
   Projects. Its writes belong in the Task Checkout, and the coding prompt
@@ -517,7 +512,7 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 | Base of a Task's branch | `worktree::resolve_default_base`, `Project.base` (`domain::ProjectBase`), `worktree::project_base` |
 | Repository readiness and setup | `worktree::readiness`, `worktree::remote_head`, `worktree::vcs_init`; `commands/repository_setup.rs` |
 | Local delivery and integration | `commands/human_review.rs`, `commands/integration.rs`, `worktree::integration`, `domain::LocalIntegration` (`Task.local_integration`) |
-| Workspace root as agent context | `TaskExecutor::resolve_workspace_launch` in `queue/executor.rs` |
+| Workspace root as agent context | `TaskExecutor::launch_for_membership` and `workspace_context` in `queue/executor.rs` |
 | Task Checkout lifecycle | `lifecycle.rs` |
 | Jujutsu integration | `commands/pr.rs` (PR delivery); `worktree` (default base, colocated init) |
 

@@ -493,8 +493,8 @@ pub struct ClaudeRunConfig {
     /// [`ToolAccess::ReadOnly`] always does this.
     pub disable_mcp: bool,
     /// Extra directories to expose to Claude via repeated `--add-dir` flags.
-    /// Used when running from a meta-workspace cwd so the agent can also
-    /// read/write a specific project tree.
+    /// No coding run passes any: a Worker runs in its Task Checkout, and the
+    /// Workspace root is never granted.
     pub additional_dirs: Vec<std::path::PathBuf>,
     /// When true, the run reads only the project's settings and instruction
     /// files (`--setting-sources project`) and disables every hook
@@ -776,9 +776,10 @@ fn ancestor_instruction_excludes(working_dir: &std::path::Path) -> Vec<serde_jso
 /// `--add-dir` directory. Without it the CLI loads instruction files only from
 /// the working directory and its ancestors.
 ///
-/// A workspace-backed run starts from the Workspace root and exposes the Task
-/// Checkout with `--add-dir`, so without this the checkout's own `CLAUDE.md`
-/// (and the `@AGENTS.md` it imports) never reaches the agent. Checked on
+/// A run that passes `--add-dir` directories needs this. No coding Worker does
+/// today: each runs in its Task Checkout, and a Workspace root's instructions
+/// reach it as copied text. Without the variable, a checkout's own `CLAUDE.md`
+/// (and the `@AGENTS.md` it imports) would not load for such a run. Checked on
 /// Claude Code 2.1.308 with a local stub: with the variable set, the checkout's
 /// file loads, and its ancestors and sibling directories stay out.
 const ADDITIONAL_DIRS_CLAUDE_MD_ENV: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
