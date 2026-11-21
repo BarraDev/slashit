@@ -106,12 +106,40 @@ pub const OPENCODE_POLICY_CONTENT: &str = r#"{"permissions":[{"action":"*","reso
 /// the prompt named it. `config_dir` replaces the user's global configuration
 /// directory, so the user's global permissions, agent overrides and plugins are
 /// not read either. It must be empty and owned by this run.
-pub fn policy_env(config_dir: &str) -> Vec<(String, String)> {
+pub fn policy_env(config_dir: &str, instructions: Option<&str>) -> Vec<(String, String)> {
     vec![
         ("OPENCODE_DISABLE_PROJECT_CONFIG".to_string(), "1".to_string()),
         ("OPENCODE_CONFIG_DIR".to_string(), config_dir.to_string()),
-        ("OPENCODE_CONFIG_CONTENT".to_string(), OPENCODE_POLICY_CONTENT.to_string()),
+        ("OPENCODE_CONFIG_CONTENT".to_string(), policy_config_content(instructions)),
     ]
+}
+
+/// The inline configuration: the permission policy, plus the instruction file
+/// when the run has one. The permissions are the constant's own text, so adding
+/// instructions never rebuilds or edits the policy.
+fn policy_config_content(instructions: Option<&str>) -> String {
+    let Some(path) = instructions else {
+        return OPENCODE_POLICY_CONTENT.to_string();
+    };
+    // The constant is a JSON object, so its first byte is the opening brace.
+    let rest = OPENCODE_POLICY_CONTENT.strip_prefix('{').unwrap_or(OPENCODE_POLICY_CONTENT);
+    let path = serde_json::Value::String(path.to_string());
+    format!(r#"{{"instructions":[{path}],{rest}"#)
+}
+
+/// The name of the instruction file in a run's configuration directory.
+const INSTRUCTIONS_FILE: &str = "slashit-workspace-instructions.md";
+
+/// Writes the copied Workspace instructions into the run's own configuration
+/// directory, where only this run reads them. OpenCode's `instructions` key
+/// takes a path, not text. Returns the file's path.
+pub fn write_instructions(config_dir: &std::path::Path, text: &str) -> Result<String, String> {
+    let path = config_dir.join(INSTRUCTIONS_FILE);
+    std::fs::write(&path, text)
+        .map_err(|e| format!("The Workspace instructions could not be written for this run: {e}"))?;
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "The Workspace instructions path is not UTF-8".to_string())
 }
 
 /// The environment one OpenCode process is started with: the provider
@@ -120,12 +148,13 @@ pub fn policy_env(config_dir: &str) -> Vec<(String, String)> {
 pub fn opencode_spawn_env(
     parent: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     config_dir: &str,
+    instructions: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = provider_env(parent)
         .into_iter()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect();
-    env.extend(policy_env(config_dir));
+    env.extend(policy_env(config_dir, instructions));
     env
 }
 
@@ -183,6 +212,16 @@ pub struct OpenCodeRunConfig {
     /// without one would use OpenCode's own default, which SlashIt does not
     /// choose and may bill, so [`OpenCodeRunner::start`] refuses it.
     pub model: Option<String>,
+    /// Extra directories the session is given, sent only when the agent
+    /// advertises `additionalDirectories`. A grant is not a sandbox, and shell
+    /// commands reach any path regardless. Production passes none: a Workspace
+    /// root reaches the run as copied instructions instead (see `instructions`).
+    pub additional_dirs: Vec<std::path::PathBuf>,
+    /// Shared Workspace instruction text, copied by SlashIt and never a path.
+    /// It is written to the run's own configuration directory and named in
+    /// OpenCode's `instructions` key. It grants no access; the policy is
+    /// unchanged. `None` for a Task without a custom Workspace root.
+    pub instructions: Option<String>,
 }
 
 /// A running OpenCode session. Dropping it ends the process and its group.
@@ -264,11 +303,15 @@ impl OpenCodeRunner {
             .to_str()
             .ok_or_else(|| "The OpenCode configuration directory path is not UTF-8".to_string())?
             .to_string();
+        let instructions = match &config.instructions {
+            Some(text) => Some(write_instructions(config_dir.path(), text)?),
+            None => None,
+        };
         let spec = SpawnSpec {
             program: config.program.clone(),
             args: config.args.clone(),
             cwd: config.working_dir.clone(),
-            env: opencode_spawn_env(std::env::vars_os(), &config_path),
+            env: opencode_spawn_env(std::env::vars_os(), &config_path, instructions.as_deref()),
             clear_env: true,
             request_timeout: REQUEST_TIMEOUT,
             permission_timeout: PERMISSION_TIMEOUT,
@@ -278,7 +321,7 @@ impl OpenCodeRunner {
             .map_err(|e| e.to_string())?;
         connection.initialize().await.map_err(|e| e.to_string())?;
         let session = connection
-            .new_session(&config.working_dir)
+            .new_session_with_dirs(&config.working_dir, &config.additional_dirs)
             .await
             .map_err(|e| e.to_string())?;
         // The model is selected before the prompt is sent, and the run stops
@@ -538,7 +581,7 @@ mod tests {
         ]
         .map(|(name, value)| (OsString::from(name), OsString::from(value)));
         let env: std::collections::HashMap<String, String> =
-            opencode_spawn_env(parent, "/run/slashit-config").into_iter().collect();
+            opencode_spawn_env(parent, "/run/slashit-config", None).into_iter().collect();
 
         assert_eq!(env.get("HOME").map(String::as_str), Some("/home/worker"));
         assert_eq!(env.get("OPENCODE_DISABLE_PROJECT_CONFIG").map(String::as_str), Some("1"));
@@ -549,6 +592,32 @@ mod tests {
         );
         assert!(!env.contains_key("OPENCODE_CONFIG"), "the user's config file is not passed");
         assert_eq!(env["OPENCODE_CONFIG_CONTENT"], OPENCODE_POLICY_CONTENT);
+    }
+
+    /// A run with Workspace instructions names its file in OpenCode's
+    /// `instructions` key, and the permission rules stay exactly the constant's.
+    #[test]
+    fn the_instructions_are_named_by_path_and_the_policy_is_unchanged() {
+        let path = "/run/slashit-config/slashit-workspace-instructions.md";
+        let content = policy_config_content(Some(path));
+        let value: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+
+        assert_eq!(value["instructions"], serde_json::json!([path]));
+        let base: serde_json::Value =
+            serde_json::from_str(OPENCODE_POLICY_CONTENT).expect("policy is JSON");
+        assert_eq!(value["permissions"], base["permissions"]);
+        assert_eq!(policy_config_content(None), OPENCODE_POLICY_CONTENT);
+    }
+
+    /// The copied text is written into the run's own directory, unchanged.
+    #[test]
+    fn write_instructions_puts_the_exact_text_in_the_runs_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let text = "### CLAUDE.md\n\nShared rule: \u{00e9}.";
+        let path = write_instructions(dir.path(), text).expect("written");
+
+        assert_eq!(std::path::Path::new(&path).parent(), Some(dir.path()));
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), text);
     }
 
     /// The policy, as OpenCode reads it: deny everything, then allow exactly the
@@ -618,6 +687,8 @@ mod tests {
         OpenCodeRunConfig {
             prompt: "make the change".into(),
             working_dir: std::env::temp_dir(),
+            additional_dirs: Vec::new(),
+            instructions: None,
             program: debug_dir
                 .join("acp_fixture_agent")
                 .to_string_lossy()
@@ -662,6 +733,37 @@ mod tests {
         assert_eq!(run.get_output().await, "hello");
         assert_eq!(run.final_result_text().await.as_deref(), Ok("hello"));
         assert!(run.refused_permissions().is_empty());
+    }
+
+    /// The agent process receives the instruction file named by its config,
+    /// with the copied text, while the run is live. No directory is granted,
+    /// and the external-directory deny is in the policy it is started with.
+    #[tokio::test]
+    async fn a_workspace_run_receives_its_instructions_as_a_file_and_no_extra_directory() {
+        let mut config = fixture("config-echo");
+        config.instructions = Some("### CLAUDE.md\n\nShared rule.".to_string());
+        assert!(config.additional_dirs.is_empty());
+        let run = OpenCodeRunner::start(config, None).await.expect("start");
+        assert_eq!(run.wait().await, Ok(true));
+        let output = run.get_output().await;
+
+        assert!(output.contains("slashit-workspace-instructions.md"), "{output}");
+        assert!(output.contains("instructions-text=### CLAUDE.md\n\nShared rule."), "{output}");
+        assert!(output.contains(r#""action":"external_directory","resource":"*","effect":"deny""#), "{output}");
+        assert!(!output.contains("instructions-missing"), "{output}");
+    }
+
+    /// A run without Workspace instructions is configured exactly as before:
+    /// the policy only, and no instruction file.
+    #[tokio::test]
+    async fn a_run_without_workspace_instructions_is_configured_as_before() {
+        let run = OpenCodeRunner::start(fixture("config-echo"), None).await.expect("start");
+        assert_eq!(run.wait().await, Ok(true));
+        let output = run.get_output().await;
+
+        assert!(output.contains("instructions-none"), "{output}");
+        assert!(!output.contains("slashit-workspace-instructions.md"), "{output}");
+        assert!(output.contains(OPENCODE_POLICY_CONTENT), "the policy is the same as before: {output}");
     }
 
     #[tokio::test]
