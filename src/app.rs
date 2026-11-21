@@ -215,7 +215,6 @@ pub fn App() -> impl IntoView {
                                 />
                             }.into_any();
                         }
-                        let project_id = if in_workspace { String::new() } else { selected_project.get() };
                         match page.as_str() {
                         "conversations" => view! { <Conversations project_id=selected_project.get() /> }.into_any(),
                         "dashboard" => view! { <Dashboard project_id=selected_project.get() /> }.into_any(),
@@ -223,7 +222,13 @@ pub fn App() -> impl IntoView {
                         "roadmap" => view! { <Roadmap project_id=selected_project.get() /> }.into_any(),
                         "ideation" => view! { <Ideation project_id=selected_project.get() /> }.into_any(),
                         "context" => view! { <Context project_id=selected_project.get() /> }.into_any(),
-                        "settings" => view! { <Settings project_id=project_id /> }.into_any(),
+                        // Read inside the Settings page, not here: this closure would
+                        // otherwise rebuild Settings, and its active tab, on every Project switch.
+                        "settings" => view! {
+                            <Settings project_id=Signal::derive(move || {
+                                if selected_workspace.get().is_empty() { selected_project.get() } else { String::new() }
+                            }) />
+                        }.into_any(),
                         "insights" => view! { <Insights project_id=selected_project.get() /> }.into_any(),
                         "changelog" => view! { <Changelog project_id=selected_project.get() /> }.into_any(),
                         "mcp" => view! { <McpOverview /> }.into_any(),

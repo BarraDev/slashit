@@ -75,8 +75,10 @@ pub fn Settings(
     /// The project whose storage is being configured. Empty when no project is
     /// selected, which the Storage tab renders as an explanatory empty state
     /// rather than a control that silently does nothing.
-    #[prop(default = String::new())]
-    project_id: String,
+    /// A signal, so a Project switch updates the Repository and Storage tabs in
+    /// place instead of remounting Settings and resetting the active tab.
+    #[prop(into)]
+    project_id: Signal<String>,
 ) -> impl IntoView {
     let (active_tab, set_active_tab) = signal(SettingsTab::General);
 
@@ -84,7 +86,7 @@ pub fn Settings(
 
     // Repository and Storage act on one Project. Outside Project context they are
     // hidden rather than shown as Workspace settings.
-    let has_project = !project_id.is_empty();
+    let has_project = Signal::derive(move || !project_id.get().is_empty());
     let tabs: Vec<SettingsTab> = [
         SettingsTab::General,
         SettingsTab::Repository,
@@ -95,7 +97,7 @@ pub fn Settings(
         SettingsTab::Updates,
     ]
     .into_iter()
-    .filter(|tab| has_project || !matches!(tab, SettingsTab::Repository | SettingsTab::Storage))
+    .filter(|tab| has_project.get_untracked() || !matches!(tab, SettingsTab::Repository | SettingsTab::Storage))
     .collect();
 
     let (diff_collapsed, set_diff_collapsed) = signal({
@@ -111,7 +113,7 @@ pub fn Settings(
             <div class="mb-6">
                 <h1 class="text-2xl font-bold text-white/90">"Settings"</h1>
                 <p class="text-sm text-white/40 mt-1">
-                    {if has_project {
+                    {if has_project.get() {
                         "Application preferences, and settings for the selected Project"
                     } else {
                         "Application preferences. Select a Project to configure its repository and storage."
@@ -207,14 +209,14 @@ pub fn Settings(
                                 }.into_any(),
 
                                 SettingsTab::Repository => view! {
-                                    <crate::components::RepositorySetup project_id=project_id.clone() />
+                                    <crate::components::RepositorySetup project_id=project_id.get() />
                                 }.into_any(),
 
                                 SettingsTab::Storage => view! {
                                     <div class="space-y-10">
                                         <crate::components::DiskUsage />
-                                        <crate::components::StorageSettings project_id=project_id.clone() />
-                                        <crate::components::OrphanReclaim project_id=project_id.clone() />
+                                        <crate::components::StorageSettings project_id=project_id.get() />
+                                        <crate::components::OrphanReclaim project_id=project_id.get() />
                                     </div>
                                 }.into_any(),
 
