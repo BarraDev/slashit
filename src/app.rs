@@ -90,6 +90,10 @@ pub fn App() -> impl IntoView {
     // Workspace context is separate from the selected Project: entering a
     // Workspace leaves the Project selection as it was.
     let (selected_workspace, set_selected_workspace) = signal(get_persisted_selected_workspace());
+    // Bumped after each membership change, so an open Workspace page reloads its members.
+    let (membership_version, set_membership_version) = signal(0u32);
+    provide_context(membership_version);
+    provide_context(set_membership_version);
 
     // Provide current page as global context so components can react to navigation
     // even if they are kept alive/cached by Leptos.

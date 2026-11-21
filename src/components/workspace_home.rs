@@ -29,7 +29,11 @@ pub fn WorkspaceHome(
     // Reads the Workspace, its root and its members for the id that was
     // selected when the read started. A reply for an id that is no longer
     // selected is dropped, so a quick switch never shows the wrong Workspace.
+    // Also re-reads after any membership change, so attaching or detaching a Project
+    // shows here without leaving the page.
+    let membership_version = expect_context::<ReadSignal<u32>>();
     Effect::new(move |_| {
+        let _ = membership_version.get();
         let id = workspace_id.get();
         if id.is_empty() {
             return;
