@@ -91,19 +91,32 @@ if [ "$built_mode" = embedded ] && [ -n "$actual_sha" ] && [ "$actual_sha" = "$b
   built_verified=yes
 fi
 
-# The running instance, from the supervisor's own status. Only exit 0 verifies it.
-# Any other status (1: a stale record or a degraded frontend, 3: unverifiable,
-# 4: environment mismatch) can print a commit, but the text is not evidence of
-# what runs, so it is never read as the running commit.
+# The running instance, from the supervisor's own status. Exit 0 verifies it.
+# Exit 1 is ambiguous: it is a stale launch record (the endpoint is served by
+# another pid), a degraded frontend, or a verified instance whose frontend
+# predates the promoted build. Only the last is a restart target, and only when
+# the output proves the process, endpoint and environment. Every other status
+# (3: unverifiable, 4: environment mismatch, a record mismatch) can print a
+# commit, but the text is not evidence of what runs, so it is never read as the
+# running commit.
 st=0
 status_out=$("$sup" status 2>&1) || st=$?
 running=unverifiable
 running_commit=
+frontend_stale=no
 if [ "$st" -eq 0 ] && grep -q '^instance: *running' <<<"$status_out"; then
   running=running
   running_commit=$(printf '%s\n' "$status_out" | awk '/^commit:/ { print $2; exit }')
 elif [ "$st" -eq 0 ] && grep -q '^instance: *stopped' <<<"$status_out"; then
   running=stopped
+elif [ "$st" -eq 1 ] && grep -q '^instance: *running' <<<"$status_out" &&
+  grep -q '^control channel: answering on the declared endpoint' <<<"$status_out" &&
+  grep -q '^environment: *verified' <<<"$status_out" &&
+  grep -q '^frontend: *STALE INSTANCE' <<<"$status_out" &&
+  ! grep -q '^record: *STALE' <<<"$status_out"; then
+  running=running
+  frontend_stale=yes
+  running_commit=$(printf '%s\n' "$status_out" | awk '/^commit:/ { print $2; exit }')
 fi
 
 forward=n/a
@@ -189,7 +202,8 @@ report() {
   echo "target commit:    $(short "$target") ($ref)"
   echo "pending changes:  $pending uncommitted path(s)"
   echo "running:          $running${running_commit:+ at $(short "$running_commit")}"
-  [ "$st" -eq 0 ] || echo "supervisor status: exit $st; its output is not evidence of the running commit"
+  [ "$frontend_stale" = yes ] && echo "frontend:         stale (the verified instance predates the promoted build; a restart loads it)"
+  [ "$st" -eq 0 ] || [ "$frontend_stale" = yes ] || echo "supervisor status: exit $st; its output is not evidence of the running commit"
   echo "forward only:     $forward (target descends from the running commit)"
   echo "state writer:     $(short "$writer_commit") forward=$state_forward (target descends from the last build that wrote the state)"
   echo "artifact:         $binary"

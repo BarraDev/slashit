@@ -352,6 +352,47 @@ if [[ "$out" == *"running exe sha:  $want_sha (state-writer names it: yes)"* ]] 
 else bad "a running image with a deleted path was misreported (exit $st)"; printf '%s\n' "$out" >&2; fi
 rm -rf "$work/state"
 
+# The supervisor's status for a verified instance whose frontend predates the
+# promoted build: exit 1, with the process, endpoint and environment proven.
+# The record line carries no pid, so the executable-provenance check (which needs
+# a readable /proc entry and a verified state writer) is not part of these cases.
+status_stale() { # commit, then optional extra lines that must refuse
+  printf 'instance:       running (pid 1, mode gui, version x)\nendpoint:       unix:/x\nbinary:         %s\ncommit:         %s\nrecord:         started 2026-01-01T00:00:00Z\ncontrol channel: answering on the declared endpoint\nfrontend:       STALE INSTANCE — the binary was rebuilt after this instance started\nenvironment:    verified (the live process carries the declared values)\n%s\n' "$repo/target/dogfood/slashit-ui" "$1" "${2:-}" >"$work/status"
+}
+
+echo "== a verified instance with a stale frontend is restarted to the target"
+git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; rm -f "$work/expect"
+out=$(export STUB_STATUS_RC=1; run --apply); st=$?
+if [ "$st" -eq 0 ] && calls_have restart && [ "$(cat "$work/expect" 2>/dev/null)" = "$new" ]; then ok "a stale-frontend instance with a provably older commit is restarted, and the supervisor receives the target"
+else bad "a verified stale-frontend instance was not restarted (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(export STUB_STATUS_RC=1; run --check); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"frontend:         stale"* ]] && [[ "$out" != *"supervisor status: exit"* ]]; then ok "--check reports the stale frontend as a verified running state and exits 0"
+else bad "--check did not report the stale frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== a stale-frontend status is refused when any identity proof is missing"
+status_stale "$old" "record:         STALE — it names pid 9, the endpoint is served by pid 1"; reset
+out=$(export STUB_STATUS_RC=1; run --apply); st=$?
+if [ "$st" -ne 0 ] && [ ! -f "$calls" ]; then ok "a record that names another pid is never a stale-frontend restart target"
+else bad "a record mismatch was accepted as a stale frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
+status_stale "$old"; sed -i 's/^environment: .*/environment:    MISMATCH (a declared value differs)/' "$work/status"; reset
+out=$(export STUB_STATUS_RC=4; run --apply); st=$?
+if [ "$st" -ne 0 ] && [ ! -f "$calls" ]; then ok "an environment mismatch with a stale frontend is refused"
+else bad "an environment mismatch was accepted (exit $st)"; printf '%s\n' "$out" >&2; fi
+status_stale "$old"; sed -i "s|^control channel: .*|control channel: answering on 'unix:/other', which is NOT the declared endpoint|" "$work/status"; reset
+out=$(export STUB_STATUS_RC=1; run --apply); st=$?
+if [ "$st" -ne 0 ] && [ ! -f "$calls" ]; then ok "an instance answering on another endpoint is refused even with a stale frontend"
+else bad "a wrong endpoint was accepted (exit $st)"; printf '%s\n' "$out" >&2; fi
+status_stale "$old" ; sed -i 's/^frontend: .*/frontend:       UNAVAILABLE — this is a development build, which loads an unanswered server/' "$work/status"; reset
+out=$(export STUB_STATUS_RC=1; run --apply); st=$?
+if [ "$st" -ne 0 ] && [ ! -f "$calls" ]; then ok "a degraded frontend that is not STALE is still unverifiable"
+else bad "a degraded frontend was accepted as stale (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== a stale-frontend instance still needs the ancestry gate"
+git -C "$repo" checkout -q "$new"; status_stale "$new"; reset
+out=$(export STUB_STATUS_RC=1; run --apply "$old"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not provably descend"* ]] && [ ! -f "$calls" ]; then ok "a stale-frontend instance is not downgraded to an older target"
+else bad "a stale-frontend downgrade was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+
 echo
 echo "$pass passed, $fails failed"
 [ "$fails" -eq 0 ]
