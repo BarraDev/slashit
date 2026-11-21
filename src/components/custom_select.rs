@@ -25,9 +25,10 @@ impl SelectOption {
 /// of the dropdown appearance including the options list.
 #[component]
 pub fn CustomSelect(
-    /// The list of options to display in the dropdown
+    /// The options to display in the dropdown. Read reactively, so an open
+    /// dropdown shows a Workspace added or renamed after it was rendered.
     #[prop(into)]
-    options: Vec<SelectOption>,
+    options: Signal<Vec<SelectOption>>,
     /// Signal containing the currently selected value
     #[prop(into)]
     selected: Signal<String>,
@@ -37,14 +38,13 @@ pub fn CustomSelect(
     /// Placeholder text shown when no option is selected
     #[prop(default = "Select...".to_string())]
     placeholder: String,
-    /// Whether the select is disabled
-    #[prop(default = false)]
-    disabled: bool,
+    /// Whether the select is disabled, read reactively so a busy operation
+    /// disables an already-rendered select.
+    #[prop(into, default = Signal::stored(false))]
+    disabled: Signal<bool>,
 ) -> impl IntoView {
     let (is_open, set_is_open) = signal(false);
     
-    // Store options in a signal for reactive access
-    let options_signal = StoredValue::new(options);
     let placeholder_signal = StoredValue::new(placeholder);
     
     // Get the label for the currently selected value
@@ -53,7 +53,8 @@ pub fn CustomSelect(
         if val.is_empty() {
             return placeholder_signal.get_value();
         }
-        options_signal.get_value()
+        options
+            .get()
             .iter()
             .find(|o| o.value == val)
             .map(|o| o.label.clone())
@@ -131,17 +132,17 @@ pub fn CustomSelect(
             // Trigger button
             <button
                 type="button"
-                disabled=disabled
+                disabled=move || disabled.get()
                 on:click=move |ev: web_sys::MouseEvent| {
                     ev.stop_propagation();
-                    if !disabled {
+                    if !disabled.get() {
                         set_is_open.update(|v| *v = !*v);
                     }
                 }
                 on:keydown=on_keydown
                 class=move || format!(
                     "w-full px-3 py-2 rounded-lg border text-left flex items-center justify-between transition-all duration-150 {}",
-                    if disabled {
+                    if disabled.get() {
                         "bg-white/5 border-white/10 text-white/40 cursor-not-allowed"
                     } else if is_open.get() {
                         "bg-white/10 border-blue-500/50 text-white/90 ring-2 ring-blue-500/50"
@@ -182,7 +183,7 @@ pub fn CustomSelect(
                     role="listbox"
                 >
                     {move || {
-                        options_signal.get_value().into_iter().map(|opt| {
+                        options.get().into_iter().map(|opt| {
                             let value = opt.value.clone();
                             let label = opt.label.clone();
                             let is_selected = selected.get() == value;

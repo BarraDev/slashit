@@ -1195,13 +1195,19 @@ async fn attach_project_to_workspace_committed(
     Ok(result)
 }
 
+/// `expected_workspace_id` is the Workspace the caller believes the Project is
+/// in. A stale caller (its list predates a move) is refused rather than
+/// detaching the Project from the Workspace it now belongs to.
 #[tauri::command]
 pub async fn detach_project_from_workspace(
     _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
+    expected_workspace_id: String,
 ) -> Result<Project, String> {
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
+    let expected_workspace_id =
+        Uuid::parse_str(&expected_workspace_id).map_err(|e| e.to_string())?;
     refuse_if_project_removed(&state.project.projects, project_id).await?;
     // Idle means the same as removal: no active execution, queued work, pending
     // review, recovery or delivery. Checked under the Project gate and the Task
@@ -1222,16 +1228,25 @@ pub async fn detach_project_from_workspace(
             "This Project cannot leave its Workspace yet: {message}. Nothing was changed."
         ));
     }
-    detach_project_from_workspace_committed(&state.project.projects, &state.storage, project_id).await
+    detach_project_from_workspace_committed(
+        &state.project.projects,
+        &state.storage,
+        project_id,
+        expected_workspace_id,
+    )
+    .await
 }
 
 /// Core of [`detach_project_from_workspace`]; see [`create_project_committed`]
 /// for why the map is cloned first. Refuses a project that is already
-/// standalone so a caller cannot mistake a no-op for a successful detach.
+/// standalone so a caller cannot mistake a no-op for a successful detach, and
+/// refuses one whose Workspace is not `expected_workspace_id`. The check runs
+/// under the projects write lock, against the membership the detach changes.
 async fn detach_project_from_workspace_committed(
     projects: &RwLock<HashMap<Uuid, Project>>,
     storage: &Storage,
     project_id: Uuid,
+    expected_workspace_id: Uuid,
 ) -> Result<Project, String> {
     let mut projects_w = projects.write().await;
     let mut proposed = projects_w.clone();
@@ -1245,6 +1260,12 @@ async fn detach_project_from_workspace_committed(
     }
     if matches!(project.scope, ProjectScope::Standalone) {
         return Err("Project is not attached to a workspace".to_string());
+    }
+    if project.scope.workspace_id() != Some(expected_workspace_id) {
+        return Err(
+            "Project is no longer in that workspace; refresh the list. Nothing was changed."
+                .to_string(),
+        );
     }
     project.scope = ProjectScope::Standalone;
     project.updated_at = chrono::Utc::now();
@@ -1273,7 +1294,7 @@ pub async fn get_project_path(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::paths::{AppPaths, StateLocation};
     use crate::config::storage::AppConfig;
@@ -1393,7 +1414,7 @@ mod tests {
         }
     }
 
-    fn make_test_project(id: Uuid) -> Project {
+    pub(crate) fn make_test_project(id: Uuid) -> Project {
         Project {
             id,
             name: "Test Project".to_string(),
@@ -2314,10 +2335,11 @@ mod tests {
         let (storage, _temp) = create_test_storage();
         let mut existing = make_test_project(Uuid::new_v4());
         let id = existing.id;
-        existing.scope = ProjectScope::InWorkspace { workspace_id: Uuid::new_v4() };
+        let workspace_id = Uuid::new_v4();
+        existing.scope = ProjectScope::InWorkspace { workspace_id };
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
-        let result = detach_project_from_workspace_committed(&projects, &storage, id)
+        let result = detach_project_from_workspace_committed(&projects, &storage, id, workspace_id)
             .await
             .expect("detaching a member project should succeed");
 
@@ -2341,7 +2363,7 @@ mod tests {
         let id = existing.id;
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
-        let result = detach_project_from_workspace_committed(&projects, &storage, id).await;
+        let result = detach_project_from_workspace_committed(&projects, &storage, id, Uuid::new_v4()).await;
 
         assert!(result.is_err(), "detaching an already-standalone project must be refused");
     }
@@ -2352,7 +2374,7 @@ mod tests {
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
 
         let result =
-            detach_project_from_workspace_committed(&projects, &storage, Uuid::new_v4()).await;
+            detach_project_from_workspace_committed(&projects, &storage, Uuid::new_v4(), Uuid::new_v4()).await;
 
         assert!(result.is_err(), "detaching a project that does not exist must be refused");
     }
@@ -2370,7 +2392,7 @@ mod tests {
         existing.scope = ProjectScope::InWorkspace { workspace_id };
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
-        let result = detach_project_from_workspace_committed(&projects, &storage, id).await;
+        let result = detach_project_from_workspace_committed(&projects, &storage, id, workspace_id).await;
 
         assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
         assert_eq!(
@@ -2409,7 +2431,7 @@ mod tests {
                 .await;
         assert!(refused.is_err(), "a dangling membership must not be silently re-parented");
 
-        let detached = detach_project_from_workspace_committed(&projects, &storage, id)
+        let detached = detach_project_from_workspace_committed(&projects, &storage, id, lost.id)
             .await
             .expect("detaching must not require the lost workspace to exist");
         assert_eq!(detached.scope.workspace_id(), None);
@@ -2424,6 +2446,59 @@ mod tests {
                 .await
                 .expect("a detached project is attachable again");
         assert_eq!(reattached.scope.workspace_id(), Some(survivor.id));
+    }
+
+    /// A Project moved from Workspace A to B. A row still showing A then sends
+    /// a stale detach and a stale attach: both are refused and B keeps the
+    /// membership, on disk and in memory. A detach that names B succeeds.
+    #[tokio::test]
+    async fn a_stale_move_request_is_refused_and_keeps_the_new_workspace() {
+        let (storage, _temp) = create_test_storage();
+        let ws_a = registered_workspace();
+        let ws_b = registered_workspace();
+        let existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+        attach_project_to_workspace_committed(&projects, &ws_a.registry, &storage, id, ws_a.id)
+            .await
+            .expect("attach to A");
+        detach_project_from_workspace_committed(&projects, &storage, id, ws_a.id)
+            .await
+            .expect("first move: detach from A");
+        attach_project_to_workspace_committed(&projects, &ws_b.registry, &storage, id, ws_b.id)
+            .await
+            .expect("first move: attach to B");
+
+        let stale_detach = detach_project_from_workspace_committed(&projects, &storage, id, ws_a.id)
+            .await
+            .expect_err("a detach that names A must not detach the Project from B");
+        let stale_attach =
+            attach_project_to_workspace_committed(&projects, &ws_a.registry, &storage, id, ws_a.id)
+                .await
+                .expect_err("a Project already in B must not be attached again");
+
+        assert!(
+            stale_detach.contains("no longer in that workspace"),
+            "{stale_detach}"
+        );
+        assert!(stale_attach.contains("already belongs"), "{stale_attach}");
+        assert_eq!(
+            projects.read().await[&id].scope.workspace_id(),
+            Some(ws_b.id),
+            "memory keeps B"
+        );
+        assert_eq!(
+            storage.load_config().unwrap().projects[&id.to_string()]
+                .scope
+                .workspace_id(),
+            Some(ws_b.id),
+            "disk keeps B"
+        );
+
+        let current = detach_project_from_workspace_committed(&projects, &storage, id, ws_b.id)
+            .await
+            .expect("a detach that names the current Workspace succeeds");
+        assert_eq!(current.scope.workspace_id(), None);
     }
     // ------------------------------------------------------------------
     // Safe Project deletion: refusals, durables and concurrency (issue #193)
@@ -4024,7 +4099,7 @@ mod tests {
             .unwrap();
         let before = projects.read().await[&id].clone();
 
-        let refusal = detach_project_from_workspace_committed(&projects, &storage, id)
+        let refusal = detach_project_from_workspace_committed(&projects, &storage, id, workspace_id)
             .await
             .expect_err("a removed member must not be detached");
 
@@ -4064,13 +4139,13 @@ mod tests {
 
             let (detached, removed) = if detach_first {
                 tokio::join!(
-                    detach_project_from_workspace_committed(&projects, &storage, id),
+                    detach_project_from_workspace_committed(&projects, &storage, id, workspace_id),
                     remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id),
                 )
             } else {
                 let (r, d) = tokio::join!(
                     remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id),
-                    detach_project_from_workspace_committed(&projects, &storage, id),
+                    detach_project_from_workspace_committed(&projects, &storage, id, workspace_id),
                 );
                 (d, r)
             };

@@ -409,7 +409,7 @@ mod tests {
         assert!(fx.ledger.admit_commit(fx.task_id).await.is_err(), "an ordinary Worker commit is refused");
         assert!(fx.ledger.begin_attempt(fx.task_id, &dir(&fx)).await.is_err(), "an AI Review fix is refused");
         assert!(
-            resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.storage, fx.task_id, op, None)
+            resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.project.projects, &fx.state.storage, fx.task_id, op, None)
                 .await
                 .is_err(),
             "uncommitted successful edits cannot be resolved away"
@@ -472,7 +472,7 @@ mod tests {
 
         assert!(fx.ledger.admit_apply_commit(fx.task_id, None).await.is_err(), "a continuation is refused");
         assert!(fx.ledger.admit_commit(fx.task_id).await.is_err());
-        resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.storage, fx.task_id, op, None)
+        resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.project.projects, &fx.state.storage, fx.task_id, op, None)
             .await
             .expect("the clean checkout on the Task branch reconciles");
         assert!(record(&fx).await.is_none());
@@ -567,7 +567,7 @@ mod tests {
         assert!(fx.ledger.admit_apply_commit(fx.task_id, None).await.is_err());
         assert!(fx.ledger.admit_commit(fx.task_id).await.is_err());
 
-        resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.storage, fx.task_id, op, None)
+        resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.project.projects, &fx.state.storage, fx.task_id, op, None)
             .await
             .expect("the clean checkout on the Task branch reconciles after a restart");
         assert!(record(&fx).await.is_none());
@@ -588,7 +588,7 @@ mod tests {
         stop_after_commit(&fx, op).await;
         // The process stops after the commit and before the scope settles.
         assert!(reloaded(&fx).is_some());
-        resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.storage, fx.task_id, op, None)
+        resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.project.projects, &fx.state.storage, fx.task_id, op, None)
             .await
             .expect("a clean checkout on the Task branch reconciles");
         assert!(record(&fx).await.is_none());

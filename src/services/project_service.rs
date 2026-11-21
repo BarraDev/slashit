@@ -79,10 +79,15 @@ pub async fn attach_project_to_workspace(project_id: String, workspace_id: Strin
 }
 
 /// Detach a project from its workspace, returning it to standalone. Fails if
-/// the project is already standalone.
-pub async fn detach_project_from_workspace(project_id: String) -> Result<Project, String> {
+/// the project is already standalone, or if it is no longer in
+/// `expected_workspace_id` (a stale list).
+pub async fn detach_project_from_workspace(
+    project_id: String,
+    expected_workspace_id: String,
+) -> Result<Project, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "projectId": project_id,
+        "expectedWorkspaceId": expected_workspace_id,
     })).unwrap();
 
     let response = invoke_checked("detach_project_from_workspace", args).await?;

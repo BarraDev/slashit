@@ -5858,9 +5858,10 @@ async fn begin_pr_helper(
             // Nothing can own the task without an executor, but unresolved
             // Worker recovery evidence does not depend on one: a provider that
             // can edit the checkout is still refused, under the same lifecycle
-            // lease the executor's own admission uses.
+            // lease the executor's own admission uses. The lease also refuses
+            // a removed Project, for both purposes.
+            let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
             if purpose == crate::queue::PrHelperPurpose::Editing {
-                let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
                 if let Some(refusal) = state
                     .task
                     .tasks
@@ -8995,6 +8996,11 @@ async fn link_pr_to_task_reserved(
     pr_url: &str,
     reservation: Option<crate::queue::PrHelperLease>,
 ) -> Result<(), PrLinkFailure> {
+    // Refuse a removed Project before the GitHub read. The lease check below is
+    // the authoritative one; this only avoids the external call.
+    crate::commands::project::refuse_if_task_project_removed(state, task_uuid)
+        .await
+        .map_err(PrLinkFailure::NotRecorded)?;
     let remote_state = fetch_pr_state(&state.pr_statuses, pr_url).await;
     let merged = matches!(remote_state.as_deref(), Some("MERGED"));
 
@@ -27042,6 +27048,7 @@ mod tests {
                 crate::review_fix_residue::resolve(
                     &ledger.authority,
                     &ledger.tasks,
+                    &tokio::sync::RwLock::new(std::collections::HashMap::new()),
                     &ledger.storage,
                     task.id,
                     attempt,

@@ -124,21 +124,25 @@ pub fn ProjectOrganizer(
                             }
                         >
                             <ul class="space-y-3 max-h-[40vh] overflow-y-auto" data-testid="project-organizer-list">
+                                // Keyed by id, and each row reads its Project from `projects`:
+                                // a reload that renames a Project reaches the same row
+                                // without remounting it.
                                 <For
-                                    each=move || projects.get()
-                                    key=|project| project.id
-                                    let:project
-                                >
-                                    <ProjectRow
-                                        project=project
-                                        action_error=action_error
-                                        selected_project=selected_project
-                                        set_selected_project=set_selected_project
-                                        selected_workspace=selected_workspace
-                                        on_changed=on_changed
-                                        reload=Callback::new(move |()| reload())
-                                    />
-                                </For>
+                                    each=move || projects.with(|ps| ps.iter().map(|p| p.id).collect::<Vec<Uuid>>())
+                                    key=|id| *id
+                                    children=move |id| view! {
+                                        <ProjectRow
+                                            id=id
+                                            projects=projects
+                                            action_error=action_error
+                                            selected_project=selected_project
+                                            set_selected_project=set_selected_project
+                                            selected_workspace=selected_workspace
+                                            on_changed=on_changed
+                                            reload=Callback::new(move |()| reload())
+                                        />
+                                    }
+                                />
                             </ul>
                         </Show>
 
@@ -150,12 +154,21 @@ pub fn ProjectOrganizer(
     }
 }
 
+/// Whether the fallback Project may replace a removed Project. It may only do so
+/// while the removed Project is still selected and no Workspace is selected.
+/// Selecting a Project leaves Workspace context, so a late replacement would
+/// otherwise overwrite a Workspace the user just chose.
+fn fallback_applies(selected_project: &str, selected_workspace: &str, removed: &str) -> bool {
+    selected_project == removed && selected_workspace.is_empty()
+}
+
 /// One Project's row. Its rename and remove actions are independent: a failed
 /// rename leaves the name as it was, and a failed remove leaves the Project in
 /// the rail.
 #[component]
 fn ProjectRow(
-    project: Project,
+    id: Uuid,
+    projects: RwSignal<Vec<Project>>,
     action_error: RwSignal<Option<String>>,
     selected_project: Signal<String>,
     set_selected_project: WriteSignal<String>,
@@ -163,10 +176,31 @@ fn ProjectRow(
     on_changed: Callback<()>,
     reload: Callback<()>,
 ) -> impl IntoView {
-    let id: Uuid = project.id;
+    // The name the list reports for this Project now.
+    let listed = Memo::new(move |_| {
+        projects.with(|ps| {
+            ps.iter()
+                .find(|p| p.id == id)
+                .map(|p| p.name.clone())
+                .unwrap_or_default()
+        })
+    });
     // The name as the backend last confirmed it, and what the user is typing.
-    let saved = RwSignal::new(project.name.clone());
-    let draft = RwSignal::new(project.name.clone());
+    let initial = listed.get_untracked();
+    let saved = RwSignal::new(initial.clone());
+    let draft = RwSignal::new(initial);
+    // A reload can bring a new name for this Project. The row adopts it, and
+    // replaces the typed text only when the user has not started editing.
+    Effect::new(move |prev: Option<String>| {
+        let next = listed.get();
+        if prev.as_ref().is_some_and(|p| *p != next) && !next.is_empty() {
+            if draft.get_untracked() == saved.get_untracked() {
+                draft.set(next.clone());
+            }
+            saved.set(next.clone());
+        }
+        next
+    });
     let saving = RwSignal::new(false);
     let confirming = RwSignal::new(false);
     let removing = RwSignal::new(false);
@@ -213,16 +247,27 @@ fn ProjectRow(
             match remove_project(id_text.clone()).await {
                 Ok(()) => {
                     let _ = action_error.try_set(None);
-                    if selected_project.get_untracked() == id_text {
+                    if selected_project.try_get_untracked().as_deref() == Some(id_text.as_str()) {
                         // In Workspace context the Project is only a stale id, so clearing it
                         // must not switch context. In Project context, pick the next active one.
-                        let next = if selected_workspace.get_untracked().is_empty() {
-                            list_projects().await.unwrap_or_default().first().map(|p| p.id.to_string())
+                        let next = if selected_workspace
+                            .try_get_untracked()
+                            .is_some_and(|w| w.is_empty())
+                        {
+                            list_projects()
+                                .await
+                                .unwrap_or_default()
+                                .first()
+                                .map(|p| p.id.to_string())
                         } else {
                             None
                         };
-                        // A selection made while the fallback was read wins over it.
-                        if selected_project.get_untracked() == id_text {
+                        // Checked again after the read: a Workspace chosen meanwhile must not
+                        // be replaced, because setting a Project leaves Workspace context.
+                        let project_now = selected_project.try_get_untracked().unwrap_or_default();
+                        let workspace_now =
+                            selected_workspace.try_get_untracked().unwrap_or_default();
+                        if fallback_applies(&project_now, &workspace_now, &id_text) {
                             set_selected_project.set(next.unwrap_or_default());
                         }
                     }
@@ -302,5 +347,27 @@ fn ProjectRow(
                 </div>
             })}
         </li>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fallback_applies;
+
+    #[test]
+    fn the_fallback_replaces_a_removed_selection_when_no_workspace_was_chosen() {
+        assert!(fallback_applies("removed", "", "removed"));
+    }
+
+    #[test]
+    fn the_fallback_does_not_replace_a_workspace_chosen_while_it_was_read() {
+        // Setting a Project would leave Workspace context and drop this choice.
+        assert!(!fallback_applies("removed", "ws-1", "removed"));
+    }
+
+    #[test]
+    fn the_fallback_does_not_replace_a_selection_that_moved_on() {
+        assert!(!fallback_applies("other", "", "removed"));
+        assert!(!fallback_applies("", "", "removed"));
     }
 }

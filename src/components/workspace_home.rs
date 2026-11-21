@@ -102,6 +102,16 @@ pub fn WorkspaceHome(
                             {root_view}
                         </div>
 
+                        // Leaves Workspace context whether or not the Rail is shown.
+                        <button
+                            type="button"
+                            data-testid="workspace-home-exit"
+                            class="px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-white/70 text-sm transition-colors"
+                            on:click=move |_| set_selected_workspace.set(String::new())
+                        >
+                            "Back to Projects"
+                        </button>
+
                         <section class="space-y-3" data-testid="workspace-home-members">
                             <h2 class="font-semibold text-white/80">
                                 {format!("Projects ({member_count})")}

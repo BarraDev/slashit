@@ -21,6 +21,10 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
     let (new_name, set_new_name) = signal(String::new());
     let (new_path, set_new_path) = signal(String::new());
     let (creating, set_creating) = signal(false);
+    // Counts membership reloads that were applied. A row that started a
+    // membership change waits for this count to pass its own start.
+    let membership_applied = RwSignal::new(0u64);
+    provide_context(membership_applied);
 
     // Reloads overlap -- one per attach, detach and created workspace -- and
     // their replies can arrive out of order. Each read takes a number, and a
@@ -28,29 +32,30 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
     // an older registry can never replace a newer one.
     let workspaces_read = StoredValue::new(0u64);
     let projects_read = StoredValue::new(0u64);
+    // Takes the next read number, or None once the organizer has closed: a
+    // disposed StoredValue cannot be read, so no request is then started.
     let next = |counter: StoredValue<u64>| {
-        counter.update_value(|n| *n += 1);
-        counter.get_value()
+        counter.try_update_value(|n| {
+            *n += 1;
+            *n
+        })
     };
 
-    let load_workspaces = move || {
-        let read = next(workspaces_read);
-        async move {
-            let result = workspace_service::list_workspaces().await;
-            // try_get_value: the organizer may have closed during the await.
-            if workspaces_read.try_get_value() != Some(read) {
-                return;
+    let load_workspaces = move |read: u64| async move {
+        let result = workspace_service::list_workspaces().await;
+        // try_get_value: the organizer may have closed during the await.
+        if workspaces_read.try_get_value() != Some(read) {
+            return;
+        }
+        match result {
+            Ok(ws) => {
+                set_workspaces.set(ws);
+                set_workspaces_loaded.set(true);
             }
-            match result {
-                Ok(ws) => {
-                    set_workspaces.set(ws);
-                    set_workspaces_loaded.set(true);
-                }
-                Err(e) => {
-                    set_workspaces.set(Vec::new());
-                    set_workspaces_loaded.set(false);
-                    toast::error(format!("Could not load workspaces: {}", e));
-                }
+            Err(e) => {
+                set_workspaces.set(Vec::new());
+                set_workspaces_loaded.set(false);
+                toast::error(format!("Could not load workspaces: {}", e));
             }
         }
     };
@@ -59,10 +64,19 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
     // once. A project list newer than the registry could name a Workspace
     // another client just created, and that Project would briefly show as
     // unresolved with a Detach button on it.
+    //
+    // The projects read is numbered before the task starts, so a reply that
+    // is superseded by a later call never reports as applied. Pending rows
+    // release their busy state on that count (see `PendingReload`).
     let reload_membership = move || {
+        let Some(workspace_read) = next(workspaces_read) else {
+            return;
+        };
+        let Some(read) = next(projects_read) else {
+            return;
+        };
         spawn_local(async move {
-            load_workspaces().await;
-            let read = next(projects_read);
+            load_workspaces(workspace_read).await;
             let result = list_projects().await;
             if projects_read.try_get_value() != Some(read) {
                 return;
@@ -74,6 +88,7 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
                     toast::error(format!("Could not load projects: {}", e));
                 }
             }
+            let _ = membership_applied.try_update(|n| *n += 1);
         });
     };
 

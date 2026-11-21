@@ -1284,6 +1284,9 @@ pub enum PrHelperRefusal {
     /// An integration of the task into a local branch was started and not
     /// finished; resuming or discarding it comes first.
     IntegrationUnfinished,
+    /// The task's Project was removed. A removed Project is read-only, and a
+    /// PR helper reads or writes the Task, the plan and the checkout.
+    ProjectRemoved,
     /// The task still holds unresolved Worker recovery evidence, and a helper
     /// that can edit its checkout would change what a person has yet to
     /// inspect. Carries `Task::worker_recovery_refusal`'s own wording.
@@ -1338,6 +1341,9 @@ impl std::fmt::Display for PrHelperRefusal {
                 "an integration of this task into a local branch was started and not finished, so \
                  an agent cannot work in its checkout. Resume or discard the integration first"
             ),
+            Self::ProjectRemoved => {
+                f.write_str(crate::domain::project::PROJECT_REMOVED_REFUSAL)
+            }
             Self::WorkerRecovery(refusal) => f.write_str(refusal),
         }
     }
@@ -5766,6 +5772,7 @@ impl TaskExecutor {
                     self.worktree_manager
                         .release_unrecorded(&repo_path, &acquired.info, acquired.created_at.as_deref())
                         .await;
+                    self.refuse_unrecorded_start(task_id, &refusal);
                     return Err(refusal);
                 }
             };
@@ -6307,6 +6314,26 @@ impl TaskExecutor {
         Err(message)
     }
 
+    /// Logs a start refused for a reason the person must fix first, such as a
+    /// missing Workspace root, and backs the poller off from it. The poller
+    /// discards a start's result, so without this the refusal would repeat on
+    /// every pass with nothing on the Task saying why it has not run. The Task
+    /// keeps its state, as the refusal says.
+    fn refuse_unrecorded_start(&self, task_id: Uuid, refusal: &str) {
+        self.events.agent_event(AgentEvent::Log {
+            task_id: task_id.to_string(),
+            level: LogLevel::Warn,
+            message: refusal.to_string(),
+        });
+        self.unrecorded_backoff_lock().insert(
+            task_id,
+            UnrecordedBackoff {
+                since: std::time::Instant::now(),
+                announced: true,
+            },
+        );
+    }
+
     fn unrecorded_backoff_lock(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<Uuid, UnrecordedBackoff>> {
@@ -6588,6 +6615,13 @@ impl TaskExecutor {
                 .contains_key(&task_id);
         if already_owned {
             return Err(PrHelperRefusal::TaskAlreadyOwned);
+        }
+        // Checked under the lease: removal holds it while it writes `removed_at`.
+        let project_id = self.tasks.read().await.get(&task_id).map(|t| t.project_id);
+        if let Some(project_id) = project_id {
+            if crate::lifecycle::project_is_removed(&self.projects, project_id).await {
+                return Err(PrHelperRefusal::ProjectRemoved);
+            }
         }
         if purpose == PrHelperPurpose::Editing {
             if let Some(refusal) = self
@@ -24051,6 +24085,60 @@ VERDICT: APPROVED"
         #[tokio::test]
         async fn a_registered_worktree_of_a_resumed_stacked_branch_is_left_as_it_is() {
             refused_then_recorded_after_retry(Class::StackedResumedRegistered).await;
+        }
+
+        /// A Workspace whose root has gone missing refuses the start. The refusal
+        /// is logged on the Task once, the Task keeps its state, and the poller
+        /// does not acquire and release a checkout on every pass.
+        #[tokio::test]
+        async fn a_start_refused_for_a_missing_workspace_root_is_logged_and_backed_off() {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let w = world_with(test_executor_with_events(recording.clone()), Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let root_dir = tempfile::TempDir::new().unwrap();
+            let root = crate::domain::WorkspaceRoot::try_new(root_dir.path()).unwrap();
+            let workspace = crate::domain::Workspace::new("Shared".into(), Some(root));
+            w.executor
+                .workspace_registry
+                .write()
+                .await
+                .upsert(workspace.clone())
+                .expect("the Workspace is registered");
+            w.executor.projects.write().await.get_mut(&w.project_id).unwrap().scope =
+                ProjectScope::InWorkspace {
+                    workspace_id: workspace.id,
+                };
+            let ready_before = w.in_memory().await;
+            drop(root_dir);
+
+            let first = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(
+                first.as_ref().is_err_and(|e| e.contains("is missing") && e.contains("Nothing was started")),
+                "{first:?}"
+            );
+            assert_eq!(created_worktrees(&recording), 1);
+            assert_eq!(w.in_memory().await.status, ready_before.status, "the Task keeps its state");
+            let logged = |recording: &crate::events::RecordingEventSink| {
+                recording
+                    .recorded()
+                    .iter()
+                    .filter(|(name, payload)| {
+                        name == "agent-event"
+                            && payload.get("level").and_then(|v| v.as_str()) == Some("warn")
+                            && payload
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|m| m.contains("is missing"))
+                    })
+                    .count()
+            };
+            assert_eq!(logged(&recording), 1, "the refusal is on the Task");
+
+            let within = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(within.is_err_and(|e| e.contains("tried again")));
+            assert_eq!(created_worktrees(&recording), 1, "no checkout is acquired inside the backoff");
+            assert_eq!(logged(&recording), 1, "the refusal is not repeated on every pass");
         }
 
         /// How many times a start acquired a new worktree, from its log.

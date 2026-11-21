@@ -15,8 +15,8 @@ use leptos::task::spawn_local;
 /// What a Workspace does and does not do for a member Project's Tasks, shown
 /// with its member list. The agent may read Workspace context, but only the
 /// Task Checkout is reviewed, committed and sent to a pull request.
-const TASK_BOUNDARY_NOTE: &str = "Tasks in these projects start from the workspace folder, when it exists, and read its \
-shared instructions, but each Task edits only its own checkout. Review, commit and pull request \
+const TASK_BOUNDARY_NOTE: &str = "Tasks in these projects start from the Workspace's shared folder when one is set, and read \
+its shared instructions; otherwise they start in their own checkout. Each Task edits only its own checkout. Review, commit and pull request \
 cover that checkout only; changes made elsewhere in the workspace are not included.";
 
 /// Projects whose membership names a Workspace missing from `workspaces`,
@@ -116,16 +116,19 @@ fn UnresolvedMemberships(
     on_membership_change: Callback<()>,
 ) -> impl IntoView {
     let (busy, set_busy) = signal(false);
+    let reload = PendingReload::new(set_busy, on_membership_change);
     let unresolved = move || {
         projects.with(|ps| {
             workspaces.with(|ws| unresolved_members(ps, ws, workspaces_loaded.get()))
         })
     };
 
-    let on_detach = move |project_id: String, project_name: String| {
+    // `missing` is the Workspace the Project still records: the detach is
+    // refused if the Project has since moved elsewhere.
+    let on_detach = move |project_id: String, project_name: String, missing: String| {
         set_busy.set(true);
         spawn_local(async move {
-            match detach_project_from_workspace(project_id).await {
+            match detach_project_from_workspace(project_id, missing).await {
                 Ok(_) => {
                     toast::success(format!("Detached {}; it is now standalone", project_name));
                 }
@@ -133,8 +136,7 @@ fn UnresolvedMemberships(
                     toast::error(format!("Failed to detach project: {}", e));
                 }
             }
-            on_membership_change.run(());
-            set_busy.set(false);
+            reload.reload();
         });
     };
 
@@ -156,6 +158,7 @@ fn UnresolvedMemberships(
                             let pid = p.id.to_string();
                             let row_testid = format!("unresolved-member-{}", pid);
                             let missing = p.scope.workspace_id().map(|id| id.to_string()).unwrap_or_default();
+                            let missing_for_detach = missing.clone();
                             view! {
                                 <div
                                     data-testid=row_testid
@@ -174,7 +177,7 @@ fn UnresolvedMemberships(
                                     <button
                                         data-testid="unresolved-detach"
                                         disabled=move || busy.get()
-                                        on:click=move |_| on_detach(pid.clone(), name_for_detach.clone())
+                                        on:click=move |_| on_detach(pid.clone(), name_for_detach.clone(), missing_for_detach.clone())
                                         class="text-xs px-2 py-1 rounded bg-white/5 hover:bg-red-500/20 hover:text-red-300 text-white/50 transition-colors disabled:opacity-50"
                                     >
                                         "Detach"
@@ -199,6 +202,49 @@ fn move_detach_failure(project_name: &str, error: &str) -> String {
 /// standalone or in another Workspace; only the refreshed list can say which.
 fn move_attach_failure(project_name: &str, error: &str) -> String {
     format!("Could not add {project_name} to the workspace: {error}. The list shows its current workspace; it may be standalone.")
+}
+
+/// Keeps a row busy from the start of a membership change until the reload
+/// it triggered has been applied. Until then the row's member list still shows
+/// the Project in its old Workspace, so the row must not act on it.
+///
+/// Create it in the row component (it installs an effect), then call
+/// [`PendingReload::reload`] when the operation's outcome is known.
+#[derive(Clone, Copy)]
+struct PendingReload {
+    /// The applied-reload count at the start of the pending reload.
+    pending: RwSignal<Option<u64>>,
+    applied: RwSignal<u64>,
+    on_membership_change: Callback<()>,
+}
+
+impl PendingReload {
+    fn new(busy: WriteSignal<bool>, on_membership_change: Callback<()>) -> Self {
+        let applied = expect_context::<RwSignal<u64>>();
+        let pending = RwSignal::new(None::<u64>);
+        Effect::new(move |_| {
+            let now = applied.get();
+            if let Some(before) = pending.get() {
+                if now > before {
+                    pending.set(None);
+                    let _ = busy.try_set(false);
+                }
+            }
+        });
+        Self { pending, applied, on_membership_change }
+    }
+
+    /// Starts the reload. The row stays busy until a reload that began after
+    /// this call has been applied. A completion can arrive after the organizer
+    /// closed, which disposes these signals and the callback; then there is no
+    /// list left to reload, so nothing is started.
+    fn reload(self) {
+        let Some(before) = self.applied.try_get_untracked() else {
+            return;
+        };
+        let _ = self.pending.try_set(Some(before));
+        let _ = self.on_membership_change.try_run(());
+    }
 }
 
 /// The folder a Workspace uses, for its header: the effective path, marked when
@@ -233,6 +279,7 @@ fn WorkspaceItem(
 ) -> impl IntoView {
     let (expanded, set_expanded) = signal(false);
     let (busy, set_busy) = signal(false);
+    let reload = PendingReload::new(set_busy, on_membership_change);
     let (selected_to_attach, set_selected_to_attach) = signal(String::new());
     let ws_id = workspace.id;
     // Name and root are shown from signals, because a rename or root change
@@ -279,11 +326,12 @@ fn WorkspaceItem(
                     set_shown_name.set(saved.name.clone());
                     name_draft.set(saved.name);
                     toast::success("Workspace renamed".to_string());
-                    on_membership_change.run(());
+                    // try_run: the organizer may have closed during the request.
+                    let _ = on_membership_change.try_run(());
                 }
                 Err(e) => toast::error(format!("Failed to rename workspace: {}", e)),
             }
-            set_busy.set(false);
+            let _ = set_busy.try_set(false);
         });
     };
 
@@ -297,11 +345,12 @@ fn WorkspaceItem(
                     set_shown_root.set(saved.root_path);
                     load_root_info();
                     toast::success("Workspace root saved; existing folders were not moved".to_string());
-                    on_membership_change.run(());
+                    // try_run: the organizer may have closed during the request.
+                    let _ = on_membership_change.try_run(());
                 }
                 Err(e) => toast::error(format!("Failed to set workspace root: {}", e)),
             }
-            set_busy.set(false);
+            let _ = set_busy.try_set(false);
         });
     };
 
@@ -326,7 +375,9 @@ fn WorkspaceItem(
         }
         set_busy.set(true);
         spawn_local(async move {
-            match detach_project_from_workspace(project_id.clone()).await {
+            // This row's Workspace is the expected source: a row whose list is
+            // out of date is refused by the backend rather than moving the Project.
+            match detach_project_from_workspace(project_id.clone(), ws_id.to_string()).await {
                 Err(e) => toast::error(move_detach_failure(&project_name, &e)),
                 Ok(_) if target == STANDALONE => {
                     toast::success(format!("Moved {} to standalone", project_name));
@@ -336,8 +387,7 @@ fn WorkspaceItem(
                     Err(e) => toast::error(move_attach_failure(&project_name, &e)),
                 },
             }
-            on_membership_change.run(());
-            set_busy.set(false);
+            reload.reload();
         });
     };
 
@@ -381,7 +431,6 @@ fn WorkspaceItem(
                 Ok(project) => {
                     toast::success(format!("Attached {} to this workspace", project.name));
                     set_selected_to_attach.set(String::new());
-                    on_membership_change.run(());
                 }
                 Err(e) => {
                     toast::error(format!("Failed to attach project: {}", e));
@@ -391,27 +440,24 @@ fn WorkspaceItem(
                     // cleared too: after the resync the project may no longer be
                     // offered, and Attach must not resubmit a hidden choice.
                     set_selected_to_attach.set(String::new());
-                    on_membership_change.run(());
                 }
             }
-            set_busy.set(false);
+            reload.reload();
         });
     };
 
     let on_detach = move |project_id: String, project_name: String| {
         set_busy.set(true);
         spawn_local(async move {
-            match detach_project_from_workspace(project_id).await {
+            match detach_project_from_workspace(project_id, ws_id.to_string()).await {
                 Ok(_) => {
                     toast::success(format!("Detached {} from this workspace", project_name));
-                    on_membership_change.run(());
                 }
                 Err(e) => {
                     toast::error(format!("Failed to detach project: {}", e));
-                    on_membership_change.run(());
                 }
             }
-            set_busy.set(false);
+            reload.reload();
         });
     };
 
@@ -520,13 +566,13 @@ fn WorkspaceItem(
                                             <div class="flex items-center gap-2 shrink-0">
                                                 <div class="w-40" data-testid="workspace-move">
                                                     <CustomSelect
-                                                        options=move_options()
+                                                        options=move_options
                                                         selected=Signal::derive(String::new)
                                                         on_change=Callback::new(move |target: String| {
                                                             move_member(pid_for_move.clone(), name_for_move.clone(), target)
                                                         })
                                                         placeholder="Move to...".to_string()
-                                                        disabled=busy.get()
+                                                        disabled=move || busy.get()
                                                     />
                                                 </div>
                                                 <button
@@ -559,11 +605,11 @@ fn WorkspaceItem(
                             <div class="flex gap-2" data-testid="workspace-attach">
                                 <div class="flex-1">
                                     <CustomSelect
-                                        options=eligible_options()
+                                        options=eligible_options
                                         selected=Signal::derive(move || selected_to_attach.get())
                                         on_change=Callback::new(move |v| set_selected_to_attach.set(v))
                                         placeholder="Select a project...".to_string()
-                                        disabled=busy.get()
+                                        disabled=move || busy.get()
                                     />
                                 </div>
                                 <button
@@ -625,6 +671,8 @@ mod tests {
 
     #[test]
     fn the_boundary_note_limits_delivery_to_the_task_checkout() {
+        assert!(TASK_BOUNDARY_NOTE.contains("when one is set"));
+        assert!(TASK_BOUNDARY_NOTE.contains("otherwise they start in their own checkout"));
         assert!(TASK_BOUNDARY_NOTE.contains("edits only its own checkout"));
         assert!(TASK_BOUNDARY_NOTE.contains("cover that checkout only"));
         assert!(TASK_BOUNDARY_NOTE.contains("are not included"));

@@ -55,26 +55,48 @@ fn ensure_managed_root(paths: &AppPaths, workspace_id: Uuid) -> Result<std::path
     Ok(root)
 }
 
-/// Creates a Workspace. Without a custom root it gets its managed root at once,
-/// so the Workspace has an execution context from the start.
-/// The Workspace that already reads `root`: its custom root, or its managed
-/// folder when it has none. `except` is the Workspace being changed.
+/// The folder a Workspace reads: its custom root, or its managed folder when it
+/// has none. Canonical, so a symlinked data directory names the same folder
+/// whether or not the managed folder exists yet.
+fn effective_root(paths: &AppPaths, workspace: &Workspace) -> std::path::PathBuf {
+    let raw = match &workspace.root_path {
+        Some(custom) => custom.as_path().to_path_buf(),
+        None => paths.workspace_managed_root(workspace.id),
+    };
+    canonical_with_missing_tail(&raw)
+}
+
+/// Canonicalizes the longest existing ancestor of `path` and re-appends the
+/// names that do not exist yet. A path that cannot be resolved this way is
+/// returned unchanged.
+fn canonical_with_missing_tail(path: &std::path::Path) -> std::path::PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            return missing.iter().rev().fold(real, |acc, name| acc.join(name));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// The Workspace that already reads `root` (a canonical folder). `except` is
+/// the Workspace being changed.
 fn root_owner<'a>(
     registry: &'a WorkspaceRegistry,
     paths: &AppPaths,
     root: &std::path::Path,
     except: Option<Uuid>,
 ) -> Option<&'a Workspace> {
-    registry.all().find(|w| {
-        if Some(w.id) == except {
-            return false;
-        }
-        let effective = match &w.root_path {
-            Some(custom) => custom.as_path().to_path_buf(),
-            None => paths.workspace_managed_root(w.id),
-        };
-        effective.as_path() == root
-    })
+    registry
+        .all()
+        .find(|w| Some(w.id) != except && effective_root(paths, w) == root)
 }
 
 /// A Workspace that was not created. `workspace` is set only when the registry
@@ -86,6 +108,8 @@ pub struct CreateWorkspaceFailure {
     pub workspace: Option<Workspace>,
 }
 
+/// Creates a Workspace. Without a custom root it gets its managed root at once,
+/// so the Workspace has an execution context from the start.
 pub(crate) async fn create_workspace_core(
     registry: &RwLock<WorkspaceRegistry>,
     paths: &AppPaths,
@@ -148,16 +172,19 @@ pub(crate) async fn set_workspace_root_core(
         .get(&workspace_id)
         .cloned()
         .ok_or_else(|| "Workspace not found".to_string())?;
-    if let Some(root) = &root {
-        let owner = root_owner(&registry, paths, root.as_path(), Some(workspace_id));
-        if let Some(owner) = owner {
-            return Err(format!(
-                "The folder {} already belongs to the Workspace \"{}\"",
-                root.as_path().display(),
-                owner.name
-            ));
-        }
-    } else {
+    // Check the folder this change would leave in effect, whether it is the
+    // custom root or the managed root that clearing returns to, before any write.
+    let mut resulting = workspace.clone();
+    resulting.root_path = root.clone();
+    let resolved = effective_root(paths, &resulting);
+    if let Some(owner) = root_owner(&registry, paths, &resolved, Some(workspace_id)) {
+        return Err(format!(
+            "The folder {} already belongs to the Workspace \"{}\"",
+            resolved.display(),
+            owner.name
+        ));
+    }
+    if root.is_none() {
         ensure_managed_root(paths, workspace_id)?;
     }
     workspace.root_path = root;
@@ -496,6 +523,39 @@ mod tests {
             .expect("a folder no other Workspace reads is accepted");
     }
 
+    /// The data directory is reached through a symlink, so the managed folder
+    /// has two spellings. The canonical one names the same folder and is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_data_directory_cannot_hide_another_workspaces_managed_folder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let real_data = temp.path().join("real-data");
+        std::fs::create_dir_all(&real_data).unwrap();
+        let data_alias = temp.path().join("data");
+        std::os::unix::fs::symlink(&real_data, &data_alias).unwrap();
+        let paths = AppPaths::with_roots(
+            temp.path().join("config"),
+            data_alias,
+            temp.path().join("cache"),
+            temp.path().join("run"),
+        );
+        let registry = RwLock::new(WorkspaceRegistry::load_from(paths.workspaces_file()).unwrap());
+        let owner = create_workspace_core(&registry, &paths, "Owner".into(), None).await.unwrap();
+        let other = create_workspace_core(&registry, &paths, "Other".into(), None).await.unwrap();
+        let canonical_managed = real_data.join("workspaces").join(owner.id.to_string());
+
+        let refusal = set_workspace_root_core(
+            &registry,
+            &paths,
+            other.id,
+            Some(canonical_managed.display().to_string()),
+        )
+        .await
+        .expect_err("the canonical spelling of a managed folder is the same folder");
+        assert!(refusal.contains("Owner"), "{refusal}");
+        assert!(registry.read().await.get(&other.id).unwrap().root_path.is_none());
+    }
+
     #[tokio::test]
     async fn clearing_the_custom_root_returns_to_the_managed_root_without_deleting_anything() {
         let (temp, paths, registry) = fixture();
@@ -510,6 +570,82 @@ mod tests {
         assert!(cleared.root_path.is_none());
         assert!(paths.workspace_managed_root(workspace.id).is_dir());
         assert!(folder.is_dir(), "the custom folder is never deleted");
+    }
+
+    /// Workspace W uses a custom root, so its managed folder is unowned. Another
+    /// Workspace may then claim that managed folder. Clearing W's root would
+    /// return W to the claimed folder, so it must be refused and nothing changes.
+    #[tokio::test]
+    async fn clearing_a_custom_root_is_refused_when_another_workspace_owns_the_managed_folder() {
+        let (temp, paths, registry) = fixture();
+        let custom = temp.path().join("custom");
+        std::fs::create_dir_all(&custom).unwrap();
+        let w = create_workspace_core(&registry, &paths, "W".into(), Some(custom.display().to_string()))
+            .await
+            .unwrap();
+        let w_managed = paths.workspace_managed_root(w.id);
+        std::fs::create_dir_all(&w_managed).unwrap();
+        let other = create_workspace_core(&registry, &paths, "Other".into(), None).await.unwrap();
+        set_workspace_root_core(&registry, &paths, other.id, Some(w_managed.display().to_string()))
+            .await
+            .expect("W's managed folder is unowned while W uses a custom root");
+
+        let refusal = set_workspace_root_core(&registry, &paths, w.id, None)
+            .await
+            .expect_err("clearing W's root would give W a folder that Other already owns");
+
+        assert!(refusal.contains("Other"), "{refusal}");
+        let persisted = registry.read().await.get(&w.id).unwrap().root_path.clone();
+        assert_eq!(persisted.as_ref().map(|r| r.as_path().to_path_buf()), Some(custom.clone()));
+        assert!(custom.is_dir(), "the custom folder is untouched");
+    }
+
+    /// The data directory is reached through a symlink, so the managed folder has two
+    /// spellings: clearing must see that Other owns the same folder through either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clearing_refuses_a_managed_folder_claimed_through_the_canonical_spelling() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let real_data = temp.path().join("real-data");
+        std::fs::create_dir_all(&real_data).unwrap();
+        let data_alias = temp.path().join("data");
+        std::os::unix::fs::symlink(&real_data, &data_alias).unwrap();
+        let paths = AppPaths::with_roots(
+            temp.path().join("config"),
+            data_alias,
+            temp.path().join("cache"),
+            temp.path().join("run"),
+        );
+        let registry = RwLock::new(WorkspaceRegistry::load_from(paths.workspaces_file()).unwrap());
+        let custom = temp.path().join("custom");
+        std::fs::create_dir_all(&custom).unwrap();
+        let w = create_workspace_core(&registry, &paths, "W".into(), Some(custom.display().to_string()))
+            .await
+            .unwrap();
+        // Other claims W's managed folder through its canonical spelling; the data
+        // directory alias names the same folder.
+        let canonical_w_managed = real_data.join("workspaces").join(w.id.to_string());
+        std::fs::create_dir_all(&canonical_w_managed).unwrap();
+        let other = create_workspace_core(&registry, &paths, "Other".into(), None).await.unwrap();
+        set_workspace_root_core(&registry, &paths, other.id, Some(canonical_w_managed.display().to_string()))
+            .await
+            .expect("W's managed folder is unowned while W uses a custom root");
+
+        let refusal = set_workspace_root_core(&registry, &paths, w.id, None)
+            .await
+            .expect_err("the managed folder is Other's root through the alias");
+
+        assert!(refusal.contains("Other"), "{refusal}");
+    }
+
+    #[test]
+    fn canonical_with_missing_tail_resolves_the_existing_ancestor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let existing = temp.path().join("present");
+        std::fs::create_dir_all(&existing).unwrap();
+        let expected = existing.canonicalize().unwrap().join("a").join("b");
+
+        assert_eq!(canonical_with_missing_tail(&existing.join("a").join("b")), expected);
     }
 
     #[tokio::test]

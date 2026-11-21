@@ -36,7 +36,106 @@ fn placement(project: &Project, known: &HashSet<Uuid>) -> Placement {
     }
 }
 
-/// Vertical project switcher rail — sits on the far left edge of the window.
+type Registry = Option<Result<Vec<Workspace>, String>>;
+
+/// Whether selecting a Workspace must leave the current page. Workspace Home
+/// is not shown on Settings or MCP, so a Workspace click from either would
+/// otherwise leave the user on a page that ignores the selection.
+fn opens_workspace_home_from(page: &str) -> bool {
+    matches!(page, "settings" | "mcp")
+}
+
+/// One top-level entry of the rail. Its key identifies the entry itself (not
+/// its position or its data), so the keyed list keeps the entry's DOM, and
+/// with it keyboard focus, while the data it shows changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopRow {
+    WorkspacesUnavailable,
+    Workspace(Uuid),
+    UnresolvedNotice,
+    Project(Uuid),
+    Separator,
+}
+
+impl TopRow {
+    fn key(self) -> String {
+        match self {
+            TopRow::WorkspacesUnavailable => "notice:workspaces".to_string(),
+            TopRow::Workspace(id) => format!("workspace:{id}"),
+            TopRow::UnresolvedNotice => "notice:unresolved".to_string(),
+            TopRow::Project(id) => format!("project:{id}"),
+            TopRow::Separator => "separator".to_string(),
+        }
+    }
+}
+
+/// The top-level entries in display order. Membership decides whether a
+/// Project is listed under its Workspace or at this level.
+fn top_rows(registry: &Registry, projects: &[Project]) -> Vec<TopRow> {
+    match registry {
+        // The registry has not been read yet: show Projects flat.
+        None => projects.iter().map(|p| TopRow::Project(p.id)).collect(),
+        Some(Err(_)) => std::iter::once(TopRow::WorkspacesUnavailable)
+            .chain(projects.iter().map(|p| TopRow::Project(p.id)))
+            .collect(),
+        Some(Ok(list)) => {
+            let known: HashSet<Uuid> = list.iter().map(|w| w.id).collect();
+            let mut rows: Vec<TopRow> = list.iter().map(|w| TopRow::Workspace(w.id)).collect();
+            // A Project whose Workspace is missing from the registry stays
+            // visible here until the user repairs it.
+            let unresolved: Vec<TopRow> = projects
+                .iter()
+                .filter(|p| matches!(placement(p, &known), Placement::Unresolved(_)))
+                .map(|p| TopRow::Project(p.id))
+                .collect();
+            if !unresolved.is_empty() {
+                rows.push(TopRow::UnresolvedNotice);
+                rows.extend(unresolved);
+            }
+            let standalone: Vec<TopRow> = projects
+                .iter()
+                .filter(|p| placement(p, &known) == Placement::Standalone)
+                .map(|p| TopRow::Project(p.id))
+                .collect();
+            if !list.is_empty() && !standalone.is_empty() {
+                rows.push(TopRow::Separator);
+            }
+            rows.extend(standalone);
+            rows
+        }
+    }
+}
+
+/// The member Projects of one Workspace, in the order the list holds them.
+fn member_ids(registry: &Registry, projects: &[Project], workspace: Uuid) -> Vec<Uuid> {
+    let known: HashSet<Uuid> = match registry {
+        Some(Ok(list)) => list.iter().map(|w| w.id).collect(),
+        _ => HashSet::new(),
+    };
+    projects
+        .iter()
+        .filter(|p| placement(p, &known) == Placement::Member(workspace))
+        .map(|p| p.id)
+        .collect()
+}
+
+/// What every rail row reads. Rows read these signals when they render, so a
+/// row stays mounted and shows fresh data instead of being rebuilt.
+#[derive(Clone, Copy)]
+struct RailCtx {
+    projects: RwSignal<Vec<Project>>,
+    workspaces: RwSignal<Registry>,
+    selected_project: Signal<String>,
+    set_selected_project: WriteSignal<String>,
+    selected_workspace: Signal<String>,
+    set_selected_workspace: WriteSignal<String>,
+    current_page: Signal<String>,
+    on_navigate: Callback<String>,
+    hovered: ReadSignal<bool>,
+    collapsed: RwSignal<HashSet<Uuid>>,
+    needs_you: Callback<Uuid, usize>,
+}
+
 /// Shows Workspace groups and standalone Projects in a narrow strip (~48px),
 /// expanding on hover to reveal names.
 ///
@@ -49,6 +148,8 @@ pub fn ProjectRail(
     set_selected_project: WriteSignal<String>,
     #[prop(into)] selected_workspace: Signal<String>,
     set_selected_workspace: WriteSignal<String>,
+    #[prop(into)] current_page: Signal<String>,
+    on_navigate: Callback<String>,
 ) -> impl IntoView {
     let projects = RwSignal::new(Vec::<Project>::new());
     // None until the registry has been read; Some(Err) when it could not be
@@ -151,6 +252,24 @@ pub fn ProjectRail(
         }
     };
 
+    // The rows of the list. Recomputed only when the registry or the Project
+    // list changes; selection and hover do not rebuild it.
+    let top = Memo::new(move |_| workspaces.with(|w| projects.with(|ps| top_rows(w, ps))));
+
+    provide_context(RailCtx {
+        projects,
+        workspaces,
+        selected_project,
+        set_selected_project,
+        selected_workspace,
+        set_selected_workspace,
+        current_page,
+        on_navigate,
+        hovered,
+        collapsed,
+        needs_you: Callback::new(needs_you),
+    });
+
     let on_project_created = Callback::new(move |project: Project| {
         let pid = project.id.to_string();
         set_selected_workspace.set(String::new());
@@ -167,181 +286,17 @@ pub fn ProjectRail(
             on:mouseleave=move |_| set_hovered.set(false)
         >
             <div class="flex-1 flex flex-col gap-1 py-2 overflow-y-auto overflow-x-hidden">
-                {move || {
-                    let active_project = selected_project.get();
-                    let active_workspace = selected_workspace.get();
-                    let is_expanded = hovered.get();
-                    let all = projects.get();
-
-                    // One Project row. `indented` marks a member of a Workspace.
-                    let project_row = |project: &Project, indented: bool| -> AnyView {
-                        let pid = project.id.to_string();
-                        let pid_click = pid.clone();
-                        let is_active = active_workspace.is_empty() && pid == active_project;
-                        let name = project.name.clone();
-                        let initial = name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                        let project_uuid = project.id;
-                        let testid = format!("rail-attention-{pid}");
-                        let name_for_label = name.clone();
-                        let label = move || match needs_you(project_uuid) {
-                            0 => name_for_label.clone(),
-                            n => format!("{name_for_label}, needs you: {n}"),
-                        };
-                        view! {
-                            <button
-                                data-testid=format!("rail-project-{}", pid)
-                                on:click=move |_| {
-                                    set_selected_workspace.set(String::new());
-                                    set_selected_project.set(pid_click.clone());
-                                }
-                                class="rail-item"
-                                class:rail-member=indented
-                                class:active=is_active
-                                title=label.clone()
-                                aria-label=label
-                            >
-                                {is_active.then(|| view! {
-                                    <div class="rail-active-indicator"></div>
-                                })}
-                                <div class="rail-badge" class:active=is_active>
-                                    <span>{initial}</span>
-                                    {move || {
-                                        let count = needs_you(project_uuid);
-                                        (count > 0).then(|| view! {
-                                            <span
-                                                data-testid=testid.clone()
-                                                data-count=count.to_string()
-                                                class="rail-attention"
-                                                aria-hidden="true"
-                                            >
-                                                {count}
-                                            </span>
-                                        })
-                                    }}
-                                </div>
-                                {is_expanded.then(|| view! {
-                                    <span class="rail-label">{name.clone()}</span>
-                                })}
-                            </button>
-                        }.into_any()
-                    };
-
-                    let mut rows: Vec<AnyView> = Vec::new();
-                    match workspaces.get() {
-                        // The registry has not been read yet: show Projects flat.
-                        None => rows.extend(all.iter().map(|p| project_row(p, false))),
-                        Some(Err(message)) => {
-                            rows.push(view! {
-                                <div
-                                    role="status"
-                                    data-testid="rail-workspaces-unavailable"
-                                    title=format!("Workspace groups could not be read: {message}. Your Projects are listed without groups.")
-                                    class="rail-notice"
-                                >
-                                    <div class="rail-badge warn"><span>"!"</span></div>
-                                    {is_expanded.then(|| view! {
-                                        <span class="rail-label">{format!("Groups unavailable: {message}")}</span>
-                                    })}
-                                </div>
-                            }.into_any());
-                            rows.extend(all.iter().map(|p| project_row(p, false)));
-                        }
-                        Some(Ok(list)) => {
-                            let known: HashSet<Uuid> = list.iter().map(|w| w.id).collect();
-                            for ws in &list {
-                                let wid = ws.id;
-                                let wid_s = wid.to_string();
-                                let open = collapsed.with(|c| !c.contains(&wid));
-                                let is_active_ws = active_workspace == wid_s;
-                                let wid_click = wid_s.clone();
-                                let ws_name = ws.name.clone();
-                                let initial = ws_name.chars().next().unwrap_or('W').to_uppercase().to_string();
-                                let members: Vec<AnyView> = all
-                                    .iter()
-                                    .filter(|p| placement(p, &known) == Placement::Member(wid))
-                                    .map(|p| project_row(p, true))
-                                    .collect();
-                                let toggle_label = format!(
-                                    "{} {}",
-                                    if open { "Collapse" } else { "Expand" },
-                                    ws_name
-                                );
-                                let select_label = format!("Workspace {ws_name}");
-                                rows.push(view! {
-                                    <div class="rail-group" data-testid=format!("rail-workspace-{wid_s}")>
-                                        <div class="rail-workspace-row">
-                                            <button
-                                                type="button"
-                                                data-testid=format!("rail-workspace-toggle-{wid_s}")
-                                                aria-expanded=open.to_string()
-                                                aria-label=toggle_label.clone()
-                                                title=toggle_label
-                                                class="rail-toggle"
-                                                on:click=move |_| collapsed.update(|c| {
-                                                    if !c.remove(&wid) {
-                                                        c.insert(wid);
-                                                    }
-                                                })
-                                            >
-                                                <svg class=if open { "w-3 h-3 transition-transform rotate-90" } else { "w-3 h-3 transition-transform" } fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-                                                </svg>
-                                            </button>
-                                            <button
-                                                type="button"
-                                                data-testid=format!("rail-workspace-select-{wid_s}")
-                                                aria-label=select_label.clone()
-                                                aria-current=is_active_ws.then_some("true")
-                                                title=select_label
-                                                class="rail-item rail-workspace"
-                                                class:active=is_active_ws
-                                                on:click=move |_| set_selected_workspace.set(wid_click.clone())
-                                            >
-                                                <div class="rail-badge workspace" class:active=is_active_ws>
-                                                    <span>{initial}</span>
-                                                </div>
-                                                {is_expanded.then(|| view! {
-                                                    <span class="rail-label">{ws_name.clone()}</span>
-                                                })}
-                                            </button>
-                                        </div>
-                                        {open.then(|| members.into_iter().collect_view())}
-                                    </div>
-                                }.into_any());
-                            }
-
-                            // A Project whose Workspace is missing from the registry
-                            // stays visible here until the user repairs it.
-                            let unresolved: Vec<AnyView> = all
-                                .iter()
-                                .filter(|p| matches!(placement(p, &known), Placement::Unresolved(_)))
-                                .map(|p| project_row(p, false))
-                                .collect();
-                            if !unresolved.is_empty() {
-                                rows.push(view! {
-                                    <div data-testid="rail-unresolved" class="rail-notice" role="status">
-                                        <div class="rail-badge warn"><span>"!"</span></div>
-                                        {is_expanded.then(|| view! {
-                                            <span class="rail-label">"Unresolved membership: open Organize Projects"</span>
-                                        })}
-                                    </div>
-                                }.into_any());
-                                rows.extend(unresolved);
-                            }
-
-                            let standalone: Vec<AnyView> = all
-                                .iter()
-                                .filter(|p| placement(p, &known) == Placement::Standalone)
-                                .map(|p| project_row(p, false))
-                                .collect();
-                            if !list.is_empty() && !standalone.is_empty() {
-                                rows.push(view! { <div class="rail-separator" aria-hidden="true"></div> }.into_any());
-                            }
-                            rows.extend(standalone);
-                        }
+                <For
+                    each=move || top.get()
+                    key=|row| row.key()
+                    children=move |row| match row {
+                        TopRow::WorkspacesUnavailable => view! { <RailWorkspacesUnavailable /> }.into_any(),
+                        TopRow::Workspace(id) => view! { <RailWorkspace id=id /> }.into_any(),
+                        TopRow::UnresolvedNotice => view! { <RailUnresolvedNotice /> }.into_any(),
+                        TopRow::Project(id) => view! { <RailProjectRow id=id indented=false /> }.into_any(),
+                        TopRow::Separator => view! { <div class="rail-separator" aria-hidden="true"></div> }.into_any(),
                     }
-                    rows
-                }}
+                />
             </div>
 
             // Add project button
@@ -444,6 +399,201 @@ pub fn ProjectRail(
     }
 }
 
+/// One Project row. Its label, attention count and active state are read from
+/// the signals when they change; the row itself is not rebuilt. `indented`
+/// marks a member of a Workspace.
+#[component]
+fn RailProjectRow(id: Uuid, indented: bool) -> impl IntoView {
+    let ctx = expect_context::<RailCtx>();
+    let name = move || {
+        ctx.projects.with(|ps| {
+            ps.iter()
+                .find(|p| p.id == id)
+                .map(|p| p.name.clone())
+                .unwrap_or_default()
+        })
+    };
+    let attention = move || ctx.needs_you.run(id);
+    let is_active = move || {
+        ctx.selected_workspace.get().is_empty() && ctx.selected_project.get() == id.to_string()
+    };
+    let label = move || match attention() {
+        0 => name(),
+        n => format!("{}, needs you: {n}", name()),
+    };
+    let initial = move || {
+        name()
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_uppercase()
+            .to_string()
+    };
+    let attention_testid = format!("rail-attention-{id}");
+    view! {
+        <button
+            data-testid=format!("rail-project-{id}")
+            on:click=move |_| {
+                ctx.set_selected_workspace.set(String::new());
+                ctx.set_selected_project.set(id.to_string());
+            }
+            class="rail-item"
+            class:rail-member=indented
+            class:active=is_active
+            title=label
+            aria-label=label
+        >
+            {move || is_active().then(|| view! {
+                <div class="rail-active-indicator"></div>
+            })}
+            <div class="rail-badge" class:active=is_active>
+                <span>{initial}</span>
+                {move || {
+                    let count = attention();
+                    (count > 0).then(|| view! {
+                        <span
+                            data-testid=attention_testid.clone()
+                            data-count=count.to_string()
+                            class="rail-attention"
+                            aria-hidden="true"
+                        >
+                            {count}
+                        </span>
+                    })
+                }}
+            </div>
+            {move || ctx.hovered.get().then(|| view! {
+                <span class="rail-label">{name()}</span>
+            })}
+        </button>
+    }
+}
+
+/// A Workspace's group: the chevron shows or hides its members, and the name
+/// enters Workspace context. The two are separate controls, so the chevron
+/// never changes the selection.
+#[component]
+fn RailWorkspace(id: Uuid) -> impl IntoView {
+    let ctx = expect_context::<RailCtx>();
+    let name = move || {
+        ctx.workspaces.with(|w| match w {
+            Some(Ok(list)) => list
+                .iter()
+                .find(|ws| ws.id == id)
+                .map(|ws| ws.name.clone())
+                .unwrap_or_default(),
+            _ => String::new(),
+        })
+    };
+    let open = move || ctx.collapsed.with(|c| !c.contains(&id));
+    let is_active = move || ctx.selected_workspace.get() == id.to_string();
+    let members = move || {
+        ctx.workspaces
+            .with(|w| ctx.projects.with(|ps| member_ids(w, ps, id)))
+    };
+    let toggle_label = move || format!("{} {}", if open() { "Collapse" } else { "Expand" }, name());
+    let select_label = move || format!("Workspace {}", name());
+    let initial = move || {
+        name()
+            .chars()
+            .next()
+            .unwrap_or('W')
+            .to_uppercase()
+            .to_string()
+    };
+    view! {
+        <div class="rail-group" data-testid=format!("rail-workspace-{id}")>
+            <div class="rail-workspace-row">
+                <button
+                    type="button"
+                    data-testid=format!("rail-workspace-toggle-{id}")
+                    aria-expanded=move || open().to_string()
+                    aria-label=toggle_label
+                    title=toggle_label
+                    class="rail-toggle"
+                    on:click=move |_| ctx.collapsed.update(|c| {
+                        if !c.remove(&id) {
+                            c.insert(id);
+                        }
+                    })
+                >
+                    <svg class=move || if open() { "w-3 h-3 transition-transform rotate-90" } else { "w-3 h-3 transition-transform" } fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                    </svg>
+                </button>
+                <button
+                    type="button"
+                    data-testid=format!("rail-workspace-select-{id}")
+                    aria-label=select_label
+                    aria-current=move || is_active().then_some("true")
+                    title=select_label
+                    class="rail-item rail-workspace"
+                    class:active=is_active
+                    on:click=move |_| {
+                        ctx.set_selected_workspace.set(id.to_string());
+                        if opens_workspace_home_from(&ctx.current_page.get_untracked()) {
+                            ctx.on_navigate.run("dashboard".to_string());
+                        }
+                    }
+                >
+                    <div class="rail-badge workspace" class:active=is_active>
+                        <span>{initial}</span>
+                    </div>
+                    {move || ctx.hovered.get().then(|| view! {
+                        <span class="rail-label">{name()}</span>
+                    })}
+                </button>
+            </div>
+            {move || open().then(|| view! {
+                <For
+                    each=members
+                    key=|pid| *pid
+                    children=move |pid| view! { <RailProjectRow id=pid indented=true /> }
+                />
+            })}
+        </div>
+    }
+}
+
+/// Shown when the registry could not be read. The Projects still list below it.
+#[component]
+fn RailWorkspacesUnavailable() -> impl IntoView {
+    let ctx = expect_context::<RailCtx>();
+    let message = move || {
+        ctx.workspaces.with(|w| match w {
+            Some(Err(message)) => message.clone(),
+            _ => String::new(),
+        })
+    };
+    view! {
+        <div
+            role="status"
+            data-testid="rail-workspaces-unavailable"
+            title=move || format!("Workspace groups could not be read: {}. Your Projects are listed without groups.", message())
+            class="rail-notice"
+        >
+            <div class="rail-badge warn"><span>"!"</span></div>
+            {move || ctx.hovered.get().then(|| view! {
+                <span class="rail-label">{format!("Groups unavailable: {}", message())}</span>
+            })}
+        </div>
+    }
+}
+
+/// Heads the Projects whose Workspace is missing from the registry.
+#[component]
+fn RailUnresolvedNotice() -> impl IntoView {
+    let ctx = expect_context::<RailCtx>();
+    view! {
+        <div data-testid="rail-unresolved" class="rail-notice" role="status">
+            <div class="rail-badge warn"><span>"!"</span></div>
+            {move || ctx.hovered.get().then(|| view! {
+                <span class="rail-label">"Unresolved membership: open Organize Projects"</span>
+            })}
+        </div>
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +634,76 @@ mod tests {
             placement(&p, &HashSet::new()),
             Placement::Unresolved(missing),
             "a Project must not disappear because its Workspace is not in the registry"
+        );
+    }
+
+    fn workspace(id: Uuid) -> Workspace {
+        let now = chrono::Utc::now();
+        Workspace {
+            id,
+            name: "ws".to_string(),
+            root_path: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn a_row_keeps_its_key_when_its_project_is_renamed_or_regrouped() {
+        // Keys identify the entry, so a rename (same id) keeps the DOM node
+        // and its focus, and a regrouped Project keeps its own key.
+        let p = project(ProjectScope::Standalone);
+        let before = top_rows(&Some(Ok(vec![])), std::slice::from_ref(&p));
+        let mut renamed = p.clone();
+        renamed.name = "renamed".to_string();
+        let after = top_rows(&Some(Ok(vec![])), std::slice::from_ref(&renamed));
+        assert_eq!(
+            before.iter().map(|r| r.key()).collect::<Vec<_>>(),
+            after.iter().map(|r| r.key()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_list_places_members_under_their_workspace_and_standalone_below() {
+        let ws = workspace(Uuid::new_v4());
+        let member = project(ProjectScope::InWorkspace {
+            workspace_id: ws.id,
+        });
+        let standalone = project(ProjectScope::Standalone);
+        let rows = top_rows(&Some(Ok(vec![ws.clone()])), &[member.clone(), standalone.clone()]);
+        assert_eq!(
+            rows,
+            vec![
+                TopRow::Workspace(ws.id),
+                TopRow::Separator,
+                TopRow::Project(standalone.id),
+            ]
+        );
+        assert_eq!(
+            member_ids(
+                &Some(Ok(vec![ws.clone()])),
+                &[member.clone(), standalone],
+                ws.id
+            ),
+            vec![member.id]
+        );
+    }
+
+    #[test]
+    fn a_workspace_click_from_settings_or_mcp_leaves_that_page() {
+        assert!(opens_workspace_home_from("settings"));
+        assert!(opens_workspace_home_from("mcp"));
+        assert!(!opens_workspace_home_from("dashboard"));
+        assert!(!opens_workspace_home_from("conversations"));
+    }
+
+    #[test]
+    fn a_failed_registry_read_keeps_projects_visible_flat() {
+        let p = project(ProjectScope::Standalone);
+        let rows = top_rows(&Some(Err("corrupt".to_string())), std::slice::from_ref(&p));
+        assert_eq!(
+            rows,
+            vec![TopRow::WorkspacesUnavailable, TopRow::Project(p.id)]
         );
     }
 }

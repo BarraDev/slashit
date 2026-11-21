@@ -22,6 +22,7 @@ pub async fn resolve_review_fix(
     crate::review_fix_residue::resolve(
         &state.task_lifecycle_locks,
         &state.task.tasks,
+        &state.project.projects,
         &state.storage,
         task_id,
         attempt_id,
