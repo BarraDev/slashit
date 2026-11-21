@@ -527,7 +527,7 @@ fn WorkspaceItem(
                                 <p class="text-xs text-white/30">"No standalone projects available to attach"</p>
                             }
                         >
-                            <div class="flex gap-2" data-testid="workspace-attach">
+                            <div class="flex items-start gap-2" data-testid="workspace-attach">
                                 <div class="flex-1">
                                     <CustomSelect
                                         options=eligible_options()
