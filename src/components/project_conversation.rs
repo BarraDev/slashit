@@ -441,7 +441,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let (applied_snapshot_request, set_applied_snapshot_request) = signal(0u64);
     let begin_snapshot_request = Callback::new(move |()| {
         let mut request = 0;
-        set_next_snapshot_request.update(|latest| {
+        set_next_snapshot_request.try_update(|latest| {
             *latest = latest.saturating_add(1);
             request = *latest;
         });
@@ -524,7 +524,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             };
             let loaded_value = loaded.as_ref().ok().cloned();
             match loaded {
-                Ok(value) => publish.run((request, value)),
+                Ok(value) => { let _ = publish.try_run((request, value)); }
                 Err(error) => { let _ = set_error.try_set(Some(error)); }
             }
             // The read at start-up is fresh and no send is in flight, so it can settle a pending send either way.
@@ -555,7 +555,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let id = poll_id.clone();
         let request = poll_begin_request.run(());
         let publish = poll_publish;
-        spawn_local(async move { if let Ok(value) = conversation_service::get_project_conversation(id).await { publish.run((request, value)); } });
+        spawn_local(async move { if let Ok(value) = conversation_service::get_project_conversation(id).await { publish.try_run((request, value)); } });
     })));
     on_cleanup(move || { timer.update_value(|value| { value.take(); }); });
 
@@ -624,13 +624,13 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                 return;
             }
             let known = match conversation_service::send_project_message(project.clone(), message).await {
-                Ok(value) => { publish.run((request, value.clone())); Some(value) }
+                Ok(value) => { publish.try_run((request, value.clone())); Some(value) }
                 Err(error) => {
                     let _ = set_error.try_set(Some(error));
                     // A failed send can still have saved the Human message. Read the history before deciding.
                     match conversation_service::get_project_conversation(project.clone()).await {
                         Ok(value) => {
-                            publish.run((refresh_begin_request.run(()), value.clone()));
+                            publish.try_run((refresh_begin_request.try_run(()).unwrap_or_default(), value.clone()));
                             Some(value)
                         }
                         Err(_) => None,
@@ -657,7 +657,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         spawn_local(async move {
             match conversation_service::get_project_conversation(id.clone()).await {
                 Ok(value) => {
-                    publish.run((request, value.clone()));
+                    publish.try_run((request, value.clone()));
                     if composer::settle_pending_send(&id, &value, true) {
                         let _ = set_draft.try_set(composer::draft_text(&id));
                     }
@@ -681,9 +681,9 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let refresh_publish = approve_publish;
         spawn_local(async move {
             match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Approve { request }).await {
-                Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
+                Ok(value) => { let _ = publish.try_run((request_id, value)); } Err(error) => { let _ = set_error.try_set(Some(error)); let refresh_request = refresh_begin_request.try_run(()).unwrap_or_default(); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.try_run((refresh_request, value)); } },
             }
-            set_busy.set(false);
+            let _ = set_busy.try_set(false);
         });
     });
     let reject_project_id = project_id.clone();
@@ -700,9 +700,9 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let refresh_publish = reject_publish;
         spawn_local(async move {
             match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Reject).await {
-                Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
+                Ok(value) => { let _ = publish.try_run((request_id, value)); } Err(error) => { let _ = set_error.try_set(Some(error)); let refresh_request = refresh_begin_request.try_run(()).unwrap_or_default(); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.try_run((refresh_request, value)); } },
             }
-            set_busy.set(false);
+            let _ = set_busy.try_set(false);
         });
     });
     let withdraw_project_id = project_id.clone();
@@ -719,9 +719,9 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let refresh_publish = withdraw_publish;
         spawn_local(async move {
             match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Withdraw).await {
-                Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
+                Ok(value) => { let _ = publish.try_run((request_id, value)); } Err(error) => { let _ = set_error.try_set(Some(error)); let refresh_request = refresh_begin_request.try_run(()).unwrap_or_default(); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.try_run((refresh_request, value)); } },
             }
-            set_busy.set(false);
+            let _ = set_busy.try_set(false);
         });
     });
     let retry_project_id = project_id.clone();
@@ -742,10 +742,10 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             match conversation_service::retry_project_conversation_continuation(
                 id, current.conversation.id.to_string(), current.conversation.revision, action_id,
             ).await {
-                Ok(value) => publish.run((request, value)),
+                Ok(value) => { let _ = publish.try_run((request, value)); }
                 Err(error) => { let _ = set_error.try_set(Some(error)); }
             }
-            set_busy.set(false);
+            let _ = set_busy.try_set(false);
         });
     });
     let turn_project_id = project_id.clone();
@@ -764,17 +764,17 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let refresh_publish = turn_publish;
         spawn_local(async move {
             match conversation_service::retry_project_message(id, current.conversation.id.to_string(), current.conversation.revision).await {
-                Ok(value) => publish.run((request, value)),
+                Ok(value) => { let _ = publish.try_run((request, value)); }
                 Err(error) => {
                     // A refused retry means the Conversation moved on, so reload it.
-                    set_error.set(Some(error));
-                    let refresh_request = refresh_begin_request.run(());
+                    let _ = set_error.try_set(Some(error));
+                    let refresh_request = refresh_begin_request.try_run(()).unwrap_or_default();
                     if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await {
-                        refresh_publish.run((refresh_request, value));
+                        refresh_publish.try_run((refresh_request, value));
                     }
                 }
             }
-            set_busy.set(false);
+            let _ = set_busy.try_set(false);
         });
     });
     let key_project = pid.clone();
@@ -1343,5 +1343,17 @@ mod tests {
         assert!(executions.try_get_untracked().is_none());
         assert!(set_executions.try_set(Vec::new()).is_some());
         assert!(stable_refreshes.try_update_value(|count| *count += 1).is_none());
+    }
+
+    #[test]
+    fn a_snapshot_that_returns_after_disposal_is_not_published() {
+        // A late snapshot response calls the publish callback after a Project switch. A disposed callback
+        // reports that nothing is left, so the response is dropped instead of panicking.
+        let owner = leptos::reactive::owner::Owner::new();
+        let (published, set_published) = owner.with(|| signal(0u64));
+        let publish = owner.with(|| Callback::new(move |(request, _value): (u64, ())| set_published.set(request)));
+        owner.cleanup();
+        assert!(publish.try_run((1, ())).is_none());
+        assert!(published.try_get_untracked().is_none());
     }
 }
