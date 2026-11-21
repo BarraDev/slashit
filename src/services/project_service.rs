@@ -41,7 +41,9 @@ pub async fn create_project(name: String, repository_id: Option<String>, agent_t
         "agentType": agent_type,
     })).unwrap();
 
-    let response = invoke("create_project", args).await;
+    // `invoke` traps on a refused create, which aborted the caller silently:
+    // no message, and the dialog stayed open. The refusal must come back as Err.
+    let response = invoke_checked("create_project", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 

@@ -114,3 +114,6 @@
 # Public replies to PR review comments: posted only when selected, with the exact text shown.
 3	pr_comment_review::a_public_reply_is_posted_only_as_the_person_approved_its_exact_text
 3	pr_comment_analyze::analyze_builds_the_review_plan_from_github_and_the_triage_helper
+1	project_rail::a_workspace_without_projects_stays_visible_in_the_rail
+3	project_rail::a_recent_folder_that_is_already_open_is_refused_without_a_second_project
+2	project_rail::a_workspace_chevron_collapses_and_expands_its_member_projects

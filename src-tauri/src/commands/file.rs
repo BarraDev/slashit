@@ -152,15 +152,18 @@ pub async fn read_file(
 #[tauri::command]
 pub async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    
-    app.dialog()
-        .file()
-        .set_title("Select Repository Folder")
-        .pick_folder(move |folder_path| {
-            let result = folder_path.map(|p| p.to_string());
-            let _ = tx.send(result);
-        });
-    
+
+    let mut dialog = app.dialog().file().set_title("Select Repository Folder");
+    // Start in the home folder: GTK otherwise opens on the empty Recent view,
+    // where nothing can be selected.
+    if let Some(home) = dirs::home_dir() {
+        dialog = dialog.set_directory(home);
+    }
+    dialog.pick_folder(move |folder_path| {
+        let result = folder_path.map(|p| p.to_string());
+        let _ = tx.send(result);
+    });
+
     match rx.await {
         Ok(Some(path)) => Ok(Some(path)),
         Ok(None) => Ok(None), // User cancelled

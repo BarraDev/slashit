@@ -123,6 +123,9 @@ pub async fn create_project(
         Some(id) => state.repository.repositories.read().await.get(&id).map(|r| r.local_path.clone()),
         None => None,
     };
+    // A folder that already has an active Project is refused before the
+    // reopen below, which would otherwise bring back a removed one beside it.
+    refuse_second_active_project(&*state.project.projects.read().await, repository_id)?;
     // Opening the folder of a removed Project returns that Project, with its
     // id, name, Tasks and Conversation, instead of creating a second one.
     if let Some(folder) = repository_path.as_deref() {
@@ -184,6 +187,28 @@ pub(crate) async fn refuse_if_task_project_removed(
         return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
     }
     Ok(())
+}
+
+/// Refuses a second active Project on one repository. The folder is already
+/// open as that Project, so a second one would give two boards and two
+/// Conversations for the same checkout.
+fn refuse_second_active_project(
+    projects: &HashMap<Uuid, Project>,
+    repository_id: Option<Uuid>,
+) -> Result<(), String> {
+    let Some(repository_id) = repository_id else {
+        return Ok(());
+    };
+    match projects
+        .values()
+        .find(|p| !p.is_removed() && p.repository_id == Some(repository_id))
+    {
+        Some(active) => Err(format!(
+            "This folder is already open as Project '{}'. Nothing was changed.",
+            active.name
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The removed Project whose repository is the given folder, if any. The
@@ -429,6 +454,9 @@ async fn create_project_committed(
     project: Project,
 ) -> Result<Project, String> {
     let mut projects_w = projects.write().await;
+    // Checked under the same write lock as the insert, so two concurrent
+    // opens of one folder cannot both pass the check.
+    refuse_second_active_project(&projects_w, project.repository_id)?;
     let mut proposed = projects_w.clone();
     proposed.insert(project.id, project.clone());
 
@@ -1792,6 +1820,35 @@ mod tests {
         let on_disk = reopened(&storage).load_config().unwrap();
         assert_eq!(on_disk.projects[&id.to_string()].name, "Renamed");
         assert!(on_disk.projects.contains_key(&other.id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_second_active_project_on_one_repository_is_refused_and_another_repository_is_not() {
+        let (storage, _temp) = create_test_storage();
+        let repository = Uuid::new_v4();
+        let mut first = make_test_project(Uuid::new_v4());
+        first.repository_id = Some(repository);
+        let projects = RwLock::new(HashMap::from([(first.id, first.clone())]));
+
+        let mut second = make_test_project(Uuid::new_v4());
+        second.repository_id = Some(repository);
+        let message = create_project_committed(&projects, &storage, second).await.unwrap_err();
+        assert!(message.contains("already open"), "{message}");
+        assert_eq!(projects.read().await.len(), 1, "a refused Project must not be inserted");
+
+        let mut other = make_test_project(Uuid::new_v4());
+        other.repository_id = Some(Uuid::new_v4());
+        create_project_committed(&projects, &storage, other).await.unwrap();
+    }
+
+    #[test]
+    fn a_removed_project_on_a_repository_does_not_block_a_new_active_one() {
+        let repository = Uuid::new_v4();
+        let mut removed = make_test_project(Uuid::new_v4());
+        removed.repository_id = Some(repository);
+        removed.removed_at = Some(chrono::Utc::now());
+        let projects = HashMap::from([(removed.id, removed)]);
+        assert!(refuse_second_active_project(&projects, Some(repository)).is_ok());
     }
 
     /// Project deletion whose config write replaced the file without

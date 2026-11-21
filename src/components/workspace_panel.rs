@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::components::custom_select::{CustomSelect, SelectOption};
 use crate::components::toast;
+use crate::models::workspace::WorkspaceRootInfo;
 use crate::models::{Project, ProjectScope, Workspace};
 use crate::services::{attach_project_to_workspace, detach_project_from_workspace, workspace_service};
 
@@ -188,10 +189,27 @@ fn UnresolvedMemberships(
     }
 }
 
-/// The label for a Workspace's root, shown in the header and details.
-fn root_label(root: &Option<String>) -> String {
-    root.clone()
-        .unwrap_or_else(|| "Grouping only: no shared agent context directory".to_string())
+/// The folder a Workspace uses, for its header: the effective path, marked when
+/// it is missing. A Workspace without a custom root still has its managed
+/// folder, so this never says it has no folder.
+fn folder_label(info: &Option<WorkspaceRootInfo>) -> String {
+    match info {
+        None => "Loading folder…".to_string(),
+        Some(info) if info.exists => info.path.clone(),
+        Some(info) => format!("{} (missing)", info.path),
+    }
+}
+
+/// The folder and what kind it is, for the details.
+fn folder_detail(info: &Option<WorkspaceRootInfo>) -> String {
+    match info {
+        None => "Loading folder…".to_string(),
+        Some(info) => {
+            let kind = if info.custom { "custom folder" } else { "managed by SlashIt" };
+            let state = if info.exists { "exists" } else { "missing" };
+            format!("{} ({kind}, {state})", info.path)
+        }
+    }
 }
 
 #[component]
@@ -211,6 +229,17 @@ fn WorkspaceItem(
     let (shown_root, set_shown_root) = signal(workspace.root_path.clone());
     let name_draft = RwSignal::new(workspace.name.clone());
     let root_draft = RwSignal::new(workspace.root_path.clone().unwrap_or_default());
+    // The effective folder, from the backend: the custom root, or the managed
+    // folder SlashIt created for this Workspace.
+    let root_info = RwSignal::new(None::<WorkspaceRootInfo>);
+    let load_root_info = move || {
+        spawn_local(async move {
+            if let Ok(info) = workspace_service::get_workspace_root(&ws_id.to_string()).await {
+                root_info.set(Some(info));
+            }
+        });
+    };
+    load_root_info();
 
     let on_rename = move |_| {
         let name = name_draft.get().trim().to_string();
@@ -241,6 +270,7 @@ fn WorkspaceItem(
                 Ok(saved) => {
                     root_draft.set(saved.root_path.clone().unwrap_or_default());
                     set_shown_root.set(saved.root_path);
+                    load_root_info();
                     toast::success("Workspace root saved; existing folders were not moved".to_string());
                     on_membership_change.run(());
                 }
@@ -372,7 +402,7 @@ fn WorkspaceItem(
                     </svg>
                     <div class="flex-1 min-w-0 text-left">
                         <h3 class="font-medium text-white/90 truncate" data-testid="workspace-name">{move || shown_name.get()}</h3>
-                        <p class="text-xs text-white/40 truncate font-mono mt-0.5" data-testid="workspace-root-label">{move || root_label(&shown_root.get())}</p>
+                        <p class="text-xs text-white/40 truncate font-mono mt-0.5" data-testid="workspace-root-label">{move || folder_label(&root_info.get())}</p>
                     </div>
                 </div>
                 <span class="px-2 py-0.5 rounded text-xs font-medium bg-white/5 text-white/40">
@@ -388,8 +418,8 @@ fn WorkspaceItem(
                             <span class="text-white/70 font-mono text-xs">{ws_id.to_string()}</span>
                         </div>
                         <div class="flex items-center justify-between text-sm">
-                            <span class="text-white/40">"Path:"</span>
-                            <span class="text-white/70 font-mono text-xs truncate ml-4">{move || root_label(&shown_root.get())}</span>
+                            <span class="text-white/40">"Folder:"</span>
+                            <span class="text-white/70 font-mono text-xs truncate ml-4" data-testid="workspace-folder-detail">{move || folder_detail(&root_info.get())}</span>
                         </div>
                     </div>
 

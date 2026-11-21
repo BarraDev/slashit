@@ -227,17 +227,23 @@ button:focus:not(:focus-visible) {
   flex-direction: column;
 }
 
+/* The chevron sits in a 12px strip on the left edge, and the Workspace badge
+   starts at 14px, so the badge stays inside the 48px collapsed rail. */
 .rail-workspace-row {
+  position: relative;
   display: flex;
-  align-items: center;
-  gap: 2px;
-  padding-right: 4px;
 }
 
+/* The global button rule adds padding; the reset keeps the chevron in its strip. */
+/* z-index: the Workspace select button is a later, positioned sibling, and
+   would otherwise paint over the chevron and take its clicks. */
 .rail-toggle {
-  flex: 0 0 14px;
-  width: 14px;
-  height: 32px;
+  position: absolute;
+  z-index: 1;
+  inset: 0 auto 0 0;
+  width: 12px;
+  min-width: 0;
+  padding: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -262,10 +268,14 @@ button:focus:not(:focus-visible) {
 .rail-workspace {
   flex: 1 1 auto;
   min-width: 0;
+  padding-left: 14px;
+  padding-right: 0;
 }
 
+/* Members keep the badge inside the 48px rail; the guide line shows nesting. */
 .rail-item.rail-member {
-  padding-left: 22px;
+  padding-left: 14px;
+  box-shadow: inset 2px 0 0 rgba(255,255,255,0.08);
 }
 
 .rail-badge.workspace {
