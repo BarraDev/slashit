@@ -63,7 +63,7 @@ pub fn ProjectOrganizer(
                     role="dialog"
                     aria-modal="true"
                     aria-labelledby="project-organizer-title"
-                    class="relative w-full max-w-xl bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl"
+                    class="relative w-full max-w-xl max-h-[90vh] flex flex-col bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl"
                     on:click=move |e| e.stop_propagation()
                     on:keydown=move |e| {
                         if e.key() == "Escape" {
@@ -90,9 +90,9 @@ pub fn ProjectOrganizer(
                         </button>
                     </div>
 
-                    // Only the Project list scrolls. A scrolling body would clip the
-                    // Workspace attach dropdown, which opens below its trigger.
-                    <div class="p-6 space-y-3">
+                    // The dialog is bounded by the window; this body scrolls. Menus
+                    // open in the flow (see CustomSelect), so nothing here clips them.
+                    <div class="p-6 space-y-3 flex-1 min-h-0 overflow-y-auto">
                         {move || action_error.get().map(|message| view! {
                             <div role="alert" data-testid="project-organizer-error" class="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
                                 {message}
