@@ -74,10 +74,11 @@ pub fn WorkspaceHome(
                             let missing = (!root.exists).then(|| view! {
                                 <span class="text-red-300">" Missing: agents of member Projects cannot start here until it exists."</span>
                             });
+                            let shown = short_path(&root.path);
                             view! {
                                 <p class="text-sm text-white/50" data-testid="workspace-home-root">
-                                    {kind}": "
-                                    <span class="font-mono text-white/70 break-all">{root.path}</span>
+                                    {kind}" · "
+                                    <span class="font-mono text-white/60" title=root.path data-testid="workspace-home-root-path">{shown}</span>
                                     {missing}
                                 </p>
                             }.into_any()
@@ -151,4 +152,30 @@ async fn load(id: &str) -> Result<Loaded, String> {
         .filter(|p| p.scope.workspace_id().map(|w| w.to_string()).as_deref() == Some(id))
         .collect();
     Ok(Loaded { workspace, root, members })
+}
+
+/// The last two segments of a long path, so the Workspace title stays the main
+/// content. The full path is still shown in the element's tooltip.
+fn short_path(path: &str) -> String {
+    let segments: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    if path.len() <= 48 || segments.len() <= 2 {
+        return path.to_string();
+    }
+    format!("…/{}", segments[segments.len() - 2..].join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_path;
+
+    #[test]
+    fn a_short_path_is_shown_whole() {
+        assert_eq!(short_path("/home/me/ws"), "/home/me/ws");
+    }
+
+    #[test]
+    fn a_long_path_keeps_its_last_two_segments() {
+        let long = "/home/ruiandrada/.local/share/slashit/workspaces/field-workspace-root";
+        assert_eq!(short_path(long), "…/workspaces/field-workspace-root");
+    }
 }
