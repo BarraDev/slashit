@@ -160,8 +160,10 @@ Only part of that exists today.
   over 32 KiB or one that is not UTF-8. `@` imports are not resolved. The copy
   grants the Worker no path. A Workspace without a custom root adds no context.
   If a configured custom root is missing, the run is refused before it starts
-  and its Task Checkout is released. SlashIt does not fall back silently: the
-  person restores the folder or changes the root, then runs again. Other agent
+  and its Task Checkout is released. The Task is recorded as an Error that names
+  the missing folder, so it holds no execution capacity and no later pass starts
+  it. SlashIt does not fall back silently: the person restores the folder or
+  changes the root, then moves the Task back to Queue to run it. Other agent
   runs, such as AI review and PR review fixes, do not use the Workspace root.
 - **Verified execution limits (as of this increment).** No coding Worker is
   granted the Workspace root as a working directory or as an `--add-dir`.
