@@ -39,7 +39,8 @@ pub struct WorkspaceRootInfo {
 
 /// Validates an optional custom root. Empty input means no custom root.
 fn custom_root(root_path: Option<String>) -> Result<Option<WorkspaceRoot>, String> {
-    match root_path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+    // Only blank input means no root: a trailing space can be part of a folder name.
+    match root_path.filter(|p| !p.trim().is_empty()) {
         Some(path) => Ok(Some(WorkspaceRoot::try_new(&path)?)),
         None => Ok(None),
     }
@@ -503,16 +504,20 @@ mod tests {
         let (temp, paths, registry) = fixture();
         let owner = create_workspace_core(&registry, &paths, "Owner".into(), None).await.unwrap();
         let managed = paths.workspace_managed_root(owner.id);
+        // Refusals name the canonical folder (a Windows verbatim path differs from the raw one).
+        let canonical = managed.canonicalize().unwrap().display().to_string();
         let other = create_workspace_core(&registry, &paths, "Other".into(), None).await.unwrap();
 
         let refusal = set_workspace_root_core(&registry, &paths, other.id, Some(managed.display().to_string()))
             .await
             .expect_err("a managed folder read by another Workspace cannot become a custom root");
         assert!(refusal.contains("Owner"), "{refusal}");
+        assert!(refusal.contains(&canonical), "{refusal}");
         let refusal = create_workspace_core(&registry, &paths, "Third".into(), Some(managed.display().to_string()))
             .await
             .expect_err("creating over another Workspace's managed folder is refused");
         assert!(refusal.message.contains("already registered"), "{}", refusal.message);
+        assert!(refusal.message.contains(&canonical), "{}", refusal.message);
         assert!(refusal.workspace.is_none(), "nothing was created");
 
         // A distinct folder is still accepted for the same Workspace.
@@ -521,6 +526,25 @@ mod tests {
         set_workspace_root_core(&registry, &paths, other.id, Some(elsewhere.display().to_string()))
             .await
             .expect("a folder no other Workspace reads is accepted");
+    }
+
+    /// Whitespace is part of a folder name on Unix: a root whose name ends in a
+    /// space is that folder, not a trimmed path that does not exist.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_custom_root_keeps_whitespace_that_is_part_of_its_path() {
+        let (temp, paths, registry) = fixture();
+        let spaced = temp.path().join("client ");
+        std::fs::create_dir_all(&spaced).unwrap();
+        let workspace = create_workspace_core(&registry, &paths, "Spaced".into(), None).await.unwrap();
+
+        let updated = set_workspace_root_core(&registry, &paths, workspace.id, Some(spaced.display().to_string()))
+            .await
+            .expect("a folder whose name ends in a space is a valid root");
+        assert_eq!(
+            updated.root_path.as_ref().map(|root| root.as_path().to_path_buf()),
+            Some(spaced.canonicalize().unwrap())
+        );
     }
 
     /// The data directory is reached through a symlink, so the managed folder

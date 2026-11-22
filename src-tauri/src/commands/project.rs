@@ -125,7 +125,12 @@ pub async fn create_project(
     };
     // A folder that already has an active Project is refused before the
     // reopen below, which would otherwise bring back a removed one beside it.
-    refuse_second_active_project(&*state.project.projects.read().await, repository_id, None)?;
+    refuse_second_active_project(
+        &*state.project.projects.read().await,
+        &*state.repository.repositories.read().await,
+        repository_id,
+        None,
+    )?;
     // Opening the folder of a removed Project returns that Project, with its
     // id, name, Tasks and Conversation, instead of creating a second one.
     if let Some(folder) = repository_path.as_deref() {
@@ -151,7 +156,7 @@ pub async fn create_project(
         removed_at: None,
     };
 
-    create_project_committed(&state.project.projects, &state.storage, project).await
+    create_project_committed(&state.project.projects, &state.repository.repositories, &state.storage, project).await
 }
 
 /// Refuses a Project-scoped mutation when the Project has been removed. An
@@ -223,20 +228,29 @@ pub(crate) async fn lease_active_task_in(
     Ok(lease)
 }
 
-/// Refuses a second active Project on one repository. The folder is already
+/// Refuses a second active Project on one checkout. The folder is already
 /// open as that Project, so a second one would give two boards and two
-/// Conversations for the same checkout.
+/// Conversations for the same checkout. Two Projects are the same checkout when
+/// they name one Repository, or when their Repository records resolve to one
+/// canonical folder: legacy config can hold two records for one folder, and
+/// those are not merged here.
 fn refuse_second_active_project(
     projects: &HashMap<Uuid, Project>,
+    repositories: &HashMap<Uuid, crate::domain::Repository>,
     repository_id: Option<Uuid>,
     except: Option<Uuid>,
 ) -> Result<(), String> {
     let Some(repository_id) = repository_id else {
         return Ok(());
     };
-    match projects.iter().find(|(id, p)| {
-        Some(**id) != except && !p.is_removed() && p.repository_id == Some(repository_id)
-    }) {
+    let wanted = repositories.get(&repository_id).map(|r| canonical_folder(&r.local_path));
+    let same_checkout = |p: &Project| {
+        p.repository_id == Some(repository_id)
+            || wanted.as_ref().is_some_and(|wanted| {
+                p.repository_path(repositories).is_some_and(|path| canonical_folder(&path) == *wanted)
+            })
+    };
+    match projects.iter().find(|(id, p)| Some(**id) != except && !p.is_removed() && same_checkout(p)) {
         Some((_, active)) => Err(format!(
             "This folder is already open as Project '{}'. Nothing was changed.",
             active.name
@@ -262,9 +276,35 @@ async fn reopen_removed_project_for_folder(
     // The gate excludes a concurrent removal of the same Project, so the
     // reopen and a removal cannot both decide from the same state.
     let _gate = state.task.project_gate.write(id).await;
-    reopen_project_committed(&state.project.projects, &state.storage, id)
-        .await
-        .map(Some)
+    reopen_matching_removed_project(
+        &state.project.projects,
+        &state.repository.repositories,
+        &state.storage,
+        folder,
+        id,
+    )
+    .await
+}
+
+/// Reopens `id` only if `folder` still resolves to it. Runs under the gate,
+/// after the candidate was read, so the folder is checked again against the
+/// state the reopen decides from.
+async fn reopen_matching_removed_project(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    repositories: &RwLock<HashMap<Uuid, crate::domain::Repository>>,
+    storage: &Storage,
+    folder: &str,
+    id: Uuid,
+) -> Result<Option<Project>, String> {
+    let still_matches = {
+        let projects = projects.read().await;
+        let repositories = repositories.read().await;
+        removed_project_for_folder(&projects, &repositories, folder) == Some(id)
+    };
+    if !still_matches {
+        return Ok(None);
+    }
+    reopen_project_committed(projects, repositories, storage, id).await.map(Some)
 }
 
 /// The removed Project whose repository is `folder`. The most recently removed
@@ -296,6 +336,7 @@ fn canonical_folder(path: &str) -> std::path::PathBuf {
 /// is returned unchanged.
 async fn reopen_project_committed(
     projects: &RwLock<HashMap<Uuid, Project>>,
+    repositories: &RwLock<HashMap<Uuid, crate::domain::Repository>>,
     storage: &Storage,
     id: Uuid,
 ) -> Result<Project, String> {
@@ -303,7 +344,12 @@ async fn reopen_project_committed(
     // Checked under the write lock: an active Project may have been opened for
     // the same folder since the caller looked, and reopening must not add a second.
     if let Some(removed) = projects_w.get(&id).filter(|p| p.is_removed()) {
-        refuse_second_active_project(&projects_w, removed.repository_id, None)?;
+        refuse_second_active_project(
+            &projects_w,
+            &*repositories.read().await,
+            removed.repository_id,
+            None,
+        )?;
     }
     let mut proposed = projects_w.clone();
     let project = proposed
@@ -489,13 +535,14 @@ async fn remove_refusal_for_task(
 /// truth: an error that says the change is in place and unconfirmed.
 async fn create_project_committed(
     projects: &RwLock<HashMap<Uuid, Project>>,
+    repositories: &RwLock<HashMap<Uuid, crate::domain::Repository>>,
     storage: &Storage,
     project: Project,
 ) -> Result<Project, String> {
     let mut projects_w = projects.write().await;
     // Checked under the same write lock as the insert, so two concurrent
     // opens of one folder cannot both pass the check.
-    refuse_second_active_project(&projects_w, project.repository_id, None)?;
+    refuse_second_active_project(&projects_w, &*repositories.read().await, project.repository_id, None)?;
     let mut proposed = projects_w.clone();
     proposed.insert(project.id, project.clone());
 
@@ -1079,7 +1126,7 @@ pub async fn update_project(
     // Project's lifecycle gate shared for the persist so a concurrent deletion
     // captures and removes this Project's board files by one coherent route.
     let _gate = state.task.project_gate.read(id).await;
-    update_project_committed(&state.project.projects, &state.storage, id, name, repository_id, agent_type).await
+    update_project_committed(&state.project.projects, &state.repository.repositories, &state.storage, id, name, repository_id, agent_type).await
 }
 
 /// Core of [`update_project`]; see [`create_project_committed`] for why the
@@ -1087,6 +1134,7 @@ pub async fn update_project(
 /// update the caller was told did not apply.
 async fn update_project_committed(
     projects: &RwLock<HashMap<Uuid, Project>>,
+    repositories: &RwLock<HashMap<Uuid, crate::domain::Repository>>,
     storage: &Storage,
     id: Uuid,
     name: Option<String>,
@@ -1111,7 +1159,7 @@ async fn update_project_committed(
             let repository_id = Uuid::parse_str(&repository_id).ok();
             // Under the write lock, excluding this Project: its own repository
             // is not a conflict.
-            refuse_second_active_project(&projects_w, repository_id, Some(id))?;
+            refuse_second_active_project(&projects_w, &*repositories.read().await, repository_id, Some(id))?;
             project.repository_id = repository_id;
         }
         if let Some(agent_type) = agent_type {
@@ -1208,15 +1256,35 @@ pub async fn detach_project_from_workspace(
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
     let expected_workspace_id =
         Uuid::parse_str(&expected_workspace_id).map_err(|e| e.to_string())?;
+    detach_project_from_workspace_core(&state, project_id, expected_workspace_id).await
+}
+
+/// Core of [`detach_project_from_workspace`], taking the application state so
+/// tests can drive it.
+///
+/// Idle means the same as removal: no active execution, queued work, pending
+/// review, recovery or delivery. The check runs under the Project gate and
+/// every lifecycle lease of the Project, in the order removal takes them. A
+/// status move into Queue takes only its Task's lease, not the gate, so the
+/// gate alone would let one land between the check and the membership write.
+pub(crate) async fn detach_project_from_workspace_core(
+    state: &crate::AppState,
+    project_id: Uuid,
+    expected_workspace_id: Uuid,
+) -> Result<Project, String> {
     refuse_if_project_removed(&state.project.projects, project_id).await?;
-    // Idle means the same as removal: no active execution, queued work, pending
-    // review, recovery or delivery. Checked under the Project gate and the Task
-    // board, taken before the projects write, the order removal uses.
     let running = state
         .executor
         .get()
         .map(|executor| executor.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
     let _gate = state.task.project_gate.write(project_id).await;
+    let _task_leases = crate::lifecycle::hold_project_task_leases(
+        &state.task_lifecycle_locks,
+        &state.task.tasks,
+        project_id,
+    )
+    .await
+    .map_err(|e| format!("This Project cannot leave its Workspace yet: {e}"))?;
     let durable = state.storage.load_project_tasks(project_id).map_err(|e| {
         format!("This Project's Task records cannot be read, so SlashIt cannot prove it is idle. Nothing was changed: {e}")
     })?;
@@ -1412,6 +1480,10 @@ pub(crate) mod tests {
         async fn is_task_running(&self, task_id: Uuid) -> bool {
             self.running.contains(&task_id)
         }
+    }
+
+    fn no_repositories() -> RwLock<HashMap<Uuid, crate::domain::Repository>> {
+        RwLock::new(HashMap::new())
     }
 
     pub(crate) fn make_test_project(id: Uuid) -> Project {
@@ -1640,7 +1712,7 @@ pub(crate) mod tests {
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
         let new_project = make_test_project(Uuid::new_v4());
 
-        let result = create_project_committed(&projects, &storage, new_project.clone()).await;
+        let result = create_project_committed(&projects, &no_repositories(), &storage, new_project.clone()).await;
 
         assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
         assert!(
@@ -1818,7 +1890,7 @@ pub(crate) mod tests {
         let project = make_test_project(Uuid::new_v4());
 
         let _fault = fail_config(slashit_durable_fs::Stage::SyncDirectory);
-        let message = create_project_committed(&projects, &storage, project.clone())
+        let message = create_project_committed(&projects, &no_repositories(), &storage, project.clone())
             .await
             .expect_err("the caller must be told the durability is unconfirmed");
 
@@ -1839,7 +1911,7 @@ pub(crate) mod tests {
         let project = make_test_project(Uuid::new_v4());
 
         let _fault = fail_config(slashit_durable_fs::Stage::Replace);
-        let message = create_project_committed(&projects, &storage, project.clone()).await.unwrap_err();
+        let message = create_project_committed(&projects, &no_repositories(), &storage, project.clone()).await.unwrap_err();
 
         assert!(message.starts_with("Failed to persist project"), "{message}");
         assert!(projects.read().await.is_empty());
@@ -1895,7 +1967,7 @@ pub(crate) mod tests {
         let projects = RwLock::new(HashMap::from([(id, project)]));
 
         let fault = fail_config(slashit_durable_fs::Stage::SyncDirectory);
-        let message = update_project_committed(&projects, &storage, id, Some("Renamed".into()), None, None)
+        let message = update_project_committed(&projects, &no_repositories(), &storage, id, Some("Renamed".into()), None, None)
             .await
             .unwrap_err();
         drop(fault);
@@ -1904,7 +1976,7 @@ pub(crate) mod tests {
 
         // The next, unrelated save writes memory; the rename must survive it.
         let other = make_test_project(Uuid::new_v4());
-        create_project_committed(&projects, &storage, other.clone()).await.unwrap();
+        create_project_committed(&projects, &no_repositories(), &storage, other.clone()).await.unwrap();
         let on_disk = reopened(&storage).load_config().unwrap();
         assert_eq!(on_disk.projects[&id.to_string()].name, "Renamed");
         assert!(on_disk.projects.contains_key(&other.id.to_string()));
@@ -1920,13 +1992,13 @@ pub(crate) mod tests {
 
         let mut second = make_test_project(Uuid::new_v4());
         second.repository_id = Some(repository);
-        let message = create_project_committed(&projects, &storage, second).await.unwrap_err();
+        let message = create_project_committed(&projects, &no_repositories(), &storage, second).await.unwrap_err();
         assert!(message.contains("already open"), "{message}");
         assert_eq!(projects.read().await.len(), 1, "a refused Project must not be inserted");
 
         let mut other = make_test_project(Uuid::new_v4());
         other.repository_id = Some(Uuid::new_v4());
-        create_project_committed(&projects, &storage, other).await.unwrap();
+        create_project_committed(&projects, &no_repositories(), &storage, other).await.unwrap();
     }
 
     #[test]
@@ -1936,7 +2008,7 @@ pub(crate) mod tests {
         removed.repository_id = Some(repository);
         removed.removed_at = Some(chrono::Utc::now());
         let projects = HashMap::from([(removed.id, removed)]);
-        assert!(refuse_second_active_project(&projects, Some(repository), None).is_ok());
+        assert!(refuse_second_active_project(&projects, &HashMap::new(), Some(repository), None).is_ok());
     }
 
     #[tokio::test]
@@ -1951,7 +2023,7 @@ pub(crate) mod tests {
         let projects = RwLock::new(HashMap::from([(holder_id, holder), (other_id, other)]));
 
         let message = update_project_committed(
-            &projects, &storage, other_id, None, Some(repository.to_string()), None,
+            &projects, &no_repositories(), &storage, other_id, None, Some(repository.to_string()), None,
         )
         .await
         .unwrap_err();
@@ -1960,7 +2032,7 @@ pub(crate) mod tests {
 
         // The holder keeps its own repository: it is not a conflict with itself.
         update_project_committed(
-            &projects, &storage, holder_id, None, Some(repository.to_string()), None,
+            &projects, &no_repositories(), &storage, holder_id, None, Some(repository.to_string()), None,
         )
         .await
         .unwrap();
@@ -1978,9 +2050,84 @@ pub(crate) mod tests {
         let removed_id = removed.id;
         let projects = RwLock::new(HashMap::from([(removed_id, removed), (active.id, active)]));
 
-        let message = reopen_project_committed(&projects, &storage, removed_id).await.unwrap_err();
+        let message = reopen_project_committed(&projects, &no_repositories(), &storage, removed_id).await.unwrap_err();
         assert!(message.contains("already open"), "{message}");
         assert!(projects.read().await[&removed_id].is_removed(), "the refused Project stays removed");
+    }
+
+    /// Legacy config can hold two Repository records for one folder. A Project on
+    /// either record is the same checkout, so the other is refused, and a removed
+    /// Project on one of them cannot be reopened beside the active one.
+    #[tokio::test]
+    async fn two_repository_records_for_one_folder_are_one_checkout() {
+        let (storage, _temp) = create_test_storage();
+        let folder = TempDir::new().unwrap();
+        let path = folder.path().display().to_string();
+        let record = |id: Uuid| crate::domain::Repository {
+            id,
+            local_path: path.clone(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let repositories = HashMap::from([(first, record(first)), (second, record(second))]);
+        let mut active = make_test_project(Uuid::new_v4());
+        active.repository_id = Some(first);
+        let mut removed = make_test_project(Uuid::new_v4());
+        removed.repository_id = Some(second);
+        removed.removed_at = Some(chrono::Utc::now());
+        let removed_id = removed.id;
+        let projects = HashMap::from([(active.id, active), (removed_id, removed)]);
+
+        let message = refuse_second_active_project(&projects, &repositories, Some(second), None).unwrap_err();
+        assert!(message.contains("already open"), "{message}");
+
+        let projects = RwLock::new(projects);
+        let repositories = RwLock::new(repositories);
+        let message = reopen_project_committed(&projects, &repositories, &storage, removed_id)
+            .await
+            .unwrap_err();
+        assert!(message.contains("already open"), "{message}");
+        assert!(projects.read().await[&removed_id].is_removed(), "the refused Project stays removed");
+    }
+
+    /// The removed Project is reopened only while its folder still resolves to
+    /// it. Here it names another folder by the time the reopen runs.
+    #[tokio::test]
+    async fn a_removed_project_that_no_longer_matches_the_folder_is_not_reopened() {
+        let (storage, _temp) = create_test_storage();
+        let asked = TempDir::new().unwrap();
+        let named = TempDir::new().unwrap();
+        let repository = Uuid::new_v4();
+        let mut removed = make_test_project(Uuid::new_v4());
+        removed.repository_id = Some(repository);
+        removed.removed_at = Some(chrono::Utc::now());
+        let id = removed.id;
+        let projects = RwLock::new(HashMap::from([(id, removed)]));
+        let repositories = RwLock::new(HashMap::from([(
+            repository,
+            crate::domain::Repository {
+                id: repository,
+                local_path: named.path().display().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        )]));
+
+        let asked_path = asked.path().display().to_string();
+        let reopened = reopen_matching_removed_project(&projects, &repositories, &storage, &asked_path, id)
+            .await
+            .unwrap();
+        assert!(reopened.is_none(), "a folder that no longer matches reopens nothing");
+        assert!(projects.read().await[&id].is_removed());
+
+        let named_path = named.path().display().to_string();
+        let reopened = reopen_matching_removed_project(&projects, &repositories, &storage, &named_path, id)
+            .await
+            .unwrap();
+        assert_eq!(reopened.map(|p| p.id), Some(id), "the folder it names reopens it");
     }
 
     /// Reopening a removed folder and opening it as a new Project race on the
@@ -1999,9 +2146,10 @@ pub(crate) mod tests {
         fresh.repository_id = Some(repository);
         let projects = RwLock::new(HashMap::from([(removed_id, removed)]));
 
+        let repositories = no_repositories();
         let (reopened, created) = tokio::join!(
-            reopen_project_committed(&projects, &storage, removed_id),
-            create_project_committed(&projects, &storage, fresh),
+            reopen_project_committed(&projects, &repositories, &storage, removed_id),
+            create_project_committed(&projects, &repositories, &storage, fresh),
         );
 
         let map = projects.read().await;
@@ -2170,7 +2318,7 @@ pub(crate) mod tests {
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
         let result = update_project_committed(
-            &projects, &storage, id, Some("New Name".to_string()), None, None,
+            &projects, &no_repositories(), &storage, id, Some("New Name".to_string()), None, None,
         ).await;
 
         assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
@@ -2553,12 +2701,59 @@ pub(crate) mod tests {
         );
     }
 
-    /// A removal holds a Task's lease while it writes `removed_at`. A mutation
-    /// that asks for the lease while the removal holds it can only proceed after
-    /// the removal's write, so it must see the Project as removed. Holding the
-    /// lease first makes this order deterministic, whatever the scheduler does.
+    /// A status move into Queue takes only its Task's lease, not the Project
+    /// gate. The detach must wait on that lease, so the move lands before the
+    /// idle check and the detach is refused. Without the lease the detach runs
+    /// to completion on the first poll (current-thread runtime) and leaves the
+    /// Workspace while a Task is queued: this test fails on the unfixed code.
     #[tokio::test]
-    async fn a_mutation_waiting_on_a_removal_is_refused_by_the_removed_project() {
+    async fn a_task_queued_during_a_detach_keeps_its_project_in_the_workspace() {
+        let tmp = TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _) = crate::app_core::build_state_with_paths(paths).await.expect("state");
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let mut project = make_test_project(project_id);
+        project.scope = ProjectScope::InWorkspace { workspace_id };
+        state.project.projects.write().await.insert(project_id, project);
+        let task = crate::test_helpers::create_test_task_full("queued", project_id, crate::domain::TaskStatus::Backlog, 0);
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task);
+        let state = Arc::new(state);
+
+        // The Queue move holds the Task's lease while the detach starts.
+        let move_lease = state.task_lifecycle_locks.acquire(task_id).await.expect("the move takes its lease");
+        let detach = {
+            let state = state.clone();
+            tokio::spawn(async move { detach_project_from_workspace_core(&state, project_id, workspace_id).await })
+        };
+        tokio::task::yield_now().await;
+        state.task.tasks.write().await.get_mut(&task_id).expect("the Task").status = crate::domain::TaskStatus::Queue;
+        drop(move_lease);
+
+        let err = detach
+            .await
+            .expect("the detach finishes")
+            .expect_err("a queued Task keeps its Project in the Workspace");
+        assert!(err.contains("is in Queue"), "{err}");
+        assert_eq!(
+            state.project.projects.read().await[&project_id].scope.workspace_id(),
+            Some(workspace_id)
+        );
+    }
+
+    /// One removal against one mutation that asks for the Task's lease while the
+    /// removal holds it. The mutation is spawned and then polled once: on the
+    /// current-thread test runtime that runs it until it parks on the lease, so
+    /// the lease is the only thing it can be waiting for. `release_before_write`
+    /// drops the lease before `removed_at` is written, which is the ordering the
+    /// real removal must never use.
+    async fn removal_against_waiting_mutation(release_before_write: bool) -> Result<(), String> {
         let project_id = Uuid::new_v4();
         let task = crate::test_helpers::create_test_task_full("waits", project_id, crate::domain::TaskStatus::Backlog, 0);
         let task_id = task.id;
@@ -2573,13 +2768,38 @@ pub(crate) mod tests {
                 lease_active_task_in(&locks, &tasks, &projects, task_id).await.map(|_| ())
             })
         };
-        projects.write().await.get_mut(&project_id).expect("the Project").removed_at = Some(chrono::Utc::now());
-        drop(removal_lease);
+        tokio::task::yield_now().await;
+        let removed = || async {
+            projects.write().await.get_mut(&project_id).expect("the Project").removed_at = Some(chrono::Utc::now());
+        };
+        if release_before_write {
+            drop(removal_lease);
+            tokio::task::yield_now().await;
+            removed().await;
+        } else {
+            removed().await;
+            drop(removal_lease);
+        }
+        mutation.await.expect("the mutation finishes")
+    }
 
+    /// A removal holds a Task's lease while it writes `removed_at`. A mutation
+    /// that asks for the lease while the removal holds it can only proceed after
+    /// the write, so it must see the Project as removed.
+    #[tokio::test]
+    async fn a_mutation_waiting_on_a_removal_is_refused_by_the_removed_project() {
         assert_eq!(
-            mutation.await.expect("the mutation finishes"),
+            removal_against_waiting_mutation(false).await,
             Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string())
         );
+    }
+
+    /// Negative control for the test above: with the lease released before the
+    /// write, the same harness lets the mutation land on a Project that is about
+    /// to be removed. The refusal assertion above would fail under that ordering.
+    #[tokio::test]
+    async fn negative_control_a_lease_released_before_the_removal_write_lets_the_mutation_land() {
+        assert_eq!(removal_against_waiting_mutation(true).await, Ok(()));
     }
 
     #[tokio::test]
@@ -3003,6 +3223,7 @@ pub(crate) mod tests {
                 let _gate_read = gate.read(id).await;
                 update_project_committed(
                     &projects,
+                    &no_repositories(),
                     &storage,
                     id,
                     None,
@@ -4016,7 +4237,7 @@ pub(crate) mod tests {
         let found = removed_project_for_folder(&*projects.read().await, &*repositories.read().await, &folder);
         assert_eq!(found, Some(id), "the folder finds its removed Project");
 
-        let reopened = reopen_project_committed(&projects, &storage, id).await.unwrap();
+        let reopened = reopen_project_committed(&projects, &repositories, &storage, id).await.unwrap();
 
         assert_eq!(reopened.id, id, "same identity");
         assert_eq!(reopened.name, original_name, "same name");
@@ -4173,7 +4394,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let reopened = reopen_project_committed(&projects, &storage, id).await.unwrap();
+        let reopened = reopen_project_committed(&projects, &repositories, &storage, id).await.unwrap();
 
         assert_eq!(reopened.id, id, "the original UUID");
         assert!(!reopened.is_removed());

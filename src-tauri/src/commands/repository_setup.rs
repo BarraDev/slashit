@@ -205,6 +205,11 @@ pub(crate) async fn initialize_project_vcs_core(
     kind: VcsInitKind,
     expected_files: Option<usize>,
 ) -> Result<Readiness, String> {
+    // Shared hold of the Project gate across the whole initialization, as
+    // update_project holds it for its persist: a removal (gate write) waits
+    // for this to finish instead of landing mid-way and making the final base
+    // write refuse after the folder already changed.
+    let _gate = state.task.project_gate.read(project_id).await;
     let (_, path) = project_and_path(state, project_id).await?;
     let outcome = vcs_init::initialize(&path, kind, expected_files).await?;
     record_project_base(
