@@ -1422,10 +1422,15 @@ Three build modes exist. They do not share a binary path:
   - *No longer required when:* `scripts/supervise-dogfood.sh verify` and
     `status` show a verified instance running a build that descends from the
     copy's commit, and any state difference has been reviewed and accepted.
-  - *Archive, never delete:* confirm no lifecycle operation is running with
-    `flock -n ~/.local/state/slashit-dogfood/supervisor/lifecycle.lock true`,
-    then move the directory aside:
-    `mkdir -p ~/.local/state/slashit-dogfood/supervisor/recover-archive && mv ~/.local/state/slashit-dogfood/supervisor/recover ~/.local/state/slashit-dogfood/supervisor/recover-archive/$(date -u +%Y%m%dT%H%M%SZ)`.
+  - *Archive, never delete:* hold the lifecycle lock for the whole move, so no
+    start, stop or restart can run between the check and the move. A separate
+    `flock ... true` releases the lock before the move and protects nothing.
+    Run this in one shell, from the state directory, with `set -eu` so any
+    failure stops the move:
+    `(set -eu; flock -n 9 || { echo "a lifecycle operation is running" >&2; exit 1; }; S=~/.local/state/slashit-dogfood/supervisor; mkdir -p "$S/recover-archive"; D="$S/recover-archive/$(date -u +%Y%m%dT%H%M%SZ)-$$"; mkdir "$D"; mv -T "$S/recover" "$D/recover") 9>~/.local/state/slashit-dogfood/supervisor/lifecycle.lock`.
+    The `mkdir "$D"` (no `-p`) fails if the archive name already exists, and
+    `mv -T` never moves the directory into an existing one, so nothing is
+    overwritten.
   - *Restarting again is allowed when:* `supervisor/recover` is absent or empty,
     `activity` exits 0, and no other quiesce operation holds admission.
   - Do not remove the recovery directory or any backup directory with `rm`.

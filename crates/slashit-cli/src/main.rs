@@ -251,6 +251,13 @@ async fn main() -> Result<()> {
         return daemon_status(&options, cli.json).await;
     }
     let request = request_for(&cli.command)?;
+    if let IpcRequest::Quiesce { operation } = &request {
+        // Printed before the send: if the reply is lost after the instance
+        // closed admission, this is the only way to name the operation to resume.
+        eprintln!(
+            "quiesce operation: {operation} (reopen with: slashit resume --operation {operation})"
+        );
+    }
 
     let response = slashit_ipc::client::send(&request, &options).await?;
 

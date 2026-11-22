@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=239
+EXPECTED_TOTAL=241
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -95,11 +95,11 @@ descendants_of() { # pid
 # The supervisor a background `sv start` job became: a descendant of that job
 # whose command line is exactly this checkout's supervisor run as `start`, and
 # which carries this run's fixture environment. Prints "pid starttime".
-fixture_supervisor() { # job
-  local pid cmd
+fixture_supervisor() { # job [start|restart]
+  local pid cmd mode=${2:-start}
   for pid in $(descendants_of "$1"); do
     cmd=$({ tr '\0' ' ' <"/proc/$pid/cmdline"; } 2>/dev/null) || continue
-    [ "$cmd" = "bash $sup start " ] || continue
+    [ "$cmd" = "bash $sup $mode " ] || continue
     owned_by_fixture "$pid" || continue
     printf '%s %s\n' "$pid" "$(proc_start "$pid")"
     return 0
@@ -247,9 +247,10 @@ case $last in
     # The operation is the value after --operation; it is recorded for the cases that check it.
     op=$(printf '%s\n' "$@" | sed -n '/^--operation$/{n;p}')
     printf 'quiesce %s\n' "$op" >>"$stub_dir/ops"
-    # SLASHIT_TEST_QUIESCE_LOST: the reply is lost (no answer at all), and the fence may have closed.
+    # SLASHIT_TEST_QUIESCE_LOST: the reply is lost (no answer at all). The fence closed,
+    # unless the value is "unacquired", where the request never reached the executor.
     if [ -n "${SLASHIT_TEST_QUIESCE_LOST:-}" ]; then
-      printf '%s\n' "$op" >"$stub_dir/held"
+      [ "$SLASHIT_TEST_QUIESCE_LOST" = unacquired ] || printf '%s\n' "$op" >"$stub_dir/held"
       exit 1
     fi
     # SLASHIT_TEST_QUIESCE_REFUSAL=held|shutdown: a refusal, which is a reply and not an error.
@@ -750,17 +751,32 @@ for refusal in shutdown held; do
   cleanup_instances
 done
 
-# A lost reply may have taken the fence: it is reopened for this operation only, and nothing is stopped.
+# Acquisition succeeded and its reply was lost: the matching resume reopens the fence,
+# and the fence is actually clear afterwards (the stub holds it until a matching resume).
 sv start >/dev/null 2>&1 || bad "lost-reply fixture: start failed"
-pre=$(stub_pid); : >"$stub_dir/calls"; : >"$stub_dir/ops"
-out=$(export SLASHIT_TEST_QUIESCE_LOST=1 SLASHIT_TEST_RESUME_REFUSAL=not-held; sv restart 2>&1); status=$?
+pre=$(stub_pid); : >"$stub_dir/calls"; : >"$stub_dir/ops"; rm -f "$stub_dir/held"
+out=$(export SLASHIT_TEST_QUIESCE_LOST=1; sv restart 2>&1); status=$?
 seq=$(grep -xE 'quiesce|quit|resume' "$stub_dir/calls" | uniq | tr '\n' ' ')
 q_op=$(awk '$1 == "quiesce" { print $2; exit }' "$stub_dir/ops")
 r_op=$(awk '$1 == "resume" { print $2; exit }' "$stub_dir/ops")
 if [ "$status" -ne 0 ] && [[ "$out" == *"whether admission closed is unknown"* ]] && [ "$seq" = "quiesce resume " ] &&
-  [[ "$q_op" == sup-* ]] && [ "$q_op" = "$r_op" ] && [ "$(stub_pid)" = "$pre" ] && [[ "$out" != *"could not be confirmed"* ]]; then
-  ok "a lost quiesce reply reopens only its own operation ($q_op) and stops nothing"
-else bad "lost reply: sequence '$seq', quiesce op '$q_op', resume op '$r_op' (exit $status)"; printf '%s\n' "$out" >&2; fi
+  [[ "$q_op" == sup-* ]] && [ "$q_op" = "$r_op" ] && [ "$(stub_pid)" = "$pre" ] && [ ! -f "$stub_dir/held" ]; then
+  ok "a lost reply after the fence closed is reopened by its own operation ($q_op): the fence is clear and nothing stopped"
+else bad "lost reply after acquisition: sequence '$seq', quiesce op '$q_op', resume op '$r_op', fence file $([ -f "$stub_dir/held" ] && echo held || echo clear) (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+# Acquisition never happened and its reply was lost: a matching resume finds nothing held,
+# reports not held, and the fence stays clear and nothing is stopped.
+sv start >/dev/null 2>&1 || bad "unacquired lost-reply fixture: start failed"
+pre=$(stub_pid); : >"$stub_dir/calls"; : >"$stub_dir/ops"; rm -f "$stub_dir/held"
+out=$(export SLASHIT_TEST_QUIESCE_LOST=unacquired SLASHIT_TEST_RESUME_REFUSAL=not-held; sv restart 2>&1); status=$?
+seq=$(grep -xE 'quiesce|quit|resume' "$stub_dir/calls" | uniq | tr '\n' ' ')
+q_op=$(awk '$1 == "quiesce" { print $2; exit }' "$stub_dir/ops")
+r_op=$(awk '$1 == "resume" { print $2; exit }' "$stub_dir/ops")
+if [ "$status" -ne 0 ] && [[ "$seq" == "quiesce "* ]] && [[ "$q_op" == sup-* ]] && [ "$q_op" = "$r_op" ] &&
+  [ "$(stub_pid)" = "$pre" ] && [ ! -f "$stub_dir/held" ] && ! grep -q '^quit' "$stub_dir/calls"; then
+  ok "a lost reply before any acquisition leaves the fence clear: the resume reports not held and nothing stops"
+else bad "unacquired lost reply: sequence '$seq', quiesce op '$q_op', resume op '$r_op' (exit $status)"; printf '%s\n' "$out" >&2; fi
 cleanup_instances
 
 # A release that cannot reach the instance says so, and names the operation to resume.
@@ -787,13 +803,11 @@ killed_restart() {
   rm -f "$stub_dir/quiesce-acquired" "$stub_dir/cli-paused" "$stub_dir/held"
   : >"$stub_dir/ops"; : >"$stub_dir/calls"
   sv SLASHIT_TEST_QUIESCE_PAUSE=1 SLASHIT_DOGFOOD_CLI_TIMEOUT=120 restart >"$work/killed.out" 2>&1 &
-  local bg=$! i p cmd
+  local bg=$! i p sup_info
   for i in $(seq 1 300); do [ -f "$stub_dir/quiesce-acquired" ] && break; sleep 0.1; done
-  for p in $(pgrep -f 'supervise-dogfood.sh restart' 2>/dev/null); do
-    cmd=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null) || continue
-    if [ "$cmd" = "bash $sup restart " ]; then KILLED_SUP=$p; break; fi
-  done
-  [ -n "$KILLED_SUP" ] && kill -9 "$KILLED_SUP" 2>/dev/null
+  # Only the restart this job started, found by descent and fixture ownership, is signalled.
+  sup_info=$(fixture_supervisor "$bg" restart) && KILLED_SUP=${sup_info%% *}
+  [ -n "$KILLED_SUP" ] && signal_owned KILL "$sup_info"
   # The CLI request it was waiting on is orphaned; ending it does not touch the instance.
   p=$(cat "$stub_dir/cli-paused" 2>/dev/null) && [ -n "$p" ] && kill -9 "$p" 2>/dev/null
   wait "$bg" 2>/dev/null
@@ -802,6 +816,21 @@ killed_restart() {
 }
 rec=$state/supervisor/quiesce
 rm -rf "$state/supervisor/recover"
+
+echo "== a same-checkout restart outside this fixture is never selected"
+decoy_name="bash $sup restart"
+# The decoy blocks reading a FIFO that this shell holds open, so it has no helper child to leak.
+decoy_fifo=$work/decoy.fifo
+mkfifo "$decoy_fifo" && exec 7<>"$decoy_fifo"
+bash -c 'exec -a "$1" cat' _ "$decoy_name" <"$decoy_fifo" &
+decoy=$!
+sleep 0.3
+if [ "$(tr '\0' ' ' <"/proc/$decoy/cmdline" 2>/dev/null)" = "$decoy_name " ] &&
+  ! fixture_supervisor "$$" restart >/dev/null && kill -0 "$decoy" 2>/dev/null; then
+  ok "a matching restart without this fixture's environment is not selected or signalled"
+else bad "an unowned same-checkout restart was selected or its command line did not match the probe"; fi
+kill "$decoy" 2>/dev/null; wait "$decoy" 2>/dev/null
+exec 7>&-; rm -f "$decoy_fifo"
 
 echo "== an abrupt interruption: the quiesce is recorded, and only its own operation reopens it"
 if killed_restart "killed restart"; then

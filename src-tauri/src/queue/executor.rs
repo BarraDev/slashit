@@ -1653,6 +1653,14 @@ impl ProcessAdmission {
             .is_some()
     }
 
+    /// Whether the shutdown fence is in place: closed with no quiesce holder.
+    /// Read under one lock, so a quiesce or resume cannot change the answer
+    /// between two reads of separate fields.
+    fn is_shut_down(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed && state.quiesced_by.is_none()
+    }
+
     /// Refuse every later `enter` without waiting for the ones already in.
     fn close(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1805,6 +1813,24 @@ mod admission_quiesce_tests {
         );
         gate.resume("A").expect("the holder can still reopen it");
         assert!(gate.enter().is_ok());
+    }
+
+    #[test]
+    fn a_quiesce_and_its_resume_never_read_as_a_shutdown_fence() {
+        let gate = Arc::new(ProcessAdmission::default());
+        assert!(!gate.is_shut_down(), "an open gate is not shut down");
+        gate.quiesce("A").expect("quiesce");
+        assert!(
+            !gate.is_shut_down(),
+            "a quiesce is temporary, so the poller must keep running"
+        );
+        gate.resume("A").expect("resume");
+        assert!(
+            !gate.is_shut_down(),
+            "a resumed gate is open and its poller must keep running"
+        );
+        gate.close();
+        assert!(gate.is_shut_down(), "a shutdown fence is permanent");
     }
 
     #[test]
@@ -2270,9 +2296,8 @@ impl TaskExecutor {
             loop {
                 // A quiesced poller stays alive so that `resume_admission` leaves
                 // Queue promotion working. It starts nothing while closed.
-                if matches!(&shutdown, Some(rx) if *rx.borrow())
-                    || (!executor.is_accepting_work() && !executor.is_quiesced())
-                {
+                // One snapshot of the gate: two reads could straddle a quiesce and its resume.
+                if matches!(&shutdown, Some(rx) if *rx.borrow()) || executor.is_shut_down() {
                     return;
                 }
                 if executor.is_accepting_work() {
@@ -2330,6 +2355,11 @@ impl TaskExecutor {
 
     pub fn is_quiesced(&self) -> bool {
         self.process_admission.is_quiesced()
+    }
+
+    /// Whether admission is closed by a shutdown fence, which no resume reopens.
+    pub fn is_shut_down(&self) -> bool {
+        self.process_admission.is_shut_down()
     }
 
     /// Close synchronized process-wide admission and wait for every start

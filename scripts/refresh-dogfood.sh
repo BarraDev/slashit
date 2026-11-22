@@ -185,7 +185,7 @@ has_state=no
 # check is always reported, so a dirty tree is never hidden behind a running target.
 blockers=()
 [ "$pending" -eq 0 ] || blockers+=("uncommitted changes in this checkout")
-if [ "$running" != running ] || [ "$running_commit" != "$target" ]; then
+if [ "$running" != running ] || [ "$running_commit" != "$target" ] || [ "$frontend_stale" = yes ]; then
   if [ "$has_state" = yes ] && [ "$writer_prov" = missing ]; then
     blockers+=("no state-writer record for the existing state, so start and restart refuse; establish it with scripts/supervise-dogfood.sh migrate-legacy COMMIT SHA256 (legacy executable, instance stopped) or adopt COMMIT SHA256")
   fi
@@ -267,7 +267,7 @@ if [ "${#blockers[@]}" -gt 0 ]; then
   [ "${#blockers[@]}" -eq 1 ] || printf '%s\n' "$SELF: and ${#blockers[@]} more blocker(s) above; nothing was built, stopped or started" >&2
   exit 1
 fi
-if [ "$running" = running ] && [ "$running_commit" = "$target" ]; then
+if [ "$running" = running ] && [ "$running_commit" = "$target" ] && [ "$frontend_stale" != yes ]; then
   echo "$SELF: the running instance already runs ${target:0:12}; nothing to do"
   exit 0
 fi

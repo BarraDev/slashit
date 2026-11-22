@@ -423,6 +423,25 @@ if [ "$st" -eq 1 ] && [[ "$out" == *"apply blocked:    a restart would interrupt
   ok "--check names the active work in its apply-blocked list and exits 1, with no build or restart"
 else bad "--check did not report the active work (exit $st)"; printf '%s\n' "$out" >&2; fi
 
+echo "== a stale frontend on the target commit is restarted, never reported as nothing to do"
+git -C "$repo" checkout -q "$new"; status_stale "$new"; reset; reset_activity; rm -f "$work/expect"
+out=$(export STUB_STATUS_RC=1; run --apply "$new"); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" != *"nothing to do"* ]] && calls_have restart && [ "$(cat "$work/expect" 2>/dev/null)" = "$new" ] && [ "$(activity_count)" -eq 1 ]; then
+  ok "a same-commit stale frontend passes the idle check and is restarted with the target pinned"
+else bad "a same-commit stale frontend was not restarted (exit $st, activity checks $(activity_count))"; printf '%s\n' "$out" >&2; fi
+git -C "$repo" checkout -q "$new"; status_stale "$new"; reset; reset_activity
+out=$(export STUB_STATUS_RC=1; run --check "$new"); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"frontend:         stale"* ]] && [ ! -f "$calls" ]; then
+  ok "--check reports a same-commit stale frontend as ready (exit 0) with no restart"
+else bad "--check misreported a same-commit stale frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
+for kind in active_terminals=1 running_agents=1; do
+  git -C "$repo" checkout -q "$new"; status_stale "$new"; reset; reset_activity
+  out=$(export STUB_STATUS_RC=1 STUB_ACTIVITY_BUSY_FROM=1 STUB_ACTIVITY="active work: $kind"; run --apply "$new"); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"would interrupt the active work"* ]] && [ ! -f "$calls" ]; then
+    ok "active work ($kind) blocks a same-commit stale-frontend restart: exit 1, no restart"
+  else bad "same-commit active work ($kind) did not block (exit $st)"; printf '%s\n' "$out" >&2; fi
+done
+
 echo "== the wrapper checks once; the supervisor's restart closes admission and proves idle"
 git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; reset_activity
 out=$(export STUB_STATUS_RC=1 STUB_ACTIVITY_BUSY_FROM=2 STUB_ACTIVITY="active work: queued_tasks=1"; run --apply "$new"); st=$?
