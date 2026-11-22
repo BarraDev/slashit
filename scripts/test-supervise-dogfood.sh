@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=233
+EXPECTED_TOTAL=239
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -166,9 +166,10 @@ fi
 if [ -n "${SLASHIT_TEST_STARTUP_REMOVE:-}" ]; then
   rm -f "$SLASHIT_TEST_STARTUP_REMOVE"
 fi
-echo "$$" >"$stub_dir/pid"
 rm -f "$stub_dir/quit" "$stub_dir/held" "$stub_dir/shutdown"
+# The socket exists before the pid file: a reader that sees the pid sees the endpoint path too.
 touch "$SLASHIT_TEST_SOCKET"
+echo "$$" >"$stub_dir/pid"
 if [ "${SLASHIT_TEST_STUB_ROLE:-quit}" = quit ]; then
   while [ ! -f "$stub_dir/quit" ]; do
     sleep 0.05
@@ -227,11 +228,17 @@ case $last in
         rm -f "$SLASHIT_TEST_CLI_REPLACE_RECORD"
         mkdir "$SLASHIT_TEST_CLI_REPLACE_RECORD"
       fi
+      # SLASHIT_TEST_CLI_SWAP_PID_FROM=N: from the Nth ping on, the endpoint reports pid 1,
+      # as if another instance had taken it between the restart's selection and its quiesce.
+      pid_answer=$(cat "$stub_dir/pid")
+      if [ -n "${SLASHIT_TEST_CLI_SWAP_PID_FROM:-}" ] && [ "$(grep -c '^ping$' "$stub_dir/calls")" -ge "$SLASHIT_TEST_CLI_SWAP_PID_FROM" ]; then
+        pid_answer=1
+      fi
       # An instance built before admission quiesce omits the field (SLASHIT_TEST_OLD_BINARY).
       adm=$'  "admission_control": true,\n'
       [ -z "${SLASHIT_TEST_OLD_BINARY:-}" ] || adm=
       printf '{\n  "mode": "gui",\n  "version": "9.9.9-stub",\n  "protocol_version": 1,\n%s  "pid": %s,\n  "endpoint": "unix:%s"\n}\n' \
-        "$adm" "$(cat "$stub_dir/pid")" "$SLASHIT_TEST_SOCKET"
+        "$adm" "$pid_answer" "$SLASHIT_TEST_SOCKET"
       exit 0
     fi
     exit 1
@@ -853,7 +860,11 @@ cleanup_instances
 
 # A record from an earlier instance names a pid that no longer serves the endpoint: nothing is sent.
 if killed_restart "old record"; then
-  sv stop >/dev/null 2>&1; sv start >/dev/null 2>&1; : >"$stub_dir/ops"
+  # A stop now clears the quiesce record it names (its instance is gone), so the record
+  # is put back after the stop: this case is the crash that left it behind.
+  cp -p "$rec" "$work/old-quiesce-record"
+  sv stop >/dev/null 2>&1; cp -p "$work/old-quiesce-record" "$rec"
+  sv start >/dev/null 2>&1; : >"$stub_dir/ops"
   out=$(sv resume-quiesce 2>&1); st=$?
   if [ "$st" -eq 1 ] && [[ "$out" == *"was started after that quiesce"* ]] && [ ! -s "$stub_dir/ops" ] && [ -e "$rec" ]; then
     ok "a record from an earlier instance is refused, nothing is sent, and the record is kept"
@@ -873,6 +884,66 @@ if killed_restart "shutdown fence"; then
     ok "resume-quiesce never reopens a shutdown fence (exit 1), and a later quiesce is refused as shutdown"
   else bad "a shutdown fence was reopened or misreported (exit $st): $out / $late"; fi
 fi
+cleanup_instances
+
+# A quiesce record names its process by pid and identity. write_rec writes one by hand.
+write_rec() { # operation pid identity
+  printf 'operation\t%s\nstate\trequested\npid\t%s\nidentity\t%s\nendpoint\tunix:%s\nrecorded_at\t2000-01-01T00:00:00Z\n' \
+    "$1" "$2" "$3" "$socket" >"$rec"
+  chmod 600 "$rec"
+}
+
+echo "== a quiesce record from a reused pid is not a hold: activity, resume-quiesce and restart"
+sv start >/dev/null 2>&1 || bad "reused-pid fixture: start failed"
+live_pid=$(stub_pid)
+rm -f "$rec"; : >"$stub_dir/ops"; : >"$stub_dir/calls"
+# The live instance's pid with a different start time: the same number, another process.
+write_rec sup-0-reused "$live_pid" "$(cat /proc/sys/kernel/random/boot_id) $(($(proc_start "$live_pid") + 1))"
+out=$(sv activity 2>&1); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"quiesce record: stale"* ]] && [[ "$out" != *"admission-quiesce"* ]] && [ ! -s "$stub_dir/ops" ]; then
+  ok "activity does not count a record from a reused pid as a hold"
+else bad "activity counted a reused-pid record as held (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(sv resume-quiesce 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"belongs to a different process"* ]] && [ ! -s "$stub_dir/ops" ] && [ -e "$rec" ]; then
+  ok "resume-quiesce refuses a reused-pid record, sends nothing, and keeps the record"
+else bad "resume-quiesce acted on a reused-pid record (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(sv restart 2>&1); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" != *"recorded as quiesced"* ]] && [ "$(stub_pid)" != "$live_pid" ] && [ ! -e "$rec" ]; then
+  ok "restart is not refused by a reused-pid record and replaces it"
+else bad "restart was refused by a reused-pid record (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+echo "== a restart refuses when the instance answering the quiesce is not the one it selected"
+sv start >/dev/null 2>&1 || bad "pid-swap fixture: start failed"
+pre=$(stub_pid); rm -f "$rec"; : >"$stub_dir/calls"; : >"$stub_dir/ops"
+out=$(sv SLASHIT_TEST_CLI_SWAP_PID_FROM=2 restart 2>&1); st=$?
+if [ "$st" -ne 0 ] && [[ "$out" == *"not the pid $pre the restart selected"* ]] && ! grep -qxE 'quiesce|quit' "$stub_dir/calls" &&
+  [ ! -e "$rec" ] && [ "$(stub_pid)" = "$pre" ]; then
+  ok "a restart whose quiesce answers from another pid refuses before any quiesce, records nothing and stops nothing"
+else bad "a restart quiesced or stopped a different instance (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+echo "== stop clears the quiesce record of the instance it ended, and no other"
+sv start >/dev/null 2>&1 || bad "stop-record fixture: start failed"
+live_pid=$(stub_pid)
+write_rec sup-0-stopped "$live_pid" "$(cat /proc/sys/kernel/random/boot_id) $(proc_start "$live_pid")"
+out=$(sv stop 2>&1); st=$?
+if [ "$st" -eq 0 ] && [ -z "$(stub_pid)" ] && [ ! -e "$rec" ]; then
+  ok "stop of the recorded instance removes its quiesce record once the instance is gone"
+else bad "stop left the quiesce record of the instance it ended (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+sleep 300 &
+other_pid=$!
+own "$other_pid"
+sv start >/dev/null 2>&1 || bad "other-record fixture: start failed"
+write_rec sup-0-other "$other_pid" "$(cat /proc/sys/kernel/random/boot_id) $(proc_start "$other_pid")"
+out=$(sv stop 2>&1); st=$?
+if [ "$st" -eq 0 ] && [ -z "$(stub_pid)" ] && [ -e "$rec" ] && grep -q 'sup-0-other' "$rec"; then
+  ok "stop of one instance keeps a quiesce record that names a different live process"
+else bad "stop removed or misjudged a record for another live process (exit $st)"; printf '%s\n' "$out" >&2; fi
+{ kill "$other_pid"; wait "$other_pid"; } 2>/dev/null
+rm -f "$rec"
 cleanup_instances
 
 # A retained recovery copy stays byte-for-byte, blocks a non-forced restart, and gets no quiesce record.

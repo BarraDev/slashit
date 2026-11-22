@@ -1451,6 +1451,9 @@ cmd_stop() {
   if [ -e "$SOCKET" ]; then
     note "left endpoint path $SOCKET in place; verify no process owns it before manually removing it, then retry the requested operation"
   fi
+  # Reached only once the stopped instance is verified gone. A quiesce record that
+  # names it is stale now; a record for any other instance is left alone.
+  quiesce_record_is "$pid" "$TARGET_ID" && clear_quiesce_record
   rm -f "$RECORD"
 }
 
@@ -1713,8 +1716,8 @@ QUIESCE_RELEASE=
 write_quiesce_record() {
   local tmp=$QUIESCE_RECORD.tmp.$$
   ( umask 077
-    printf 'operation\t%s\nstate\t%s\npid\t%s\nendpoint\t%s\nrecorded_at\t%s\n' \
-      "$1" "$2" "$TARGET_PID" "$ENDPOINT" "$(date -u +%FT%TZ)" >"$tmp" ) 2>/dev/null &&
+    printf 'operation\t%s\nstate\t%s\npid\t%s\nidentity\t%s\nendpoint\t%s\nrecorded_at\t%s\n' \
+      "$1" "$2" "$TARGET_PID" "$TARGET_ID" "$ENDPOINT" "$(date -u +%FT%TZ)" >"$tmp" ) 2>/dev/null &&
     mv -f -T "$tmp" "$QUIESCE_RECORD" 2>/dev/null && return 0
   rm -f "$tmp"
   return 1
@@ -1725,6 +1728,17 @@ clear_quiesce_record() {
 # quiesce_record_field KEY: the value of KEY in the record, or nothing.
 quiesce_record_field() {
   awk -F '\t' -v key="$1" '$1 == key { print $2 }' "$QUIESCE_RECORD" 2>/dev/null | head -n 1
+}
+# quiesce_record_is PID ID: the record names this process by pid and identity (see
+# proc_identity). A pid alone proves nothing: the kernel reuses pids, so a record can
+# outlive its instance and name an unrelated process that now holds the number.
+quiesce_record_is() {
+  [ -n "$2" ] && [ "$(quiesce_record_field pid)" = "$1" ] && [ "$(quiesce_record_field identity)" = "$2" ]
+}
+# quiesce_record_names_live PID: quiesce_record_is for the process as it is now.
+quiesce_record_names_live() {
+  local now
+  now=$(proc_identity "$1") && quiesce_record_is "$1" "$now"
 }
 # Sets QUIESCE_RELEASE to the instance's answer: resumed, not-held, shutdown,
 # or unconfirmed when no answer came back.
@@ -1777,13 +1791,17 @@ refuse_if_recovery_copy() {
 # it, so it is refused first, forced or not. `resume-quiesce` clears it.
 refuse_if_quiesce_recorded() {
   [ -f "$QUIESCE_RECORD" ] || return 0
-  [ "$(quiesce_record_field pid)" = "$TARGET_PID" ] || return 0
+  quiesce_record_is "$TARGET_PID" "$TARGET_ID" || return 0
   refuse "admission on pid $TARGET_PID is recorded as quiesced by operation $(quiesce_record_field operation) in $QUIESCE_RECORD, from an interrupted restart. Nothing was stopped. Run \`$SELF resume-quiesce\`, then restart"
 }
 
 quiesce_for_restart() {
   [ "$CLI_STATE" = ready ] || refuse "cannot quiesce: $(cannot_verify_text); nothing was stopped"
   ping_fields || refuse "cannot quiesce: no verified instance answers on $ENDPOINT; nothing was stopped"
+  # The restart quiesces and stops the pid it selected; a different instance now
+  # answering on the endpoint is not that pid, so nothing is quiesced or recorded.
+  [ "$PING_PID" = "$TARGET_PID" ] ||
+    refuse "the instance that answers on $ENDPOINT is pid $PING_PID, not the pid $TARGET_PID the restart selected; nothing was quiesced or stopped"
   [ "$PING_ADMISSION" = true ] ||
     refuse "the running instance (version $PING_VERSION) predates admission quiesce, so a restart cannot prove it idle before quit; when it is idle, stop it and start the target. Nothing was stopped"
   local out rc=0 field n acquired refusal busy=
@@ -2052,10 +2070,10 @@ cmd_activity() {
   [ -z "$(ls -A "$SUP_DIR/recover" 2>/dev/null)" ] || busy="$busy recovery-copy in $SUP_DIR/recover"
   if [ -f "$QUIESCE_RECORD" ]; then
     # Only a record for the verified pid counts: an older record names an instance that has exited.
-    if [ "$(quiesce_record_field pid)" = "$PING_PID" ]; then
+    if quiesce_record_names_live "$PING_PID"; then
       busy="$busy admission-quiesce:$(quiesce_record_field operation) ($(quiesce_record_field state), recorded in $QUIESCE_RECORD; see \"$SELF resume-quiesce\")"
     else
-      echo "quiesce record: stale (it names pid $(quiesce_record_field pid); the verified instance is pid $PING_PID and was started after it), not counted as held"
+      echo "quiesce record: stale (it names pid $(quiesce_record_field pid), which is not the verified instance pid $PING_PID with its process identity), not counted as held"
     fi
   fi
   if [ -n "$busy" ]; then
@@ -2091,6 +2109,8 @@ cmd_resume_quiesce() {
   if [ "$(quiesce_record_field pid)" != "$PING_PID" ]; then
     exit_with 1 "the quiesce record names pid $(quiesce_record_field pid), but the verified instance is pid $PING_PID, which was started after that quiesce; nothing was sent and the record is kept (the next restart replaces it)"
   fi
+  quiesce_record_names_live "$PING_PID" ||
+    exit_with 1 "the quiesce record names pid $PING_PID, but that pid now belongs to a different process (its identity differs from the record's); nothing was sent and the record is kept"
   QUIESCE_HELD=1
   release_quiesce
   case $QUIESCE_RELEASE in
