@@ -3,7 +3,7 @@
 //! the one place that creates Workspaces and attaches or detaches Projects.
 
 use crate::components::toast;
-use crate::components::workspace_panel::WorkspacePanel;
+use crate::components::workspace_panel::{submitted_folder, WorkspacePanel};
 use crate::models::{project::Project, workspace::Workspace};
 use crate::services::{list_projects, pick_folder, workspace_service};
 use leptos::callback::Callback;
@@ -111,14 +111,15 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
 
     let on_create = move |_| {
         let name = new_name.get();
-        let path = new_path.get().trim().to_string();
+        // The folder is submitted as typed; only a blank field means no folder.
+        let path = new_path.get();
         if name.trim().is_empty() {
             toast::error("A workspace name is required".to_string());
             return;
         }
         set_creating.set(true);
         spawn_local(async move {
-            let root = (!path.is_empty()).then_some(path.as_str());
+            let root = submitted_folder(&path);
             match workspace_service::create_workspace(&name, root).await {
                 Ok(_) => {
                     let _ = set_new_name.try_set(String::new());

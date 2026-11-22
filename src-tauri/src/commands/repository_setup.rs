@@ -478,4 +478,66 @@ mod tests {
         record_project_base(&fx.state, fx.project_id, base.clone()).await.unwrap();
         assert_eq!(fx.state.project.projects.read().await[&fx.project_id].base, base);
     }
+
+    /// How long a parked side is given to finish. A side held by the gate cannot
+    /// finish at all, so this bounds the wait and never decides the result.
+    const PARKED: std::time::Duration = std::time::Duration::from_millis(100);
+
+    #[tokio::test]
+    async fn removal_waits_while_a_repository_setup_holds_the_project_gate() {
+        let fx = fixture().await;
+        // An initialization in flight holds the Project gate in shared mode for its whole run.
+        let in_flight = fx.state.task.project_gate.read(fx.project_id).await;
+        let removal = crate::commands::project::remove_project_gated(&fx.state, fx.project_id);
+        tokio::pin!(removal);
+        tokio::select! {
+            biased;
+            outcome = &mut removal => panic!("removal ran while a setup held the gate: {outcome:?}"),
+            _ = tokio::time::sleep(PARKED) => {}
+        }
+        assert!(!fx.state.project.projects.read().await[&fx.project_id].is_removed());
+
+        drop(in_flight);
+        removal
+            .await
+            .expect("removal proceeds once the setup has finished");
+        assert!(fx.state.project.projects.read().await[&fx.project_id].is_removed());
+    }
+
+    #[tokio::test]
+    async fn repository_setup_waits_while_a_removal_holds_the_project_gate() {
+        let fx = fixture().await;
+        // An empty folder: a setup that ran would create version control in it.
+        let plain = fx.tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let repository_id = fx.state.project.projects.read().await[&fx.project_id]
+            .repository_id
+            .unwrap();
+        fx.state
+            .repository
+            .repositories
+            .write()
+            .await
+            .get_mut(&repository_id)
+            .unwrap()
+            .local_path = plain.to_str().unwrap().to_string();
+        // A removal holds the Project gate in exclusive mode for its whole transaction.
+        let removing = fx.state.task.project_gate.write(fx.project_id).await;
+        let setup = initialize_project_vcs_core(&fx.state, fx.project_id, VcsInitKind::Git, None);
+        tokio::pin!(setup);
+        tokio::select! {
+            biased;
+            outcome = &mut setup => panic!("setup ran while a removal held the gate: {:?}", outcome.err()),
+            _ = tokio::time::sleep(PARKED) => {}
+        }
+        assert!(
+            !plain.join(".git").exists(),
+            "the folder is untouched while the setup waits"
+        );
+
+        drop(removing);
+        // Whether the setup then succeeds depends on the Git identity of this machine
+        // (SlashIt never invents one). The ordering is what this test asserts.
+        let _ = setup.await;
+    }
 }

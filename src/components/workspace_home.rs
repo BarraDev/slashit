@@ -25,20 +25,37 @@ pub fn WorkspaceHome(
     set_selected_workspace: WriteSignal<String>,
 ) -> impl IntoView {
     let loaded = RwSignal::new(None::<Result<Loaded, String>>);
+    // The Workspace the page last started reading, so a refresh keeps the shown
+    // content while only a switch to another Workspace shows the loading state.
+    let shown_id = StoredValue::new(String::new());
+    // Each read takes a number; only the newest one may apply its reply.
+    let latest_read = StoredValue::new(0u64);
+    // Re-reads on every Project or Workspace change the rail reports, so a membership
+    // or name change shows here without leaving the page.
+    let refresh = expect_context::<ReadSignal<u32>>();
 
     // Reads the Workspace, its root and its members for the id that was
     // selected when the read started. A reply for an id that is no longer
     // selected is dropped, so a quick switch never shows the wrong Workspace.
     Effect::new(move |_| {
+        let _ = refresh.get();
         let id = workspace_id.get();
         if id.is_empty() {
             return;
         }
-        loaded.set(None);
+        if shown_id.get_value() != id {
+            loaded.set(None);
+            shown_id.set_value(id.clone());
+        }
+        latest_read.update_value(|n| *n += 1);
+        let ticket = latest_read.get_value();
         spawn_local(async move {
             let result = load(&id).await;
-            if workspace_id.get_untracked() == id {
-                loaded.set(Some(result));
+            // Fallible reads: the page may have closed while the read was pending.
+            let current = latest_read.try_get_value() == Some(ticket)
+                && workspace_id.try_get_untracked().as_deref() == Some(id.as_str());
+            if current {
+                let _ = loaded.try_set(Some(result));
             }
         });
     });

@@ -154,12 +154,47 @@ pub fn ProjectOrganizer(
     }
 }
 
-/// Whether the fallback Project may replace a removed Project. It may only do so
-/// while the removed Project is still selected and no Workspace is selected.
-/// Selecting a Project leaves Workspace context, so a late replacement would
-/// otherwise overwrite a Workspace the user just chose.
-fn fallback_applies(selected_project: &str, selected_workspace: &str, removed: &str) -> bool {
-    selected_project == removed && selected_workspace.is_empty()
+/// The Project selection to set after `removed` was removed, or None when the
+/// selection moved on. A replacement is applied only while no Workspace is
+/// selected: setting a Project leaves Workspace context, so a late replacement
+/// would overwrite a Workspace the user just chose. In Workspace context the
+/// stale id is cleared to empty, which keeps the Workspace selected.
+fn selection_after_removal(
+    selected_project: &str,
+    selected_workspace: &str,
+    removed: &str,
+    replacement: Option<String>,
+) -> Option<String> {
+    if selected_project != removed {
+        return None;
+    }
+    if selected_workspace.is_empty() {
+        Some(replacement.unwrap_or_default())
+    } else {
+        Some(String::new())
+    }
+}
+
+/// What a removal attempt left behind, from its reply and a fresh Project list.
+#[derive(Debug, PartialEq, Eq)]
+enum RemovalOutcome {
+    Removed,
+    /// Removed, although the reply reported an error (the save may be unconfirmed).
+    RemovedWithError,
+    /// Still listed: the removal did not happen.
+    NotRemoved,
+    /// The reply failed and the list could not be read, so the removal may have happened.
+    Unknown,
+}
+
+/// `still_listed` is probed only after an error reply; a successful reply is final.
+fn removal_outcome(reply: &Result<(), String>, still_listed: Option<bool>) -> RemovalOutcome {
+    match (reply, still_listed) {
+        (Ok(()), _) => RemovalOutcome::Removed,
+        (Err(_), Some(false)) => RemovalOutcome::RemovedWithError,
+        (Err(_), Some(true)) => RemovalOutcome::NotRemoved,
+        (Err(_), None) => RemovalOutcome::Unknown,
+    }
 }
 
 /// One Project's row. Its rename and remove actions are independent: a failed
@@ -244,45 +279,74 @@ fn ProjectRow(
         let name = saved.get_untracked();
         let id_text = id.to_string();
         spawn_local(async move {
-            match remove_project(id_text.clone()).await {
-                Ok(()) => {
+            let reply = remove_project(id_text.clone()).await;
+            // The backend can publish a removal and still report an error, so after an
+            // error the Project list decides whether the Project is gone.
+            let still_listed = match &reply {
+                Ok(()) => None,
+                Err(_) => list_projects()
+                    .await
+                    .ok()
+                    .map(|ps| ps.iter().any(|p| p.id.to_string() == id_text)),
+            };
+            let outcome = removal_outcome(&reply, still_listed);
+            if matches!(
+                outcome,
+                RemovalOutcome::Removed | RemovalOutcome::RemovedWithError
+            ) {
+                // In Workspace context the Project is only a stale id, so the selection
+                // is cleared without switching context. In Project context the next
+                // active Project is picked.
+                let next = if selected_workspace
+                    .try_get_untracked()
+                    .is_some_and(|w| w.is_empty())
+                {
+                    list_projects()
+                        .await
+                        .unwrap_or_default()
+                        .first()
+                        .map(|p| p.id.to_string())
+                } else {
+                    None
+                };
+                // Read again after the await: a Workspace chosen meanwhile is never replaced.
+                let project_now = selected_project.try_get_untracked().unwrap_or_default();
+                let workspace_now = selected_workspace.try_get_untracked().unwrap_or_default();
+                if let Some(selection) =
+                    selection_after_removal(&project_now, &workspace_now, &id_text, next)
+                {
+                    let _ = set_selected_project.try_set(selection);
+                }
+            }
+            match outcome {
+                RemovalOutcome::Removed => {
                     let _ = action_error.try_set(None);
-                    if selected_project.try_get_untracked().as_deref() == Some(id_text.as_str()) {
-                        // In Workspace context the Project is only a stale id, so clearing it
-                        // must not switch context. In Project context, pick the next active one.
-                        let next = if selected_workspace
-                            .try_get_untracked()
-                            .is_some_and(|w| w.is_empty())
-                        {
-                            list_projects()
-                                .await
-                                .unwrap_or_default()
-                                .first()
-                                .map(|p| p.id.to_string())
-                        } else {
-                            None
-                        };
-                        // Checked again after the read: a Workspace chosen meanwhile must not
-                        // be replaced, because setting a Project leaves Workspace context.
-                        let project_now = selected_project.try_get_untracked().unwrap_or_default();
-                        let workspace_now =
-                            selected_workspace.try_get_untracked().unwrap_or_default();
-                        if fallback_applies(&project_now, &workspace_now, &id_text) {
-                            set_selected_project.set(next.unwrap_or_default());
-                        }
-                    }
                     toast::success(format!(
                         "Removed '{name}' from SlashIt. Open its folder to use it again."
                     ));
-                    reload.run(());
-                    on_changed.run(());
-                    // Stop before the row is gone; try_set above covers the rest.
                 }
-                Err(e) => {
-                    let _ = confirming.try_set(false);
+                RemovalOutcome::RemovedWithError => {
+                    let e = reply.err().unwrap_or_default();
+                    let _ = action_error.try_set(Some(format!(
+                        "'{name}' was removed, but SlashIt could not confirm the save. {e}"
+                    )));
+                }
+                RemovalOutcome::NotRemoved => {
+                    let e = reply.err().unwrap_or_default();
                     let _ = action_error.try_set(Some(format!("'{name}' was not removed. {e}")));
                 }
+                RemovalOutcome::Unknown => {
+                    let e = reply.err().unwrap_or_default();
+                    let _ = action_error.try_set(Some(format!(
+                        "'{name}' may not have been removed, and the Project list could not be read. {e}"
+                    )));
+                }
             }
+            let _ = confirming.try_set(false);
+            // Both lists are reloaded whatever the outcome: they show what the backend holds now.
+            // try_run: the panel may have closed while the request was in flight.
+            let _ = reload.try_run(());
+            let _ = on_changed.try_run(());
             let _ = removing.try_set(false);
         });
     };
@@ -352,22 +416,72 @@ fn ProjectRow(
 
 #[cfg(test)]
 mod tests {
-    use super::fallback_applies;
+    use super::{removal_outcome, selection_after_removal, RemovalOutcome};
 
     #[test]
-    fn the_fallback_replaces_a_removed_selection_when_no_workspace_was_chosen() {
-        assert!(fallback_applies("removed", "", "removed"));
+    fn the_removed_selection_is_replaced_when_no_workspace_was_chosen() {
+        assert_eq!(
+            selection_after_removal("removed", "", "removed", Some("next".into())),
+            Some("next".to_string())
+        );
     }
 
     #[test]
-    fn the_fallback_does_not_replace_a_workspace_chosen_while_it_was_read() {
-        // Setting a Project would leave Workspace context and drop this choice.
-        assert!(!fallback_applies("removed", "ws-1", "removed"));
+    fn a_removed_selection_is_cleared_in_workspace_context_without_switching_it() {
+        // Clearing only the stale id: no replacement Project is set, so the Workspace stays chosen.
+        assert_eq!(
+            selection_after_removal("removed", "ws-1", "removed", None),
+            Some(String::new())
+        );
+        assert_eq!(
+            selection_after_removal("removed", "ws-1", "removed", Some("next".into())),
+            Some(String::new())
+        );
     }
 
     #[test]
-    fn the_fallback_does_not_replace_a_selection_that_moved_on() {
-        assert!(!fallback_applies("other", "", "removed"));
-        assert!(!fallback_applies("", "", "removed"));
+    fn a_selection_that_moved_on_is_left_alone() {
+        assert_eq!(
+            selection_after_removal("other", "", "removed", Some("next".into())),
+            None
+        );
+        assert_eq!(selection_after_removal("", "", "removed", None), None);
+    }
+
+    #[test]
+    fn a_removed_selection_with_no_project_left_becomes_empty() {
+        assert_eq!(
+            selection_after_removal("removed", "", "removed", None),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn a_successful_removal_is_final_whatever_the_list_says() {
+        assert_eq!(removal_outcome(&Ok(()), None), RemovalOutcome::Removed);
+    }
+
+    #[test]
+    fn an_error_reply_is_not_reported_as_not_removed_when_the_list_shows_it_gone() {
+        let reply = Err("could not confirm the save".to_string());
+        assert_eq!(
+            removal_outcome(&reply, Some(false)),
+            RemovalOutcome::RemovedWithError
+        );
+    }
+
+    #[test]
+    fn an_error_reply_is_not_removed_only_when_the_list_still_shows_the_project() {
+        let reply = Err("refused".to_string());
+        assert_eq!(
+            removal_outcome(&reply, Some(true)),
+            RemovalOutcome::NotRemoved
+        );
+    }
+
+    #[test]
+    fn an_error_reply_with_an_unreadable_list_is_unknown_not_not_removed() {
+        let reply = Err("could not confirm the save".to_string());
+        assert_eq!(removal_outcome(&reply, None), RemovalOutcome::Unknown);
     }
 }

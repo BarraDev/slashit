@@ -620,7 +620,12 @@ mod tests {
 
         assert!(refusal.contains("Other"), "{refusal}");
         let persisted = registry.read().await.get(&w.id).unwrap().root_path.clone();
-        assert_eq!(persisted.as_ref().map(|r| r.as_path().to_path_buf()), Some(custom.clone()));
+        // The stored root is canonical (on Windows an extended-length path), so the
+        // expected value is canonicalized too rather than compared with the temp spelling.
+        assert_eq!(
+            persisted.as_ref().map(|r| r.as_path().to_path_buf()),
+            Some(custom.canonicalize().unwrap())
+        );
         assert!(custom.is_dir(), "the custom folder is untouched");
     }
 

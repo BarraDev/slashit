@@ -20,6 +20,32 @@ impl SelectOption {
     }
 }
 
+/// The identity of an option's row: its value only. A label can change while the
+/// row is kept, because the label is read from the current options.
+fn option_key(option: &SelectOption) -> String {
+    option.value.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{option_key, SelectOption};
+
+    #[test]
+    fn a_renamed_option_keeps_its_row_key() {
+        let before = SelectOption::new("ws-1", "Client");
+        let after = SelectOption::new("ws-1", "Client renamed");
+        assert_eq!(option_key(&before), option_key(&after));
+    }
+
+    #[test]
+    fn different_options_have_different_row_keys() {
+        assert_ne!(
+            option_key(&SelectOption::new("ws-1", "Client")),
+            option_key(&SelectOption::new("ws-2", "Client"))
+        );
+    }
+}
+
 /// A custom dropdown select component with full dark theme styling control.
 /// Unlike native `<select>` elements, this component allows complete customization
 /// of the dropdown appearance including the options list.
@@ -182,25 +208,38 @@ pub fn CustomSelect(
                     class="w-full mt-1 py-1 rounded-lg bg-[#1a1a1a] border border-white/10 shadow-xl max-h-60 overflow-auto animate-fade-in"
                     role="listbox"
                 >
-                    {move || {
-                        options.get().into_iter().map(|opt| {
-                            let value = opt.value.clone();
-                            let label = opt.label.clone();
-                            let is_selected = selected.get() == value;
+                    // Keyed by value alone, so a row keeps its identity when the option's
+                    // label changes. The label and the selection are read from the current
+                    // options and selection, not captured when the row was built.
+                    <For
+                        each=move || options.get()
+                        key=option_key
+                        children=move |opt: SelectOption| {
+                            let value = opt.value;
+                            let value_for_label = value.clone();
                             let value_for_click = value.clone();
+                            let label = move || {
+                                options.with(|os| {
+                                    os.iter()
+                                        .find(|o| o.value == value_for_label)
+                                        .map(|o| o.label.clone())
+                                        .unwrap_or_default()
+                                })
+                            };
+                            let is_selected = Memo::new(move |_| selected.get() == value);
 
                             view! {
                                 <button
                                     type="button"
                                     role="option"
-                                    aria-selected=move || if is_selected { "true" } else { "false" }
+                                    aria-selected=move || if is_selected.get() { "true" } else { "false" }
                                     on:click=move |ev: web_sys::MouseEvent| {
                                         ev.stop_propagation();
                                         handle_select(value_for_click.clone());
                                     }
                                     class=move || format!(
                                         "w-full px-3 py-2 text-left transition-colors duration-100 {}",
-                                        if is_selected {
+                                        if is_selected.get() {
                                             "bg-blue-500/20 text-blue-300"
                                         } else {
                                             "text-white/80 hover:bg-white/10"
@@ -208,7 +247,7 @@ pub fn CustomSelect(
                                     )
                                 >
                                     <span class="flex items-center gap-2">
-                                        {is_selected.then(|| view! {
+                                        {move || is_selected.get().then(|| view! {
                                             <svg class="w-4 h-4 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
                                             </svg>
@@ -217,8 +256,8 @@ pub fn CustomSelect(
                                     </span>
                                 </button>
                             }
-                        }).collect::<Vec<_>>()
-                    }}
+                        }
+                    />
                 </div>
             </Show>
         </div>

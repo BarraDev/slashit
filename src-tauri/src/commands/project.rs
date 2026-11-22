@@ -383,6 +383,12 @@ pub async fn remove_project(
     id: String,
 ) -> Result<(), String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    remove_project_gated(&state, id).await
+}
+
+/// The locked part of [`remove_project`], split out so tests can drive the
+/// same gate that the command takes.
+pub(crate) async fn remove_project_gated(state: &crate::AppState, id: Uuid) -> Result<(), String> {
     let running = state
         .executor
         .get()
@@ -423,6 +429,7 @@ pub async fn remove_project(
 ///
 /// Refusals come first and change nothing. A Project is refused when:
 /// - it has no repository folder SlashIt can reopen it by;
+/// - its registered folder is unavailable (missing, or not a directory);
 /// - a Task is queued, running, or waiting for a decision (the statuses that
 ///   need the executor or the user);
 /// - a Task has an agent running, a pull request being opened, or durable
@@ -450,12 +457,22 @@ async fn remove_project_committed(
     if already_removed {
         return Ok(());
     }
-    if repository_path.is_none() {
+    let Some(folder) = repository_path else {
         return Err(
             "This Project cannot be removed: it has no folder that SlashIt can open again \
              later. Nothing was changed."
                 .to_string(),
         );
+    };
+    // Refused while the registered folder is unavailable: there is no restore by ID
+    // or relocation yet, so removing it would leave no way back. This is a check at
+    // removal time, not a lock; a folder moved later is not prevented.
+    if !std::path::Path::new(&folder).is_dir() {
+        return Err(format!(
+            "This Project cannot be removed: its folder {folder} is unavailable (it is missing, or \
+             the path is not a folder). Nothing was changed. To restore it, put the folder back at \
+             its registered path, then remove the Project again."
+        ));
     }
 
     let durable = storage.load_project_tasks(id).map_err(|e| {
@@ -4223,6 +4240,134 @@ pub(crate) mod tests {
         assert!(!projects.read().await[&id].is_removed());
     }
 
+    /// Writes the in-memory Project to the config file, so a refusal can be checked on disk.
+    async fn persist_project(storage: &Storage, projects: &RwLock<HashMap<Uuid, Project>>, id: Uuid) {
+        let project = projects.read().await[&id].clone();
+        storage
+            .save_config(&AppConfig {
+                projects: HashMap::from([(id.to_string(), project)]),
+                ..AppConfig::default()
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn removal_is_refused_when_the_registered_folder_is_missing_and_nothing_changes() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        persist_project(&storage, &projects, id).await;
+        let folder = projects.read().await[&id]
+            .repository_path(&*repositories.read().await)
+            .unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        let refusal = remove_project_committed(
+            &projects,
+            &repositories,
+            &board(vec![]),
+            &storage,
+            None,
+            None,
+            id,
+        )
+        .await
+        .expect_err("a Project whose folder is missing must not be removed");
+
+        assert!(refusal.contains("unavailable"), "{refusal}");
+        assert!(
+            refusal.contains(&folder),
+            "the refusal names the folder: {refusal}"
+        );
+        assert!(
+            refusal.contains("put the folder back at its registered path"),
+            "{refusal}"
+        );
+        assert!(
+            !projects.read().await[&id].is_removed(),
+            "memory keeps the Project visible"
+        );
+        let on_disk = storage
+            .load_config()
+            .unwrap()
+            .projects
+            .get(&id.to_string())
+            .cloned();
+        assert!(
+            on_disk.is_some_and(|p| p.removed_at.is_none()),
+            "the file keeps the Project visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_is_refused_when_the_registered_path_is_no_longer_a_directory() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        persist_project(&storage, &projects, id).await;
+        let folder = projects.read().await[&id]
+            .repository_path(&*repositories.read().await)
+            .unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+        std::fs::write(&folder, b"a file now").unwrap();
+
+        let refusal = remove_project_committed(
+            &projects,
+            &repositories,
+            &board(vec![]),
+            &storage,
+            None,
+            None,
+            id,
+        )
+        .await
+        .expect_err("a registered path that is a file must not be removed");
+
+        assert!(refusal.contains("unavailable"), "{refusal}");
+        assert!(!projects.read().await[&id].is_removed());
+        let on_disk = storage
+            .load_config()
+            .unwrap()
+            .projects
+            .get(&id.to_string())
+            .cloned();
+        assert!(on_disk.is_some_and(|p| p.removed_at.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_project_whose_folder_returns_can_be_removed_and_reopened() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let folder = projects.read().await[&id]
+            .repository_path(&*repositories.read().await)
+            .unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+        remove_project_committed(
+            &projects,
+            &repositories,
+            &board(vec![]),
+            &storage,
+            None,
+            None,
+            id,
+        )
+        .await
+        .expect_err("refused while the folder is missing");
+
+        std::fs::create_dir_all(&folder).unwrap();
+        remove_project_committed(
+            &projects,
+            &repositories,
+            &board(vec![]),
+            &storage,
+            None,
+            None,
+            id,
+        )
+        .await
+        .expect("the same Project is removable once its folder is back");
+        assert!(projects.read().await[&id].is_removed());
+
+        let reopened = reopen_project_committed(&projects, &repositories, &storage, id)
+            .await
+            .expect("reopening the same folder still works");
+        assert!(!reopened.is_removed(), "active again");
+    }
     #[tokio::test]
     async fn reopening_the_same_folder_returns_the_original_project_unchanged() {
         let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;

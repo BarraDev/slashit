@@ -158,7 +158,9 @@ pub fn ProjectRail(
     let collapsed = RwSignal::new(HashSet::<Uuid>::new());
     let (hovered, set_hovered) = signal(false);
     let (show_create_modal, set_show_create_modal) = signal(false);
-    let (refresh_trigger, set_refresh_trigger) = signal(0u32);
+    // Provided by App, which also gives it to the Workspace page.
+    let refresh_trigger = expect_context::<ReadSignal<u32>>();
+    let set_refresh_trigger = expect_context::<WriteSignal<u32>>();
     let (show_import_modal, set_show_import_modal) = signal(false);
     let (show_organizer, set_show_organizer) = signal(false);
     let export_phase = RwSignal::new(None::<ExportPhase>);

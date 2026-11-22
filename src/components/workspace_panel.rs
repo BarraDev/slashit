@@ -247,6 +247,12 @@ impl PendingReload {
     }
 }
 
+/// The folder a Workspace draft submits: `None` when the field is blank, and
+/// otherwise the exact text, since a folder name may carry significant spaces.
+pub fn submitted_folder(draft: &str) -> Option<&str> {
+    (!draft.trim().is_empty()).then_some(draft)
+}
+
 /// The folder a Workspace uses, for its header: the effective path, marked when
 /// it is missing. A Workspace without a custom root still has its managed
 /// folder, so this never says it has no folder.
@@ -282,10 +288,18 @@ fn WorkspaceItem(
     let reload = PendingReload::new(set_busy, on_membership_change);
     let (selected_to_attach, set_selected_to_attach) = signal(String::new());
     let ws_id = workspace.id;
-    // Name and root are shown from signals, because a rename or root change
-    // keeps this row mounted (the list is keyed by id).
-    let (shown_name, set_shown_name) = signal(workspace.name.clone());
-    let (shown_root, set_shown_root) = signal(workspace.root_path.clone());
+    // The row stays mounted across reloads (the list is keyed by id), so the name and
+    // root it shows follow the registry record as the last reload read it. The drafts
+    // hold what the user typed and are not overwritten by a reload.
+    let listed = Memo::new(move |_| {
+        workspaces.with(|ws| {
+            ws.iter()
+                .find(|w| w.id == ws_id)
+                .map(|w| (w.name.clone(), w.root_path.clone()))
+        })
+    });
+    let shown_name = Memo::new(move |_| listed.get().map(|(name, _)| name).unwrap_or_default());
+    let shown_root = Memo::new(move |_| listed.get().and_then(|(_, root)| root));
     let name_draft = RwSignal::new(workspace.name.clone());
     let root_draft = RwSignal::new(workspace.root_path.clone().unwrap_or_default());
     // The effective folder, from the backend: the custom root, or the managed
@@ -312,6 +326,14 @@ fn WorkspaceItem(
         });
     };
     load_root_info();
+    // A reload that moves this Workspace's root re-reads its effective folder.
+    Effect::new(move |prev: Option<Option<String>>| {
+        let now = shown_root.get();
+        if prev.as_ref().is_some_and(|p| *p != now) {
+            load_root_info();
+        }
+        now
+    });
 
     let on_rename = move |_| {
         let name = name_draft.get().trim().to_string();
@@ -323,13 +345,17 @@ fn WorkspaceItem(
         spawn_local(async move {
             match workspace_service::rename_workspace(&ws_id.to_string(), &name).await {
                 Ok(saved) => {
-                    set_shown_name.set(saved.name.clone());
-                    name_draft.set(saved.name);
+                    let _ = name_draft.try_set(saved.name);
                     toast::success("Workspace renamed".to_string());
                     // try_run: the organizer may have closed during the request.
                     let _ = on_membership_change.try_run(());
                 }
-                Err(e) => toast::error(format!("Failed to rename workspace: {}", e)),
+                Err(e) => {
+                    toast::error(format!("Failed to rename workspace: {}", e));
+                    // The backend can publish a rename and still report an error, so
+                    // reload the registry rather than keep a row that may be stale.
+                    let _ = on_membership_change.try_run(());
+                }
             }
             let _ = set_busy.try_set(false);
         });
@@ -341,26 +367,31 @@ fn WorkspaceItem(
         spawn_local(async move {
             match workspace_service::set_workspace_root(&ws_id.to_string(), path.as_deref()).await {
                 Ok(saved) => {
-                    root_draft.set(saved.root_path.clone().unwrap_or_default());
-                    set_shown_root.set(saved.root_path);
+                    let _ = root_draft.try_set(saved.root_path.unwrap_or_default());
                     load_root_info();
                     toast::success("Workspace root saved; existing folders were not moved".to_string());
                     // try_run: the organizer may have closed during the request.
                     let _ = on_membership_change.try_run(());
                 }
-                Err(e) => toast::error(format!("Failed to set workspace root: {}", e)),
+                Err(e) => {
+                    toast::error(format!("Failed to set workspace root: {}", e));
+                    // A published root change can be reported as an error: reload the
+                    // effective folder and the registry from the backend.
+                    load_root_info();
+                    let _ = on_membership_change.try_run(());
+                }
             }
             let _ = set_busy.try_set(false);
         });
     };
 
     let on_save_root = move |_| {
-        let path = root_draft.get().trim().to_string();
-        if path.is_empty() {
+        let draft = root_draft.get();
+        let Some(path) = submitted_folder(&draft) else {
             toast::error("Enter a folder, or use the managed root".to_string());
             return;
-        }
-        set_root(Some(path));
+        };
+        set_root(Some(path.to_string()));
     };
 
     // Moving a member is a detach followed by an attach, each saved on its own.
@@ -631,7 +662,20 @@ fn WorkspaceItem(
 
 #[cfg(test)]
 mod tests {
-    use super::{move_attach_failure, move_detach_failure, unresolved_members, TASK_BOUNDARY_NOTE};
+    use super::{
+        move_attach_failure, move_detach_failure, submitted_folder, unresolved_members,
+        TASK_BOUNDARY_NOTE,
+    };
+
+    #[test]
+    fn a_submitted_folder_keeps_its_exact_spelling_and_a_blank_field_is_absent() {
+        // A folder name may start or end with a space; only a blank field means no folder.
+        assert_eq!(submitted_folder("/data/work "), Some("/data/work "));
+        assert_eq!(submitted_folder(" /data/work"), Some(" /data/work"));
+        assert_eq!(submitted_folder("/data/work"), Some("/data/work"));
+        assert_eq!(submitted_folder("   "), None);
+        assert_eq!(submitted_folder(""), None);
+    }
 
     #[test]
     fn a_failed_move_step_never_claims_a_membership_it_did_not_confirm() {

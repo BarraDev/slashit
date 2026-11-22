@@ -139,6 +139,16 @@ Only part of that exists today.
   and refuse new work at every front door. Removal is refused, with the reason
   listed, while a Task is queued, running, in AI review or Human Review, or a
   delivery is in flight. The UI does not call `delete_project`.
+- Removal is refused while the Project's registered folder is unavailable:
+  the path is missing, or it is no longer a directory. The refusal names the
+  folder and says how to restore it: put the folder back at its registered
+  path, then remove the Project again. The Project stays visible and nothing
+  is written. No restore by ID and no Repository relocation exists yet, so
+  this refusal is the only recovery path for a removed Project's folder.
+  Limitation: the check runs when removal is requested, under the Project
+  gate. A folder moved or deleted after a successful removal is not detected
+  or prevented by any filesystem check; reopening the folder at its registered
+  path is the recovery, as before.
 - A Project that names a Workspace missing from the registry stays in the
   rail under "Unresolved membership" until it is repaired in Organize Projects.
 - When a member Project's Task is executed and the Workspace has a custom
