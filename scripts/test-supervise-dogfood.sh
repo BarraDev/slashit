@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=221
+EXPECTED_TOTAL=233
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -167,7 +167,7 @@ if [ -n "${SLASHIT_TEST_STARTUP_REMOVE:-}" ]; then
   rm -f "$SLASHIT_TEST_STARTUP_REMOVE"
 fi
 echo "$$" >"$stub_dir/pid"
-rm -f "$stub_dir/quit"
+rm -f "$stub_dir/quit" "$stub_dir/held" "$stub_dir/shutdown"
 touch "$SLASHIT_TEST_SOCKET"
 if [ "${SLASHIT_TEST_STUB_ROLE:-quit}" = quit ]; then
   while [ ! -f "$stub_dir/quit" ]; do
@@ -240,17 +240,41 @@ case $last in
     # The operation is the value after --operation; it is recorded for the cases that check it.
     op=$(printf '%s\n' "$@" | sed -n '/^--operation$/{n;p}')
     printf 'quiesce %s\n' "$op" >>"$stub_dir/ops"
-    # SLASHIT_TEST_QUIESCE_LOST: the reply is lost (no answer at all).
-    [ -z "${SLASHIT_TEST_QUIESCE_LOST:-}" ] || exit 1
+    # SLASHIT_TEST_QUIESCE_LOST: the reply is lost (no answer at all), and the fence may have closed.
+    if [ -n "${SLASHIT_TEST_QUIESCE_LOST:-}" ]; then
+      printf '%s\n' "$op" >"$stub_dir/held"
+      exit 1
+    fi
     # SLASHIT_TEST_QUIESCE_REFUSAL=held|shutdown: a refusal, which is a reply and not an error.
     if [ -n "${SLASHIT_TEST_QUIESCE_REFUSAL:-}" ]; then
       printf '{\n  "acquired": false,\n  "operation": "%s",\n  "refusal": "%s"\n}\n' "$op" "$SLASHIT_TEST_QUIESCE_REFUSAL"
       exit 0
     fi
+    # Holder model, as the executor keeps it: a shutdown is final, and a quiesce is
+    # held by the operation that acknowledged it until that operation resumes.
+    if [ -f "$stub_dir/shutdown" ]; then
+      printf '{\n  "acquired": false,\n  "operation": "%s",\n  "refusal": "shutdown"\n}\n' "$op"
+      exit 0
+    fi
+    if [ -f "$stub_dir/held" ] && [ "$(cat "$stub_dir/held")" != "$op" ]; then
+      printf '{\n  "acquired": false,\n  "operation": "%s",\n  "refusal": "held"\n}\n' "$op"
+      exit 0
+    fi
+    printf '%s\n' "$op" >"$stub_dir/held"
     # SLASHIT_TEST_QUIESCE_BUSY reports one running agent, which refuses the restart.
     busy=0
     [ -z "${SLASHIT_TEST_QUIESCE_BUSY:-}" ] || busy=1
+    # SLASHIT_TEST_QUIESCE_PAUSE: the fence is closed and the reply withheld, so a test can kill the supervisor here.
+    if [ -n "${SLASHIT_TEST_QUIESCE_PAUSE:-}" ]; then
+      echo $$ >"$stub_dir/cli-paused"
+      : >"$stub_dir/quiesce-acquired"
+      exec sleep 300
+    fi
     printf '{\n  "acquired": true,\n  "operation": "%s",\n  "admitting": 0,\n  "owned_work": 0,\n  "active_terminals": 0,\n  "running_agents": %s,\n  "queued_tasks": 0,\n  "in_progress_tasks": 0\n}\n' "$op" "$busy"
+    exit 0
+    ;;
+  status)
+    printf '{\n  "active_terminals": 0,\n  "running_agents": 0,\n  "queued_tasks": 0,\n  "in_progress_tasks": 0\n}\n'
     exit 0
     ;;
   resume)
@@ -262,7 +286,17 @@ case $last in
       printf '{\n  "resumed": false,\n  "operation": "%s",\n  "refusal": "%s"\n}\n' "$op" "$SLASHIT_TEST_RESUME_REFUSAL"
       exit 0
     fi
-    printf '{\n  "resumed": true,\n  "operation": "%s"\n}\n' "$op"
+    # Holder model: a shutdown is never reopened, and only the holder reopens a quiesce.
+    if [ -f "$stub_dir/shutdown" ]; then
+      printf '{\n  "resumed": false,\n  "operation": "%s",\n  "refusal": "shutdown"\n}\n' "$op"
+      exit 0
+    fi
+    if [ -f "$stub_dir/held" ] && [ "$(cat "$stub_dir/held")" = "$op" ]; then
+      rm -f "$stub_dir/held"
+      printf '{\n  "resumed": true,\n  "operation": "%s"\n}\n' "$op"
+      exit 0
+    fi
+    printf '{\n  "resumed": false,\n  "operation": "%s",\n  "refusal": "not-held"\n}\n' "$op"
     exit 0
     ;;
   quit)
@@ -731,6 +765,129 @@ if [ "$status" -ne 0 ] && [[ "$out" == *"could not be confirmed reopened for ope
   ok "a failed release names the operation and the command that reopens it"
 else bad "failed release did not name its operation (exit $status)"; printf '%s\n' "$out" >&2; fi
 cleanup_instances
+
+# An abrupt interruption: a SIGKILLed restart leaves the instance quiesced. The
+# operation id is recorded, and only that id reopens admission.
+stubcli() { env SLASHIT_TEST_STUB_DIR="$stub_dir" "$stub_dir/slashit" "$@"; }
+KILLED_OP= KILLED_SUP= KILLED_PID=
+# Starts a restart whose supervisor is SIGKILLed after the instance closed admission
+# and before it replied. Sets KILLED_OP, KILLED_SUP and KILLED_PID (the instance).
+killed_restart() {
+  KILLED_OP= KILLED_SUP= KILLED_PID=
+  cleanup_instances
+  sv start >/dev/null 2>&1 || { bad "$1: start failed"; return 1; }
+  KILLED_PID=$(stub_pid)
+  rm -f "$stub_dir/quiesce-acquired" "$stub_dir/cli-paused" "$stub_dir/held"
+  : >"$stub_dir/ops"; : >"$stub_dir/calls"
+  sv SLASHIT_TEST_QUIESCE_PAUSE=1 SLASHIT_DOGFOOD_CLI_TIMEOUT=120 restart >"$work/killed.out" 2>&1 &
+  local bg=$! i p cmd
+  for i in $(seq 1 300); do [ -f "$stub_dir/quiesce-acquired" ] && break; sleep 0.1; done
+  for p in $(pgrep -f 'supervise-dogfood.sh restart' 2>/dev/null); do
+    cmd=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null) || continue
+    if [ "$cmd" = "bash $sup restart " ]; then KILLED_SUP=$p; break; fi
+  done
+  [ -n "$KILLED_SUP" ] && kill -9 "$KILLED_SUP" 2>/dev/null
+  # The CLI request it was waiting on is orphaned; ending it does not touch the instance.
+  p=$(cat "$stub_dir/cli-paused" 2>/dev/null) && [ -n "$p" ] && kill -9 "$p" 2>/dev/null
+  wait "$bg" 2>/dev/null
+  KILLED_OP=$(awk '$1 == "quiesce" { print $2; exit }' "$stub_dir/ops")
+  [ -n "$KILLED_SUP" ] && [[ "$KILLED_OP" == sup-* ]] || { bad "$1: the supervisor was not killed while holding the quiesce"; return 1; }
+}
+rec=$state/supervisor/quiesce
+rm -rf "$state/supervisor/recover"
+
+echo "== an abrupt interruption: the quiesce is recorded, and only its own operation reopens it"
+if killed_restart "killed restart"; then
+  rec_op=$(awk -F '\t' '$1 == "operation" { print $2 }' "$rec" 2>/dev/null)
+  if [ "$rec_op" = "$KILLED_OP" ] && [ "$(cat "$stub_dir/held" 2>/dev/null)" = "$KILLED_OP" ] &&
+    [ "$(stat -c %a "$rec" 2>/dev/null)" = 600 ] && kill -0 "$KILLED_PID" 2>/dev/null && ! grep -q '^resume' "$stub_dir/ops"; then
+    ok "a SIGKILLed restart leaves admission held, and its operation id is recorded owner-only"
+  else bad "killed restart: record '$rec_op', held '$(cat "$stub_dir/held" 2>/dev/null)', operation $KILLED_OP"; fi
+
+  out=$(sv activity 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"admission-quiesce:$KILLED_OP"* ]]; then
+    ok "activity reports the held quiesce and its operation id (exit 1)"
+  else bad "activity did not report the held quiesce (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+  out=$(sv restart 2>&1); st=$?
+  if [ "$st" -ne 0 ] && [[ "$out" == *"recorded as quiesced by operation $KILLED_OP"* ]] &&
+    [ "$(grep -c '^quiesce' "$stub_dir/ops")" = 1 ] && ! grep -qx quit "$stub_dir/calls" &&
+    [ "$(awk -F '\t' '$1 == "operation" { print $2 }' "$rec")" = "$KILLED_OP" ] && kill -0 "$KILLED_PID" 2>/dev/null; then
+    ok "a second restart is refused before any quiesce or quit, and the record of the held quiesce is not overwritten"
+  else bad "second restart did not refuse or overwrote the record (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+  out=$(sv resume-quiesce 2>&1); st=$?
+  if [ "$st" -eq 0 ] && [[ "$out" == *"admission reopened on"* ]] && grep -qx "resume $KILLED_OP" "$stub_dir/ops" &&
+    [ ! -e "$stub_dir/held" ] && [ ! -e "$rec" ]; then
+    ok "resume-quiesce sends the recorded operation id, reopens admission and clears the record"
+  else bad "resume-quiesce did not reopen the recorded quiesce (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+  out=$(sv restart 2>&1); st=$?
+  if [ "$st" -eq 0 ]; then ok "after the resume a restart proceeds normally"; else bad "restart after resume-quiesce failed (exit $st)"; printf '%s\n' "$out" >&2; fi
+fi
+cleanup_instances
+
+# A different operation's id is refused by the instance, and leaves the held quiesce for its owner.
+if killed_restart "foreign id"; then
+  out=$(stubcli --endpoint "unix:$socket" --json resume --operation sup-0-foreign 2>&1)
+  if [[ "$out" == *'"refusal": "not-held"'* ]] && [ "$(cat "$stub_dir/held" 2>/dev/null)" = "$KILLED_OP" ]; then
+    ok "a foreign operation id is refused and the held quiesce stays with its owner"
+  else bad "a foreign id was not refused, or the hold moved: $out"; fi
+  out=$(sv resume-quiesce 2>&1); st=$?
+  if [ "$st" -eq 0 ] && [ ! -e "$stub_dir/held" ]; then ok "the owner's recorded id still resumes after a foreign attempt"; else bad "owner resume failed after a foreign attempt (exit $st)"; printf '%s\n' "$out" >&2; fi
+fi
+cleanup_instances
+
+# A stale id, after its quiesce was released and a newer one took the fence, is refused.
+if killed_restart "stale id"; then
+  stubcli --endpoint "unix:$socket" --json resume --operation "$KILLED_OP" >/dev/null 2>&1
+  newer=sup-0-newer
+  stubcli --endpoint "unix:$socket" --json quiesce --operation "$newer" >/dev/null 2>&1
+  out=$(sv resume-quiesce 2>&1); st=$?
+  if [ "$st" -eq 0 ] && [[ "$out" == *"does not hold admission"* ]] && [ "$(cat "$stub_dir/held" 2>/dev/null)" = "$newer" ] &&
+    ! grep -qx "resume $newer" "$stub_dir/ops"; then
+    ok "a stale recorded id is refused after a newer quiescence, which stays held"
+  else bad "a stale id reopened or moved the newer quiescence (exit $st)"; printf '%s\n' "$out" >&2; fi
+fi
+cleanup_instances
+
+# A record from an earlier instance names a pid that no longer serves the endpoint: nothing is sent.
+if killed_restart "old record"; then
+  sv stop >/dev/null 2>&1; sv start >/dev/null 2>&1; : >"$stub_dir/ops"
+  out=$(sv resume-quiesce 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"was started after that quiesce"* ]] && [ ! -s "$stub_dir/ops" ] && [ -e "$rec" ]; then
+    ok "a record from an earlier instance is refused, nothing is sent, and the record is kept"
+  else bad "an earlier instance's record was not refused safely (exit $st)"; printf '%s\n' "$out" >&2; fi
+  out=$(sv activity 2>&1); st=$?
+  if [ "$st" -eq 0 ] && [[ "$out" == *"quiesce record: stale"* ]]; then ok "activity does not count a record from an earlier instance as held"; else bad "activity counted a stale record (exit $st)"; printf '%s\n' "$out" >&2; fi
+fi
+cleanup_instances
+
+# A shutdown fence is never reopened, by resume-quiesce or by any later quiesce.
+if killed_restart "shutdown fence"; then
+  : >"$stub_dir/shutdown"
+  out=$(sv resume-quiesce 2>&1); st=$?
+  late=$(stubcli --endpoint "unix:$socket" --json quiesce --operation sup-0-late 2>&1)
+  if [ "$st" -eq 1 ] && [[ "$out" == *"never reopened"* ]] && [ -e "$stub_dir/shutdown" ] &&
+    [[ "$late" == *'"refusal": "shutdown"'* ]] && ! grep -q 'resume' <<<"$out"; then
+    ok "resume-quiesce never reopens a shutdown fence (exit 1), and a later quiesce is refused as shutdown"
+  else bad "a shutdown fence was reopened or misreported (exit $st): $out / $late"; fi
+fi
+cleanup_instances
+
+# A retained recovery copy stays byte-for-byte, blocks a non-forced restart, and gets no quiesce record.
+mkdir -p "$state/supervisor/recover" && printf 'kept evidence\n' >"$state/supervisor/recover/slashit-ui"
+kept_sum=$(sha256sum "$state/supervisor/recover/slashit-ui" | cut -d' ' -f1)
+sv start >/dev/null 2>&1 || bad "recovery-copy fixture: start failed"
+pre=$(stub_pid); : >"$stub_dir/ops"; : >"$stub_dir/calls"
+out=$(sv restart 2>&1); st=$?
+if [ "$st" -ne 0 ] && [[ "$out" == *"recovery copy from an earlier interrupted or divergent restart"* ]] &&
+  [ "$(sha256sum "$state/supervisor/recover/slashit-ui" | cut -d' ' -f1)" = "$kept_sum" ] && [ ! -e "$rec" ] &&
+  [ ! -s "$stub_dir/ops" ] && [ "$(stub_pid)" = "$pre" ]; then
+  ok "a retained recovery copy blocks a restart before any quiesce is recorded, and its bytes are unchanged"
+else bad "retained recovery copy was not protected (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+rm -rf "$state/supervisor/recover"
 
 # A retained recovery copy blocks every restart, forced or not, before anything is acquired or stopped.
 for flag in "" --force; do

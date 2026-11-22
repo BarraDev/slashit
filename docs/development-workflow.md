@@ -1357,11 +1357,49 @@ Three build modes exist. They do not share a binary path:
   it. A lost reply is treated as possibly taken, and only that operation is
   reopened. If a restart is killed after its quiesce was acknowledged, the
   instance refuses new work until it is stopped or resumed. No deadline is
-  applied: the state is fail-closed and a cooperative stop still works.
-  Recovery: `scripts/supervise-dogfood.sh stop`, then `start`, which stops
-  under the quiesce; or, with the operation id that the killed restart printed,
-  `slashit --endpoint unix:<socket> resume --operation <id>`. A later restart
-  reports `held by another quiesce operation` until one of these is done.
+  applied: the state is fail-closed and a cooperative stop still works. The
+  operation id is written to `supervisor/quiesce` before the request is sent,
+  so the operator can recover from it; the procedure is in
+  "Abrupt interruption" below.
+- **Abrupt interruption (SIGKILL, power loss, a crashed terminal).** A killed
+  supervisor runs no cleanup, so admission can stay closed. Nothing reopens it
+  on its own, and that is intended.
+  - *Find the hold:* `scripts/supervise-dogfood.sh activity`. Exit 1 with
+    `admission-quiesce:<operation>` means the record names the verified
+    instance. `scripts/refresh-dogfood.sh --check` prints the same line. The
+    record itself is `supervisor/quiesce` (owner-only): `operation`, `state`
+    (`requested` means the request was written; the instance may not have
+    closed admission), `pid`, `endpoint` and `recorded_at`. The instance does
+    not report its admission state, so the record is the only evidence and
+    `activity` treats a matching record as held.
+  - *Confirm the instance:* `scripts/supervise-dogfood.sh verify`, then compare
+    its answering pid with `pid` in the record. A stale record names a pid that
+    no longer serves the endpoint (`activity` reports it as stale and not
+    held). It grants nothing; the instance was started after that quiesce.
+  - *Decide:* if the verified instance is the recorded pid and its work is what
+    you expect, reopen admission: `scripts/supervise-dogfood.sh resume-quiesce`.
+    It sends only the recorded id, and reports one of these outcomes:
+    `admission reopened` (run `activity` again; exit 0 means idle); `does not
+    hold admission` (that operation holds nothing; admission is unchanged, and
+    a restart that still reports `held by another quiesce operation` is held
+    by someone else, so use the stop-and-start path); `shutdown` (a shutdown
+    fence holds admission closed and is never reopened: wait for it to finish,
+    then start again); `could not be confirmed` (the record is kept; retry
+    when the endpoint answers). If the instance is unverified, does not answer
+    or you cannot tell who holds the quiesce, stop and start instead:
+    `scripts/supervise-dogfood.sh stop`, then `start`. A graceful stop is
+    allowed under a quiesce, and the new instance starts with admission open.
+  - *Never:* delete `supervisor/quiesce` to clear a hold (the record is the
+    only record of the id, and the instance is the only proof the hold is gone);
+    edit it to another id; pass an id that you did not read from the record and
+    match to the verified pid; run `stop --force`, `restart --force` or `kill`
+    against a live instance to get past a hold (the hold is a fence, not a
+    failure to clear); start a second instance while one answers; or remove any
+    recovery or backup directory.
+  - *A restart refuses while the record names the live pid:* it refuses before
+    it quiesces or stops anything, forced or not, and does not overwrite the
+    record. Run `resume-quiesce` first. A record for another pid does not block
+    a restart; that restart replaces it.
 - **Recovery copies.** An interrupted or divergent restart keeps the executable
   it captured under `~/.local/state/slashit-dogfood/supervisor/recover/`
   (`slashit-ui` and `slashit-ui.frontend`). Discover it with

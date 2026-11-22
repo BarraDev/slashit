@@ -55,7 +55,16 @@
 #       active work (named), 3 cannot verify. It is a check, not a lock: admission
 #       stays open, so a Task can start after it answers. The restart does not rely
 #       on it: it closes admission with `quiesce` and reads the counts under that
-#       fence, immediately before its quit.
+#       fence, immediately before its quit. An admission quiesce recorded for the
+#       verified pid by an interrupted restart counts as active work (see below).
+#
+#   scripts/supervise-dogfood.sh resume-quiesce
+#       Reopens admission that a restart closed and was killed before it could
+#       reopen. It reads the operation id from $SUP_DIR/quiesce (the record names the
+#       pid it was written for, and the verified instance must be that pid), and sends
+#       that id, and only that id, to `resume`. A record for another pid is refused and
+#       nothing is sent. A shutdown fence is never reopened. The record grants nothing:
+#       the instance decides. Takes the lifecycle lock.
 #
 #   scripts/supervise-dogfood.sh verify
 #       Endpoint verification only: ping the control socket, compare the
@@ -191,7 +200,7 @@ if [ "$(uname -s 2>/dev/null)" != Linux ]; then
 fi
 
 usage() {
-  echo "usage: $SELF {start|run|stop|restart|status|activity|verify|env} [--force]" >&2
+  echo "usage: $SELF {start|run|stop|restart|status|activity|verify|env|resume-quiesce} [--force]" >&2
   echo "       $SELF adopt COMMIT SHA256" >&2
   echo "       $SELF migrate-legacy COMMIT SHA256" >&2
   exit 2
@@ -207,7 +216,7 @@ fi
 [ "$#" -le 2 ] || usage
 case ${2:-} in "" | --force) ;; *) usage ;; esac
 case $verb in
-  start | run | stop | restart | status | activity | verify | env | adopt | migrate-legacy) ;;
+  start | run | stop | restart | status | activity | verify | env | resume-quiesce | adopt | migrate-legacy) ;;
   *) usage ;;
 esac
 case $verb in env | status | activity | run | adopt | migrate-legacy) [ "${2:-}" = "" ] || usage ;; esac
@@ -1691,20 +1700,65 @@ restart_recover() { # message
 # reopened for this operation only.
 QUIESCE_HELD=0
 QUIESCE_OP=
+# The operation id is also written to a record, because a SIGKILLed supervisor runs
+# no EXIT trap and the id would otherwise die with it. The record grants nothing:
+# nothing reads it to reopen admission, and only `resume` with the same id (or
+# `resume-quiesce`, which sends that id) can reopen it. It is cleared by any reply
+# to the release, and by the restart once the instance it quiesced has exited.
+QUIESCE_RECORD=$SUP_DIR/quiesce
+QUIESCE_RELEASE=
+# write_quiesce_record OPERATION STATE: replaced by rename, so a reader sees the
+# old record or the new one, never a partial one. Owner-only, as the id is a
+# resume credential.
+write_quiesce_record() {
+  local tmp=$QUIESCE_RECORD.tmp.$$
+  ( umask 077
+    printf 'operation\t%s\nstate\t%s\npid\t%s\nendpoint\t%s\nrecorded_at\t%s\n' \
+      "$1" "$2" "$TARGET_PID" "$ENDPOINT" "$(date -u +%FT%TZ)" >"$tmp" ) 2>/dev/null &&
+    mv -f -T "$tmp" "$QUIESCE_RECORD" 2>/dev/null && return 0
+  rm -f "$tmp"
+  return 1
+}
+clear_quiesce_record() {
+  rm -f "$QUIESCE_RECORD"
+}
+# quiesce_record_field KEY: the value of KEY in the record, or nothing.
+quiesce_record_field() {
+  awk -F '\t' -v key="$1" '$1 == key { print $2 }' "$QUIESCE_RECORD" 2>/dev/null | head -n 1
+}
+# Sets QUIESCE_RELEASE to the instance's answer: resumed, not-held, shutdown,
+# or unconfirmed when no answer came back.
 release_quiesce() {
   [ "$QUIESCE_HELD" = 1 ] || return 0
   QUIESCE_HELD=0
   local out rc=0 why
+  QUIESCE_RELEASE=unconfirmed
   out=$(timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" --json resume --operation "$QUIESCE_OP" 2>/dev/null) || rc=$?
   if [ "$rc" -ne 0 ]; then
-    echo "$SELF: warning: admission on $ENDPOINT could not be confirmed reopened for operation $QUIESCE_OP (exit $rc); if it stays closed, run \`$CLI_BIN --endpoint $ENDPOINT resume --operation $QUIESCE_OP\`, or stop and start the instance" >&2
+    # No answer, so the record stays: it is the only place the id is still written down.
+    echo "$SELF: warning: admission on $ENDPOINT could not be confirmed reopened for operation $QUIESCE_OP (exit $rc); if it stays closed, run \`$SELF resume-quiesce\` (or \`$CLI_BIN --endpoint $ENDPOINT resume --operation $QUIESCE_OP\`), or stop and start the instance" >&2
     return 0
   fi
-  [ "$(printf '%s\n' "$out" | ping_json_field resumed)" = true ] && return 0
+  if [ "$(printf '%s\n' "$out" | ping_json_field resumed)" = true ]; then
+    QUIESCE_RELEASE=resumed
+    clear_quiesce_record
+    return 0
+  fi
   why=$(printf '%s\n' "$out" | ping_json_field refusal)
-  # not-held: this operation never closed admission, so there is nothing to reopen.
-  [ "$why" = shutdown ] &&
-    echo "$SELF: shutdown is in progress on $ENDPOINT; its shutdown keeps admission closed, and this restart does not reopen it" >&2
+  case $why in
+    # not-held: this operation never closed admission, so there is nothing to reopen.
+    not-held) QUIESCE_RELEASE=not-held; clear_quiesce_record ;;
+    shutdown)
+      QUIESCE_RELEASE=shutdown
+      clear_quiesce_record
+      echo "$SELF: shutdown is in progress on $ENDPOINT; its shutdown keeps admission closed, and this restart does not reopen it" >&2
+      ;;
+    *)
+      # An answer this supervisor does not know: the record stays, as the id may still be held.
+      QUIESCE_RELEASE=unconfirmed
+      echo "$SELF: warning: the resume reply for operation $QUIESCE_OP is not a known outcome ('$why'); the quiesce record is kept in $QUIESCE_RECORD" >&2
+      ;;
+  esac
   return 0
 }
 
@@ -1718,6 +1772,15 @@ refuse_if_recovery_copy() {
   refuse "a recovery copy from an earlier interrupted or divergent restart is kept in $SUP_DIR/recover (${kept% }). It is not overwritten or deleted, and it blocks restarts until an operator archives it: see \"Recovery copies\" in docs/development-workflow.md, section 19. Nothing was stopped"
 }
 
+# A quiesce recorded for the live instance is an interrupted restart's hold. A new
+# restart would be refused by the instance and would overwrite the record that names
+# it, so it is refused first, forced or not. `resume-quiesce` clears it.
+refuse_if_quiesce_recorded() {
+  [ -f "$QUIESCE_RECORD" ] || return 0
+  [ "$(quiesce_record_field pid)" = "$TARGET_PID" ] || return 0
+  refuse "admission on pid $TARGET_PID is recorded as quiesced by operation $(quiesce_record_field operation) in $QUIESCE_RECORD, from an interrupted restart. Nothing was stopped. Run \`$SELF resume-quiesce\`, then restart"
+}
+
 quiesce_for_restart() {
   [ "$CLI_STATE" = ready ] || refuse "cannot quiesce: $(cannot_verify_text); nothing was stopped"
   ping_fields || refuse "cannot quiesce: no verified instance answers on $ENDPOINT; nothing was stopped"
@@ -1725,6 +1788,11 @@ quiesce_for_restart() {
     refuse "the running instance (version $PING_VERSION) predates admission quiesce, so a restart cannot prove it idle before quit; when it is idle, stop it and start the target. Nothing was stopped"
   local out rc=0 field n acquired refusal busy=
   QUIESCE_OP="sup-$$-$(cat /proc/sys/kernel/random/uuid)"
+  # Recorded before the request, so an id the instance acknowledges survives a kill
+  # that lands between the reply and anything else. Nothing has closed admission yet,
+  # so a failed record write stops the restart here.
+  write_quiesce_record "$QUIESCE_OP" requested ||
+    refuse "cannot record quiesce operation $QUIESCE_OP in $QUIESCE_RECORD, so admission was not closed and nothing was stopped"
   out=$(timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" --json quiesce --operation "$QUIESCE_OP" 2>/dev/null) || rc=$?
   if [ "$rc" -ne 0 ]; then
     # Lost or failed reply: the instance may have closed admission for this operation.
@@ -1736,8 +1804,8 @@ quiesce_for_restart() {
   if [ "$acquired" != true ]; then
     refusal=$(printf '%s\n' "$out" | ping_json_field refusal)
     case $refusal in
-      shutdown) refuse "shutdown is already in progress on $ENDPOINT, so its shutdown holds admission closed. This restart did not acquire admission and will not reopen it. Nothing was stopped" ;;
-      held) refuse "admission on $ENDPOINT is held by another quiesce operation, not by this restart. This restart did not acquire admission and will not reopen it. Nothing was stopped" ;;
+      shutdown) clear_quiesce_record; refuse "shutdown is already in progress on $ENDPOINT, so its shutdown holds admission closed. This restart did not acquire admission and will not reopen it. Nothing was stopped" ;;
+      held) clear_quiesce_record; refuse "admission on $ENDPOINT is held by another quiesce operation, not by this restart. This restart did not acquire admission and will not reopen it. Nothing was stopped" ;;
       *)
         QUIESCE_HELD=1
         trap release_quiesce EXIT
@@ -1778,6 +1846,7 @@ cmd_restart() {
   # Checked before the quiesce and the capture, so a kept copy is never overwritten,
   # with or without --force.
   refuse_if_recovery_copy
+  refuse_if_quiesce_recorded
   note "controlled restart of pid $pid on $ENDPOINT"
   # --force keeps its documented meaning (escalate to signals) and skips the
   # quiesce; the refresh script never passes it. The quiesce runs before the
@@ -1788,6 +1857,7 @@ cmd_restart() {
   capture_running_executable
   cmd_stop
   QUIESCE_HELD=0 # the instance has exited; there is nothing left to reopen
+  clear_quiesce_record
 
   local stamp backup
   if ! stamp=$(write_backup); then
@@ -1980,6 +2050,14 @@ cmd_activity() {
     [ "$n" -eq 0 ] || busy="$busy $field=$n"
   done
   [ -z "$(ls -A "$SUP_DIR/recover" 2>/dev/null)" ] || busy="$busy recovery-copy in $SUP_DIR/recover"
+  if [ -f "$QUIESCE_RECORD" ]; then
+    # Only a record for the verified pid counts: an older record names an instance that has exited.
+    if [ "$(quiesce_record_field pid)" = "$PING_PID" ]; then
+      busy="$busy admission-quiesce:$(quiesce_record_field operation) ($(quiesce_record_field state), recorded in $QUIESCE_RECORD; see \"$SELF resume-quiesce\")"
+    else
+      echo "quiesce record: stale (it names pid $(quiesce_record_field pid); the verified instance is pid $PING_PID and was started after it), not counted as held"
+    fi
+  fi
   if [ -n "$busy" ]; then
     echo "active work:$busy"
     exit 1
@@ -1988,12 +2066,47 @@ cmd_activity() {
   exit 0
 }
 
+# Reopens admission for the operation the quiesce record names. The record only
+# supplies the id: the instance decides, and refuses any id that does not hold its
+# admission. Runs under the lifecycle lock, so no restart can be mid-quiesce, and
+# only against the verified instance the record was written for.
+cmd_resume_quiesce() {
+  if [ ! -f "$QUIESCE_RECORD" ]; then
+    note "no quiesce record in $SUP_DIR: no restart left admission closed"
+    exit 0
+  fi
+  case $CLI_STATE in
+    ready) ;;
+    *) exit_with 3 "cannot resume: $(cannot_verify_text); the record is kept in $QUIESCE_RECORD" ;;
+  esac
+  ping_fields ||
+    exit_with 3 "cannot resume: no verified instance answers on $ENDPOINT; the record is kept in $QUIESCE_RECORD"
+  [ "$PING_MODE" = gui ] && [ "${PING_ENDPOINT#unix:}" = "$SOCKET" ] ||
+    exit_with 3 "cannot resume: the endpoint answers as mode '$PING_MODE' on '$PING_ENDPOINT', not a gui instance on $ENDPOINT; the record is kept"
+  QUIESCE_OP=$(quiesce_record_field operation)
+  case $QUIESCE_OP in
+    sup-[0-9]*-*) ;;
+    *) exit_with 1 "the quiesce record in $QUIESCE_RECORD names no valid operation; nothing was sent" ;;
+  esac
+  if [ "$(quiesce_record_field pid)" != "$PING_PID" ]; then
+    exit_with 1 "the quiesce record names pid $(quiesce_record_field pid), but the verified instance is pid $PING_PID, which was started after that quiesce; nothing was sent and the record is kept (the next restart replaces it)"
+  fi
+  QUIESCE_HELD=1
+  release_quiesce
+  case $QUIESCE_RELEASE in
+    resumed) note "admission reopened on $ENDPOINT for operation $QUIESCE_OP; the quiesce record is cleared" ;;
+    not-held) note "operation $QUIESCE_OP does not hold admission on $ENDPOINT; the record is cleared and admission is unchanged (check $SELF activity)" ;;
+    shutdown) exit_with 1 "a shutdown holds admission closed on $ENDPOINT, and a shutdown is never reopened" ;;
+    *) exit_with 1 "admission on $ENDPOINT could not be confirmed reopened for $QUIESCE_OP; the record is kept" ;;
+  esac
+}
+
 env_gates
 resolve_cli
 cli_state
 
 case $verb in
-  start | run | stop | restart | adopt | migrate-legacy) lifecycle_lock ;;
+  start | run | stop | restart | resume-quiesce | adopt | migrate-legacy) lifecycle_lock ;;
 esac
 
 case $verb in
@@ -2004,6 +2117,7 @@ case $verb in
   restart) cmd_restart ;;
   status) cmd_status ;;
   activity) cmd_activity ;;
+  resume-quiesce) cmd_resume_quiesce ;;
   verify) cmd_verify ;;
   adopt) cmd_adopt ;;
   migrate-legacy) cmd_migrate_legacy ;;
