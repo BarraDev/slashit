@@ -82,7 +82,10 @@ pub enum IpcRequest {
     SetTaskModel { task_id: String, model: String },
     /// Set how a Task's finished coding runs are reviewed: `manual` or
     /// `automatic`. A change affects only runs that have not started.
-    SetTaskReviewMode { task_id: String, review_mode: String },
+    SetTaskReviewMode {
+        task_id: String,
+        review_mode: String,
+    },
     /// Replace a Task's structured dependencies. An empty list clears them.
     ///
     /// Validated by the instance with the same rules the desktop applies: at
@@ -105,14 +108,16 @@ pub enum IpcRequest {
     Show,
     /// Request graceful quit
     Quit,
-    /// Close executor admission and report what is still in flight, in one
-    /// step. After the reply no start, Task, Project Run or Queue promotion
-    /// can be admitted until `Resume`. Refused when admission is already
-    /// closed (shutting down, or another quiesce holds it).
-    Quiesce,
-    /// Reopen admission closed by `Quiesce`. Refused otherwise, and never
-    /// reopens a shutdown fence.
-    Resume,
+    /// Close executor admission for `operation` and report what is still in
+    /// flight, in one step. After an acquired reply no start, Task, Project
+    /// Run or Queue promotion is admitted until `Resume` with the same
+    /// operation. Repeating the request with the same operation is idempotent,
+    /// so a lost reply can be retried. A refusal is a reply with
+    /// `acquired: false`, never an error, and it never reveals the holder.
+    Quiesce { operation: String },
+    /// Reopen admission closed by `Quiesce` for the same `operation`. Any other
+    /// operation, and any shutdown fence, is refused as a reply, not reopened.
+    Resume { operation: String },
     /// Report the resolved value and origin of every runtime feature flag.
     ///
     /// The daemon and the GUI resolve flags through the same code, so asking
@@ -179,8 +184,8 @@ impl IpcRequest {
                 Self::ApplyImport { .. }
                     | Self::PreviewImport { .. }
                     | Self::ExportProject { .. }
-                    | Self::Quiesce
-                    | Self::Resume
+                    | Self::Quiesce { .. }
+                    | Self::Resume { .. }
             )
     }
 
@@ -214,8 +219,8 @@ impl IpcRequest {
             Self::ListTerminals => "list_terminals",
             Self::Show => "show",
             Self::Quit => "quit",
-            Self::Quiesce => "quiesce",
-            Self::Resume => "resume",
+            Self::Quiesce { .. } => "quiesce",
+            Self::Resume { .. } => "resume",
             Self::Features => "features",
             Self::Ping => "ping",
             Self::ExportProject { .. } => "export_project",
@@ -371,11 +376,20 @@ pub struct InstanceInfo {
     pub admission_control: bool,
 }
 
-/// Reply to `Quiesce`: admission is closed and these are the counts a restart
-/// would interrupt. `admitting` counts starts still inside their admission
-/// sequence; `owned_work` counts running Task owners and Project Runs.
+/// Whether `id` is a well-formed quiesce operation id: 1 to 64 ASCII letters,
+/// digits or hyphens. Checked at the IPC boundary before any state is touched.
+pub fn is_valid_operation_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Reply to an acquired `Quiesce`: admission is closed for `operation` and these
+/// are the counts a restart would interrupt. `admitting` counts starts still
+/// inside their admission sequence; `owned_work` counts running Task owners and
+/// Project Runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuiesceInfo {
+    pub acquired: bool,
+    pub operation: String,
     pub admitting: usize,
     pub owned_work: usize,
     #[serde(flatten)]
@@ -388,17 +402,40 @@ mod tests {
 
     #[test]
     fn instance_built_before_admission_quiesce_reads_as_unsupported() {
-        let old = r#"{"mode":"gui","version":"1.0.0","protocol_version":1,"pid":7,"endpoint":"unix:/x"}"#;
+        let old =
+            r#"{"mode":"gui","version":"1.0.0","protocol_version":1,"pid":7,"endpoint":"unix:/x"}"#;
         let info: InstanceInfo = serde_json::from_str(old).unwrap();
-        assert!(!info.admission_control, "an answer without the field must fail closed");
+        assert!(
+            !info.admission_control,
+            "an answer without the field must fail closed"
+        );
         let new = r#"{"mode":"gui","version":"1.0.0","protocol_version":1,"pid":7,"endpoint":"unix:/x","admission_control":true}"#;
-        assert!(serde_json::from_str::<InstanceInfo>(new).unwrap().admission_control);
+        assert!(
+            serde_json::from_str::<InstanceInfo>(new)
+                .unwrap()
+                .admission_control
+        );
+    }
+
+    #[test]
+    fn operation_ids_are_bounded_and_plain() {
+        assert!(is_valid_operation_id("sup-42-0f8c3b1e-aaaa"));
+        assert!(!is_valid_operation_id(""));
+        assert!(!is_valid_operation_id(&"a".repeat(65)));
+        assert!(!is_valid_operation_id("a b"));
+        assert!(!is_valid_operation_id("a/../b"));
     }
 
     #[test]
     fn quiesce_and_resume_are_mutating_requests() {
-        assert!(IpcRequest::Quiesce.is_mutating());
-        assert!(IpcRequest::Resume.is_mutating());
+        let quiesce = IpcRequest::Quiesce {
+            operation: "op".into(),
+        };
+        let resume = IpcRequest::Resume {
+            operation: "op".into(),
+        };
+        assert!(quiesce.is_mutating());
+        assert!(resume.is_mutating());
     }
 
     #[test]
@@ -634,7 +671,10 @@ mod tests {
         let line = serde_json::to_string(&env).unwrap();
         let back: IpcEnvelope = serde_json::from_str(&line).unwrap();
         match back.request {
-            IpcRequest::SetTaskDependencies { task_id, dependencies } => {
+            IpcRequest::SetTaskDependencies {
+                task_id,
+                dependencies,
+            } => {
                 assert!(task_id.ends_with("0001"));
                 assert_eq!(dependencies.len(), 1);
             }

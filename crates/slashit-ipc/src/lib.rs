@@ -39,8 +39,9 @@ pub use auth::{AuthToken, Credentials};
 pub use config::{IpcConfig, TcpConfig};
 pub use endpoint::{socket_path, Endpoint};
 pub use protocol::{
-    AppStatus, FeatureFlagInfo, InstanceInfo, IpcEnvelope, IpcRequest, IpcResponse, ProjectSummary,
-    QueueStatusInfo, QuiesceInfo, TaskSummary, TerminalSummary, MAX_REQUEST_BYTES, PROTOCOL_VERSION,
+    is_valid_operation_id, AppStatus, FeatureFlagInfo, InstanceInfo, IpcEnvelope, IpcRequest,
+    IpcResponse, ProjectSummary, QueueStatusInfo, QuiesceInfo, TaskSummary, TerminalSummary,
+    MAX_REQUEST_BYTES, PROTOCOL_VERSION,
 };
 pub use transport::{Accepted, BindOptions, IpcListener, IpcStream, TransportAuth};
 

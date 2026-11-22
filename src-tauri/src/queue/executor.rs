@@ -1597,10 +1597,32 @@ struct ProcessAdmission {
 #[derive(Default)]
 struct ProcessAdmissionState {
     closed: bool,
-    /// Set only by `quiesce`; cleared by any close, so a shutdown fence can
-    /// never be reopened by `resume`.
-    quiesced: bool,
+    /// The operation holding a quiesce. Set only by `quiesce`; cleared by any
+    /// close and by `resume`, so a shutdown fence is never reopened and a
+    /// quiesce is reopened only by the operation that took it.
+    quiesced_by: Option<String>,
     starting: usize,
+}
+
+/// Why `quiesce` did not close admission. `Held` deliberately names no
+/// operation: a refused client learns that another quiesce holds the fence,
+/// never the token that would release it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuiesceRefusal {
+    /// Admission is closed by a shutdown, which no quiesce can take over.
+    Shutdown,
+    /// Admission is closed by a quiesce that belongs to another operation.
+    Held,
+}
+
+/// Why `resume` did not reopen admission.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResumeRefusal {
+    /// A shutdown closed admission; `resume` never reopens a shutdown fence.
+    Shutdown,
+    /// No quiesce of this operation holds admission (never taken, already
+    /// released, or held by another operation).
+    NotHeld,
 }
 
 /// An operation admitted by the process-wide gate. Dropping it ends the
@@ -1624,40 +1646,52 @@ impl ProcessAdmission {
     }
 
     fn is_quiesced(&self) -> bool {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).quiesced
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .quiesced_by
+            .is_some()
     }
 
     /// Refuse every later `enter` without waiting for the ones already in.
     fn close(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.closed = true;
-        state.quiesced = false;
+        state.quiesced_by = None;
     }
 
-    /// Close admission and return how many starts are still inside their
-    /// admission sequence. The close and the count share one lock, so every
-    /// lease not counted here was refused. Any owner of an uncounted lease is
-    /// already registered and visible to the caller's next read of the owner
-    /// counts. Errs when admission is already closed.
-    fn quiesce(&self) -> Result<usize, String> {
+    /// Close admission for `operation` and return how many starts are still
+    /// inside their admission sequence. The close and the count share one
+    /// lock, so every lease not counted here was refused. Any owner of an
+    /// uncounted lease is already registered and visible to the caller's next
+    /// read of the owner counts. A repeat by the holder is idempotent, so a
+    /// lost reply can be retried with the same operation.
+    fn quiesce(&self, operation: &str) -> Result<usize, QuiesceRefusal> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.closed {
-            return Err("admission is already closed: the instance is shutting down or another quiesce holds it".into());
+        match (state.closed, state.quiesced_by.as_deref()) {
+            (true, Some(holder)) if holder == operation => Ok(state.starting),
+            (true, Some(_)) => Err(QuiesceRefusal::Held),
+            (true, None) => Err(QuiesceRefusal::Shutdown),
+            (false, _) => {
+                state.closed = true;
+                state.quiesced_by = Some(operation.to_owned());
+                Ok(state.starting)
+            }
         }
-        state.closed = true;
-        state.quiesced = true;
-        Ok(state.starting)
     }
 
-    /// Reopen admission closed by `quiesce`. Refuses a shutdown fence.
-    fn resume(&self) -> Result<(), String> {
+    /// Reopen admission only for the operation that closed it by `quiesce`.
+    fn resume(&self, operation: &str) -> Result<(), ResumeRefusal> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if !state.quiesced {
-            return Err("admission is not quiesced; nothing to resume".into());
+        match (state.closed, state.quiesced_by.as_deref()) {
+            (true, Some(holder)) if holder == operation => {
+                state.closed = false;
+                state.quiesced_by = None;
+                Ok(())
+            }
+            (true, None) => Err(ResumeRefusal::Shutdown),
+            _ => Err(ResumeRefusal::NotHeld),
         }
-        state.closed = false;
-        state.quiesced = false;
-        Ok(())
     }
 
     async fn close_and_wait(&self) {
@@ -1696,44 +1730,107 @@ mod admission_quiesce_tests {
         let gate = Arc::new(ProcessAdmission::default());
         // The preflight saw nothing; a start is admitted before the quiesce.
         let lease = gate.enter().expect("admitted before the quiesce");
-        assert_eq!(gate.quiesce().expect("first quiesce"), 1, "the in-flight start is counted");
-        assert!(gate.enter().is_err(), "no start is admitted after the quiesce");
+        assert_eq!(
+            gate.quiesce("A").expect("first quiesce"),
+            1,
+            "the in-flight start is counted"
+        );
+        assert!(
+            gate.enter().is_err(),
+            "no start is admitted after the quiesce"
+        );
         drop(lease);
     }
 
     #[test]
-    fn quiesce_refuses_later_admission_until_resume() {
+    fn a_second_owner_cannot_acquire_a_held_fence() {
         let gate = Arc::new(ProcessAdmission::default());
-        assert_eq!(gate.quiesce().expect("quiesce an idle gate"), 0);
-        assert!(gate.enter().is_err());
-        assert!(gate.quiesce().is_err(), "a second quiesce is refused, so one holder resumes");
-        gate.resume().expect("the holder resumes");
-        assert!(gate.enter().is_ok(), "admission is restored");
+        gate.quiesce("A").expect("A quiesces an idle gate");
+        assert_eq!(
+            gate.quiesce("B"),
+            Err(QuiesceRefusal::Held),
+            "B is refused, not admitted over A"
+        );
+        assert!(gate.enter().is_err(), "A's fence still holds");
     }
 
     #[test]
-    fn an_aborted_refresh_restores_the_original_admission_state() {
+    fn a_rejected_owner_cannot_release_the_first_owners_fence() {
+        let gate = Arc::new(ProcessAdmission::default());
+        gate.quiesce("A").expect("A quiesces");
+        assert_eq!(
+            gate.resume("B"),
+            Err(ResumeRefusal::NotHeld),
+            "B's resume is refused"
+        );
+        assert!(gate.enter().is_err(), "A's fence is untouched by B");
+    }
+
+    #[test]
+    fn the_correct_owner_aborts_and_resumes() {
         let gate = Arc::new(ProcessAdmission::default());
         let before = gate.is_open();
-        gate.quiesce().expect("quiesce");
-        gate.resume().expect("abort path resumes");
-        assert_eq!(gate.is_open(), before);
+        gate.quiesce("A").expect("quiesce");
+        gate.resume("A").expect("the holder resumes");
+        assert_eq!(
+            gate.is_open(),
+            before,
+            "admission is back to its prior state"
+        );
+        assert!(gate.enter().is_ok());
+    }
+
+    #[test]
+    fn a_stale_resume_cannot_reopen_a_newer_quiescence() {
+        let gate = Arc::new(ProcessAdmission::default());
+        gate.quiesce("A").expect("A quiesces");
+        gate.resume("A").expect("A resumes");
+        gate.quiesce("B").expect("B quiesces next");
+        assert_eq!(
+            gate.resume("A"),
+            Err(ResumeRefusal::NotHeld),
+            "A's late resume is refused"
+        );
+        assert!(gate.enter().is_err(), "B's quiescence still holds");
+    }
+
+    #[test]
+    fn a_lost_acquisition_reply_is_retried_idempotently() {
+        let gate = Arc::new(ProcessAdmission::default());
+        assert_eq!(gate.quiesce("A").expect("acquired, reply lost"), 0);
+        assert_eq!(
+            gate.quiesce("A").expect("the holder retries"),
+            0,
+            "the retry holds the fence, not a second one"
+        );
+        gate.resume("A").expect("the holder can still reopen it");
         assert!(gate.enter().is_ok());
     }
 
     #[test]
     fn resume_never_reopens_a_shutdown_fence() {
         let gate = Arc::new(ProcessAdmission::default());
-        gate.quiesce().expect("quiesce");
+        gate.quiesce("A").expect("quiesce");
         gate.close(); // shutdown takes the fence over
-        assert!(gate.resume().is_err(), "resume must not reopen a shutdown");
+        assert_eq!(
+            gate.resume("A"),
+            Err(ResumeRefusal::Shutdown),
+            "resume must not reopen a shutdown"
+        );
         assert!(gate.enter().is_err());
+    }
+
+    #[test]
+    fn a_quiesce_after_shutdown_is_refused_as_shutdown() {
+        let gate = Arc::new(ProcessAdmission::default());
+        gate.close();
+        assert_eq!(gate.quiesce("A"), Err(QuiesceRefusal::Shutdown));
     }
 
     #[test]
     fn resume_without_a_quiesce_is_refused() {
         let gate = Arc::new(ProcessAdmission::default());
-        assert!(gate.resume().is_err());
+        assert_eq!(gate.resume("A"), Err(ResumeRefusal::NotHeld));
         assert!(gate.enter().is_ok());
     }
 }
@@ -2221,13 +2318,14 @@ impl TaskExecutor {
 
     /// Close admission for a quiesce and return the starts still in flight.
     /// The caller reads the owner counts after this returns.
-    pub fn quiesce_admission(&self) -> Result<usize, String> {
-        self.process_admission.quiesce()
+    pub fn quiesce_admission(&self, operation: &str) -> Result<usize, QuiesceRefusal> {
+        self.process_admission.quiesce(operation)
     }
 
-    /// Reopen admission closed by [`Self::quiesce_admission`].
-    pub fn resume_admission(&self) -> Result<(), String> {
-        self.process_admission.resume()
+    /// Reopen admission closed by [`Self::quiesce_admission`] for the same
+    /// `operation`.
+    pub fn resume_admission(&self, operation: &str) -> Result<(), ResumeRefusal> {
+        self.process_admission.resume(operation)
     }
 
     pub fn is_quiesced(&self) -> bool {
@@ -2699,12 +2797,12 @@ impl TaskExecutor {
     }
 
     async fn check_and_execute(&self) {
-        // Closed admission means shutdown has begun. Nothing below may start
-        // an owner, and the reconciliations are the poller's own work, not
-        // something the drain waits for.
-        if !self.is_accepting_work() {
+        // The whole pass is one admission sequence. Closed admission (shutdown
+        // or quiesce) refuses it; an open pass is counted by `quiesce`, so a
+        // Queue promotion or owner it makes cannot land after the idle proof.
+        let Ok(pass) = self.process_admission.enter() else {
             return;
-        }
+        };
         // A completed or lost runtime owner may have left only a durable
         // Started record. Classify that uncertainty once no live TaskExecutor
         // owner remains; never infer a commit from the checkout itself.
@@ -2869,6 +2967,10 @@ impl TaskExecutor {
             let reserved = self.reserved_permits.write().await.remove(&task_id);
             let _started = self.spawn_task_execution(task_id, reserved).await;
         }
+
+        // The pass ends its admission here: polling pull requests calls `gh`
+        // and starts no owner, so a quiesce need not wait for it.
+        drop(pass);
 
         // Every pass counts itself, then asks about the pull requests whose
         // poll is due (see `poll_pull_requests`). A pass with none due makes
@@ -26166,6 +26268,46 @@ VERDICT: APPROVED"
             })
             .await
             .expect("admission closes promptly");
+        }
+
+        /// A poller pass that is already running when a quiesce arrives is
+        /// counted by it, so a Queue promotion the pass makes cannot land after
+        /// the idle proof. The test parks the pass on the reservation lock it
+        /// needs (a forced interleaving, not a timed one). Before the pass was
+        /// counted, the wait below never saw it inside and timed out.
+        #[tokio::test]
+        async fn a_poller_pass_in_flight_is_counted_by_quiesce() {
+            let (executor, _temps) = test_executor();
+            let parked = executor.reserved_permits.write().await;
+            let poller = tokio::spawn({
+                let executor = executor.clone();
+                async move { executor.check_and_execute().await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while executor.process_admission.state.lock().unwrap().starting == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the pass is inside its admission sequence before the quiesce");
+
+            assert_eq!(
+                executor
+                    .quiesce_admission("idle-proof")
+                    .expect("quiesce is accepted"),
+                1,
+                "the pass that started before the quiesce is counted"
+            );
+            drop(parked);
+            poller
+                .await
+                .expect("the pass finishes once the lock is released");
+            // A pass started after the quiesce returns at once, starting nothing.
+            executor.check_and_execute().await;
+            assert!(
+                executor.process_admission.enter().is_err(),
+                "admission stays closed"
+            );
         }
 
         /// A desktop command that drives a whole Coordinator turn holds its

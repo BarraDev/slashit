@@ -166,10 +166,21 @@ enum Commands {
     /// daemon drains them within its grace period.
     Quit,
     /// Close admission on the running instance and report the work a restart
-    /// would interrupt. Admission stays closed until `resume`.
-    Quiesce,
-    /// Reopen admission closed by `quiesce`
-    Resume,
+    /// would interrupt. Admission stays closed until `resume` with the same
+    /// operation. The reply prints the operation; without --operation a fresh
+    /// one is generated.
+    Quiesce {
+        /// Operation id that owns the quiesce (1 to 64 letters, digits or hyphens)
+        #[arg(long)]
+        operation: Option<String>,
+    },
+    /// Reopen admission closed by `quiesce` for the same operation. Refused
+    /// for any other operation, and never reopens a shutdown.
+    Resume {
+        /// The operation id the quiesce printed
+        #[arg(long)]
+        operation: String,
+    },
     /// Report which instance is answering, and on which endpoint
     Ping,
     /// Show every feature flag with the value in force and where it came from
@@ -257,7 +268,7 @@ async fn main() -> Result<()> {
     // Format output based on command type
     match &cli.command {
         // The record is JSON by nature; there is no table form.
-        Commands::Inspect { .. } | Commands::Quiesce | Commands::Resume => {
+        Commands::Inspect { .. } | Commands::Quiesce { .. } | Commands::Resume { .. } => {
             println!("{}", serde_json::to_string_pretty(&response.data)?)
         }
         Commands::Status => output::print_status(&response.data),
@@ -288,6 +299,16 @@ async fn main() -> Result<()> {
 /// made absolute here.
 fn absolute_path(path: &std::path::Path) -> Result<String> {
     Ok(std::path::absolute(path)?.to_string_lossy().into_owned())
+}
+
+/// A quiesce operation id for a `quiesce` run without --operation. It is unique
+/// per process and time, and well inside the 64-character limit.
+fn generated_operation_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    format!("cli-{}-{nanos:x}", std::process::id())
 }
 
 /// The request a command sends to the running instance. `main` answers the
@@ -355,8 +376,12 @@ fn request_for(command: &Commands) -> Result<IpcRequest> {
         Commands::Terminals => IpcRequest::ListTerminals,
         Commands::Show => IpcRequest::Show,
         Commands::Quit => IpcRequest::Quit,
-        Commands::Quiesce => IpcRequest::Quiesce,
-        Commands::Resume => IpcRequest::Resume,
+        Commands::Quiesce { operation } => IpcRequest::Quiesce {
+            operation: operation.clone().unwrap_or_else(generated_operation_id),
+        },
+        Commands::Resume { operation } => IpcRequest::Resume {
+            operation: operation.clone(),
+        },
         Commands::Ping => IpcRequest::Ping,
         Commands::Features => IpcRequest::Features,
         Commands::Export { project, path } => IpcRequest::ExportProject {

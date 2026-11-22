@@ -1074,47 +1074,116 @@ async fn process(
     }
 
     if request.is_mutating() {
-        if ctx.executor.get().is_some_and(|executor| {
-            refused_by_closed_admission(&request, executor.is_accepting_work(), executor.is_quiesced())
-        }) {
-            audit(verb, peer, "denied-shutting-down");
-            return Dispatch::reply(IpcResponse::error(
-                "This SlashIt instance is not accepting state changes (shutting down or quiesced).",
-            ));
+        let refusal =
+            "This SlashIt instance is not accepting state changes (shutting down or quiesced).";
+        let mut admission = None;
+        if let Some(executor) = ctx.executor.get().map(|executor| executor.as_ref()) {
+            if refused_by_closed_admission(
+                &request,
+                executor.is_accepting_work(),
+                executor.is_quiesced(),
+            ) {
+                audit(verb, peer, "denied-shutting-down");
+                return Dispatch::reply(IpcResponse::error(refusal));
+            }
+            // The check above is only a fast refusal. The lease is what admits
+            // the mutation: a quiesce counts it, and a quiesce that closed
+            // admission after the check is refused here instead.
+            match mutation_admission(&request, executor) {
+                Ok(lease) => admission = lease,
+                Err(_) => {
+                    audit(verb, peer, "denied-shutting-down");
+                    return Dispatch::reply(IpcResponse::error(refusal));
+                }
+            }
         }
         audit(verb, peer, "dispatched");
+        let dispatch = handlers::dispatch(request, ctx, peer).await;
+        drop(admission);
+        return dispatch;
     }
 
     handlers::dispatch(request, ctx, peer).await
 }
 
-/// Whether closed admission refuses this mutating request. `Resume` always
-/// passes: it is the only way out of a quiesce. `Quit` passes a quiesce only,
-/// because a restart quiesces and then quits; a shutdown fence refuses it.
+/// The admission a mutating request holds while it is dispatched. `Quit`,
+/// `Quiesce` and `Resume` hold none: a quiesce must not count itself, and a
+/// quit must not wait for a drain that its own lease would keep open.
+fn mutation_admission(
+    request: &IpcRequest,
+    executor: &crate::queue::TaskExecutor,
+) -> Result<Option<crate::queue::executor::AdmissionLease>, String> {
+    match request {
+        IpcRequest::Quit | IpcRequest::Quiesce { .. } | IpcRequest::Resume { .. } => Ok(None),
+        _ => executor.admit_external_start().map(Some),
+    }
+}
+
+/// Whether closed admission refuses this mutating request before dispatch.
+/// `Quiesce` and `Resume` are decided by the executor, which knows the holder,
+/// so they pass here. `Quit` passes a quiesce only, because a restart quiesces
+/// and then quits; a shutdown fence refuses it. Any other mutation is refused.
 fn refused_by_closed_admission(request: &IpcRequest, accepting: bool, quiesced: bool) -> bool {
-    if accepting || matches!(request, IpcRequest::Resume) {
+    if accepting {
         return false;
     }
-    !(matches!(request, IpcRequest::Quit) && quiesced)
+    match request {
+        IpcRequest::Quiesce { .. } | IpcRequest::Resume { .. } => false,
+        IpcRequest::Quit => !quiesced,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
 mod closed_admission_tests {
     use super::*;
 
-    #[test]
-    fn a_quiesce_passes_only_resume_and_quit() {
-        assert!(!refused_by_closed_admission(&IpcRequest::Quiesce, true, false));
-        assert!(refused_by_closed_admission(&IpcRequest::Quiesce, false, true), "a second quiesce is refused");
-        assert!(!refused_by_closed_admission(&IpcRequest::Quit, false, true), "the restart's stop passes");
-        assert!(!refused_by_closed_admission(&IpcRequest::Resume, false, true));
+    fn quiesce() -> IpcRequest {
+        IpcRequest::Quiesce {
+            operation: "op".into(),
+        }
+    }
+
+    fn resume() -> IpcRequest {
+        IpcRequest::Resume {
+            operation: "op".into(),
+        }
     }
 
     #[test]
-    fn a_shutdown_fence_refuses_quit_and_every_other_state_change() {
-        assert!(refused_by_closed_admission(&IpcRequest::Quit, false, false));
-        assert!(refused_by_closed_admission(&IpcRequest::Quiesce, false, false));
-        assert!(!refused_by_closed_admission(&IpcRequest::Resume, false, false), "the executor refuses the resume itself");
+    fn quiesce_and_resume_are_left_to_the_executor_that_knows_the_holder() {
+        assert!(
+            !refused_by_closed_admission(&quiesce(), false, true),
+            "a second quiesce reaches the executor's refusal"
+        );
+        assert!(
+            !refused_by_closed_admission(&quiesce(), false, false),
+            "a shutdown reaches the executor's refusal"
+        );
+        assert!(!refused_by_closed_admission(&resume(), false, true));
+        assert!(!refused_by_closed_admission(&resume(), false, false));
+    }
+
+    #[test]
+    fn quit_passes_a_quiesce_only() {
+        assert!(
+            !refused_by_closed_admission(&IpcRequest::Quit, false, true),
+            "the restart's stop passes"
+        );
+        assert!(
+            refused_by_closed_admission(&IpcRequest::Quit, false, false),
+            "a shutdown fence refuses it"
+        );
+    }
+
+    #[test]
+    fn other_state_changes_are_refused_while_closed() {
+        let delete = IpcRequest::DeleteTask {
+            task_id: "x".into(),
+        };
+        assert!(refused_by_closed_admission(&delete, false, true));
+        assert!(refused_by_closed_admission(&delete, false, false));
+        assert!(!refused_by_closed_admission(&delete, true, false));
     }
 }
 
@@ -1169,6 +1238,37 @@ pub(crate) mod tests {
     use crate::domain::task::{TaskStatus, WorkerHandoff, WorkerHandoffStage};
     use crate::instance::{InstanceControl, InstanceMode, SharedInstanceControl};
     use crate::test_helpers::{attach_test_executor_ipc, create_test_task_full, ipc_test_context};
+
+    /// A state-changing request in flight is counted by a quiesce, and one that
+    /// arrives after the quiesce is refused. Quit, Quiesce and Resume hold no
+    /// lease, so the quiesce never counts itself.
+    #[tokio::test]
+    async fn a_mutation_in_flight_is_counted_by_quiesce() {
+        let rig = Rig::start(Layout::local_only()).await;
+        let delete = IpcRequest::DeleteTask {
+            task_id: "x".into(),
+        };
+        let lease = mutation_admission(&delete, &rig.executor)
+            .expect("admitted while open")
+            .expect("a mutation holds a lease");
+        assert_eq!(
+            rig.executor.quiesce_admission("op-1").expect("quiesce"),
+            1,
+            "the in-flight mutation is counted"
+        );
+        drop(lease);
+        assert!(
+            mutation_admission(&delete, &rig.executor).is_err(),
+            "a mutation after the quiesce is refused"
+        );
+        let quiesce = IpcRequest::Quiesce {
+            operation: "op-2".into(),
+        };
+        let no_lease = mutation_admission(&quiesce, &rig.executor).unwrap();
+        assert!(no_lease.is_none());
+        let quit = mutation_admission(&IpcRequest::Quit, &rig.executor).unwrap();
+        assert!(quit.is_none());
+    }
 
     /// What the next accept on one listener should do instead of accepting.
     #[derive(Default)]
