@@ -105,6 +105,14 @@ pub enum IpcRequest {
     Show,
     /// Request graceful quit
     Quit,
+    /// Close executor admission and report what is still in flight, in one
+    /// step. After the reply no start, Task, Project Run or Queue promotion
+    /// can be admitted until `Resume`. Refused when admission is already
+    /// closed (shutting down, or another quiesce holds it).
+    Quiesce,
+    /// Reopen admission closed by `Quiesce`. Refused otherwise, and never
+    /// reopens a shutdown fence.
+    Resume,
     /// Report the resolved value and origin of every runtime feature flag.
     ///
     /// The daemon and the GUI resolve flags through the same code, so asking
@@ -168,7 +176,11 @@ impl IpcRequest {
         self.spawns_agent()
             || matches!(
                 self,
-                Self::ApplyImport { .. } | Self::PreviewImport { .. } | Self::ExportProject { .. }
+                Self::ApplyImport { .. }
+                    | Self::PreviewImport { .. }
+                    | Self::ExportProject { .. }
+                    | Self::Quiesce
+                    | Self::Resume
             )
     }
 
@@ -202,6 +214,8 @@ impl IpcRequest {
             Self::ListTerminals => "list_terminals",
             Self::Show => "show",
             Self::Quit => "quit",
+            Self::Quiesce => "quiesce",
+            Self::Resume => "resume",
             Self::Features => "features",
             Self::Ping => "ping",
             Self::ExportProject { .. } => "export_project",
@@ -351,11 +365,41 @@ pub struct InstanceInfo {
     pub pid: u32,
     /// Human-readable endpoint the answer came in on.
     pub endpoint: String,
+    /// Whether this instance supports `Quiesce` and `Resume`. An instance
+    /// built before the field existed omits it, which reads as unsupported.
+    #[serde(default)]
+    pub admission_control: bool,
+}
+
+/// Reply to `Quiesce`: admission is closed and these are the counts a restart
+/// would interrupt. `admitting` counts starts still inside their admission
+/// sequence; `owned_work` counts running Task owners and Project Runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuiesceInfo {
+    pub admitting: usize,
+    pub owned_work: usize,
+    #[serde(flatten)]
+    pub status: AppStatus,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_built_before_admission_quiesce_reads_as_unsupported() {
+        let old = r#"{"mode":"gui","version":"1.0.0","protocol_version":1,"pid":7,"endpoint":"unix:/x"}"#;
+        let info: InstanceInfo = serde_json::from_str(old).unwrap();
+        assert!(!info.admission_control, "an answer without the field must fail closed");
+        let new = r#"{"mode":"gui","version":"1.0.0","protocol_version":1,"pid":7,"endpoint":"unix:/x","admission_control":true}"#;
+        assert!(serde_json::from_str::<InstanceInfo>(new).unwrap().admission_control);
+    }
+
+    #[test]
+    fn quiesce_and_resume_are_mutating_requests() {
+        assert!(IpcRequest::Quiesce.is_mutating());
+        assert!(IpcRequest::Resume.is_mutating());
+    }
 
     #[test]
     fn envelope_roundtrips() {

@@ -165,6 +165,11 @@ enum Commands {
     /// The GUI confirms first when agents or terminals are still running; a
     /// daemon drains them within its grace period.
     Quit,
+    /// Close admission on the running instance and report the work a restart
+    /// would interrupt. Admission stays closed until `resume`.
+    Quiesce,
+    /// Reopen admission closed by `quiesce`
+    Resume,
     /// Report which instance is answering, and on which endpoint
     Ping,
     /// Show every feature flag with the value in force and where it came from
@@ -252,7 +257,9 @@ async fn main() -> Result<()> {
     // Format output based on command type
     match &cli.command {
         // The record is JSON by nature; there is no table form.
-        Commands::Inspect { .. } => println!("{}", serde_json::to_string_pretty(&response.data)?),
+        Commands::Inspect { .. } | Commands::Quiesce | Commands::Resume => {
+            println!("{}", serde_json::to_string_pretty(&response.data)?)
+        }
         Commands::Status => output::print_status(&response.data),
         Commands::Projects => output::print_projects(&response.data),
         Commands::Tasks { .. } => output::print_tasks(&response.data),
@@ -348,6 +355,8 @@ fn request_for(command: &Commands) -> Result<IpcRequest> {
         Commands::Terminals => IpcRequest::ListTerminals,
         Commands::Show => IpcRequest::Show,
         Commands::Quit => IpcRequest::Quit,
+        Commands::Quiesce => IpcRequest::Quiesce,
+        Commands::Resume => IpcRequest::Resume,
         Commands::Ping => IpcRequest::Ping,
         Commands::Features => IpcRequest::Features,
         Commands::Export { project, path } => IpcRequest::ExportProject {

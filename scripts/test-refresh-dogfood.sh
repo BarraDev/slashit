@@ -405,8 +405,8 @@ else bad "a stale-frontend downgrade was not refused (exit $st)"; printf '%s\n' 
 echo "== a stale-frontend instance with no active work restarts after the idle check"
 git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; reset_activity; rm -f "$work/expect"
 out=$(export STUB_STATUS_RC=1; run --apply "$new"); st=$?
-if [ "$st" -eq 0 ] && calls_have restart && [ "$(cat "$work/expect" 2>/dev/null)" = "$new" ] && [ "$(activity_count)" -ge 2 ]; then
-  ok "a stale-frontend instance with no active work is restarted after the idle check ran before and immediately before the restart"
+if [ "$st" -eq 0 ] && calls_have restart && [ "$(cat "$work/expect" 2>/dev/null)" = "$new" ] && [ "$(activity_count)" -eq 1 ]; then
+  ok "a stale-frontend instance with no active work is restarted after one idle check, with the target commit pinned"
 else bad "an idle stale-frontend instance was not restarted after the check (exit $st, activity checks $(activity_count))"; printf '%s\n' "$out" >&2; fi
 
 echo "== active work blocks the automatic stale-frontend restart before any build or stop"
@@ -423,12 +423,17 @@ if [ "$st" -eq 1 ] && [[ "$out" == *"apply blocked:    a restart would interrupt
   ok "--check names the active work in its apply-blocked list and exits 1, with no build or restart"
 else bad "--check did not report the active work (exit $st)"; printf '%s\n' "$out" >&2; fi
 
-echo "== the active-work check runs again immediately before the restart"
+echo "== the wrapper checks once; the supervisor's restart closes admission and proves idle"
 git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; reset_activity
 out=$(export STUB_STATUS_RC=1 STUB_ACTIVITY_BUSY_FROM=2 STUB_ACTIVITY="active work: queued_tasks=1"; run --apply "$new"); st=$?
-if [ "$st" -eq 1 ] && [[ "$out" == *"found immediately before the restart"* ]] && ! calls_have restart && [ "$(activity_count)" -eq 2 ]; then
-  ok "work admitted after the first check (second check busy) stops the restart: no stop and no start"
-else bad "work admitted between the checks did not stop the restart (exit $st, checks $(activity_count))"; printf '%s\n' "$out" >&2; fi
+if [ "$st" -eq 0 ] && calls_have restart && [ "$(activity_count)" -eq 1 ]; then
+  ok "no second shell check runs before the restart; work admitted after the first check is left to the supervisor's quiesce"
+else bad "the wrapper ran a second shell check or skipped the restart (exit $st, checks $(activity_count))"; printf '%s\n' "$out" >&2; fi
+git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; reset_activity
+out=$(export STUB_STATUS_RC=1 STUB_RESTART_RC=1; run --apply "$new"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"the restart did not complete"* ]] && calls_have restart && ! calls_have start; then
+  ok "a restart the supervisor refuses (busy or unsupported) exits 1 and starts nothing"
+else bad "a refused restart was not reported as a failure with no start (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 echo "== the supervisor's activity verb reads the status counts and recovery copies"
 fake=$work/fake-slashit; sock=$d/run/slashit-app/slashit.sock
@@ -436,7 +441,7 @@ cat >"$fake" <<FAKE
 #!/usr/bin/env bash
 case "\$*" in
   *--version*) echo "slashit 0.0.0-test" ;;
-  *" --json ping") printf '{\n  "mode": "gui",\n  "pid": 4242,\n  "version": "0.0.0-test",\n  "endpoint": "unix:$sock"\n}\n' ;;
+  *" --json ping") if [ -n "\${FAKE_OLD:-}" ]; then printf '{\n  "mode": "gui",\n  "pid": 4242,\n  "version": "0.0.0-test",\n  "endpoint": "unix:$sock"\n}\n'; else printf '{\n  "mode": "gui",\n  "pid": 4242,\n  "version": "0.0.0-test",\n  "admission_control": true,\n  "endpoint": "unix:$sock"\n}\n'; fi ;;
   *" --json status") printf '{\n  "active_terminals": %s,\n  "running_agents": %s,\n  "queued_tasks": %s,\n  "in_progress_tasks": %s\n}\n' \$FAKE_COUNTS ;;
   *) exit 2 ;;
 esac
@@ -452,6 +457,9 @@ for case_counts in "1 0 0 0:active_terminals=1" "0 1 0 0:running_agents=1" "0 0 
   if [ "$st" -eq 1 ] && [[ "$out" == *"$want"* ]]; then ok "the verb exits 1 and names $want"
   else bad "the verb did not name $want (exit $st)"; printf '%s\n' "$out" >&2; fi
 done
+out=$(FAKE_OLD=1 act "$fake" "0 0 0 0"); st=$?
+if [ "$st" -eq 3 ] && [[ "$out" == *"predates admission quiesce"* ]]; then ok "an instance without admission_control is unverifiable (exit 3), never idle"
+else bad "an old instance was not refused as unverifiable (exit $st)"; printf '%s\n' "$out" >&2; fi
 mkdir -p "$d/state/supervisor/recover"; : >"$d/state/supervisor/recover/slashit-ui"
 out=$(act "$fake" "0 0 0 0"); st=$?
 if [ "$st" -eq 1 ] && [[ "$out" == *"recovery-copy"* ]]; then ok "a recovery copy left by an interrupted restart counts as active work"

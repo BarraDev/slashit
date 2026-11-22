@@ -1597,6 +1597,9 @@ struct ProcessAdmission {
 #[derive(Default)]
 struct ProcessAdmissionState {
     closed: bool,
+    /// Set only by `quiesce`; cleared by any close, so a shutdown fence can
+    /// never be reopened by `resume`.
+    quiesced: bool,
     starting: usize,
 }
 
@@ -1620,9 +1623,41 @@ impl ProcessAdmission {
         !self.state.lock().unwrap_or_else(|p| p.into_inner()).closed
     }
 
+    fn is_quiesced(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).quiesced
+    }
+
     /// Refuse every later `enter` without waiting for the ones already in.
     fn close(&self) {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed = true;
+        state.quiesced = false;
+    }
+
+    /// Close admission and return how many starts are still inside their
+    /// admission sequence. The close and the count share one lock, so every
+    /// lease not counted here was refused. Any owner of an uncounted lease is
+    /// already registered and visible to the caller's next read of the owner
+    /// counts. Errs when admission is already closed.
+    fn quiesce(&self) -> Result<usize, String> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed {
+            return Err("admission is already closed: the instance is shutting down or another quiesce holds it".into());
+        }
+        state.closed = true;
+        state.quiesced = true;
+        Ok(state.starting)
+    }
+
+    /// Reopen admission closed by `quiesce`. Refuses a shutdown fence.
+    fn resume(&self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.quiesced {
+            return Err("admission is not quiesced; nothing to resume".into());
+        }
+        state.closed = false;
+        state.quiesced = false;
+        Ok(())
     }
 
     async fn close_and_wait(&self) {
@@ -1646,6 +1681,60 @@ impl Drop for AdmissionLease {
         if drained {
             self.gate.drained.notify_one();
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_quiesce_tests {
+    use super::*;
+
+    // Deterministic: each step is a synchronous call in a fixed order, so no
+    // test waits on a timer or a scheduler.
+
+    #[test]
+    fn a_start_admitted_after_preflight_is_counted_by_quiesce() {
+        let gate = Arc::new(ProcessAdmission::default());
+        // The preflight saw nothing; a start is admitted before the quiesce.
+        let lease = gate.enter().expect("admitted before the quiesce");
+        assert_eq!(gate.quiesce().expect("first quiesce"), 1, "the in-flight start is counted");
+        assert!(gate.enter().is_err(), "no start is admitted after the quiesce");
+        drop(lease);
+    }
+
+    #[test]
+    fn quiesce_refuses_later_admission_until_resume() {
+        let gate = Arc::new(ProcessAdmission::default());
+        assert_eq!(gate.quiesce().expect("quiesce an idle gate"), 0);
+        assert!(gate.enter().is_err());
+        assert!(gate.quiesce().is_err(), "a second quiesce is refused, so one holder resumes");
+        gate.resume().expect("the holder resumes");
+        assert!(gate.enter().is_ok(), "admission is restored");
+    }
+
+    #[test]
+    fn an_aborted_refresh_restores_the_original_admission_state() {
+        let gate = Arc::new(ProcessAdmission::default());
+        let before = gate.is_open();
+        gate.quiesce().expect("quiesce");
+        gate.resume().expect("abort path resumes");
+        assert_eq!(gate.is_open(), before);
+        assert!(gate.enter().is_ok());
+    }
+
+    #[test]
+    fn resume_never_reopens_a_shutdown_fence() {
+        let gate = Arc::new(ProcessAdmission::default());
+        gate.quiesce().expect("quiesce");
+        gate.close(); // shutdown takes the fence over
+        assert!(gate.resume().is_err(), "resume must not reopen a shutdown");
+        assert!(gate.enter().is_err());
+    }
+
+    #[test]
+    fn resume_without_a_quiesce_is_refused() {
+        let gate = Arc::new(ProcessAdmission::default());
+        assert!(gate.resume().is_err());
+        assert!(gate.enter().is_ok());
     }
 }
 
@@ -2082,12 +2171,16 @@ impl TaskExecutor {
         async move {
             let mut shutdown = shutdown;
             loop {
-                if !executor.is_accepting_work()
-                    || matches!(&shutdown, Some(rx) if *rx.borrow())
+                // A quiesced poller stays alive so that `resume_admission` leaves
+                // Queue promotion working. It starts nothing while closed.
+                if matches!(&shutdown, Some(rx) if *rx.borrow())
+                    || (!executor.is_accepting_work() && !executor.is_quiesced())
                 {
                     return;
                 }
-                executor.check_and_execute().await;
+                if executor.is_accepting_work() {
+                    executor.check_and_execute().await;
+                }
                 match shutdown.as_mut() {
                     Some(rx) => {
                         tokio::select! {
@@ -2124,6 +2217,21 @@ impl TaskExecutor {
     /// Whether this process still accepts owner work.
     pub fn is_accepting_work(&self) -> bool {
         self.process_admission.is_open()
+    }
+
+    /// Close admission for a quiesce and return the starts still in flight.
+    /// The caller reads the owner counts after this returns.
+    pub fn quiesce_admission(&self) -> Result<usize, String> {
+        self.process_admission.quiesce()
+    }
+
+    /// Reopen admission closed by [`Self::quiesce_admission`].
+    pub fn resume_admission(&self) -> Result<(), String> {
+        self.process_admission.resume()
+    }
+
+    pub fn is_quiesced(&self) -> bool {
+        self.process_admission.is_quiesced()
     }
 
     /// Close synchronized process-wide admission and wait for every start

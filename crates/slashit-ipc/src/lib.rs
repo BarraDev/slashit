@@ -40,7 +40,7 @@ pub use config::{IpcConfig, TcpConfig};
 pub use endpoint::{socket_path, Endpoint};
 pub use protocol::{
     AppStatus, FeatureFlagInfo, InstanceInfo, IpcEnvelope, IpcRequest, IpcResponse, ProjectSummary,
-    QueueStatusInfo, TaskSummary, TerminalSummary, MAX_REQUEST_BYTES, PROTOCOL_VERSION,
+    QueueStatusInfo, QuiesceInfo, TaskSummary, TerminalSummary, MAX_REQUEST_BYTES, PROTOCOL_VERSION,
 };
 pub use transport::{Accepted, BindOptions, IpcListener, IpcStream, TransportAuth};
 

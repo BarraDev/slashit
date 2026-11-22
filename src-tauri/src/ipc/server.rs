@@ -1074,20 +1074,48 @@ async fn process(
     }
 
     if request.is_mutating() {
-        if ctx
-            .executor
-            .get()
-            .is_some_and(|executor| !executor.is_accepting_work())
-        {
+        if ctx.executor.get().is_some_and(|executor| {
+            refused_by_closed_admission(&request, executor.is_accepting_work(), executor.is_quiesced())
+        }) {
             audit(verb, peer, "denied-shutting-down");
             return Dispatch::reply(IpcResponse::error(
-                "This SlashIt instance is shutting down and no longer accepts state changes.",
+                "This SlashIt instance is not accepting state changes (shutting down or quiesced).",
             ));
         }
         audit(verb, peer, "dispatched");
     }
 
     handlers::dispatch(request, ctx, peer).await
+}
+
+/// Whether closed admission refuses this mutating request. `Resume` always
+/// passes: it is the only way out of a quiesce. `Quit` passes a quiesce only,
+/// because a restart quiesces and then quits; a shutdown fence refuses it.
+fn refused_by_closed_admission(request: &IpcRequest, accepting: bool, quiesced: bool) -> bool {
+    if accepting || matches!(request, IpcRequest::Resume) {
+        return false;
+    }
+    !(matches!(request, IpcRequest::Quit) && quiesced)
+}
+
+#[cfg(test)]
+mod closed_admission_tests {
+    use super::*;
+
+    #[test]
+    fn a_quiesce_passes_only_resume_and_quit() {
+        assert!(!refused_by_closed_admission(&IpcRequest::Quiesce, true, false));
+        assert!(refused_by_closed_admission(&IpcRequest::Quiesce, false, true), "a second quiesce is refused");
+        assert!(!refused_by_closed_admission(&IpcRequest::Quit, false, true), "the restart's stop passes");
+        assert!(!refused_by_closed_admission(&IpcRequest::Resume, false, true));
+    }
+
+    #[test]
+    fn a_shutdown_fence_refuses_quit_and_every_other_state_change() {
+        assert!(refused_by_closed_admission(&IpcRequest::Quit, false, false));
+        assert!(refused_by_closed_admission(&IpcRequest::Quiesce, false, false));
+        assert!(!refused_by_closed_admission(&IpcRequest::Resume, false, false), "the executor refuses the resume itself");
+    }
 }
 
 /// Record one security-relevant request.

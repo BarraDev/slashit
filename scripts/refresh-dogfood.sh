@@ -29,10 +29,10 @@
 #       other build before it stops or starts anything.
 #       A restart of a running instance also refuses when `supervise-dogfood.sh
 #       activity` reports work the restart would interrupt (terminals, Workers,
-#       Queue or in-progress Tasks, a recovery copy) or cannot verify it. The check
-#       runs before the build and again right before the restart. It does not close
-#       admission, so a Task admitted between the second check and the stop is not
-#       covered; see the PR notes.
+#       Queue or in-progress Tasks, a recovery copy) or cannot verify it, and when
+#       the instance predates admission quiesce. The restart itself closes admission
+#       and proves idle immediately before its quit (see `quiesce` in the supervisor);
+#       a busy answer reopens admission and stops nothing.
 #       Does nothing when the target is already the running commit.
 #
 # The artifact root (the promoted binary, its sidecar and previous/) is the one
@@ -293,17 +293,9 @@ fi
 # The supervisor checks the copy it launches against this commit before it stops
 # or starts anything, so a build promoted after the check above cannot be launched
 # under this target's name.
-# The build above can take minutes, so the active-work check runs again here, as
-# close to the stop as the shell can make it. It cannot close admission (see the
-# header), so it narrows the window rather than closing it.
-if [ "$running" = running ]; then
-  act_rc=0; act_out=$("$sup" activity 2>&1) || act_rc=$?
-  if [ "$act_rc" -ne 0 ]; then
-    echo "$SELF: refusing: $act_out, found immediately before the restart; nothing was stopped or restarted" >&2
-    if [ "$act_rc" -eq 1 ]; then exit 1; fi
-    exit 3
-  fi
-fi
+# The build above can take minutes. No second shell check runs here: the supervisor's
+# restart closes admission and checks for active work immediately before its quit,
+# which a check made here could not do atomically.
 if [ "$running" = stopped ]; then
   SLASHIT_DOGFOOD_EXPECT_COMMIT=$target "$sup" start || { echo "$SELF: the start did not complete; see the supervisor's message above" >&2; exit 1; }
 else

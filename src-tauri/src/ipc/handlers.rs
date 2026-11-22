@@ -9,8 +9,8 @@
 //! type at all: it is the same code in both processes.
 
 use slashit_ipc::{
-    AppStatus, InstanceInfo, IpcRequest, IpcResponse, ProjectSummary, QueueStatusInfo, TaskSummary,
-    TerminalSummary, PROTOCOL_VERSION,
+    AppStatus, InstanceInfo, IpcRequest, IpcResponse, ProjectSummary, QueueStatusInfo,
+    QuiesceInfo, TaskSummary, TerminalSummary, PROTOCOL_VERSION,
 };
 use uuid::Uuid;
 
@@ -96,6 +96,8 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
         IpcRequest::ListTerminals => Dispatch::reply(handle_list_terminals(ctx).await),
         IpcRequest::Show => Dispatch::reply(handle_show(ctx)),
         IpcRequest::Quit => handle_quit(),
+        IpcRequest::Quiesce => Dispatch::reply(handle_quiesce(ctx).await),
+        IpcRequest::Resume => Dispatch::reply(handle_resume(ctx)),
         IpcRequest::Features => Dispatch::reply(handle_features(ctx).await),
         IpcRequest::Ping => Dispatch::reply(handle_ping(ctx, peer)),
         IpcRequest::ExportProject { project_id, path } => {
@@ -149,6 +151,10 @@ async fn handle_apply_import(ctx: &IpcContext, path: String, checksum: String) -
 }
 
 async fn handle_status(ctx: &IpcContext) -> IpcResponse {
+    IpcResponse::success(serde_json::to_value(app_status(ctx).await).unwrap_or_default())
+}
+
+async fn app_status(ctx: &IpcContext) -> AppStatus {
     let active_terminals = ctx.pty.sessions.lock().await.len();
 
     let executor = ctx.executor.get().map(|executor| executor.as_ref());
@@ -159,14 +165,43 @@ async fn handle_status(ctx: &IpcContext) -> IpcResponse {
     let queued_tasks = queue_mgr.get_queued_tasks().await.len();
     let in_progress_tasks = queue_mgr.get_in_progress_count().await;
 
-    let status = AppStatus {
+    AppStatus {
         active_terminals,
         running_agents,
         queued_tasks,
         in_progress_tasks,
-    };
+    }
+}
 
-    IpcResponse::success(serde_json::to_value(status).unwrap_or_default())
+/// Close admission, then read every count a restart would interrupt. The
+/// admission close comes first: a count read before it could be overtaken by
+/// a start admitted after it. A busy answer is not a refusal: the caller
+/// sends `Resume`.
+async fn handle_quiesce(ctx: &IpcContext) -> IpcResponse {
+    let Some(executor) = ctx.executor.get().map(|executor| executor.as_ref()) else {
+        return IpcResponse::error("This instance has no task executor, so admission cannot be quiesced.");
+    };
+    let admitting = match executor.quiesce_admission() {
+        Ok(admitting) => admitting,
+        Err(error) => return IpcResponse::error(error),
+    };
+    let owned_work = executor.running_task_count().await + executor.active_project_run_count();
+    let info = QuiesceInfo {
+        admitting,
+        owned_work,
+        status: app_status(ctx).await,
+    };
+    IpcResponse::success(serde_json::to_value(info).unwrap_or_default())
+}
+
+fn handle_resume(ctx: &IpcContext) -> IpcResponse {
+    let Some(executor) = ctx.executor.get().map(|executor| executor.as_ref()) else {
+        return IpcResponse::error("This instance has no task executor, so there is nothing to resume.");
+    };
+    match executor.resume_admission() {
+        Ok(()) => IpcResponse::success(serde_json::json!({"resumed": true})),
+        Err(error) => IpcResponse::error(error),
+    }
 }
 
 async fn handle_list_projects(ctx: &IpcContext) -> IpcResponse {
@@ -1629,6 +1664,7 @@ fn handle_ping(ctx: &IpcContext, peer: &PeerContext) -> IpcResponse {
         protocol_version: PROTOCOL_VERSION,
         pid: std::process::id(),
         endpoint: peer.endpoint.to_string(),
+        admission_control: true,
     };
     IpcResponse::success(serde_json::to_value(info).unwrap_or_default())
 }

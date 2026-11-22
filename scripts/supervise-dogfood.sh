@@ -434,6 +434,8 @@ ping_fields() {
   PING_PID=$(printf '%s\n' "$out" | ping_json_field pid) || return 1
   PING_VERSION=$(printf '%s\n' "$out" | ping_json_field version) || return 1
   PING_ENDPOINT=$(printf '%s\n' "$out" | ping_json_field endpoint) || return 1
+  # Absent from an instance built before admission quiesce; that reads as unsupported.
+  PING_ADMISSION=$(printf '%s\n' "$out" | ping_json_field admission_control 2>/dev/null) || PING_ADMISSION=
   case $PING_PID in '' | *[!0-9]*) return 1 ;; esac
 }
 
@@ -1674,6 +1676,42 @@ restart_recover() { # message
   fail "the restart did not complete ($1), but the instance was started again on the captured previous executable"
 }
 
+# Admission on the live instance is closed before the quit that stops it, so no
+# Task, Worker, Queue promotion or Project Run starts between the idle proof and
+# the stop. The instance closes admission and reports the work a restart would
+# interrupt in one call. A busy answer or any failure reopens admission (the EXIT
+# trap), so a refused restart leaves the instance as it was.
+QUIESCE_HELD=0
+release_quiesce() {
+  [ "$QUIESCE_HELD" = 1 ] || return 0
+  QUIESCE_HELD=0
+  timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" resume >/dev/null 2>&1 ||
+    echo "$SELF: warning: admission on $ENDPOINT could not be reopened; it stays closed to new work until \`$CLI_BIN --endpoint $ENDPOINT resume\` succeeds or the instance is restarted" >&2
+}
+
+quiesce_for_restart() {
+  [ "$CLI_STATE" = ready ] || refuse "cannot quiesce: $(cannot_verify_text); nothing was stopped"
+  ping_fields || refuse "cannot quiesce: no verified instance answers on $ENDPOINT; nothing was stopped"
+  [ "$PING_ADMISSION" = true ] ||
+    refuse "the running instance (version $PING_VERSION) predates admission quiesce, so a restart cannot prove it idle before quit; when it is idle, stop it and start the target. Nothing was stopped"
+  local out rc=0 field n busy=
+  # Set before the call: a quiesce whose reply was lost may still have closed admission.
+  QUIESCE_HELD=1
+  trap release_quiesce EXIT
+  out=$(timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" --json quiesce 2>/dev/null) || rc=$?
+  [ "$rc" -eq 0 ] || refuse "the instance did not confirm that admission is closed (exit $rc); nothing was stopped"
+  for field in admitting owned_work active_terminals running_agents queued_tasks in_progress_tasks; do
+    n=$(printf '%s\n' "$out" | ping_json_field "$field") ||
+      refuse "quiesce reports no $field; nothing was stopped"
+    case $n in '' | *[!0-9]*) refuse "quiesce reports $field as '$n'; nothing was stopped" ;; esac
+    [ "$n" -eq 0 ] || busy="$busy $field=$n"
+  done
+  [ -z "$(ls -A "$SUP_DIR/recover" 2>/dev/null)" ] || busy="$busy recovery-copy"
+  [ -z "$busy" ] ||
+    refuse "a restart would interrupt the active work:$busy; admission was reopened and nothing was stopped"
+  note "admission closed on $ENDPOINT and no work is active; stopping pid $TARGET_PID"
+}
+
 cmd_restart() {
   select_target || fail "$(nothing_reachable_text) — nothing to restart"
   local pid=$TARGET_PID
@@ -1692,9 +1730,17 @@ cmd_restart() {
   # against a path that may have changed.
   PREVALIDATED=1
   precheck_backup_room
-  capture_running_executable
   note "controlled restart of pid $pid on $ENDPOINT"
+  # --force keeps its documented meaning (escalate to signals) and skips the
+  # quiesce; the refresh script never passes it. The quiesce runs before the
+  # capture: the capture writes the recovery copy that the quiesce's busy check
+  # reads as an interrupted restart's leftover.
+  if [ "$force" -eq 0 ]; then
+    quiesce_for_restart
+  fi
+  capture_running_executable
   cmd_stop
+  QUIESCE_HELD=0 # the instance has exited; there is nothing left to reopen
 
   local stamp backup
   if ! stamp=$(write_backup); then
@@ -1871,6 +1917,8 @@ cmd_activity() {
     exit_with 3 "cannot verify active work — no verified instance answers on $ENDPOINT"
   [ "$PING_MODE" = gui ] && [ "${PING_ENDPOINT#unix:}" = "$SOCKET" ] ||
     exit_with 3 "cannot verify active work — the endpoint answers as mode '$PING_MODE' on '$PING_ENDPOINT', not a gui instance on $ENDPOINT"
+  [ "$PING_ADMISSION" = true ] ||
+    exit_with 3 "cannot verify active work — the instance (version $PING_VERSION) predates admission quiesce, so a restart cannot prove it idle; stop it when idle, then start the target"
   local rec
   rec=$(record_field pid || true)
   [ -z "$rec" ] || [ "$rec" = "$PING_PID" ] ||
