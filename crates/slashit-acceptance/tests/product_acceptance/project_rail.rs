@@ -261,8 +261,23 @@ async fn a_recent_folder_that_is_already_open_is_refused_without_a_second_projec
     context.finish(outcome);
 }
 
+/// The sidebar entry marked as the active view, as its `nav-*` test id, or null.
+/// The active entry is the one with the `border-l-2` accent class, which both the
+/// normal and the stub variant carry.
+async fn active_view(driver: &WebDriver) -> Result<Value> {
+    page(
+        driver,
+        "const active = [...document.querySelectorAll('[data-testid^=\"nav-\"]')] \
+         .find(b => b.className.split(' ').includes('border-l-2')); \
+         return active ? active.dataset.testid : null;",
+        vec![],
+    )
+    .await
+}
+
 /// The chevron of a Workspace group hides and shows its member Projects, and
-/// the Workspace's own control stays separate from it.
+/// the Workspace's own control stays separate from it. Neither the Workspace
+/// control nor the chevron changes the active view.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_workspace_chevron_collapses_and_expands_its_member_projects() {
     let context = TestContext::new("project_rail_group").expect("harness setup");
@@ -289,6 +304,10 @@ async fn a_workspace_chevron_collapses_and_expands_its_member_projects() {
             Ok(page(driver, &members, vec![]).await?.as_u64() == Some(2))
         })
         .await?;
+        let view_before = active_view(driver).await?;
+        if !view_before.is_string() {
+            bail!("no sidebar view is marked active before the chevron is used: {view_before}");
+        }
 
         let toggle = format!("[data-testid=\"rail-workspace-toggle-{workspace}\"]");
         ui::visible(driver, &toggle).await?.click().await.context("could not collapse the Workspace")?;
@@ -296,14 +315,422 @@ async fn a_workspace_chevron_collapses_and_expands_its_member_projects() {
             Ok(page(driver, &members, vec![]).await?.as_u64() == Some(0))
         })
         .await?;
+        let view_collapsed = active_view(driver).await?;
+        if view_collapsed != view_before {
+            bail!("collapsing the Workspace changed the active view from {view_before} to {view_collapsed}");
+        }
 
         ui::visible(driver, &toggle).await?.click().await.context("could not expand the Workspace")?;
         wait_until("the chevron to show the members again", || async {
             Ok(page(driver, &members, vec![]).await?.as_u64() == Some(2))
         })
         .await?;
+        let view_expanded = active_view(driver).await?;
+        if view_expanded != view_before {
+            bail!("expanding the Workspace changed the active view from {view_before} to {view_expanded}");
+        }
 
         context.close_session(session, "rail-group", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    context.finish(outcome);
+}
+
+/// Clicking a Workspace's name in the rail while Settings is open leaves
+/// Settings for that Workspace's home, and its exit returns to Projects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workspace_name_in_the_rail_opens_its_home_from_settings_and_exits() {
+    let context = TestContext::new("project_rail_settings_home").expect("harness setup");
+
+    let outcome = async {
+        let session = context.start_session("rail-settings-home").await?;
+        let driver = session.driver();
+        let workspace = created_id(
+            ui::invoke(driver, "create_workspace", json!({ "name": "Settings Home", "rootPath": Value::Null })).await?,
+            "create_workspace",
+        )?;
+        driver.refresh().await.context("could not reload the application window")?;
+        ui::assert_frontend_is_real(driver).await?;
+
+        ui::visible(driver, "[data-testid=\"nav-settings\"]").await?.click().await.context("could not open Settings")?;
+        ui::visible(driver, &format!("[data-testid=\"rail-workspace-select-{workspace}\"]"))
+            .await?
+            .click()
+            .await
+            .context("could not click the Workspace in the rail")?;
+        wait_until("Workspace Home to open for the clicked Workspace", || async {
+            Ok(page(
+                driver,
+                "const el = document.querySelector('[data-testid=\"workspace-home-name\"]'); \
+                 return !!el && el.textContent.trim() === 'Settings Home';",
+                vec![],
+            )
+            .await?
+                == Value::Bool(true))
+        })
+        .await?;
+
+        ui::visible(driver, "[data-testid=\"workspace-home-exit\"]")
+            .await?
+            .click()
+            .await
+            .context("could not press Back to Projects")?;
+        wait_until("Workspace Home to close after the exit", || async {
+            Ok(page(driver, "return !document.querySelector('[data-testid=\"workspace-home\"]');", vec![]).await?
+                == Value::Bool(true))
+        })
+        .await?;
+
+        context.close_session(session, "rail-settings-home", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    context.finish(outcome);
+}
+
+/// The organizer's focused name field keeps keyboard focus while the rail
+/// reloads and shows the rename. This proves the organizer field's focus only.
+/// It does not check focus on a rail element.
+#[tokio::test(flavor = "multi_thread")]
+async fn organizer_name_keeps_focus_while_the_rail_shows_the_rename() {
+    let context = TestContext::new("project_rail_focus").expect("harness setup");
+
+    let outcome = async {
+        let session = context.start_session("rail-focus").await?;
+        let driver = session.driver();
+        create_project(driver, "Focus Alpha").await?;
+        let beta = create_project(driver, "Focus Beta").await?;
+        driver.refresh().await.context("could not reload the application window")?;
+        ui::assert_frontend_is_real(driver).await?;
+
+        ui::visible(driver, RAIL_ORGANIZE).await?.click().await.context("could not open Organize Projects")?;
+        ui::visible(driver, "[data-testid=\"project-organizer\"]").await?;
+        page(
+            driver,
+            "const row = [...document.querySelectorAll('[data-testid=\"project-organizer-row\"]')] \
+             .find(r => r.querySelector('[data-testid=\"project-organizer-name\"]').value === 'Focus Beta'); \
+             if (!row) return false; \
+             row.querySelector('[data-testid=\"project-organizer-name\"]').dataset.focusProbe = '1'; return true;",
+            vec![],
+        )
+        .await?;
+        let name = ui::visible(driver, "[data-testid=\"project-organizer-row\"] [data-testid=\"project-organizer-name\"][data-focus-probe=\"1\"]").await?;
+        name.clear().await.context("could not clear the name field")?;
+        name.send_keys("Focus Beta Renamed").await.context("could not type the new name")?;
+        if page(driver, "return document.activeElement?.dataset.focusProbe === '1';", vec![]).await? != Value::Bool(true) {
+            bail!("the name field did not hold keyboard focus before the rail update");
+        }
+
+        // Save with a script click, so the pointer and keyboard focus do not move.
+        page(
+            driver,
+            "const row = [...document.querySelectorAll('[data-testid=\"project-organizer-row\"]')] \
+             .find(r => r.querySelector('[data-testid=\"project-organizer-name\"]').dataset.focusProbe === '1'); \
+             row.querySelector('[data-testid=\"project-organizer-save\"]').click(); return true;",
+            vec![],
+        )
+        .await?;
+        let label = format!("[data-testid=\"rail-project-{beta}\"]");
+        wait_until("the rail to show the renamed Project", || async {
+            Ok(page(
+                driver,
+                &format!("const el = document.querySelector('{label}'); return !!el && (el.getAttribute('aria-label') || '').includes('Focus Beta Renamed');"),
+                vec![],
+            )
+            .await?
+                == Value::Bool(true))
+        })
+        .await?;
+        if page(driver, "return document.activeElement?.dataset.focusProbe === '1';", vec![]).await? != Value::Bool(true) {
+            bail!("keyboard focus left the organizer name field when the rail updated");
+        }
+
+        context.close_session(session, "rail-focus", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    context.finish(outcome);
+}
+
+/// A member row whose membership another client already removed cannot detach
+/// again. The refusal reaches the user, and the other member is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_member_row_refuses_a_second_detach_and_leaves_other_members_alone() {
+    let context = TestContext::new("project_rail_stale_detach").expect("harness setup");
+
+    let outcome = async {
+        let session = context.start_session("rail-stale-detach").await?;
+        let driver = session.driver();
+        let workspace = created_id(
+            ui::invoke(driver, "create_workspace", json!({ "name": "Stale Row", "rootPath": Value::Null })).await?,
+            "create_workspace",
+        )?;
+        let alpha = create_project(driver, "Stale Alpha").await?;
+        let beta = create_project(driver, "Stale Beta").await?;
+        for project in [&alpha, &beta] {
+            ui::invoke(driver, "attach_project_to_workspace", json!({ "projectId": project, "workspaceId": workspace })).await?;
+        }
+        driver.refresh().await.context("could not reload the application window")?;
+        ui::assert_frontend_is_real(driver).await?;
+
+        ui::visible(driver, RAIL_ORGANIZE).await?.click().await.context("could not open Organize Projects")?;
+        ui::visible(driver, &format!("[data-testid=\"workspace-{workspace}\"] [data-testid=\"workspace-toggle\"]"))
+            .await?
+            .click()
+            .await
+            .context("could not expand the Workspace")?;
+        let alpha_row = format!("[data-testid=\"workspace-{workspace}\"] [data-testid=\"workspace-member-{alpha}\"]");
+        ui::visible(driver, &alpha_row).await?;
+
+        // Another client detaches Alpha while this page still lists it.
+        ui::invoke(
+            driver,
+            "detach_project_from_workspace",
+            json!({ "projectId": alpha, "expectedWorkspaceId": workspace }),
+        )
+        .await?;
+        ui::visible(driver, &format!("{alpha_row} [data-testid=\"workspace-detach\"]"))
+            .await?
+            .click()
+            .await
+            .context("could not press Detach on the stale row")?;
+        wait_until("the refusal of the stale Detach", || async {
+            Ok(page(
+                driver,
+                "return [...document.querySelectorAll('[data-testid=\"toast\"][data-variant=\"error\"]')] \
+                 .some(t => t.textContent.includes('Project is not attached to a workspace'));",
+                vec![],
+            )
+            .await?
+                == Value::Bool(true))
+        })
+        .await?;
+
+        assert_backend_scope(driver, &alpha, None).await?;
+        assert_backend_scope(driver, &beta, Some(&workspace)).await?;
+
+        context.close_session(session, "rail-stale-detach", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    context.finish(outcome);
+}
+
+const ATTACH_PICKER: &str = "[data-testid=\"workspace-attach\"] button[aria-haspopup=\"listbox\"]";
+const ATTACH_SUBMIT: &str = "[data-testid=\"workspace-attach-submit\"]";
+
+fn workspace_select(workspace: &str) -> String {
+    format!("[data-testid=\"rail-workspace-select-{workspace}\"]")
+}
+
+/// The name Workspace Home shows, or the empty string when it shows none.
+async fn home_name(driver: &WebDriver) -> Result<String> {
+    Ok(page(
+        driver,
+        "const el = document.querySelector('[data-testid=\"workspace-home-name\"]'); \
+         return el ? el.textContent.trim() : null;",
+        vec![],
+    )
+    .await?
+    .as_str()
+    .unwrap_or_default()
+    .to_string())
+}
+
+/// Opens Organize Projects and expands one Workspace in it.
+async fn expand_workspace_in_organizer(driver: &WebDriver, workspace: &str) -> Result<()> {
+    ui::visible(driver, RAIL_ORGANIZE).await?.click().await.context("could not open Organize Projects")?;
+    ui::visible(driver, &format!("[data-testid=\"workspace-{workspace}\"] [data-testid=\"workspace-toggle\"]"))
+        .await?
+        .click()
+        .await
+        .context("could not expand the Workspace")?;
+    ui::visible(driver, &format!("[data-testid=\"workspace-{workspace}\"] {ATTACH_PICKER}")).await?;
+    Ok(())
+}
+
+/// Picks a standalone Project in the Attach picker and presses Attach.
+async fn attach_from_picker(driver: &WebDriver, project_name: &str) -> Result<()> {
+    ui::visible(driver, ATTACH_PICKER).await?.click().await.context("could not open the Attach picker")?;
+    wait_until(&format!("the Attach picker to offer {project_name}"), || async {
+        Ok(page(
+            driver,
+            "const option = [...document.querySelectorAll('[role=\"option\"]')] \
+             .find(o => o.textContent.includes(arguments[0])); \
+             if (!option) return false; option.click(); return true;",
+            vec![json!(project_name)],
+        )
+        .await?
+            == Value::Bool(true))
+    })
+    .await?;
+    ui::visible(driver, ATTACH_SUBMIT).await?.click().await.context("could not press Attach")?;
+    Ok(())
+}
+
+/// Scenario: a Project read that is still pending when the user selects a
+/// different Workspace must not replace the Workspace on screen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delayed_project_read_does_not_replace_the_selected_workspace() {
+    let context = TestContext::new("project_rail_stale_home").expect("harness setup");
+
+    let outcome = async {
+        let session = context.start_session("rail-stale-home").await?;
+        let driver = session.driver();
+        let first = created_id(
+            ui::invoke(driver, "create_workspace", json!({ "name": "Delayed Alpha", "rootPath": Value::Null })).await?,
+            "create_workspace",
+        )?;
+        let second = created_id(
+            ui::invoke(driver, "create_workspace", json!({ "name": "Delayed Beta", "rootPath": Value::Null })).await?,
+            "create_workspace",
+        )?;
+        driver.refresh().await.context("could not reload the application window")?;
+        ui::assert_frontend_is_real(driver).await?;
+
+        // The first Project read the next selection makes is Workspace A's, from its Home load.
+        ui::arm_invoke_fault(driver, "list_projects", ui::InvokeFault::Hold).await?;
+        ui::visible(driver, &workspace_select(&first)).await?.click().await.context("could not select Delayed Alpha")?;
+        wait_until("Workspace A's Project read to be issued", || async {
+            Ok(ui::invoke_fault_state(driver).await?.0)
+        })
+        .await?;
+
+        ui::visible(driver, &workspace_select(&second)).await?.click().await.context("could not select Delayed Beta")?;
+        wait_until("Workspace Home to show Delayed Beta", || async {
+            Ok(home_name(driver).await? == "Delayed Beta")
+        })
+        .await?;
+
+        ui::release_invoke_hold(driver).await?;
+        wait_until("the held Project read to reach the application", || async {
+            Ok(ui::invoke_fault_state(driver).await?.1)
+        })
+        .await?;
+        let shown = home_name(driver).await?;
+        if shown != "Delayed Beta" {
+            bail!("the late Project read replaced the selected Workspace: Workspace Home shows {shown:?}");
+        }
+
+        context.close_session(session, "rail-stale-home", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    context.finish(outcome);
+}
+
+/// Scenario: a membership reload that fails leaves no permanent busy state, and
+/// the next Attach works once the organizer reads the Projects again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_membership_reload_clears_busy_and_the_next_attach_works() {
+    let context = TestContext::new("project_rail_reload_failure").expect("harness setup");
+
+    let outcome = async {
+        let session = context.start_session("rail-reload-failure").await?;
+        let driver = session.driver();
+        let workspace = created_id(
+            ui::invoke(driver, "create_workspace", json!({ "name": "Reload Failure", "rootPath": Value::Null })).await?,
+            "create_workspace",
+        )?;
+        let alpha = create_project(driver, "Reload Alpha").await?;
+        create_project(driver, "Reload Beta").await?;
+        create_project(driver, "Reload Gamma").await?;
+        ui::invoke(driver, "attach_project_to_workspace", json!({ "projectId": alpha, "workspaceId": workspace })).await?;
+        driver.refresh().await.context("could not reload the application window")?;
+        ui::assert_frontend_is_real(driver).await?;
+
+        expand_workspace_in_organizer(driver, &workspace).await?;
+        // The next Project read answers with a payload that is not a Project list.
+        ui::arm_invoke_fault(driver, "list_projects", ui::InvokeFault::BadPayload(json!("not a project list"))).await?;
+        attach_from_picker(driver, "Reload Beta").await?;
+        wait_until("the failed membership reload to be issued", || async {
+            Ok(ui::invoke_fault_state(driver).await?.0)
+        })
+        .await?;
+
+        let busy_control = format!("[data-testid=\"workspace-{workspace}\"] [data-testid=\"workspace-rename-save\"]");
+        wait_until("the organizer to leave its busy state", || async {
+            Ok(page(
+                driver,
+                "const el = document.querySelector(arguments[0]); return !!el && el.disabled === false;",
+                vec![json!(busy_control)],
+            )
+            .await?
+                == Value::Bool(true))
+        })
+        .await?;
+
+        // The failed read empties the Attach picker, so reopen the organizer to read the Projects again.
+        ui::visible(driver, ORGANIZER_CLOSE).await?.click().await.context("could not close the organizer")?;
+        expand_workspace_in_organizer(driver, &workspace).await?;
+        attach_from_picker(driver, "Reload Gamma").await?;
+        ui::visible(driver, &format!("[data-testid=\"workspace-{workspace}\"] [data-testid=\"workspace-member-{alpha}\"]")).await?;
+        wait_until("the second Attach to list Reload Gamma", || async {
+            Ok(page(
+                driver,
+                "return [...document.querySelectorAll('[data-testid^=\"workspace-member-\"]')] \
+                 .some(r => r.textContent.includes('Reload Gamma'));",
+                vec![],
+            )
+            .await?
+                == Value::Bool(true))
+        })
+        .await?;
+
+        context.close_session(session, "rail-reload-failure", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    context.finish(outcome);
+}
+
+/// Scenario: closing the organizer while an Attach is pending does not break the
+/// application when the reply arrives afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_the_organizer_while_an_attach_is_pending_leaves_the_app_responsive() {
+    let context = TestContext::new("project_rail_close_pending").expect("harness setup");
+
+    let outcome = async {
+        let session = context.start_session("rail-close-pending").await?;
+        let driver = session.driver();
+        let workspace = created_id(
+            ui::invoke(driver, "create_workspace", json!({ "name": "Closing Race", "rootPath": Value::Null })).await?,
+            "create_workspace",
+        )?;
+        let alpha = create_project(driver, "Closing Alpha").await?;
+        create_project(driver, "Closing Beta").await?;
+        ui::invoke(driver, "attach_project_to_workspace", json!({ "projectId": alpha, "workspaceId": workspace })).await?;
+        driver.refresh().await.context("could not reload the application window")?;
+        ui::assert_frontend_is_real(driver).await?;
+
+        expand_workspace_in_organizer(driver, &workspace).await?;
+        ui::arm_invoke_fault(driver, "attach_project_to_workspace", ui::InvokeFault::Hold).await?;
+        attach_from_picker(driver, "Closing Beta").await?;
+        wait_until("the Attach to be issued", || async {
+            Ok(ui::invoke_fault_state(driver).await?.0)
+        })
+        .await?;
+
+        ui::visible(driver, ORGANIZER_CLOSE).await?.click().await.context("could not close the organizer")?;
+        wait_until("the organizer to close while the Attach is pending", || async {
+            Ok(page(driver, "return !document.querySelector('[data-testid=\"project-organizer\"]');", vec![]).await?
+                == Value::Bool(true))
+        })
+        .await?;
+
+        ui::release_invoke_hold(driver).await?;
+        wait_until("the held Attach reply to reach the application", || async {
+            Ok(ui::invoke_fault_state(driver).await?.1)
+        })
+        .await?;
+
+        // The application must still respond: the rail is up, and the organizer opens again.
+        ui::visible(driver, RAIL).await?;
+        ui::visible(driver, RAIL_ORGANIZE).await?.click().await.context("could not reopen Organize Projects")?;
+        ui::visible(driver, "[data-testid=\"project-organizer\"]").await?;
+
+        context.close_session(session, "rail-close-pending", &Ok(())).await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;

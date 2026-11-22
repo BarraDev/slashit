@@ -236,6 +236,130 @@ async fn dispatch(
         .ok_or_else(|| anyhow!("invoke({command}) returned an unrecognised envelope: {value}"))
 }
 
+/// What happens to the next matching `window.__TAURI__.core.invoke` call once a
+/// [`InvokeFault`] is armed. The fault is single-shot: the first call of the
+/// named command after arming is handled, and every later call reaches the
+/// backend unchanged.
+#[derive(Debug, Clone)]
+pub enum InvokeFault {
+    /// Let the backend run the command, but hold its reply until
+    /// [`release_invoke_hold`] is called.
+    Hold,
+    /// Reject the call with this message and do not run the command.
+    Reject(String),
+    /// Resolve the call with this value and do not run the command. A value of
+    /// the wrong shape reaches the frontend's deserialisation error path.
+    BadPayload(Value),
+}
+
+/// Installs the invoke wrapper on first use, then arms `fault` for `command`.
+/// The wrapper is page-scoped, so a reload clears it.
+const ARM_FAULT: &str = r#"
+    const [command, mode, payload] = arguments;
+    const core = window.__TAURI__ && window.__TAURI__.core;
+    if (!core) { return "the IPC bridge is missing"; }
+    if (!window.__slashitInvokeWrapped) {
+        const original = core.invoke;
+        core.invoke = function (cmd, args, options) {
+            const fault = window.__slashitInvokeFault;
+            if (!fault || fault.spent || fault.command !== cmd) {
+                return original.apply(this, arguments);
+            }
+            fault.spent = true;
+            fault.issued = true;
+            if (fault.mode === "hold") {
+                const reply = original.apply(this, arguments);
+                return new Promise((resolve, reject) => {
+                    fault.release = () => {
+                        reply.then(
+                            (value) => { resolve(value); fault.delivered = true; },
+                            (error) => { reject(error); fault.delivered = true; }
+                        );
+                    };
+                });
+            }
+            fault.delivered = true;
+            return fault.mode === "reject"
+                ? Promise.reject(fault.payload)
+                : Promise.resolve(fault.payload);
+        };
+        window.__slashitInvokeWrapped = true;
+    }
+    window.__slashitInvokeFault = {
+        command, mode, payload, spent: false, issued: false, delivered: false, release: null,
+    };
+    return "armed";
+"#;
+
+const RELEASE_HOLD: &str = r#"
+    const fault = window.__slashitInvokeFault;
+    if (!fault || typeof fault.release !== "function") { return false; }
+    fault.release();
+    return true;
+"#;
+
+const FAULT_STATE: &str = r#"
+    const fault = window.__slashitInvokeFault;
+    return {
+        issued: !!fault && fault.issued === true,
+        delivered: !!fault && fault.delivered === true,
+    };
+"#;
+
+/// Arms `fault` for the next call of `command` the product issues. Call this
+/// before the action that makes the product issue it. Then wait with
+/// [`invoke_fault_state`] for `issued`, which is the observed call, not a sleep.
+pub async fn arm_invoke_fault(driver: &WebDriver, command: &str, fault: InvokeFault) -> Result<()> {
+    let (mode, payload) = match fault {
+        InvokeFault::Hold => ("hold", Value::Null),
+        InvokeFault::Reject(message) => ("reject", Value::String(message)),
+        InvokeFault::BadPayload(value) => ("bad", value),
+    };
+    let armed = driver
+        .execute(
+            ARM_FAULT,
+            vec![Value::String(command.to_string()), Value::String(mode.to_string()), payload],
+        )
+        .await
+        .with_context(|| format!("could not arm a fault for {command}"))?
+        .json()
+        .clone();
+    if armed != Value::String("armed".to_string()) {
+        bail!("could not arm a fault for {command}: {armed}");
+    }
+    Ok(())
+}
+
+/// Returns `(issued, delivered)` for the armed fault: whether the product has
+/// made the matched call, and whether its reply has reached the product.
+pub async fn invoke_fault_state(driver: &WebDriver) -> Result<(bool, bool)> {
+    let state = driver
+        .execute(FAULT_STATE, vec![])
+        .await
+        .context("could not read the armed fault")?
+        .json()
+        .clone();
+    Ok((
+        state["issued"] == Value::Bool(true),
+        state["delivered"] == Value::Bool(true),
+    ))
+}
+
+/// Delivers the held reply of an armed [`InvokeFault::Hold`] to the product.
+/// Fails if nothing is held, which means the product never issued the call.
+pub async fn release_invoke_hold(driver: &WebDriver) -> Result<()> {
+    let released = driver
+        .execute(RELEASE_HOLD, vec![])
+        .await
+        .context("could not release the held reply")?
+        .json()
+        .clone();
+    if released != Value::Bool(true) {
+        bail!("there is no held reply to release");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod await_enabled_tests {
     use super::*;
