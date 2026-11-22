@@ -47,6 +47,15 @@
 #       listed under "Exit status" below. It says "cannot verify" when the CLI
 #       is missing or unverified, and never claims a state it could not check.
 #
+#   scripts/supervise-dogfood.sh activity
+#       Read-only. Reports whether the verified instance on the declared endpoint
+#       holds work that a restart would interrupt: active terminals, running
+#       Workers, Tasks in Queue or in progress (the status counts), or a recovery
+#       copy an interrupted restart left under $SUP_DIR/recover. Exit 0 idle, 1
+#       active work (named), 3 cannot verify. It is a check, not a lock: admission
+#       stays open, so a Task can start after it answers. refresh-dogfood.sh
+#       therefore runs it again immediately before the restart.
+#
 #   scripts/supervise-dogfood.sh verify
 #       Endpoint verification only: ping the control socket, compare the
 #       answering PID and endpoint with the declaration, and verify the live
@@ -181,7 +190,7 @@ if [ "$(uname -s 2>/dev/null)" != Linux ]; then
 fi
 
 usage() {
-  echo "usage: $SELF {start|run|stop|restart|status|verify|env} [--force]" >&2
+  echo "usage: $SELF {start|run|stop|restart|status|activity|verify|env} [--force]" >&2
   echo "       $SELF adopt COMMIT SHA256" >&2
   echo "       $SELF migrate-legacy COMMIT SHA256" >&2
   exit 2
@@ -197,10 +206,10 @@ fi
 [ "$#" -le 2 ] || usage
 case ${2:-} in "" | --force) ;; *) usage ;; esac
 case $verb in
-  start | run | stop | restart | status | verify | env | adopt | migrate-legacy) ;;
+  start | run | stop | restart | status | activity | verify | env | adopt | migrate-legacy) ;;
   *) usage ;;
 esac
-case $verb in env | status | run | adopt | migrate-legacy) [ "${2:-}" = "" ] || usage ;; esac
+case $verb in env | status | activity | run | adopt | migrate-legacy) [ "${2:-}" = "" ] || usage ;; esac
 case $verb in stop | restart) : ;; *) [ "${2:-}" != "--force" ] || usage ;; esac
 force=0
 [ "${2:-}" = "--force" ] && force=1
@@ -1853,6 +1862,37 @@ cmd_verify() {
   esac
 }
 
+cmd_activity() {
+  case $CLI_STATE in
+    ready) ;;
+    *) exit_with 3 "cannot verify active work: $(cannot_verify_text)" ;;
+  esac
+  ping_fields ||
+    exit_with 3 "cannot verify active work — no verified instance answers on $ENDPOINT"
+  [ "$PING_MODE" = gui ] && [ "${PING_ENDPOINT#unix:}" = "$SOCKET" ] ||
+    exit_with 3 "cannot verify active work — the endpoint answers as mode '$PING_MODE' on '$PING_ENDPOINT', not a gui instance on $ENDPOINT"
+  local rec
+  rec=$(record_field pid || true)
+  [ -z "$rec" ] || [ "$rec" = "$PING_PID" ] ||
+    exit_with 3 "cannot verify active work — the endpoint is served by pid $PING_PID, but the launch record names pid $rec"
+  local out field n busy=
+  out=$(timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" --json status 2>/dev/null) ||
+    exit_with 3 "cannot verify active work — status did not answer within ${CLI_TIMEOUT}s"
+  for field in active_terminals running_agents queued_tasks in_progress_tasks; do
+    n=$(printf '%s\n' "$out" | ping_json_field "$field") ||
+      exit_with 3 "cannot verify active work — status reports no $field"
+    case $n in '' | *[!0-9]*) exit_with 3 "cannot verify active work — $field is '$n'" ;; esac
+    [ "$n" -eq 0 ] || busy="$busy $field=$n"
+  done
+  [ -z "$(ls -A "$SUP_DIR/recover" 2>/dev/null)" ] || busy="$busy recovery-copy"
+  if [ -n "$busy" ]; then
+    echo "active work:$busy"
+    exit 1
+  fi
+  echo "active work: none"
+  exit 0
+}
+
 env_gates
 resolve_cli
 cli_state
@@ -1868,6 +1908,7 @@ case $verb in
   stop) cmd_stop ;;
   restart) cmd_restart ;;
   status) cmd_status ;;
+  activity) cmd_activity ;;
   verify) cmd_verify ;;
   adopt) cmd_adopt ;;
   migrate-legacy) cmd_migrate_legacy ;;
