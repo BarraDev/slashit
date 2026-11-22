@@ -41,6 +41,45 @@ const WORKSPACE_CONTEXT_FILES: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
 /// A larger file is skipped rather than truncated, so the Worker never gets a cut-off instruction.
 const WORKSPACE_CONTEXT_MAX_BYTES: u64 = 32 * 1024;
 
+/// Opens an instruction file for reading and refuses anything that is not a
+/// regular file, judged on the object actually opened, not on the path. The
+/// caller's metadata check happens before the open, so a swap in between must
+/// not be followed (`O_NOFOLLOW`, or on Windows `FILE_FLAG_OPEN_REPARSE_POINT`
+/// which opens the link itself) nor block (`O_NONBLOCK`, so a FIFO returns at
+/// once and is refused here before any read).
+fn open_instruction_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    #[cfg(windows)]
+    let reparse_point = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let reparse_point = false;
+    if !meta.is_file() || reparse_point {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// The Workspace root's shared instructions as one copied text, and the reason
 /// each present file was left out. The reasons name files and conditions only,
 /// never content, so they are safe for the Task log.
@@ -78,17 +117,11 @@ fn workspace_context(root: &std::path::Path) -> WorkspaceContext {
                 continue;
             }
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
         let mut bytes = Vec::new();
-        let read = options
-            .open(&path)
-            .and_then(|file| file.take(WORKSPACE_CONTEXT_MAX_BYTES + 1).read_to_end(&mut bytes));
+        let read = open_instruction_file(&path).and_then(|file| {
+            file.take(WORKSPACE_CONTEXT_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+        });
         if let Err(e) = read {
             skipped.push(format!("{name} could not be read: {e}"));
             continue;
@@ -9705,6 +9738,76 @@ mod tests {
         let context = workspace_context(root.path());
         assert_eq!(context.text, None);
         assert_eq!(context.skipped.len(), 1, "{:?}", context.skipped);
+    }
+
+    /// The opening helper accepts a regular file, and refuses a symbolic link
+    /// and a directory on the object it opened.
+    #[cfg(unix)]
+    #[test]
+    fn open_instruction_file_accepts_a_regular_file_and_refuses_a_link_or_directory() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let file = dir.path().join("CLAUDE.md");
+        std::fs::write(&file, "Shared rule.\n").unwrap();
+        assert!(open_instruction_file(&file).is_ok());
+
+        let link = dir.path().join("LINK.md");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(
+            open_instruction_file(&link).is_err(),
+            "a symlink is refused"
+        );
+
+        assert!(
+            open_instruction_file(dir.path()).is_err(),
+            "a directory is refused"
+        );
+    }
+
+    /// A FIFO at the instruction path is refused without blocking: the open is
+    /// nonblocking, and the opened object is checked before any read. The open
+    /// runs on a thread with a deadline so a regression fails rather than hangs.
+    #[cfg(unix)]
+    #[test]
+    fn open_instruction_file_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let fifo = dir.path().join("CLAUDE.md");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_instruction_file(&path).map(|_| ()));
+        });
+        let opened = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the open of a FIFO returned without blocking");
+        assert_eq!(opened.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The Windows counterparts: a regular file loads, a directory is refused,
+    /// and a symbolic link at the path is refused rather than followed. Creating
+    /// a symbolic link can need a privilege the account lacks; then the test
+    /// returns without asserting the link case.
+    #[cfg(windows)]
+    #[test]
+    fn open_instruction_file_on_windows_accepts_a_file_and_refuses_a_link_or_directory() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let file = dir.path().join("CLAUDE.md");
+        std::fs::write(&file, "Shared rule.\n").unwrap();
+        assert!(open_instruction_file(&file).is_ok());
+        assert!(
+            open_instruction_file(dir.path()).is_err(),
+            "a directory is refused"
+        );
+
+        let link = dir.path().join("LINK.md");
+        if std::os::windows::fs::symlink_file(&file, &link).is_ok() {
+            assert!(
+                open_instruction_file(&link).is_err(),
+                "a symbolic link is refused"
+            );
+        }
     }
 
     /// A root without instruction files yields no text and no reason: the
@@ -22241,10 +22344,12 @@ VERDICT: APPROVED"
                 !launch.contains(&root.path().display().to_string()),
                 "no argument names the Workspace root: {launch}"
             );
-            assert!(launch.contains("--append-system-prompt"), "{launch}");
+            // The copied text goes to the prompt file, not argv. The runner's
+            // tests check the file itself; here only its absence from argv.
+            assert!(launch.contains("--append-system-prompt-file"), "{launch}");
             assert!(
-                launch.contains("### CLAUDE.md\n\nShared workspace rule for claude."),
-                "the root's CLAUDE.md is copied as text into the appended prompt: {launch}"
+                !launch.contains("Shared workspace rule for claude."),
+                "the root's copied instructions are not in argv: {launch}"
             );
         }
 

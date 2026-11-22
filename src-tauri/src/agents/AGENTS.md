@@ -105,8 +105,14 @@ The prompt never goes in argv. `claude_args` passes a bare `-p`, and
 started at spawn, then closes it; the CLI reads stdin to EOF before it starts.
 An argument is capped at 128 KiB on Linux and is readable by any local
 process, and prompts carry review text and diffs of any size. This holds for
-every run, `ReadOnly` and `Full` alike. `--append-system-prompt` stays in
-argv: SlashIt only passes a fixed rules text there.
+every run, `ReadOnly` and `Full` alike. The appended system prompt is not in
+argv either, because it can carry a Workspace root's copied instructions. It
+goes to an owner-only `--append-system-prompt-file` in the runtime directory
+(`AppendPromptFile`), or in `~/.local/share/slashit/run` when `XDG_RUNTIME_DIR`
+is unset, never under the temporary directory. It is deleted when the runner is
+dropped. Claude Code 2.1.330
+accepts the flag; the oldest CLI that does was not determined, and an older
+one fails the run with its own unknown-option error.
 
 - The writer starts at spawn and runs alongside the stdout and stderr
   drains, so a large prompt cannot deadlock against a full output pipe. The

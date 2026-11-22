@@ -11618,10 +11618,11 @@ mod tests {
             Some(PR_HELPER_SYSTEM_RULES)
         );
 
-        let args: Vec<String> = claude_args(&config, None)
-            .into_iter()
-            .map(|a| a.into_string().unwrap())
-            .collect();
+        let args: Vec<String> =
+            claude_args(&config, None, Some(std::path::Path::new("prompt.txt")))
+                .into_iter()
+                .map(|a| a.into_string().unwrap())
+                .collect();
         let at = args
             .iter()
             .position(|a| a == "--tools")
@@ -11702,8 +11703,13 @@ mod tests {
             other => panic!("the apply helper must be able to edit, got {other:?}"),
         }
         assert!(config.isolate_customizations, "the apply run must isolate customizations");
-        // An isolated run is always launched with its settings file.
-        let args = claude_args(&config, Some(std::path::Path::new("settings.json")));
+        // An isolated run is launched with its settings file, and its appended
+        // prompt with that prompt's private file.
+        let args = claude_args(
+            &config,
+            Some(std::path::Path::new("settings.json")),
+            Some(std::path::Path::new("prompt.txt")),
+        );
         assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
         let mode = args.iter().position(|a| a == "--permission-mode").map(|i| args[i + 1].clone());
         assert_eq!(mode.as_deref(), Some(std::ffi::OsStr::new("auto")), "{args:?}");

@@ -296,6 +296,7 @@ fn record_claude_run(log: &Path, prompts: &Path) -> String {
     let dir = prompts.parent().expect("the prompt log lives in a directory");
     format!(
         "for a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\n\
+         prev=; for a in \"$@\"; do if [ \"$prev\" = --append-system-prompt-file ]; then printf '%s\\n' '---APPEND-PROMPT---' >> {log:?}; cat \"$a\" >> {log:?}; printf '\\n%s\\n' '---END-APPEND---' >> {log:?}; fi; prev=\"$a\"; done\n\
          printf '%s\\n' '---END-ARGS---' >> {log:?}\n\
          run_prompt=$(mktemp {template:?})\n\
          cat > \"$run_prompt\"\n\
@@ -347,9 +348,20 @@ fn assert_read_only_invocation(claude_log: &str, what: &str) {
         !args.contains(&"--dangerously-skip-permissions"),
         "{what} must not bypass permissions, got:\n{claude_log}"
     );
+    // The rule travels by file: its text must not be in argv, and the file the
+    // CLI received must carry it (the mock copies that file into the log).
     assert!(
-        value_of("--append-system-prompt").is_some_and(|p| p.contains("untrusted_review_text_")),
-        "{what} runs with the untrusted-data rule, got:\n{claude_log}"
+        !args.contains(&"--append-system-prompt"),
+        "{what}: the rule must not be in argv, got:\n{claude_log}"
+    );
+    let appended = claude_log
+        .split("---APPEND-PROMPT---")
+        .nth(1)
+        .and_then(|rest| rest.split("---END-APPEND---").next())
+        .unwrap_or_default();
+    assert!(
+        appended.contains("untrusted_review_text_"),
+        "{what} runs with the untrusted-data rule in its prompt file, got:\n{claude_log}"
     );
 }
 
