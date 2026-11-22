@@ -221,6 +221,8 @@ report() {
   echo "running:          $running${running_commit:+ at $(short "$running_commit")}"
   [ "$frontend_stale" = yes ] && echo "frontend:         stale (the verified instance predates the promoted build; a restart loads it)"
   [ -z "$activity_report" ] || echo "activity:         $activity_report"
+  [ -z "$(ls -A "$state_base/supervisor/recover" 2>/dev/null)" ] ||
+    echo "recovery copy:    kept in $state_base/supervisor/recover; restarts refuse until it is archived (docs/development-workflow.md, section 19, Recovery copies)"
   [ "$st" -eq 0 ] || [ "$frontend_stale" = yes ] || echo "supervisor status: exit $st; its output is not evidence of the running commit"
   echo "forward only:     $forward (target descends from the running commit)"
   echo "state writer:     $(short "$writer_commit") forward=$state_forward (target descends from the last build that wrote the state)"

@@ -1350,6 +1350,47 @@ Three build modes exist. They do not share a binary path:
   and `verify`. Check the persisted Task and Project records, and confirm the
   webview renders by looking at the window. Enabling autostart is a separate
   owner decision.
+- **Quiesce ownership.** A restart closes admission with an operation id it
+  generates (`sup-<pid>-<uuid>`) and reopens admission only for that id. A
+  refused quiesce is reported with its reason (`shutdown` or `held`); the
+  restart stops nothing and does not reopen the fence, because it never took
+  it. A lost reply is treated as possibly taken, and only that operation is
+  reopened. If a restart is killed after its quiesce was acknowledged, the
+  instance refuses new work until it is stopped or resumed. No deadline is
+  applied: the state is fail-closed and a cooperative stop still works.
+  Recovery: `scripts/supervise-dogfood.sh stop`, then `start`, which stops
+  under the quiesce; or, with the operation id that the killed restart printed,
+  `slashit --endpoint unix:<socket> resume --operation <id>`. A later restart
+  reports `held by another quiesce operation` until one of these is done.
+- **Recovery copies.** An interrupted or divergent restart keeps the executable
+  it captured under `~/.local/state/slashit-dogfood/supervisor/recover/`
+  (`slashit-ui` and `slashit-ui.frontend`). Discover it with
+  `scripts/refresh-dogfood.sh --check`, `scripts/supervise-dogfood.sh activity`
+  or `ls -la ~/.local/state/slashit-dogfood/supervisor/recover`. While it
+  exists, every restart refuses, forced or not, before it quiesces or stops
+  anything, and nothing overwrites or deletes it.
+  - *Identity:* `sha256sum recover/slashit-ui` and `grep '^commit=' recover/slashit-ui.frontend`.
+    Compare them with `supervisor/instance` (its `sha256` and `commit` fields)
+    and `supervisor/state-writer`.
+  - *Provenance:* the frontend sidecar must say `mode=embedded` and `dirty=no`,
+    and its commit must be the one the state writer records or a descendant of
+    the one it records.
+  - *Backup:* a divergent restart names its backup under
+    `supervisor/backup/<stamp>/`. Compare `manifest.sha256` with the copy
+    listed in the refusal before you decide anything.
+  - *Still required when:* the instance is stopped and no start has succeeded
+    since the copy was made; or the running build is not verified; or the
+    state differs from the backup and the difference is not yet explained.
+  - *No longer required when:* `scripts/supervise-dogfood.sh verify` and
+    `status` show a verified instance running a build that descends from the
+    copy's commit, and any state difference has been reviewed and accepted.
+  - *Archive, never delete:* confirm no lifecycle operation is running with
+    `flock -n ~/.local/state/slashit-dogfood/supervisor/lifecycle.lock true`,
+    then move the directory aside:
+    `mkdir -p ~/.local/state/slashit-dogfood/supervisor/recover-archive && mv ~/.local/state/slashit-dogfood/supervisor/recover ~/.local/state/slashit-dogfood/supervisor/recover-archive/$(date -u +%Y%m%dT%H%M%SZ)`.
+  - *Restarting again is allowed when:* `supervisor/recover` is absent or empty,
+    `activity` exits 0, and no other quiesce operation holds admission.
+  - Do not remove the recovery directory or any backup directory with `rm`.
 
 ### Optional systemd user unit
 

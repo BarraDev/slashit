@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=215
+EXPECTED_TOTAL=221
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -194,9 +194,12 @@ printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$(sha256sum "$bin_dir/sl
 cat >"$stub_dir/slashit" <<'STUB'
 #!/usr/bin/env bash
 stub_dir=$SLASHIT_TEST_STUB_DIR
+# The verb is the first known one; `quiesce --operation ID` puts the id last.
 last=
 for a in "$@"; do
-  case $a in --endpoint | --json) ;; *) last=$a ;; esac
+  case $a in
+    quiesce | resume | ping | quit | status | --version) [ -n "$last" ] || last=$a ;;
+  esac
 done
 echo "$last" >>"$stub_dir/calls"
 case $last in
@@ -234,14 +237,32 @@ case $last in
     exit 1
     ;;
   quiesce)
+    # The operation is the value after --operation; it is recorded for the cases that check it.
+    op=$(printf '%s\n' "$@" | sed -n '/^--operation$/{n;p}')
+    printf 'quiesce %s\n' "$op" >>"$stub_dir/ops"
+    # SLASHIT_TEST_QUIESCE_LOST: the reply is lost (no answer at all).
+    [ -z "${SLASHIT_TEST_QUIESCE_LOST:-}" ] || exit 1
+    # SLASHIT_TEST_QUIESCE_REFUSAL=held|shutdown: a refusal, which is a reply and not an error.
+    if [ -n "${SLASHIT_TEST_QUIESCE_REFUSAL:-}" ]; then
+      printf '{\n  "acquired": false,\n  "operation": "%s",\n  "refusal": "%s"\n}\n' "$op" "$SLASHIT_TEST_QUIESCE_REFUSAL"
+      exit 0
+    fi
     # SLASHIT_TEST_QUIESCE_BUSY reports one running agent, which refuses the restart.
     busy=0
     [ -z "${SLASHIT_TEST_QUIESCE_BUSY:-}" ] || busy=1
-    printf '{\n  "admitting": 0,\n  "owned_work": 0,\n  "active_terminals": 0,\n  "running_agents": %s,\n  "queued_tasks": 0,\n  "in_progress_tasks": 0\n}\n' "$busy"
+    printf '{\n  "acquired": true,\n  "operation": "%s",\n  "admitting": 0,\n  "owned_work": 0,\n  "active_terminals": 0,\n  "running_agents": %s,\n  "queued_tasks": 0,\n  "in_progress_tasks": 0\n}\n' "$op" "$busy"
     exit 0
     ;;
   resume)
-    echo '{"resumed": true}'
+    op=$(printf '%s\n' "$@" | sed -n '/^--operation$/{n;p}')
+    printf 'resume %s\n' "$op" >>"$stub_dir/ops"
+    # SLASHIT_TEST_RESUME_FAIL: the reply is lost, so the release cannot confirm.
+    [ -z "${SLASHIT_TEST_RESUME_FAIL:-}" ] || exit 1
+    if [ -n "${SLASHIT_TEST_RESUME_REFUSAL:-}" ]; then
+      printf '{\n  "resumed": false,\n  "operation": "%s",\n  "refusal": "%s"\n}\n' "$op" "$SLASHIT_TEST_RESUME_REFUSAL"
+      exit 0
+    fi
+    printf '{\n  "resumed": true,\n  "operation": "%s"\n}\n' "$op"
     exit 0
     ;;
   quit)
@@ -673,6 +694,59 @@ else bad "an instance without admission quiesce was not refused safely (exit $st
 cleanup_instances
 
 rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
+echo "== quiesce ownership: a refused or lost quiesce never reopens a fence this restart did not take"
+# A refusal is a reply that names its reason: nothing is stopped and nothing is resumed.
+for refusal in shutdown held; do
+  sv start >/dev/null 2>&1 || bad "refusal fixture ($refusal): start failed"
+  pre=$(stub_pid); : >"$stub_dir/calls"; : >"$stub_dir/ops"
+  out=$(export SLASHIT_TEST_QUIESCE_REFUSAL=$refusal; sv restart 2>&1); status=$?
+  seq=$(grep -xE 'quiesce|quit|resume' "$stub_dir/calls" | uniq | tr '\n' ' ')
+  if [ "$refusal" = shutdown ]; then want="shutdown is already in progress"; else want="held by another quiesce operation"; fi
+  if [ "$status" -ne 0 ] && [[ "$out" == *"$want"* ]] && [[ "$out" == *"will not reopen it"* ]] &&
+    [ "$seq" = "quiesce " ] && ! grep -q '^resume' "$stub_dir/ops" && [ "$(stub_pid)" = "$pre" ]; then
+    ok "a $refusal refusal is reported as that refusal, and the restart neither stops nor resumes"
+  else bad "$refusal refusal: sequence '$seq' (exit $status)"; printf '%s\n' "$out" >&2; fi
+  cleanup_instances
+done
+
+# A lost reply may have taken the fence: it is reopened for this operation only, and nothing is stopped.
+sv start >/dev/null 2>&1 || bad "lost-reply fixture: start failed"
+pre=$(stub_pid); : >"$stub_dir/calls"; : >"$stub_dir/ops"
+out=$(export SLASHIT_TEST_QUIESCE_LOST=1 SLASHIT_TEST_RESUME_REFUSAL=not-held; sv restart 2>&1); status=$?
+seq=$(grep -xE 'quiesce|quit|resume' "$stub_dir/calls" | uniq | tr '\n' ' ')
+q_op=$(awk '$1 == "quiesce" { print $2; exit }' "$stub_dir/ops")
+r_op=$(awk '$1 == "resume" { print $2; exit }' "$stub_dir/ops")
+if [ "$status" -ne 0 ] && [[ "$out" == *"whether admission closed is unknown"* ]] && [ "$seq" = "quiesce resume " ] &&
+  [[ "$q_op" == sup-* ]] && [ "$q_op" = "$r_op" ] && [ "$(stub_pid)" = "$pre" ] && [[ "$out" != *"could not be confirmed"* ]]; then
+  ok "a lost quiesce reply reopens only its own operation ($q_op) and stops nothing"
+else bad "lost reply: sequence '$seq', quiesce op '$q_op', resume op '$r_op' (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+# A release that cannot reach the instance says so, and names the operation to resume.
+sv start >/dev/null 2>&1 || bad "resume-failure fixture: start failed"
+: >"$stub_dir/ops"
+out=$(export SLASHIT_TEST_QUIESCE_BUSY=1 SLASHIT_TEST_RESUME_FAIL=1; sv restart 2>&1); status=$?
+op=$(awk '$1 == "quiesce" { print $2; exit }' "$stub_dir/ops")
+if [ "$status" -ne 0 ] && [[ "$out" == *"could not be confirmed reopened for operation $op"* ]] && [[ "$out" == *"resume --operation $op"* ]]; then
+  ok "a failed release names the operation and the command that reopens it"
+else bad "failed release did not name its operation (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+# A retained recovery copy blocks every restart, forced or not, before anything is acquired or stopped.
+for flag in "" --force; do
+  sv start >/dev/null 2>&1 || bad "recovery fixture ($flag): start failed"
+  pre=$(stub_pid); : >"$stub_dir/calls"
+  mkdir -p "$state/supervisor/recover" && : >"$state/supervisor/recover/slashit-ui"
+  out=$(sv restart $flag 2>&1); status=$?
+  if [ "$status" -ne 0 ] && [[ "$out" == *"recovery copy from an earlier interrupted or divergent restart"* ]] &&
+    [[ "$out" == *"$state/supervisor/recover"* ]] && ! grep -qxE 'quiesce|quit' "$stub_dir/calls" &&
+    [ -f "$state/supervisor/recover/slashit-ui" ] && [ "$(stub_pid)" = "$pre" ]; then
+    ok "a retained recovery copy refuses a restart ${flag:-(non-forced)} before any quiesce or quit, and is kept"
+  else bad "retained recovery copy did not refuse ${flag:-non-forced} restart (exit $status)"; printf '%s\n' "$out" >&2; fi
+  rm -rf "$state/supervisor/recover"
+  cleanup_instances
+done
+
 echo "== WebKit cache regeneration and UI preferences do not fail a restart; Task data still does"
 webcache="$state/data/com.barradev.slashit-app/WebKitCache/Version 17/entry"
 webprefs="$state/data/com.barradev.slashit-app/localstorage/http_localhost_1420.localstorage"

@@ -53,8 +53,9 @@
 #       Workers, Tasks in Queue or in progress (the status counts), or a recovery
 #       copy an interrupted restart left under $SUP_DIR/recover. Exit 0 idle, 1
 #       active work (named), 3 cannot verify. It is a check, not a lock: admission
-#       stays open, so a Task can start after it answers. refresh-dogfood.sh
-#       therefore runs it again immediately before the restart.
+#       stays open, so a Task can start after it answers. The restart does not rely
+#       on it: it closes admission with `quiesce` and reads the counts under that
+#       fence, immediately before its quit.
 #
 #   scripts/supervise-dogfood.sh verify
 #       Endpoint verification only: ping the control socket, compare the
@@ -1681,12 +1682,40 @@ restart_recover() { # message
 # the stop. The instance closes admission and reports the work a restart would
 # interrupt in one call. A busy answer or any failure reopens admission (the EXIT
 # trap), so a refused restart leaves the instance as it was.
+#
+# Ownership: the restart names its quiesce with a fresh operation id, and only that
+# id can reopen admission. The fence is held, and so reopened on exit, only after
+# the instance has acknowledged this operation. A refused quiesce (another holder,
+# or a shutdown) is never followed by a resume, so this restart cannot reopen a
+# fence it did not take. A lost reply is treated as possibly taken, and is
+# reopened for this operation only.
 QUIESCE_HELD=0
+QUIESCE_OP=
 release_quiesce() {
   [ "$QUIESCE_HELD" = 1 ] || return 0
   QUIESCE_HELD=0
-  timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" resume >/dev/null 2>&1 ||
-    echo "$SELF: warning: admission on $ENDPOINT could not be reopened; it stays closed to new work until \`$CLI_BIN --endpoint $ENDPOINT resume\` succeeds or the instance is restarted" >&2
+  local out rc=0 why
+  out=$(timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" --json resume --operation "$QUIESCE_OP" 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "$SELF: warning: admission on $ENDPOINT could not be confirmed reopened for operation $QUIESCE_OP (exit $rc); if it stays closed, run \`$CLI_BIN --endpoint $ENDPOINT resume --operation $QUIESCE_OP\`, or stop and start the instance" >&2
+    return 0
+  fi
+  [ "$(printf '%s\n' "$out" | ping_json_field resumed)" = true ] && return 0
+  why=$(printf '%s\n' "$out" | ping_json_field refusal)
+  # not-held: this operation never closed admission, so there is nothing to reopen.
+  [ "$why" = shutdown ] &&
+    echo "$SELF: shutdown is in progress on $ENDPOINT; its shutdown keeps admission closed, and this restart does not reopen it" >&2
+  return 0
+}
+
+# A recovery copy left by an interrupted or divergent restart is evidence. It is
+# never overwritten or deleted by a restart, and it blocks every later restart until
+# an operator archives it (docs/development-workflow.md, section 19, "Recovery copies").
+refuse_if_recovery_copy() {
+  local kept
+  kept=$(ls -A "$SUP_DIR/recover" 2>/dev/null | tr '\n' ' ') || kept=
+  [ -z "$kept" ] && return 0
+  refuse "a recovery copy from an earlier interrupted or divergent restart is kept in $SUP_DIR/recover (${kept% }). It is not overwritten or deleted, and it blocks restarts until an operator archives it: see \"Recovery copies\" in docs/development-workflow.md, section 19. Nothing was stopped"
 }
 
 quiesce_for_restart() {
@@ -1694,22 +1723,38 @@ quiesce_for_restart() {
   ping_fields || refuse "cannot quiesce: no verified instance answers on $ENDPOINT; nothing was stopped"
   [ "$PING_ADMISSION" = true ] ||
     refuse "the running instance (version $PING_VERSION) predates admission quiesce, so a restart cannot prove it idle before quit; when it is idle, stop it and start the target. Nothing was stopped"
-  local out rc=0 field n busy=
-  # Set before the call: a quiesce whose reply was lost may still have closed admission.
+  local out rc=0 field n acquired refusal busy=
+  QUIESCE_OP="sup-$$-$(cat /proc/sys/kernel/random/uuid)"
+  out=$(timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" --json quiesce --operation "$QUIESCE_OP" 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Lost or failed reply: the instance may have closed admission for this operation.
+    QUIESCE_HELD=1
+    trap release_quiesce EXIT
+    refuse "the quiesce reply was lost or failed (exit $rc), so whether admission closed is unknown; admission is reopened for operation $QUIESCE_OP, and nothing was stopped"
+  fi
+  acquired=$(printf '%s\n' "$out" | ping_json_field acquired)
+  if [ "$acquired" != true ]; then
+    refusal=$(printf '%s\n' "$out" | ping_json_field refusal)
+    case $refusal in
+      shutdown) refuse "shutdown is already in progress on $ENDPOINT, so its shutdown holds admission closed. This restart did not acquire admission and will not reopen it. Nothing was stopped" ;;
+      held) refuse "admission on $ENDPOINT is held by another quiesce operation, not by this restart. This restart did not acquire admission and will not reopen it. Nothing was stopped" ;;
+      *)
+        QUIESCE_HELD=1
+        trap release_quiesce EXIT
+        refuse "the quiesce reply is not a known outcome ('$refusal'), so whether admission closed is unknown; admission is reopened for operation $QUIESCE_OP, and nothing was stopped" ;;
+    esac
+  fi
   QUIESCE_HELD=1
   trap release_quiesce EXIT
-  out=$(timeout -k 2 "$CLI_TIMEOUT" "$CLI_BIN" --endpoint "$ENDPOINT" --json quiesce 2>/dev/null) || rc=$?
-  [ "$rc" -eq 0 ] || refuse "the instance did not confirm that admission is closed (exit $rc); nothing was stopped"
   for field in admitting owned_work active_terminals running_agents queued_tasks in_progress_tasks; do
     n=$(printf '%s\n' "$out" | ping_json_field "$field") ||
-      refuse "quiesce reports no $field; nothing was stopped"
-    case $n in '' | *[!0-9]*) refuse "quiesce reports $field as '$n'; nothing was stopped" ;; esac
+      refuse "quiesce reports no $field; admission is reopened for operation $QUIESCE_OP, and nothing was stopped"
+    case $n in '' | *[!0-9]*) refuse "quiesce reports $field as '$n'; admission is reopened for operation $QUIESCE_OP, and nothing was stopped" ;; esac
     [ "$n" -eq 0 ] || busy="$busy $field=$n"
   done
-  [ -z "$(ls -A "$SUP_DIR/recover" 2>/dev/null)" ] || busy="$busy recovery-copy"
   [ -z "$busy" ] ||
-    refuse "a restart would interrupt the active work:$busy; admission was reopened and nothing was stopped"
-  note "admission closed on $ENDPOINT and no work is active; stopping pid $TARGET_PID"
+    refuse "a restart would interrupt the active work:$busy; admission is reopened for operation $QUIESCE_OP, and nothing was stopped"
+  note "admission closed on $ENDPOINT for operation $QUIESCE_OP and no work is active; stopping pid $TARGET_PID"
 }
 
 cmd_restart() {
@@ -1730,11 +1775,13 @@ cmd_restart() {
   # against a path that may have changed.
   PREVALIDATED=1
   precheck_backup_room
+  # Checked before the quiesce and the capture, so a kept copy is never overwritten,
+  # with or without --force.
+  refuse_if_recovery_copy
   note "controlled restart of pid $pid on $ENDPOINT"
   # --force keeps its documented meaning (escalate to signals) and skips the
   # quiesce; the refresh script never passes it. The quiesce runs before the
-  # capture: the capture writes the recovery copy that the quiesce's busy check
-  # reads as an interrupted restart's leftover.
+  # capture, so the capture's copy is never read as a leftover of this restart.
   if [ "$force" -eq 0 ]; then
     quiesce_for_restart
   fi
@@ -1932,7 +1979,7 @@ cmd_activity() {
     case $n in '' | *[!0-9]*) exit_with 3 "cannot verify active work — $field is '$n'" ;; esac
     [ "$n" -eq 0 ] || busy="$busy $field=$n"
   done
-  [ -z "$(ls -A "$SUP_DIR/recover" 2>/dev/null)" ] || busy="$busy recovery-copy"
+  [ -z "$(ls -A "$SUP_DIR/recover" 2>/dev/null)" ] || busy="$busy recovery-copy in $SUP_DIR/recover"
   if [ -n "$busy" ]; then
     echo "active work:$busy"
     exit 1
