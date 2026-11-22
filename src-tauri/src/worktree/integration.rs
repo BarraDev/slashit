@@ -984,10 +984,8 @@ mod tests {
     /// any test waits, so only the timeout can end it.
     #[cfg(unix)]
     fn hanging_git(dir: &Path) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let fake = dir.join("fake-git");
-        std::fs::write(&fake, "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_helpers::write_executable(&fake, "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 60\n");
         fake.to_string_lossy().into_owned()
     }
 
@@ -1030,14 +1028,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_oversized_status_listing_is_reported_incomplete() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("checkout");
         std::fs::create_dir_all(&repo).unwrap();
         let fake = dir.path().join("fake-git");
         let script = "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec head -c 2097152 /dev/zero\n";
-        std::fs::write(&fake, script).unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_helpers::write_executable(&fake, script);
         let result = uncommitted_paths_with_program(
             &fake.to_string_lossy(),
             repo.to_str().unwrap(),

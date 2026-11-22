@@ -2126,7 +2126,6 @@ mod tests {
     async fn a_pull_request_pushed_to_by_another_clone_is_seen_only_through_the_status_poll() {
         use crate::domain::ExternalRef;
         use crate::pr_status::{PrKey, PrStatuses};
-        use std::os::unix::fs::PermissionsExt;
 
         let mut local = local_project().await;
         local.approve().await;
@@ -2183,12 +2182,10 @@ mod tests {
         });
         std::fs::write(dir.join("answer.json"), answer.to_string()).unwrap();
         let gh = dir.join("gh");
-        std::fs::write(
+        crate::test_helpers::write_executable(
             &gh,
             "#!/bin/sh\nd=\"$(dirname \"$0\")\"\nif [ -f \"$d/fail\" ]; then echo 'connection reset' >&2; exit 1; fi\ncat \"$d/answer.json\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         local.state.pr_statuses = std::sync::Arc::new(PrStatuses::with_program(gh, std::time::Duration::from_secs(20)));
         let published = |status: &ApprovalStatus| status.published.clone().expect("the pull request is recorded");
 
