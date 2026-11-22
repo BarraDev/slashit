@@ -565,9 +565,56 @@ async fn attach_from_picker(driver: &WebDriver, project_name: &str) -> Result<()
             == Value::Bool(true))
     })
     .await?;
-    ui::visible(driver, ATTACH_SUBMIT).await?.click().await.context("could not press Attach")?;
+    // Toasts from earlier actions sit over the bottom-right corner, where Attach is.
+    dismiss_toasts(driver).await?;
+    let submit = ui::visible(driver, ATTACH_SUBMIT).await?;
+    if let Err(error) = submit.click().await {
+        // Name the element that took the pointer, so the failure says what covers Attach.
+        let state = page(driver, ATTACH_DIAGNOSTIC, vec![])
+            .await
+            .map_or_else(|e| format!("unreadable: {e:#}"), |v| v.to_string());
+        bail!("could not press Attach: {error}\nAttach page state: {state}");
+    }
     Ok(())
 }
+
+/// Dismisses every visible toast through its own dismiss control, as a user would,
+/// and waits until none is shown.
+async fn dismiss_toasts(driver: &WebDriver) -> Result<()> {
+    // Re-query after each click: dismissing one toast re-renders the others, which
+    // stales any element found before. The bound stops a toast that never leaves.
+    for _ in 0..10 {
+        let Some(button) = driver.find_all(By::Css("[data-testid=\"toast-dismiss\"]")).await?.into_iter().next() else {
+            break;
+        };
+        button.click().await.context("could not dismiss a toast")?;
+    }
+    wait_until("the toasts to clear", || async {
+        Ok(page(driver, "return document.querySelectorAll('[data-testid=\"toast\"]').length === 0;", vec![]).await?
+            == Value::Bool(true))
+    })
+    .await
+}
+
+/// What covers the Attach button at its centre, and the picker's state.
+const ATTACH_DIAGNOSTIC: &str = "\
+    const submit = document.querySelector('[data-testid=\"workspace-attach-submit\"]');\
+    const picker = document.querySelector('[data-testid=\"workspace-attach\"] button[aria-haspopup=\"listbox\"]');\
+    const r = submit ? submit.getBoundingClientRect() : null;\
+    const hit = r ? document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) : null;\
+    return {\
+        submitDisabled: submit ? submit.disabled : null,\
+        submitRect: r ? [r.left, r.top, r.width, r.height] : null,\
+        pickerText: picker ? picker.textContent.trim() : null,\
+        pickerExpanded: picker ? picker.getAttribute('aria-expanded') : null,\
+        listboxOpen: !!document.querySelector('[role=\"listbox\"]'),\
+        toasts: [...document.querySelectorAll('[data-testid=\"toast\"]')].map(t => t.textContent.trim().slice(0, 160)),\
+        hitTag: hit ? hit.tagName : null,\
+        hitTestId: hit ? (hit.closest('[data-testid]') || {}).dataset?.testid || null : null,\
+        hitClass: hit ? String(hit.className).slice(0, 160) : null,\
+        hitText: hit ? (hit.textContent || '').trim().slice(0, 80) : null,\
+        viewport: [window.innerWidth, window.innerHeight],\
+    };";
 
 /// Scenario: Workspace Home's own pending Project read (its `list_projects` on
 /// load) must not replace the Workspace the user selected afterwards. This is
@@ -657,6 +704,22 @@ async fn a_failed_membership_reload_clears_busy_and_the_next_attach_works() {
                 driver,
                 "const el = document.querySelector(arguments[0]); return !!el && el.disabled === false;",
                 vec![json!(busy_control)],
+            )
+            .await?
+                == Value::Bool(true))
+        })
+        .await?;
+
+        // The injected reply reached the application, and the failure it caused is shown.
+        wait_until("the injected reply to reach the application", || async {
+            Ok(ui::invoke_fault_state(driver).await?.1)
+        })
+        .await?;
+        wait_until("the failed reload's error toast to show", || async {
+            Ok(page(
+                driver,
+                "return [...document.querySelectorAll('[data-testid=\"toast\"]')].some(t => t.textContent.includes('Could not load projects'));",
+                vec![],
             )
             .await?
                 == Value::Bool(true))
