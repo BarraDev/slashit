@@ -256,14 +256,16 @@ pub enum InvokeFault {
 /// The wrapper is page-scoped, so a reload clears it.
 const ARM_FAULT: &str = r#"
     const [command, mode, payload] = arguments;
-    // The product calls window.__TAURI__.core.invoke, which is a frozen namespace
-    // export and cannot be reassigned. Its body forwards to
-    // window.__TAURI_INTERNALS__.invoke at call time, so the wrapper goes there.
-    const internals = window.__TAURI_INTERNALS__;
-    if (!internals || typeof internals.invoke !== "function") { return "the IPC internals are missing"; }
+    // Tauri defines window.__TAURI_INTERNALS__.invoke and window.__TAURI__.core.invoke
+    // as non-writable properties, so neither can be wrapped in place. The global
+    // window.__TAURI__ is a plain assignment, and the product reads
+    // window.__TAURI__.core.invoke at each call, so it receives a replacement
+    // global whose core.invoke is the wrapper. The other members are copied across.
+    const bridge = window.__TAURI__;
+    if (!bridge || !bridge.core || typeof bridge.core.invoke !== "function") { return "the IPC bridge is missing"; }
     if (!window.__slashitInvokeWrapped) {
-        const original = internals.invoke;
-        internals.invoke = function (cmd, args, options) {
+        const original = bridge.core.invoke;
+        const wrapper = function (cmd, args, options) {
             const fault = window.__slashitInvokeFault;
             if (!fault || fault.spent || fault.command !== cmd) {
                 return original.apply(this, arguments);
@@ -288,7 +290,8 @@ const ARM_FAULT: &str = r#"
         };
         // Verify the replacement took effect: a silent failure here would leave the
         // fault unarmed and every journey waiting for an invoke that never reaches it.
-        if (internals.invoke === original) { return "window.__TAURI_INTERNALS__.invoke is not replaceable"; }
+        window.__TAURI__ = Object.assign({}, bridge, { core: Object.assign({}, bridge.core, { invoke: wrapper }) });
+        if (window.__TAURI__.core.invoke !== wrapper) { return "window.__TAURI__ is not replaceable"; }
         window.__slashitInvokeWrapped = true;
     }
     window.__slashitInvokeFault = {
