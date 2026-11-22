@@ -569,8 +569,10 @@ async fn attach_from_picker(driver: &WebDriver, project_name: &str) -> Result<()
     Ok(())
 }
 
-/// Scenario: a Project read that is still pending when the user selects a
-/// different Workspace must not replace the Workspace on screen.
+/// Scenario: Workspace Home's own pending Project read (its `list_projects` on
+/// load) must not replace the Workspace the user selected afterwards. This is
+/// not the organizer's fallback read after a Project removal; that path is not
+/// covered here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delayed_project_read_does_not_replace_the_selected_workspace() {
     let context = TestContext::new("project_rail_stale_home").expect("harness setup");

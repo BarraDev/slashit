@@ -256,11 +256,14 @@ pub enum InvokeFault {
 /// The wrapper is page-scoped, so a reload clears it.
 const ARM_FAULT: &str = r#"
     const [command, mode, payload] = arguments;
-    const core = window.__TAURI__ && window.__TAURI__.core;
-    if (!core) { return "the IPC bridge is missing"; }
+    // The product calls window.__TAURI__.core.invoke, which is a frozen namespace
+    // export and cannot be reassigned. Its body forwards to
+    // window.__TAURI_INTERNALS__.invoke at call time, so the wrapper goes there.
+    const internals = window.__TAURI_INTERNALS__;
+    if (!internals || typeof internals.invoke !== "function") { return "the IPC internals are missing"; }
     if (!window.__slashitInvokeWrapped) {
-        const original = core.invoke;
-        core.invoke = function (cmd, args, options) {
+        const original = internals.invoke;
+        internals.invoke = function (cmd, args, options) {
             const fault = window.__slashitInvokeFault;
             if (!fault || fault.spent || fault.command !== cmd) {
                 return original.apply(this, arguments);
@@ -283,6 +286,9 @@ const ARM_FAULT: &str = r#"
                 ? Promise.reject(fault.payload)
                 : Promise.resolve(fault.payload);
         };
+        // Verify the replacement took effect: a silent failure here would leave the
+        // fault unarmed and every journey waiting for an invoke that never reaches it.
+        if (internals.invoke === original) { return "window.__TAURI_INTERNALS__.invoke is not replaceable"; }
         window.__slashitInvokeWrapped = true;
     }
     window.__slashitInvokeFault = {
