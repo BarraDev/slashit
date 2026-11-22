@@ -256,19 +256,21 @@ pub fn submitted_folder(draft: &str) -> Option<&str> {
 /// The folder a Workspace uses, for its header: the effective path, marked when
 /// it is missing. A Workspace without a custom root still has its managed
 /// folder, so this never says it has no folder.
-fn folder_label(info: &Option<WorkspaceRootInfo>) -> String {
-    match info {
-        None => "Loading folder…".to_string(),
-        Some(info) if info.exists => info.path.clone(),
-        Some(info) => format!("{} (missing)", info.path),
+fn folder_label(info: &Option<WorkspaceRootInfo>, error: &Option<String>) -> String {
+    match (info, error) {
+        (None, Some(_)) => "Folder unavailable".to_string(),
+        (None, None) => "Loading folder…".to_string(),
+        (Some(info), _) if info.exists => info.path.clone(),
+        (Some(info), _) => format!("{} (missing)", info.path),
     }
 }
 
 /// The folder and what kind it is, for the details.
-fn folder_detail(info: &Option<WorkspaceRootInfo>) -> String {
-    match info {
-        None => "Loading folder…".to_string(),
-        Some(info) => {
+fn folder_detail(info: &Option<WorkspaceRootInfo>, error: &Option<String>) -> String {
+    match (info, error) {
+        (None, Some(e)) => format!("The folder could not be read: {e}"),
+        (None, None) => "Loading folder…".to_string(),
+        (Some(info), _) => {
             let kind = if info.custom { "custom folder" } else { "managed by SlashIt" };
             let state = if info.exists { "exists" } else { "missing" };
             format!("{} ({kind}, {state})", info.path)
@@ -305,6 +307,9 @@ fn WorkspaceItem(
     // The effective folder, from the backend: the custom root, or the managed
     // folder SlashIt created for this Workspace.
     let root_info = RwSignal::new(None::<WorkspaceRootInfo>);
+    // The reason the last lookup failed. Cleared when a lookup starts, so a folder
+    // from an earlier lookup is never shown as current.
+    let root_error = RwSignal::new(None::<String>);
     // Overlapping lookups (mount and after a save) apply only the newest reply, so an
     // older reply cannot replace the root a save just displayed.
     let root_read = StoredValue::new(0u64);
@@ -315,13 +320,20 @@ fn WorkspaceItem(
         }) else {
             return;
         };
+        let _ = root_info.try_set(None);
+        let _ = root_error.try_set(None);
         spawn_local(async move {
             let result = workspace_service::get_workspace_root(&ws_id.to_string()).await;
             if root_read.try_get_value() != Some(read) {
                 return;
             }
-            if let Ok(info) = result {
-                let _ = root_info.try_set(Some(info));
+            match result {
+                Ok(info) => {
+                    let _ = root_info.try_set(Some(info));
+                }
+                Err(e) => {
+                    let _ = root_error.try_set(Some(e));
+                }
             }
         });
     };
@@ -508,7 +520,7 @@ fn WorkspaceItem(
                     </svg>
                     <div class="flex-1 min-w-0 text-left">
                         <h3 class="font-medium text-white/90 truncate" data-testid="workspace-name">{move || shown_name.get()}</h3>
-                        <p class="text-xs text-white/40 truncate font-mono mt-0.5" data-testid="workspace-root-label">{move || folder_label(&root_info.get())}</p>
+                        <p class="text-xs text-white/40 truncate font-mono mt-0.5" data-testid="workspace-root-label">{move || folder_label(&root_info.get(), &root_error.get())}</p>
                     </div>
                 </div>
                 <span class="px-2 py-0.5 rounded text-xs font-medium bg-white/5 text-white/40">
@@ -525,7 +537,7 @@ fn WorkspaceItem(
                         </div>
                         <div class="flex items-center justify-between text-sm">
                             <span class="text-white/40">"Folder:"</span>
-                            <span class="text-white/70 font-mono text-xs truncate ml-4" data-testid="workspace-folder-detail">{move || folder_detail(&root_info.get())}</span>
+                            <span class="text-white/70 font-mono text-xs truncate ml-4" data-testid="workspace-folder-detail">{move || folder_detail(&root_info.get(), &root_error.get())}</span>
                         </div>
                     </div>
 
@@ -663,9 +675,26 @@ fn WorkspaceItem(
 #[cfg(test)]
 mod tests {
     use super::{
-        move_attach_failure, move_detach_failure, submitted_folder, unresolved_members,
-        TASK_BOUNDARY_NOTE,
+        folder_detail, folder_label, move_attach_failure, move_detach_failure, submitted_folder,
+        unresolved_members, TASK_BOUNDARY_NOTE,
     };
+    use crate::models::workspace::WorkspaceRootInfo;
+
+    fn present(path: &str) -> Option<WorkspaceRootInfo> {
+        Some(WorkspaceRootInfo { path: path.to_string(), exists: true, custom: true })
+    }
+
+    #[test]
+    fn a_failed_root_lookup_is_shown_as_unavailable_not_as_loading_or_stale() {
+        // Nothing yet: the lookup is in flight.
+        assert_eq!(folder_label(&None, &None), "Loading folder…");
+        // A failed lookup says so, and never keeps an earlier folder's path.
+        assert_eq!(folder_label(&None, &Some("denied".to_string())), "Folder unavailable");
+        assert!(folder_detail(&None, &Some("denied".to_string())).contains("could not be read: denied"));
+        // A verified folder is shown with its state.
+        assert_eq!(folder_label(&present("/data/shared"), &None), "/data/shared");
+        assert!(folder_detail(&present("/data/shared"), &None).contains("custom folder, exists"));
+    }
 
     #[test]
     fn a_submitted_folder_keeps_its_exact_spelling_and_a_blank_field_is_absent() {

@@ -2424,6 +2424,9 @@ impl TaskExecutor {
 
         match promoted? {
             Some(task) => {
+                // A new promotion is a new admission decision, so it ends any
+                // backoff a refused start of the same Task left behind.
+                self.unrecorded_backoff_lock().remove(&task.id);
                 reserved.insert(task.id, permit);
                 Ok(PromotionOutcome::Promoted(Box::new(task)))
             }
@@ -5772,7 +5775,23 @@ impl TaskExecutor {
                     self.worktree_manager
                         .release_unrecorded(&repo_path, &acquired.info, acquired.created_at.as_deref())
                         .await;
-                    self.refuse_unrecorded_start(task_id, &refusal);
+                    // Recorded as an Error, not left InProgress: an InProgress Task
+                    // counts against `parallel_task_limit` and would hold capacity
+                    // until the root returns. An Error is not promoted or started
+                    // again until a person moves it back to Queue.
+                    Self::set_task_error_static(
+                        &self.tasks,
+                        &self.storage,
+                        &self.events,
+                        task_id,
+                        &refusal,
+                        None,
+                    )
+                    .await;
+                    // If the write did not persist, the Task is still ready and the next
+                    // pass would acquire and release its checkout again. The backoff
+                    // bounds that for this process whether or not the record persisted.
+                    self.back_off_refused_start(task_id);
                     return Err(refusal);
                 }
             };
@@ -6314,17 +6333,10 @@ impl TaskExecutor {
         Err(message)
     }
 
-    /// Logs a start refused for a reason the person must fix first, such as a
-    /// missing Workspace root, and backs the poller off from it. The poller
-    /// discards a start's result, so without this the refusal would repeat on
-    /// every pass with nothing on the Task saying why it has not run. The Task
-    /// keeps its state, as the refusal says.
-    fn refuse_unrecorded_start(&self, task_id: Uuid, refusal: &str) {
-        self.events.agent_event(AgentEvent::Log {
-            task_id: task_id.to_string(),
-            level: LogLevel::Warn,
-            message: refusal.to_string(),
-        });
+    /// Holds the next start of `task_id` back for [`UNRECORDED_ACQUISITION_BACKOFF`]
+    /// after a refused start, so a missing prerequisite does not acquire and
+    /// release a checkout on every pass when the refusal could not be recorded.
+    fn back_off_refused_start(&self, task_id: Uuid) {
         self.unrecorded_backoff_lock().insert(
             task_id,
             UnrecordedBackoff {
@@ -8609,7 +8621,7 @@ impl TaskExecutor {
     ) -> Result<(String, Vec<std::path::PathBuf>), String> {
         match membership.root.as_ref() {
             Some(root) if !root.is_dir() => Err(format!(
-                "The Workspace root {} is missing. Nothing was started. Restore the folder or change the Workspace root, then run this Task again.",
+                "The Workspace root {} is missing. Nothing was started. Restore the folder or change the Workspace root, then move this Task back to Queue to run it.",
                 root.display()
             )),
             Some(root) => Ok((
@@ -9008,6 +9020,8 @@ impl TaskExecutor {
                 t.status = TaskStatus::Error;
                 t.phase = TaskPhase::Failed;
                 t.worker_handoff_confirmed = false;
+                // A refused or failed start ends the confirmation, so a new attempt must be confirmed again.
+                t.new_attempt_confirmed = false;
                 t.error_message = Some(msg_owned.clone());
                 if let Some(tools) = &tools {
                     tools.apply_to(t);
@@ -24088,8 +24102,8 @@ VERDICT: APPROVED"
         }
 
         /// A Workspace whose root has gone missing refuses the start. The refusal
-        /// is logged on the Task once, the Task keeps its state, and the poller
-        /// does not acquire and release a checkout on every pass.
+        /// is recorded on the Task once as an Error, and later passes do not
+        /// acquire and release a checkout, because an Error is not started.
         #[tokio::test]
         async fn a_start_refused_for_a_missing_workspace_root_is_logged_and_backed_off() {
             let recording = Arc::new(crate::events::RecordingEventSink::new());
@@ -24118,27 +24132,17 @@ VERDICT: APPROVED"
                 "{first:?}"
             );
             assert_eq!(created_worktrees(&recording), 1);
-            assert_eq!(w.in_memory().await.status, ready_before.status, "the Task keeps its state");
-            let logged = |recording: &crate::events::RecordingEventSink| {
-                recording
-                    .recorded()
-                    .iter()
-                    .filter(|(name, payload)| {
-                        name == "agent-event"
-                            && payload.get("level").and_then(|v| v.as_str()) == Some("warn")
-                            && payload
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .is_some_and(|m| m.contains("is missing"))
-                    })
-                    .count()
-            };
-            assert_eq!(logged(&recording), 1, "the refusal is on the Task");
+            assert_eq!(ready_before.status, TaskStatus::InProgress);
+            assert_eq!(w.in_memory().await.status, TaskStatus::Error, "the refusal is recorded on the Task");
+            assert!(
+                w.in_memory().await.error_message.as_deref().is_some_and(|m| m.contains("is missing")),
+                "the refusal is on the Task"
+            );
 
-            let within = w.executor.spawn_task_execution(w.task_id, None).await;
-            assert!(within.is_err_and(|e| e.contains("tried again")));
-            assert_eq!(created_worktrees(&recording), 1, "no checkout is acquired inside the backoff");
-            assert_eq!(logged(&recording), 1, "the refusal is not repeated on every pass");
+            let later = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert_eq!(later, Ok(false), "an Error Task is not started by a later pass");
+            assert_eq!(created_worktrees(&recording), 1, "no checkout is acquired on a later pass");
+            assert_eq!(w.in_memory().await.status, TaskStatus::Error, "the refusal is not repeated on every pass");
         }
 
         /// How many times a start acquired a new worktree, from its log.
@@ -24252,6 +24256,244 @@ VERDICT: APPROVED"
 
             assert_eq!(refs_of(&w.repo), refs_before);
             assert_eq!(agent.invocations(), "");
+        }
+
+        /// A start refused because the Workspace root is missing is recorded on
+        /// the Task as an Error. It no longer counts against the parallel limit,
+        /// and the refused start is not repeated on later passes.
+        #[tokio::test]
+        async fn a_start_refused_for_a_missing_workspace_root_is_recorded_and_frees_its_capacity() {
+            let w = world(Class::Created).await;
+            let vanished = tempfile::TempDir::new().expect("tempdir").path().join("gone");
+            let workspace = crate::domain::Workspace::new(
+                "ws".to_string(),
+                Some(crate::domain::WorkspaceRoot::from_trusted(vanished)),
+            );
+            let workspace_id = workspace.id;
+            w.executor
+                .workspace_registry
+                .write()
+                .await
+                .upsert(workspace)
+                .expect("upsert the Workspace");
+            w.executor
+                .projects
+                .write()
+                .await
+                .get_mut(&w.project_id)
+                .expect("the Task's Project is registered")
+                .scope = crate::domain::ProjectScope::InWorkspace { workspace_id };
+            let capacity_before = w.executor.queue_manager.read().await.get_in_progress_count().await;
+            assert_eq!(w.in_memory().await.status, crate::domain::TaskStatus::InProgress);
+
+            let refusal = w
+                .executor
+                .spawn_task_execution(w.task_id, None)
+                .await
+                .expect_err("a missing Workspace root refuses the start");
+            assert!(refusal.contains("is missing"), "{refusal}");
+
+            let in_memory = w.in_memory().await;
+            assert_eq!(in_memory.status, crate::domain::TaskStatus::Error);
+            assert_eq!(in_memory.phase, crate::domain::TaskPhase::Failed);
+            assert!(
+                in_memory.error_message.as_deref().is_some_and(|m| m.contains("is missing")),
+                "the Task names the refusal: {:?}",
+                in_memory.error_message
+            );
+            assert_eq!(w.on_disk().status, crate::domain::TaskStatus::Error, "the refusal is durable");
+            assert_eq!(
+                w.executor.queue_manager.read().await.get_in_progress_count().await,
+                capacity_before - 1,
+                "a refused start releases its execution capacity"
+            );
+
+            let again = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert_eq!(again, Ok(false), "an Error Task is not started by a later pass");
+        }
+
+        /// After a refused start, restoring the root and moving the Task back to
+        /// Queue lets it start. Nothing starts it automatically in between.
+        #[tokio::test]
+        async fn a_refused_start_runs_once_the_root_returns_and_the_task_is_requeued() {
+            // The successful start below spawns the agent; the stand-in must replace the real `claude`.
+            let agent = fake_agent().await;
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let root_dir = tempfile::TempDir::new().unwrap();
+            let root_path = root_dir.path().to_path_buf();
+            let root = crate::domain::WorkspaceRoot::try_new(&root_path).unwrap();
+            let workspace = crate::domain::Workspace::new("Shared".into(), Some(root));
+            w.executor
+                .workspace_registry
+                .write()
+                .await
+                .upsert(workspace.clone())
+                .expect("the Workspace is registered");
+            w.executor.projects.write().await.get_mut(&w.project_id).unwrap().scope =
+                ProjectScope::InWorkspace {
+                    workspace_id: workspace.id,
+                };
+            drop(root_dir);
+
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(refused.is_err_and(|e| e.contains("is missing")));
+            assert_eq!(w.in_memory().await.status, TaskStatus::Error);
+
+            // The person restores the folder and moves the Task back to Queue.
+            std::fs::create_dir_all(&root_path).expect("restore the root");
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let task = tasks.get_mut(&w.task_id).expect("the Task is on the board");
+                task.status = TaskStatus::Queue;
+                task.reset_execution_state();
+                let board: Vec<Task> = tasks.values().filter(|t| t.project_id == w.project_id).cloned().collect();
+                w.executor
+                    .storage
+                    .save_project_tasks(w.project_id, &board)
+                    .expect("save the requeued board");
+            }
+            let promoted = w
+                .executor
+                .promote_queued(PromotionChoice::Exact(w.task_id), |_, _| {})
+                .await
+                .expect("the requeued Task is promoted");
+            assert!(matches!(promoted, PromotionOutcome::Promoted(_)), "the requeued Task is promoted");
+
+            let started = w.executor.spawn_task_execution(w.task_id, None).await;
+            let invoked = agent_invoked(&agent).await;
+            w.end_run().await;
+            assert_eq!(started, Ok(true), "the restored root lets the Task start");
+            assert!(invoked, "the restored root runs the agent");
+        }
+
+        /// Puts the Task's Project in a Workspace whose custom root does not exist.
+        async fn project_in_missing_root(w: &World) {
+            let vanished = tempfile::TempDir::new().expect("tempdir").path().join("gone");
+            let workspace = crate::domain::Workspace::new(
+                "ws".to_string(),
+                Some(crate::domain::WorkspaceRoot::from_trusted(vanished)),
+            );
+            let workspace_id = workspace.id;
+            w.executor
+                .workspace_registry
+                .write()
+                .await
+                .upsert(workspace)
+                .expect("upsert the Workspace");
+            w.executor.projects.write().await.get_mut(&w.project_id).expect("project").scope =
+                crate::domain::ProjectScope::InWorkspace { workspace_id };
+        }
+
+        /// The refusal is durable: after a restart the Task is still an Error and
+        /// no pass starts it.
+        #[tokio::test]
+        async fn a_refused_start_stays_blocked_after_a_restart() {
+            let w = world(Class::Created).await;
+            project_in_missing_root(&w).await;
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(refused.is_err_and(|e| e.contains("is missing")));
+
+            w.restart().await;
+            assert_eq!(w.on_disk().status, TaskStatus::Error, "the block is on disk");
+            assert_eq!(w.in_memory().await.status, TaskStatus::Error, "and after the restart");
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(false));
+            assert_eq!(w.in_memory().await.status, TaskStatus::Error);
+        }
+
+        /// A refusal that cannot be recorded leaves the Task as it was, and the
+        /// backoff bounds the acquire-and-release of its checkout on later passes.
+        #[tokio::test]
+        async fn a_refusal_that_cannot_be_recorded_is_backed_off() {
+            use slashit_durable_fs::{fault, Stage};
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let w = world_with(test_executor_with_events(recording.clone()), Class::Created).await;
+            project_in_missing_root(&w).await;
+            {
+                let _fault = fault::fail_at(Stage::Replace, std::io::ErrorKind::Other);
+                let refused = w.executor.spawn_task_execution(w.task_id, None).await;
+                assert!(refused.is_err_and(|e| e.contains("is missing")));
+            }
+            assert_eq!(
+                w.in_memory().await.status,
+                TaskStatus::InProgress,
+                "an unrecorded refusal leaves the Task as it was"
+            );
+            assert_eq!(created_worktrees(&recording), 1);
+
+            let again = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(again.is_err_and(|e| e.contains("tried again")), "the retry is held back");
+            assert_eq!(created_worktrees(&recording), 1, "no checkout is acquired inside the backoff");
+        }
+
+        /// At the limit, a refused start frees its slot for another queued Task of
+        /// the same Project, and that Task is promoted.
+        #[tokio::test]
+        async fn a_refused_start_frees_a_slot_for_another_queued_task_at_the_limit() {
+            let w = world(Class::Created).await;
+            project_in_missing_root(&w).await;
+            let waiting = crate::test_helpers::create_test_task_full("waiting", w.project_id, TaskStatus::Queue, 2);
+            let waiting_id = waiting.id;
+            let board: Vec<Task> = {
+                let mut tasks = w.executor.tasks.write().await;
+                tasks.insert(waiting_id, waiting);
+                tasks.values().filter(|t| t.project_id == w.project_id).cloned().collect()
+            };
+            w.executor.storage.save_project_tasks(w.project_id, &board).expect("save");
+            let held = w.executor.queue_manager.read().await.get_in_progress_count().await;
+            let mut config = w.executor.queue_manager.read().await.config().clone();
+            config.parallel_task_limit = held as u32;
+            w.executor.queue_manager.write().await.set_config(config).await;
+
+            let blocked = w.executor.promote_queued(PromotionChoice::Next, |_, _| {}).await.expect("promotion");
+            // The in-progress count is checked by selection, so a full limit selects
+            // nothing; the admission gate would answer NoCapacity. Neither promotes.
+            assert!(
+                matches!(blocked, PromotionOutcome::NoCapacity | PromotionOutcome::NothingEligible),
+                "the limit is full while the Task holds its slot"
+            );
+
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(refused.is_err_and(|e| e.contains("is missing")));
+            let promoted = w.executor.promote_queued(PromotionChoice::Next, |_, _| {}).await.expect("promotion");
+            match promoted {
+                PromotionOutcome::Promoted(task) => assert_eq!(task.id, waiting_id),
+                _ => panic!("the freed slot must promote the waiting Task"),
+            }
+        }
+
+        /// Two promotions racing for the last slot promote exactly one Task.
+        #[tokio::test]
+        async fn concurrent_promotions_never_exceed_the_limit() {
+            let w = world(Class::Created).await;
+            let held = w.executor.queue_manager.read().await.get_in_progress_count().await;
+            let mut waiting_ids = Vec::new();
+            let board: Vec<Task> = {
+                let mut tasks = w.executor.tasks.write().await;
+                for n in 0..2 {
+                    let task = crate::test_helpers::create_test_task_full("q", w.project_id, TaskStatus::Queue, 10 + n);
+                    waiting_ids.push(task.id);
+                    tasks.insert(task.id, task);
+                }
+                tasks.values().filter(|t| t.project_id == w.project_id).cloned().collect()
+            };
+            w.executor.storage.save_project_tasks(w.project_id, &board).expect("save");
+            let mut config = w.executor.queue_manager.read().await.config().clone();
+            config.parallel_task_limit = held as u32 + 1;
+            w.executor.queue_manager.write().await.set_config(config).await;
+
+            let (a, b) = tokio::join!(
+                w.executor.promote_queued(PromotionChoice::Next, |_, _| {}),
+                w.executor.promote_queued(PromotionChoice::Next, |_, _| {}),
+            );
+            let outcomes = [a.expect("first promotion"), b.expect("second promotion")];
+            let promoted = outcomes.iter().filter(|o| matches!(o, PromotionOutcome::Promoted(_))).count();
+            assert_eq!(promoted, 1, "exactly one of two promotions takes the last slot");
+            assert!(
+                w.executor.queue_manager.read().await.get_in_progress_count().await <= held + 1,
+                "the in-progress count stays within the limit"
+            );
         }
 
         /// A manual start refused for the same reason says so, rather than

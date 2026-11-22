@@ -261,29 +261,50 @@ fn refuse_second_active_project(
 
 /// The removed Project whose repository is the given folder, if any. The
 /// most recently removed one wins when several match.
+/// A removed Project is reopened only when its folder is a directory: otherwise it
+/// would become active with no folder to work in. This is a check, not a lock, as at
+/// removal, so a folder that disappears later is not prevented.
+fn reopen_folder_available(folder: &str) -> Result<(), String> {
+    if std::path::Path::new(folder).is_dir() {
+        return Ok(());
+    }
+    Err(format!(
+        "This Project cannot be reopened: its folder {folder} is unavailable. Put the folder back at its registered path, then open it again. Nothing was changed."
+    ))
+}
+
 async fn reopen_removed_project_for_folder(
     state: &crate::AppState,
     folder: &str,
 ) -> Result<Option<Project>, String> {
-    let candidate = {
-        let projects = state.project.projects.read().await;
-        let repositories = state.repository.repositories.read().await;
-        removed_project_for_folder(&projects, &repositories, folder)
-    };
-    let Some(id) = candidate else {
-        return Ok(None);
-    };
-    // The gate excludes a concurrent removal of the same Project, so the
-    // reopen and a removal cannot both decide from the same state.
-    let _gate = state.task.project_gate.write(id).await;
-    reopen_matching_removed_project(
-        &state.project.projects,
-        &state.repository.repositories,
-        &state.storage,
-        folder,
-        id,
-    )
-    .await
+    // A candidate can be deleted or superseded while this waits for its gate, so the
+    // lookup is retried a bounded number of times with the remaining candidate.
+    for _ in 0..3 {
+        let candidate = {
+            let projects = state.project.projects.read().await;
+            let repositories = state.repository.repositories.read().await;
+            removed_project_for_folder(&projects, &repositories, folder)
+        };
+        let Some(id) = candidate else {
+            return Ok(None);
+        };
+        reopen_folder_available(folder)?;
+        // The gate excludes a concurrent removal of the same Project, so the
+        // reopen and a removal cannot both decide from the same state.
+        let _gate = state.task.project_gate.write(id).await;
+        if let Some(reopened) = reopen_matching_removed_project(
+            &state.project.projects,
+            &state.repository.repositories,
+            &state.storage,
+            folder,
+            id,
+        )
+        .await?
+        {
+            return Ok(Some(reopened));
+        }
+    }
+    Ok(None)
 }
 
 /// Reopens `id` only if `folder` still resolves to it. Runs under the gate,
@@ -455,6 +476,13 @@ async fn remove_project_committed(
         (project.is_removed(), project.repository_path(&repositories_r))
     };
     if already_removed {
+        // A removal adopted in memory after an unconfirmed write is confirmed by
+        // a write of the same state before a retry reports success. The removal
+        // timestamp is kept as it is.
+        let projects_w = projects.write().await;
+        try_persist_projects(storage, &projects_w).map_err(|e| {
+            format!("This Project is removed, but SlashIt could not confirm the save. {e}")
+        })?;
         return Ok(());
     }
     let Some(folder) = repository_path else {
@@ -472,6 +500,27 @@ async fn remove_project_committed(
             "This Project cannot be removed: its folder {folder} is unavailable (it is missing, or \
              the path is not a folder). Nothing was changed. To restore it, put the folder back at \
              its registered path, then remove the Project again."
+        ));
+    }
+    // Legacy records can open one folder as two active Projects. Removing this one
+    // would leave its folder held by the other, and reopening it would then be
+    // refused as a second active Project on that checkout.
+    let other_active = {
+        let projects_r = projects.read().await;
+        let repositories_r = repositories.read().await;
+        let wanted = canonical_folder(&folder);
+        projects_r
+            .values()
+            .find(|p| {
+                p.id != id
+                    && !p.is_removed()
+                    && p.repository_path(&repositories_r).is_some_and(|path| canonical_folder(&path) == wanted)
+            })
+            .map(|p| p.name.clone())
+    };
+    if let Some(name) = other_active {
+        return Err(format!(
+            "This Project cannot be removed: its folder is also open as Project '{name}'. Remove that Project first. Nothing was changed."
         ));
     }
 
@@ -1177,6 +1226,21 @@ async fn update_project_committed(
             // Under the write lock, excluding this Project: its own repository
             // is not a conflict.
             refuse_second_active_project(&projects_w, &*repositories.read().await, repository_id, Some(id))?;
+            // A folder held by a removed Project is reserved for that Project: reopening
+            // it would be refused as a second active Project on the checkout.
+            let target_folder = {
+                let repositories_r = repositories.read().await;
+                repository_id.and_then(|rid| repositories_r.get(&rid).map(|r| r.local_path.clone()))
+            };
+            if let Some(folder) = target_folder {
+                let held_by = removed_project_for_folder(&projects_w, &*repositories.read().await, &folder);
+                if held_by.is_some_and(|other| other != id) {
+                    return Err(
+                        "This folder belongs to a removed Project. Open the folder to restore that Project, or choose another folder. Nothing was changed."
+                            .to_string(),
+                    );
+                }
+            }
             project.repository_id = repository_id;
         }
         if let Some(agent_type) = agent_type {
@@ -4612,25 +4676,20 @@ pub(crate) mod tests {
         let leases = crate::lifecycle::hold_project_task_leases(&locks, &tasks, id)
             .await
             .expect("no other lifecycle operation owns the Task");
-        let entry = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            crate::lifecycle::enqueue_current(&tasks, &storage, &projects, &locks, None, task_id),
-        )
-        .await;
-        assert!(
-            entry.is_err(),
-            "the Queue entry must wait for the removal's lease"
-        );
+        // The first entry stays pinned: it must not check the Project before the
+        // lease, so the same future resumes after the removal and sees the marker.
+        let mut first = Box::pin(crate::lifecycle::enqueue_current(
+            &tasks, &storage, &projects, &locks, None, task_id,
+        ));
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(100), first.as_mut()).await;
+        assert!(waited.is_err(), "the Queue entry must wait for the removal's lease");
 
         remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
             .await
             .expect("an idle Project is removed");
         drop(leases);
 
-        let verdict =
-            crate::lifecycle::enqueue_current(&tasks, &storage, &projects, &locks, None, task_id)
-                .await
-                .expect("the refusal is answered");
+        let verdict = first.await.expect("the refusal is answered");
         assert!(
             matches!(&verdict, crate::lifecycle::EnqueueVerdict::Blocked(reason)
                 if reason == crate::domain::project::PROJECT_REMOVED_REFUSAL),
@@ -4641,6 +4700,92 @@ pub(crate) mod tests {
             crate::domain::TaskStatus::Backlog
         );
         assert!(projects.read().await[&id].is_removed());
+    }
+
+    /// A removal whose save could not be confirmed is confirmed by the retry, which
+    /// reports success only after the same state is written again.
+    #[tokio::test]
+    async fn a_retried_removal_confirms_the_save_it_could_not_confirm() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let tasks = board(vec![]);
+        {
+            let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+            let first = remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id).await;
+            assert!(first.is_err(), "the save is not confirmed");
+        }
+        assert!(projects.read().await[&id].is_removed(), "the removal was adopted in memory");
+
+        remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+            .await
+            .expect("the retry confirms the save");
+        let on_disk = storage.load_config().expect("config").projects;
+        assert!(on_disk[&id.to_string()].is_removed(), "the removal is on disk after the retry");
+    }
+
+    /// Reopening needs the folder to exist. A missing folder is refused, and an
+    /// existing one is accepted.
+    #[test]
+    fn reopening_requires_the_folder_to_exist() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let present = temp.path().to_string_lossy().to_string();
+        assert!(reopen_folder_available(&present).is_ok());
+        let missing = temp.path().join("gone").to_string_lossy().to_string();
+        let refusal = reopen_folder_available(&missing).expect_err("a missing folder is refused");
+        assert!(refusal.contains("unavailable") && refusal.contains("Nothing was changed"), "{refusal}");
+    }
+
+    /// Legacy records can open one folder as two active Projects. Removing one
+    /// would leave the other holding the folder, so the removal is refused.
+    #[tokio::test]
+    async fn removing_a_project_whose_folder_another_active_project_holds_is_refused() {
+        let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
+        let repository_id = projects.read().await[&id].repository_id;
+        let mut other = make_test_project(Uuid::new_v4());
+        other.repository_id = repository_id;
+        projects.write().await.insert(other.id, other);
+        let tasks = board(vec![]);
+
+        let refusal = remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+            .await
+            .expect_err("the shared folder is held by another active Project");
+        assert!(refusal.contains("also open as Project"), "{refusal}");
+        assert!(!projects.read().await[&id].is_removed(), "nothing was changed");
+    }
+
+    /// A removed Project keeps its folder. Reassigning another active Project to
+    /// that folder would stop the removed one from reopening, so it is refused.
+    #[tokio::test]
+    async fn reassigning_a_project_to_a_folder_a_removed_project_holds_is_refused() {
+        let (storage, temp, projects, repositories, removed_id) = project_with_folder(vec![]).await;
+        let held_repository = projects.read().await[&removed_id].repository_id.expect("a repository");
+        remove_project_committed(&projects, &repositories, &board(vec![]), &storage, None, None, removed_id)
+            .await
+            .expect("the idle Project is removed");
+
+        let other_folder = temp.path().join("other");
+        std::fs::create_dir_all(&other_folder).unwrap();
+        let other_repository = make_test_repository(&other_folder);
+        let mut active = make_test_project(Uuid::new_v4());
+        active.repository_id = Some(other_repository.id);
+        let active_id = active.id;
+        repositories.write().await.insert(other_repository.id, other_repository);
+        projects.write().await.insert(active_id, active);
+
+        let before = projects.read().await[&active_id].repository_id;
+        let refusal = update_project_committed(
+            &projects,
+            &repositories,
+            &storage,
+            active_id,
+            None,
+            Some(held_repository.to_string()),
+            None,
+        )
+        .await
+        .expect_err("the folder belongs to a removed Project");
+        assert!(refusal.contains("belongs to a removed Project"), "{refusal}");
+        assert_eq!(projects.read().await[&active_id].repository_id, before, "nothing was changed");
     }
 
     /// The reverse order: a Task that entered Queue first makes the removal

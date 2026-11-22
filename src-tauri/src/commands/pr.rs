@@ -5854,13 +5854,7 @@ async fn begin_pr_helper(
     state: &crate::AppState,
     task_id: Uuid,
     purpose: crate::queue::PrHelperPurpose,
-) -> Result<
-    (
-        Option<crate::queue::PrHelperLease>,
-        tokio::sync::watch::Receiver<bool>,
-    ),
-    String,
-> {
+) -> Result<(Option<PrHelperHold>, tokio::sync::watch::Receiver<bool>), String> {
     refuse_while_republish_pending(state, task_id).await?;
     match state.executor.get() {
         Some(executor) => {
@@ -5869,15 +5863,16 @@ async fn begin_pr_helper(
                 .await
                 .map_err(|refusal| refusal.to_string())?;
             let cancel_rx = lease.cancel_receiver();
-            Ok((Some(lease), cancel_rx))
+            Ok((Some(PrHelperHold::executor(lease)), cancel_rx))
         }
         None => {
             // Nothing can own the task without an executor, but unresolved
             // Worker recovery evidence does not depend on one: a provider that
             // can edit the checkout is still refused, under the same lifecycle
             // lease the executor's own admission uses. The lease also refuses
-            // a removed Project, for both purposes.
-            let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
+            // a removed Project, for both purposes. It is returned to the caller,
+            // so it stays held while the helper edits the checkout.
+            let lease = crate::commands::project::lease_active_task(state, task_id).await?;
             if purpose == crate::queue::PrHelperPurpose::Editing {
                 if let Some(refusal) = state
                     .task
@@ -5890,8 +5885,25 @@ async fn begin_pr_helper(
                     return Err(refusal);
                 }
             }
-            Ok((None, tokio::sync::watch::channel(false).1))
+            Ok((Some(PrHelperHold::lifecycle(lease)), tokio::sync::watch::channel(false).1))
         }
+    }
+}
+
+/// What keeps a PR helper's claim on its Task for as long as the helper runs:
+/// the executor's lease, or, with no executor, the lifecycle lease. Dropping it
+/// releases the claim, so the caller holds it until the helper has finished.
+struct PrHelperHold {
+    _guard: Box<dyn std::any::Any + Send>,
+}
+
+impl PrHelperHold {
+    fn executor(lease: crate::queue::PrHelperLease) -> Self {
+        Self { _guard: Box::new(lease) }
+    }
+
+    fn lifecycle(lease: crate::lifecycle::LifecycleLease) -> Self {
+        Self { _guard: Box::new(lease) }
     }
 }
 
@@ -34701,6 +34713,44 @@ mod recovery_admission_tests {
         (tmp, state, id)
     }
 
+    /// With no executor, an editing helper holds its Task's lifecycle lease for as
+    /// long as it keeps the guard: another lifecycle operation waits until the guard
+    /// is dropped, so no edit can run after the lease is released.
+    #[tokio::test]
+    async fn an_editing_helper_without_an_executor_holds_the_task_lease_until_it_ends() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _) = crate::app_core::build_state_with_paths(paths).await.expect("state");
+        let project_id = Uuid::new_v4();
+        let task = crate::test_helpers::create_test_task_full("plain", project_id, TaskStatus::Backlog, 0);
+        let id = task.id;
+        state.task.tasks.write().await.insert(id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed");
+
+        let (hold, _cancel) = begin_pr_helper(&state, id, PrHelperPurpose::Editing)
+            .await
+            .expect("an editing helper is admitted for a plain Task");
+        let contended = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            crate::commands::project::lease_active_task(&state, id),
+        )
+        .await;
+        assert!(contended.is_err(), "the lease is held while the helper holds its guard");
+
+        drop(hold);
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::commands::project::lease_active_task(&state, id),
+        )
+        .await;
+        assert!(released.is_ok_and(|lease| lease.is_ok()), "the lease is free once the helper ends");
+    }
+
     /// Editing is refused with and without an executor; inspection is not.
     #[tokio::test]
     async fn only_an_editing_helper_is_refused_for_a_recovery_task() {
@@ -34714,7 +34764,7 @@ mod recovery_admission_tests {
             let (lease, _cancel) = begin_pr_helper(&state, id, PrHelperPurpose::Inspection)
                 .await
                 .unwrap_or_else(|e| panic!("executor={with_executor}: read-only stays open: {e}"));
-            assert_eq!(lease.is_some(), with_executor);
+            assert!(lease.is_some(), "executor={with_executor}: the helper holds its Task in both cases");
             drop(lease);
             // Publishing the branch is refused too, before any owner is ended.
             let reserve = reserve_task_for_pr_side_effect(&state, id)

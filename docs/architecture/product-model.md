@@ -159,9 +159,11 @@ Only part of that exists today.
   A Workspace without a custom root leaves the Worker in its Task Checkout, as
   a standalone Project is, so its managed folder never changes what a Worker
   can reach. If a configured custom root is missing, the run is refused before
-  it starts and its Task Checkout is released. SlashIt does not fall back
-  silently: the person restores the folder or changes the root, then runs
-  again. Other agent runs, such as AI review and PR review fixes, do not use
+  it starts and its Task Checkout is released. The Task is recorded as an
+  Error that names the missing folder, so it holds no execution capacity and no
+  later pass starts it. SlashIt does not fall back silently: the person
+  restores the folder or changes the root, then moves the Task back to Queue to
+  run it. Other agent runs, such as AI review and PR review fixes, do not use
   the Workspace root.
 - **Verified execution limits (as of this increment).** Only a custom root
   reaches a Claude Code Worker. The managed root is created and reported, but

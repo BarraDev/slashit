@@ -159,18 +159,20 @@ async fn create_repository_core(
         return Err(format!("'{}' is not a directory", local_path));
     }
 
-    // Answered before any version-control side effect, so a folder that is
-    // already registered is never initialized a second time. The committed step
-    // below repeats this check under the write lock.
-    if let Some(existing) = registered_repository_for(
+    // The conflict check only reads, so a remote mismatch refuses before any
+    // side effect. A registered folder still goes through `ensure_vcs_initialized`:
+    // it refuses a folder inside another repository and initializes a folder that
+    // was registered as plain and is now asked to become Git. The helper does
+    // nothing for a folder that already has commits, so it is not initialized twice.
+    let registered = registered_repository_for(
         &*repositories.read().await,
         &canonical_or_raw(&path),
         remote_url.as_deref(),
-    )? {
+    )?;
+    let git_freshly_initialized = ensure_vcs_initialized(&path, initialize, expected_files).await?;
+    if let Some(existing) = registered {
         return Ok(existing);
     }
-
-    let git_freshly_initialized = ensure_vcs_initialized(&path, initialize, expected_files).await?;
 
     let id = Uuid::new_v4();
     let remote_type = remote_url.as_ref().and_then(|url| {
@@ -255,21 +257,27 @@ fn registered_repository_for(
     canonical: &Path,
     remote_url: Option<&str>,
 ) -> Result<Option<Repository>, String> {
-    let Some(existing) = repositories
+    // Legacy config can hold several records for one folder. Choose by a stable
+    // order, and prefer the record whose remote matches the request.
+    let mut matches: Vec<&Repository> = repositories
         .values()
-        .find(|r| canonical_or_raw(Path::new(&r.local_path)) == canonical)
-    else {
+        .filter(|r| canonical_or_raw(Path::new(&r.local_path)) == canonical)
+        .collect();
+    matches.sort_by_key(|r| r.id);
+    let Some(first) = matches.first() else {
         return Ok(None);
     };
     match remote_url {
-        Some(url) if existing.remote_url.as_deref() != Some(url) => Err(format!(
-            "'{}' is already registered as repository {} with remote {}. The supplied remote '{}' conflicts with it, and the existing record was not changed.",
-            canonical.display(),
-            existing.id,
-            existing.remote_url.as_deref().unwrap_or("(none)"),
-            url
-        )),
-        _ => Ok(Some(existing.clone())),
+        None => Ok(Some((*first).clone())),
+        Some(url) => match matches.iter().find(|r| r.remote_url.as_deref() == Some(url)) {
+            Some(compatible) => Ok(Some((*compatible).clone())),
+            // The message names the folder and record only: a remote URL can carry credentials.
+            None => Err(format!(
+                "'{}' is already registered as repository {}, and the supplied remote conflicts with its stored remote. The existing record was not changed.",
+                canonical.display(),
+                first.id
+            )),
+        },
     }
 }
 
@@ -452,6 +460,85 @@ mod tests {
         let head = git(&folder, &["symbolic-ref", "HEAD"]);
         assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "refs/heads/trunk-xyz");
         assert!(git(&folder, &["rev-parse", "--verify", "refs/heads/trunk-xyz"]).status.success());
+    }
+
+    /// A folder registered as plain, then asked to become Git, is initialized and
+    /// keeps its existing record.
+    #[tokio::test]
+    async fn a_registered_plain_folder_is_initialized_when_git_is_now_requested() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let first = create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, None, None)
+            .await
+            .expect("the plain folder is registered");
+        assert!(!is_git_repo_root(&folder));
+
+        let second = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+        )
+        .await
+        .expect("the requested initialization runs");
+        assert_eq!(second.id, first.id, "the existing record is reused");
+        assert!(is_git_repo_root(&folder), "the requested Git initialization must run");
+    }
+
+    /// A registered folder that later sits inside another repository is refused
+    /// again, as a new folder would be.
+    #[tokio::test]
+    async fn a_registered_folder_inside_another_repository_is_refused_again() {
+        let (storage, temp) = create_test_storage();
+        let parent = temp.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, None, None)
+            .await
+            .expect("the child folder is registered first");
+        assert!(git(&parent, &["init"]).status.success());
+
+        let again = create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, None, None).await;
+        assert!(
+            again.is_err_and(|e| e.contains("inside git repository")),
+            "a registered subdirectory of another checkout must be refused"
+        );
+    }
+
+    /// A remote conflict names the folder and record, never the remote URLs,
+    /// which can carry credentials.
+    #[tokio::test]
+    async fn a_remote_conflict_does_not_repeat_the_remote_urls() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        create_repository_core(
+            &repositories,
+            &storage,
+            folder.to_string_lossy().to_string(),
+            Some("https://user:hunter2@example.com/stored.git".to_string()),
+            None,
+            None,
+        )
+        .await
+        .expect("the folder is registered with its remote");
+
+        let conflict = create_repository_core(
+            &repositories,
+            &storage,
+            folder.to_string_lossy().to_string(),
+            Some("https://other.example.com/supplied.git".to_string()),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a different remote conflicts");
+        assert!(conflict.contains("conflicts with its stored remote"), "{conflict}");
+        for secret in ["hunter2", "stored.git", "supplied.git", "other.example.com"] {
+            assert!(!conflict.contains(secret), "the conflict repeated {secret}: {conflict}");
+        }
     }
 
     /// A folder holding files gets them as its first commit, ignore rules

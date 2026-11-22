@@ -27,6 +27,8 @@ pub fn ProjectOrganizer(
     let projects = RwSignal::new(Vec::<Project>::new());
     let load_error = RwSignal::new(None::<String>);
     let action_error = RwSignal::new(None::<String>);
+    // Whether a read has succeeded, so an empty list is shown only once it is known.
+    let loaded = RwSignal::new(false);
 
     // Overlapping reloads (on open, after a removal) apply only the newest reply,
     // and a reply that arrives after the panel closed is dropped.
@@ -42,6 +44,7 @@ pub fn ProjectOrganizer(
             match result {
                 Ok(list) => {
                     let _ = projects.try_set(list);
+                    let _ = loaded.try_set(true);
                     let _ = load_error.try_set(None);
                 }
                 Err(e) => {
@@ -58,8 +61,50 @@ pub fn ProjectOrganizer(
             reload();
         }
     });
+    // A read still pending when the panel closes must not update the rows that stay
+    // cached for the next opening, so closing invalidates it.
+    Effect::new(move |_| {
+        if !show.get() {
+            reload_seq.update_value(|n| *n += 1);
+        }
+    });
 
     let close = move || set_show.set(false);
+
+    // The element that had focus when the panel opened, which gets focus back on close.
+    // Declared before the focus effect below, so it reads focus before the dialog takes it.
+    let opener = StoredValue::new(None::<web_sys::HtmlElement>);
+    Effect::new(move |_| {
+        if show.get() {
+            let active = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.active_element());
+            opener.set_value(active.and_then(|e| {
+                use wasm_bindgen::JsCast;
+                e.dyn_into::<web_sys::HtmlElement>().ok()
+            }));
+        }
+    });
+
+    // Focus moves into the dialog when it opens, so its Escape handler receives keys
+    // from the keyboard.
+    let dialog_ref = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move |_| {
+        if show.get() {
+            if let Some(dialog) = dialog_ref.get() {
+                let _ = dialog.focus();
+            }
+        }
+    });
+
+    // Closing returns focus to the element that opened the panel, if it is still there.
+    Effect::new(move |_| {
+        if !show.get() {
+            if let Some(element) = opener.get_value() {
+                let _ = element.focus();
+            }
+        }
+    });
 
     view! {
         <Show when=move || show.get()>
@@ -70,6 +115,8 @@ pub fn ProjectOrganizer(
                 ></div>
 
                 <div
+                    node_ref=dialog_ref
+                    tabindex="-1"
                     data-testid="project-organizer"
                     role="dialog"
                     aria-modal="true"
@@ -79,6 +126,14 @@ pub fn ProjectOrganizer(
                     on:keydown=move |e| {
                         if e.key() == "Escape" {
                             close();
+                        } else if e.key() == "Tab" {
+                            // aria-modal keeps Tab inside the dialog: wrap at its edges.
+                            if let Some(dialog) = dialog_ref.get() {
+                                if let Some(target) = tab_wrap_target(&dialog, e.shift_key()) {
+                                    e.prevent_default();
+                                    let _ = target.focus();
+                                }
+                            }
                         }
                     }
                 >
@@ -117,10 +172,19 @@ pub fn ProjectOrganizer(
 
                         <Show
                             when=move || !projects.with(Vec::is_empty)
-                            fallback=move || view! {
-                                <p data-testid="project-organizer-empty" class="text-sm text-white/50">
-                                    "No Projects are open. Open a folder to add one."
-                                </p>
+                            fallback=move || if loaded.get() {
+                                view! {
+                                    <p data-testid="project-organizer-empty" class="text-sm text-white/50">
+                                        "No Projects are open. Open a folder to add one."
+                                    </p>
+                                }.into_any()
+                            } else if load_error.with(Option::is_some) {
+                                // The read failed: the error above says so, and no request is pending.
+                                ().into_any()
+                            } else {
+                                view! {
+                                    <p class="text-sm text-white/50">"Loading Projects…"</p>
+                                }.into_any()
                             }
                         >
                             <ul class="space-y-3 max-h-[40vh] overflow-y-auto" data-testid="project-organizer-list">
@@ -152,6 +216,47 @@ pub fn ProjectOrganizer(
             </div>
         </Show>
     }
+}
+
+/// Moves focus to the Organizer dialog, for when the control that had it is removed.
+fn focus_organizer_dialog() {
+    use wasm_bindgen::JsCast;
+    let dialog = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector("[data-testid=\"project-organizer\"]").ok().flatten())
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok());
+    if let Some(dialog) = dialog {
+        let _ = dialog.focus();
+    }
+}
+
+/// The controls Tab moves between inside the Organizer, in tab order.
+const FOCUSABLE: &str = "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex=\"-1\"])";
+
+/// The index of the control Tab should wrap to, or None to let the browser move focus.
+/// `current` is the focused control's index; None means focus is on the dialog itself or outside it.
+fn tab_wrap_index(current: Option<usize>, count: usize, shift: bool) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    if shift {
+        (current.is_none() || current == Some(0)).then_some(count - 1)
+    } else {
+        (current.is_none() || current == Some(count - 1)).then_some(0)
+    }
+}
+
+/// The control to focus instead of the browser's next Tab stop, when that stop would leave the dialog.
+fn tab_wrap_target(dialog: &web_sys::HtmlElement, shift: bool) -> Option<web_sys::HtmlElement> {
+    use wasm_bindgen::JsCast;
+    let document = web_sys::window()?.document()?;
+    let active = document.active_element()?;
+    let active: &web_sys::Node = active.as_ref();
+    let items = dialog.query_selector_all(FOCUSABLE).ok()?;
+    let nodes: Vec<web_sys::Node> = (0..items.length()).filter_map(|i| items.item(i)).collect();
+    let current = nodes.iter().position(|node| node.is_same_node(Some(active)));
+    let index = tab_wrap_index(current, nodes.len(), shift)?;
+    nodes.get(index)?.clone().dyn_into::<web_sys::HtmlElement>().ok()
 }
 
 /// The Project selection to set after `removed` was removed, or None when the
@@ -240,14 +345,18 @@ fn ProjectRow(
     let confirming = RwSignal::new(false);
     let removing = RwSignal::new(false);
 
+    // A rename and a removal of one row are not allowed at the same time.
     let can_save = move || {
         let typed = draft.get();
         let typed = typed.trim();
-        !saving.get() && !typed.is_empty() && typed != saved.get()
+        !saving.get() && !removing.get() && !typed.is_empty() && typed != saved.get()
     };
 
     let on_rename = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
+        if saving.get_untracked() || removing.get_untracked() {
+            return;
+        }
         let name = draft.get_untracked().trim().to_string();
         if name.is_empty() {
             action_error.set(Some("A Project needs a name.".to_string()));
@@ -261,6 +370,13 @@ fn ProjectRow(
                     // (the panel closed), so every write from here uses try_set.
                     let _ = saved.try_set(name.clone());
                     let _ = draft.try_set(name.clone());
+                    // The shared list shows the new name, even if this row is reopened
+                    // before the next reload finishes.
+                    let _ = projects.try_update(|list| {
+                        for project in list.iter_mut().filter(|p| p.id == id) {
+                            project.name = name.clone();
+                        }
+                    });
                     action_error.set(None);
                     toast::success(format!("Renamed to '{name}'. The folder was not changed."));
                     on_changed.run(());
@@ -292,20 +408,30 @@ fn ProjectRow(
             let outcome = removal_outcome(&reply, still_listed);
             if matches!(
                 outcome,
-                RemovalOutcome::Removed | RemovalOutcome::RemovedWithError
+                RemovalOutcome::Removed | RemovalOutcome::RemovedWithError | RemovalOutcome::Unknown
             ) {
                 // In Workspace context the Project is only a stale id, so the selection
                 // is cleared without switching context. In Project context the next
-                // active Project is picked.
-                let next = if selected_workspace
+                // active Project is picked. An Unknown outcome may have removed the
+                // Project, but the list is unknown too, so the selection is cleared
+                // without a replacement rather than moved to an unverified Project.
+                let next = if matches!(outcome, RemovalOutcome::Unknown) {
+                    None
+                } else if selected_workspace
                     .try_get_untracked()
                     .is_some_and(|w| w.is_empty())
                 {
-                    list_projects()
-                        .await
-                        .unwrap_or_default()
-                        .first()
-                        .map(|p| p.id.to_string())
+                    // A failed read is not an empty list: the next Project is unknown, so
+                    // the selection is cleared and the person is told why.
+                    match list_projects().await {
+                        Ok(list) => list.first().map(|p| p.id.to_string()),
+                        Err(e) => {
+                            toast::error(format!(
+                                "Could not confirm the next open Project ({e}). Choose one from the list."
+                            ));
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
@@ -318,6 +444,9 @@ fn ProjectRow(
                     let _ = set_selected_project.try_set(selection);
                 }
             }
+            // A removed row stays disabled until the reload drops it; only a refused
+            // or unknown removal makes it actionable again.
+            let row_gone = matches!(outcome, RemovalOutcome::Removed | RemovalOutcome::RemovedWithError);
             match outcome {
                 RemovalOutcome::Removed => {
                     let _ = action_error.try_set(None);
@@ -343,11 +472,17 @@ fn ProjectRow(
                 }
             }
             let _ = confirming.try_set(false);
+            if row_gone {
+                // The removed row's buttons are about to go; keep keyboard focus in the dialog.
+                focus_organizer_dialog();
+            }
             // Both lists are reloaded whatever the outcome: they show what the backend holds now.
             // try_run: the panel may have closed while the request was in flight.
             let _ = reload.try_run(());
             let _ = on_changed.try_run(());
-            let _ = removing.try_set(false);
+            if !row_gone {
+                let _ = removing.try_set(false);
+            }
         });
     };
 
@@ -393,7 +528,11 @@ fn ProjectRow(
                         <button
                             type="button"
                             disabled=move || removing.get()
-                            on:click=move |_| confirming.set(false)
+                            on:click=move |_| {
+                                // The confirmation's buttons disappear here, which would drop focus out of the dialog.
+                                confirming.set(false);
+                                focus_organizer_dialog();
+                            }
                             class="px-3 py-1.5 rounded-lg text-white/70 hover:bg-white/5 transition-colors"
                         >
                             "Cancel"
@@ -416,7 +555,24 @@ fn ProjectRow(
 
 #[cfg(test)]
 mod tests {
-    use super::{removal_outcome, selection_after_removal, RemovalOutcome};
+    use super::{removal_outcome, selection_after_removal, tab_wrap_index, RemovalOutcome};
+
+    #[test]
+    fn tab_leaves_the_organizer_only_by_wrapping_to_its_first_or_last_control() {
+        // Forward from the last control, or from outside, wraps to the first.
+        assert_eq!(tab_wrap_index(Some(2), 3, false), Some(0));
+        assert_eq!(tab_wrap_index(None, 3, false), Some(0));
+        // Forward within the dialog is left to the browser.
+        assert_eq!(tab_wrap_index(Some(0), 3, false), None);
+        assert_eq!(tab_wrap_index(Some(1), 3, false), None);
+        // Backward from the first control, from the dialog itself, or from outside wraps to the last.
+        assert_eq!(tab_wrap_index(Some(0), 3, true), Some(2));
+        assert_eq!(tab_wrap_index(None, 3, true), Some(2));
+        assert_eq!(tab_wrap_index(Some(1), 3, true), None);
+        // A dialog with no controls has nothing to move to.
+        assert_eq!(tab_wrap_index(None, 0, false), None);
+        assert_eq!(tab_wrap_index(None, 0, true), None);
+    }
 
     #[test]
     fn the_removed_selection_is_replaced_when_no_workspace_was_chosen() {

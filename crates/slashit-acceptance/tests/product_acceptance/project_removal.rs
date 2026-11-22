@@ -383,3 +383,94 @@ async fn after_restart(
     }
     Ok(())
 }
+
+const WEBDRIVER_TAB: &str = "\u{E004}";
+/// The first button of the removal confirmation, which is Cancel.
+const ORGANIZER_CANCEL: &str = "[data-testid=\"project-organizer-confirm\"] button";
+
+/// Where keyboard focus is: `inside` the Organizer, `body`, or `outside:<element>`.
+async fn focus_location(driver: &WebDriver) -> Result<String> {
+    let value = page(
+        driver,
+        "const a = document.activeElement; \
+         const d = document.querySelector('[data-testid=\"project-organizer\"]'); \
+         if (!a || a === document.body) return 'body'; \
+         if (d && d.contains(a)) return 'inside'; \
+         return 'outside:' + a.tagName + ' ' + (a.getAttribute('data-testid') || a.getAttribute('aria-label') || '');",
+        vec![],
+    )
+    .await?;
+    Ok(value.as_str().unwrap_or_default().to_string())
+}
+
+async fn organizer_is_open(driver: &WebDriver) -> Result<bool> {
+    Ok(page(driver, "return !!document.querySelector('[data-testid=\"project-organizer\"]');", vec![]).await?
+        == Value::Bool(true))
+}
+
+async fn rail_organize_has_focus(driver: &WebDriver) -> Result<bool> {
+    Ok(page(
+        driver,
+        "return document.activeElement === document.querySelector('[data-testid=\"rail-organize-projects\"]');",
+        vec![],
+    )
+    .await?
+        == Value::Bool(true))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn organizer_keeps_keyboard_focus_inside_while_open() {
+    let context = TestContext::new("project_organizer_focus").expect("harness setup");
+    let folder = context.state().path().join("folders").join("gamma");
+    let outcome = async {
+        fs::create_dir_all(&folder).context("could not create the fixture folder")?;
+        fs::write(folder.join("README.md"), "gamma\n").context("could not write the fixture file")?;
+        let session = context.start_session("focus").await?;
+        let outcome = organizer_focus(session.driver(), &folder).await;
+        context.close_session(session, "focus", &outcome).await?;
+        outcome
+    }
+    .await;
+    context.finish(outcome);
+}
+
+/// Focus enters the Organizer on open, Tab never leaves it, Escape and the Close button
+/// close it, and focus returns to the Organize Projects control that opened it.
+async fn organizer_focus(driver: &WebDriver, folder: &Path) -> Result<()> {
+    open_folder(driver, folder, "Gamma").await?;
+    driver.refresh().await.context("could not reload the application window")?;
+
+    ui::visible(driver, RAIL_ORGANIZE).await?.click().await.context("could not open Organize Projects")?;
+    ui::visible(driver, ORGANIZER).await?;
+    wait_until("keyboard focus to enter the Organizer", || async {
+        Ok(focus_location(driver).await? == "inside")
+    })
+    .await?;
+
+    // Forty Tab presses cover the dialog several times over; any press that leaves it fails.
+    for step in 0..40 {
+        driver.active_element().await?.send_keys(WEBDRIVER_TAB).await.context("could not press Tab")?;
+        let location = focus_location(driver).await?;
+        if location != "inside" {
+            bail!("Tab press {step} moved keyboard focus out of the open Organizer to {location}");
+        }
+    }
+
+    // Cancelling a removal removes its buttons; focus must stay inside the dialog.
+    ui::visible(driver, ORGANIZER_REMOVE).await?.click().await.context("could not press Remove")?;
+    ui::visible(driver, ORGANIZER_CANCEL).await?.click().await.context("could not press Cancel")?;
+    let location = focus_location(driver).await?;
+    if location != "inside" {
+        bail!("cancelling a removal left keyboard focus at {location}, outside the Organizer");
+    }
+
+    driver.active_element().await?.send_keys(WEBDRIVER_ESCAPE).await.context("could not press Escape")?;
+    wait_until("Escape to close the Organizer", || async { Ok(!organizer_is_open(driver).await?) }).await?;
+    wait_until("focus to return to Organize Projects after Escape", || rail_organize_has_focus(driver)).await?;
+
+    ui::visible(driver, RAIL_ORGANIZE).await?.click().await.context("could not reopen Organize Projects")?;
+    ui::visible(driver, ORGANIZER_CLOSE).await?.click().await.context("could not press Close")?;
+    wait_until("the Close button to close the Organizer", || async { Ok(!organizer_is_open(driver).await?) }).await?;
+    wait_until("focus to return to Organize Projects after Close", || rail_organize_has_focus(driver)).await?;
+    Ok(())
+}

@@ -76,11 +76,21 @@ pub fn CreateProjectModal(
         }
     });
 
+    // Counts each opening of the modal. A reply to a request begun in an earlier
+    // opening must not close this one or select its Project.
+    let opening = StoredValue::new(0u64);
+    Effect::new(move |_| {
+        if show.get() {
+            opening.update_value(|n| *n += 1);
+        }
+    });
+
     // Handle "Open Folder" - directly open folder picker and create project
     let handle_open_folder = {
         move |_| {
             let on_created = on_project_created;
             let set_show_clone = set_show;
+            let session = opening.get_value();
             spawn_local(async move {
                 match pick_folder().await {
                     Ok(Some(path)) => {
@@ -99,11 +109,14 @@ pub fn CreateProjectModal(
                                 match create_project(project_name.clone(), Some(repo.id.to_string()), AgentType::ClaudeCode).await {
                                     Ok(project) => {
                                         // Opening a folder that a removed Project used returns that Project.
-                                        toast::success(format!("Project '{}' is open.", project_name));
+                                        // The stored name: a removed Project may come back under another name.
+                                        toast::success(format!("Project '{}' is open.", project.name));
                                         announce_setup_needed(&project).await;
-                                        set_show_clone.set(false);
-                                        if let Some(callback) = on_created {
-                                            callback.run(project);
+                                        if opening.try_get_value() == Some(session) {
+                                            set_show_clone.set(false);
+                                            if let Some(callback) = on_created {
+                                                callback.run(project);
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -121,9 +134,11 @@ pub fn CreateProjectModal(
                                         match existing {
                                             Some(project) => {
                                                 toast::info(format!("Project '{}' is already open.", project.name));
-                                                set_show_clone.set(false);
-                                                if let Some(callback) = on_created {
-                                                    callback.run(project);
+                                                if opening.try_get_value() == Some(session) {
+                                                    set_show_clone.set(false);
+                                                    if let Some(callback) = on_created {
+                                                        callback.run(project);
+                                                    }
                                                 }
                                             }
                                             None => {

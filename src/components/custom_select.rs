@@ -127,10 +127,20 @@ pub fn CustomSelect(
         true
     });
     
+    // A select that becomes disabled while open closes, and an option click can no
+    // longer change it.
+    Effect::new(move |_| {
+        if disabled.get() {
+            set_is_open.set(false);
+        }
+    });
+
     // Handle option selection
     let handle_select = move |value: String| {
-        on_change.run(value);
         set_is_open.set(false);
+        if !disabled.get_untracked() {
+            on_change.run(value);
+        }
     };
     
     // Handle keyboard navigation
