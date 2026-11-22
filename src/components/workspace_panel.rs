@@ -288,6 +288,9 @@ fn WorkspaceItem(
     let (expanded, set_expanded) = signal(false);
     let (busy, set_busy) = signal(false);
     let reload = PendingReload::new(set_busy, on_membership_change);
+    // Workspace Home re-reads on this counter. The panel's own callback is lost if the
+    // organizer closes mid-request, so a rename or root save bumps it directly.
+    let set_membership_version = expect_context::<WriteSignal<u32>>();
     let (selected_to_attach, set_selected_to_attach) = signal(String::new());
     let ws_id = workspace.id;
     // The row stays mounted across reloads (the list is keyed by id), so the name and
@@ -369,6 +372,7 @@ fn WorkspaceItem(
                     let _ = on_membership_change.try_run(());
                 }
             }
+            set_membership_version.update(|v| *v += 1);
             let _ = set_busy.try_set(false);
         });
     };
@@ -393,6 +397,7 @@ fn WorkspaceItem(
                     let _ = on_membership_change.try_run(());
                 }
             }
+            set_membership_version.update(|v| *v += 1);
             let _ = set_busy.try_set(false);
         });
     };
