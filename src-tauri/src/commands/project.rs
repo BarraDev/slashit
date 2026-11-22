@@ -2724,21 +2724,19 @@ pub(crate) mod tests {
         let task = crate::test_helpers::create_test_task_full("queued", project_id, crate::domain::TaskStatus::Backlog, 0);
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task);
-        let state = Arc::new(state);
 
-        // The Queue move holds the Task's lease while the detach starts.
+        // The Queue move holds the Task's lease while the detach starts. The
+        // detach is polled by hand: Pending proves it parked on that lease
+        // (the project gate is uncontended and comes first) before the Queue
+        // move lands.
         let move_lease = state.task_lifecycle_locks.acquire(task_id).await.expect("the move takes its lease");
-        let detach = {
-            let state = state.clone();
-            tokio::spawn(async move { detach_project_from_workspace_core(&state, project_id, workspace_id).await })
-        };
-        tokio::task::yield_now().await;
+        let mut detach = std::pin::pin!(detach_project_from_workspace_core(&state, project_id, workspace_id));
+        assert!(poll_once(detach.as_mut()).is_pending(), "the detach must park on the Task's lease");
         state.task.tasks.write().await.get_mut(&task_id).expect("the Task").status = crate::domain::TaskStatus::Queue;
         drop(move_lease);
 
         let err = detach
             .await
-            .expect("the detach finishes")
             .expect_err("a queued Task keeps its Project in the Workspace");
         assert!(err.contains("is in Queue"), "{err}");
         assert_eq!(
@@ -2747,12 +2745,19 @@ pub(crate) mod tests {
         );
     }
 
+    /// Polls a future once with a waker that does nothing. The waker is never
+    /// used: the tests poll again by hand, so the poll results order the steps.
+    fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        std::future::Future::poll(fut, &mut cx)
+    }
+
     /// One removal against one mutation that asks for the Task's lease while the
-    /// removal holds it. The mutation is spawned and then polled once: on the
-    /// current-thread test runtime that runs it until it parks on the lease, so
-    /// the lease is the only thing it can be waiting for. `release_before_write`
-    /// drops the lease before `removed_at` is written, which is the ordering the
-    /// real removal must never use.
+    /// removal holds it. The mutation is polled by hand until it returns Pending,
+    /// which proves it is parked on that lease. The removal then writes
+    /// `removed_at`, the lease is dropped, and the parked mutation is awaited.
+    /// `release_before_write` drops the lease before `removed_at` is written,
+    /// which is the ordering the real removal must never use.
     async fn removal_against_waiting_mutation(release_before_write: bool) -> Result<(), String> {
         let project_id = Uuid::new_v4();
         let task = crate::test_helpers::create_test_task_full("waits", project_id, crate::domain::TaskStatus::Backlog, 0);
@@ -2762,25 +2767,28 @@ pub(crate) mod tests {
         let projects = Arc::new(RwLock::new(HashMap::from([(project_id, make_test_project(project_id))])));
 
         let removal_lease = locks.acquire(task_id).await.expect("the removal takes the lease");
-        let mutation = {
-            let (locks, tasks, projects) = (locks.clone(), tasks.clone(), projects.clone());
-            tokio::spawn(async move {
-                lease_active_task_in(&locks, &tasks, &projects, task_id).await.map(|_| ())
-            })
-        };
-        tokio::task::yield_now().await;
+        let mut mutation = std::pin::pin!(async {
+            lease_active_task_in(&locks, &tasks, &projects, task_id).await.map(|_| ())
+        });
+        assert!(
+            poll_once(mutation.as_mut()).is_pending(),
+            "the mutation must park on the removal's lease before the removal writes"
+        );
         let removed = || async {
             projects.write().await.get_mut(&project_id).expect("the Project").removed_at = Some(chrono::Utc::now());
         };
         if release_before_write {
             drop(removal_lease);
-            tokio::task::yield_now().await;
+            // The released lease must let the mutation land before the write.
+            let std::task::Poll::Ready(result) = poll_once(mutation.as_mut()) else {
+                panic!("the mutation must land once the lease is released");
+            };
             removed().await;
-        } else {
-            removed().await;
-            drop(removal_lease);
+            return result;
         }
-        mutation.await.expect("the mutation finishes")
+        removed().await;
+        drop(removal_lease);
+        mutation.await
     }
 
     /// A removal holds a Task's lease while it writes `removed_at`. A mutation
