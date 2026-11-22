@@ -4111,6 +4111,59 @@ pub(crate) mod tests {
         assert_eq!(on_disk[&id.to_string()].scope.workspace_id(), Some(workspace_id));
     }
 
+    /// The command refuses a member with unfinished Task work before any write, and
+    /// the Project keeps the Workspace it names.
+    #[tokio::test]
+    async fn detach_command_refuses_a_member_with_unfinished_work_and_keeps_its_workspace() {
+        use tauri::Manager;
+
+        for (status, reason) in [
+            (crate::domain::TaskStatus::Queue, "is in Queue; move it out of Queue first"),
+            (crate::domain::TaskStatus::InProgress, "is in progress; stop it first"),
+            (
+                crate::domain::TaskStatus::HumanReview,
+                "is waiting for your review decision",
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let paths = std::sync::Arc::new(AppPaths::with_roots(
+                tmp.path().join("config"),
+                tmp.path().join("data"),
+                tmp.path().join("cache"),
+                tmp.path().join("runtime"),
+            ));
+            let (state, _report) = crate::app_core::build_state_with_paths(paths)
+                .await
+                .expect("build state");
+            let workspace_id = Uuid::new_v4();
+            let mut project = make_test_project(Uuid::new_v4());
+            project.scope = ProjectScope::InWorkspace { workspace_id };
+            let id = project.id;
+            state.project.projects.write().await.insert(id, project);
+            let label = format!("{status:?}");
+            let task = crate::test_helpers::create_test_task_full("unfinished work", id, status, 0);
+            state.task.tasks.write().await.insert(task.id, task);
+            let app = tauri::test::mock_app();
+            app.manage(state);
+
+            let refusal = detach_project_from_workspace(
+                GuiMutation::untracked(),
+                app.state(),
+                id.to_string(),
+                workspace_id.to_string(),
+            )
+            .await
+            .expect_err("a member with unfinished Task work must not be detached");
+
+            assert!(refusal.contains(reason), "{label}: {refusal}");
+            assert!(refusal.contains("Nothing was changed"), "{label}: {refusal}");
+            let scope = app.state::<crate::AppState>().project.projects.read().await[&id]
+                .scope
+                .workspace_id();
+            assert_eq!(scope, Some(workspace_id), "{label}: the Workspace is unchanged");
+        }
+    }
+
     #[tokio::test]
     async fn reopening_a_removed_member_restores_it_to_its_original_workspace() {
         let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;

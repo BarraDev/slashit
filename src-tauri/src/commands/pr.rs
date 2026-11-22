@@ -1071,11 +1071,16 @@ pub async fn analyze_pr_comments(
     task_id: String,
 ) -> Result<PrReviewPlan, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let task = {
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
+    // Refuse a removed Project before the checkout is resolved or read, and
+    // before GitHub is asked for review data. The lease taken below stays
+    // authoritative for the run itself.
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, task.project_id)
+        .await?;
+    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let pr_url = pr_url_for_task(&task)?;
     // Record the checkout state the triage helper is about to read: its
     // branch tip and the content of its uncommitted changes. An analysis
@@ -1474,6 +1479,18 @@ pub async fn discuss_pr_review_questions(
     plan: PrReviewPlan,
 ) -> Result<PrReviewPlan, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    // A removed Project is refused before its checkout is resolved, so the
+    // refusal names the removal rather than a missing worktree.
+    let project_id = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .map(|t| t.project_id)
+        .ok_or("Task not found")?;
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, project_id)
+        .await?;
     let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
 
     // Discuss runs `ToolAccess::ReadOnly` (see `run_claude_pr_helper(.., false, ..)`).
@@ -15276,8 +15293,10 @@ mod tests {
             /// reservation at all, so the lease check is the only guard it has.
             /// A removed Project's Task records nothing, and an active one links.
             #[tokio::test(flavor = "multi_thread")]
+            #[cfg(unix)]
             async fn linking_a_pull_request_refuses_a_removed_project_without_recording_it() {
                 let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
                 let repo = RepoFixture::new();
                 point_origin_at_github(&repo);
                 let (state, _tmp) = build_test_state().await;
@@ -15308,6 +15327,7 @@ mod tests {
                     serde_json::to_value(&before).unwrap(),
                     "a refused link changes no Task state or evidence"
                 );
+                assert_eq!(mock.read_log(), "", "the refusal comes before any gh call");
 
                 for project in state.project.projects.write().await.values_mut() {
                     project.removed_at = None;
@@ -15345,6 +15365,152 @@ mod tests {
                 .expect_err("a removed Project's review replies are not synced");
 
                 assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                assert_eq!(mock.read_log(), "", "no GitHub call was made");
+            }
+
+            /// Analyzing a removed Project's pull request is refused before the
+            /// checkout is read or GitHub is asked for review data, even when the
+            /// PR has no comments (the early return that would skip the lease).
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn analyzing_a_removed_projects_comments_makes_no_github_call() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", "{}");
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-analyze-removed"), TaskStatus::HumanReview)
+                        .await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.pr_url = Some("https://github.com/testorg/testrepo/pull/19".into());
+                }
+                let before = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let refusal = analyze_pr_comments(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                )
+                .await
+                .expect_err("a removed Project's comments are not analyzed");
+
+                assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                assert_eq!(mock.read_log(), "", "no GitHub call was made");
+                let after = app
+                    .state::<crate::AppState>()
+                    .task
+                    .tasks
+                    .read()
+                    .await
+                    .get(&task_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "a refused analysis changes no Task state"
+                );
+            }
+
+            /// Discussing a removed Project's review questions is refused by the helper
+            /// lease, after the Task's workspace is resolved and before any agent or
+            /// GitHub call. The Task has a worktree so the workspace check passes first.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discussing_a_removed_projects_review_questions_makes_no_github_call() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", "{}");
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-discuss-removed"), TaskStatus::HumanReview)
+                        .await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.pr_url = Some("https://github.com/testorg/testrepo/pull/19".into());
+                    // No worktree: the removal, not a missing checkout, must be the refusal.
+                    task.worktree_path = None;
+                }
+                let before = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+                let plan = crate::domain::task::PrReviewPlan {
+                    generated_at: chrono::Utc::now(),
+                    pr_url: "https://github.com/testorg/testrepo/pull/19".into(),
+                    review_decision: None,
+                    comments: Vec::new(),
+                    items: Vec::new(),
+                    raw_plan: String::new(),
+                    last_apply: None,
+                    fixed_content: Vec::new(),
+                    analyzed_head_oid: None,
+                    analyzed_worktree_oid: None,
+                    analyzed_worktree_fingerprint: None,
+                    analyzed_at: None,
+                };
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let refusal = discuss_pr_review_questions(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                    plan,
+                )
+                .await
+                .expect_err("a removed Project's review questions are not discussed");
+
+                assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                assert_eq!(mock.read_log(), "", "no GitHub call was made");
+                let after = app
+                    .state::<crate::AppState>()
+                    .task
+                    .tasks
+                    .read()
+                    .await
+                    .get(&task_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "a refused discussion changes no Task state"
+                );
+            }
+
+            /// Address needs the Editing helper lease, which a removed Project's Task
+            /// must not get. Checked on `begin_pr_helper` directly: `address_pr_review`
+            /// takes an `AppHandle` that the mock cannot supply on this path.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn addressing_a_removed_projects_review_takes_no_editing_lease() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", "{}");
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-address-removed"), TaskStatus::HumanReview)
+                        .await;
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+
+                match begin_pr_helper(&state, task_id, PrHelperPurpose::Editing).await {
+                    Err(refusal) => {
+                        assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL)
+                    }
+                    Ok(_) => panic!("a removed Project's Task took an Editing PR helper lease"),
+                }
                 assert_eq!(mock.read_log(), "", "no GitHub call was made");
             }
 

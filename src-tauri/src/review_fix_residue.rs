@@ -867,6 +867,7 @@ mod tests {
             .begin_attempt(fx.task_id, fx.checkout.to_str().unwrap())
             .await
             .unwrap();
+        let before = residue(&fx).await.expect("an unresolved record exists before the refusal");
         let mut project = crate::commands::project::tests::make_test_project(fx.project_id);
         project.removed_at = Some(chrono::Utc::now());
         fx.state.project.projects.write().await.insert(fx.project_id, project);
@@ -882,8 +883,11 @@ mod tests {
         )
         .await;
 
-        assert!(refused.is_err(), "a removed Project's record is not cleared");
-        assert!(residue(&fx).await.is_some(), "the unresolved record stays");
+        assert_eq!(
+            refused.expect_err("a removed Project's record is not cleared"),
+            crate::domain::project::PROJECT_REMOVED_REFUSAL
+        );
+        assert_eq!(residue(&fx).await, Some(before), "the unresolved record is unchanged");
     }
 
     #[tokio::test]
