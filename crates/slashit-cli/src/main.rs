@@ -408,42 +408,6 @@ fn request_for(command: &Commands) -> Result<IpcRequest> {
     })
 }
 
-#[cfg(test)]
-mod dispatch_tests {
-    use super::*;
-
-    const TASK: &str = "6f96fefa-0000-0000-0000-000000000003";
-
-    fn request_for_args(args: &[&str]) -> IpcRequest {
-        let cli = Cli::try_parse_from(args).expect("the arguments parse");
-        request_for(&cli.command).expect("the command maps to a request")
-    }
-
-    /// `slashit runs` reaches the evidence verb, and only that verb: it must
-    /// not fall through to the full Task record `inspect` asks for.
-    #[test]
-    fn runs_sends_the_read_only_evidence_request() {
-        match request_for_args(&["slashit", "runs", TASK]) {
-            IpcRequest::GetTaskEvidence { task_id } => assert_eq!(task_id, TASK),
-            other => panic!("runs mapped to {other:?}"),
-        }
-    }
-
-    #[test]
-    fn inspect_still_sends_the_full_task_record_request() {
-        match request_for_args(&["slashit", "inspect", TASK]) {
-            IpcRequest::GetTask { task_id } => assert_eq!(task_id, TASK),
-            other => panic!("inspect mapped to {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_daemon_command_is_not_a_request() {
-        let cli = Cli::try_parse_from(["slashit", "daemon", "status"]).expect("parses");
-        assert!(request_for(&cli.command).is_err());
-    }
-}
-
 /// Answer "is a daemon running?" with an exit status a script can branch on.
 ///
 /// A GUI instance answering is deliberately *not* success: the question is
@@ -509,5 +473,41 @@ fn report_no_daemon(json: bool, reason: &str, endpoint: &str) {
     } else {
         println!("No daemon is answering on {endpoint}.");
         eprintln!("{reason}");
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    const TASK: &str = "6f96fefa-0000-0000-0000-000000000003";
+
+    fn request_for_args(args: &[&str]) -> IpcRequest {
+        let cli = Cli::try_parse_from(args).expect("the arguments parse");
+        request_for(&cli.command).expect("the command maps to a request")
+    }
+
+    /// `slashit runs` reaches the evidence verb, and only that verb: it must
+    /// not fall through to the full Task record `inspect` asks for.
+    #[test]
+    fn runs_sends_the_read_only_evidence_request() {
+        match request_for_args(&["slashit", "runs", TASK]) {
+            IpcRequest::GetTaskEvidence { task_id } => assert_eq!(task_id, TASK),
+            other => panic!("runs mapped to {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_still_sends_the_full_task_record_request() {
+        match request_for_args(&["slashit", "inspect", TASK]) {
+            IpcRequest::GetTask { task_id } => assert_eq!(task_id, TASK),
+            other => panic!("inspect mapped to {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_daemon_command_is_not_a_request() {
+        let cli = Cli::try_parse_from(["slashit", "daemon", "status"]).expect("parses");
+        assert!(request_for(&cli.command).is_err());
     }
 }
