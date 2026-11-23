@@ -502,28 +502,6 @@ async fn remove_project_committed(
              its registered path, then remove the Project again."
         ));
     }
-    // Legacy records can open one folder as two active Projects. Removing this one
-    // would leave its folder held by the other, and reopening it would then be
-    // refused as a second active Project on that checkout.
-    let other_active = {
-        let projects_r = projects.read().await;
-        let repositories_r = repositories.read().await;
-        let wanted = canonical_folder(&folder);
-        projects_r
-            .values()
-            .find(|p| {
-                p.id != id
-                    && !p.is_removed()
-                    && p.repository_path(&repositories_r).is_some_and(|path| canonical_folder(&path) == wanted)
-            })
-            .map(|p| p.name.clone())
-    };
-    if let Some(name) = other_active {
-        return Err(format!(
-            "This Project cannot be removed: its folder is also open as Project '{name}'. Remove that Project first. Nothing was changed."
-        ));
-    }
-
     let durable = storage.load_project_tasks(id).map_err(|e| {
         format!(
             "This Project's Task records cannot be read, so SlashIt cannot prove that removing \
@@ -4735,22 +4713,31 @@ pub(crate) mod tests {
         assert!(refusal.contains("unavailable") && refusal.contains("Nothing was changed"), "{refusal}");
     }
 
-    /// Legacy records can open one folder as two active Projects. Removing one
-    /// would leave the other holding the folder, so the removal is refused.
+    /// Legacy records can open one folder as two active Projects. Both must be
+    /// removable, since refusing both would deadlock them. Reopening the removed one
+    /// is refused while the other stays active.
     #[tokio::test]
-    async fn removing_a_project_whose_folder_another_active_project_holds_is_refused() {
+    async fn legacy_duplicate_projects_on_one_folder_can_both_be_removed() {
         let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
         let repository_id = projects.read().await[&id].repository_id;
         let mut other = make_test_project(Uuid::new_v4());
         other.repository_id = repository_id;
+        let other_id = other.id;
         projects.write().await.insert(other.id, other);
         let tasks = board(vec![]);
 
-        let refusal = remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+        remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
             .await
-            .expect_err("the shared folder is held by another active Project");
-        assert!(refusal.contains("also open as Project"), "{refusal}");
-        assert!(!projects.read().await[&id].is_removed(), "nothing was changed");
+            .expect("the first duplicate is removed");
+        assert!(projects.read().await[&id].is_removed());
+        assert!(!projects.read().await[&other_id].is_removed(), "the other duplicate stays active");
+
+        let reopen = reopen_project_committed(&projects, &repositories, &storage, id).await;
+        assert!(reopen.is_err_and(|e| e.contains("already open")), "reopening beside an active Project is refused");
+
+        remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, other_id)
+            .await
+            .expect("the second duplicate is removed too, so there is no deadlock");
     }
 
     /// A removed Project keeps its folder. Reassigning another active Project to
