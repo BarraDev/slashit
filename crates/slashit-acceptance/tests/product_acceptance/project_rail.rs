@@ -791,3 +791,135 @@ async fn closing_the_organizer_while_an_attach_is_pending_leaves_the_app_respons
     .await;
     context.finish(outcome);
 }
+
+/// Scenario: text typed into the Workspace name while its rename is in flight
+/// is kept when the reply arrives. The reply confirms the name that was
+/// submitted, and it does not replace the newer text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workspace_name_typed_during_its_rename_survives_the_reply() {
+    let context = TestContext::new("project_rail_rename_inflight").expect("harness setup");
+
+    let outcome = async {
+        let session = context.start_session("rail-rename-inflight").await?;
+        let driver = session.driver();
+        let workspace = created_id(
+            ui::invoke(driver, "create_workspace", json!({ "name": "Rename Alpha", "rootPath": Value::Null })).await?,
+            "create_workspace",
+        )?;
+        driver.refresh().await.context("could not reload the application window")?;
+        ui::assert_frontend_is_real(driver).await?;
+
+        ui::visible(driver, &workspace_select(&workspace)).await?.click().await.context("could not select Rename Alpha")?;
+        wait_until("Workspace Home to show Rename Alpha", || async { Ok(home_name(driver).await? == "Rename Alpha") })
+            .await?;
+
+        let field = ui::visible(driver, "[data-testid=\"workspace-rename-input\"]").await?;
+        field.clear().await.context("could not clear the name field")?;
+        field.send_keys("Renamed Once").await.context("could not type the new name")?;
+
+        ui::arm_invoke_fault(driver, "rename_workspace", ui::InvokeFault::Hold).await?;
+        ui::visible(driver, "[data-testid=\"workspace-rename-save\"]")
+            .await?
+            .click()
+            .await
+            .context("could not save the name")?;
+        wait_until("the rename to be issued", || async { Ok(ui::invoke_fault_state(driver).await?.0) }).await?;
+
+        // Typed while the save is still in flight.
+        ui::visible(driver, "[data-testid=\"workspace-rename-input\"]")
+            .await?
+            .send_keys(" and more")
+            .await
+            .context("could not type while the rename is in flight")?;
+
+        ui::release_invoke_hold(driver).await?;
+        wait_until("the held rename reply to reach the application", || async {
+            Ok(ui::invoke_fault_state(driver).await?.1)
+        })
+        .await?;
+        wait_until("Workspace Home to show the saved name", || async {
+            Ok(home_name(driver).await? == "Renamed Once")
+        })
+        .await?;
+
+        let draft = page(
+            driver,
+            "const el = document.querySelector('[data-testid=\"workspace-rename-input\"]'); return el ? el.value : null;",
+            vec![],
+        )
+        .await?;
+        if draft != json!("Renamed Once and more") {
+            bail!("the rename reply replaced text typed during the save: the name field shows {draft}");
+        }
+
+        context.close_session(session, "rail-rename-inflight", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    context.finish(outcome);
+}
+
+/// Scenario: text typed into the Workspace root field while its save is in
+/// flight is kept when the reply arrives, as with the name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workspace_root_typed_during_its_save_survives_the_reply() {
+    let context = TestContext::new("project_rail_root_inflight").expect("harness setup");
+
+    let outcome = async {
+        let folder = context.state().path().join("folders").join("root-inflight");
+        std::fs::create_dir_all(&folder).context("could not create the fixture folder")?;
+        let location = folder.to_str().context("the folder path is not UTF-8")?.to_string();
+
+        let session = context.start_session("rail-root-inflight").await?;
+        let driver = session.driver();
+        let workspace = created_id(
+            ui::invoke(driver, "create_workspace", json!({ "name": "Root Alpha", "rootPath": Value::Null })).await?,
+            "create_workspace",
+        )?;
+        driver.refresh().await.context("could not reload the application window")?;
+        ui::assert_frontend_is_real(driver).await?;
+
+        ui::visible(driver, &workspace_select(&workspace)).await?.click().await.context("could not select Root Alpha")?;
+        wait_until("Workspace Home to show Root Alpha", || async { Ok(home_name(driver).await? == "Root Alpha") }).await?;
+
+        let field = ui::visible(driver, "[data-testid=\"workspace-root-input\"]").await?;
+        field.clear().await.context("could not clear the root field")?;
+        field.send_keys(&location).await.context("could not type the root folder")?;
+
+        ui::arm_invoke_fault(driver, "set_workspace_root", ui::InvokeFault::Hold).await?;
+        ui::visible(driver, "[data-testid=\"workspace-root-save\"]")
+            .await?
+            .click()
+            .await
+            .context("could not save the root")?;
+        wait_until("the root save to be issued", || async { Ok(ui::invoke_fault_state(driver).await?.0) }).await?;
+
+        ui::visible(driver, "[data-testid=\"workspace-root-input\"]")
+            .await?
+            .send_keys("-later")
+            .await
+            .context("could not type while the root save is in flight")?;
+
+        ui::release_invoke_hold(driver).await?;
+        wait_until("the held root reply to reach the application", || async {
+            Ok(ui::invoke_fault_state(driver).await?.1)
+        })
+        .await?;
+
+        let draft = page(
+            driver,
+            "const el = document.querySelector('[data-testid=\"workspace-root-input\"]'); return el ? el.value : null;",
+            vec![],
+        )
+        .await?;
+        let expected = format!("{location}-later");
+        if draft != json!(expected) {
+            bail!("the root reply replaced text typed during the save: the root field shows {draft}");
+        }
+
+        context.close_session(session, "rail-root-inflight", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    context.finish(outcome);
+}

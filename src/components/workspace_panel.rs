@@ -351,7 +351,8 @@ fn WorkspaceItem(
     });
 
     let on_rename = move |_| {
-        let name = name_draft.get().trim().to_string();
+        let typed = name_draft.get();
+        let name = typed.trim().to_string();
         if name.is_empty() {
             toast::error("A workspace name is required".to_string());
             return;
@@ -360,7 +361,11 @@ fn WorkspaceItem(
         spawn_local(async move {
             match workspace_service::rename_workspace(&ws_id.to_string(), &name).await {
                 Ok(saved) => {
-                    let _ = name_draft.try_set(saved.name);
+                    // Replace the draft only while it still holds what was submitted, so
+                    // text typed during the save is kept.
+                    if name_draft.try_get_untracked().as_deref() == Some(typed.as_str()) {
+                        let _ = name_draft.try_set(saved.name);
+                    }
                     toast::success("Workspace renamed".to_string());
                     // try_run: the organizer may have closed during the request.
                     let _ = on_membership_change.try_run(());
@@ -379,11 +384,15 @@ fn WorkspaceItem(
 
     // `path` is the custom root to set, or None to return to the managed root.
     let set_root = move |path: Option<String>| {
+        // The draft as it was when the save started; see `on_rename`.
+        let typed = root_draft.get_untracked();
         set_busy.set(true);
         spawn_local(async move {
             match workspace_service::set_workspace_root(&ws_id.to_string(), path.as_deref()).await {
                 Ok(saved) => {
-                    let _ = root_draft.try_set(saved.root_path.unwrap_or_default());
+                    if root_draft.try_get_untracked().as_deref() == Some(typed.as_str()) {
+                        let _ = root_draft.try_set(saved.root_path.unwrap_or_default());
+                    }
                     load_root_info();
                     toast::success("Workspace root saved; existing folders were not moved".to_string());
                     // try_run: the organizer may have closed during the request.
