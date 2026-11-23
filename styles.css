@@ -220,6 +220,90 @@ button:focus:not(:focus-visible) {
   color: #fbbf24;
 }
 
+/* Workspace groups: a chevron (expands members) beside the Workspace's own
+   select control. The chevron is narrow so the 48px strip still fits. */
+.rail-group {
+  display: flex;
+  flex-direction: column;
+}
+
+/* The chevron sits in a 12px strip on the left edge, and the Workspace badge
+   starts at 14px, so the badge stays inside the 48px collapsed rail. */
+.rail-workspace-row {
+  position: relative;
+  display: flex;
+}
+
+/* The global button rule adds padding; the reset keeps the chevron in its strip. */
+/* z-index: the Workspace select button is a later, positioned sibling, and
+   would otherwise paint over the chevron and take its clicks. */
+.rail-toggle {
+  position: absolute;
+  z-index: 1;
+  inset: 0 auto 0 0;
+  width: 12px;
+  min-width: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: rgba(255,255,255,0.35);
+  cursor: pointer;
+}
+
+.rail-toggle:hover {
+  color: rgba(255,255,255,0.7);
+}
+
+.rail-toggle svg {
+  transition: transform 0.15s;
+}
+
+.rail-toggle svg.rotate-90 {
+  transform: rotate(90deg);
+}
+
+.rail-workspace {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-left: 14px;
+  padding-right: 0;
+}
+
+/* Members keep the badge inside the 48px rail; the guide line shows nesting. */
+.rail-item.rail-member {
+  padding-left: 14px;
+  box-shadow: inset 2px 0 0 rgba(255,255,255,0.08);
+}
+
+.rail-badge.workspace {
+  border-radius: 10px;
+  border-style: dashed;
+  border-color: rgba(255,255,255,0.12);
+}
+
+.rail-badge.warn {
+  background: rgba(248,113,113,0.15);
+  color: #fca5a5;
+}
+
+.rail-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #fca5a5;
+}
+
+.rail-separator {
+  height: 1px;
+  margin: 6px 10px;
+  background: rgba(255,255,255,0.08);
+}
+
 .rail-active-indicator {
   position: absolute;
   left: 0;

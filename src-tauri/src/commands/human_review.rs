@@ -110,6 +110,7 @@ pub async fn approve_task(
     tip: Option<String>,
 ) -> Result<ApprovalOutcome, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     approve(&state, task_id, create_pr, tip.as_deref()).await
 }
 
@@ -122,6 +123,7 @@ pub async fn create_approved_task_pr(
     task_id: String,
 ) -> Result<ApprovalOutcome, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     retry_delivery(&state, task_id).await
 }
 
@@ -140,6 +142,7 @@ pub async fn complete_task_locally(
     without_pull_request: Option<bool>,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     complete_locally(&state, task_id, without_pull_request.unwrap_or(false)).await
 }
 
@@ -157,6 +160,7 @@ pub async fn request_task_changes(
     feedback: String,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     request_changes(&state, task_id, &feedback).await
 }
 
@@ -445,6 +449,7 @@ pub async fn approve_task_again(
     tip: String,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(&state, task_id).await?;
     approve_again(&state, task_id, &tip).await
 }
 
@@ -453,7 +458,7 @@ pub(crate) async fn approve_again(
     task_id: Uuid,
     tip: &str,
 ) -> Result<Task, String> {
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await.ok_or("Task not found")?;
     check_reviewable(&task, "approved again")?;
@@ -627,7 +632,7 @@ pub(crate) async fn complete_locally(
     task_id: Uuid,
     without_pull_request: bool,
 ) -> Result<Task, String> {
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await.ok_or("Task not found")?;
     if task.completed_locally() {
@@ -721,7 +726,7 @@ async fn record_approval(
     task_id: Uuid,
     shown_tip: Option<&str>,
 ) -> Result<Task, String> {
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await.ok_or("Task not found")?;
     check_reviewable(&task, "approved")?;
@@ -779,7 +784,7 @@ async fn request_changes(
         ));
     }
 
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await.ok_or("Task not found")?;
     check_reviewable(&task, "sent back with changes")?;
@@ -1042,6 +1047,42 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("the Task did not reach {wanted:?}");
+    }
+
+    /// A request for changes that waits on a removal's lease can only proceed
+    /// after the removal has committed `removed_at`, so it must refuse and
+    /// leave the Task and its review record as they were.
+    #[tokio::test]
+    async fn a_request_for_changes_waiting_on_a_removal_is_refused_and_writes_nothing() {
+        let (tmp, state) = test_state().await;
+        let (project_id, task_id) = seed_in_review(&state, &tmp).await;
+        let before = state.task.tasks.read().await[&task_id].clone();
+        let removal = state
+            .task_lifecycle_locks
+            .acquire(task_id)
+            .await
+            .expect("the removal takes the lease");
+
+        let removal_side = async {
+            tokio::task::yield_now().await;
+            state.project.projects.write().await.get_mut(&project_id).expect("the Project").removed_at =
+                Some(chrono::Utc::now());
+            drop(removal);
+        };
+        let (_, outcome) =
+            tokio::join!(removal_side, request_changes(&state, task_id, "Also count lines."));
+
+        assert_eq!(
+            outcome.expect_err("the request must be refused"),
+            crate::domain::project::PROJECT_REMOVED_REFUSAL
+        );
+        let after = state.task.tasks.read().await[&task_id].clone();
+        assert_eq!(after.status, before.status);
+        assert_eq!(
+            format!("{:?}", after.human_review),
+            format!("{:?}", before.human_review),
+            "a refused request leaves the review record exactly as found"
+        );
     }
 
     /// Two review cycles, then an approval whose pull request fails twice:
@@ -1511,6 +1552,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
         (repo, project_id, base)
@@ -2458,6 +2500,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
         let mut task = create_test_task_full("stale in jj", project_id, TaskStatus::HumanReview, 0);

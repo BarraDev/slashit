@@ -76,11 +76,21 @@ pub fn CreateProjectModal(
         }
     });
 
+    // Counts each opening of the modal. A reply to a request begun in an earlier
+    // opening must not close this one or select its Project.
+    let opening = StoredValue::new(0u64);
+    Effect::new(move |_| {
+        if show.get() {
+            opening.update_value(|n| *n += 1);
+        }
+    });
+
     // Handle "Open Folder" - directly open folder picker and create project
     let handle_open_folder = {
         move |_| {
             let on_created = on_project_created;
             let set_show_clone = set_show;
+            let session = opening.get_value();
             spawn_local(async move {
                 match pick_folder().await {
                     Ok(Some(path)) => {
@@ -98,16 +108,44 @@ pub fn CreateProjectModal(
                                 // Create project with the new repository
                                 match create_project(project_name.clone(), Some(repo.id.to_string()), AgentType::ClaudeCode).await {
                                     Ok(project) => {
-                                        toast::success(format!("Project '{}' created successfully!", project_name));
+                                        // Opening a folder that a removed Project used returns that Project.
+                                        // The stored name: a removed Project may come back under another name.
+                                        toast::success(format!("Project '{}' is open.", project.name));
                                         announce_setup_needed(&project).await;
-                                        set_show_clone.set(false);
-                                        if let Some(callback) = on_created {
-                                            callback.run(project);
+                                        if opening.try_get_value() == Some(session) {
+                                            set_show_clone.set(false);
+                                            if let Some(callback) = on_created {
+                                                callback.run(project);
+                                            }
                                         }
                                     }
                                     Err(e) => {
-                                        toast::error(format!("Failed to create project: {}", e));
-                                        leptos::logging::error!("Failed to create project: {}", e);
+                                        // Only the explicit duplicate-open refusal selects the existing Project.
+                                        // Any other failure, including one reported after the Project was
+                                        // saved, is shown as the error it is.
+                                        let existing = if e.contains("already open as Project") {
+                                            crate::services::list_projects()
+                                                .await
+                                                .ok()
+                                                .and_then(|projects| projects.into_iter().find(|p| p.repository_id == Some(repo.id)))
+                                        } else {
+                                            None
+                                        };
+                                        match existing {
+                                            Some(project) => {
+                                                toast::info(format!("Project '{}' is already open.", project.name));
+                                                if opening.try_get_value() == Some(session) {
+                                                    set_show_clone.set(false);
+                                                    if let Some(callback) = on_created {
+                                                        callback.run(project);
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                toast::error(format!("Failed to create project: {}", e));
+                                                leptos::logging::error!("Failed to create project: {}", e);
+                                            }
+                                        }
                                     }
                                 }
                             }

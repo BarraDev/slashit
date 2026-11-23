@@ -92,7 +92,8 @@ impl Membership {
         let workspace_id = projects.get(&project_id).and_then(|p| p.scope.workspace_id());
         let root = workspace_id
             .and_then(|id| registry.get(&id))
-            .map(|ws| ws.root_path.as_path().to_path_buf());
+            .and_then(|ws| ws.root_path.as_ref())
+            .map(|root| root.as_path().to_path_buf());
         Self { project_id: Some(project_id), workspace_id, root }
     }
 }
@@ -1283,6 +1284,9 @@ pub enum PrHelperRefusal {
     /// An integration of the task into a local branch was started and not
     /// finished; resuming or discarding it comes first.
     IntegrationUnfinished,
+    /// The task's Project was removed. A removed Project is read-only, and a
+    /// PR helper reads or writes the Task, the plan and the checkout.
+    ProjectRemoved,
     /// The task still holds unresolved Worker recovery evidence, and a helper
     /// that can edit its checkout would change what a person has yet to
     /// inspect. Carries `Task::worker_recovery_refusal`'s own wording.
@@ -1337,6 +1341,9 @@ impl std::fmt::Display for PrHelperRefusal {
                 "an integration of this task into a local branch was started and not finished, so \
                  an agent cannot work in its checkout. Resume or discard the integration first"
             ),
+            Self::ProjectRemoved => {
+                f.write_str(crate::domain::project::PROJECT_REMOVED_REFUSAL)
+            }
             Self::WorkerRecovery(refusal) => f.write_str(refusal),
         }
     }
@@ -2386,13 +2393,24 @@ impl TaskExecutor {
             return Ok(PromotionOutcome::NoCapacity);
         };
 
+        // Tasks of removed Projects are never promoted; read before the queue
+        // locks so the selection itself stays synchronous.
+        let removed: HashSet<Uuid> = self
+            .projects
+            .read()
+            .await
+            .values()
+            .filter(|project| project.is_removed())
+            .map(|project| project.id)
+            .collect();
         let mut reserved = self.reserved_permits.write().await;
         let manager = self.queue_manager.read().await;
+        let admits = |task: &Task| {
+            !removed.contains(&task.project_id) && start_lease_admits(&self.storage, task)
+        };
         let select = |tasks: &HashMap<Uuid, Task>| match choice {
-            PromotionChoice::Next => manager
-                .select_promotable(tasks, |task| start_lease_admits(&self.storage, task)),
-            PromotionChoice::Exact(task_id) => manager
-                .select_exact(tasks, task_id, |task| start_lease_admits(&self.storage, task)),
+            PromotionChoice::Next => manager.select_promotable(tasks, admits),
+            PromotionChoice::Exact(task_id) => manager.select_exact(tasks, task_id, admits),
         };
         let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
             if let Some(task) = staged.get_mut(&task_id) {
@@ -2406,6 +2424,9 @@ impl TaskExecutor {
 
         match promoted? {
             Some(task) => {
+                // A new promotion is a new admission decision, so it ends any
+                // backoff a refused start of the same Task left behind.
+                self.unrecorded_backoff_lock().remove(&task.id);
                 reserved.insert(task.id, permit);
                 Ok(PromotionOutcome::Promoted(Box::new(task)))
             }
@@ -2488,6 +2509,21 @@ impl TaskExecutor {
     /// fix agent there and commits there -- so a terminalization that only
     /// looked at `running_handles` would happily remove a checkout an AI review
     /// was halfway through.
+    /// Whether the Project a Task belongs to has been removed. A removed
+    /// Project starts no work: promotion and execution both ask this.
+    async fn task_project_removed(&self, task_id: Uuid) -> bool {
+        let project_id = self.tasks.read().await.get(&task_id).map(|t| t.project_id);
+        match project_id {
+            Some(project_id) => self
+                .projects
+                .read()
+                .await
+                .get(&project_id)
+                .is_some_and(|project| project.is_removed()),
+            None => false,
+        }
+    }
+
     pub async fn is_task_running(&self, task_id: Uuid) -> bool {
         let running = self
             .running_handles
@@ -3286,6 +3322,9 @@ impl TaskExecutor {
         let Some(recorded) = state.as_recorded() else {
             return Ok(());
         };
+        if self.task_project_removed(task_id).await {
+            return Ok(());
+        }
         // Answers are applied once a whole batch has settled, so a newer
         // reading may have landed in the meantime, say an open after a
         // reopen. Only what the cache still says is acted on.
@@ -3379,6 +3418,10 @@ impl TaskExecutor {
         if self.tasks.read().await.get(&task_id).is_some_and(|t| t.cleanup_in_flight) {
             return Err(format!("Pull request #{} merge commit was not recorded: Task cleanup is in flight; refresh once it finishes", key.number));
         }
+        // Checked under the lease: removal holds it while it writes `removed_at`.
+        if self.task_project_removed(task_id).await {
+            return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+        }
         let key_owned = key.clone();
         let commit_owned = commit.to_string();
         let backfill = move |staged: &mut HashMap<Uuid, Task>| {
@@ -3434,6 +3477,15 @@ impl TaskExecutor {
         key: &crate::pr_status::PrKey,
         state: &str,
     ) {
+        // Declined while another transition holds the task: the next poll
+        // observes the same state again, so nothing is lost.
+        let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
+            return;
+        };
+        // Checked under the lease: removal holds it while it writes `removed_at`.
+        if self.task_project_removed(task_id).await {
+            return;
+        }
         let state_owned = state.to_string();
         let key_owned = key.clone();
         let revise = move |staged: &mut HashMap<Uuid, Task>| {
@@ -3613,6 +3665,18 @@ impl TaskExecutor {
                 success: true,
                 message: Some("PR merged — task complete".to_string()),
             }),
+
+            // The Project was removed before the removal's lease was taken, so
+            // nothing was written. A removed Project's Tasks are read-only, so
+            // the ref is not latched here; later polls skip the removed Project
+            // by their own check.
+            Err(refusal @ crate::lifecycle::TerminalizeRefusal::ProjectRemoved) => {
+                self.events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Warn,
+                    message: format!("The pull request is merged, but the task was not finished: {refusal}"),
+                })
+            }
 
             // Answered, and the merge is durable: `record_first` reached the
             // disk in the write that announced the cleanup, before anything
@@ -5415,6 +5479,14 @@ impl TaskExecutor {
                 }
             };
         }
+        if self.task_project_removed(task_id).await {
+            return match request {
+                StartRequest::Pending => Ok(false),
+                StartRequest::Direct | StartRequest::NewAttempt { .. } => {
+                    Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string())
+                }
+            };
+        }
 
         // The authorized decision, when this is a new attempt. Read under the
         // lease below, and used again for the Git checks before anything is written.
@@ -5697,7 +5769,32 @@ impl TaskExecutor {
             Self::read_membership(&self.tasks, &self.projects, &self.workspace_registry, task_id)
                 .await;
         let (claude_cwd, claude_add_dirs) =
-            Self::launch_for_membership(&membership, &acquired.info.path);
+            match Self::launch_for_membership(&membership, &acquired.info.path) {
+                Ok(launch) => launch,
+                Err(refusal) => {
+                    self.worktree_manager
+                        .release_unrecorded(&repo_path, &acquired.info, acquired.created_at.as_deref())
+                        .await;
+                    // Recorded as an Error, not left InProgress: an InProgress Task
+                    // counts against `parallel_task_limit` and would hold capacity
+                    // until the root returns. An Error is not promoted or started
+                    // again until a person moves it back to Queue.
+                    Self::set_task_error_static(
+                        &self.tasks,
+                        &self.storage,
+                        &self.events,
+                        task_id,
+                        &refusal,
+                        None,
+                    )
+                    .await;
+                    // If the write did not persist, the Task is still ready and the next
+                    // pass would acquire and release its checkout again. The backoff
+                    // bounds that for this process whether or not the record persisted.
+                    self.back_off_refused_start(task_id);
+                    return Err(refusal);
+                }
+            };
         let RunStart {
             working_dir,
             run,
@@ -6236,6 +6333,19 @@ impl TaskExecutor {
         Err(message)
     }
 
+    /// Holds the next start of `task_id` back for [`UNRECORDED_ACQUISITION_BACKOFF`]
+    /// after a refused start, so a missing prerequisite does not acquire and
+    /// release a checkout on every pass when the refusal could not be recorded.
+    fn back_off_refused_start(&self, task_id: Uuid) {
+        self.unrecorded_backoff_lock().insert(
+            task_id,
+            UnrecordedBackoff {
+                since: std::time::Instant::now(),
+                announced: true,
+            },
+        );
+    }
+
     fn unrecorded_backoff_lock(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<Uuid, UnrecordedBackoff>> {
@@ -6517,6 +6627,13 @@ impl TaskExecutor {
                 .contains_key(&task_id);
         if already_owned {
             return Err(PrHelperRefusal::TaskAlreadyOwned);
+        }
+        // Checked under the lease: removal holds it while it writes `removed_at`.
+        let project_id = self.tasks.read().await.get(&task_id).map(|t| t.project_id);
+        if let Some(project_id) = project_id {
+            if crate::lifecycle::project_is_removed(&self.projects, project_id).await {
+                return Err(PrHelperRefusal::ProjectRemoved);
+            }
         }
         if purpose == PrHelperPurpose::Editing {
             if let Some(refusal) = self
@@ -8478,7 +8595,8 @@ impl TaskExecutor {
                 .read()
                 .await
                 .get(&id)
-                .map(|ws| ws.root_path.as_path().to_path_buf()),
+                .and_then(|ws| ws.root_path.as_ref())
+                .map(|root| root.as_path().to_path_buf()),
             None => None,
         };
         Membership { project_id: Some(project_id), workspace_id, root }
@@ -8487,25 +8605,30 @@ impl TaskExecutor {
     /// Resolve agent launch context.
     ///
     /// If the task's project is attached to a workspace *and that
-    /// workspace's root still exists on disk*, return `(workspace_root,
+    /// workspace has a custom root that exists, return `(workspace_root,
     /// [task_working_dir])` so Claude runs from the workspace cwd with the
-    /// task tree exposed via `--add-dir`. Otherwise return
-    /// `(task_working_dir, [])` — the same fallback used when there is no
-    /// workspace at all. A registered root that has been unmounted, renamed,
-    /// or deleted must not fail the task: the task's own worktree is
-    /// unaffected by the workspace root disappearing, so launching from it
-    /// directly is strictly safer than erroring out from underneath a task
-    /// whose own working directory is still perfectly valid.
+    /// task tree exposed via `--add-dir`. A Workspace without a custom root
+    /// keeps the Worker in its Task Checkout, `(task_working_dir, [])`, so its
+    /// managed root never changes what a Worker can reach.
+    ///
+    /// A configured custom root that is missing refuses the start. Silently
+    /// running from the Task Checkout instead would change the Worker's
+    /// context without the person knowing. The Task Checkout is unaffected,
+    /// so the person restores the folder or changes the root and runs again.
     fn launch_for_membership(
         membership: &Membership,
         task_working_dir: &str,
-    ) -> (String, Vec<std::path::PathBuf>) {
-        match membership.root.as_ref().filter(|root| root.is_dir()) {
-            Some(root) => (
+    ) -> Result<(String, Vec<std::path::PathBuf>), String> {
+        match membership.root.as_ref() {
+            Some(root) if !root.is_dir() => Err(format!(
+                "The Workspace root {} is missing. Nothing was started. Restore the folder or change the Workspace root, then move this Task back to Queue to run it.",
+                root.display()
+            )),
+            Some(root) => Ok((
                 root.to_string_lossy().to_string(),
                 vec![std::path::PathBuf::from(task_working_dir)],
-            ),
-            None => (task_working_dir.to_string(), Vec::new()),
+            )),
+            None => Ok((task_working_dir.to_string(), Vec::new())),
         }
     }
 
@@ -8897,6 +9020,8 @@ impl TaskExecutor {
                 t.status = TaskStatus::Error;
                 t.phase = TaskPhase::Failed;
                 t.worker_handoff_confirmed = false;
+                // A refused or failed start ends the confirmation, so a new attempt must be confirmed again.
+                t.new_attempt_confirmed = false;
                 t.error_message = Some(msg_owned.clone());
                 if let Some(tools) = &tools {
                     tools.apply_to(t);
@@ -9403,6 +9528,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         }
     }
 
@@ -9418,7 +9544,7 @@ mod tests {
         let workspace_root = tempfile::TempDir::new().expect("workspace root tempdir");
         let workspace = Workspace::new(
             "ws".to_string(),
-            WorkspaceRoot::try_new(workspace_root.path()).expect("real dir must validate"),
+            Some(WorkspaceRoot::try_new(workspace_root.path()).expect("real dir must validate")),
         );
         let workspace_id = workspace.id;
 
@@ -9438,7 +9564,7 @@ mod tests {
         let registry = Arc::new(RwLock::new(registry));
         let membership = TaskExecutor::read_membership(&tasks, &projects, &registry, task_id).await;
         let (root, extra_dirs) =
-            TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir");
+            TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir").unwrap();
 
         assert_eq!(
             root,
@@ -9455,17 +9581,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_workspace_launch_falls_back_to_task_dir_when_the_registered_root_is_missing() {
+    async fn resolve_workspace_launch_refuses_when_the_configured_root_is_missing() {
         // The registry holds a root that no longer exists on disk — e.g. an
         // unmounted drive, a rename, or a deleted folder — which
         // `WorkspaceRoot::from_trusted` allows (registry loads never
-        // re-validate). The task's own worktree is unaffected and must still
-        // be usable.
+        // re-validate). The Worker must not silently start in its Task Checkout
+        // instead, so the start is refused and says what is missing.
         let vanished = tempfile::TempDir::new()
             .expect("tempdir")
             .path()
             .join("gone");
-        let workspace = Workspace::new("ws".to_string(), WorkspaceRoot::from_trusted(vanished));
+        let workspace = Workspace::new("ws".to_string(), Some(WorkspaceRoot::from_trusted(vanished)));
         let workspace_id = workspace.id;
 
         let (mut registry, _reg_temp) = test_registry();
@@ -9485,17 +9611,40 @@ mod tests {
 
         let registry = Arc::new(RwLock::new(registry));
         let membership = TaskExecutor::read_membership(&tasks, &projects, &registry, task_id).await;
-        let (root, extra_dirs) =
-            TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir");
+        let refusal = TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir")
+            .expect_err("a configured but missing workspace root must refuse the start");
 
-        assert_eq!(
-            root, "/tmp/task-working-dir",
-            "a missing workspace root must fall back to the task's own working directory"
-        );
         assert!(
-            extra_dirs.is_empty(),
-            "the fallback must match the no-workspace shape exactly (no --add-dir entries)"
+            refusal.contains("is missing") && refusal.contains("Nothing was started"),
+            "the refusal must say what is missing and that nothing started: {refusal}"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_launch_keeps_the_task_dir_for_a_workspace_without_a_custom_root() {
+        // A managed root is never a Worker's working directory: the Workspace
+        // without a custom root launches exactly as a standalone Project does.
+        let workspace = Workspace::new("ws".to_string(), None);
+        let workspace_id = workspace.id;
+        let (mut registry, _reg_temp) = test_registry();
+        registry.upsert(workspace).expect("upsert should succeed");
+
+        let project_id = Uuid::new_v4();
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            test_project(project_id, ProjectScope::InWorkspace { workspace_id }),
+        )])));
+        let task = create_test_task_full("t", project_id, TaskStatus::InProgress, 0);
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+
+        let registry = Arc::new(RwLock::new(registry));
+        let membership = TaskExecutor::read_membership(&tasks, &projects, &registry, task_id).await;
+        let (root, extra_dirs) =
+            TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir").unwrap();
+
+        assert_eq!(root, "/tmp/task-working-dir");
+        assert!(extra_dirs.is_empty());
     }
 
     fn test_storage() -> (crate::config::Storage, tempfile::TempDir) {
@@ -10589,6 +10738,46 @@ mod tests {
             "the failure must be surfaced, not silently swallowed; recorded events: {:?}",
             recording.recorded()
         );
+    }
+
+    /// A poll observation must not write to a Task while a removal holds its
+    /// lease, and must not write after the removal has committed. The removal
+    /// writes `removed_at` under that lease, so the observation either declines
+    /// (lease busy) or is refused by the removed Project; both leave the Task as
+    /// it was.
+    #[tokio::test]
+    async fn a_pr_observation_during_or_after_a_removal_writes_nothing() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let (id, project_id) = task_with_open_pr(&executor, None).await;
+        executor
+            .projects
+            .write()
+            .await
+            .insert(project_id, test_project(project_id, ProjectScope::Standalone));
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let before = executor.tasks.read().await.get(&id).cloned().expect("task");
+
+        let removal = executor.lifecycle.try_acquire(id).await.expect("the removal takes the lease");
+        executor.record_pr_poll_state(id, &key, "CLOSED").await;
+        assert_eq!(
+            format!("{:?}", executor.tasks.read().await[&id].external_refs),
+            format!("{:?}", before.external_refs),
+            "an observation while the removal holds the lease writes nothing"
+        );
+        executor.projects.write().await.get_mut(&project_id).expect("the Project").removed_at =
+            Some(chrono::Utc::now());
+        drop(removal);
+
+        executor.record_pr_poll_state(id, &key, "CLOSED").await;
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            format!("{:?}", after.external_refs),
+            format!("{:?}", before.external_refs),
+            "an observation after the removal committed writes nothing"
+        );
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.error_message, before.error_message);
     }
 
     /// A closure observation whose directory sync failed has still been
@@ -23107,7 +23296,7 @@ VERDICT: APPROVED"
             let digest = crate::queue::prompt::task_input_digest(&w.in_memory().await);
             let _lease = w.executor.lifecycle.acquire(id).await.unwrap();
             let moved = crate::lifecycle::enqueue_leased(
-                &w.executor.tasks, &w.executor.storage, project, id, &TaskStatus::Error,
+                &w.executor.tasks, &w.executor.storage, &w.executor.projects, project, id, &TaskStatus::Error,
                 Some(crate::lifecycle::InputApproval { id: Uuid::new_v4(), digest: &digest, request: None, checkout: None }),
             )
             .await
@@ -23912,6 +24101,50 @@ VERDICT: APPROVED"
             refused_then_recorded_after_retry(Class::StackedResumedRegistered).await;
         }
 
+        /// A Workspace whose root has gone missing refuses the start. The refusal
+        /// is recorded on the Task once as an Error, and later passes do not
+        /// acquire and release a checkout, because an Error is not started.
+        #[tokio::test]
+        async fn a_start_refused_for_a_missing_workspace_root_is_logged_and_backed_off() {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let w = world_with(test_executor_with_events(recording.clone()), Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let root_dir = tempfile::TempDir::new().unwrap();
+            let root = crate::domain::WorkspaceRoot::try_new(root_dir.path()).unwrap();
+            let workspace = crate::domain::Workspace::new("Shared".into(), Some(root));
+            w.executor
+                .workspace_registry
+                .write()
+                .await
+                .upsert(workspace.clone())
+                .expect("the Workspace is registered");
+            w.executor.projects.write().await.get_mut(&w.project_id).unwrap().scope =
+                ProjectScope::InWorkspace {
+                    workspace_id: workspace.id,
+                };
+            let ready_before = w.in_memory().await;
+            drop(root_dir);
+
+            let first = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(
+                first.as_ref().is_err_and(|e| e.contains("is missing") && e.contains("Nothing was started")),
+                "{first:?}"
+            );
+            assert_eq!(created_worktrees(&recording), 1);
+            assert_eq!(ready_before.status, TaskStatus::InProgress);
+            assert_eq!(w.in_memory().await.status, TaskStatus::Error, "the refusal is recorded on the Task");
+            assert!(
+                w.in_memory().await.error_message.as_deref().is_some_and(|m| m.contains("is missing")),
+                "the refusal is on the Task"
+            );
+
+            let later = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert_eq!(later, Ok(false), "an Error Task is not started by a later pass");
+            assert_eq!(created_worktrees(&recording), 1, "no checkout is acquired on a later pass");
+            assert_eq!(w.in_memory().await.status, TaskStatus::Error, "the refusal is not repeated on every pass");
+        }
+
         /// How many times a start acquired a new worktree, from its log.
         fn created_worktrees(recording: &crate::events::RecordingEventSink) -> usize {
             recording
@@ -24023,6 +24256,244 @@ VERDICT: APPROVED"
 
             assert_eq!(refs_of(&w.repo), refs_before);
             assert_eq!(agent.invocations(), "");
+        }
+
+        /// A start refused because the Workspace root is missing is recorded on
+        /// the Task as an Error. It no longer counts against the parallel limit,
+        /// and the refused start is not repeated on later passes.
+        #[tokio::test]
+        async fn a_start_refused_for_a_missing_workspace_root_is_recorded_and_frees_its_capacity() {
+            let w = world(Class::Created).await;
+            let vanished = tempfile::TempDir::new().expect("tempdir").path().join("gone");
+            let workspace = crate::domain::Workspace::new(
+                "ws".to_string(),
+                Some(crate::domain::WorkspaceRoot::from_trusted(vanished)),
+            );
+            let workspace_id = workspace.id;
+            w.executor
+                .workspace_registry
+                .write()
+                .await
+                .upsert(workspace)
+                .expect("upsert the Workspace");
+            w.executor
+                .projects
+                .write()
+                .await
+                .get_mut(&w.project_id)
+                .expect("the Task's Project is registered")
+                .scope = crate::domain::ProjectScope::InWorkspace { workspace_id };
+            let capacity_before = w.executor.queue_manager.read().await.get_in_progress_count().await;
+            assert_eq!(w.in_memory().await.status, crate::domain::TaskStatus::InProgress);
+
+            let refusal = w
+                .executor
+                .spawn_task_execution(w.task_id, None)
+                .await
+                .expect_err("a missing Workspace root refuses the start");
+            assert!(refusal.contains("is missing"), "{refusal}");
+
+            let in_memory = w.in_memory().await;
+            assert_eq!(in_memory.status, crate::domain::TaskStatus::Error);
+            assert_eq!(in_memory.phase, crate::domain::TaskPhase::Failed);
+            assert!(
+                in_memory.error_message.as_deref().is_some_and(|m| m.contains("is missing")),
+                "the Task names the refusal: {:?}",
+                in_memory.error_message
+            );
+            assert_eq!(w.on_disk().status, crate::domain::TaskStatus::Error, "the refusal is durable");
+            assert_eq!(
+                w.executor.queue_manager.read().await.get_in_progress_count().await,
+                capacity_before - 1,
+                "a refused start releases its execution capacity"
+            );
+
+            let again = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert_eq!(again, Ok(false), "an Error Task is not started by a later pass");
+        }
+
+        /// After a refused start, restoring the root and moving the Task back to
+        /// Queue lets it start. Nothing starts it automatically in between.
+        #[tokio::test]
+        async fn a_refused_start_runs_once_the_root_returns_and_the_task_is_requeued() {
+            // The successful start below spawns the agent; the stand-in must replace the real `claude`.
+            let agent = fake_agent().await;
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let root_dir = tempfile::TempDir::new().unwrap();
+            let root_path = root_dir.path().to_path_buf();
+            let root = crate::domain::WorkspaceRoot::try_new(&root_path).unwrap();
+            let workspace = crate::domain::Workspace::new("Shared".into(), Some(root));
+            w.executor
+                .workspace_registry
+                .write()
+                .await
+                .upsert(workspace.clone())
+                .expect("the Workspace is registered");
+            w.executor.projects.write().await.get_mut(&w.project_id).unwrap().scope =
+                ProjectScope::InWorkspace {
+                    workspace_id: workspace.id,
+                };
+            drop(root_dir);
+
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(refused.is_err_and(|e| e.contains("is missing")));
+            assert_eq!(w.in_memory().await.status, TaskStatus::Error);
+
+            // The person restores the folder and moves the Task back to Queue.
+            std::fs::create_dir_all(&root_path).expect("restore the root");
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let task = tasks.get_mut(&w.task_id).expect("the Task is on the board");
+                task.status = TaskStatus::Queue;
+                task.reset_execution_state();
+                let board: Vec<Task> = tasks.values().filter(|t| t.project_id == w.project_id).cloned().collect();
+                w.executor
+                    .storage
+                    .save_project_tasks(w.project_id, &board)
+                    .expect("save the requeued board");
+            }
+            let promoted = w
+                .executor
+                .promote_queued(PromotionChoice::Exact(w.task_id), |_, _| {})
+                .await
+                .expect("the requeued Task is promoted");
+            assert!(matches!(promoted, PromotionOutcome::Promoted(_)), "the requeued Task is promoted");
+
+            let started = w.executor.spawn_task_execution(w.task_id, None).await;
+            let invoked = agent_invoked(&agent).await;
+            w.end_run().await;
+            assert_eq!(started, Ok(true), "the restored root lets the Task start");
+            assert!(invoked, "the restored root runs the agent");
+        }
+
+        /// Puts the Task's Project in a Workspace whose custom root does not exist.
+        async fn project_in_missing_root(w: &World) {
+            let vanished = tempfile::TempDir::new().expect("tempdir").path().join("gone");
+            let workspace = crate::domain::Workspace::new(
+                "ws".to_string(),
+                Some(crate::domain::WorkspaceRoot::from_trusted(vanished)),
+            );
+            let workspace_id = workspace.id;
+            w.executor
+                .workspace_registry
+                .write()
+                .await
+                .upsert(workspace)
+                .expect("upsert the Workspace");
+            w.executor.projects.write().await.get_mut(&w.project_id).expect("project").scope =
+                crate::domain::ProjectScope::InWorkspace { workspace_id };
+        }
+
+        /// The refusal is durable: after a restart the Task is still an Error and
+        /// no pass starts it.
+        #[tokio::test]
+        async fn a_refused_start_stays_blocked_after_a_restart() {
+            let w = world(Class::Created).await;
+            project_in_missing_root(&w).await;
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(refused.is_err_and(|e| e.contains("is missing")));
+
+            w.restart().await;
+            assert_eq!(w.on_disk().status, TaskStatus::Error, "the block is on disk");
+            assert_eq!(w.in_memory().await.status, TaskStatus::Error, "and after the restart");
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(false));
+            assert_eq!(w.in_memory().await.status, TaskStatus::Error);
+        }
+
+        /// A refusal that cannot be recorded leaves the Task as it was, and the
+        /// backoff bounds the acquire-and-release of its checkout on later passes.
+        #[tokio::test]
+        async fn a_refusal_that_cannot_be_recorded_is_backed_off() {
+            use slashit_durable_fs::{fault, Stage};
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let w = world_with(test_executor_with_events(recording.clone()), Class::Created).await;
+            project_in_missing_root(&w).await;
+            {
+                let _fault = fault::fail_at(Stage::Replace, std::io::ErrorKind::Other);
+                let refused = w.executor.spawn_task_execution(w.task_id, None).await;
+                assert!(refused.is_err_and(|e| e.contains("is missing")));
+            }
+            assert_eq!(
+                w.in_memory().await.status,
+                TaskStatus::InProgress,
+                "an unrecorded refusal leaves the Task as it was"
+            );
+            assert_eq!(created_worktrees(&recording), 1);
+
+            let again = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(again.is_err_and(|e| e.contains("tried again")), "the retry is held back");
+            assert_eq!(created_worktrees(&recording), 1, "no checkout is acquired inside the backoff");
+        }
+
+        /// At the limit, a refused start frees its slot for another queued Task of
+        /// the same Project, and that Task is promoted.
+        #[tokio::test]
+        async fn a_refused_start_frees_a_slot_for_another_queued_task_at_the_limit() {
+            let w = world(Class::Created).await;
+            project_in_missing_root(&w).await;
+            let waiting = crate::test_helpers::create_test_task_full("waiting", w.project_id, TaskStatus::Queue, 2);
+            let waiting_id = waiting.id;
+            let board: Vec<Task> = {
+                let mut tasks = w.executor.tasks.write().await;
+                tasks.insert(waiting_id, waiting);
+                tasks.values().filter(|t| t.project_id == w.project_id).cloned().collect()
+            };
+            w.executor.storage.save_project_tasks(w.project_id, &board).expect("save");
+            let held = w.executor.queue_manager.read().await.get_in_progress_count().await;
+            let mut config = w.executor.queue_manager.read().await.config().clone();
+            config.parallel_task_limit = held as u32;
+            w.executor.queue_manager.write().await.set_config(config).await;
+
+            let blocked = w.executor.promote_queued(PromotionChoice::Next, |_, _| {}).await.expect("promotion");
+            // The in-progress count is checked by selection, so a full limit selects
+            // nothing; the admission gate would answer NoCapacity. Neither promotes.
+            assert!(
+                matches!(blocked, PromotionOutcome::NoCapacity | PromotionOutcome::NothingEligible),
+                "the limit is full while the Task holds its slot"
+            );
+
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(refused.is_err_and(|e| e.contains("is missing")));
+            let promoted = w.executor.promote_queued(PromotionChoice::Next, |_, _| {}).await.expect("promotion");
+            match promoted {
+                PromotionOutcome::Promoted(task) => assert_eq!(task.id, waiting_id),
+                _ => panic!("the freed slot must promote the waiting Task"),
+            }
+        }
+
+        /// Two promotions racing for the last slot promote exactly one Task.
+        #[tokio::test]
+        async fn concurrent_promotions_never_exceed_the_limit() {
+            let w = world(Class::Created).await;
+            let held = w.executor.queue_manager.read().await.get_in_progress_count().await;
+            let mut waiting_ids = Vec::new();
+            let board: Vec<Task> = {
+                let mut tasks = w.executor.tasks.write().await;
+                for n in 0..2 {
+                    let task = crate::test_helpers::create_test_task_full("q", w.project_id, TaskStatus::Queue, 10 + n);
+                    waiting_ids.push(task.id);
+                    tasks.insert(task.id, task);
+                }
+                tasks.values().filter(|t| t.project_id == w.project_id).cloned().collect()
+            };
+            w.executor.storage.save_project_tasks(w.project_id, &board).expect("save");
+            let mut config = w.executor.queue_manager.read().await.config().clone();
+            config.parallel_task_limit = held as u32 + 1;
+            w.executor.queue_manager.write().await.set_config(config).await;
+
+            let (a, b) = tokio::join!(
+                w.executor.promote_queued(PromotionChoice::Next, |_, _| {}),
+                w.executor.promote_queued(PromotionChoice::Next, |_, _| {}),
+            );
+            let outcomes = [a.expect("first promotion"), b.expect("second promotion")];
+            let promoted = outcomes.iter().filter(|o| matches!(o, PromotionOutcome::Promoted(_))).count();
+            assert_eq!(promoted, 1, "exactly one of two promotions takes the last slot");
+            assert!(
+                w.executor.queue_manager.read().await.get_in_progress_count().await <= held + 1,
+                "the in-progress count stays within the limit"
+            );
         }
 
         /// A manual start refused for the same reason says so, rather than
@@ -27575,6 +28046,7 @@ VERDICT: APPROVED"
                 crate::lifecycle::enqueue_leased(
                     &self.executor.tasks,
                     &self.executor.storage,
+                    &self.executor.projects,
                     self.project_id,
                     self.task_id,
                     &TaskStatus::Backlog,
@@ -27733,6 +28205,7 @@ VERDICT: APPROVED"
                 crate::lifecycle::enqueue_leased(
                     &fx.executor.tasks,
                     &fx.executor.storage,
+                    &fx.executor.projects,
                     fx.project_id,
                     fx.task_id,
                     &TaskStatus::Backlog,
@@ -27906,6 +28379,7 @@ VERDICT: APPROVED"
                 crate::lifecycle::enqueue_leased(
                     &fx.executor.tasks,
                     &fx.executor.storage,
+                    &fx.executor.projects,
                     fx.project_id,
                     fx.task_id,
                     &TaskStatus::Backlog,
@@ -27946,6 +28420,7 @@ VERDICT: APPROVED"
                 crate::lifecycle::enqueue_leased(
                     &fx.executor.tasks,
                     &fx.executor.storage,
+                    &fx.executor.projects,
                     fx.project_id,
                     fx.task_id,
                     &TaskStatus::Backlog,
@@ -27997,6 +28472,7 @@ VERDICT: APPROVED"
                 crate::lifecycle::enqueue_leased(
                     &fx.executor.tasks,
                     &fx.executor.storage,
+                    &fx.executor.projects,
                     fx.project_id,
                     fx.task_id,
                     &TaskStatus::Backlog,

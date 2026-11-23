@@ -1071,11 +1071,16 @@ pub async fn analyze_pr_comments(
     task_id: String,
 ) -> Result<PrReviewPlan, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let task = {
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
+    // Refuse a removed Project before the checkout is resolved or read, and
+    // before GitHub is asked for review data. The lease taken below stays
+    // authoritative for the run itself.
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, task.project_id)
+        .await?;
+    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let pr_url = pr_url_for_task(&task)?;
     // Record the checkout state the triage helper is about to read: its
     // branch tip and the content of its uncommitted changes. An analysis
@@ -1474,6 +1479,18 @@ pub async fn discuss_pr_review_questions(
     plan: PrReviewPlan,
 ) -> Result<PrReviewPlan, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    // A removed Project is refused before its checkout is resolved, so the
+    // refusal names the removal rather than a missing worktree.
+    let project_id = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .map(|t| t.project_id)
+        .ok_or("Task not found")?;
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, project_id)
+        .await?;
     let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
 
     // Discuss runs `ToolAccess::ReadOnly` (see `run_claude_pr_helper(.., false, ..)`).
@@ -3636,7 +3653,8 @@ pub async fn sync_pr_review_replies(
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     // Held for the whole publication, so Apply, Analyze and another Sync cannot
     // overlap it, and the plan read below is the plan this call updates.
-    let _lease = state.task_lifecycle_locks.acquire(task_uuid).await?;
+    // Refuses a removed Project under the lease, before any GitHub call.
+    let _lease = crate::commands::project::lease_active_task(&state, task_uuid).await?;
     refuse_sync_while_pr_helper_runs(&state, task_uuid)?;
     // The checkout when the task still has one; the repository otherwise,
     // which holds the same remote-tracking refs and is only asked where the
@@ -5836,13 +5854,7 @@ async fn begin_pr_helper(
     state: &crate::AppState,
     task_id: Uuid,
     purpose: crate::queue::PrHelperPurpose,
-) -> Result<
-    (
-        Option<crate::queue::PrHelperLease>,
-        tokio::sync::watch::Receiver<bool>,
-    ),
-    String,
-> {
+) -> Result<(Option<PrHelperHold>, tokio::sync::watch::Receiver<bool>), String> {
     refuse_while_republish_pending(state, task_id).await?;
     match state.executor.get() {
         Some(executor) => {
@@ -5851,15 +5863,17 @@ async fn begin_pr_helper(
                 .await
                 .map_err(|refusal| refusal.to_string())?;
             let cancel_rx = lease.cancel_receiver();
-            Ok((Some(lease), cancel_rx))
+            Ok((Some(PrHelperHold::executor(lease)), cancel_rx))
         }
         None => {
             // Nothing can own the task without an executor, but unresolved
             // Worker recovery evidence does not depend on one: a provider that
             // can edit the checkout is still refused, under the same lifecycle
-            // lease the executor's own admission uses.
+            // lease the executor's own admission uses. The lease also refuses
+            // a removed Project, for both purposes. It is returned to the caller,
+            // so it stays held while the helper edits the checkout.
+            let lease = crate::commands::project::lease_active_task(state, task_id).await?;
             if purpose == crate::queue::PrHelperPurpose::Editing {
-                let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
                 if let Some(refusal) = state
                     .task
                     .tasks
@@ -5871,8 +5885,25 @@ async fn begin_pr_helper(
                     return Err(refusal);
                 }
             }
-            Ok((None, tokio::sync::watch::channel(false).1))
+            Ok((Some(PrHelperHold::lifecycle(lease)), tokio::sync::watch::channel(false).1))
         }
+    }
+}
+
+/// What keeps a PR helper's claim on its Task for as long as the helper runs:
+/// the executor's lease, or, with no executor, the lifecycle lease. Dropping it
+/// releases the claim, so the caller holds it until the helper has finished.
+struct PrHelperHold {
+    _guard: Box<dyn std::any::Any + Send>,
+}
+
+impl PrHelperHold {
+    fn executor(lease: crate::queue::PrHelperLease) -> Self {
+        Self { _guard: Box::new(lease) }
+    }
+
+    fn lifecycle(lease: crate::lifecycle::LifecycleLease) -> Self {
+        Self { _guard: Box::new(lease) }
     }
 }
 
@@ -5941,6 +5972,9 @@ async fn reserve_task_admitted_as(
 ) -> Result<Option<crate::queue::PrHelperLease>, String> {
     let approval_required = admission == PrSideEffectAdmission::RequiresApproval;
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    // Under the lease, which removal holds for every Task of the Project, so
+    // a removal cannot commit between this check and the reservation.
+    crate::commands::project::refuse_if_task_project_removed(state, task_id).await?;
     refuse_while_republish_pending(state, task_id).await?;
     // A pull request moves the task to PR Created, out of the column its
     // unfinished local integration is resumed from. Refused before any
@@ -6054,6 +6088,7 @@ async fn reserve_task_for_republish(
     task_id: Uuid,
 ) -> Result<Option<crate::queue::PrHelperLease>, String> {
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    crate::commands::project::refuse_if_task_project_removed(state, task_id).await?;
     match state.executor.get() {
         Some(executor) => executor
             .begin_republish_under_lease(task_id)
@@ -6518,6 +6553,7 @@ fn extract_text_from_stream_json(stdout: &str) -> String {
 
 async fn create_pr_inner(state: &crate::AppState, task_id: &str) -> Result<String, String> {
     let task_uuid = Uuid::parse_str(task_id).map_err(|e| e.to_string())?;
+    crate::commands::project::refuse_if_task_project_removed(state, task_uuid).await?;
 
     // Before anything below reads a branch name, pushes it, or asks GitHub
     // to open a pull request against it: end whatever execution, AI review/
@@ -8989,6 +9025,11 @@ async fn link_pr_to_task_reserved(
     pr_url: &str,
     reservation: Option<crate::queue::PrHelperLease>,
 ) -> Result<(), PrLinkFailure> {
+    // Refuse a removed Project before the GitHub read. The lease check below is
+    // the authoritative one; this only avoids the external call.
+    crate::commands::project::refuse_if_task_project_removed(state, task_uuid)
+        .await
+        .map_err(PrLinkFailure::NotRecorded)?;
     let remote_state = fetch_pr_state(&state.pr_statuses, pr_url).await;
     let merged = matches!(remote_state.as_deref(), Some("MERGED"));
 
@@ -9007,10 +9048,10 @@ async fn link_pr_to_task_reserved(
             tokio::select! {
                 biased;
                 _ = wait_for_cancel(&mut cancel) => return Err(not_linked()),
-                lease = state.task_lifecycle_locks.acquire(task_uuid) => lease,
+                lease = crate::commands::project::lease_active_task(state, task_uuid) => lease,
             }
         }
-        None => state.task_lifecycle_locks.acquire(task_uuid).await,
+        None => crate::commands::project::lease_active_task(state, task_uuid).await,
     };
     let _lease = acquired.map_err(PrLinkFailure::NotRecorded)?;
     drop(reservation);
@@ -9391,9 +9432,7 @@ pub async fn refresh_task_pr_state(
     // below -- the two halves are one thing the user asked for, and dropping
     // the lease between them let another transition take the task and turned
     // this operation into a `Busy` race against itself.
-    let _lease = state
-        .task_lifecycle_locks
-        .acquire(task_uuid)
+    let _lease = crate::commands::project::lease_active_task(&state, task_uuid)
         .await
         .map_err(|e| format!("recording the pull request state failed: {e}"))?;
 
@@ -14637,6 +14676,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             };
             let project_id = project.id;
             state
@@ -15222,6 +15262,334 @@ mod tests {
                     "admission records no decision"
                 );
                 assert_eq!(after.status, TaskStatus::HumanReview);
+            }
+
+            /// A removed Project admits no pull request side effect: neither an
+            /// explicit publication, nor a republish, nor a recovery. The Task
+            /// itself is Done here, so only the Project decides.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_removed_projects_task_admits_no_pull_request_side_effect() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-removed"),
+                    TaskStatus::Done,
+                )
+                .await;
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+
+                let publication = reserve_task_for_explicit_publication(&state, task_id)
+                    .await
+                    .err()
+                    .expect("explicit publication refuses a removed Project's Task");
+                assert_eq!(publication, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                let republish = reserve_task_for_republish(&state, task_id)
+                    .await
+                    .err()
+                    .expect("republish refuses a removed Project's Task");
+                assert_eq!(republish, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                let generic = reserve_task_for_pr_side_effect(&state, task_id)
+                    .await
+                    .err()
+                    .expect("the generic admission refuses a removed Project's Task");
+                assert_eq!(generic, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+            }
+
+            /// Linking a pull request is the path `sync_existing_pr` takes with no
+            /// reservation at all, so the lease check is the only guard it has.
+            /// A removed Project's Task records nothing, and an active one links.
+            #[tokio::test(flavor = "multi_thread")]
+            #[cfg(unix)]
+            async fn linking_a_pull_request_refuses_a_removed_project_without_recording_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-link-removed"),
+                    TaskStatus::InProgress,
+                )
+                .await;
+                let pr_url = "https://github.com/BarraDev/slashit/pull/9001";
+                let before = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+                match link_pr_to_task_reserved(&state, task_id, pr_url, None).await {
+                    Err(PrLinkFailure::NotRecorded(message)) => assert_eq!(
+                        message,
+                        crate::domain::project::PROJECT_REMOVED_REFUSAL
+                    ),
+                    Err(_) => panic!("a removed Project's link was not refused as NotRecorded"),
+                    Ok(()) => panic!("a removed Project's Task accepted a pull request link"),
+                }
+                let after = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "a refused link changes no Task state or evidence"
+                );
+                assert_eq!(mock.read_log(), "", "the refusal comes before any gh call");
+
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = None;
+                }
+                link_pr_to_task_reserved(&state, task_id, pr_url, None)
+                    .await
+                    .unwrap_or_else(|_| panic!("an active Project's Task links its pull request"));
+            }
+
+            /// Syncing review replies refuses a removed Project under the Task lease,
+            /// before any GitHub call: the fake `gh` records no invocation at all.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn syncing_review_replies_for_a_removed_project_makes_no_github_call() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", "{}");
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-sync-removed"), TaskStatus::Done).await;
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let refusal = sync_pr_review_replies(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                    Vec::new(),
+                )
+                .await
+                .expect_err("a removed Project's review replies are not synced");
+
+                assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                assert_eq!(mock.read_log(), "", "no GitHub call was made");
+            }
+
+            /// Analyzing a removed Project's pull request is refused before the
+            /// checkout is read or GitHub is asked for review data, even when the
+            /// PR has no comments (the early return that would skip the lease).
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn analyzing_a_removed_projects_comments_makes_no_github_call() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", "{}");
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-analyze-removed"), TaskStatus::HumanReview)
+                        .await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.pr_url = Some("https://github.com/testorg/testrepo/pull/19".into());
+                }
+                let before = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let refusal = analyze_pr_comments(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                )
+                .await
+                .expect_err("a removed Project's comments are not analyzed");
+
+                assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                assert_eq!(mock.read_log(), "", "no GitHub call was made");
+                let after = app
+                    .state::<crate::AppState>()
+                    .task
+                    .tasks
+                    .read()
+                    .await
+                    .get(&task_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "a refused analysis changes no Task state"
+                );
+            }
+
+            /// Discussing a removed Project's review questions is refused by the helper
+            /// lease, after the Task's workspace is resolved and before any agent or
+            /// GitHub call. The Task has a worktree so the workspace check passes first.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discussing_a_removed_projects_review_questions_makes_no_github_call() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", "{}");
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-discuss-removed"), TaskStatus::HumanReview)
+                        .await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.pr_url = Some("https://github.com/testorg/testrepo/pull/19".into());
+                    // No worktree: the removal, not a missing checkout, must be the refusal.
+                    task.worktree_path = None;
+                }
+                let before = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+                let plan = crate::domain::task::PrReviewPlan {
+                    generated_at: chrono::Utc::now(),
+                    pr_url: "https://github.com/testorg/testrepo/pull/19".into(),
+                    review_decision: None,
+                    comments: Vec::new(),
+                    items: Vec::new(),
+                    raw_plan: String::new(),
+                    last_apply: None,
+                    fixed_content: Vec::new(),
+                    analyzed_head_oid: None,
+                    analyzed_worktree_oid: None,
+                    analyzed_worktree_fingerprint: None,
+                    analyzed_at: None,
+                };
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let refusal = discuss_pr_review_questions(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                    plan,
+                )
+                .await
+                .expect_err("a removed Project's review questions are not discussed");
+
+                assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+                assert_eq!(mock.read_log(), "", "no GitHub call was made");
+                let after = app
+                    .state::<crate::AppState>()
+                    .task
+                    .tasks
+                    .read()
+                    .await
+                    .get(&task_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "a refused discussion changes no Task state"
+                );
+            }
+
+            /// Address needs the Editing helper lease, which a removed Project's Task
+            /// must not get. Checked on `begin_pr_helper` directly: `address_pr_review`
+            /// takes an `AppHandle` that the mock cannot supply on this path.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn addressing_a_removed_projects_review_takes_no_editing_lease() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", "{}");
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-address-removed"), TaskStatus::HumanReview)
+                        .await;
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+
+                match begin_pr_helper(&state, task_id, PrHelperPurpose::Editing).await {
+                    Err(refusal) => {
+                        assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL)
+                    }
+                    Ok(_) => panic!("a removed Project's Task took an Editing PR helper lease"),
+                }
+                assert_eq!(mock.read_log(), "", "no GitHub call was made");
+            }
+
+            /// A GitHub state change for a removed Project's Task is read, then
+            /// refused under the lease: the Task record and its evidence are unchanged.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refreshing_a_removed_projects_pull_request_records_nothing() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup("unused", r#"{"state":"CLOSED"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    "/tmp",
+                    Some("task-refresh-removed"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let url = "https://github.com/testorg/testrepo/pull/19";
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.pr_url = Some(url.to_string());
+                    task.external_refs
+                        .push(crate::domain::task::ExternalRef::GithubPr {
+                            url: url.to_string(),
+                            number: 19,
+                            repo: "testorg/testrepo".to_string(),
+                            state: None,
+                            merge_commit: None,
+                        });
+                }
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+                for project in state.project.projects.write().await.values_mut() {
+                    project.removed_at = Some(chrono::Utc::now());
+                }
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let refusal = refresh_task_pr_state(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                )
+                .await
+                .expect_err("a removed Project's pull request state is not recorded");
+
+                assert!(
+                    refusal.contains(crate::domain::project::PROJECT_REMOVED_REFUSAL),
+                    "{refusal}"
+                );
+                let after = app
+                    .state::<crate::AppState>()
+                    .task
+                    .tasks
+                    .read()
+                    .await
+                    .get(&task_id)
+                    .unwrap()
+                    .clone();
+                assert_eq!(
+                    serde_json::to_value(&after).unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "a refused refresh changes no Task state or evidence"
+                );
             }
 
             /// The gate's Human Review rule applies to every Task in Human Review
@@ -26858,6 +27226,7 @@ mod tests {
                 crate::review_fix_residue::resolve(
                     &ledger.authority,
                     &ledger.tasks,
+                    &tokio::sync::RwLock::new(std::collections::HashMap::new()),
                     &ledger.storage,
                     task.id,
                     attempt,
@@ -34344,6 +34713,44 @@ mod recovery_admission_tests {
         (tmp, state, id)
     }
 
+    /// With no executor, an editing helper holds its Task's lifecycle lease for as
+    /// long as it keeps the guard: another lifecycle operation waits until the guard
+    /// is dropped, so no edit can run after the lease is released.
+    #[tokio::test]
+    async fn an_editing_helper_without_an_executor_holds_the_task_lease_until_it_ends() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _) = crate::app_core::build_state_with_paths(paths).await.expect("state");
+        let project_id = Uuid::new_v4();
+        let task = crate::test_helpers::create_test_task_full("plain", project_id, TaskStatus::Backlog, 0);
+        let id = task.id;
+        state.task.tasks.write().await.insert(id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed");
+
+        let (hold, _cancel) = begin_pr_helper(&state, id, PrHelperPurpose::Editing)
+            .await
+            .expect("an editing helper is admitted for a plain Task");
+        let contended = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            crate::commands::project::lease_active_task(&state, id),
+        )
+        .await;
+        assert!(contended.is_err(), "the lease is held while the helper holds its guard");
+
+        drop(hold);
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::commands::project::lease_active_task(&state, id),
+        )
+        .await;
+        assert!(released.is_ok_and(|lease| lease.is_ok()), "the lease is free once the helper ends");
+    }
+
     /// Editing is refused with and without an executor; inspection is not.
     #[tokio::test]
     async fn only_an_editing_helper_is_refused_for_a_recovery_task() {
@@ -34357,7 +34764,7 @@ mod recovery_admission_tests {
             let (lease, _cancel) = begin_pr_helper(&state, id, PrHelperPurpose::Inspection)
                 .await
                 .unwrap_or_else(|e| panic!("executor={with_executor}: read-only stays open: {e}"));
-            assert_eq!(lease.is_some(), with_executor);
+            assert!(lease.is_some(), "executor={with_executor}: the helper holds its Task in both cases");
             drop(lease);
             // Publishing the branch is refused too, before any owner is ended.
             let reserve = reserve_task_for_pr_side_effect(&state, id)

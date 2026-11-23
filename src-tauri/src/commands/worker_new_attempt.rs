@@ -277,6 +277,16 @@ async fn prepare(
             "The Task has an unfinished cleanup, restack, integration or pull request.".into(),
         );
     }
+    if state
+        .project
+        .projects
+        .read()
+        .await
+        .get(&task.project_id)
+        .is_some_and(|project| project.is_removed())
+    {
+        refusals.push(crate::domain::project::PROJECT_REMOVED_REFUSAL.into());
+    }
     if let Some(executor) = state.executor.get() {
         if crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), task.id).await {
             refusals.push("An execution or review currently owns this Task.".into());
@@ -721,6 +731,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
 
@@ -1040,6 +1051,38 @@ mod tests {
 
         assert_eq!(fx.repo_state(), repo_before);
         assert_eq!(std::fs::read_to_string(fx.checkout.join("work.txt")).unwrap(), "dirty");
+    }
+
+    /// A confirmed new attempt whose Workspace root is missing is refused before it
+    /// starts. The Task becomes a durable Error, and the recovery evidence is left
+    /// as it was. The attempt must be confirmed again.
+    #[tokio::test]
+    async fn a_new_attempt_refused_for_a_missing_workspace_root_keeps_its_recovery() {
+        let fx = fixture().await;
+        let id = Uuid::new_v4();
+        let request = fx.request(id).await;
+        record_decision(&fx.state, request).await.unwrap();
+        let recovery_before = fx.task().await.worker_handoff.clone();
+        let vanished = fx._tmp.path().join("gone");
+        let workspace = crate::domain::Workspace::new(
+            "ws".to_string(),
+            Some(crate::domain::WorkspaceRoot::from_trusted(vanished)),
+        );
+        let workspace_id = workspace.id;
+        fx.state.workspace.registry.write().await.upsert(workspace).expect("upsert");
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).expect("project").scope =
+            crate::domain::ProjectScope::InWorkspace { workspace_id };
+        let executor = fx.state.executor.get().unwrap().clone();
+
+        assert!(fx.task().await.new_attempt_confirmed, "the decision is confirmed before the start");
+        let refusal = executor.start_new_attempt(fx.task_id, id).await.expect_err("the root is missing");
+        assert!(refusal.contains("is missing"), "{refusal}");
+
+        let task = fx.task().await;
+        assert_eq!(task.status, crate::domain::TaskStatus::Error, "the refusal is recorded");
+        assert_eq!(fx.on_disk().status, crate::domain::TaskStatus::Error, "and durable");
+        assert_eq!(task.worker_handoff, recovery_before, "the recovery evidence is kept");
+        assert!(!task.new_attempt_confirmed, "the attempt must be confirmed again");
     }
 
     /// A confirmed decision starts exactly one run, consumes itself in the same

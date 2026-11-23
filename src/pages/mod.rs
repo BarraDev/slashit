@@ -12,7 +12,7 @@ pub mod insights;
 pub mod changelog;
 pub mod mcp;
 pub mod worktrees;
-pub mod workspaces;
+
 pub mod github_issues;
 pub mod github_prs;
 
@@ -27,7 +27,7 @@ pub use insights::*;
 pub use changelog::*;
 pub use mcp::*;
 pub use worktrees::*;
-pub use workspaces::*;
+
 pub use github_issues::*;
 pub use github_prs::*;
 
@@ -47,7 +47,7 @@ pub fn page_offered(page: &str) -> bool {
 
 /// Every page name the router renders. Keep it in step with the match in
 /// `app.rs`. A name outside this list was removed, or was never a page.
-pub const ROUTED_PAGES: [&str; 14] = [
+pub const ROUTED_PAGES: [&str; 13] = [
     "conversations",
     "dashboard",
     "agent",
@@ -59,7 +59,6 @@ pub const ROUTED_PAGES: [&str; 14] = [
     "changelog",
     "mcp",
     "worktrees",
-    "workspaces",
     "github_issues",
     "github_prs",
 ];
@@ -77,6 +76,7 @@ mod tests {
     #[test]
     fn a_removed_page_name_is_not_restored() {
         assert!(!page_restorable("spec"), "spec was removed and has no route");
+        assert!(!page_restorable("workspaces"), "the Workspaces page was retired; Workspace context replaces it");
         assert!(!page_restorable(""));
     }
 

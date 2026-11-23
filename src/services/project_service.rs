@@ -41,7 +41,9 @@ pub async fn create_project(name: String, repository_id: Option<String>, agent_t
         "agentType": agent_type,
     })).unwrap();
 
-    let response = invoke("create_project", args).await;
+    // `invoke` traps on a refused create, which aborted the caller silently:
+    // no message, and the dialog stayed open. The refusal must come back as Err.
+    let response = invoke_checked("create_project", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
@@ -77,12 +79,43 @@ pub async fn attach_project_to_workspace(project_id: String, workspace_id: Strin
 }
 
 /// Detach a project from its workspace, returning it to standalone. Fails if
-/// the project is already standalone.
-pub async fn detach_project_from_workspace(project_id: String) -> Result<Project, String> {
+/// the project is already standalone, or if it is no longer in
+/// `expected_workspace_id` (a stale list).
+pub async fn detach_project_from_workspace(
+    project_id: String,
+    expected_workspace_id: String,
+) -> Result<Project, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "projectId": project_id,
+        "expectedWorkspaceId": expected_workspace_id,
     })).unwrap();
 
     let response = invoke_checked("detach_project_from_workspace", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// Rename a Project's displayed name. The repository folder is not changed.
+pub async fn rename_project(project_id: String, name: String) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "id": project_id,
+        "name": name,
+    })).unwrap();
+
+    let response = invoke_checked("update_project", args).await?;
+    // The backend answers None when the Project no longer exists: not a rename.
+    let updated: Option<Project> = serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())?;
+    updated
+        .map(|_| ())
+        .ok_or_else(|| "This Project no longer exists.".to_string())
+}
+
+/// Remove a Project from SlashIt's active Projects. Its folder, Tasks, history
+/// and identity are kept; opening the same folder again brings it back.
+pub async fn remove_project(project_id: String) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "id": project_id,
+    })).unwrap();
+
+    invoke_checked("remove_project", args).await?;
+    Ok(())
 }

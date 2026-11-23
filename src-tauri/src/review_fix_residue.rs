@@ -30,6 +30,7 @@ use crate::config::Storage;
 use crate::domain::task::{ReviewFixResidue, Task};
 use crate::lifecycle::{self, TaskLifecycleLocks, Tasks};
 use crate::worktree::CheckoutCommit;
+use tokio::sync::RwLock;
 
 // shortcut: one entry per Task ever touched stays in this map for the process lifetime, upgrade to evicting idle entries if the board grows large.
 static RECORD_GATES: std::sync::LazyLock<
@@ -234,12 +235,14 @@ pub(crate) async fn write_record(
 pub async fn resolve(
     authority: &TaskLifecycleLocks,
     tasks: &Tasks,
+    projects: &RwLock<HashMap<Uuid, crate::domain::Project>>,
     storage: &Storage,
     task_id: Uuid,
     attempt_id: Uuid,
     executor: Option<&crate::queue::TaskExecutor>,
 ) -> Result<(), String> {
-    let _lease = authority.acquire(task_id).await?;
+    // Refuses a removed Project under the lease: this clears a Task record.
+    let _lease = crate::commands::project::lease_active_task_in(authority, tasks, projects, task_id).await?;
     // Checked under the lease: a run or review registers under it, so none can
     // start between this check and the clear. A live attempt means its agent may
     // still be editing the checkout, so the record must stay.
@@ -776,6 +779,7 @@ mod tests {
         let stale = resolve(
             &fx.ledger.authority,
             &fx.state.task.tasks,
+            &fx.state.project.projects,
             &fx.state.storage,
             fx.task_id,
             Uuid::new_v4(),
@@ -786,6 +790,7 @@ mod tests {
         let dirty = resolve(
             &fx.ledger.authority,
             &fx.state.task.tasks,
+            &fx.state.project.projects,
             &fx.state.storage,
             fx.task_id,
             attempt,
@@ -802,6 +807,7 @@ mod tests {
         resolve(
             &fx.ledger.authority,
             &fx.state.task.tasks,
+            &fx.state.project.projects,
             &fx.state.storage,
             fx.task_id,
             attempt,
@@ -840,6 +846,7 @@ mod tests {
         let refused = resolve(
             &fx.ledger.authority,
             &fx.state.task.tasks,
+            &fx.state.project.projects,
             &fx.state.storage,
             fx.task_id,
             attempt,
@@ -848,6 +855,39 @@ mod tests {
         .await;
         assert!(refused.is_err());
         assert!(residue(&fx).await.is_some());
+    }
+
+    /// A removed Project is read-only, and clearing the record is a Task write:
+    /// it is refused under the lease and the unresolved record stays.
+    #[tokio::test]
+    async fn resolve_refuses_a_removed_project_and_keeps_the_record() {
+        let fx = fixture().await;
+        let attempt = fx
+            .ledger
+            .begin_attempt(fx.task_id, fx.checkout.to_str().unwrap())
+            .await
+            .unwrap();
+        let before = residue(&fx).await.expect("an unresolved record exists before the refusal");
+        let mut project = crate::commands::project::tests::make_test_project(fx.project_id);
+        project.removed_at = Some(chrono::Utc::now());
+        fx.state.project.projects.write().await.insert(fx.project_id, project);
+
+        let refused = resolve(
+            &fx.ledger.authority,
+            &fx.state.task.tasks,
+            &fx.state.project.projects,
+            &fx.state.storage,
+            fx.task_id,
+            attempt,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            refused.expect_err("a removed Project's record is not cleared"),
+            crate::domain::project::PROJECT_REMOVED_REFUSAL
+        );
+        assert_eq!(residue(&fx).await, Some(before), "the unresolved record is unchanged");
     }
 
     #[tokio::test]
@@ -1037,6 +1077,7 @@ mod tests {
         resolve(
             &fx.ledger.authority,
             &fx.state.task.tasks,
+            &fx.state.project.projects,
             &fx.state.storage,
             fx.task_id,
             attempt,
@@ -1093,6 +1134,7 @@ mod tests {
             resolve(
                 &fx.ledger.authority,
                 &fx.state.task.tasks,
+                &fx.state.project.projects,
                 &fx.state.storage,
                 fx.task_id,
                 attempt,
@@ -1126,6 +1168,7 @@ mod tests {
         resolve(
             &fx.ledger.authority,
             &fx.state.task.tasks,
+            &fx.state.project.projects,
             &fx.state.storage,
             fx.task_id,
             attempt,
@@ -1194,6 +1237,7 @@ mod tests {
         assert!(resolve(
             &fx.ledger.authority,
             &fx.state.task.tasks,
+            &fx.state.project.projects,
             &fx.state.storage,
             fx.task_id,
             attempt,
@@ -1206,6 +1250,7 @@ mod tests {
         resolve(
             &fx.ledger.authority,
             &fx.state.task.tasks,
+            &fx.state.project.projects,
             &fx.state.storage,
             fx.task_id,
             attempt,
@@ -1244,6 +1289,7 @@ mod tests {
         let refused = resolve(
             &fx.ledger.authority,
             &fx.state.task.tasks,
+            &fx.state.project.projects,
             &fx.state.storage,
             fx.task_id,
             attempt,

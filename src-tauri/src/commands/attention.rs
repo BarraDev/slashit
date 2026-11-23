@@ -63,7 +63,10 @@ pub async fn get_attention_summary(
 ) -> Result<Vec<ProjectAttention>, String> {
     let tasks = state.task.tasks.read().await;
     let deliveries = &state.task.deliveries;
-    Ok(summarize(&tasks, |id| deliveries.contains(id)))
+    let mut summary = summarize(&tasks, |id| deliveries.contains(id));
+    let projects = state.project.projects.read().await;
+    summary.retain(|p| projects.get(&p.project_id).is_some_and(|project| !project.is_removed()));
+    Ok(summary)
 }
 
 #[cfg(test)]

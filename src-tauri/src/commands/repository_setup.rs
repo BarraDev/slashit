@@ -30,6 +30,9 @@ async fn project_and_path(
         .get(&project_id)
         .cloned()
         .ok_or_else(|| format!("Project {project_id} not found"))?;
+    if project.is_removed() {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
     let repository_id = project
         .repository_id
         .ok_or_else(|| format!("Project {} has no repository folder linked", project.name))?;
@@ -57,6 +60,11 @@ pub(crate) async fn record_project_base(
     let project = proposed
         .get_mut(&project_id)
         .ok_or_else(|| format!("Project {project_id} not found"))?;
+    // Checked under the write lock, after the caller's awaits: a removal that
+    // landed in between must not gain a base.
+    if project.is_removed() {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
     project.base = base;
     project.updated_at = chrono::Utc::now();
     let outcome = crate::commands::project::try_persist_projects(&state.storage, &proposed);
@@ -197,6 +205,11 @@ pub(crate) async fn initialize_project_vcs_core(
     kind: VcsInitKind,
     expected_files: Option<usize>,
 ) -> Result<Readiness, String> {
+    // Shared hold of the Project gate across the whole initialization, as
+    // update_project holds it for its persist: a removal (gate write) waits
+    // for this to finish instead of landing mid-way and making the final base
+    // write refuse after the folder already changed.
+    let _gate = state.task.project_gate.read(project_id).await;
     let (_, path) = project_and_path(state, project_id).await?;
     let outcome = vcs_init::initialize(&path, kind, expected_files).await?;
     record_project_base(
@@ -309,6 +322,7 @@ mod tests {
                 },
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                removed_at: None,
             },
         );
         Fx {
@@ -443,5 +457,87 @@ mod tests {
         assert_eq!(stored(&fx), Some(ProjectBase::PreferredLocalBranch { branch: "trunk".into() }));
         // The chosen local branch still works with that origin/HEAD.
         assert_eq!(source_of(&report(&fx.state, fx.project_id).await.unwrap()), "Local");
+    }
+
+    #[tokio::test]
+    async fn recording_a_base_on_a_removed_project_is_refused_and_changes_nothing() {
+        let fx = fixture().await;
+        let base = Some(ProjectBase::LocalBranch { branch: "trunk".into() });
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().removed_at =
+            Some(chrono::Utc::now());
+        let removed = fx.state.project.projects.read().await[&fx.project_id].clone();
+
+        let refused = record_project_base(&fx.state, fx.project_id, base.clone()).await.unwrap_err();
+        assert_eq!(refused, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        let after = fx.state.project.projects.read().await[&fx.project_id].clone();
+        assert_eq!(after.base, removed.base, "a removed Project gains no base");
+        assert_eq!(after.updated_at, removed.updated_at, "a refused write leaves updated_at alone");
+
+        // An active Project records the same base: the refusal is the removal, not the call.
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().removed_at = None;
+        record_project_base(&fx.state, fx.project_id, base.clone()).await.unwrap();
+        assert_eq!(fx.state.project.projects.read().await[&fx.project_id].base, base);
+    }
+
+    /// How long a parked side is given to finish. A side held by the gate cannot
+    /// finish at all, so this bounds the wait and never decides the result.
+    const PARKED: std::time::Duration = std::time::Duration::from_millis(100);
+
+    #[tokio::test]
+    async fn removal_waits_while_a_repository_setup_holds_the_project_gate() {
+        let fx = fixture().await;
+        // An initialization in flight holds the Project gate in shared mode for its whole run.
+        let in_flight = fx.state.task.project_gate.read(fx.project_id).await;
+        let removal = crate::commands::project::remove_project_gated(&fx.state, fx.project_id);
+        tokio::pin!(removal);
+        tokio::select! {
+            biased;
+            outcome = &mut removal => panic!("removal ran while a setup held the gate: {outcome:?}"),
+            _ = tokio::time::sleep(PARKED) => {}
+        }
+        assert!(!fx.state.project.projects.read().await[&fx.project_id].is_removed());
+
+        drop(in_flight);
+        removal
+            .await
+            .expect("removal proceeds once the setup has finished");
+        assert!(fx.state.project.projects.read().await[&fx.project_id].is_removed());
+    }
+
+    #[tokio::test]
+    async fn repository_setup_waits_while_a_removal_holds_the_project_gate() {
+        let fx = fixture().await;
+        // An empty folder: a setup that ran would create version control in it.
+        let plain = fx.tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let repository_id = fx.state.project.projects.read().await[&fx.project_id]
+            .repository_id
+            .unwrap();
+        fx.state
+            .repository
+            .repositories
+            .write()
+            .await
+            .get_mut(&repository_id)
+            .unwrap()
+            .local_path = plain.to_str().unwrap().to_string();
+        // A removal holds the Project gate in exclusive mode for its whole transaction.
+        let removing = fx.state.task.project_gate.write(fx.project_id).await;
+        let setup = initialize_project_vcs_core(&fx.state, fx.project_id, VcsInitKind::Git, None);
+        tokio::pin!(setup);
+        tokio::select! {
+            biased;
+            outcome = &mut setup => panic!("setup ran while a removal held the gate: {:?}", outcome.err()),
+            _ = tokio::time::sleep(PARKED) => {}
+        }
+        assert!(
+            !plain.join(".git").exists(),
+            "the folder is untouched while the setup waits"
+        );
+
+        drop(removing);
+        // Whether the setup then succeeds depends on the Git identity of this machine
+        // (SlashIt never invents one). The ordering is what this test asserts.
+        let _ = setup.await;
     }
 }

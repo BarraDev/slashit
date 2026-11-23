@@ -198,12 +198,16 @@ async fn project_after_lock(
     projects: &tokio::sync::RwLock<HashMap<Uuid, crate::domain::Project>>,
     project_id: Uuid,
 ) -> Result<crate::domain::Project, String> {
-    projects
+    let project = projects
         .read()
         .await
         .get(&project_id)
         .cloned()
-        .ok_or_else(|| "Project not found".to_string())
+        .ok_or_else(|| "Project not found".to_string())?;
+    if project.is_removed() {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
+    Ok(project)
 }
 
 #[tauri::command]
@@ -229,15 +233,10 @@ pub async fn get_project_conversation(
     project_id: String,
 ) -> Result<Snapshot, String> {
     let project_id = parse_id(&project_id, "Project id")?;
-    if !state
-        .project
-        .projects
-        .read()
-        .await
-        .contains_key(&project_id)
-    {
-        return Err("Project not found".into());
-    }
+    crate::lifecycle::refuse_inactive_project(&state.project.projects, project_id, || {
+        "Project not found".to_string()
+    })
+    .await?;
     // Reads during an active provider run must remain available so the UI can
     // show liveness and offer Stop. Atomic storage replacement makes this a
     // consistent snapshot; all mutations still take the Project lock.
@@ -316,15 +315,10 @@ pub async fn get_project_conversation_executions(
     project_id: String,
 ) -> Result<Vec<ExecutionView>, String> {
     let project_id = parse_id(&project_id, "Project id")?;
-    if !state
-        .project
-        .projects
-        .read()
-        .await
-        .contains_key(&project_id)
-    {
-        return Err("Project not found".into());
-    }
+    crate::lifecycle::refuse_inactive_project(&state.project.projects, project_id, || {
+        "Project not found".to_string()
+    })
+    .await?;
     let Some(conversation) = state
         .storage
         .load_primary_conversation(project_id)
@@ -1584,6 +1578,7 @@ mod tests {
                     },
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
+                    removed_at: None,
                 },
             );
             let mut task = board_task(project_id, TaskStatus::Error);
@@ -1738,6 +1733,7 @@ mod tests {
                     },
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
+                    removed_at: None,
                 },
             );
             let task = board_task(project_id, TaskStatus::Backlog);
@@ -1996,6 +1992,7 @@ mod tests {
                     },
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
+                    removed_at: None,
                 },
             );
             let mut task = board_task(project_id, TaskStatus::Error);
@@ -2351,6 +2348,7 @@ mod tests {
                     },
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
+                    removed_at: None,
                 },
             );
             let app = tauri::test::mock_app();

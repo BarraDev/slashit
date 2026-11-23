@@ -208,7 +208,7 @@ pub(crate) async fn set_task_status(
     close_without_merge: Option<bool>,
 ) -> Result<Option<Task>, String> {
     if matches!(status, TaskStatus::Done) {
-        let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+        let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
         if let Some(old_status) = state.task.tasks.read().await.get(&task_id).map(|t| t.status.clone()) {
             refuse_unconfirmed_close(&old_status, close_without_merge)?;
         }
@@ -226,7 +226,7 @@ pub(crate) async fn set_task_status(
         };
     }
 
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let Some((old_status, unfinished_integration, queue_refusal, repeated_queue)) = ({
         let tasks = state.task.tasks.read().await;
@@ -240,6 +240,15 @@ pub(crate) async fn set_task_status(
         })
     }) else {
         return Ok(None);
+    };
+    // A removed Project's Tasks do not enter Queue. Read under the lease held
+    // above, so removal cannot happen between this check and the write.
+    let queue_refusal = match queue_refusal {
+        Some(refusal) => Some(refusal),
+        None => {
+            crate::lifecycle::removed_project_queue_refusal(&state.task.tasks, &state.project.projects, task_id, &status)
+                .await
+        }
     };
 
     // A request for the column a queued Task already holds is answered with the
@@ -355,6 +364,7 @@ pub async fn set_task_dependencies(
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     set_task_dependencies_via(
         &state.task.tasks,
+        &state.project.projects,
         &state.storage,
         &state.task_lifecycle_locks,
         task_id,
@@ -374,13 +384,15 @@ pub async fn set_task_dependencies(
 /// exactly as they were.
 pub(crate) async fn set_task_dependencies_via(
     tasks: &crate::lifecycle::Tasks,
+    projects: &tokio::sync::RwLock<std::collections::HashMap<Uuid, crate::domain::project::Project>>,
     storage: &crate::config::Storage,
     task_lifecycle_locks: &crate::lifecycle::TaskLifecycleLocks,
     task_id: Uuid,
     dependencies: Vec<String>,
 ) -> Result<Option<Task>, String> {
     let requested = crate::domain::task_dependencies::parse_requested(&dependencies)?;
-    let _lease = task_lifecycle_locks.acquire(task_id).await?;
+    let _lease =
+        crate::commands::project::lease_active_task_in(task_lifecycle_locks, tasks, projects, task_id).await?;
 
     // Checked against every Task first, so a Task of another Project is named
     // as such. The write checks again against the Tasks it stages.
@@ -484,6 +496,8 @@ pub async fn update_task_metadata(
             }
         }
     };
+    // Like every Task edit, this takes the Task's lease, which refuses a removed Project.
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
@@ -498,6 +512,7 @@ pub async fn update_task_progress(
     sequence_number: u32,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
             task.phase = phase.clone();
@@ -517,6 +532,7 @@ pub async fn add_subtask(
     title: String,
 ) -> Result<Option<Subtask>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     let subtask = Subtask {
         id: Uuid::new_v4(),
         title,
@@ -543,6 +559,7 @@ pub async fn toggle_subtask(
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     let subtask_id = Uuid::parse_str(&subtask_id).map_err(|e| e.to_string())?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
 
     // Checked before staging so a subtask that does not exist never triggers
     // a write: `commit_task` cannot itself tell "nothing to change" apart
@@ -581,6 +598,7 @@ pub async fn link_github_issue(
     issue_url: String,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     let issue = parse_issue_url(&issue_url)?;
     if state
         .task
@@ -654,7 +672,7 @@ pub async fn link_pr(
     // Replacing `pr_url` changes which pull request the task is delivered
     // through, which a refresh decided before it held this lease (see
     // `refresh_task_pr_state`), so it is written under the same lease.
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     // This links whatever URL it is given. A task that holds a request to
     // open its pull request that was never answered is settled only by the
     // recovery that checks the pull request is this branch's own, in this
@@ -710,6 +728,7 @@ pub async fn mark_task_stuck(
     task_id: String,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
             task.stuck_since = Some(chrono::Utc::now());
@@ -725,6 +744,7 @@ pub async fn unstick_task(
     task_id: String,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
             task.stuck_since = None;
@@ -743,11 +763,14 @@ pub async fn unstick_task(
 /// instead of re-deciding how the fields are stored.
 pub(crate) async fn set_task_model_and_review_mode(
     tasks: &crate::lifecycle::Tasks,
+    projects: &tokio::sync::RwLock<std::collections::HashMap<Uuid, crate::domain::project::Project>>,
+    locks: &crate::lifecycle::TaskLifecycleLocks,
     storage: &crate::config::Storage,
     task_id: Uuid,
     model: Option<String>,
     review_mode: Option<crate::domain::task::ReviewMode>,
 ) -> Result<Option<Task>, String> {
+    let _lease = crate::commands::project::lease_active_task_in(locks, tasks, projects, task_id).await?;
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
             if let Some(m) = model.clone() {
@@ -829,12 +852,9 @@ pub async fn update_task(
         .as_deref()
         .map(crate::domain::task_dependencies::parse_requested)
         .transpose()?;
-    // A dependency change takes the lease `set_task_dependencies` takes, so it
-    // serializes with the same lifecycle operations.
-    let _lease = match dependencies {
-        Some(_) => Some(state.task_lifecycle_locks.acquire(task_id).await?),
-        None => None,
-    };
+    // Every edit takes the Task's lease and refuses a removed Project under it,
+    // so no field can be written to a Task that is read-only by removal.
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     if let Some(requested) = &dependencies {
         // Checked against every Task first, so a Task of another Project is
         // named as such. The write checks the staged Tasks again.
@@ -985,7 +1005,7 @@ pub async fn reorder_task(
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
 
     let Some((project_id, old_status, unfinished_integration, queue_refusal)) = ({
         let tasks = state.task.tasks.read().await;
@@ -1021,6 +1041,11 @@ pub async fn reorder_task(
     if target_status == TaskStatus::Queue && old_status != TaskStatus::Queue {
         if let Some(refusal) = queue_refusal {
             return Err(refusal);
+        }
+        // A removed Project's Tasks do not enter Queue. The lease held above
+        // keeps removal from landing between this check and the write.
+        if crate::lifecycle::project_is_removed(&state.project.projects, project_id).await {
+            return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
         }
     }
 
@@ -1139,6 +1164,7 @@ pub async fn add_external_ref(
     external_ref: ExternalRef,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
     add_external_ref_serialized(&state.task.tasks, &state.storage, task_id, external_ref).await
 }
 
@@ -1189,15 +1215,8 @@ pub async fn remove_external_ref(
     expected: ExternalRef,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    remove_external_ref_chosen_serialized(
-        &state.task.tasks,
-        &state.storage,
-        &state.task_lifecycle_locks,
-        task_id,
-        ref_index,
-        &expected,
-    )
-    .await
+    let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
+    remove_external_ref_chosen_locked(&state.task.tasks, &state.storage, task_id, ref_index, &expected).await
 }
 
 /// [`remove_external_ref_serialized`] for a caller that names the reference it
@@ -1206,10 +1225,25 @@ pub async fn remove_external_ref(
 /// position since. Otherwise nothing is removed and the caller is told to ask
 /// again. Two references to one Issue or pull request are the same link when
 /// their URLs are; their recorded state is not identity.
+#[cfg(test)]
 pub(crate) async fn remove_external_ref_chosen_serialized(
     tasks: &crate::lifecycle::Tasks,
     storage: &crate::config::Storage,
     locks: &crate::lifecycle::TaskLifecycleLocks,
+    task_id: Uuid,
+    ref_index: usize,
+    expected: &ExternalRef,
+) -> Result<Option<Task>, String> {
+    let guards_lifecycle = matches!(expected, ExternalRef::GithubPr { .. });
+    let _lease = if guards_lifecycle { Some(locks.acquire(task_id).await?) } else { None };
+    remove_external_ref_chosen_locked(tasks, storage, task_id, ref_index, expected).await
+}
+
+/// The write of [`remove_external_ref_chosen_serialized`], for a caller that
+/// already holds the Task's lease (see `lease_active_task`).
+pub(crate) async fn remove_external_ref_chosen_locked(
+    tasks: &crate::lifecycle::Tasks,
+    storage: &crate::config::Storage,
     task_id: Uuid,
     ref_index: usize,
     expected: &ExternalRef,
@@ -1221,9 +1255,6 @@ pub(crate) async fn remove_external_ref_chosen_serialized(
         }
         _ => a == b,
     };
-    let guards_lifecycle = matches!(expected, ExternalRef::GithubPr { .. });
-    let _lease = if guards_lifecycle { Some(locks.acquire(task_id).await?) } else { None };
-
     let moved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let revise = {
         let moved = moved.clone();
@@ -3246,6 +3277,7 @@ mod task_dependency_contract {
             },
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            removed_at: None,
         }
     }
 
@@ -3849,6 +3881,77 @@ mod task_dependency_contract {
         assert_eq!(both_copies(&app, project_id, legacy.id).await, before);
     }
 
+    /// A removed Project's Task is read-only: a title edit, a metadata edit and
+    /// a dependency edit are each refused, and the stored Task does not change.
+    /// The control at the end shows the same title edit succeeds once the
+    /// Project is active again, so the refusal is caused by the removal.
+    #[tokio::test]
+    async fn a_removed_projects_task_refuses_title_metadata_and_dependency_edits() {
+        let project_id = Uuid::new_v4();
+        let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
+        let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
+        let (_tmp, _paths, app) =
+            app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
+        let state = app.state::<crate::AppState>();
+        state
+            .project
+            .projects
+            .write()
+            .await
+            .get_mut(&project_id)
+            .unwrap()
+            .removed_at = Some(chrono::Utc::now());
+        let before = both_copies(&app, project_id, child.id).await;
+
+        let title = update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            edit_of(child.id, None, None),
+        )
+        .await
+        .expect_err("a title edit is refused for a removed Project");
+        assert_eq!(title, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        let metadata = update_task_metadata(
+            GuiMutation::untracked(),
+            app.state(),
+            child.id.to_string(),
+            None,
+            Some(TaskPriority::High),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a metadata edit is refused for a removed Project");
+        assert_eq!(metadata, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        let dependency = set(&app, child.id, vec![parent.id])
+            .await
+            .expect_err("a dependency edit is refused");
+        assert_eq!(dependency, crate::domain::project::PROJECT_REMOVED_REFUSAL);
+        assert_eq!(
+            both_copies(&app, project_id, child.id).await,
+            before,
+            "nothing was written"
+        );
+
+        state
+            .project
+            .projects
+            .write()
+            .await
+            .get_mut(&project_id)
+            .unwrap()
+            .removed_at = None;
+        update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            edit_of(child.id, None, None),
+        )
+        .await
+        .expect("an active Project's Task is edited")
+        .expect("the task exists");
+    }
+
     #[tokio::test]
     async fn a_recorded_dependency_is_read_back_from_disk_by_a_new_process() {
         let project_id = Uuid::new_v4();
@@ -4157,6 +4260,7 @@ mod issue_reference_write_tests {
 
         let result = set_task_dependencies_via(
             &board.tasks,
+            &tokio::sync::RwLock::new(std::collections::HashMap::new()),
             &board.storage,
             &board.locks,
             board.task_id,
