@@ -792,6 +792,20 @@ async fn closing_the_organizer_while_an_attach_is_pending_leaves_the_app_respons
     context.finish(outcome);
 }
 
+/// Opens Organize Projects and expands one Workspace's settings. Unlike
+/// `expand_workspace_in_organizer`, this waits only for the settings inputs, so
+/// it works for a Workspace with no Projects to attach.
+async fn expand_workspace_settings(driver: &WebDriver, workspace: &str) -> Result<()> {
+    ui::visible(driver, RAIL_ORGANIZE).await?.click().await.context("could not open Organize Projects")?;
+    ui::visible(driver, &format!("[data-testid=\"workspace-{workspace}\"] [data-testid=\"workspace-toggle\"]"))
+        .await?
+        .click()
+        .await
+        .context("could not expand the Workspace")?;
+    ui::visible(driver, &format!("[data-testid=\"workspace-{workspace}\"] [data-testid=\"workspace-settings\"]")).await?;
+    Ok(())
+}
+
 /// Scenario: text typed into the Workspace name while its rename is in flight
 /// is kept when the reply arrives. The reply confirms the name that was
 /// submitted, and it does not replace the newer text.
@@ -809,7 +823,7 @@ async fn a_workspace_name_typed_during_its_rename_survives_the_reply() {
         driver.refresh().await.context("could not reload the application window")?;
         ui::assert_frontend_is_real(driver).await?;
 
-        expand_workspace_in_organizer(driver, &workspace).await?;
+        expand_workspace_settings(driver, &workspace).await?;
 
         let field = ui::visible(driver, "[data-testid=\"workspace-rename-input\"]").await?;
         field.clear().await.context("could not clear the name field")?;
@@ -883,7 +897,7 @@ async fn a_workspace_root_typed_during_its_save_survives_the_reply() {
         driver.refresh().await.context("could not reload the application window")?;
         ui::assert_frontend_is_real(driver).await?;
 
-        expand_workspace_in_organizer(driver, &workspace).await?;
+        expand_workspace_settings(driver, &workspace).await?;
 
         let field = ui::visible(driver, "[data-testid=\"workspace-root-input\"]").await?;
         field.clear().await.context("could not clear the root field")?;
