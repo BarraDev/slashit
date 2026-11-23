@@ -809,9 +809,7 @@ async fn a_workspace_name_typed_during_its_rename_survives_the_reply() {
         driver.refresh().await.context("could not reload the application window")?;
         ui::assert_frontend_is_real(driver).await?;
 
-        ui::visible(driver, &workspace_select(&workspace)).await?.click().await.context("could not select Rename Alpha")?;
-        wait_until("Workspace Home to show Rename Alpha", || async { Ok(home_name(driver).await? == "Rename Alpha") })
-            .await?;
+        expand_workspace_in_organizer(driver, &workspace).await?;
 
         let field = ui::visible(driver, "[data-testid=\"workspace-rename-input\"]").await?;
         field.clear().await.context("could not clear the name field")?;
@@ -837,8 +835,14 @@ async fn a_workspace_name_typed_during_its_rename_survives_the_reply() {
             Ok(ui::invoke_fault_state(driver).await?.1)
         })
         .await?;
-        wait_until("Workspace Home to show the saved name", || async {
-            Ok(home_name(driver).await? == "Renamed Once")
+        wait_until("the rename success to be reported", || async {
+            Ok(page(
+                driver,
+                "return [...document.querySelectorAll('[data-testid=\"toast\"]')].some(t => t.textContent.includes('Workspace renamed'));",
+                vec![],
+            )
+            .await?
+                == Value::Bool(true))
         })
         .await?;
 
@@ -879,8 +883,7 @@ async fn a_workspace_root_typed_during_its_save_survives_the_reply() {
         driver.refresh().await.context("could not reload the application window")?;
         ui::assert_frontend_is_real(driver).await?;
 
-        ui::visible(driver, &workspace_select(&workspace)).await?.click().await.context("could not select Root Alpha")?;
-        wait_until("Workspace Home to show Root Alpha", || async { Ok(home_name(driver).await? == "Root Alpha") }).await?;
+        expand_workspace_in_organizer(driver, &workspace).await?;
 
         let field = ui::visible(driver, "[data-testid=\"workspace-root-input\"]").await?;
         field.clear().await.context("could not clear the root field")?;
@@ -903,6 +906,17 @@ async fn a_workspace_root_typed_during_its_save_survives_the_reply() {
         ui::release_invoke_hold(driver).await?;
         wait_until("the held root reply to reach the application", || async {
             Ok(ui::invoke_fault_state(driver).await?.1)
+        })
+        .await?;
+
+        wait_until("the root save success to be reported", || async {
+            Ok(page(
+                driver,
+                "return [...document.querySelectorAll('[data-testid=\"toast\"]')].some(t => t.textContent.includes('Workspace root saved'));",
+                vec![],
+            )
+            .await?
+                == Value::Bool(true))
         })
         .await?;
 
