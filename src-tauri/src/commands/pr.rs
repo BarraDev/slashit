@@ -13779,14 +13779,11 @@ mod tests {
         #[cfg(target_os = "linux")]
         #[tokio::test]
         async fn a_tip_read_past_its_bound_kills_the_git_it_waits_on() {
-            use std::os::unix::fs::PermissionsExt;
-
             let repo = ColocatedJj::new("task-branch");
             let dir = tempfile::tempdir().expect("tempdir");
             let pid_file = dir.path().join("pid");
             let hung_git = dir.path().join("git");
-            std::fs::write(&hung_git, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 300\n", pid_file.display())).unwrap();
-            std::fs::set_permissions(&hung_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_helpers::write_executable(&hung_git, &format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 300\n", pid_file.display()));
 
             let began = std::time::Instant::now();
             let err = test_programs::scope(

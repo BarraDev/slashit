@@ -239,12 +239,10 @@ mod tests {
     /// `jq` at all when `status` is `None`.
     #[cfg(target_os = "linux")]
     fn jq_directory(name: &str, status: Option<u8>) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let dir = scratch(name);
         if let Some(status) = status {
             let jq = dir.join("jq");
-            std::fs::write(&jq, format!("#!/bin/sh\nexit {status}\n")).expect("jq stub");
-            std::fs::set_permissions(&jq, std::fs::Permissions::from_mode(0o755)).expect("jq mode");
+            crate::fixture::write_executable(&jq, &format!("#!/bin/sh\nexit {status}\n")).expect("jq stub");
         }
         dir
     }
