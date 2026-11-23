@@ -52,11 +52,11 @@ impl AsRef<Path> for WorkspaceRoot {
 /// to via `ProjectScope`.
 ///
 /// `root_path` is an advanced, optional Shared Agent Context Directory. When
-/// it is set, a Worker of a member Project starts from that folder and the
-/// Task Checkout is exposed with `--add-dir`. When it is absent, the Workspace
-/// is grouping only and Workers start from their own Task Checkout as before.
-/// Records written before the root became optional still carry it and keep
-/// their meaning.
+/// it is set, its `CLAUDE.md` and `AGENTS.md` are copied as text into the
+/// instructions of member Projects' coding Workers. A Worker still starts in
+/// its Task Checkout, and the folder is never granted to it as a directory.
+/// When it is absent, the Workspace is grouping only. Records written before
+/// the root became optional still carry it and keep their meaning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Uuid,

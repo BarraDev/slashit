@@ -22,6 +22,7 @@
 //!   session selected to `<record>` as JSON, writes `fixed-by-opencode.txt` in its
 //!   working directory, then ends the turn.
 //! - `hang-on-prompt`: never answers session/prompt.
+//! - `config-echo`: reports OPENCODE_CONFIG_CONTENT and the instruction file it names.
 //!
 //! Every other scenario accepts session/set_config_option and reports the value.
 //!
@@ -184,6 +185,7 @@ fn dispatch(io: &mut Io, scenario: &str, message: &Value) {
                     permission_turn(io, &id, &session, scenario)
                 }
                 "model-echo" => echo_model_turn(io, &id, &session),
+                "config-echo" => config_echo_turn(io, &id, &session),
                 "edit-on-prompt" => edit_turn(io, &id, &session, message),
                 // Never ends the turn: the client must cancel it.
                 "hang-on-prompt" => loop {
@@ -203,6 +205,24 @@ fn dispatch(io: &mut Io, scenario: &str, message: &Value) {
         })),
         _ => {}
     }
+}
+
+/// Reports what OpenCode would be given: the inline configuration this process
+/// was started with, and the text of the instruction file that configuration
+/// names, read during the turn. Proves the file exists while the run is live.
+fn config_echo_turn(io: &mut Io, id: &Value, session: &Value) {
+    let config = std::env::var("OPENCODE_CONFIG_CONTENT").unwrap_or_default();
+    io.text_update(session, &format!("config={config}"));
+    let parsed: Value = serde_json::from_str(&config).unwrap_or(Value::Null);
+    let instructions = match parsed["instructions"][0].as_str() {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => format!("instructions-text={text}"),
+            Err(e) => format!("instructions-missing={e}"),
+        },
+        None => "instructions-none".to_string(),
+    };
+    io.text_update(session, &instructions);
+    respond(io, id, json!({"stopReason": "end_turn"}));
 }
 
 /// The model the last session/set_config_option selected in this process.

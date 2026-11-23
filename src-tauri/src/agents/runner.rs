@@ -485,16 +485,17 @@ pub struct ClaudeRunConfig {
     pub model: Option<String>,
     /// Replaces the CLI's default system prompt (`--system-prompt`).
     pub system_prompt: Option<String>,
-    /// Appended to the system prompt (`--append-system-prompt`). Rules that
-    /// must outrank anything in the user prompt go here.
+    /// Appended to the system prompt (`--append-system-prompt-file`). Rules that
+    /// must outrank anything in the user prompt go here. The text goes to a
+    /// private file, never to argv (see [`AppendPromptFile`]).
     pub append_system_prompt: Option<String>,
     /// When true, pass --strict-mcp-config without any --mcp-config files,
     /// effectively disabling all MCP servers (project + user) for this run.
     /// [`ToolAccess::ReadOnly`] always does this.
     pub disable_mcp: bool,
     /// Extra directories to expose to Claude via repeated `--add-dir` flags.
-    /// Used when running from a meta-workspace cwd so the agent can also
-    /// read/write a specific project tree.
+    /// No coding run passes any: a Worker runs in its Task Checkout, and the
+    /// Workspace root is never granted.
     pub additional_dirs: Vec<std::path::PathBuf>,
     /// When true, the run reads only the project's settings and instruction
     /// files (`--setting-sources project`) and disables every hook
@@ -745,6 +746,102 @@ impl IsolatedSettingsFile {
     }
 }
 
+/// Prefix of the name of a run's appended-prompt file. The rest is random.
+const PROMPT_FILE_PREFIX: &str = "slashit-claude-prompt-";
+
+/// Why a run did not start because its prompt file could not be written. It
+/// names no path and no content.
+const PROMPT_FILE_FAILURE: &str =
+    "SlashIt could not write the Claude Code prompt file securely, so the run was not started.";
+
+/// The `--append-system-prompt-file` of one run.
+///
+/// The appended text holds the Workspace root's copied instructions, which
+/// the user wrote and may not want visible to other local users. Any local
+/// user can read another process's argv, so the text goes to an owner-only
+/// file and the argument list carries only its path. The file lives in the
+/// application's runtime directory (`slashit_ipc::endpoint::runtime_dir`),
+/// not in a shared temporary directory, and it is deleted when this value is
+/// dropped, which happens once the provider has exited.
+struct AppendPromptFile(tempfile::TempPath);
+
+/// Directory for the private instruction file. With `XDG_RUNTIME_DIR` set (the
+/// normal Linux session) it is the runtime directory. Without it, the runtime
+/// fallback is the temporary directory (`/tmp`, RAM-backed), so the file goes to
+/// the user's data directory instead. Other platforms keep their runtime
+/// directory.
+fn prompt_file_dir_from(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    data_local_dir: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if !cfg!(unix) || xdg_runtime_dir.is_some_and(|dir| !dir.is_empty()) {
+        return Some(slashit_ipc::endpoint::runtime_dir());
+    }
+    data_local_dir.map(|dir| dir.join("slashit").join("run"))
+}
+
+#[cfg(test)]
+mod prompt_file_location_tests {
+    use super::prompt_file_dir_from;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    #[test]
+    fn without_a_runtime_dir_the_instruction_file_leaves_the_temporary_directory() {
+        let data = PathBuf::from("/home/someone/.local/share");
+        let dir = prompt_file_dir_from(None, Some(data.clone())).expect("a data directory");
+        if cfg!(unix) {
+            assert_eq!(dir, data.join("slashit").join("run"));
+            assert!(!dir.starts_with(std::env::temp_dir()), "{dir:?} is under the temporary directory");
+            assert!(prompt_file_dir_from(Some(OsStr::new("")), None).is_none(), "no directory is chosen");
+        }
+    }
+}
+
+impl AppendPromptFile {
+    /// Writes `text` to a new owner-only file in the directory chosen by
+    /// [`prompt_file_dir_from`].
+    fn create(text: &str) -> Result<Self, String> {
+        let dir = prompt_file_dir_from(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            dirs::data_local_dir(),
+        )
+        .ok_or_else(|| PROMPT_FILE_FAILURE.to_string())?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&dir)
+            .map_err(|_| PROMPT_FILE_FAILURE.to_string())?;
+        Self::create_in(&dir, text)
+    }
+
+    /// [`Self::create`] in `dir`. The file is opened with `create_new`
+    /// (`O_EXCL`) under a random name and is `0600` from its first byte. If it
+    /// cannot be written, nothing is left behind.
+    fn create_in(dir: &std::path::Path, text: &str) -> Result<Self, String> {
+        use std::io::Write;
+
+        let mut file = tempfile::Builder::new()
+            .prefix(PROMPT_FILE_PREFIX)
+            .suffix(".txt")
+            .tempfile_in(dir)
+            .map_err(|_| PROMPT_FILE_FAILURE.to_string())?;
+        // An error here drops `file`, which deletes it.
+        file.write_all(text.as_bytes())
+            .map_err(|_| PROMPT_FILE_FAILURE.to_string())?;
+        Ok(Self(file.into_temp_path()))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
 /// Instruction files that Claude Code reads from each directory above the
 /// working directory, as well as the working directory itself.
 const ANCESTOR_INSTRUCTION_FILES: &[&str] = &[
@@ -776,9 +873,10 @@ fn ancestor_instruction_excludes(working_dir: &std::path::Path) -> Vec<serde_jso
 /// `--add-dir` directory. Without it the CLI loads instruction files only from
 /// the working directory and its ancestors.
 ///
-/// A workspace-backed run starts from the Workspace root and exposes the Task
-/// Checkout with `--add-dir`, so without this the checkout's own `CLAUDE.md`
-/// (and the `@AGENTS.md` it imports) never reaches the agent. Checked on
+/// A run that passes `--add-dir` directories needs this. No coding Worker does
+/// today: each runs in its Task Checkout, and a Workspace root's instructions
+/// reach it as copied text. Without the variable, a checkout's own `CLAUDE.md`
+/// (and the `@AGENTS.md` it imports) would not load for such a run. Checked on
 /// Claude Code 2.1.308 with a local stub: with the variable set, the checkout's
 /// file loads, and its ancestors and sibling directories stay out.
 const ADDITIONAL_DIRS_CLAUDE_MD_ENV: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
@@ -790,6 +888,9 @@ fn additional_dirs_instruction_env(config: &ClaudeRunConfig) -> Option<(&'static
 }
 
 /// The Claude CLI arguments for `config`, in order, without the program.
+///
+/// The appended system prompt is not among them either: `prompt_file` is the
+/// [`AppendPromptFile`] holding it, and only its path is passed.
 ///
 /// Separate from [`ClaudeRunner::start_program`] so the capability flags a
 /// configuration produces can be tested without spawning anything.
@@ -809,10 +910,12 @@ fn additional_dirs_instruction_env(config: &ClaudeRunConfig) -> Option<(&'static
 ///
 /// If `isolate_customizations` is set and `settings_file` is `None`. Passing no
 /// settings file would start the run without its isolation, so the caller that
-/// builds an isolated run is the one that must supply it.
+/// builds an isolated run is the one that must supply it. The same holds for
+/// `prompt_file` and a set `append_system_prompt`.
 pub fn claude_args(
     config: &ClaudeRunConfig,
     settings_file: Option<&std::path::Path>,
+    prompt_file: Option<&std::path::Path>,
 ) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     let mut push = |a: &str| args.push(a.into());
@@ -884,17 +987,21 @@ pub fn claude_args(
         push("--system-prompt");
         push(sys);
     }
-    if let Some(ref extra) = config.append_system_prompt {
-        push("--append-system-prompt");
-        push(extra);
-    }
     if let Some(ref schema) = config.json_schema {
         push("--json-schema");
         push(&schema.to_string());
     }
 
     // From here on the arguments are pushed directly, not through `push`:
-    // the settings path is an `OsStr`, which the closure above does not take.
+    // the settings and prompt paths are `OsStr`s, which the closure above does
+    // not take.
+    if config.append_system_prompt.is_some() {
+        let file = prompt_file.expect(
+            "an appended system prompt is launched with its prompt file; see `claude_args`",
+        );
+        args.push("--append-system-prompt-file".into());
+        args.push(file.as_os_str().to_owned());
+    }
     if config.isolate_customizations {
         let settings = settings_file
             .expect("an isolated run is launched with its settings file; see `claude_args`");
@@ -998,6 +1105,9 @@ pub struct ClaudeRunner {
     /// exited (see [`Self::wait`]), and deleted when this runner is dropped
     /// whatever happened before that.
     settings_file: std::sync::Mutex<Option<IsolatedSettingsFile>>,
+    /// The `--append-system-prompt-file` of the run, held and deleted like
+    /// `settings_file`.
+    prompt_file: std::sync::Mutex<Option<AppendPromptFile>>,
 }
 
 impl Drop for ClaudeRunner {
@@ -1135,7 +1245,15 @@ impl ClaudeRunner {
         } else {
             None
         };
-        cmd.args(claude_args(&config, settings_file.as_ref().map(IsolatedSettingsFile::path)));
+        let prompt_file = match config.append_system_prompt.as_deref() {
+            Some(text) => Some(AppendPromptFile::create(text).map_err(LaunchError::before_spawn)?),
+            None => None,
+        };
+        cmd.args(claude_args(
+            &config,
+            settings_file.as_ref().map(IsolatedSettingsFile::path),
+            prompt_file.as_ref().map(AppendPromptFile::path),
+        ));
         cmd.env_clear();
         cmd.envs(child_env);
         if let Some((name, value)) = instruction_env {
@@ -1266,6 +1384,7 @@ impl ClaudeRunner {
             expect_auto,
             auto_confirmed: Arc::new(AtomicBool::new(false)),
             settings_file: std::sync::Mutex::new(settings_file),
+            prompt_file: std::sync::Mutex::new(prompt_file),
         };
 
         let handle = runner.start_reader(stdout);
@@ -1655,6 +1774,9 @@ impl ClaudeRunner {
         // keeps the file's life to the run's own.
         if let Ok(mut settings) = self.settings_file.lock() {
             settings.take();
+        }
+        if let Ok(mut prompt) = self.prompt_file.lock() {
+            prompt.take();
         }
 
         // Wait for the stdout reader to drain before callers read accumulated_output.
@@ -2240,7 +2362,7 @@ mod args_tests {
     }
 
     fn args(config: &ClaudeRunConfig) -> Vec<String> {
-        claude_args(config, None)
+        claude_args(config, None, None)
             .into_iter()
             .map(|a| a.into_string().expect("utf-8 arg"))
             .collect()
@@ -2284,7 +2406,7 @@ mod args_tests {
             additional_dirs_instruction_env(config),
         )
         .expect("the settings file is written");
-        let args: Vec<String> = claude_args(config, Some(file.path()))
+        let args: Vec<String> = claude_args(config, Some(file.path()), None)
             .into_iter()
             .map(|a| a.into_string().expect("utf-8 arg"))
             .collect();
@@ -2452,12 +2574,42 @@ mod args_tests {
     }
 
     #[test]
-    fn the_appended_system_prompt_is_passed_through() {
+    fn the_appended_system_prompt_reaches_the_cli_by_file_not_argv() {
+        let text = "Shared instructions: rule-marker-7f3a";
         let mut cfg = config(ToolAccess::ReadOnly);
-        cfg.append_system_prompt = Some("rules".into());
-        let args = args(&cfg);
-        assert_eq!(value_of(&args, "--append-system-prompt"), Some("rules"));
+        cfg.append_system_prompt = Some(text.into());
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = AppendPromptFile::create_in(dir.path(), text).unwrap();
+        let args: Vec<String> = claude_args(&cfg, None, Some(file.path()))
+            .into_iter()
+            .map(|a| a.into_string().expect("utf-8 arg"))
+            .collect();
+        assert_eq!(
+            value_of(&args, "--append-system-prompt-file"),
+            file.path().to_str()
+        );
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), text);
+        assert!(
+            !args.iter().any(|a| a == "--append-system-prompt"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a.contains("rule-marker")), "{args:?}");
         assert!(!args.iter().any(|a| a == "--system-prompt"));
+    }
+
+    /// The file is owner-only from its first byte and is deleted with its value,
+    /// the same lifetime as the isolated settings file.
+    #[cfg(unix)]
+    #[test]
+    fn the_appended_prompt_file_is_owner_only_and_deleted_when_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = AppendPromptFile::create_in(dir.path(), "rules").unwrap();
+        let mode = std::fs::metadata(file.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let path = file.path().to_path_buf();
+        drop(file);
+        assert!(!path.exists(), "{path:?} outlived its run");
     }
 
     /// The prompt goes to the child's stdin (see `ClaudeRunner::start_program`),
@@ -2516,7 +2668,7 @@ mod launch_policy_tests {
 
     #[test]
     fn auto_passes_auto_and_never_bypass_or_an_approval_list() {
-        let args: Vec<String> = claude_args(&auto_config(vec!["Bash".into(), "Edit".into()]), None)
+        let args: Vec<String> = claude_args(&auto_config(vec!["Bash".into(), "Edit".into()]), None, None)
             .into_iter()
             .map(|a| a.into_string().unwrap())
             .collect();
@@ -2802,7 +2954,7 @@ mod launch_policy_tests {
     #[test]
     fn runs_that_are_not_isolated_keep_the_settings_their_user_configured() {
         let args: Vec<String> =
-            claude_args(&auto_config(vec![]), None).into_iter().map(|a| a.into_string().unwrap()).collect();
+            claude_args(&auto_config(vec![]), None, None).into_iter().map(|a| a.into_string().unwrap()).collect();
         assert!(!args.iter().any(|a| a == "--setting-sources" || a == "--settings"), "{args:?}");
     }
 
@@ -2877,7 +3029,7 @@ mod launch_policy_tests {
 
         let mut config = auto_config(vec![]);
         config.isolate_customizations = true;
-        let args: Vec<String> = claude_args(&config, Some(file.path()))
+        let args: Vec<String> = claude_args(&config, Some(file.path()), None)
             .into_iter()
             .map(|a| a.into_string().unwrap())
             .collect();
@@ -4079,7 +4231,7 @@ mod tests {
             let fixture = Fixture::new(STDIN_ECHO);
             let prompt = "PROMPT-MARKER: review this change\n--tools Bash\n";
             let config = fixture.config_with_prompt(prompt, tools);
-            let expected_argv: Vec<Vec<u8>> = claude_args(&config, None)
+            let expected_argv: Vec<Vec<u8>> = claude_args(&config, None, None)
                 .into_iter()
                 .map(|a| a.into_encoded_bytes())
                 .collect();

@@ -87,7 +87,7 @@ async fn initialized(scenario: &str) -> (Connection, SessionRef) {
     let conn = start(scenario);
     conn.initialize().await.expect("initialize");
     let session = conn
-        .new_session(&std::env::temp_dir())
+        .new_session_with_dirs(&std::env::temp_dir(), &[])
         .await
         .expect("session/new");
     (conn, session)
@@ -254,7 +254,7 @@ async fn unsupported_protocol_version_fails_closed_and_kills_the_agent() {
     let error = conn.initialize().await.unwrap_err();
     assert!(matches!(error, AcpError::UnsupportedProtocolVersion { ref agent } if agent == "2"));
     // The connection refuses every later request.
-    let later = conn.new_session(&std::env::temp_dir()).await.unwrap_err();
+    let later = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap_err();
     assert!(matches!(
         later,
         AcpError::NotInitialized | AcpError::Closed(_)
@@ -268,11 +268,11 @@ async fn session_new_requires_an_absolute_working_directory() {
     let conn = start("ok");
     conn.initialize().await.unwrap();
     let relative = conn
-        .new_session(Path::new("relative/dir"))
+        .new_session_with_dirs(Path::new("relative/dir"), &[])
         .await
         .unwrap_err();
     assert!(matches!(relative, AcpError::InvalidWorkingDirectory(_)));
-    let session = conn.new_session(&std::env::temp_dir()).await.unwrap();
+    let session = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap();
     assert_eq!(session.id(), "fixture-session-1");
     conn.shutdown(LONG).await.unwrap();
 }
@@ -280,9 +280,43 @@ async fn session_new_requires_an_absolute_working_directory() {
 #[tokio::test]
 async fn session_new_before_initialize_is_refused() {
     let conn = start("ok");
-    let error = conn.new_session(&std::env::temp_dir()).await.unwrap_err();
+    let error = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap_err();
     assert_eq!(error, AcpError::NotInitialized);
     conn.shutdown(LONG).await.unwrap();
+}
+
+#[tokio::test]
+async fn session_new_with_dirs_is_refused_when_the_agent_does_not_advertise_them() {
+    let conn = start("ok");
+    conn.initialize().await.unwrap();
+    let dir = std::env::temp_dir();
+    let error = conn
+        .new_session_with_dirs(&dir, std::slice::from_ref(&dir))
+        .await
+        .unwrap_err();
+    assert_eq!(error, AcpError::AdditionalDirectoriesUnsupported);
+    conn.shutdown(LONG).await.unwrap();
+}
+
+#[test]
+fn session_new_params_omit_the_field_without_directories() {
+    let params = super::connection::session_new_params("/work", &[]);
+    assert_eq!(params, serde_json::json!({"cwd": "/work", "mcpServers": []}));
+    let with_dirs = super::connection::session_new_params("/work", &["/root".to_string()]);
+    assert_eq!(with_dirs["additionalDirectories"], serde_json::json!(["/root"]));
+}
+
+#[test]
+fn additional_directories_is_read_only_when_advertised() {
+    let advertised = serde_json::json!({
+        "protocolVersion": 1,
+        "agentCapabilities": {"sessionCapabilities": {"additionalDirectories": {}}}
+    });
+    let (_, caps) = super::types::parse_initialize_result(&advertised).unwrap();
+    assert!(caps.additional_directories);
+    let absent = serde_json::json!({"protocolVersion": 1, "agentCapabilities": {}});
+    let (_, caps) = super::types::parse_initialize_result(&absent).unwrap();
+    assert!(!caps.additional_directories);
 }
 
 // Connection: streaming, stop reasons, and the event stream
@@ -329,7 +363,7 @@ async fn streamed_updates_are_typed_and_unknown_events_are_not_actions() {
 async fn permission_without_a_decision_is_cancelled_by_timeout() {
     let conn = Connection::spawn_holding(&spec("permission", LONG, Duration::from_millis(100)), None, Box::new(())).unwrap();
     conn.initialize().await.unwrap();
-    let session = conn.new_session(&std::env::temp_dir()).await.unwrap();
+    let session = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap();
     let mut events = conn.take_events().unwrap();
 
     let turn = {
@@ -361,7 +395,7 @@ async fn permission_decisions_must_name_an_offered_option_of_the_matching_kind()
     let (conn, session) = {
         let conn = Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
         conn.initialize().await.unwrap();
-        let session = conn.new_session(&std::env::temp_dir()).await.unwrap();
+        let session = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap();
         (conn, session)
     };
     let mut events = conn.take_events().unwrap();
@@ -404,7 +438,7 @@ async fn permission_decisions_must_name_an_offered_option_of_the_matching_kind()
 async fn an_explicit_reject_selects_only_the_reject_option() {
     let conn = Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
     conn.initialize().await.unwrap();
-    let session = conn.new_session(&std::env::temp_dir()).await.unwrap();
+    let session = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap();
     let mut events = conn.take_events().unwrap();
     let turn = {
         let conn = conn.clone();
@@ -439,7 +473,7 @@ async fn an_explicit_reject_selects_only_the_reject_option() {
 async fn cancel_answers_pending_permission_and_ends_the_turn_as_cancelled() {
     let conn = Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
     conn.initialize().await.unwrap();
-    let session = conn.new_session(&std::env::temp_dir()).await.unwrap();
+    let session = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap();
     let mut events = conn.take_events().unwrap();
     let turn = {
         let conn = conn.clone();
@@ -486,7 +520,7 @@ async fn a_cancel_is_written_while_a_request_is_waiting_for_its_reply() {
     // The fixture never answers session/new, so this stays pending.
     let pending = {
         let conn = conn.clone();
-        tokio::spawn(async move { conn.new_session(&std::env::temp_dir()).await })
+        tokio::spawn(async move { conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await })
     };
 
     conn.cancel(&session)
@@ -509,7 +543,7 @@ async fn a_cancel_is_written_while_a_request_is_waiting_for_its_reply() {
 async fn a_request_times_out_when_the_agent_is_silent() {
     let conn = Connection::spawn_holding(&spec("silent", Duration::from_millis(150), LONG), None, Box::new(())).unwrap();
     conn.initialize().await.unwrap();
-    let error = conn.new_session(&std::env::temp_dir()).await.unwrap_err();
+    let error = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap_err();
     assert_eq!(
         error,
         AcpError::Timeout {
@@ -554,7 +588,7 @@ async fn an_unexpected_exit_fails_the_pending_turn_and_reports_the_status() {
 async fn malformed_stdout_fails_the_connection_and_kills_the_agent() {
     let conn = start("bad-json");
     conn.initialize().await.unwrap();
-    let error = conn.new_session(&std::env::temp_dir()).await.unwrap_err();
+    let error = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap_err();
     assert!(matches!(error, AcpError::Malformed(_)), "{error:?}");
     let status = conn.shutdown(LONG).await.unwrap();
     assert!(exit_is_failure(status));

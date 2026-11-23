@@ -36,6 +36,116 @@ fn worker_scratch_rule(checkout: &str) -> String {
     )
 }
 
+/// The instruction files a custom Workspace root contributes to a Worker.
+const WORKSPACE_CONTEXT_FILES: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
+/// A larger file is skipped rather than truncated, so the Worker never gets a cut-off instruction.
+const WORKSPACE_CONTEXT_MAX_BYTES: u64 = 32 * 1024;
+
+/// Opens an instruction file for reading and refuses anything that is not a
+/// regular file, judged on the object actually opened, not on the path. The
+/// caller's metadata check happens before the open, so a swap in between must
+/// not be followed (`O_NOFOLLOW`, or on Windows `FILE_FLAG_OPEN_REPARSE_POINT`
+/// which opens the link itself) nor block (`O_NONBLOCK`, so a FIFO returns at
+/// once and is refused here before any read).
+fn open_instruction_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    #[cfg(windows)]
+    let reparse_point = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let reparse_point = false;
+    if !meta.is_file() || reparse_point {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// The Workspace root's shared instructions as one copied text, and the reason
+/// each present file was left out. The reasons name files and conditions only,
+/// never content, so they are safe for the Task log.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WorkspaceContext {
+    text: Option<String>,
+    skipped: Vec<String>,
+}
+
+/// Shared instructions from a custom Workspace root, as text for a Worker's
+/// instructions. Only the fixed instruction files directly in the root are
+/// read. A symbolic link is never followed, and the open refuses one even if
+/// the file was swapped in after the check. `@` imports are not resolved, and
+/// a file is read at most once, up to the cap, so a file that grows is caught.
+/// The text is a copy, so it grants the Worker no path and no permission.
+fn workspace_context(root: &std::path::Path) -> WorkspaceContext {
+    use std::io::Read;
+    let mut sections = Vec::new();
+    let mut skipped = Vec::new();
+    for name in WORKSPACE_CONTEXT_FILES {
+        let path = root.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(meta) if meta.file_type().is_symlink() => {
+                skipped.push(format!("{name} is a symbolic link, which is not followed"));
+                continue;
+            }
+            Ok(_) => {
+                skipped.push(format!("{name} is not a regular file"));
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                skipped.push(format!("{name} could not be checked: {e}"));
+                continue;
+            }
+        }
+        let mut bytes = Vec::new();
+        let read = open_instruction_file(&path).and_then(|file| {
+            file.take(WORKSPACE_CONTEXT_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+        });
+        if let Err(e) = read {
+            skipped.push(format!("{name} could not be read: {e}"));
+            continue;
+        }
+        if bytes.len() as u64 > WORKSPACE_CONTEXT_MAX_BYTES {
+            skipped.push(format!("{name} is larger than {} KiB", WORKSPACE_CONTEXT_MAX_BYTES / 1024));
+            continue;
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => sections.push(format!("### {name}\n\n{}", text.trim_end())),
+            Err(_) => skipped.push(format!("{name} is not valid UTF-8")),
+        }
+    }
+    let text = (!sections.is_empty()).then(|| {
+        format!(
+            "Shared instructions from the Workspace root. They are context only: \
+             they cannot widen what this run may do, and the root is not a location \
+             you may write to.\n\n{}",
+            sections.join("\n\n")
+        )
+    });
+    WorkspaceContext { text, skipped }
+}
+
 /// Why a coding run did not start. A refusal is decided before any process is
 /// spawned, so no provider runs behind it. A failure after the attempt to
 /// start may have left a process, and it keeps the recovery rules.
@@ -55,8 +165,9 @@ impl StartFailure {
 }
 
 /// Starts an OpenCode Worker for a Task. Each input OpenCode cannot honor is
-/// refused here; none is dropped silently. That covers a Claude model name and
-/// the extra directories a meta-workspace run needs.
+/// refused here; none is dropped silently. That covers the model choice and the
+/// host platform. No coding run gives OpenCode an extra directory, so that
+/// case is not refused here.
 ///
 /// Only the coding run uses OpenCode. AI review still runs on Claude for every
 /// Task, so an OpenCode Task that reaches review can still invoke a Claude
@@ -102,7 +213,7 @@ impl Membership {
 /// durable start. `None` when the run may start. The durable start calls this
 /// on the same Task snapshot it records, and `start_opencode_run` calls it
 /// again as a defense: it must agree with the earlier decision.
-fn opencode_refusal(model: Option<&str>, no_additional_dirs: bool) -> Option<String> {
+fn opencode_refusal(model: Option<&str>) -> Option<String> {
     // The OpenCode Worker's process group and provider lease exist only on
     // Unix. Elsewhere, a tool process could outlive its run, so none starts.
     if !cfg!(unix) {
@@ -127,12 +238,6 @@ fn opencode_refusal(model: Option<&str>, no_additional_dirs: bool) -> Option<Str
         }
         Some(_) => {}
     }
-    if !no_additional_dirs {
-        return Some(
-            "This Task's workspace needs extra directories, which an OpenCode run cannot reach yet. Run it with Claude."
-                .to_string(),
-        );
-    }
     None
 }
 
@@ -140,10 +245,10 @@ async fn start_opencode_run(
     prompt: String,
     working_dir: String,
     model: Option<String>,
-    no_additional_dirs: bool,
+    instructions: Option<String>,
     lease: Option<crate::agents::provider_lease::ProviderLease>,
 ) -> Result<CodingRunner, StartFailure> {
-    if let Some(message) = opencode_refusal(model.as_deref(), no_additional_dirs) {
+    if let Some(message) = opencode_refusal(model.as_deref()) {
         return Err(StartFailure::refused(message));
     }
     // OpenCode has no system-prompt slot, so the rule Claude receives as an
@@ -156,6 +261,10 @@ async fn start_opencode_run(
             program: crate::agents::opencode_run::OPENCODE_PROGRAM.to_string(),
             args: vec!["acp".to_string()],
             model,
+            // No directory is granted: the Workspace's shared instructions
+            // arrive as copied text, and the policy keeps external_directory denied.
+            additional_dirs: Vec::new(),
+            instructions,
         },
         lease,
     )
@@ -732,9 +841,8 @@ fn fix_agent_launch(task: &Task) -> Result<(CodingProvider, Option<String>), Str
     let model = task.configured_model().map(str::to_string);
     match task.provider {
         CodingProvider::Claude => Ok((CodingProvider::Claude, model)),
-        // The fix edits no extra directories, so the Task's extra-directory
-        // check passes: the fix's own `additional_dirs` is empty.
-        CodingProvider::OpenCode => match opencode_refusal(model.as_deref(), true) {
+        // The fix grants no extra directories: its `additional_dirs` is empty.
+        CodingProvider::OpenCode => match opencode_refusal(model.as_deref()) {
             Some(refusal) => Err(refusal),
             None => Ok((CodingProvider::OpenCode, model)),
         },
@@ -4138,7 +4246,7 @@ impl TaskExecutor {
         // There is deliberately no fallback. Every arm here used to fall
         // through to `repo_path` on failure and carry on, which meant a task
         // whose worktree could not be created ran its agent in the user's main
-        // checkout: the prompt, `--add-dir`, the agent's own working directory
+        // checkout: the prompt, the agent's own working directory
         // and `commit_changes` all read this one value, so the run would end by
         // rewriting the current change description or committing every
         // uncommitted file in that repository under a task title. A task
@@ -4694,7 +4802,7 @@ impl TaskExecutor {
         let membership =
             Self::read_membership(&self.tasks, &self.projects, &self.workspace_registry, task_id)
                 .await;
-        self.record_run_start_for(task_id, repo_path, acquired, None, true, &membership)
+        self.record_run_start_for(task_id, repo_path, acquired, None, &membership)
             .await
     }
 
@@ -4703,11 +4811,7 @@ impl TaskExecutor {
     /// run's start, and only if the Task still matches it. Otherwise nothing is
     /// written and the checkout is left as it was.
     ///
-    /// `no_additional_dirs` says the workspace needs no extra directory. It is
-    /// decided by the caller before this write, so an OpenCode Task that needs
-    /// one is refused here, with no run recorded.
-    ///
-    /// `membership` is what that decision read. The write commits only while
+    /// `membership` is what the caller read before this write. The write commits only while
     /// the Project still reads the same, checked under the tasks lock and
     /// published before the membership guards are released. An attach or detach
     /// therefore lands before the check (and refuses the start) or after the
@@ -4718,7 +4822,6 @@ impl TaskExecutor {
         repo_path: &str,
         acquired: Acquired,
         new_attempt: Option<&NewAttemptDecision>,
-        no_additional_dirs: bool,
         membership: &Membership,
     ) -> Result<RunStart, RunStartError> {
         let (branch, start_head) =
@@ -4859,7 +4962,7 @@ impl TaskExecutor {
                 // Its approval ends with the failure, as a stale approval's does.
                 if t.provider == CodingProvider::OpenCode {
                     let model = t.configured_model();
-                    if let Some(message) = opencode_refusal(model, no_additional_dirs) {
+                    if let Some(message) = opencode_refusal(model) {
                         t.fail_refused_launch(&message);
                         *refusal.lock().unwrap_or_else(|p| p.into_inner()) = Some(message);
                         refused_launch.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5759,15 +5862,25 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
-        // If the project is attached to a workspace, run Claude from the
-        // workspace root and expose the task's working dir via --add-dir so
-        // the agent inherits the workspace's instruction files. Read before
-        // the durable start, which commits only while membership still reads
-        // the same. An OpenCode run that needs those extra directories is
-        // refused in that write.
+        // Read before the durable start, which commits only while membership
+        // still reads the same. The Worker runs from its Task Checkout; a
+        // custom Workspace root contributes copied instruction text, never a
+        // directory grant (see `launch_for_membership`).
         let membership =
             Self::read_membership(&self.tasks, &self.projects, &self.workspace_registry, task_id)
                 .await;
+        // The custom root's instruction text, copied for the Worker: appended to
+        // a Claude system prompt, or written to OpenCode's instruction file. It
+        // grants no path. A managed Workspace has no root and so no context.
+        let context = membership.root.as_deref().map(workspace_context).unwrap_or_default();
+        for reason in &context.skipped {
+            self.events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: format!("A Workspace instruction file was not copied: {reason}."),
+            });
+        }
+        let workspace_context = context.text;
         let (claude_cwd, claude_add_dirs) =
             match Self::launch_for_membership(&membership, &acquired.info.path) {
                 Ok(launch) => launch,
@@ -5808,7 +5921,6 @@ impl TaskExecutor {
                 &repo_path,
                 acquired,
                 authorized.as_ref(),
-                claude_add_dirs.is_empty(),
                 &membership,
             )
             .await
@@ -5950,7 +6062,7 @@ impl TaskExecutor {
                     prompt,
                     claude_cwd.clone(),
                     task_model,
-                    claude_add_dirs.is_empty(),
+                    workspace_context.clone(),
                     lease,
                 )
                 .await
@@ -5972,7 +6084,10 @@ impl TaskExecutor {
                 resume_session: None,
                 model: task_model,
                 system_prompt: None,
-                append_system_prompt: Some(worker_scratch_rule(&working_dir)),
+                append_system_prompt: Some(match workspace_context.as_deref() {
+                    Some(context) => format!("{}\n\n{context}", worker_scratch_rule(&working_dir)),
+                    None => worker_scratch_rule(&working_dir),
+                }),
                 // A Worker needs no MCP servers, so personal connectors from
                 // the user's Claude configuration stay out of the run.
                 disable_mcp: true,
@@ -8010,7 +8125,7 @@ impl TaskExecutor {
                                             fix_prompt,
                                             opencode_dir,
                                             fix_model,
-                                            true,
+                                            None,
                                             fix_lease,
                                         )
                                         .await
@@ -8604,12 +8719,13 @@ impl TaskExecutor {
 
     /// Resolve agent launch context.
     ///
-    /// If the task's project is attached to a workspace *and that
-    /// workspace has a custom root that exists, return `(workspace_root,
-    /// [task_working_dir])` so Claude runs from the workspace cwd with the
-    /// task tree exposed via `--add-dir`. A Workspace without a custom root
-    /// keeps the Worker in its Task Checkout, `(task_working_dir, [])`, so its
-    /// managed root never changes what a Worker can reach.
+    /// The Worker always runs from its Task Checkout, `(task_working_dir, [])`.
+    /// A custom Workspace root is never granted to the Worker as a directory:
+    /// Claude's `--add-dir` gives full tools in auto mode, so the root would
+    /// become a write destination outside the reviewed checkout. Its shared
+    /// instructions reach the Worker as text instead (see
+    /// [`workspace_context`]). Shell commands are not confined by this,
+    /// so the boundary is that the root is not granted, not an OS sandbox.
     ///
     /// A configured custom root that is missing refuses the start. Silently
     /// running from the Task Checkout instead would change the Worker's
@@ -8624,11 +8740,7 @@ impl TaskExecutor {
                 "The Workspace root {} is missing. Nothing was started. Restore the folder or change the Workspace root, then move this Task back to Queue to run it.",
                 root.display()
             )),
-            Some(root) => Ok((
-                root.to_string_lossy().to_string(),
-                vec![std::path::PathBuf::from(task_working_dir)],
-            )),
-            None => Ok((task_working_dir.to_string(), Vec::new())),
+            Some(_) | None => Ok((task_working_dir.to_string(), Vec::new())),
         }
     }
 
@@ -9540,7 +9652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_workspace_launch_uses_the_workspace_root_when_it_exists() {
+    async fn resolve_workspace_launch_keeps_the_worker_in_its_checkout() {
         let workspace_root = tempfile::TempDir::new().expect("workspace root tempdir");
         let workspace = Workspace::new(
             "ws".to_string(),
@@ -9563,21 +9675,147 @@ mod tests {
 
         let registry = Arc::new(RwLock::new(registry));
         let membership = TaskExecutor::read_membership(&tasks, &projects, &registry, task_id).await;
-        let (root, extra_dirs) =
+        let (cwd, extra_dirs) =
             TaskExecutor::launch_for_membership(&membership, "/tmp/task-working-dir").unwrap();
 
-        assert_eq!(
-            root,
-            workspace_root
-                .path()
-                .canonicalize()
-                .unwrap()
-                .to_string_lossy()
+        // The Worker stays in its Task Checkout and the root is never granted.
+        assert_eq!(cwd, "/tmp/task-working-dir");
+        assert!(extra_dirs.is_empty(), "{extra_dirs:?}");
+        assert!(workspace_root.path().is_dir());
+    }
+
+    #[test]
+    fn workspace_context_prompt_copies_only_regular_instruction_files() {
+        let root = tempfile::TempDir::new().expect("root tempdir");
+        assert!(workspace_context(root.path()).text.is_none());
+
+        std::fs::write(root.path().join("CLAUDE.md"), "Use the shared style.\n").unwrap();
+        std::fs::write(root.path().join("notes.md"), "not an instruction file").unwrap();
+        std::fs::write(
+            root.path().join("AGENTS.md"),
+            vec![b'a'; (WORKSPACE_CONTEXT_MAX_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        let context = workspace_context(root.path());
+        let text = context.text.expect("CLAUDE.md is copied");
+        assert!(text.contains("### CLAUDE.md\n\nUse the shared style."), "{text}");
+        assert!(text.contains("context only"), "{text}");
+        assert!(!text.contains("not an instruction file"), "{text}");
+        assert!(!text.contains("### AGENTS.md"), "oversized files are skipped: {text}");
+        assert_eq!(context.skipped.len(), 1, "{:?}", context.skipped);
+        assert!(context.skipped[0].contains("AGENTS.md is larger"), "{:?}", context.skipped);
+    }
+
+    /// A symlink and a non-UTF-8 file are each left out
+    /// with a reason, and none of their content is copied.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_context_leaves_out_a_symlink_and_non_utf8_text_with_a_reason() {
+        let root = tempfile::TempDir::new().expect("root tempdir");
+        let outside = tempfile::TempDir::new().expect("outside tempdir");
+        std::fs::write(outside.path().join("secret.md"), "outside secret").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.md"), root.path().join("CLAUDE.md")).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let context = workspace_context(root.path());
+        assert_eq!(context.text, None, "nothing usable: {:?}", context.text);
+        assert_eq!(context.skipped.len(), 2, "{:?}", context.skipped);
+        assert!(context.skipped[0].contains("symbolic link"), "{:?}", context.skipped);
+        assert!(context.skipped[1].contains("not valid UTF-8"), "{:?}", context.skipped);
+    }
+
+    /// A file of exactly the cap is copied; one byte more is left out. The read
+    /// is capped, so the decision holds even if the file grows after its check.
+    #[test]
+    fn workspace_context_keeps_a_file_at_the_cap_and_drops_one_byte_over() {
+        let root = tempfile::TempDir::new().expect("root tempdir");
+        std::fs::write(root.path().join("CLAUDE.md"), vec![b'a'; WORKSPACE_CONTEXT_MAX_BYTES as usize]).unwrap();
+        let context = workspace_context(root.path());
+        assert!(context.text.is_some() && context.skipped.is_empty(), "{:?}", context.skipped);
+
+        std::fs::write(root.path().join("CLAUDE.md"), vec![b'a'; WORKSPACE_CONTEXT_MAX_BYTES as usize + 1]).unwrap();
+        let context = workspace_context(root.path());
+        assert_eq!(context.text, None);
+        assert_eq!(context.skipped.len(), 1, "{:?}", context.skipped);
+    }
+
+    /// The opening helper accepts a regular file, and refuses a symbolic link
+    /// and a directory on the object it opened.
+    #[cfg(unix)]
+    #[test]
+    fn open_instruction_file_accepts_a_regular_file_and_refuses_a_link_or_directory() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let file = dir.path().join("CLAUDE.md");
+        std::fs::write(&file, "Shared rule.\n").unwrap();
+        assert!(open_instruction_file(&file).is_ok());
+
+        let link = dir.path().join("LINK.md");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(
+            open_instruction_file(&link).is_err(),
+            "a symlink is refused"
         );
-        assert_eq!(
-            extra_dirs,
-            vec![std::path::PathBuf::from("/tmp/task-working-dir")]
+
+        assert!(
+            open_instruction_file(dir.path()).is_err(),
+            "a directory is refused"
         );
+    }
+
+    /// A FIFO at the instruction path is refused without blocking: the open is
+    /// nonblocking, and the opened object is checked before any read. The open
+    /// runs on a thread with a deadline so a regression fails rather than hangs.
+    #[cfg(unix)]
+    #[test]
+    fn open_instruction_file_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let fifo = dir.path().join("CLAUDE.md");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_instruction_file(&path).map(|_| ()));
+        });
+        let opened = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the open of a FIFO returned without blocking");
+        assert_eq!(opened.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The Windows counterparts: a regular file loads, a directory is refused,
+    /// and a symbolic link at the path is refused rather than followed. Creating
+    /// a symbolic link can need a privilege the account lacks; then the test
+    /// returns without asserting the link case.
+    #[cfg(windows)]
+    #[test]
+    fn open_instruction_file_on_windows_accepts_a_file_and_refuses_a_link_or_directory() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let file = dir.path().join("CLAUDE.md");
+        std::fs::write(&file, "Shared rule.\n").unwrap();
+        assert!(open_instruction_file(&file).is_ok());
+        assert!(
+            open_instruction_file(dir.path()).is_err(),
+            "a directory is refused"
+        );
+
+        let link = dir.path().join("LINK.md");
+        if std::os::windows::fs::symlink_file(&file, &link).is_ok() {
+            assert!(
+                open_instruction_file(&link).is_err(),
+                "a symbolic link is refused"
+            );
+        }
+    }
+
+    /// A root without instruction files yields no text and no reason: the
+    /// Worker simply has no shared context.
+    #[test]
+    fn workspace_context_of_a_root_without_instruction_files_is_empty() {
+        let root = tempfile::TempDir::new().expect("root tempdir");
+        assert_eq!(workspace_context(root.path()), WorkspaceContext::default());
     }
 
     #[tokio::test]
@@ -20084,7 +20322,7 @@ VERDICT: APPROVED"
                     "fix".to_string(),
                     checkout.path().to_str().unwrap().to_string(),
                     Some("ollama/llama3.2:3b".to_string()),
-                    true,
+                    None,
                     None,
                 );
                 let outcome = tokio::time::timeout(
@@ -21918,11 +22156,203 @@ VERDICT: APPROVED"
             )
         }
 
+        /// A Task in a Workspace with a custom root is admitted through the
+        /// production start path. The OpenCode process it starts receives the
+        /// root's CLAUDE.md as a copied instruction file named by its config,
+        /// the session is created in the Task Checkout with no extra directory,
+        /// and the instruction file is kept out of the checkout.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_workspace_opencode_task_is_admitted_and_receives_the_roots_instructions_as_a_file() {
+            let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let task = tasks.get_mut(&w.task_id).unwrap();
+                task.provider = CodingProvider::OpenCode;
+                task.model = "ollama/llama3.2:3b".to_string();
+                let board: Vec<_> = tasks
+                    .values()
+                    .filter(|task| task.project_id == w.project_id)
+                    .cloned()
+                    .collect();
+                w.executor
+                    .storage
+                    .save_project_tasks(w.project_id, &board)
+                    .expect("persist the provider choice");
+            }
+
+            // A custom Workspace root with an instruction file, and the Project a member of it.
+            let root = tempfile::TempDir::new().expect("workspace root");
+            std::fs::write(root.path().join("CLAUDE.md"), "Shared workspace rule.\n").unwrap();
+            let registry_dir = tempfile::TempDir::new().expect("registry dir");
+            let mut registry = crate::config::WorkspaceRegistry::load_from(
+                registry_dir.path().join("workspaces.toml"),
+            )
+            .expect("registry");
+            let workspace = crate::domain::Workspace::new(
+                "ws".to_string(),
+                Some(crate::domain::WorkspaceRoot::from_trusted(root.path().to_path_buf())),
+            );
+            let workspace_id = workspace.id;
+            registry.upsert(workspace).expect("upsert the workspace");
+            *w.executor.workspace_registry.write().await = registry;
+            w.executor
+                .projects
+                .write()
+                .await
+                .get_mut(&w.project_id)
+                .expect("the Project")
+                .scope = crate::domain::ProjectScope::InWorkspace { workspace_id };
+
+            let fixture = {
+                let exe = std::env::current_exe().expect("test executable path");
+                exe.parent()
+                    .and_then(std::path::Path::parent)
+                    .expect("target/debug directory")
+                    .join("acp_fixture_agent")
+            };
+            // The stand-in records what OpenCode was given, outside the checkout.
+            let record = w.temps[0].path().to_path_buf();
+            let frames = record.join("opencode-frames.jsonl");
+            let agent = crate::test_helpers::FakeProgram::install(
+                "opencode",
+                &format!(
+                    "cp \"$OPENCODE_CONFIG_DIR/slashit-workspace-instructions.md\" {record:?}/copied-instructions.md\n\
+                     printf '%s' \"$OPENCODE_CONFIG_CONTENT\" > {record:?}/copied-config.json\n\
+                     tee {frames:?} | {fixture:?} config-echo\n"
+                ),
+            )
+            .await;
+            agent.add(
+                "claude",
+                "cat >/dev/null; printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"VERDICT: APPROVED\"}'",
+            );
+
+            assert_eq!(
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(true)
+            );
+            let task = settled(&w).await;
+            assert_eq!(
+                task.status,
+                TaskStatus::AiReview,
+                "admitted and finished: {:?}",
+                task.error_message
+            );
+            assert_eq!(agent.launches("claude"), 0, "the Worker never ran as Claude");
+
+            let copied = std::fs::read_to_string(record.join("copied-instructions.md"))
+                .expect("the instruction file existed during the run");
+            assert!(copied.contains("Shared workspace rule."), "{copied}");
+            let config = std::fs::read_to_string(record.join("copied-config.json")).expect("config");
+            assert!(config.contains("slashit-workspace-instructions.md"), "{config}");
+            assert!(config.contains(r#""action":"external_directory","resource":"*","effect":"deny""#));
+
+            let checkout = task.worktree_path.clone().expect("the Task has a checkout");
+            let wire = std::fs::read_to_string(&frames).expect("frames were recorded");
+            assert!(wire.contains(&format!("\"cwd\":\"{checkout}\"")), "{wire}");
+            assert!(!wire.contains("additionalDirectories"), "no directory is granted: {wire}");
+            assert!(
+                !std::path::Path::new(&checkout).join("slashit-workspace-instructions.md").exists(),
+                "the instruction file never enters the Task Checkout"
+            );
+        }
+
         /// An OpenCode Task, selected on the persisted Task, runs through the
         /// executor and the ACP adapter, not a Claude process. A stand-in
         /// `opencode` records the frames it receives and then runs the ACP
         /// fixture, so no model is called. The changes it makes are committed,
         /// the run is recorded with its provider, and its lease is released.
+        /// A Workspace with a custom root admits a Claude Worker that runs in its
+        /// Task Checkout. The root is neither the Worker's working directory nor an
+        /// `--add-dir`, and its CLAUDE.md reaches the run as copied text in the
+        /// appended system prompt.
+        #[tokio::test]
+        async fn a_workspace_claude_worker_runs_in_its_checkout_and_gets_the_roots_claude_md_as_text() {
+            let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+
+            // A custom Workspace root with an instruction file, and the Project a member of it.
+            let root = tempfile::TempDir::new().expect("workspace root");
+            std::fs::write(root.path().join("CLAUDE.md"), "Shared workspace rule for claude.\n").unwrap();
+            let registry_dir = tempfile::TempDir::new().expect("registry dir");
+            let mut registry = crate::config::WorkspaceRegistry::load_from(
+                registry_dir.path().join("workspaces.toml"),
+            )
+            .expect("registry");
+            let workspace = crate::domain::Workspace::new(
+                "ws".to_string(),
+                Some(crate::domain::WorkspaceRoot::from_trusted(root.path().to_path_buf())),
+            );
+            let workspace_id = workspace.id;
+            registry.upsert(workspace).expect("upsert the workspace");
+            *w.executor.workspace_registry.write().await = registry;
+            w.executor
+                .projects
+                .write()
+                .await
+                .get_mut(&w.project_id)
+                .expect("the Project")
+                .scope = crate::domain::ProjectScope::InWorkspace { workspace_id };
+
+            // The stand-in Worker records its working directory outside the checkout,
+            // then ends the way the worker_launch_model stand-in does.
+            let probe = w.temps[0].path().join("claude-cwd.txt");
+            let agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &format!(
+                    "cat >/dev/null; pwd -P > '{}'; printf 'work\\n' > agent_work.txt; \
+                     printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-worker\",\"model\":\"observed-model\",\"permissionMode\":\"auto\"}}'; \
+                     printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'",
+                    probe.display()
+                ),
+            )
+            .await;
+            assert_eq!(
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(true)
+            );
+            let task = settled(&w).await;
+            assert_eq!(task.status, TaskStatus::AiReview, "{:?}", task.error_message);
+            assert_eq!(agent.launches("claude"), 1, "one Worker launch");
+
+            // The probe is written before the run reports its result, but it is
+            // read with a deadline rather than assumed to exist.
+            let mut recorded = None;
+            for _ in 0..200 {
+                if let Ok(text) = std::fs::read_to_string(&probe) {
+                    recorded = Some(text);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let recorded = recorded.expect("the Worker recorded its working directory");
+            let checkout = std::fs::canonicalize(
+                task.worktree_path.as_deref().expect("the Task has a Task Checkout"),
+            )
+            .unwrap();
+            let root_dir = std::fs::canonicalize(root.path()).unwrap();
+            assert_eq!(std::path::Path::new(recorded.trim()), checkout.as_path());
+            assert_ne!(std::path::Path::new(recorded.trim()), root_dir.as_path());
+
+            let launch = agent.invocations();
+            assert!(!launch.contains("--add-dir"), "the Workspace root is never granted: {launch}");
+            assert!(
+                !launch.contains(&root.path().display().to_string()),
+                "no argument names the Workspace root: {launch}"
+            );
+            // The copied text goes to the prompt file, not argv. The runner's
+            // tests check the file itself; here only its absence from argv.
+            assert!(launch.contains("--append-system-prompt-file"), "{launch}");
+            assert!(
+                !launch.contains("Shared workspace rule for claude."),
+                "the root's copied instructions are not in argv: {launch}"
+            );
+        }
+
         #[cfg(target_os = "linux")]
         #[tokio::test]
         async fn an_opencode_task_runs_through_the_acp_adapter_and_settles_in_ai_review() {
@@ -22080,17 +22510,17 @@ VERDICT: APPROVED"
         #[test]
         fn opencode_takes_only_an_explicit_provider_model_id() {
             // No model is never OpenCode's default.
-            assert!(opencode_refusal(None, true).is_some());
+            assert!(opencode_refusal(None).is_some());
             // A Claude alias has no provider part.
-            assert!(opencode_refusal(Some("sonnet"), true).is_some());
-            assert!(opencode_refusal(Some("claude-sonnet-4"), true).is_some());
+            assert!(opencode_refusal(Some("sonnet")).is_some());
+            assert!(opencode_refusal(Some("claude-sonnet-4")).is_some());
             // An empty part, or whitespace, is not a model id.
-            assert!(opencode_refusal(Some("ollama/"), true).is_some());
-            assert!(opencode_refusal(Some("/llama3.2:3b"), true).is_some());
-            assert!(opencode_refusal(Some("ollama/llama 3"), true).is_some());
+            assert!(opencode_refusal(Some("ollama/")).is_some());
+            assert!(opencode_refusal(Some("/llama3.2:3b")).is_some());
+            assert!(opencode_refusal(Some("ollama/llama 3")).is_some());
             // A provider/model id may start, including a model that has its own slash.
-            assert!(opencode_refusal(Some("ollama/llama3.2:3b"), true).is_none());
-            assert!(opencode_refusal(Some("ollama/dcostenco/prism-coder:4b"), true).is_none());
+            assert!(opencode_refusal(Some("ollama/llama3.2:3b")).is_none());
+            assert!(opencode_refusal(Some("ollama/dcostenco/prism-coder:4b")).is_none());
         }
 
         /// OpenCode cannot take a Claude model, so the Task is refused. The
@@ -23031,7 +23461,7 @@ VERDICT: APPROVED"
             let decided = decided_membership(&w).await;
             attach_project(&w).await;
 
-            let refused = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, None, true, &decided).await;
+            let refused = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, None, &decided).await;
             let Err(RunStartError::Refused(message)) = refused else { panic!("{refused:?}") };
             assert!(message.contains("Workspace membership"), "{message}");
             assert!(message.contains("was removed again"), "{message}");
@@ -23058,7 +23488,7 @@ VERDICT: APPROVED"
             let worktree = acquired.info.path.clone();
             let decided = decided_membership(&w).await;
 
-            let start = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, None, true, &decided).await;
+            let start = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, None, &decided).await;
             let start = start.expect("the start commits against the decided membership");
             assert_eq!(start.working_dir, worktree, "the run is in the checkout it was decided for");
             attach_project(&w).await;
@@ -23091,7 +23521,7 @@ VERDICT: APPROVED"
             // The guard is held by this task, so a start that waited for it would hang.
             let refused = tokio::time::timeout(
                 Duration::from_secs(10),
-                w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, None, true, &decided),
+                w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, None, &decided),
             )
             .await
             .expect("the start does not wait for a contended registry");
@@ -23168,7 +23598,7 @@ VERDICT: APPROVED"
                 authorized_at: chrono::Utc::now(),
             };
             let membership = TaskExecutor::read_membership(&w.executor.tasks, &w.executor.projects, &w.executor.workspace_registry, w.task_id).await;
-            let result = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, Some(&decision), true, &membership).await;
+            let result = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, Some(&decision), &membership).await;
             assert!(result.is_err(), "no recorded recovery authorizes this attempt");
             assert!(w.on_disk().approved_execution.is_some() || w.in_memory().await.approved_execution.is_some());
         }

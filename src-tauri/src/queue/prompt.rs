@@ -30,10 +30,9 @@ pub fn build_task_prompt(task: &Task, project_path: Option<&str>) -> String {
     }
     parts.push(format!("\n## Context\n{}", meta.join("\n")));
 
-    // Working directory. This is the Task Checkout. A member Project's agent
-    // may be launched from the Workspace root with the checkout as an added
-    // directory, but SlashIt reviews, commits and opens the pull request from
-    // the checkout only, so writes belong there. The wording is the same with
+    // Working directory. This is the Task Checkout, where the agent starts.
+    // SlashIt reviews, commits and opens the pull request from the checkout
+    // only, so writes belong there. The wording is the same with
     // or without a Workspace; reading elsewhere stays allowed.
     if let Some(path) = project_path {
         parts.push(format!(
@@ -985,11 +984,9 @@ mod tests {
 
     #[test]
     fn build_task_prompt_project_path_identifies_edit_target() {
-        // In workspace mode, Claude's cwd is the meta-workspace root and the
-        // task's worktree is exposed only via --add-dir alongside other
-        // directories. The rendered prompt must unambiguously name the
-        // supplied path as the actual edit target (not just "a" visible
-        // directory), so the agent doesn't act on the workspace root while
+        // A Worker's cwd is its Task Checkout, and no Workspace root is granted,
+        // so the rendered prompt must name the supplied path as the actual edit
+        // target. Otherwise the agent could act on another directory while
         // SlashIt's post-run commit logic expects changes in the worktree.
         let task = create_test_task("Workspace task");
         let prompt = build_task_prompt(&task, Some("/repo/worktrees/task-1"));
