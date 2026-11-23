@@ -7,3 +7,4 @@
 //! actually produce, rather than against reconstructed samples.
 pub mod client;
 pub mod output;
+pub mod task_ref;
