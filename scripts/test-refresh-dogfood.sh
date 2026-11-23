@@ -40,6 +40,9 @@ case "\$1" in
   env) printf 'STATE_BASE       %s\nBINARY           %s\nSTATE_WRITER     %s\n' "$work/state" "\${STUB_BINARY:-$repo/target/dogfood/slashit-ui}" "$work/state/supervisor/state-writer" ;;
   restart) echo restart >>"$calls"; printf '%s\n' "\${SLASHIT_DOGFOOD_EXPECT_COMMIT-unset}" >>"$work/expect"; exit "\${STUB_RESTART_RC:-0}" ;;
   start) echo start >>"$calls"; printf '%s\n' "\${SLASHIT_DOGFOOD_EXPECT_COMMIT-unset}" >>"$work/expect"; exit 0 ;;
+  activity) n=\$((\$(cat "$work/activity-n" 2>/dev/null || echo 0) + 1)); echo "\$n" >"$work/activity-n"; echo activity >>"$work/activity-calls"
+    if [ "\$n" -ge "\${STUB_ACTIVITY_BUSY_FROM:-999999}" ]; then echo "\${STUB_ACTIVITY:-active work: running_agents=1}"; exit 1; fi
+    echo "active work: none"; exit 0 ;;
   *) echo "stub sup: \$*" >&2; exit 2 ;;
 esac
 STUB
@@ -78,6 +81,10 @@ export STUB_STATUS="$work/status"
 status_running() { printf 'instance:       running (pid 1, mode gui, version x)\ncommit:         %s\n' "$1" >"$work/status"; }
 status_stopped() { printf 'instance:       stopped\n' >"$work/status"; }
 reset() { rm -f "$calls"; }
+# The stub's activity verb counts its calls in activity-n (for STUB_ACTIVITY_BUSY_FROM)
+# and logs them to activity-calls, not to calls, so the "no call at all" checks stay exact.
+reset_activity() { rm -f "$work/activity-n" "$work/activity-calls"; }
+activity_count() { cat "$work/activity-calls" 2>/dev/null | wc -l; }
 run() { (cd "$repo" && bash scripts/refresh-dogfood.sh "$@") 2>&1; }
 calls_have() { [ -f "$calls" ] && grep -qx "$1" "$calls"; }
 
@@ -351,6 +358,135 @@ if [[ "$out" == *"running exe sha:  $want_sha (state-writer names it: yes)"* ]] 
   ok "a deleted launch copy is still identified by sha256 through /proc and matches the writer"
 else bad "a running image with a deleted path was misreported (exit $st)"; printf '%s\n' "$out" >&2; fi
 rm -rf "$work/state"
+
+# The supervisor's status for a verified instance whose frontend predates the
+# promoted build: exit 1, with the process, endpoint and environment proven.
+# The record line carries no pid, so the executable-provenance check (which needs
+# a readable /proc entry and a verified state writer) is not part of these cases.
+status_stale() { # commit, then optional extra lines that must refuse
+  printf 'instance:       running (pid 1, mode gui, version x)\nendpoint:       unix:/x\nbinary:         %s\ncommit:         %s\nrecord:         started 2026-01-01T00:00:00Z\ncontrol channel: answering on the declared endpoint\nfrontend:       STALE INSTANCE — the binary was rebuilt after this instance started\nenvironment:    verified (the live process carries the declared values)\n%s\n' "$repo/target/dogfood/slashit-ui" "$1" "${2:-}" >"$work/status"
+}
+
+echo "== a verified instance with a stale frontend is restarted to the target"
+git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; rm -f "$work/expect"
+out=$(export STUB_STATUS_RC=1; run --apply); st=$?
+if [ "$st" -eq 0 ] && calls_have restart && [ "$(cat "$work/expect" 2>/dev/null)" = "$new" ]; then ok "a stale-frontend instance with a provably older commit is restarted, and the supervisor receives the target"
+else bad "a verified stale-frontend instance was not restarted (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(export STUB_STATUS_RC=1; run --check); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"frontend:         stale"* ]] && [[ "$out" != *"supervisor status: exit"* ]]; then ok "--check reports the stale frontend as a verified running state and exits 0"
+else bad "--check did not report the stale frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== a stale-frontend status is refused when any identity proof is missing"
+status_stale "$old" "record:         STALE — it names pid 9, the endpoint is served by pid 1"; reset
+out=$(export STUB_STATUS_RC=1; run --apply); st=$?
+if [ "$st" -ne 0 ] && [ ! -f "$calls" ]; then ok "a record that names another pid is never a stale-frontend restart target"
+else bad "a record mismatch was accepted as a stale frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
+status_stale "$old"; sed -i 's/^environment: .*/environment:    MISMATCH (a declared value differs)/' "$work/status"; reset
+# Exit 1 (the stale-frontend exit), not the supervisor's exit 4, so the stale
+# branch is refused by the environment line alone: the environment gate is isolated.
+out=$(export STUB_STATUS_RC=1; run --apply); st=$?
+if [ "$st" -eq 3 ] && [ ! -f "$calls" ] && [[ "$out" == *"cannot be verified"* ]] && [[ "$out" != *"frontend:         stale"* ]]; then ok "an environment mismatch with a stale frontend (status exit 1) is unverifiable, exits 3, and is never restarted"
+else bad "an environment mismatch was accepted or misreported (exit $st)"; printf '%s\n' "$out" >&2; fi
+status_stale "$old"; sed -i "s|^control channel: .*|control channel: answering on 'unix:/other', which is NOT the declared endpoint|" "$work/status"; reset
+out=$(export STUB_STATUS_RC=1; run --apply); st=$?
+if [ "$st" -ne 0 ] && [ ! -f "$calls" ]; then ok "an instance answering on another endpoint is refused even with a stale frontend"
+else bad "a wrong endpoint was accepted (exit $st)"; printf '%s\n' "$out" >&2; fi
+status_stale "$old" ; sed -i 's/^frontend: .*/frontend:       UNAVAILABLE — this is a development build, which loads an unanswered server/' "$work/status"; reset
+out=$(export STUB_STATUS_RC=1; run --apply); st=$?
+if [ "$st" -ne 0 ] && [ ! -f "$calls" ]; then ok "a degraded frontend that is not STALE is still unverifiable"
+else bad "a degraded frontend was accepted as stale (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== a stale-frontend instance still needs the ancestry gate"
+git -C "$repo" checkout -q "$new"; status_stale "$new"; reset
+out=$(export STUB_STATUS_RC=1; run --apply "$old"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"does not provably descend"* ]] && [ ! -f "$calls" ]; then ok "a stale-frontend instance is not downgraded to an older target"
+else bad "a stale-frontend downgrade was not refused (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== a stale-frontend instance with no active work restarts after the idle check"
+git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; reset_activity; rm -f "$work/expect"
+out=$(export STUB_STATUS_RC=1; run --apply "$new"); st=$?
+if [ "$st" -eq 0 ] && calls_have restart && [ "$(cat "$work/expect" 2>/dev/null)" = "$new" ] && [ "$(activity_count)" -eq 1 ]; then
+  ok "a stale-frontend instance with no active work is restarted after one idle check, with the target commit pinned"
+else bad "an idle stale-frontend instance was not restarted after the check (exit $st, activity checks $(activity_count))"; printf '%s\n' "$out" >&2; fi
+
+echo "== active work blocks the automatic stale-frontend restart before any build or stop"
+for kind in active_terminals=1 running_agents=1 queued_tasks=1 in_progress_tasks=1 recovery-copy; do
+  git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; reset_activity
+  out=$(export STUB_STATUS_RC=1 STUB_ACTIVITY_BUSY_FROM=1 STUB_ACTIVITY="active work: $kind"; run --apply "$new"); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"would interrupt the active work"* ]] && [[ "$out" == *"$kind"* ]] && [ ! -f "$calls" ]; then
+    ok "active work ($kind) blocks the stale-frontend restart: exit 1, no build, no restart"
+  else bad "active work ($kind) did not block the restart (exit $st)"; printf '%s\n' "$out" >&2; fi
+done
+git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; reset_activity
+out=$(export STUB_STATUS_RC=1 STUB_ACTIVITY_BUSY_FROM=1 STUB_ACTIVITY="active work: running_agents=1"; run --check "$new"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"apply blocked:    a restart would interrupt the active work"* ]] && [[ "$out" == *"activity:         active work: running_agents=1"* ]] && [ ! -f "$calls" ]; then
+  ok "--check names the active work in its apply-blocked list and exits 1, with no build or restart"
+else bad "--check did not report the active work (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== a stale frontend on the target commit is restarted, never reported as nothing to do"
+git -C "$repo" checkout -q "$new"; status_stale "$new"; reset; reset_activity; rm -f "$work/expect"
+out=$(export STUB_STATUS_RC=1; run --apply "$new"); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" != *"nothing to do"* ]] && calls_have restart && [ "$(cat "$work/expect" 2>/dev/null)" = "$new" ] && [ "$(activity_count)" -eq 1 ]; then
+  ok "a same-commit stale frontend passes the idle check and is restarted with the target pinned"
+else bad "a same-commit stale frontend was not restarted (exit $st, activity checks $(activity_count))"; printf '%s\n' "$out" >&2; fi
+git -C "$repo" checkout -q "$new"; status_stale "$new"; reset; reset_activity
+out=$(export STUB_STATUS_RC=1; run --check "$new"); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"frontend:         stale"* ]] && [ ! -f "$calls" ]; then
+  ok "--check reports a same-commit stale frontend as ready (exit 0) with no restart"
+else bad "--check misreported a same-commit stale frontend (exit $st)"; printf '%s\n' "$out" >&2; fi
+for kind in active_terminals=1 running_agents=1; do
+  git -C "$repo" checkout -q "$new"; status_stale "$new"; reset; reset_activity
+  out=$(export STUB_STATUS_RC=1 STUB_ACTIVITY_BUSY_FROM=1 STUB_ACTIVITY="active work: $kind"; run --apply "$new"); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"would interrupt the active work"* ]] && [ ! -f "$calls" ]; then
+    ok "active work ($kind) blocks a same-commit stale-frontend restart: exit 1, no restart"
+  else bad "same-commit active work ($kind) did not block (exit $st)"; printf '%s\n' "$out" >&2; fi
+done
+
+echo "== the wrapper checks once; the supervisor's restart closes admission and proves idle"
+git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; reset_activity
+out=$(export STUB_STATUS_RC=1 STUB_ACTIVITY_BUSY_FROM=2 STUB_ACTIVITY="active work: queued_tasks=1"; run --apply "$new"); st=$?
+if [ "$st" -eq 0 ] && calls_have restart && [ "$(activity_count)" -eq 1 ]; then
+  ok "no second shell check runs before the restart; work admitted after the first check is left to the supervisor's quiesce"
+else bad "the wrapper ran a second shell check or skipped the restart (exit $st, checks $(activity_count))"; printf '%s\n' "$out" >&2; fi
+git -C "$repo" checkout -q "$new"; status_stale "$old"; reset; reset_activity
+out=$(export STUB_STATUS_RC=1 STUB_RESTART_RC=1; run --apply "$new"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"the restart did not complete"* ]] && calls_have restart && ! calls_have start; then
+  ok "a restart the supervisor refuses (busy or unsupported) exits 1 and starts nothing"
+else bad "a refused restart was not reported as a failure with no start (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+echo "== the supervisor's activity verb reads the status counts and recovery copies"
+fake=$work/fake-slashit; sock=$d/run/slashit-app/slashit.sock
+cat >"$fake" <<FAKE
+#!/usr/bin/env bash
+case "\$*" in
+  *--version*) echo "slashit 0.0.0-test" ;;
+  *" --json ping") if [ -n "\${FAKE_OLD:-}" ]; then printf '{\n  "mode": "gui",\n  "pid": 4242,\n  "version": "0.0.0-test",\n  "endpoint": "unix:$sock"\n}\n'; else printf '{\n  "mode": "gui",\n  "pid": 4242,\n  "version": "0.0.0-test",\n  "admission_control": true,\n  "endpoint": "unix:$sock"\n}\n'; fi ;;
+  *" --json status") printf '{\n  "active_terminals": %s,\n  "running_agents": %s,\n  "queued_tasks": %s,\n  "in_progress_tasks": %s\n}\n' \$FAKE_COUNTS ;;
+  *) exit 2 ;;
+esac
+FAKE
+chmod +x "$fake"
+act() { "${denv[@]}" SLASHIT_DOGFOOD_CLI="$1" FAKE_COUNTS="$2" bash "$d/main/scripts/supervise-dogfood.sh" activity 2>&1; }
+out=$(act "$fake" "0 0 0 0"); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == "active work: none" ]]; then ok "the verb exits 0 when the status counts are all zero"
+else bad "idle counts did not exit 0 (exit $st)"; printf '%s\n' "$out" >&2; fi
+for case_counts in "1 0 0 0:active_terminals=1" "0 1 0 0:running_agents=1" "0 0 2 0:queued_tasks=2" "0 0 0 1:in_progress_tasks=1"; do
+  counts=${case_counts%%:*}; want=${case_counts#*:}
+  out=$(act "$fake" "$counts"); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"$want"* ]]; then ok "the verb exits 1 and names $want"
+  else bad "the verb did not name $want (exit $st)"; printf '%s\n' "$out" >&2; fi
+done
+out=$(FAKE_OLD=1 act "$fake" "0 0 0 0"); st=$?
+if [ "$st" -eq 3 ] && [[ "$out" == *"predates admission quiesce"* ]]; then ok "an instance without admission_control is unverifiable (exit 3), never idle"
+else bad "an old instance was not refused as unverifiable (exit $st)"; printf '%s\n' "$out" >&2; fi
+mkdir -p "$d/state/supervisor/recover"; : >"$d/state/supervisor/recover/slashit-ui"
+out=$(act "$fake" "0 0 0 0"); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"recovery-copy"* ]]; then ok "a recovery copy left by an interrupted restart counts as active work"
+else bad "a recovery copy was not reported (exit $st)"; printf '%s\n' "$out" >&2; fi
+rm -rf "$d/state/supervisor/recover"
+out=$(act "" "0 0 0 0"); st=$?
+if [ "$st" -eq 3 ] && [[ "$out" == *"cannot verify active work"* ]]; then ok "without a verified CLI the verb cannot verify active work and exits 3"
+else bad "the verb without a CLI did not exit 3 (exit $st)"; printf '%s\n' "$out" >&2; fi
 
 echo
 echo "$pass passed, $fails failed"

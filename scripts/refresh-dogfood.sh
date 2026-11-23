@@ -27,6 +27,12 @@
 #       `supervise-dogfood.sh restart` (no --force), or `start` when stopped, with
 #       SLASHIT_DOGFOOD_EXPECT_COMMIT set to the target: the supervisor refuses any
 #       other build before it stops or starts anything.
+#       A restart of a running instance also refuses when `supervise-dogfood.sh
+#       activity` reports work the restart would interrupt (terminals, Workers,
+#       Queue or in-progress Tasks, a recovery copy) or cannot verify it, and when
+#       the instance predates admission quiesce. The restart itself closes admission
+#       and proves idle immediately before its quit (see `quiesce` in the supervisor);
+#       a busy answer reopens admission and stops nothing.
 #       Does nothing when the target is already the running commit.
 #
 # The artifact root (the promoted binary, its sidecar and previous/) is the one
@@ -91,19 +97,33 @@ if [ "$built_mode" = embedded ] && [ -n "$actual_sha" ] && [ "$actual_sha" = "$b
   built_verified=yes
 fi
 
-# The running instance, from the supervisor's own status. Only exit 0 verifies it.
-# Any other status (1: a stale record or a degraded frontend, 3: unverifiable,
-# 4: environment mismatch) can print a commit, but the text is not evidence of
-# what runs, so it is never read as the running commit.
+# The running instance, from the supervisor's own status. Exit 0 verifies it.
+# Exit 1 is ambiguous: it is a stale launch record (the endpoint is served by
+# another pid), a degraded frontend, or a verified instance whose frontend
+# predates the promoted build. Only the last is a restart target, and only when
+# the output proves the process, endpoint and environment. Every other status
+# (3: unverifiable, 4: environment mismatch, a record mismatch) can print a
+# commit, but the text is not evidence of what runs, so it is never read as the
+# running commit.
 st=0
 status_out=$("$sup" status 2>&1) || st=$?
 running=unverifiable
 running_commit=
+frontend_stale=no
+activity_report=
 if [ "$st" -eq 0 ] && grep -q '^instance: *running' <<<"$status_out"; then
   running=running
   running_commit=$(printf '%s\n' "$status_out" | awk '/^commit:/ { print $2; exit }')
 elif [ "$st" -eq 0 ] && grep -q '^instance: *stopped' <<<"$status_out"; then
   running=stopped
+elif [ "$st" -eq 1 ] && grep -q '^instance: *running' <<<"$status_out" &&
+  grep -q '^control channel: answering on the declared endpoint' <<<"$status_out" &&
+  grep -q '^environment: *verified' <<<"$status_out" &&
+  grep -q '^frontend: *STALE INSTANCE' <<<"$status_out" &&
+  ! grep -q '^record: *STALE' <<<"$status_out"; then
+  running=running
+  frontend_stale=yes
+  running_commit=$(printf '%s\n' "$status_out" | awk '/^commit:/ { print $2; exit }')
 fi
 
 forward=n/a
@@ -165,7 +185,7 @@ has_state=no
 # check is always reported, so a dirty tree is never hidden behind a running target.
 blockers=()
 [ "$pending" -eq 0 ] || blockers+=("uncommitted changes in this checkout")
-if [ "$running" != running ] || [ "$running_commit" != "$target" ]; then
+if [ "$running" != running ] || [ "$running_commit" != "$target" ] || [ "$frontend_stale" = yes ]; then
   if [ "$has_state" = yes ] && [ "$writer_prov" = missing ]; then
     blockers+=("no state-writer record for the existing state, so start and restart refuse; establish it with scripts/supervise-dogfood.sh migrate-legacy COMMIT SHA256 (legacy executable, instance stopped) or adopt COMMIT SHA256")
   fi
@@ -181,6 +201,16 @@ if [ "$running" != running ] || [ "$running_commit" != "$target" ]; then
   if [ "$running" = running ] && [ -n "$running_sha" ] && { [ "$writer_prov" != verified-sidecar ] || [ "$running_sha" != "$writer_sha" ]; }; then
     blockers+=("the running executable (sha256 ${running_sha:0:12}) is not the build the verified state-writer names, so a restart cannot capture it for recovery; stop the instance cooperatively, then migrate-legacy or adopt")
   fi
+  # A restart would stop the instance, so work it holds must be absent.
+  if [ "$running" = running ]; then
+    act_rc=0; act_out=$("$sup" activity 2>&1) || act_rc=$?
+    activity_report=$act_out
+    case $act_rc in
+      0) ;;
+      1) blockers+=("a restart would interrupt the active work:${act_out#active work:}") ;;
+      *) blockers+=("active work cannot be verified, so a restart is refused: $act_out") ;;
+    esac
+  fi
 fi
 
 short() { printf '%s' "${1:-none}" | cut -c1-12; }
@@ -189,7 +219,11 @@ report() {
   echo "target commit:    $(short "$target") ($ref)"
   echo "pending changes:  $pending uncommitted path(s)"
   echo "running:          $running${running_commit:+ at $(short "$running_commit")}"
-  [ "$st" -eq 0 ] || echo "supervisor status: exit $st; its output is not evidence of the running commit"
+  [ "$frontend_stale" = yes ] && echo "frontend:         stale (the verified instance predates the promoted build; a restart loads it)"
+  [ -z "$activity_report" ] || echo "activity:         $activity_report"
+  [ -z "$(ls -A "$state_base/supervisor/recover" 2>/dev/null)" ] ||
+    echo "recovery copy:    kept in $state_base/supervisor/recover; restarts refuse until it is archived (docs/development-workflow.md, section 19, Recovery copies)"
+  [ "$st" -eq 0 ] || [ "$frontend_stale" = yes ] || echo "supervisor status: exit $st; its output is not evidence of the running commit"
   echo "forward only:     $forward (target descends from the running commit)"
   echo "state writer:     $(short "$writer_commit") forward=$state_forward (target descends from the last build that wrote the state)"
   echo "artifact:         $binary"
@@ -233,7 +267,7 @@ if [ "${#blockers[@]}" -gt 0 ]; then
   [ "${#blockers[@]}" -eq 1 ] || printf '%s\n' "$SELF: and ${#blockers[@]} more blocker(s) above; nothing was built, stopped or started" >&2
   exit 1
 fi
-if [ "$running" = running ] && [ "$running_commit" = "$target" ]; then
+if [ "$running" = running ] && [ "$running_commit" = "$target" ] && [ "$frontend_stale" != yes ]; then
   echo "$SELF: the running instance already runs ${target:0:12}; nothing to do"
   exit 0
 fi
@@ -261,6 +295,9 @@ fi
 # The supervisor checks the copy it launches against this commit before it stops
 # or starts anything, so a build promoted after the check above cannot be launched
 # under this target's name.
+# The build above can take minutes. No second shell check runs here: the supervisor's
+# restart closes admission and checks for active work immediately before its quit,
+# which a check made here could not do atomically.
 if [ "$running" = stopped ]; then
   SLASHIT_DOGFOOD_EXPECT_COMMIT=$target "$sup" start || { echo "$SELF: the start did not complete; see the supervisor's message above" >&2; exit 1; }
 else

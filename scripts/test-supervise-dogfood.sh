@@ -11,7 +11,7 @@
 # usage: scripts/test-supervise-dogfood.sh
 set -uo pipefail
 
-EXPECTED_TOTAL=212
+EXPECTED_TOTAL=241
 
 # Linux only: the supervisor and this harness read /proc and use flock and setsid.
 [ "$(uname -s)" = Linux ] || { echo "FAIL $0 is Linux only (it exercises /proc, flock and setsid)" >&2; exit 1; }
@@ -95,11 +95,11 @@ descendants_of() { # pid
 # The supervisor a background `sv start` job became: a descendant of that job
 # whose command line is exactly this checkout's supervisor run as `start`, and
 # which carries this run's fixture environment. Prints "pid starttime".
-fixture_supervisor() { # job
-  local pid cmd
+fixture_supervisor() { # job [start|restart]
+  local pid cmd mode=${2:-start}
   for pid in $(descendants_of "$1"); do
     cmd=$({ tr '\0' ' ' <"/proc/$pid/cmdline"; } 2>/dev/null) || continue
-    [ "$cmd" = "bash $sup start " ] || continue
+    [ "$cmd" = "bash $sup $mode " ] || continue
     owned_by_fixture "$pid" || continue
     printf '%s %s\n' "$pid" "$(proc_start "$pid")"
     return 0
@@ -166,9 +166,10 @@ fi
 if [ -n "${SLASHIT_TEST_STARTUP_REMOVE:-}" ]; then
   rm -f "$SLASHIT_TEST_STARTUP_REMOVE"
 fi
-echo "$$" >"$stub_dir/pid"
-rm -f "$stub_dir/quit"
+rm -f "$stub_dir/quit" "$stub_dir/held" "$stub_dir/shutdown"
+# The socket exists before the pid file: a reader that sees the pid sees the endpoint path too.
 touch "$SLASHIT_TEST_SOCKET"
+echo "$$" >"$stub_dir/pid"
 if [ "${SLASHIT_TEST_STUB_ROLE:-quit}" = quit ]; then
   while [ ! -f "$stub_dir/quit" ]; do
     sleep 0.05
@@ -194,9 +195,12 @@ printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\n' "$(sha256sum "$bin_dir/sl
 cat >"$stub_dir/slashit" <<'STUB'
 #!/usr/bin/env bash
 stub_dir=$SLASHIT_TEST_STUB_DIR
+# The verb is the first known one; `quiesce --operation ID` puts the id last.
 last=
 for a in "$@"; do
-  case $a in --endpoint | --json) ;; *) last=$a ;; esac
+  case $a in
+    quiesce | resume | ping | quit | status | --version) [ -n "$last" ] || last=$a ;;
+  esac
 done
 echo "$last" >>"$stub_dir/calls"
 case $last in
@@ -224,11 +228,84 @@ case $last in
         rm -f "$SLASHIT_TEST_CLI_REPLACE_RECORD"
         mkdir "$SLASHIT_TEST_CLI_REPLACE_RECORD"
       fi
-      printf '{\n  "mode": "gui",\n  "version": "9.9.9-stub",\n  "protocol_version": 1,\n  "pid": %s,\n  "endpoint": "unix:%s"\n}\n' \
-        "$(cat "$stub_dir/pid")" "$SLASHIT_TEST_SOCKET"
+      # SLASHIT_TEST_CLI_SWAP_PID_FROM=N: from the Nth ping on, the endpoint reports pid 1,
+      # as if another instance had taken it between the restart's selection and its quiesce.
+      pid_answer=$(cat "$stub_dir/pid")
+      if [ -n "${SLASHIT_TEST_CLI_SWAP_PID_FROM:-}" ] && [ "$(grep -c '^ping$' "$stub_dir/calls")" -ge "$SLASHIT_TEST_CLI_SWAP_PID_FROM" ]; then
+        pid_answer=1
+      fi
+      # An instance built before admission quiesce omits the field (SLASHIT_TEST_OLD_BINARY).
+      adm=$'  "admission_control": true,\n'
+      [ -z "${SLASHIT_TEST_OLD_BINARY:-}" ] || adm=
+      printf '{\n  "mode": "gui",\n  "version": "9.9.9-stub",\n  "protocol_version": 1,\n%s  "pid": %s,\n  "endpoint": "unix:%s"\n}\n' \
+        "$adm" "$pid_answer" "$SLASHIT_TEST_SOCKET"
       exit 0
     fi
     exit 1
+    ;;
+  quiesce)
+    # The operation is the value after --operation; it is recorded for the cases that check it.
+    op=$(printf '%s\n' "$@" | sed -n '/^--operation$/{n;p}')
+    printf 'quiesce %s\n' "$op" >>"$stub_dir/ops"
+    # SLASHIT_TEST_QUIESCE_LOST: the reply is lost (no answer at all). The fence closed,
+    # unless the value is "unacquired", where the request never reached the executor.
+    if [ -n "${SLASHIT_TEST_QUIESCE_LOST:-}" ]; then
+      [ "$SLASHIT_TEST_QUIESCE_LOST" = unacquired ] || printf '%s\n' "$op" >"$stub_dir/held"
+      exit 1
+    fi
+    # SLASHIT_TEST_QUIESCE_REFUSAL=held|shutdown: a refusal, which is a reply and not an error.
+    if [ -n "${SLASHIT_TEST_QUIESCE_REFUSAL:-}" ]; then
+      printf '{\n  "acquired": false,\n  "operation": "%s",\n  "refusal": "%s"\n}\n' "$op" "$SLASHIT_TEST_QUIESCE_REFUSAL"
+      exit 0
+    fi
+    # Holder model, as the executor keeps it: a shutdown is final, and a quiesce is
+    # held by the operation that acknowledged it until that operation resumes.
+    if [ -f "$stub_dir/shutdown" ]; then
+      printf '{\n  "acquired": false,\n  "operation": "%s",\n  "refusal": "shutdown"\n}\n' "$op"
+      exit 0
+    fi
+    if [ -f "$stub_dir/held" ] && [ "$(cat "$stub_dir/held")" != "$op" ]; then
+      printf '{\n  "acquired": false,\n  "operation": "%s",\n  "refusal": "held"\n}\n' "$op"
+      exit 0
+    fi
+    printf '%s\n' "$op" >"$stub_dir/held"
+    # SLASHIT_TEST_QUIESCE_BUSY reports one running agent, which refuses the restart.
+    busy=0
+    [ -z "${SLASHIT_TEST_QUIESCE_BUSY:-}" ] || busy=1
+    # SLASHIT_TEST_QUIESCE_PAUSE: the fence is closed and the reply withheld, so a test can kill the supervisor here.
+    if [ -n "${SLASHIT_TEST_QUIESCE_PAUSE:-}" ]; then
+      echo $$ >"$stub_dir/cli-paused"
+      : >"$stub_dir/quiesce-acquired"
+      exec sleep 300
+    fi
+    printf '{\n  "acquired": true,\n  "operation": "%s",\n  "admitting": 0,\n  "owned_work": 0,\n  "active_terminals": 0,\n  "running_agents": %s,\n  "queued_tasks": 0,\n  "in_progress_tasks": 0\n}\n' "$op" "$busy"
+    exit 0
+    ;;
+  status)
+    printf '{\n  "active_terminals": 0,\n  "running_agents": 0,\n  "queued_tasks": 0,\n  "in_progress_tasks": 0\n}\n'
+    exit 0
+    ;;
+  resume)
+    op=$(printf '%s\n' "$@" | sed -n '/^--operation$/{n;p}')
+    printf 'resume %s\n' "$op" >>"$stub_dir/ops"
+    # SLASHIT_TEST_RESUME_FAIL: the reply is lost, so the release cannot confirm.
+    [ -z "${SLASHIT_TEST_RESUME_FAIL:-}" ] || exit 1
+    if [ -n "${SLASHIT_TEST_RESUME_REFUSAL:-}" ]; then
+      printf '{\n  "resumed": false,\n  "operation": "%s",\n  "refusal": "%s"\n}\n' "$op" "$SLASHIT_TEST_RESUME_REFUSAL"
+      exit 0
+    fi
+    # Holder model: a shutdown is never reopened, and only the holder reopens a quiesce.
+    if [ -f "$stub_dir/shutdown" ]; then
+      printf '{\n  "resumed": false,\n  "operation": "%s",\n  "refusal": "shutdown"\n}\n' "$op"
+      exit 0
+    fi
+    if [ -f "$stub_dir/held" ] && [ "$(cat "$stub_dir/held")" = "$op" ]; then
+      rm -f "$stub_dir/held"
+      printf '{\n  "resumed": true,\n  "operation": "%s"\n}\n' "$op"
+      exit 0
+    fi
+    printf '{\n  "resumed": false,\n  "operation": "%s",\n  "refusal": "not-held"\n}\n' "$op"
+    exit 0
     ;;
   quit)
     if [ -f "$stub_dir/pid" ]; then
@@ -583,6 +660,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== restart"
 out=$(sv restart 2>&1); expect fail "a restart of a stopped instance is refused" "$out" $? "nothing found to operate on"
 
@@ -596,6 +674,7 @@ else
   bad "the restart did not prove the state unchanged (digest before '$before', after '$(settings_digest)')"; printf '%s\n' "$out" >&2
 fi
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== the backup contains exactly the compared snapshot set"
 manifest=$(ls -1t "$state"/supervisor/backup/*/manifest.sha256 2>/dev/null | head -n 1)
 if [ -n "$manifest" ] &&
@@ -607,6 +686,7 @@ else
   [ -n "$manifest" ] && cat "$manifest" >&2
 fi
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a state change across the restart is caught"
 printf 'settings v1\n' >"$state/config/slashit-app/settings.toml"
 # The instance the previous restart left running is the fixture.
@@ -624,6 +704,305 @@ else
 fi
 cleanup_instances
 printf 'settings v1\n' >"$state/config/slashit-app/settings.toml"
+
+echo "== quiesce closes admission before the quit; a busy answer reopens it and stops nothing"
+# The tamper case above failed after its restart; the copy it kept blocks the next
+# restart by design. Clear it as an operator would, so these cases test quiesce alone.
+rm -rf "$state/supervisor/recover"
+sv start >/dev/null 2>&1 || bad "quiesce fixture: start failed"
+: >"$stub_dir/calls"
+out=$(sv restart 2>&1); status=$?
+seq=$(grep -xE 'quiesce|quit|resume' "$stub_dir/calls" | uniq | tr '\n' ' ')
+if [ "$status" -eq 0 ] && [ "$seq" = "quiesce quit " ]; then
+  ok "the restart closes admission, then quits, and never resumes on success"
+else bad "admission order was '$seq' (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+sv start >/dev/null 2>&1 || bad "busy quiesce fixture: start failed"
+: >"$stub_dir/calls"
+out=$(export SLASHIT_TEST_QUIESCE_BUSY=1; sv restart 2>&1); status=$?
+seq=$(grep -xE 'quiesce|quit|resume' "$stub_dir/calls" | uniq | tr '\n' ' ')
+if [ "$status" -ne 0 ] && [[ "$out" == *"interrupt the active work"* ]] && [ "$seq" = "quiesce resume " ]; then
+  ok "a busy quiesce reopens admission and quits nothing"
+else bad "busy quiesce sequence was '$seq' (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+sv start >/dev/null 2>&1 || bad "old-binary fixture: start failed"
+: >"$stub_dir/calls"
+out=$(export SLASHIT_TEST_OLD_BINARY=1; sv restart 2>&1); status=$?
+if [ "$status" -ne 0 ] && [[ "$out" == *"predates admission quiesce"* ]] && ! grep -qxE 'quit|quiesce' "$stub_dir/calls"; then
+  ok "an instance without admission quiesce is refused before any quit"
+else bad "an instance without admission quiesce was not refused safely (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
+echo "== quiesce ownership: a refused or lost quiesce never reopens a fence this restart did not take"
+# A refusal is a reply that names its reason: nothing is stopped and nothing is resumed.
+for refusal in shutdown held; do
+  sv start >/dev/null 2>&1 || bad "refusal fixture ($refusal): start failed"
+  pre=$(stub_pid); : >"$stub_dir/calls"; : >"$stub_dir/ops"
+  out=$(export SLASHIT_TEST_QUIESCE_REFUSAL=$refusal; sv restart 2>&1); status=$?
+  seq=$(grep -xE 'quiesce|quit|resume' "$stub_dir/calls" | uniq | tr '\n' ' ')
+  if [ "$refusal" = shutdown ]; then want="shutdown is already in progress"; else want="held by another quiesce operation"; fi
+  if [ "$status" -ne 0 ] && [[ "$out" == *"$want"* ]] && [[ "$out" == *"will not reopen it"* ]] &&
+    [ "$seq" = "quiesce " ] && ! grep -q '^resume' "$stub_dir/ops" && [ "$(stub_pid)" = "$pre" ]; then
+    ok "a $refusal refusal is reported as that refusal, and the restart neither stops nor resumes"
+  else bad "$refusal refusal: sequence '$seq' (exit $status)"; printf '%s\n' "$out" >&2; fi
+  cleanup_instances
+done
+
+# Acquisition succeeded and its reply was lost: the matching resume reopens the fence,
+# and the fence is actually clear afterwards (the stub holds it until a matching resume).
+sv start >/dev/null 2>&1 || bad "lost-reply fixture: start failed"
+pre=$(stub_pid); : >"$stub_dir/calls"; : >"$stub_dir/ops"; rm -f "$stub_dir/held"
+out=$(export SLASHIT_TEST_QUIESCE_LOST=1; sv restart 2>&1); status=$?
+seq=$(grep -xE 'quiesce|quit|resume' "$stub_dir/calls" | uniq | tr '\n' ' ')
+q_op=$(awk '$1 == "quiesce" { print $2; exit }' "$stub_dir/ops")
+r_op=$(awk '$1 == "resume" { print $2; exit }' "$stub_dir/ops")
+if [ "$status" -ne 0 ] && [[ "$out" == *"whether admission closed is unknown"* ]] && [ "$seq" = "quiesce resume " ] &&
+  [[ "$q_op" == sup-* ]] && [ "$q_op" = "$r_op" ] && [ "$(stub_pid)" = "$pre" ] && [ ! -f "$stub_dir/held" ]; then
+  ok "a lost reply after the fence closed is reopened by its own operation ($q_op): the fence is clear and nothing stopped"
+else bad "lost reply after acquisition: sequence '$seq', quiesce op '$q_op', resume op '$r_op', fence file $([ -f "$stub_dir/held" ] && echo held || echo clear) (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+# Acquisition never happened and its reply was lost: a matching resume finds nothing held,
+# reports not held, and the fence stays clear and nothing is stopped.
+sv start >/dev/null 2>&1 || bad "unacquired lost-reply fixture: start failed"
+pre=$(stub_pid); : >"$stub_dir/calls"; : >"$stub_dir/ops"; rm -f "$stub_dir/held"
+out=$(export SLASHIT_TEST_QUIESCE_LOST=unacquired SLASHIT_TEST_RESUME_REFUSAL=not-held; sv restart 2>&1); status=$?
+seq=$(grep -xE 'quiesce|quit|resume' "$stub_dir/calls" | uniq | tr '\n' ' ')
+q_op=$(awk '$1 == "quiesce" { print $2; exit }' "$stub_dir/ops")
+r_op=$(awk '$1 == "resume" { print $2; exit }' "$stub_dir/ops")
+if [ "$status" -ne 0 ] && [[ "$seq" == "quiesce "* ]] && [[ "$q_op" == sup-* ]] && [ "$q_op" = "$r_op" ] &&
+  [ "$(stub_pid)" = "$pre" ] && [ ! -f "$stub_dir/held" ] && ! grep -q '^quit' "$stub_dir/calls"; then
+  ok "a lost reply before any acquisition leaves the fence clear: the resume reports not held and nothing stops"
+else bad "unacquired lost reply: sequence '$seq', quiesce op '$q_op', resume op '$r_op' (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+# A release that cannot reach the instance says so, and names the operation to resume.
+sv start >/dev/null 2>&1 || bad "resume-failure fixture: start failed"
+: >"$stub_dir/ops"
+out=$(export SLASHIT_TEST_QUIESCE_BUSY=1 SLASHIT_TEST_RESUME_FAIL=1; sv restart 2>&1); status=$?
+op=$(awk '$1 == "quiesce" { print $2; exit }' "$stub_dir/ops")
+if [ "$status" -ne 0 ] && [[ "$out" == *"could not be confirmed reopened for operation $op"* ]] && [[ "$out" == *"resume --operation $op"* ]]; then
+  ok "a failed release names the operation and the command that reopens it"
+else bad "failed release did not name its operation (exit $status)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+# An abrupt interruption: a SIGKILLed restart leaves the instance quiesced. The
+# operation id is recorded, and only that id reopens admission.
+stubcli() { env SLASHIT_TEST_STUB_DIR="$stub_dir" "$stub_dir/slashit" "$@"; }
+KILLED_OP= KILLED_SUP= KILLED_PID=
+# Starts a restart whose supervisor is SIGKILLed after the instance closed admission
+# and before it replied. Sets KILLED_OP, KILLED_SUP and KILLED_PID (the instance).
+killed_restart() {
+  KILLED_OP= KILLED_SUP= KILLED_PID=
+  cleanup_instances
+  sv start >/dev/null 2>&1 || { bad "$1: start failed"; return 1; }
+  KILLED_PID=$(stub_pid)
+  rm -f "$stub_dir/quiesce-acquired" "$stub_dir/cli-paused" "$stub_dir/held"
+  : >"$stub_dir/ops"; : >"$stub_dir/calls"
+  sv SLASHIT_TEST_QUIESCE_PAUSE=1 SLASHIT_DOGFOOD_CLI_TIMEOUT=120 restart >"$work/killed.out" 2>&1 &
+  local bg=$! i p sup_info
+  for i in $(seq 1 300); do [ -f "$stub_dir/quiesce-acquired" ] && break; sleep 0.1; done
+  # Only the restart this job started, found by descent and fixture ownership, is signalled.
+  sup_info=$(fixture_supervisor "$bg" restart) && KILLED_SUP=${sup_info%% *}
+  [ -n "$KILLED_SUP" ] && signal_owned KILL "$sup_info"
+  # The CLI request it was waiting on is orphaned; ending it does not touch the instance.
+  p=$(cat "$stub_dir/cli-paused" 2>/dev/null) && [ -n "$p" ] && kill -9 "$p" 2>/dev/null
+  wait "$bg" 2>/dev/null
+  KILLED_OP=$(awk '$1 == "quiesce" { print $2; exit }' "$stub_dir/ops")
+  [ -n "$KILLED_SUP" ] && [[ "$KILLED_OP" == sup-* ]] || { bad "$1: the supervisor was not killed while holding the quiesce"; return 1; }
+}
+rec=$state/supervisor/quiesce
+rm -rf "$state/supervisor/recover"
+
+echo "== a same-checkout restart outside this fixture is never selected"
+decoy_name="bash $sup restart"
+# The decoy blocks reading a FIFO that this shell holds open, so it has no helper child to leak.
+decoy_fifo=$work/decoy.fifo
+mkfifo "$decoy_fifo" && exec 7<>"$decoy_fifo"
+bash -c 'exec -a "$1" cat' _ "$decoy_name" <"$decoy_fifo" &
+decoy=$!
+sleep 0.3
+if [ "$(tr '\0' ' ' <"/proc/$decoy/cmdline" 2>/dev/null)" = "$decoy_name " ] &&
+  ! fixture_supervisor "$$" restart >/dev/null && kill -0 "$decoy" 2>/dev/null; then
+  ok "a matching restart without this fixture's environment is not selected or signalled"
+else bad "an unowned same-checkout restart was selected or its command line did not match the probe"; fi
+kill "$decoy" 2>/dev/null; wait "$decoy" 2>/dev/null
+exec 7>&-; rm -f "$decoy_fifo"
+
+echo "== an abrupt interruption: the quiesce is recorded, and only its own operation reopens it"
+if killed_restart "killed restart"; then
+  rec_op=$(awk -F '\t' '$1 == "operation" { print $2 }' "$rec" 2>/dev/null)
+  if [ "$rec_op" = "$KILLED_OP" ] && [ "$(cat "$stub_dir/held" 2>/dev/null)" = "$KILLED_OP" ] &&
+    [ "$(stat -c %a "$rec" 2>/dev/null)" = 600 ] && kill -0 "$KILLED_PID" 2>/dev/null && ! grep -q '^resume' "$stub_dir/ops"; then
+    ok "a SIGKILLed restart leaves admission held, and its operation id is recorded owner-only"
+  else bad "killed restart: record '$rec_op', held '$(cat "$stub_dir/held" 2>/dev/null)', operation $KILLED_OP"; fi
+
+  out=$(sv activity 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"admission-quiesce:$KILLED_OP"* ]]; then
+    ok "activity reports the held quiesce and its operation id (exit 1)"
+  else bad "activity did not report the held quiesce (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+  out=$(sv restart 2>&1); st=$?
+  if [ "$st" -ne 0 ] && [[ "$out" == *"recorded as quiesced by operation $KILLED_OP"* ]] &&
+    [ "$(grep -c '^quiesce' "$stub_dir/ops")" = 1 ] && ! grep -qx quit "$stub_dir/calls" &&
+    [ "$(awk -F '\t' '$1 == "operation" { print $2 }' "$rec")" = "$KILLED_OP" ] && kill -0 "$KILLED_PID" 2>/dev/null; then
+    ok "a second restart is refused before any quiesce or quit, and the record of the held quiesce is not overwritten"
+  else bad "second restart did not refuse or overwrote the record (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+  out=$(sv resume-quiesce 2>&1); st=$?
+  if [ "$st" -eq 0 ] && [[ "$out" == *"admission reopened on"* ]] && grep -qx "resume $KILLED_OP" "$stub_dir/ops" &&
+    [ ! -e "$stub_dir/held" ] && [ ! -e "$rec" ]; then
+    ok "resume-quiesce sends the recorded operation id, reopens admission and clears the record"
+  else bad "resume-quiesce did not reopen the recorded quiesce (exit $st)"; printf '%s\n' "$out" >&2; fi
+
+  out=$(sv restart 2>&1); st=$?
+  if [ "$st" -eq 0 ]; then ok "after the resume a restart proceeds normally"; else bad "restart after resume-quiesce failed (exit $st)"; printf '%s\n' "$out" >&2; fi
+fi
+cleanup_instances
+
+# A different operation's id is refused by the instance, and leaves the held quiesce for its owner.
+if killed_restart "foreign id"; then
+  out=$(stubcli --endpoint "unix:$socket" --json resume --operation sup-0-foreign 2>&1)
+  if [[ "$out" == *'"refusal": "not-held"'* ]] && [ "$(cat "$stub_dir/held" 2>/dev/null)" = "$KILLED_OP" ]; then
+    ok "a foreign operation id is refused and the held quiesce stays with its owner"
+  else bad "a foreign id was not refused, or the hold moved: $out"; fi
+  out=$(sv resume-quiesce 2>&1); st=$?
+  if [ "$st" -eq 0 ] && [ ! -e "$stub_dir/held" ]; then ok "the owner's recorded id still resumes after a foreign attempt"; else bad "owner resume failed after a foreign attempt (exit $st)"; printf '%s\n' "$out" >&2; fi
+fi
+cleanup_instances
+
+# A stale id, after its quiesce was released and a newer one took the fence, is refused.
+if killed_restart "stale id"; then
+  stubcli --endpoint "unix:$socket" --json resume --operation "$KILLED_OP" >/dev/null 2>&1
+  newer=sup-0-newer
+  stubcli --endpoint "unix:$socket" --json quiesce --operation "$newer" >/dev/null 2>&1
+  out=$(sv resume-quiesce 2>&1); st=$?
+  if [ "$st" -eq 0 ] && [[ "$out" == *"does not hold admission"* ]] && [ "$(cat "$stub_dir/held" 2>/dev/null)" = "$newer" ] &&
+    ! grep -qx "resume $newer" "$stub_dir/ops"; then
+    ok "a stale recorded id is refused after a newer quiescence, which stays held"
+  else bad "a stale id reopened or moved the newer quiescence (exit $st)"; printf '%s\n' "$out" >&2; fi
+fi
+cleanup_instances
+
+# A record from an earlier instance names a pid that no longer serves the endpoint: nothing is sent.
+if killed_restart "old record"; then
+  # A stop now clears the quiesce record it names (its instance is gone), so the record
+  # is put back after the stop: this case is the crash that left it behind.
+  cp -p "$rec" "$work/old-quiesce-record"
+  sv stop >/dev/null 2>&1; cp -p "$work/old-quiesce-record" "$rec"
+  sv start >/dev/null 2>&1; : >"$stub_dir/ops"
+  out=$(sv resume-quiesce 2>&1); st=$?
+  if [ "$st" -eq 1 ] && [[ "$out" == *"was started after that quiesce"* ]] && [ ! -s "$stub_dir/ops" ] && [ -e "$rec" ]; then
+    ok "a record from an earlier instance is refused, nothing is sent, and the record is kept"
+  else bad "an earlier instance's record was not refused safely (exit $st)"; printf '%s\n' "$out" >&2; fi
+  out=$(sv activity 2>&1); st=$?
+  if [ "$st" -eq 0 ] && [[ "$out" == *"quiesce record: stale"* ]]; then ok "activity does not count a record from an earlier instance as held"; else bad "activity counted a stale record (exit $st)"; printf '%s\n' "$out" >&2; fi
+fi
+cleanup_instances
+
+# A shutdown fence is never reopened, by resume-quiesce or by any later quiesce.
+if killed_restart "shutdown fence"; then
+  : >"$stub_dir/shutdown"
+  out=$(sv resume-quiesce 2>&1); st=$?
+  late=$(stubcli --endpoint "unix:$socket" --json quiesce --operation sup-0-late 2>&1)
+  if [ "$st" -eq 1 ] && [[ "$out" == *"never reopened"* ]] && [ -e "$stub_dir/shutdown" ] &&
+    [[ "$late" == *'"refusal": "shutdown"'* ]] && ! grep -q 'resume' <<<"$out"; then
+    ok "resume-quiesce never reopens a shutdown fence (exit 1), and a later quiesce is refused as shutdown"
+  else bad "a shutdown fence was reopened or misreported (exit $st): $out / $late"; fi
+fi
+cleanup_instances
+
+# A quiesce record names its process by pid and identity. write_rec writes one by hand.
+write_rec() { # operation pid identity
+  printf 'operation\t%s\nstate\trequested\npid\t%s\nidentity\t%s\nendpoint\tunix:%s\nrecorded_at\t2000-01-01T00:00:00Z\n' \
+    "$1" "$2" "$3" "$socket" >"$rec"
+  chmod 600 "$rec"
+}
+
+echo "== a quiesce record from a reused pid is not a hold: activity, resume-quiesce and restart"
+sv start >/dev/null 2>&1 || bad "reused-pid fixture: start failed"
+live_pid=$(stub_pid)
+rm -f "$rec"; : >"$stub_dir/ops"; : >"$stub_dir/calls"
+# The live instance's pid with a different start time: the same number, another process.
+write_rec sup-0-reused "$live_pid" "$(cat /proc/sys/kernel/random/boot_id) $(($(proc_start "$live_pid") + 1))"
+out=$(sv activity 2>&1); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" == *"quiesce record: stale"* ]] && [[ "$out" != *"admission-quiesce"* ]] && [ ! -s "$stub_dir/ops" ]; then
+  ok "activity does not count a record from a reused pid as a hold"
+else bad "activity counted a reused-pid record as held (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(sv resume-quiesce 2>&1); st=$?
+if [ "$st" -eq 1 ] && [[ "$out" == *"belongs to a different process"* ]] && [ ! -s "$stub_dir/ops" ] && [ -e "$rec" ]; then
+  ok "resume-quiesce refuses a reused-pid record, sends nothing, and keeps the record"
+else bad "resume-quiesce acted on a reused-pid record (exit $st)"; printf '%s\n' "$out" >&2; fi
+out=$(sv restart 2>&1); st=$?
+if [ "$st" -eq 0 ] && [[ "$out" != *"recorded as quiesced"* ]] && [ "$(stub_pid)" != "$live_pid" ] && [ ! -e "$rec" ]; then
+  ok "restart is not refused by a reused-pid record and replaces it"
+else bad "restart was refused by a reused-pid record (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+echo "== a restart refuses when the instance answering the quiesce is not the one it selected"
+sv start >/dev/null 2>&1 || bad "pid-swap fixture: start failed"
+pre=$(stub_pid); rm -f "$rec"; : >"$stub_dir/calls"; : >"$stub_dir/ops"
+out=$(sv SLASHIT_TEST_CLI_SWAP_PID_FROM=2 restart 2>&1); st=$?
+if [ "$st" -ne 0 ] && [[ "$out" == *"not the pid $pre the restart selected"* ]] && ! grep -qxE 'quiesce|quit' "$stub_dir/calls" &&
+  [ ! -e "$rec" ] && [ "$(stub_pid)" = "$pre" ]; then
+  ok "a restart whose quiesce answers from another pid refuses before any quiesce, records nothing and stops nothing"
+else bad "a restart quiesced or stopped a different instance (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+echo "== stop clears the quiesce record of the instance it ended, and no other"
+sv start >/dev/null 2>&1 || bad "stop-record fixture: start failed"
+live_pid=$(stub_pid)
+write_rec sup-0-stopped "$live_pid" "$(cat /proc/sys/kernel/random/boot_id) $(proc_start "$live_pid")"
+out=$(sv stop 2>&1); st=$?
+if [ "$st" -eq 0 ] && [ -z "$(stub_pid)" ] && [ ! -e "$rec" ]; then
+  ok "stop of the recorded instance removes its quiesce record once the instance is gone"
+else bad "stop left the quiesce record of the instance it ended (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+
+sleep 300 &
+other_pid=$!
+own "$other_pid"
+sv start >/dev/null 2>&1 || bad "other-record fixture: start failed"
+write_rec sup-0-other "$other_pid" "$(cat /proc/sys/kernel/random/boot_id) $(proc_start "$other_pid")"
+out=$(sv stop 2>&1); st=$?
+if [ "$st" -eq 0 ] && [ -z "$(stub_pid)" ] && [ -e "$rec" ] && grep -q 'sup-0-other' "$rec"; then
+  ok "stop of one instance keeps a quiesce record that names a different live process"
+else bad "stop removed or misjudged a record for another live process (exit $st)"; printf '%s\n' "$out" >&2; fi
+{ kill "$other_pid"; wait "$other_pid"; } 2>/dev/null
+rm -f "$rec"
+cleanup_instances
+
+# A retained recovery copy stays byte-for-byte, blocks a non-forced restart, and gets no quiesce record.
+mkdir -p "$state/supervisor/recover" && printf 'kept evidence\n' >"$state/supervisor/recover/slashit-ui"
+kept_sum=$(sha256sum "$state/supervisor/recover/slashit-ui" | cut -d' ' -f1)
+sv start >/dev/null 2>&1 || bad "recovery-copy fixture: start failed"
+pre=$(stub_pid); : >"$stub_dir/ops"; : >"$stub_dir/calls"
+out=$(sv restart 2>&1); st=$?
+if [ "$st" -ne 0 ] && [[ "$out" == *"recovery copy from an earlier interrupted or divergent restart"* ]] &&
+  [ "$(sha256sum "$state/supervisor/recover/slashit-ui" | cut -d' ' -f1)" = "$kept_sum" ] && [ ! -e "$rec" ] &&
+  [ ! -s "$stub_dir/ops" ] && [ "$(stub_pid)" = "$pre" ]; then
+  ok "a retained recovery copy blocks a restart before any quiesce is recorded, and its bytes are unchanged"
+else bad "retained recovery copy was not protected (exit $st)"; printf '%s\n' "$out" >&2; fi
+cleanup_instances
+rm -rf "$state/supervisor/recover"
+
+# A retained recovery copy blocks every restart, forced or not, before anything is acquired or stopped.
+for flag in "" --force; do
+  sv start >/dev/null 2>&1 || bad "recovery fixture ($flag): start failed"
+  pre=$(stub_pid); : >"$stub_dir/calls"
+  mkdir -p "$state/supervisor/recover" && : >"$state/supervisor/recover/slashit-ui"
+  out=$(sv restart $flag 2>&1); status=$?
+  if [ "$status" -ne 0 ] && [[ "$out" == *"recovery copy from an earlier interrupted or divergent restart"* ]] &&
+    [[ "$out" == *"$state/supervisor/recover"* ]] && ! grep -qxE 'quiesce|quit' "$stub_dir/calls" &&
+    [ -f "$state/supervisor/recover/slashit-ui" ] && [ "$(stub_pid)" = "$pre" ]; then
+    ok "a retained recovery copy refuses a restart ${flag:-(non-forced)} before any quiesce or quit, and is kept"
+  else bad "retained recovery copy did not refuse ${flag:-non-forced} restart (exit $status)"; printf '%s\n' "$out" >&2; fi
+  rm -rf "$state/supervisor/recover"
+  cleanup_instances
+done
 
 echo "== WebKit cache regeneration and UI preferences do not fail a restart; Task data still does"
 webcache="$state/data/com.barradev.slashit-app/WebKitCache/Version 17/entry"
@@ -649,6 +1028,7 @@ cleanup_instances
 printf 'session 7\n' >"$state/data/slashit-app/board.toml"
 rm -rf "$state/data/com.barradev.slashit-app"
 
+rm -rf "$state/supervisor/recover" # kept by the divergence case above; see the quiesce section
 echo "== restart ignores a third-party file that is rewritten while the instance runs"
 codex="$state/config/Codex/cache.bin"
 mkdir -p "$(dirname "$codex")"
@@ -667,6 +1047,7 @@ fi
 cleanup_instances
 rm -rf "$state/config/Codex"
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a backup location that cannot be written is refused before the instance is stopped"
 sv start >/dev/null 2>&1 || bad "backup precheck fixture: start failed"
 pre=$(stub_pid)
@@ -692,6 +1073,7 @@ running_exe() { # the script the running stub instance was exec'd from
 # The sha256 the launch record captured for the running instance (the copy it execs).
 record_sha() { awk -F '\t' '$1 == "sha256" { print $2 }' "$state/supervisor/instance" 2>/dev/null; }
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a backup that fails after the stop starts the captured executable again, over unchanged state"
 sv verify >/dev/null 2>&1 || sv start >/dev/null 2>&1 || bad "post-stop fixture: start failed"
 sums_before=$(state_sums); n_before=$(backup_count); old_pid=$(stub_pid)
@@ -709,6 +1091,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== recovery starts the captured executable, never the newly promoted one"
 sel=$work/select
 mkdir -p "$sel"
@@ -739,6 +1122,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a running executable whose identity cannot be proven is not stopped"
 sv start >/dev/null 2>&1 || bad "unprovable fixture: start failed"
 pre=$(stub_pid)
@@ -752,6 +1136,7 @@ fi
 cleanup_instances
 rm -f "$state/supervisor/instance"
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a promotion whose backup retention failed refuses a restart before the stop"
 # The build script promoted a new pair, but keeping the replaced pair in previous/
 # failed: it sits only in .previous.*, so the rollback copy is not at previous/.
@@ -785,6 +1170,7 @@ fi
 cleanup_instances
 rm -f "$state/supervisor/instance"
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a running embedded build with no matching frontend sidecar is not stopped"
 nos=$repo/target/nosidecar
 mkdir -p "$nos"
@@ -817,6 +1203,7 @@ fi
 cleanup_instances
 rm -f "$state/supervisor/instance"
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== the requested target is the build a launch runs (SLASHIT_DOGFOOD_EXPECT_COMMIT)"
 sv stop >/dev/null 2>&1; cleanup_instances
 seed_writer "$state"
@@ -841,6 +1228,7 @@ else bad "a promoted build for another commit was not refused before the stop (e
 printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$stub_sha" "$commit_id" >"$bin_dir/slashit-ui.frontend"
 sv stop >/dev/null 2>&1; cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a build promoted during a restart's stop cannot fail the restart"
 sv start >/dev/null 2>&1 || bad "stop-promotion fixture: start failed"
 promote=$work/promote-dirty.sh
@@ -859,6 +1247,7 @@ else bad "a promotion during the stop failed the restart (exit $st, pid '$pre' n
 printf 'mode=embedded\nsha256=%s\nwasm=stub_bg.wasm\ncommit=%s\ndirty=no\n' "$stub_sha" "$commit_id" >"$bin_dir/slashit-ui.frontend"
 sv stop >/dev/null 2>&1; cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a recovery copy with incomplete provenance is refused before the stop"
 prov="$work/prov"
 mkdir -p "$prov/previous"
@@ -883,6 +1272,7 @@ if [ "$st" -eq 1 ] && [[ "$out" == *"does not name a verified clean commit"* ]] 
 else bad "an incomplete recovery copy was not refused before the stop (exit $st, pid '$pre' now '$(stub_pid)')"; printf '%s\n' "$out" >&2; fi
 sv stop >/dev/null 2>&1; cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== an empty required data root is backed up as an empty directory"
 aside=$work/data-aside
 mkdir -p "$aside"; mv "$state/data/slashit-app" "$aside/"; mkdir -p "$state/data/slashit-app"
@@ -898,6 +1288,7 @@ fi
 cleanup_instances
 rm -rf "$state/data/slashit-app"; mv "$aside/slashit-app" "$state/data/"
 rm -rf "$state/supervisor/backup/"*; rm -f "$state/supervisor/instance"
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== the state-writer record refuses an older build, running or stopped"
 writer=$state/supervisor/state-writer
 sv start >/dev/null 2>&1 || bad "state-writer fixture: start failed"
@@ -940,6 +1331,7 @@ rm -rf "$fwd"
 git -C "$repo" reset -q --hard "$commit_id"
 seed_writer "$state"
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== state-writer provenance: fresh installs initialize, unknown writers fail closed until adopted"
 prov=$work/prov
 fresh_env=(SLASHIT_DOGFOOD_STATE="$prov")
@@ -1073,6 +1465,7 @@ expect fail "a recorded writer that the executable does not descend from is refu
   "$(sv "${fresh_env[@]}" start 2>&1)" $? "does not provably descend"
 cleanup_instances; rm -rf "$prov" "$work/prov-empty" "$shim" "$old_dir" "$dev_dir"
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== frontend mode: an embedded build needs no server; a development build needs its dev server"
 # Inside the git checkout, so a development build (no sidecar) still has a commit.
 fe=$repo/target/frontend
@@ -1167,6 +1560,7 @@ else
   ok "dev-server readiness positive case skipped: python3 is not installed"
 fi
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== restart snapshots are bounded to the newest five"
 cleanup_instances
 sv start >/dev/null 2>&1 || bad "retention fixture: start failed"
@@ -1199,6 +1593,7 @@ make_state() {
   seed_writer "$1"
 }
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== default discovery: no explicit binary or CLI, inside a git checkout"
 disc=$work/disc
 mkdir -p "$disc/main/target/dogfood" "$disc/main/scripts"
@@ -1236,6 +1631,7 @@ else
   bad "status without a discovered CLI did not exit 3 (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== protected state: missing or unprovable evidence refuses before anything is stopped"
 cleanup_instances
 empty=$work/empty-state
@@ -1303,6 +1699,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== status and verify follow the documented exit contract"
 out=$(sv status 2>&1); st=$?
 if [ "$st" -eq 0 ] && [[ "$out" == *"instance:       stopped"* ]]; then
@@ -1365,6 +1762,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== an endpoint path with no verified answer is unverifiable, never stopped"
 cleanup_instances
 mkdir -p "$runtime/slashit-app"
@@ -1383,6 +1781,7 @@ else
 fi
 rm -f "$socket"
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== stop --force escalates to signals when there is no CLI"
 out=$(sv start 2>&1); st=$?
 forced_pid=$(stub_pid)
@@ -1398,6 +1797,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a forced stop leaves ambiguous endpoint cleanup to the owner"
 out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
 forced_pid=$(stub_pid)
@@ -1419,6 +1819,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a replacement endpoint is never unlinked after the recorded process exits"
 out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
 foreign_pid=$(stub_pid)
@@ -1437,6 +1838,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a stop over a control channel that does not answer in time is refused as unverifiable"
 out=$(sv start 2>&1); st=$?
 hung_pid=$(stub_pid)
@@ -1452,6 +1854,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== run refuses a binary that prints a version line and then fails, as start does"
 printf '#!/usr/bin/env bash\necho "slashit-ui 9.9.9-broken"\nexit 3\n' >"$work/broken-version"
 chmod +x "$work/broken-version"
@@ -1462,6 +1865,7 @@ else
   bad "run accepted a binary whose --version exits nonzero (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== run requires a present CLI with a successful, nonempty version"
 out=$(sv SLASHIT_DOGFOOD_CLI= run 2>&1); st=$?
 if [ "$st" -eq 1 ] && [[ "$out" == *'no `slashit` CLI is available'* ]] && [[ "$out" != *"exec "* ]]; then
@@ -1486,6 +1890,7 @@ else
   bad "run accepted a failing CLI version check (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== with no launch record, a control channel that does not answer is still unverifiable, not absent"
 cleanup_instances
 out=$(sv SLASHIT_TEST_CLI_HANG=1 SLASHIT_DOGFOOD_CLI_TIMEOUT=2 stop 2>&1); st=$?
@@ -1495,6 +1900,7 @@ else
   bad "stop with no record and a hung channel did not report an unverifiable channel (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a restart that could not start again is refused before the instance is stopped"
 out=$(sv start 2>&1); st=$?
 running_pid=$(stub_pid)
@@ -1510,6 +1916,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== process identity: a launch record alone never authorizes a signal"
 # Foreign processes are disposable `sleep` children of this test. The EXIT trap
 # kills any that remain; no case signals a pid this test did not start itself.
@@ -1599,6 +2006,7 @@ else
   bad "the identity-verified control was not stopped (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== process identity: an endpoint that disagrees with the launch record"
 cleanup_instances
 out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
@@ -1617,6 +2025,7 @@ fi
 cleanup_instances
 rm -f "$record_file"
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== endpoint and launch record name different processes: nothing is quit or signaled"
 # The endpoint answers for one live instance (A). The launch record names a second
 # live process (B) with a matching identity and the declared environment. Each
@@ -1655,6 +2064,7 @@ rm -f "$record_file"
 signal_owned KILL "$record_id" || true
 wait "$record_pid" 2>/dev/null || true
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== the identity re-read after the environment check refuses a changed process"
 # Deterministic, without pid reuse: PATH shims stand in for two commands. `tr` is
 # the only command verify_env runs, so once it has run, the `cat` shim reports
@@ -1702,6 +2112,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== process identity: a verified instance still stops and restarts"
 out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
 first_pid=$(stub_pid)
@@ -1719,6 +2130,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== process identity: recovery after the recorded instance has exited"
 out=$(sv SLASHIT_TEST_STUB_ROLE=noquit start 2>&1); st=$?
 dead_instance=$(stub_pid)
@@ -1756,6 +2168,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== no launch record: an endpoint's own answer never authorizes a quit or a signal"
 # The stub CLI prints a reply file for ping, so each case declares its own
 # endpoint. The foreign processes are disposable: one carries no declared
@@ -1834,6 +2247,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== a failed start leaves no untracked child and no second launch"
 # Each case marks its supervisor and that supervisor's children with a unique
 # environment variable, so the children are found even when no pid is known.
@@ -2076,6 +2490,7 @@ else
 fi
 cleanup_instances
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== XDG paths: trailing and repeated slashes cannot bypass the default-directory gate"
 expect fail "a default runtime directory with a trailing slash is refused" \
   "$(sv SLASHIT_DOGFOOD_RUNTIME="/run/user/$(id -u)/" env 2>&1)" $? "default directory derived from HOME"
@@ -2092,6 +2507,7 @@ else
   bad "a legitimate runtime with a trailing slash was not kept in normalized form (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== XDG paths: '.' and '..' components cannot name a default directory"
 # Each of these names a default location without spelling it: the old gate
 # compared spellings, so each was accepted and the instance used the real state.
@@ -2104,6 +2520,7 @@ expect fail "a runtime directory with a /. component is refused" \
 expect fail "a HOME with a '.' component cannot shift the defaults it derives" \
   "$(sv HOME="$HOME/." SLASHIT_DOGFOOD_STATE="$HOME/.local/state" env 2>&1)" $? "may not contain '.' or '..'"
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== XDG paths: HOME and state trailing slashes are compared in normalized form"
 expect fail "a HOME with a trailing slash still derives the defaults, so the default state is refused" \
   "$(sv HOME="$HOME/" SLASHIT_DOGFOOD_STATE="$HOME/.local/state" env 2>&1)" $? "default directory derived from HOME"
@@ -2120,6 +2537,7 @@ else
   bad "a trailing slash on the isolated state base was not normalized (exit $st)"; printf '%s\n' "$out" >&2
 fi
 
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== launch copy: what runs is the copy that was checked"
 # A verified start executes a private copy whose sha256 is the proven one, and
 # the copy is removed once the start is verified.
@@ -2228,6 +2646,7 @@ fi
 
 # ---- migrate-legacy: a one-time attestation for an executable whose sidecar
 # predates the commit field. Each case uses its own disposable state and binary.
+rm -rf "$state/supervisor/recover" # sections after this one assume no copy from an earlier failure
 echo "== migrate-legacy: explicit, attested, stopped-only, and never a verified record"
 legacy_sums() { (cd "$1" && find config/slashit-app data/slashit-app -type f ! -path '*/logs/*' ! -path '*/worktrees/*' -exec sha256sum {} + 2>/dev/null | LC_ALL=C sort); }
 legacy_run() { # BINARY_DIR STATE COMMIT SHA256

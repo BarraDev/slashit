@@ -165,6 +165,22 @@ enum Commands {
     /// The GUI confirms first when agents or terminals are still running; a
     /// daemon drains them within its grace period.
     Quit,
+    /// Close admission on the running instance and report the work a restart
+    /// would interrupt. Admission stays closed until `resume` with the same
+    /// operation. The reply prints the operation; without --operation a fresh
+    /// one is generated.
+    Quiesce {
+        /// Operation id that owns the quiesce (1 to 64 letters, digits or hyphens)
+        #[arg(long)]
+        operation: Option<String>,
+    },
+    /// Reopen admission closed by `quiesce` for the same operation. Refused
+    /// for any other operation, and never reopens a shutdown.
+    Resume {
+        /// The operation id the quiesce printed
+        #[arg(long)]
+        operation: String,
+    },
     /// Report which instance is answering, and on which endpoint
     Ping,
     /// Show every feature flag with the value in force and where it came from
@@ -235,6 +251,13 @@ async fn main() -> Result<()> {
         return daemon_status(&options, cli.json).await;
     }
     let request = request_for(&cli.command)?;
+    if let IpcRequest::Quiesce { operation } = &request {
+        // Printed before the send: if the reply is lost after the instance
+        // closed admission, this is the only way to name the operation to resume.
+        eprintln!(
+            "quiesce operation: {operation} (reopen with: slashit resume --operation {operation})"
+        );
+    }
 
     let response = slashit_ipc::client::send(&request, &options).await?;
 
@@ -252,7 +275,9 @@ async fn main() -> Result<()> {
     // Format output based on command type
     match &cli.command {
         // The record is JSON by nature; there is no table form.
-        Commands::Inspect { .. } => println!("{}", serde_json::to_string_pretty(&response.data)?),
+        Commands::Inspect { .. } | Commands::Quiesce { .. } | Commands::Resume { .. } => {
+            println!("{}", serde_json::to_string_pretty(&response.data)?)
+        }
         Commands::Status => output::print_status(&response.data),
         Commands::Projects => output::print_projects(&response.data),
         Commands::Tasks { .. } => output::print_tasks(&response.data),
@@ -281,6 +306,16 @@ async fn main() -> Result<()> {
 /// made absolute here.
 fn absolute_path(path: &std::path::Path) -> Result<String> {
     Ok(std::path::absolute(path)?.to_string_lossy().into_owned())
+}
+
+/// A quiesce operation id for a `quiesce` run without --operation. It is unique
+/// per process and time, and well inside the 64-character limit.
+fn generated_operation_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    format!("cli-{}-{nanos:x}", std::process::id())
 }
 
 /// The request a command sends to the running instance. `main` answers the
@@ -348,6 +383,12 @@ fn request_for(command: &Commands) -> Result<IpcRequest> {
         Commands::Terminals => IpcRequest::ListTerminals,
         Commands::Show => IpcRequest::Show,
         Commands::Quit => IpcRequest::Quit,
+        Commands::Quiesce { operation } => IpcRequest::Quiesce {
+            operation: operation.clone().unwrap_or_else(generated_operation_id),
+        },
+        Commands::Resume { operation } => IpcRequest::Resume {
+            operation: operation.clone(),
+        },
         Commands::Ping => IpcRequest::Ping,
         Commands::Features => IpcRequest::Features,
         Commands::Export { project, path } => IpcRequest::ExportProject {
@@ -365,42 +406,6 @@ fn request_for(command: &Commands) -> Result<IpcRequest> {
             anyhow::bail!("daemon status is answered by `main`, not sent as a request")
         }
     })
-}
-
-#[cfg(test)]
-mod dispatch_tests {
-    use super::*;
-
-    const TASK: &str = "6f96fefa-0000-0000-0000-000000000003";
-
-    fn request_for_args(args: &[&str]) -> IpcRequest {
-        let cli = Cli::try_parse_from(args).expect("the arguments parse");
-        request_for(&cli.command).expect("the command maps to a request")
-    }
-
-    /// `slashit runs` reaches the evidence verb, and only that verb: it must
-    /// not fall through to the full Task record `inspect` asks for.
-    #[test]
-    fn runs_sends_the_read_only_evidence_request() {
-        match request_for_args(&["slashit", "runs", TASK]) {
-            IpcRequest::GetTaskEvidence { task_id } => assert_eq!(task_id, TASK),
-            other => panic!("runs mapped to {other:?}"),
-        }
-    }
-
-    #[test]
-    fn inspect_still_sends_the_full_task_record_request() {
-        match request_for_args(&["slashit", "inspect", TASK]) {
-            IpcRequest::GetTask { task_id } => assert_eq!(task_id, TASK),
-            other => panic!("inspect mapped to {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_daemon_command_is_not_a_request() {
-        let cli = Cli::try_parse_from(["slashit", "daemon", "status"]).expect("parses");
-        assert!(request_for(&cli.command).is_err());
-    }
 }
 
 /// Answer "is a daemon running?" with an exit status a script can branch on.
@@ -468,5 +473,41 @@ fn report_no_daemon(json: bool, reason: &str, endpoint: &str) {
     } else {
         println!("No daemon is answering on {endpoint}.");
         eprintln!("{reason}");
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    const TASK: &str = "6f96fefa-0000-0000-0000-000000000003";
+
+    fn request_for_args(args: &[&str]) -> IpcRequest {
+        let cli = Cli::try_parse_from(args).expect("the arguments parse");
+        request_for(&cli.command).expect("the command maps to a request")
+    }
+
+    /// `slashit runs` reaches the evidence verb, and only that verb: it must
+    /// not fall through to the full Task record `inspect` asks for.
+    #[test]
+    fn runs_sends_the_read_only_evidence_request() {
+        match request_for_args(&["slashit", "runs", TASK]) {
+            IpcRequest::GetTaskEvidence { task_id } => assert_eq!(task_id, TASK),
+            other => panic!("runs mapped to {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_still_sends_the_full_task_record_request() {
+        match request_for_args(&["slashit", "inspect", TASK]) {
+            IpcRequest::GetTask { task_id } => assert_eq!(task_id, TASK),
+            other => panic!("inspect mapped to {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_daemon_command_is_not_a_request() {
+        let cli = Cli::try_parse_from(["slashit", "daemon", "status"]).expect("parses");
+        assert!(request_for(&cli.command).is_err());
     }
 }

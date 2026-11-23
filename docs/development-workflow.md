@@ -1350,6 +1350,90 @@ Three build modes exist. They do not share a binary path:
   and `verify`. Check the persisted Task and Project records, and confirm the
   webview renders by looking at the window. Enabling autostart is a separate
   owner decision.
+- **Quiesce ownership.** A restart closes admission with an operation id it
+  generates (`sup-<pid>-<uuid>`) and reopens admission only for that id. A
+  refused quiesce is reported with its reason (`shutdown` or `held`); the
+  restart stops nothing and does not reopen the fence, because it never took
+  it. A lost reply is treated as possibly taken, and only that operation is
+  reopened. If a restart is killed after its quiesce was acknowledged, the
+  instance refuses new work until it is stopped or resumed. No deadline is
+  applied: the state is fail-closed and a cooperative stop still works. The
+  operation id is written to `supervisor/quiesce` before the request is sent,
+  so the operator can recover from it; the procedure is in
+  "Abrupt interruption" below.
+- **Abrupt interruption (SIGKILL, power loss, a crashed terminal).** A killed
+  supervisor runs no cleanup, so admission can stay closed. Nothing reopens it
+  on its own, and that is intended.
+  - *Find the hold:* `scripts/supervise-dogfood.sh activity`. Exit 1 with
+    `admission-quiesce:<operation>` means the record names the verified
+    instance. `scripts/refresh-dogfood.sh --check` prints the same line. The
+    record itself is `supervisor/quiesce` (owner-only): `operation`, `state`
+    (`requested` means the request was written; the instance may not have
+    closed admission), `pid`, `endpoint` and `recorded_at`. The instance does
+    not report its admission state, so the record is the only evidence and
+    `activity` treats a matching record as held.
+  - *Confirm the instance:* `scripts/supervise-dogfood.sh verify`, then compare
+    its answering pid with `pid` in the record. A stale record names a pid that
+    no longer serves the endpoint (`activity` reports it as stale and not
+    held). It grants nothing; the instance was started after that quiesce.
+  - *Decide:* if the verified instance is the recorded pid and its work is what
+    you expect, reopen admission: `scripts/supervise-dogfood.sh resume-quiesce`.
+    It sends only the recorded id, and reports one of these outcomes:
+    `admission reopened` (run `activity` again; exit 0 means idle); `does not
+    hold admission` (that operation holds nothing; admission is unchanged, and
+    a restart that still reports `held by another quiesce operation` is held
+    by someone else, so use the stop-and-start path); `shutdown` (a shutdown
+    fence holds admission closed and is never reopened: wait for it to finish,
+    then start again); `could not be confirmed` (the record is kept; retry
+    when the endpoint answers). If the instance is unverified, does not answer
+    or you cannot tell who holds the quiesce, stop and start instead:
+    `scripts/supervise-dogfood.sh stop`, then `start`. A graceful stop is
+    allowed under a quiesce, and the new instance starts with admission open.
+  - *Never:* delete `supervisor/quiesce` to clear a hold (the record is the
+    only record of the id, and the instance is the only proof the hold is gone);
+    edit it to another id; pass an id that you did not read from the record and
+    match to the verified pid; run `stop --force`, `restart --force` or `kill`
+    against a live instance to get past a hold (the hold is a fence, not a
+    failure to clear); start a second instance while one answers; or remove any
+    recovery or backup directory.
+  - *A restart refuses while the record names the live pid:* it refuses before
+    it quiesces or stops anything, forced or not, and does not overwrite the
+    record. Run `resume-quiesce` first. A record for another pid does not block
+    a restart; that restart replaces it.
+- **Recovery copies.** An interrupted or divergent restart keeps the executable
+  it captured under `~/.local/state/slashit-dogfood/supervisor/recover/`
+  (`slashit-ui` and `slashit-ui.frontend`). Discover it with
+  `scripts/refresh-dogfood.sh --check`, `scripts/supervise-dogfood.sh activity`
+  or `ls -la ~/.local/state/slashit-dogfood/supervisor/recover`. While it
+  exists, every restart refuses, forced or not, before it quiesces or stops
+  anything, and nothing overwrites or deletes it.
+  - *Identity:* `sha256sum recover/slashit-ui` and `grep '^commit=' recover/slashit-ui.frontend`.
+    Compare them with `supervisor/instance` (its `sha256` and `commit` fields)
+    and `supervisor/state-writer`.
+  - *Provenance:* the frontend sidecar must say `mode=embedded` and `dirty=no`,
+    and its commit must be the one the state writer records or a descendant of
+    the one it records.
+  - *Backup:* a divergent restart names its backup under
+    `supervisor/backup/<stamp>/`. Compare `manifest.sha256` with the copy
+    listed in the refusal before you decide anything.
+  - *Still required when:* the instance is stopped and no start has succeeded
+    since the copy was made; or the running build is not verified; or the
+    state differs from the backup and the difference is not yet explained.
+  - *No longer required when:* `scripts/supervise-dogfood.sh verify` and
+    `status` show a verified instance running a build that descends from the
+    copy's commit, and any state difference has been reviewed and accepted.
+  - *Archive, never delete:* hold the lifecycle lock for the whole move, so no
+    start, stop or restart can run between the check and the move. A separate
+    `flock ... true` releases the lock before the move and protects nothing.
+    Run this in one shell, from the state directory, with `set -eu` so any
+    failure stops the move:
+    `(set -eu; flock -n 9 || { echo "a lifecycle operation is running" >&2; exit 1; }; S=~/.local/state/slashit-dogfood/supervisor; mkdir -p "$S/recover-archive"; D="$S/recover-archive/$(date -u +%Y%m%dT%H%M%SZ)-$$"; mkdir "$D"; mv -T "$S/recover" "$D/recover") 9>~/.local/state/slashit-dogfood/supervisor/lifecycle.lock`.
+    The `mkdir "$D"` (no `-p`) fails if the archive name already exists, and
+    `mv -T` never moves the directory into an existing one, so nothing is
+    overwritten.
+  - *Restarting again is allowed when:* `supervisor/recover` is absent or empty,
+    `activity` exits 0, and no other quiesce operation holds admission.
+  - Do not remove the recovery directory or any backup directory with `rm`.
 
 ### Optional systemd user unit
 

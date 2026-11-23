@@ -9,12 +9,13 @@
 //! type at all: it is the same code in both processes.
 
 use slashit_ipc::{
-    AppStatus, InstanceInfo, IpcRequest, IpcResponse, ProjectSummary, QueueStatusInfo, TaskSummary,
-    TerminalSummary, PROTOCOL_VERSION,
+    AppStatus, InstanceInfo, IpcRequest, IpcResponse, ProjectSummary, QueueStatusInfo, QuiesceInfo,
+    TaskSummary, TerminalSummary, PROTOCOL_VERSION,
 };
 use uuid::Uuid;
 
 use crate::domain::{TaskPriority, TaskStatus};
+use crate::queue::executor::{QuiesceRefusal, ResumeRefusal};
 
 use super::server::{IpcContext, PeerContext};
 
@@ -96,6 +97,8 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
         IpcRequest::ListTerminals => Dispatch::reply(handle_list_terminals(ctx).await),
         IpcRequest::Show => Dispatch::reply(handle_show(ctx)),
         IpcRequest::Quit => handle_quit(),
+        IpcRequest::Quiesce { operation } => Dispatch::reply(handle_quiesce(ctx, operation).await),
+        IpcRequest::Resume { operation } => Dispatch::reply(handle_resume(ctx, operation)),
         IpcRequest::Features => Dispatch::reply(handle_features(ctx).await),
         IpcRequest::Ping => Dispatch::reply(handle_ping(ctx, peer)),
         IpcRequest::ExportProject { project_id, path } => {
@@ -149,6 +152,10 @@ async fn handle_apply_import(ctx: &IpcContext, path: String, checksum: String) -
 }
 
 async fn handle_status(ctx: &IpcContext) -> IpcResponse {
+    IpcResponse::success(serde_json::to_value(app_status(ctx).await).unwrap_or_default())
+}
+
+async fn app_status(ctx: &IpcContext) -> AppStatus {
     let active_terminals = ctx.pty.sessions.lock().await.len();
 
     let executor = ctx.executor.get().map(|executor| executor.as_ref());
@@ -159,14 +166,75 @@ async fn handle_status(ctx: &IpcContext) -> IpcResponse {
     let queued_tasks = queue_mgr.get_queued_tasks().await.len();
     let in_progress_tasks = queue_mgr.get_in_progress_count().await;
 
-    let status = AppStatus {
+    AppStatus {
         active_terminals,
         running_agents,
         queued_tasks,
         in_progress_tasks,
-    };
+    }
+}
 
-    IpcResponse::success(serde_json::to_value(status).unwrap_or_default())
+/// Close admission for `operation`, then read every count a restart would
+/// interrupt. The admission close comes first: a count read before it could be
+/// overtaken by a start admitted after it. A refusal is a reply, not an error,
+/// so the caller can tell "not acquired" from "unknown"; it names the reason
+/// but never the holder. A busy answer is not a refusal: the caller sends
+/// `Resume` with the same operation.
+async fn handle_quiesce(ctx: &IpcContext, operation: String) -> IpcResponse {
+    if !slashit_ipc::is_valid_operation_id(&operation) {
+        return IpcResponse::error("A quiesce operation id is 1 to 64 letters, digits or hyphens.");
+    }
+    let Some(executor) = ctx.executor.get().map(|executor| executor.as_ref()) else {
+        return IpcResponse::error(
+            "This instance has no task executor, so admission cannot be quiesced.",
+        );
+    };
+    let admitting = match executor.quiesce_admission(&operation) {
+        Ok(admitting) => admitting,
+        Err(QuiesceRefusal::Shutdown) => {
+            return IpcResponse::success(serde_json::json!({
+                "acquired": false, "operation": operation, "refusal": "shutdown"
+            }))
+        }
+        Err(QuiesceRefusal::Held) => {
+            return IpcResponse::success(serde_json::json!({
+                "acquired": false, "operation": operation, "refusal": "held"
+            }))
+        }
+    };
+    let owned_work = executor.running_task_count().await + executor.active_project_run_count();
+    let info = QuiesceInfo {
+        acquired: true,
+        operation,
+        admitting,
+        owned_work,
+        status: app_status(ctx).await,
+    };
+    IpcResponse::success(serde_json::to_value(info).unwrap_or_default())
+}
+
+/// Reopen admission only for `operation`. A refusal is a reply that names the
+/// reason, so a caller that never held the fence learns that and reopens nothing.
+fn handle_resume(ctx: &IpcContext, operation: String) -> IpcResponse {
+    if !slashit_ipc::is_valid_operation_id(&operation) {
+        return IpcResponse::error("A resume operation id is 1 to 64 letters, digits or hyphens.");
+    }
+    let Some(executor) = ctx.executor.get().map(|executor| executor.as_ref()) else {
+        return IpcResponse::error(
+            "This instance has no task executor, so there is nothing to resume.",
+        );
+    };
+    match executor.resume_admission(&operation) {
+        Ok(()) => {
+            IpcResponse::success(serde_json::json!({"resumed": true, "operation": operation}))
+        }
+        Err(ResumeRefusal::Shutdown) => IpcResponse::success(serde_json::json!({
+            "resumed": false, "operation": operation, "refusal": "shutdown"
+        })),
+        Err(ResumeRefusal::NotHeld) => IpcResponse::success(serde_json::json!({
+            "resumed": false, "operation": operation, "refusal": "not-held"
+        })),
+    }
 }
 
 async fn handle_list_projects(ctx: &IpcContext) -> IpcResponse {
@@ -1656,6 +1724,7 @@ fn handle_ping(ctx: &IpcContext, peer: &PeerContext) -> IpcResponse {
         protocol_version: PROTOCOL_VERSION,
         pid: std::process::id(),
         endpoint: peer.endpoint.to_string(),
+        admission_control: true,
     };
     IpcResponse::success(serde_json::to_value(info).unwrap_or_default())
 }
