@@ -34,21 +34,25 @@ pub fn parse(input: &str) -> Result<TaskRef, String> {
     if is_full_uuid(&lower) {
         return Ok(TaskRef::Full(lower));
     }
-    // Dashes are allowed so a prefix may be copied from a longer UUID.
-    if lower.is_empty() || !lower.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+    // A prefix copied from a UUID may keep its dashes, but only where a UUID has them.
+    let dashes_ok = lower
+        .char_indices()
+        .all(|(i, c)| c != '-' || matches!(i, 8 | 13 | 18 | 23));
+    let hex: String = lower.chars().filter(|c| *c != '-').collect();
+    if hex.is_empty() || !dashes_ok || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
             "'{input}' is not a Task ID: use a full UUID or a hexadecimal prefix of at least {MIN_PREFIX_LEN} characters"
         ));
     }
-    if lower.len() < MIN_PREFIX_LEN {
+    if hex.len() < MIN_PREFIX_LEN {
         return Err(format!(
             "'{input}' is too short: a Task ID prefix needs at least {MIN_PREFIX_LEN} characters"
         ));
     }
-    if lower.len() >= 36 {
+    if hex.len() >= 32 {
         return Err(format!("'{input}' is not a Task ID: it is longer than a UUID or malformed"));
     }
-    Ok(TaskRef::Prefix(lower))
+    Ok(TaskRef::Prefix(hex))
 }
 
 /// Turns a valid prefix into the one full Task ID it names.
@@ -60,7 +64,7 @@ pub fn resolve_prefix(prefix: &str, tasks: &Value) -> Result<String, String> {
         .filter(|t| {
             t["id"]
                 .as_str()
-                .is_some_and(|id| id.to_ascii_lowercase().starts_with(prefix))
+                .is_some_and(|id| id.replace('-', "").to_ascii_lowercase().starts_with(prefix))
         })
         .collect();
     match matches.as_slice() {
@@ -129,6 +133,17 @@ mod tests {
         let err = resolve_prefix("aaaaaaaa", &tasks()).unwrap_err();
         assert!(err.contains("matches 2 Tasks"));
         assert!(err.contains("two") && err.contains("three"));
-        assert!(resolve_prefix("aaaaaaaa-1", &tasks()).is_ok());
+        let TaskRef::Prefix(p) = parse("aaaaaaaa-1").unwrap() else { panic!() };
+        assert!(resolve_prefix(&p, &tasks()).is_ok());
+    }
+
+    #[test]
+    fn long_prefixes_match_with_or_without_dashes() {
+        for input in ["6F96FEFA-0000-4", "6f96fefa00004", "6f96fefa-0000-4000-8000-00000000000"] {
+            let TaskRef::Prefix(p) = parse(input).unwrap() else { panic!("{input}") };
+            assert_eq!(resolve_prefix(&p, &tasks()).unwrap(), FULL, "{input}");
+        }
+        assert!(parse("6f96fefa-00-00").is_err());
+        assert!(parse("6f96fefa0000400080000000000000031").is_err());
     }
 }

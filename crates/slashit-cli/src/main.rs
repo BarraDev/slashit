@@ -551,6 +551,18 @@ mod dispatch_tests {
         request_for(&cli.command).expect("the command maps to a request")
     }
 
+    /// Every Task reference a command carries, dependencies included, is
+    /// offered for prefix resolution; commands without one offer none.
+    #[test]
+    fn task_refs_cover_ids_and_dependencies() {
+        let mut cli = Cli::try_parse_from(["slashit", "set-dependencies", "aaaaaaaa", "bbbbbbbb"])
+            .expect("the arguments parse");
+        let refs: Vec<String> = task_refs(&mut cli.command).into_iter().map(|r| r.clone()).collect();
+        assert_eq!(refs, ["aaaaaaaa", "bbbbbbbb"]);
+        let mut cli = Cli::try_parse_from(["slashit", "inspect", "aaaaaaaa"]).unwrap();
+        assert_eq!(task_refs(&mut cli.command).len(), 1);
+    }
+
     /// `slashit runs` reaches the evidence verb, and only that verb: it must
     /// not fall through to the full Task record `inspect` asks for.
     #[test]

@@ -752,8 +752,6 @@ fn TaskSummary(task: Task) -> impl IntoView {
         <section class="space-y-2 text-sm">
             {task.description.clone().filter(|d| !d.trim().is_empty()).map(|d| {
                 let expanded = RwSignal::new(false);
-                // Only a long description needs the control; a short one fits already.
-                let long = d.lines().count() > 6 || d.chars().count() > 400;
                 view! {
                     <div>
                         <p
@@ -764,7 +762,7 @@ fn TaskSummary(task: Task) -> impl IntoView {
                                 "text-white/60 whitespace-pre-wrap break-words line-clamp-6"
                             }
                         >{d}</p>
-                        {long.then(|| view! {
+                        {view! {
                             <button
                                 type="button"
                                 data-testid="task-drawer-description-toggle"
@@ -774,7 +772,7 @@ fn TaskSummary(task: Task) -> impl IntoView {
                             >
                                 {move || if expanded.get() { "Show less" } else { "Show full description" }}
                             </button>
-                        })}
+                        }}
                     </div>
                 }
             })}
