@@ -83,6 +83,66 @@ reply. The provider and harness overhead is unknown; the 40,000 figure is a
 placeholder, not a measurement. Nothing here claims a token saving or a
 provider-window guarantee.
 
+### Required and optional content
+
+Required, never dropped or silently shortened: the system prompt, the output
+contract, the output schema, the envelope, the Project identity,
+`history_semantics`, the current Human message (or the returned action of a
+continuation), structural metadata and the read reserve.
+
+Optional, filled in this order with what remains: open-proposal references, then
+Task index entries, then recent history. The maxima of 20 proposals and 40 Task
+index entries are not allocations, and history has no fixed entry count: it
+takes as many of the newest entries as fit. Under pressure the Builder includes
+fewer, keeps the totals accurate and says what was left out. A full proposal
+block or Task index that does not fit never fails a turn.
+
+### Ceilings and markers
+
+Every historical text field has a stable ceiling that always applies, so an
+entry renders the same whatever other entries exist: message 4,000, request
+3,000, explanation 2,000, target title 500, Worker result 3,000, failure
+message 1,000, refusal reason 1,000. A field above its ceiling is cut on a scalar
+boundary, keeping a head (two thirds) and a tail (one third) with an inline
+marker that names the omitted count, `original_chars` and the record id. Markers
+count in the budget. `returned_action` fields of a continuation use the same
+ceilings; previously they were uncapped.
+
+When the history that survives its ceilings does not fit, only evidence is
+shortened further: Worker results and failure messages, oldest first, to 1,000
+characters. Human messages and decision entries are never cut below their
+ceilings. If it still does not fit, the oldest entries are omitted and the
+newest kept.
+
+Each history entry carries `entry_id` and `created_at`. `history_omitted` is
+present only when a projectable entry is not shown because of the budget. It
+gives the count, the first and last omitted `created_at` and counts by kind.
+Included plus omitted entries equal the projectable entries. Entries whose
+action record is missing were never projectable and are not counted.
+
+### Open proposals
+
+`open_proposals` is built from the Conversation's `project_actions` whose status
+is `Proposed`, not from history position, so a proposal older than the entries
+shown in history is present. Each reference has `action_id`, `kind`, the target
+Task id where there is one, the status read from the record at build time,
+`created_at` and a summary of at most 400 characters. The list is newest first,
+at most 20. `open_proposals_total`, `open_proposals_omitted` and, when any are
+omitted, `open_proposals_oldest_omitted_created_at` are always accurate, whether
+the omission comes from the cap of 20 or from budget pressure.
+
+What the model sees does not change what the Human can decide: the decision path
+reads the same records and is untouched, so a proposal left out of the block can
+still be approved or rejected.
+
+### Task index
+
+The index keeps its order (Backlog position, then id), `tasks_total` and
+`tasks_truncated`. It adds `tasks_included`. Titles are clipped to 200
+characters with a marker. Under pressure fewer than 40 entries are shown, and
+`tasks_truncated` is true whenever any Task is not shown. The Coordinator pages
+with `list_tasks` from offset `tasks_included`.
+
 ### Read caps
 
 A read result is at most the per-read cap once serialized. A larger result gains
