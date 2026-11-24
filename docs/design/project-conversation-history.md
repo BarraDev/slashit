@@ -1,6 +1,8 @@
 # Project Conversation: continuous history and bounded context
 
-Status: direction recorded; the sections "Layers", "Minimal roadmap", "Small UX
+Status: direction recorded. The deterministic, budgeted Context Builder (roadmap
+step 1) is implemented and described in
+[context-management.md](context-management.md); the sections "Layers", "Minimal roadmap", "Small UX
 improvements" and "Open decisions" are proposals, and nothing here is implemented beyond what
 [agent-runtime-and-conversations.md](agent-runtime-and-conversations.md)
 already describes. Vocabulary follows
@@ -72,22 +74,26 @@ behavior.
 
 ## Confirmed limits of the current projection
 
-`Conversation::coordinator_projection_before` builds the context for an
-ordinary Human turn; the Worker-result continuation reuses its
-`recent_history` and assembles the rest separately. Observed limits:
+These limits describe the projection before the Context Builder
+([context-management.md](context-management.md)). Items 1, 2, 4, 5, 6 and 8 are
+addressed by it, as marked below; item 3 is not. The current Human message is
+not cut in the projection, but `Conversation::validate_text` bounds it to
+`MESSAGE_LIMIT` (16,000 bytes) when it is sent. Original limits:
 
-1. **Fixed count window.** The last `PROJECTION_MESSAGE_COUNT` (16) entries are
+1. **Fixed count window.** (Implemented: 16 remains a maximum, now bounded by a
+   character budget.) The last `PROJECTION_MESSAGE_COUNT` (16) entries are
    projected. The count applies after entries that cannot be projected are
    dropped, and proposals, decisions, Worker starts and results each take a
    slot, so 16 is far fewer than 16 conversational turns once Task work
    happens. Selection is purely positional.
-2. **No omission signal.** The model is not told that older history exists, how
+2. **No omission signal.** (Implemented: `history_omitted`.) The model is not told that older history exists, how
    much was left out, or what period the window covers. It cannot distinguish
    "nothing earlier" from "earlier discussion exists".
 3. **No retrieval.** The Coordinator's lookups cover Tasks, Task activity, pull
    requests and the Project. None reads older Conversation entries, so anything
    outside the window is unreachable.
-4. **Silent per-entry truncation, no total budget.** Text is cut per entry
+4. **Silent per-entry truncation, no total budget.** (Implemented: marked
+   ceilings and a total budget.) Text is cut per entry
    (4,000 characters for messages, 3,000 for requests and Worker results, 2,000
    for action explanations, 1,000 for failures and Task-action refusal reasons,
    500 for action target titles, and 1,500 for Task-action summaries) with no
@@ -95,11 +101,11 @@ ordinary Human turn; the Worker-result continuation reuses its
    product of the entry count and the per-entry caps. The prompt travels over
    stdin, so the operating system argument limit is not the constraint; the
    provider's context window and cost are.
-5. **Task index is arbitrary and unmarked.** At most `TASK_INDEX_LIMIT` (40)
-   Tasks, sorted by random id rather than status or recency, with no total or
-   truncated flag. `ListTasks` can page, but the model is not told the index is
-   partial.
-6. **Two assembly sites.** The send path and the Worker-result continuation
+5. **Task index.** The index was already ordered by Backlog position then id,
+   with `tasks_total` and `tasks_truncated`. It is now also bounded by the
+   budget, titles are clipped with a marker, and `tasks_included` says how many
+   are shown.
+6. **Two assembly sites.** (Implemented: one Builder.) The send path and the Worker-result continuation
    each compose their context. Any budget, marker or summary has to be added to
    both or they will drift.
 7. **Whole-document storage and transport.** All entries live in one
@@ -107,7 +113,8 @@ ordinary Human turn; the Worker-result continuation reuses its
    full for every command. The snapshot returned to the UI carries the entire
    Conversation. Cost grows linearly with history, and the UI renders every
    entry.
-8. **Unused timestamps.** Entries carry `created_at`, but neither the
+8. **Unused timestamps.** (Implemented in the projection: each history entry
+   carries `entry_id` and `created_at`.) Entries carry `created_at`, but neither the
    projection nor the UI uses it.
 
 Not limits: the single-Conversation lock model, delete-with-Project recovery,
@@ -121,10 +128,12 @@ on evidence from the one before it. None changes the authoritative history.
 0. **Measure.** Record, locally and without content, entries per Conversation,
    document size, save latency, and projection size per Run. Decide from real
    data whether steps 3 and 4 are needed and at what size.
-1. **Honest window.** Keep the same recency selection, but select by an
+1. **Honest window.** (Implemented; see [context-management.md](context-management.md).)
+   Keep the same recency selection, but select by an
    explicit character budget instead of an entry count, tell the model how many
    earlier entries were omitted and the time span covered, and mark truncated
-   text. Give the Task index a stable order and a total/truncated flag. Build
+   text. The Task index has a stable order (done) and a total/truncated flag
+   (done). Build
    both assembly sites from one function. No storage change.
 2. **Explicit history retrieval.** Add a read-only lookup to the existing
    lookup set: a bounded page of earlier entries before a given point, with the
@@ -163,8 +172,8 @@ Frontend-only and independent of the steps above, in rough priority:
 - What a "fresh chapter" means: only a navigation marker, or also a reset of
   the model's context; and whether earlier chapters stay retrievable by the
   Coordinator by default.
-- The budget unit (characters or provider tokens, which SlashIt cannot count
-  portably today) and its target size.
+- The budget's target size. The unit is decided: logical characters (see
+  [context-management.md](context-management.md)); the value is experimental.
 - Who authors summaries (model, Human-edited, or both), how they are labeled,
   and whether a Human can pin notes the Coordinator always receives.
 - What retrieval may return: Conversation messages only, or also Worker results

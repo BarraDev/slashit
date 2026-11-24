@@ -27,6 +27,7 @@ pub mod pr_status;
 pub mod lifecycle;
 pub mod conversation_actions;
 pub mod conversation_executions;
+pub mod conversation_context;
 pub mod coordinator_reads;
 pub mod app_core;
 /// Headless execution, sharing the whole stack with the GUI.
