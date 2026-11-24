@@ -162,9 +162,12 @@ If the required content alone does not fit, the Builder returns
 sizes. On an ordinary turn the Human message stays saved and unmodified, no
 provider starts, and a non-retryable `RunFailed` entry says the message and
 required context exceed the context budget and asks for a shorter request. A
-later, smaller message is answered normally. Through the send command this is
-unreachable with the default budget, because `validate_text` already rejects a
-message above 16,000 bytes; it is exercised with an injected smaller budget.
+later, smaller message is answered normally. The send command can reach this
+with the default budget: `validate_text` accepts a message of up to 16,000
+bytes, but JSON escaping can expand it, since each U+0001 becomes six characters.
+Sixteen thousand U+0001 characters serialize to 96,000 characters, over the
+64,000 default, so the refusal is covered by a regression test at the default
+budget as well as by an injected smaller budget.
 On a continuation the error is the existing retryable continuation error: the
 Worker result stays unmediated and Retry is offered again. A follow-up
 invocation that would exceed the total is an ordinary retryable turn failure.

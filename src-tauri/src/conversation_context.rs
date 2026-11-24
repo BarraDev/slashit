@@ -323,14 +323,39 @@ struct HistoryOmitted {
     by_kind: BTreeMap<&'static str, usize>,
 }
 
-fn omission(omitted: &[Rendered]) -> Option<HistoryOmitted> {
-    let first = omitted.iter().map(|item| item.entry.created_at).min()?;
-    let last = omitted.iter().map(|item| item.entry.created_at).max()?;
-    let mut by_kind = BTreeMap::new();
-    for item in omitted {
-        *by_kind.entry(item.kind).or_insert(0) += 1;
+/// The omission summary of a history prefix, extended one entry at a time so
+/// the selection never rescans the prefix it has already summarized.
+#[derive(Default)]
+struct OmissionTally {
+    count: usize,
+    first: Option<DateTime<Utc>>,
+    last: Option<DateTime<Utc>>,
+    by_kind: BTreeMap<&'static str, usize>,
+}
+
+impl OmissionTally {
+    fn add(&mut self, item: &Rendered) {
+        let at = item.entry.created_at;
+        self.count += 1;
+        self.first = Some(self.first.map_or(at, |first| first.min(at)));
+        self.last = Some(self.last.map_or(at, |last| last.max(at)));
+        *self.by_kind.entry(item.kind).or_insert(0) += 1;
     }
-    Some(HistoryOmitted { count: omitted.len(), first_created_at: first, last_created_at: last, by_kind })
+
+    fn summary(&self) -> Option<HistoryOmitted> {
+        Some(HistoryOmitted {
+            count: self.count,
+            first_created_at: self.first?,
+            last_created_at: self.last?,
+            by_kind: self.by_kind.clone(),
+        })
+    }
+}
+
+fn omission(omitted: &[Rendered]) -> Option<HistoryOmitted> {
+    let mut tally = OmissionTally::default();
+    omitted.iter().for_each(|item| tally.add(item));
+    tally.summary()
 }
 
 #[derive(Serialize)]
@@ -402,6 +427,19 @@ impl Frame<'_> {
             current_message: self.current_message,
         };
         serde_json::to_string(&projection).expect("a projection of JSON values serializes")
+    }
+
+    /// The length `render` would return, without serializing the history. `history`
+    /// is the characters and count of the included entries; the empty array already
+    /// in the base is the `[]` of an empty history.
+    fn projected_chars(&self, proposals: usize, tasks: usize, omitted: Option<&HistoryOmitted>, history: (usize, usize)) -> usize {
+        let (history_chars, count) = history;
+        let base = chars(&self.render(proposals, tasks, &[], omitted));
+        if count == 0 {
+            base
+        } else {
+            base + history_chars + count - 1
+        }
     }
 }
 
@@ -492,13 +530,17 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
         current_message: message,
     };
     let overhead = request.fixed_chars + request.read_reserve_chars;
-    let fits = |text: &str| overhead + chars(text) <= request.budget.total_chars;
+    let fits = |len: usize| overhead + len <= request.budget.total_chars;
+    let mut history_chars: usize = all.iter().map(|item| chars(&item.value.to_string())).sum();
+    let all_omitted = omission(&all);
 
-    // Required content alone, with everything optional left out.
-    let skeleton = frame.render(0, 0, &[], omission(&all).as_ref());
-    if !fits(&skeleton) {
+    // Required content alone, with every entry omitted and nothing optional. A
+    // complete history that fits is accepted even when this skeleton does not,
+    // since the omission summary can make the skeleton the longer of the two.
+    let skeleton_chars = frame.projected_chars(0, 0, all_omitted.as_ref(), (0, 0));
+    if !fits(skeleton_chars) && !fits(frame.projected_chars(0, 0, None, (history_chars, total_entries))) {
         let turn_chars = message.map_or_else(|| returned.as_ref().map_or(0, |value| chars(&value.to_string())), chars);
-        let structure_chars = chars(&skeleton).saturating_sub(turn_chars);
+        let structure_chars = skeleton_chars.saturating_sub(turn_chars);
         let mut parts = [
             (request.fixed_chars, "fixed_prompt"),
             (request.read_reserve_chars, "read_reserve"),
@@ -508,7 +550,7 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
         parts.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
         return Err(ContextError::RequiredExceedsBudget {
             component: parts[0].1,
-            required_chars: overhead + chars(&skeleton),
+            required_chars: overhead + skeleton_chars,
             budget_chars: request.budget.total_chars,
             fixed_chars: request.fixed_chars,
             read_reserve_chars: request.read_reserve_chars,
@@ -517,39 +559,43 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
         });
     }
 
-    let measure = |kp: usize, kt: usize, from: usize, all: &[Rendered]| {
-        frame.render(kp, kt, &all[from..], omission(&all[..from]).as_ref())
-    };
-
     // 1. open proposals, 2. Task index, 3. history; each with what remains.
     let mut kp = 0;
-    while kp < proposals.len() && fits(&measure(kp + 1, 0, total_entries, &all)) {
+    while kp < proposals.len() && fits(frame.projected_chars(kp + 1, 0, all_omitted.as_ref(), (0, 0))) {
         kp += 1;
     }
     let mut kt = 0;
-    while kt < clipped_tasks.len() && fits(&measure(kp, kt + 1, total_entries, &all)) {
+    while kt < clipped_tasks.len() && fits(frame.projected_chars(kp, kt + 1, all_omitted.as_ref(), (0, 0))) {
         kt += 1;
     }
     let mut from = 0;
-    if !fits(&measure(kp, kt, from, &all)) {
-        for index in 0..total_entries {
-            if !all[index].is_evidence() {
+    if !fits(frame.projected_chars(kp, kt, None, (history_chars, total_entries))) {
+        for item in all.iter_mut() {
+            if !item.is_evidence() {
                 continue;
             }
-            if let Some((_, value, shortened)) = describe(conversation, all[index].entry, true) {
-                all[index].value = value;
-                all[index].shortened = shortened;
+            if let Some((_, value, shortened)) = describe(conversation, item.entry, true) {
+                history_chars = history_chars - chars(&item.value.to_string()) + chars(&value.to_string());
+                item.value = value;
+                item.shortened = shortened;
             }
-            if fits(&measure(kp, kt, from, &all)) {
+            if fits(frame.projected_chars(kp, kt, None, (history_chars, total_entries))) {
                 break;
             }
         }
-        while from < total_entries && !fits(&measure(kp, kt, from, &all)) {
+        // The newest suffix that fits. Each prefix entry is summarized and measured once.
+        let mut prefix = OmissionTally::default();
+        let mut included_chars = history_chars;
+        let mut included = total_entries;
+        while from < total_entries && !fits(frame.projected_chars(kp, kt, prefix.summary().as_ref(), (included_chars, included))) {
+            prefix.add(&all[from]);
+            included_chars -= chars(&all[from].value.to_string());
+            included -= 1;
             from += 1;
         }
     }
 
-    let projection = measure(kp, kt, from, &all);
+    let projection = frame.render(kp, kt, &all[from..], omission(&all[..from]).as_ref());
     let omitted = omission(&all[..from]);
     let projection_chars = chars(&projection);
     let shortened_fields = all[from..].iter().map(|item| item.shortened).sum::<usize>()
@@ -1000,5 +1046,113 @@ mod tests {
         let built = build(&conversation, &big, &index, CONTEXT_BUDGET_CHARS);
         assert!(built.snapshot.used_chars <= CONTEXT_BUDGET_CHARS);
         assert!(built.snapshot.open_proposals_included <= 20 && built.snapshot.tasks_included <= 40);
+    }
+
+    fn stamp(conversation: &mut Conversation) {
+        for (index, entry) in conversation.entries.iter_mut().enumerate() {
+            entry.created_at = DateTime::<Utc>::from_timestamp(1_700_000_000 + index as i64, 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_default_budget_refuses_a_message_whose_json_escaping_exceeds_it() {
+        // A 16,000-byte message of U+0001 serializes as 96,000 characters, over the 64,000 default.
+        let conversation = Conversation::new(Uuid::new_v4());
+        let message = "\u{1}".repeat(16_000);
+        let error = build_coordinator_context(&request(&conversation, &message, &[], CONTEXT_BUDGET_CHARS))
+            .expect_err("the escaped message does not fit the default budget");
+        let ContextError::RequiredExceedsBudget { required_chars, budget_chars, .. } = &error;
+        assert_eq!(*budget_chars, CONTEXT_BUDGET_CHARS);
+        assert!(*required_chars > CONTEXT_BUDGET_CHARS);
+    }
+
+    #[test]
+    fn a_complete_projection_that_exactly_fits_the_budget_is_accepted() {
+        for entries in 1..=3 {
+            let mut conversation = Conversation::new(Uuid::new_v4());
+            for index in 0..entries {
+                message(&mut conversation, &format!("hello {index}"));
+            }
+            stamp(&mut conversation);
+            let complete = build(&conversation, "now", &[], CONTEXT_BUDGET_CHARS);
+            assert_eq!(complete.snapshot.omitted_count, 0);
+            let exact = complete.snapshot.projection_chars;
+            let fitted = build_coordinator_context(&request(&conversation, "now", &[], exact))
+                .expect("a complete projection that fits the budget is accepted");
+            assert_eq!(fitted.projection, complete.projection, "{entries} entries");
+        }
+    }
+
+    /// Pinned selection summaries: (seed, budget, projection chars, omitted, included, open proposals, tasks).
+    #[test]
+    fn selection_keeps_the_recorded_outputs() {
+        const RECORDED: &[(u64, usize, usize, usize, usize, usize, usize)] = &[
+            (1, 2000, 1890, 19, 0, 3, 1),
+            (1, 6000, 5733, 15, 4, 5, 3),
+            (1, 15000, 14590, 8, 11, 5, 3),
+            (1, 30000, 29950, 0, 19, 5, 3),
+            (1, 64000, 29950, 0, 19, 5, 3),
+            (2, 2000, 1955, 23, 0, 3, 2),
+            (2, 6000, 4182, 22, 1, 3, 3),
+            (2, 15000, 14408, 18, 5, 3, 3),
+            (2, 30000, 29748, 9, 14, 3, 3),
+            (2, 64000, 53214, 0, 23, 3, 3),
+            (3, 2000, 1501, 20, 0, 1, 3),
+            (3, 6000, 5770, 16, 4, 1, 3),
+            (3, 15000, 12095, 12, 8, 1, 3),
+            (3, 30000, 29586, 5, 15, 1, 3),
+            (3, 64000, 44278, 0, 20, 1, 3),
+            (7, 2000, 1958, 41, 0, 3, 2),
+            (7, 6000, 5852, 38, 3, 3, 3),
+            (7, 15000, 12083, 35, 6, 3, 3),
+            (7, 30000, 29533, 25, 16, 3, 3),
+            (7, 64000, 60474, 6, 35, 3, 3),
+            (11, 2000, 1890, 21, 0, 3, 1),
+            (11, 6000, 3419, 20, 1, 5, 3),
+            (11, 15000, 14672, 14, 7, 5, 3),
+            (11, 30000, 29999, 4, 17, 5, 3),
+            (11, 64000, 38448, 0, 21, 5, 3),
+            (23, 2000, 1794, 18, 0, 2, 3),
+            (23, 6000, 4029, 16, 2, 2, 3),
+            (23, 15000, 14744, 8, 10, 2, 3),
+            (23, 30000, 27632, 0, 18, 2, 3),
+            (23, 64000, 27632, 0, 18, 2, 3),
+            (40, 2000, 1937, 12, 0, 3, 2),
+            (40, 6000, 5727, 10, 2, 3, 3),
+            (40, 15000, 12202, 3, 9, 3, 3),
+            (40, 30000, 17911, 0, 12, 3, 3),
+            (40, 64000, 17911, 0, 12, 3, 3),
+        ];
+        for (seed, budget, chars, omitted, included, open, task_count) in RECORDED.iter().copied() {
+            let mut conversation = random_conversation(&mut Lcg(seed));
+            stamp(&mut conversation);
+            let index = tasks(3, "t");
+            let built = build_coordinator_context(&request(&conversation, "now", &index, budget)).expect("fits");
+            let snapshot = &built.snapshot;
+            assert_eq!(
+                (snapshot.projection_chars, snapshot.omitted_count, snapshot.included_entry_ids.len(), snapshot.open_proposals_included, snapshot.tasks_included),
+                (chars, omitted, included, open, task_count),
+                "seed {seed}, budget {budget}"
+            );
+        }
+    }
+
+    /// A large history: the newest suffix that fits is selected, with exact omission metadata.
+    /// Pins the output of a history long enough to make a per-entry rescan expensive.
+    #[test]
+    fn a_thousand_long_entries_select_the_recorded_newest_suffix() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        for index in 0..1_000 {
+            message(&mut conversation, &format!("{index:04}{}", "m".repeat(3_996)));
+        }
+        stamp(&mut conversation);
+        let built = build(&conversation, "now", &[], CONTEXT_BUDGET_CHARS);
+        let snapshot = &built.snapshot;
+        assert_eq!(
+            (snapshot.projection_chars, snapshot.omitted_count, snapshot.included_entry_ids.len()),
+            (62_708, 985, 15)
+        );
+        assert!(built.projection.contains("0999mmmm"), "the newest entry is kept");
+        assert!(!built.projection.contains("0984mmmm"), "the entry before the kept suffix is omitted");
     }
 }
