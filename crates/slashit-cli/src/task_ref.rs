@@ -49,6 +49,17 @@ pub fn parse(input: &str) -> Result<TaskRef, String> {
             "'{input}' is too short: a Task ID prefix needs at least {MIN_PREFIX_LEN} characters"
         ));
     }
+    if hex.len() == 32 && !lower.contains('-') {
+        // A complete UUID written without dashes: send the canonical form.
+        return Ok(TaskRef::Full(format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        )));
+    }
     if hex.len() >= 32 {
         return Err(format!("'{input}' is not a Task ID: it is longer than a UUID or malformed"));
     }
@@ -145,5 +156,16 @@ mod tests {
         }
         assert!(parse("6f96fefa-00-00").is_err());
         assert!(parse("6f96fefa0000400080000000000000031").is_err());
+    }
+
+    #[test]
+    fn undashed_32_hex_uuid_is_full_and_33_is_refused() {
+        let undashed = FULL.replace('-', "");
+        assert_eq!(undashed.len(), 32);
+        assert_eq!(parse(&undashed), Ok(TaskRef::Full(FULL.into())));
+        assert_eq!(parse(&undashed.to_uppercase()), Ok(TaskRef::Full(FULL.into())));
+        assert!(parse(&format!("{undashed}1")).is_err());
+        // 31 characters stay a prefix, so an ambiguous one is still refused.
+        assert!(matches!(parse(&undashed[..31]), Ok(TaskRef::Prefix(_))));
     }
 }
