@@ -685,21 +685,27 @@ mod tests {
         let mut big = task(project, &"t".repeat(TITLE_CHARS * 2), TaskStatus::Backlog, 0);
         big.description = Some("d".repeat(DESCRIPTION_CHARS + 50));
         big.error_message = Some("e".repeat(ERROR_CHARS * 3));
-        big.subtasks = (0..SUBTASKS_SHOWN + 5)
-            .map(|n| crate::domain::Subtask {
-                id: Uuid::new_v4(),
-                title: format!("s{n}"),
-                completed: false,
-            })
-            .collect();
         let id = big.id;
-        // The per-field limits, before the per-read cap (tested separately) applies.
-        let result = super::read_uncapped(&inspect(id), project, &store(vec![big]), &no_github(), &facts()).unwrap();
+        // Through the capped read path: the field limits fit inside the cap.
+        let result = read(&inspect(id), project, &store(vec![big])).unwrap();
+        assert!(result.get("result_truncated").is_none(), "{}", chars_of(&result));
         let task = &result["task"];
         assert_eq!(task["title"].as_str().unwrap().chars().count(), TITLE_CHARS);
         assert_eq!(task["description"].as_str().unwrap().chars().count(), DESCRIPTION_CHARS);
         assert_eq!(task["description_truncated"], true);
         assert_eq!(task["error"].as_str().unwrap().chars().count(), ERROR_CHARS);
+    }
+
+    #[test]
+    fn subtasks_are_limited_through_the_capped_read() {
+        let project = Uuid::new_v4();
+        let mut big = task(project, "Subject", TaskStatus::Backlog, 0);
+        big.subtasks = (0..SUBTASKS_SHOWN + 5)
+            .map(|n| crate::domain::Subtask { id: Uuid::new_v4(), title: format!("s{n}"), completed: false })
+            .collect();
+        let id = big.id;
+        let result = read(&inspect(id), project, &store(vec![big])).unwrap();
+        let task = &result["task"];
         assert_eq!(task["subtasks"].as_array().unwrap().len(), SUBTASKS_SHOWN);
         assert_eq!(task["subtasks_total"], SUBTASKS_SHOWN + 5);
     }

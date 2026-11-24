@@ -1345,6 +1345,34 @@ mod tests {
         }
     }
 
+    /// An estimate, not a guarantee. SlashIt has no tokenizer and the model
+    /// catalog carries no window sizes, so this assumes a smallest window and,
+    /// pessimistically, one token per logical character. The budget already
+    /// contains everything SlashIt controls (measured fixed parts, the read
+    /// reserve and the projection). What it cannot measure is added as an
+    /// explicit assumption: the provider CLI's own system prompt and tool
+    /// definitions, any harness-added context, and the model's reply.
+    #[test]
+    fn the_budget_plus_assumed_unmeasured_overhead_fits_an_assumed_window_estimate() {
+        use crate::conversation_context::{ContextBudget, ContextSite};
+        const ASSUMED_SMALLEST_WINDOW_TOKENS: usize = 200_000;
+        const PESSIMISTIC_TOKENS_PER_CHAR: usize = 1;
+        const ASSUMED_UNMEASURED_PROVIDER_AND_HARNESS_TOKENS: usize = 40_000;
+        const ASSUMED_REPLY_TOKENS: usize = 16_000;
+        let budget = ContextBudget::default();
+        let reserve = crate::coordinator_reads::read_reserve_chars(budget.per_read_cap_chars);
+        for site in [ContextSite::Ordinary, ContextSite::Continuation] {
+            // Measured: the most SlashIt itself sends in one invocation.
+            let fixed = super::fixed_invocation_chars(site);
+            assert!(fixed + reserve < budget.total_chars);
+        }
+        let sent_tokens = budget.total_chars * PESSIMISTIC_TOKENS_PER_CHAR;
+        assert!(
+            sent_tokens + ASSUMED_UNMEASURED_PROVIDER_AND_HARNESS_TOKENS + ASSUMED_REPLY_TOKENS <= ASSUMED_SMALLEST_WINDOW_TOKENS,
+            "estimate only: {sent_tokens} budget tokens plus assumed overhead"
+        );
+    }
+
     #[test]
     fn a_retired_delegation_is_refused_without_recording_a_task_action() {
         let project_id = Uuid::new_v4();
@@ -3066,6 +3094,105 @@ mod tests {
                 })
                 .collect();
             assert_eq!(replies, ["Retried", "Newer"]);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn three_maximum_size_reads_keep_every_invocation_within_the_budget() {
+            const FIRST: &str = "11111111-1111-4111-8111-111111111111";
+            const SECOND: &str = "22222222-2222-4222-8222-222222222222";
+            let inspect_first = r#"{"type":"inspect_task","target_task_id":"11111111-1111-4111-8111-111111111111"}"#;
+            let list = r#"{"type":"list_tasks","limit":20}"#;
+            let inspect_second = r#"{"type":"inspect_task","target_task_id":"22222222-2222-4222-8222-222222222222"}"#;
+            let fx = fixture(
+                tempfile::tempdir().unwrap(),
+                &[Step::Proposal(inspect_first), Step::Proposal(list), Step::Proposal(inspect_second), Step::Reply("Done.")],
+            )
+            .await;
+            {
+                let mut tasks = fx.state().task.tasks.write().await;
+                for id in [FIRST, SECOND] {
+                    let mut task = board_task(fx.project_id, crate::domain::TaskStatus::Error);
+                    task.id = id.parse().unwrap();
+                    task.title = "t".repeat(300);
+                    task.description = Some("d".repeat(5_000));
+                    task.error_message = Some("e".repeat(2_000));
+                    task.subtasks = (0..30)
+                        .map(|n| crate::domain::Subtask { id: Uuid::new_v4(), title: "s".repeat(300), completed: n % 2 == 0 })
+                        .collect();
+                    tasks.insert(task.id, task);
+                }
+                for position in 0..30 {
+                    let mut task = board_task(fx.project_id, crate::domain::TaskStatus::Backlog);
+                    task.title = "l".repeat(300);
+                    task.position = position;
+                    tasks.insert(task.id, task);
+                }
+            }
+            send(&fx, "Look at everything").await.expect("the send succeeds");
+            assert_eq!(fx.runs(), 4);
+            let (limits, _) = super::super::invocation_limits(crate::conversation_context::ContextSite::Ordinary, Default::default());
+            for run in 1..=4 {
+                let sent = fx.prompt(run).chars().count() + limits.other_fixed_chars;
+                eprintln!("maximum reads, invocation {run}: {sent} characters of {}", limits.max_chars);
+                assert!(sent <= limits.max_chars, "invocation {run} sent {sent}");
+            }
+            let last = fx.prompt(4);
+            assert_eq!(last.matches("\"result_truncated\"").count(), 3, "all three reads were capped and marked");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_proposal_left_out_of_the_context_can_still_be_decided() {
+            use crate::domain::conversation::ProjectActionStatus;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Seen.")]).await;
+            let mut conversation = fx.state().storage.create_primary_conversation(fx.project_id).unwrap();
+            for index in 0..25 {
+                crate::conversation_actions::record_proposal(
+                    &mut conversation,
+                    fx.project_id,
+                    crate::domain::conversation::CoordinatorOutput::CreateTask {
+                        text: "why".into(),
+                        title: format!("Task {index}"),
+                        description: None,
+                        priority: None,
+                        category: None,
+                    },
+                    &Default::default(),
+                    None,
+                )
+                .unwrap();
+            }
+            fx.state().storage.save_conversation(&conversation).unwrap();
+            let omitted = [conversation.project_actions[0].id, conversation.project_actions[1].id];
+
+            send(&fx, "What is open?").await.expect("the send succeeds");
+            let prompt = fx.prompt(1);
+            assert!(prompt.contains("\"open_proposals_total\":25") && prompt.contains("\"open_proposals_omitted\":5"));
+            let block = prompt.split("\"open_proposals\":[").nth(1).unwrap().split("\"recent_history\"").next().unwrap();
+            assert_eq!(block.matches("\"action_id\"").count(), 20);
+            for id in omitted {
+                assert!(!block.contains(&id.to_string()), "the oldest proposals are not in the open proposals block");
+            }
+
+            for (id, action) in [
+                (omitted[0], crate::commands::conversation::HumanAction::Reject),
+                (omitted[1], crate::commands::conversation::HumanAction::Approve { request: None }),
+            ] {
+                let current = fx.conversation();
+                super::super::act_on_project_conversation(
+                    GuiMutation::untracked(),
+                    fx.app.state(),
+                    fx.project_id.to_string(),
+                    current.id.to_string(),
+                    current.revision,
+                    id.to_string(),
+                    action,
+                )
+                .await
+                .expect("an omitted proposal is still decidable");
+            }
+            let after = fx.conversation();
+            assert_eq!(after.project_action(omitted[0]).unwrap().status, ProjectActionStatus::Rejected);
+            assert_ne!(after.project_action(omitted[1]).unwrap().status, ProjectActionStatus::Proposed);
         }
     }
 }

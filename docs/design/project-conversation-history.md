@@ -76,13 +76,12 @@ behavior.
 
 These limits describe the projection before the Context Builder
 ([context-management.md](context-management.md)). Items 1, 2, 4, 5, 6 and 8 are
-addressed by it, as marked below; item 3 is not. The current Human message is
+addressed by it, as marked below; items 3 and 7 are not. The current Human message is
 not cut in the projection, but `Conversation::validate_text` bounds it to
 `MESSAGE_LIMIT` (16,000 bytes) when it is sent. Original limits:
 
-1. **Fixed count window.** (Implemented: 16 remains a maximum, now bounded by a
-   character budget.) The last `PROJECTION_MESSAGE_COUNT` (16) entries are
-   projected. The count applies after entries that cannot be projected are
+1. **Fixed count window.** (Implemented: the count window is gone; a character
+   budget bounds history.) The last 16 entries were projected. The count applies after entries that cannot be projected are
    dropped, and proposals, decisions, Worker starts and results each take a
    slot, so 16 is far fewer than 16 conversational turns once Task work
    happens. Selection is purely positional.

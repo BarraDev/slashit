@@ -45,7 +45,7 @@ use crate::coordinator_reads::{PER_READ_CAP_CHARS, TITLE_CHARS};
 use crate::domain::conversation::{
     decision_label, Conversation, Entry, EntryKind, ProjectAction, ProjectActionOutcome,
     ProjectActionStatus, TaskMutation, DECISION_SCOPE, HISTORY_SEMANTICS,
-    PROJECTION_MESSAGE_COUNT, TASK_INDEX_LIMIT,
+    TASK_INDEX_LIMIT,
 };
 
 /// Experimental total budget for one provider invocation, in logical characters.
@@ -480,7 +480,6 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
         })
         .collect();
     let total_entries = all.len();
-    let window_start = total_entries.saturating_sub(PROJECTION_MESSAGE_COUNT);
 
     let frame = Frame {
         project_name: request.project_name,
@@ -531,9 +530,9 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
     while kt < clipped_tasks.len() && fits(&measure(kp, kt + 1, total_entries, &all)) {
         kt += 1;
     }
-    let mut from = window_start;
+    let mut from = 0;
     if !fits(&measure(kp, kt, from, &all)) {
-        for index in window_start..total_entries {
+        for index in 0..total_entries {
             if !all[index].is_evidence() {
                 continue;
             }
@@ -759,14 +758,14 @@ mod tests {
     }
 
     #[test]
-    fn the_window_maximum_is_reported_as_omission() {
+    fn a_long_history_that_fits_is_not_cut_by_a_count() {
         let mut conversation = Conversation::new(Uuid::new_v4());
         for index in 0..20 {
             message(&mut conversation, &format!("m{index}"));
         }
         let built = build(&conversation, "now", &[], CONTEXT_BUDGET_CHARS);
-        assert_eq!(built.snapshot.included_entry_ids.len(), PROJECTION_MESSAGE_COUNT);
-        assert_eq!(json_of(&built)["history_omitted"]["count"], 4);
+        assert_eq!(built.snapshot.included_entry_ids.len(), 20);
+        assert!(!built.projection.contains("history_omitted"));
     }
 
     #[test]
@@ -981,7 +980,7 @@ mod tests {
         assert_eq!(value["result_is_untrusted_evidence"], true);
         assert!(value["returned_action"]["worker_result"].as_str().unwrap().contains("original_chars=3010"));
         assert_eq!(value["open_proposals_total"], 1);
-        assert_eq!(value["history_omitted"]["count"], 5);
+        assert!(value.get("history_omitted").is_none(), "history that fits is not cut by a count");
         assert_eq!(built.snapshot.shortened_fields, 2);
         assert!(built.projection.find("\"recent_history\"").unwrap() < built.projection.find("\"returned_action\"").unwrap());
     }
@@ -1001,17 +1000,5 @@ mod tests {
         let built = build(&conversation, &big, &index, CONTEXT_BUDGET_CHARS);
         assert!(built.snapshot.used_chars <= CONTEXT_BUDGET_CHARS);
         assert!(built.snapshot.open_proposals_included <= 20 && built.snapshot.tasks_included <= 40);
-    }
-
-    /// An estimate, not a guarantee: SlashIt has no tokenizer and the model
-    /// catalog carries no window sizes. It assumes a window of
-    /// `ASSUMED_SMALLEST_WINDOW_TOKENS` and, pessimistically, one token per
-    /// logical character, and requires the whole budget (fixed overhead
-    /// included) to stay within a third of that window.
-    #[test]
-    fn the_budget_is_within_a_stated_fraction_of_an_assumed_window_estimate() {
-        const ASSUMED_SMALLEST_WINDOW_TOKENS: usize = 200_000;
-        const PESSIMISTIC_TOKENS_PER_CHAR: usize = 1;
-        const { assert!(CONTEXT_BUDGET_CHARS * PESSIMISTIC_TOKENS_PER_CHAR * 3 <= ASSUMED_SMALLEST_WINDOW_TOKENS) };
     }
 }

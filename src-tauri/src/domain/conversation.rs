@@ -11,7 +11,6 @@ use super::{Task, TaskCategory, TaskPriority, TaskStatus};
 pub const MESSAGE_LIMIT: usize = 16_000;
 pub const TASK_TITLE_LIMIT: usize = 200;
 pub const TASK_DESCRIPTION_LIMIT: usize = 8_000;
-pub const PROJECTION_MESSAGE_COUNT: usize = 16;
 pub const TASK_INDEX_LIMIT: usize = 40;
 /// How much of a Task's description an approval card carries.
 pub const INPUT_PREVIEW_LIMIT: usize = 2_000;
