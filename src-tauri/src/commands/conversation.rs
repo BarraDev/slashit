@@ -519,17 +519,23 @@ async fn answer_human_message(
             return record_budget_failure(state, project_id, &error).await;
         }
     };
-    eprintln!("{}", diagnostics::context_line(&correlation, &context.snapshot, started.elapsed().as_millis()));
+    diagnostics::emit(&diagnostics::context_line(&correlation, &context.snapshot, started.elapsed().as_millis()));
     let prompt = ordinary_prompt(&context.projection);
     // Failures before the provider starts are recorded like run failures, so the
     // Human message never stays unanswered and invisible.
     let working_directory = match coordinator_working_directory(root.as_deref()) {
         Ok(directory) => directory,
-        Err(reason) => return record_failed_turn(state, project_id, &reason).await,
+        Err(reason) => {
+            log_turn_without_provider(&correlation, Outcome::Failed);
+            return record_failed_turn(state, project_id, &reason).await;
+        }
     };
     let executor = match state.executor.get() {
         Some(executor) => executor.clone(),
-        None => return record_failed_turn(state, project_id, "Task executor is not ready").await,
+        None => {
+            log_turn_without_provider(&correlation, Outcome::Failed);
+            return record_failed_turn(state, project_id, "Task executor is not ready").await;
+        }
     };
     let answer = coordinator_turn(state, &executor, &correlation, project_id, &prompt, limits, |prompt| ClaudeRunConfig {
         prompt, working_dir: working_directory.path.clone(), tools: ToolAccess::ReadOnly, max_turns: Some(4), max_budget_usd: None,
@@ -787,27 +793,27 @@ async fn coordinator_turn(
             crate::coordinator_reads::read(&output, project_id, &tasks, &state.pr_statuses, &facts).ok_or(output)
         },
         |event: DriveEvent| {
-            eprintln!("{}", diagnostics::invocation_line(correlation, &event));
+            diagnostics::emit(&diagnostics::invocation_line(correlation, &event));
             tally.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(&event);
         },
     )
     .await;
     let tally = tally.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    eprintln!(
-        "{}",
-        diagnostics::turn_end_line(correlation, &tally, tally.final_outcome(result.is_ok()))
-    );
+    diagnostics::emit(&diagnostics::turn_end_line(correlation, &tally, tally.final_outcome(result.is_ok())));
     result
 }
 
 /// The `[coordinator-context]` and `[coordinator-turn]` lines of a turn the
 /// Builder refused before any provider call.
 fn log_context_refusal(correlation: &Correlation, error: &ContextError, construction_ms: u128) {
-    eprintln!("{}", diagnostics::context_refusal_line(correlation, error, construction_ms));
-    eprintln!(
-        "{}",
-        diagnostics::turn_end_line(correlation, &TurnTally::default(), Outcome::OverBudget)
-    );
+    diagnostics::emit(&diagnostics::context_refusal_line(correlation, error, construction_ms));
+    log_turn_without_provider(correlation, Outcome::OverBudget);
+}
+
+/// The terminal `[coordinator-turn]` line of a turn that ended before any
+/// provider call. It reports zero invocations and zero reads.
+fn log_turn_without_provider(correlation: &Correlation, outcome: Outcome) {
+    diagnostics::emit(&diagnostics::turn_end_line(correlation, &TurnTally::default(), outcome));
 }
 
 /// The Project facts `inspect_project` may report, copied out so no lock is
@@ -1254,14 +1260,22 @@ async fn continue_from_worker_result(
             return Err(error.to_string().into());
         }
     };
-    eprintln!("{}", diagnostics::context_line(&correlation, &context.snapshot, started.elapsed().as_millis()));
-    let working_directory = coordinator_working_directory(root.as_deref())?;
+    diagnostics::emit(&diagnostics::context_line(&correlation, &context.snapshot, started.elapsed().as_millis()));
+    let working_directory = match coordinator_working_directory(root.as_deref()) {
+        Ok(directory) => directory,
+        Err(reason) => {
+            log_turn_without_provider(&correlation, Outcome::Failed);
+            return Err(reason.into());
+        }
+    };
     let prompt = continuation_prompt(&context.projection);
-    let executor = state
-        .executor
-        .get()
-        .ok_or("Task executor is not ready")?
-        .clone();
+    let executor = match state.executor.get() {
+        Some(executor) => executor.clone(),
+        None => {
+            log_turn_without_provider(&correlation, Outcome::Failed);
+            return Err("Task executor is not ready".into());
+        }
+    };
     let (output, run_lease) = coordinator_turn(state, &executor, &correlation, project_id, &prompt, limits, |prompt| ClaudeRunConfig {
         prompt, working_dir: working_directory.path.clone(), tools: ToolAccess::ReadOnly, max_turns: Some(4), max_budget_usd: None,
         session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
@@ -1316,6 +1330,20 @@ mod tests {
     };
     use crate::domain::conversation::{ActionStatus, Conversation, EntryKind, Role, TaskAction};
     use uuid::Uuid;
+
+    /// Asserts the captured lines of one turn: one context line, one terminal
+    /// turn line with the given outcome, and no invocation line, because no
+    /// provider call was made.
+    fn assert_turn_lines(lines: &[String], site: &str, outcome: &str) {
+        let with_tag = |tag: &str| lines.iter().filter(|line| line.starts_with(tag)).collect::<Vec<_>>();
+        assert_eq!(with_tag("[coordinator-context]").len(), 1, "{lines:?}");
+        assert!(with_tag("[coordinator-context]")[0].contains(&format!("site={site}")), "{lines:?}");
+        assert!(with_tag("[coordinator-invocation]").is_empty(), "{lines:?}");
+        let turns = with_tag("[coordinator-turn]");
+        assert_eq!(turns.len(), 1, "exactly one terminal record: {lines:?}");
+        assert!(turns[0].contains(&format!("outcome={outcome}")), "{lines:?}");
+        assert!(turns[0].contains("invocations=0 structured_reads=0 read_budget_exhausted=false"), "{lines:?}");
+    }
 
     #[tokio::test]
     async fn queued_conversation_open_rechecks_project_after_deletion() {
@@ -1896,6 +1924,15 @@ mod tests {
         }
 
         async fn fixture_with_budget(tmp: tempfile::TempDir, result: &str, mediated: bool, budget: crate::conversation_context::ContextBudget) -> Fx {
+            build_fixture(tmp, result, mediated, budget, true).await
+        }
+
+        /// The same Project and Worker result, but no Task executor is installed.
+        async fn fixture_without_executor(tmp: tempfile::TempDir, result: &str) -> Fx {
+            build_fixture(tmp, result, false, Default::default(), false).await
+        }
+
+        async fn build_fixture(tmp: tempfile::TempDir, result: &str, mediated: bool, budget: crate::conversation_context::ContextBudget, attach_executor: bool) -> Fx {
             let log = tmp.path().join("provider-runs.log");
             let fake = crate::test_helpers::FakeProgram::install("claude", &coordinator_body(&log, result)).await;
             let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
@@ -1906,7 +1943,9 @@ mod tests {
             ));
             let (mut state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
             state.conversation.context_budget = budget;
-            crate::test_helpers::attach_test_executor(&state);
+            if attach_executor {
+                crate::test_helpers::attach_test_executor(&state);
+            }
             let project_id = Uuid::new_v4();
             state.project.projects.write().await.insert(
                 project_id,
@@ -2099,6 +2138,22 @@ mod tests {
             assert!(prompt.contains("\"result_is_untrusted_evidence\":true") && prompt.contains("\"open_proposals_total\":0"));
             let (limits, _) = super::super::invocation_limits(crate::conversation_context::ContextSite::Continuation, Default::default());
             assert!(prompt.chars().count() + limits.other_fixed_chars <= limits.max_chars);
+        }
+
+        /// Without an executor no provider starts, so the turn's one terminal
+        /// record must still say so: a failed turn with no invocation and no read.
+        #[tokio::test]
+        async fn a_continuation_without_an_executor_ends_its_turn_with_zero_invocations() {
+            let fx = fixture_without_executor(tempfile::tempdir().unwrap(), r#"{"type":"reply","text":"ok"}"#).await;
+            let before = fx.conversation();
+            crate::coordinator_diagnostics::capture::start();
+            let _ = super::super::retry_project_conversation_continuation(
+                GuiMutation::untracked(), fx.app.state(), fx.project_id.to_string(),
+                before.id.to_string(), before.revision, fx.returned.to_string(),
+            ).await;
+            let lines = crate::coordinator_diagnostics::capture::finish();
+            assert!(fx.runs().is_empty(), "no provider ran");
+            assert_turn_lines(&lines, "continuation", "failed");
         }
 
         /// A continuation that cannot fit keeps its own semantics: the Worker
@@ -2556,6 +2611,15 @@ mod tests {
         }
 
         async fn fixture_with_budget(tmp: tempfile::TempDir, steps: &[Step], budget: crate::conversation_context::ContextBudget) -> Fx {
+            build_fixture(tmp, steps, budget, true).await
+        }
+
+        /// The same Project, but no Task executor is installed.
+        async fn fixture_without_executor(tmp: tempfile::TempDir, steps: &[Step]) -> Fx {
+            build_fixture(tmp, steps, Default::default(), false).await
+        }
+
+        async fn build_fixture(tmp: tempfile::TempDir, steps: &[Step], budget: crate::conversation_context::ContextBudget, attach_executor: bool) -> Fx {
             let log = tmp.path().join("provider-runs.log");
             let fake = crate::test_helpers::FakeProgram::install("claude", &provider_body(&log, steps)).await;
             let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
@@ -2566,7 +2630,9 @@ mod tests {
             ));
             let (mut state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
             state.conversation.context_budget = budget;
-            crate::test_helpers::attach_test_executor(&state);
+            if attach_executor {
+                crate::test_helpers::attach_test_executor(&state);
+            }
             let project_id = Uuid::new_v4();
             state.project.projects.write().await.insert(
                 project_id,
@@ -2614,6 +2680,22 @@ mod tests {
             fn prompt(&self, run: usize) -> String {
                 std::fs::read_to_string(format!("{}.prompt.{run}", self.log.display())).unwrap_or_default()
             }
+        }
+
+        /// The ordinary turn without an executor records its refusal once and
+        /// ends with exactly one terminal turn record that made no provider call.
+        #[tokio::test]
+        async fn a_turn_without_an_executor_ends_with_one_terminal_record_and_no_invocation() {
+            let fx = fixture_without_executor(tempfile::tempdir().unwrap(), &[Step::Reply("Hello")]).await;
+            crate::coordinator_diagnostics::capture::start();
+            let snapshot = send(&fx, "Hi").await.expect("the failure is recorded, not returned");
+            let lines = crate::coordinator_diagnostics::capture::finish();
+            assert!(fx.runs() == 0, "no provider ran");
+            assert!(snapshot.conversation.entries.iter().any(|entry| matches!(
+                &entry.kind,
+                EntryKind::RunFailed { role: Role::Coordinator, message, .. } if message.contains("executor")
+            )));
+            assert_turn_lines(&lines, "ordinary", "failed");
         }
 
         async fn send(fx: &Fx, text: &str) -> Result<Snapshot, String> {

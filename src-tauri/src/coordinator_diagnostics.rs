@@ -31,6 +31,45 @@ pub struct Correlation {
     pub trigger: Trigger,
 }
 
+/// Writes one diagnostic line to the instance log. Tests capture lines on their
+/// own thread instead, so the turn's real early exits can be checked.
+pub fn emit(line: &str) {
+    #[cfg(test)]
+    if capture::record(line) {
+        return;
+    }
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+pub mod capture {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    /// Starts capturing this thread's diagnostic lines.
+    pub fn start() {
+        LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stops capturing and returns the lines written since `start`.
+    pub fn finish() -> Vec<String> {
+        LINES.with(|lines| lines.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn record(line: &str) -> bool {
+        LINES.with(|lines| match lines.borrow_mut().as_mut() {
+            Some(captured) => {
+                captured.push(line.to_owned());
+                true
+            }
+            None => false,
+        })
+    }
+}
+
 fn site_name(site: ContextSite) -> &'static str {
     match site {
         ContextSite::Ordinary => "ordinary",
