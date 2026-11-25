@@ -8,10 +8,9 @@ This page names each installer the release produces, says what was verified for
 it and what was not, and describes how to install, remove and update it. The
 release notes in [`CHANGELOG.md`](../CHANGELOG.md) list what changed.
 
-The files below are what the release workflow is expected to produce for a
-`v0.0.4` tag. Their names follow the pattern used for earlier releases. They have
-not been checked against built artifacts, because none exist yet. The verification
-recorded for 0.0.3 and 0.0.2 applies to those builds only. It is in
+The files below are the assets of the `v0.0.4` prerelease, published on 2026-11-18.
+The table gives each file's architecture and whether any verification is recorded for
+it. The verification recorded for 0.0.3 and 0.0.2 applies to those builds only. It is in
 [the 0.0.3 section](#verification-of-003-2026-10-29) of this page and in the
 [0.0.2 guide](https://github.com/BarraDev/slashit/blob/v0.0.2/docs/installation.md).
 
@@ -19,18 +18,19 @@ recorded for 0.0.3 and 0.0.2 applies to those builds only. It is in
 
 | Platform | File | Architecture | Verified for 0.0.4 |
 |---|---|---|---|
-| Linux | `SlashIt_0.0.4_amd64.AppImage` | x86_64 | Not yet. |
-| Linux (Debian, Ubuntu) | `SlashIt_0.0.4_amd64.deb` | x86_64 | Not yet. |
-| Linux (Fedora, RHEL-like) | `SlashIt-0.0.4-1.x86_64.rpm` | x86_64 | Not yet. |
-| Windows | `SlashIt_0.0.4_x64-setup.exe` (NSIS) | x64 | Not yet. |
-| Windows | `SlashIt_0.0.4_x64_en-US.msi` | x64 | Not yet. |
-| macOS, Apple silicon | `SlashIt_0.0.4_aarch64.dmg` | arm64 | Not yet. |
-| macOS, Intel | `SlashIt_0.0.4_x64.dmg` | x86_64 | Not yet. |
+| Linux | `SlashIt_0.0.4_amd64.AppImage` | x86_64 | No verification recorded. |
+| Linux (Debian, Ubuntu) | `SlashIt_0.0.4_amd64.deb` | x86_64 | No verification recorded. |
+| Linux (Fedora, RHEL-like) | `SlashIt-0.0.4-1.x86_64.rpm` | x86_64 | No verification recorded. |
+| Windows | `SlashIt_0.0.4_x64-setup.exe` (NSIS) | x64 | No verification recorded. |
+| Windows | `SlashIt_0.0.4_x64_en-US.msi` | x64 | No verification recorded. |
+| macOS, Apple silicon | `SlashIt_0.0.4_aarch64.dmg` | arm64 | No verification recorded. |
+| macOS, Intel | `SlashIt_0.0.4_x64.dmg` | x86_64 | No verification recorded. |
 
 The release also contains `.sig` files, `latest.json`, and macOS `.app.tar.gz`
 files. These are for the updater, not for installation. Do not install them.
 
-No artifact of this release has been installed or launched yet. The 0.0.3
+No installation or launch of a 0.0.4 artifact is recorded in this repository. That does
+not show that nobody has installed one. The 0.0.3
 AppImage was launched on one host, and that result does not carry over to 0.0.4.
 Treat every platform as untested until this page says otherwise.
 

@@ -433,7 +433,7 @@ The probe is a compatibility check. It does not show that an update is
 downloaded and installed. That is the end-to-end test in section 6. A controlled
 run of it, from the published 0.0.2 AppImage to the published 0.0.3 AppImage,
 passed on one host on 2026-10-29. The run was manual, and its limits are recorded
-in [`installation.md`](installation.md#verification-update-2026-10-29). It is not
+in [`installation.md`](installation.md#verification-of-003-2026-10-29). It is not
 a release gate.
 
 The release workflow installs the Tauri CLI with `npm install --global
