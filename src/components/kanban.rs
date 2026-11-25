@@ -1094,6 +1094,17 @@ impl PrReviewDialog {
         true
     }
 
+    /// Reports a refused or failed operation of `opening`. The error is shown;
+    /// the plan is left as it is, so the Human's drafts (decision, approval,
+    /// note, instruction) are not replaced by the stored plan.
+    fn report_failure(self, opening: ReviewOpening, message: String) -> bool {
+        if !self.shows(opening) {
+            return false;
+        }
+        self.error.set(Some(message));
+        true
+    }
+
     /// Clears the replies selected for posting after a Sync that began at
     /// `opening`, but only while that opening is shown.
     fn release_selected_replies(self, opening: ReviewOpening) -> bool {
@@ -1316,7 +1327,9 @@ fn PrReviewModal(
                     let task_id_inner = task_id.clone();
                     spawn_local(async move {
                         if let Ok(Some(updated)) = refresh_task_pr_state(task_id_inner).await {
-                            if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
+                            // A dry run stores nothing, so the stored plan would
+                            // replace the Human's unsaved drafts.
+                            if let Some(refreshed_plan) = updated.pr_review_plan.clone().filter(|_| !was_dry_run) {
                                 dialog.adopt_plan(opening, refreshed_plan);
                             }
                             set_tasks.update(|tasks| {
@@ -1329,9 +1342,7 @@ fn PrReviewModal(
                 }
                 Err(e) => {
                     let msg = format!("Failed to apply PR fixes: {}", e);
-                    if dialog.shows(opening) {
-                        error.set(Some(msg.clone()));
-                    }
+                    dialog.report_failure(opening, msg.clone());
                     toast::error(msg);
                 }
             }
@@ -1361,9 +1372,7 @@ fn PrReviewModal(
                 }
                 Err(e) => {
                     let msg = format!("Failed to discuss: {}", e);
-                    if dialog.shows(opening) {
-                        error.set(Some(msg.clone()));
-                    }
+                    dialog.report_failure(opening, msg.clone());
                     toast::error(msg);
                 }
             }
@@ -2043,7 +2052,10 @@ fn render_review_item(
     };
     let on_change_input = move |ev: leptos::ev::Event| {
         let v = event_target_value(&ev);
-        update_item(&|it| it.proposed_change = v.clone());
+        update_item(&|it| it.set_proposed_change_override(&v));
+    };
+    let on_restore_original = move |_| {
+        update_item(&|it| it.set_proposed_change_override(""));
     };
     let on_user_note_input = move |ev: leptos::ev::Event| {
         let v = event_target_value(&ev);
@@ -2068,6 +2080,8 @@ fn render_review_item(
     let summary = item.summary.clone();
     let reasoning = item.reasoning.clone();
     let proposed = item.proposed_change.clone();
+    let override_text = item.proposed_change_override.clone().unwrap_or_default();
+    let instruction_locked = item.instruction_is_locked();
     let user_note = item.user_note.clone();
     let approved_init = item.approved;
     let is_question = matches!(item.decision, PrReviewDecisionKind::Question);
@@ -2225,17 +2239,35 @@ fn render_review_item(
                     ></textarea>
                 </label>
 
-                <label class="block">
-                    <span class="text-[10px] uppercase tracking-wide text-white/40">"Proposed change"</span>
-                    <textarea
-                        class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50 disabled:opacity-60 disabled:cursor-not-allowed"
-                        rows="2"
-                        on:input=on_change_input
-                        prop:value=proposed
-                        disabled=move || busy.get()
-                        placeholder="What the agent will change if approved."
-                    ></textarea>
-                </label>
+                <div class="block">
+                    <span class="text-[10px] uppercase tracking-wide text-white/40">"Proposed change (original)"</span>
+                    <div
+                        class="mt-1 whitespace-pre-wrap bg-white/[0.02] border border-white/5 rounded p-2 text-xs text-white/60 font-mono"
+                        data-testid="pr-review-item-original-change"
+                    >{proposed}</div>
+                    <label class="block mt-2">
+                        <span class="text-[10px] uppercase tracking-wide text-white/40">"Your instruction (replaces the original; clear it to restore)"</span>
+                        <textarea
+                            class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50 disabled:opacity-60 disabled:cursor-not-allowed"
+                            rows="2"
+                            data-testid="pr-review-item-override"
+                            on:input=on_change_input
+                            prop:value=move || plan.with(|p| p.as_ref()
+                                .and_then(|p| p.items.get(idx))
+                                .and_then(|i| i.proposed_change_override.clone())
+                                .unwrap_or_else(|| override_text.clone()))
+                            disabled=move || busy.get() || instruction_locked
+                            placeholder="Leave empty to use the original proposal. Changing it clears the approval."
+                        ></textarea>
+                    </label>
+                    <button
+                        type="button"
+                        class="mt-1 text-[10px] text-white/50 hover:text-white/80 disabled:opacity-40"
+                        data-testid="pr-review-item-restore-original"
+                        on:click=on_restore_original
+                        disabled=move || busy.get() || instruction_locked
+                    >"Restore original"</button>
+                </div>
             </div>
 
             {is_question.then(|| view! {
@@ -3640,6 +3672,38 @@ mod tests {
         assert!(!delivered_reply_fix(&no_text), "internal reasoning is never a reply");
         let posted = PrReviewItem { reply_posted: true, ..item.clone() };
         assert!(!delivered_reply_fix(&posted));
+    }
+
+    #[test]
+    fn a_refused_operation_keeps_the_drafts() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        assert!(!dialog.open(task_with_cached_plan(1)));
+        let opening = dialog.opening().expect("shown");
+        let mut drafted = dialog.plan.get_untracked().expect("plan");
+        let item = &mut drafted.items[0];
+        item.user_note = "draft note".to_string();
+        item.set_proposed_change_override("my instruction");
+        item.approved = true;
+        dialog.plan.set(Some(drafted));
+        let before = dialog.plan.get_untracked();
+        assert!(dialog.report_failure(opening, "refused".to_string()));
+        assert_eq!(dialog.plan.get_untracked(), before, "the drafts stay as they were");
+        assert_eq!(dialog.error.get_untracked().as_deref(), Some("refused"));
+    }
+
+    #[test]
+    fn clearing_the_override_shows_the_original_and_clears_approval() {
+        let mut item = review_item(7, "fix", true);
+        item.set_proposed_change_override("mine");
+        assert_eq!(item.effective_proposed_change(), "mine");
+        assert_eq!(item.proposed_change, "p", "the original is untouched");
+        assert!(!item.approved, "changing the instruction clears the approval");
+        item.approved = true;
+        item.set_proposed_change_override("");
+        assert_eq!(item.effective_proposed_change(), "p");
+        assert!(item.proposed_change_override.is_none());
+        assert!(!item.approved);
     }
 
     #[test]
