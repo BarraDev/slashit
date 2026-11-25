@@ -7,6 +7,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::store::{ScrollbackManager, SessionMetadata, SessionStore};
+#[cfg(unix)]
+use super::terminal_env::{terminal_xdg_changes, XdgChange};
 
 /// Information about a PTY session
 pub struct PtySession {
@@ -273,6 +275,16 @@ pub fn spawn_pty_session(
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("LC_ALL", "C.UTF-8");
+    // An isolated instance's redirected XDG_*_HOME would make the shell miss the owner's daily setup.
+    #[cfg(unix)]
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from).filter(|h| h.is_absolute()) {
+        for (name, change) in terminal_xdg_changes(|key| std::env::var_os(key), &home) {
+            match change {
+                XdgChange::Set(value) => cmd.env(name, value),
+                XdgChange::Unset => cmd.env_remove(name),
+            }
+        }
+    }
     println!("[PTY Manager] Step 4: ✓ Environment variables set");
     
     // Set the current working directory

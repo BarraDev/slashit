@@ -1121,6 +1121,15 @@ defaults derived from `HOME`:
 | `GH_CONFIG_DIR` | `~/.config/gh` | real GitHub credentials, deliberately shared |
 | `HOME` | the real home | the desktop session's display and PATH flow through unchanged |
 
+Integrated terminals (`src-tauri/src/pty/terminal_env.rs`) do not get the
+redirected `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` or
+`XDG_STATE_HOME`: a value inside the redirected `XDG_STATE_HOME` is replaced by
+the daily default, so the shell is the owner's daily shell. `XDG_RUNTIME_DIR`
+is the one deliberate exception and stays the instance's. To keep a value that
+sits inside the redirected state home, set `SLASHIT_TERMINAL_<NAME>` (for
+example `SLASHIT_TERMINAL_XDG_CONFIG_HOME`) to the exact value the terminal
+should receive.
+
 ### Launch and supervision
 
 `scripts/supervise-dogfood.sh` is the mechanism. Run it with `start`, `run`,

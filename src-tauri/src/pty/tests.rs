@@ -711,3 +711,222 @@ mod registration_tests {
         assert_eq!(recorded[0].project_id.as_deref(), Some("project-a"));
     }
 }
+
+// ==================== Terminal XDG Environment Tests ====================
+
+#[cfg(unix)]
+#[cfg(test)]
+mod terminal_xdg_tests {
+    use super::super::terminal_env::{terminal_xdg_changes, XdgChange};
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    const HOME: &str = "/h";
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, OsString> {
+        pairs.iter().map(|(k, v)| (k.to_string(), OsString::from(v))).collect()
+    }
+
+    fn decide(pairs: &[(&str, &str)]) -> HashMap<&'static str, XdgChange> {
+        let map = env(pairs);
+        terminal_xdg_changes(|key| map.get(key).cloned(), Path::new(HOME))
+            .into_iter()
+            .collect()
+    }
+
+    fn set(value: &str) -> XdgChange {
+        XdgChange::Set(OsString::from(value))
+    }
+
+    const REDIRECT: &str = "/h/.local/state/slashit-dogfood";
+
+    #[test]
+    fn redirected_instance_rebases_the_moved_variables_to_daily_defaults() {
+        let changes = decide(&[
+            ("XDG_STATE_HOME", REDIRECT),
+            ("XDG_CONFIG_HOME", "/h/.local/state/slashit-dogfood/config"),
+            ("XDG_DATA_HOME", "/h/.local/state/slashit-dogfood/data"),
+            ("XDG_CACHE_HOME", "/h/.local/state/slashit-dogfood/cache"),
+        ]);
+        assert_eq!(changes.get("XDG_CONFIG_HOME"), Some(&set("/h/.config")));
+        assert_eq!(changes.get("XDG_DATA_HOME"), Some(&set("/h/.local/share")));
+        assert_eq!(changes.get("XDG_CACHE_HOME"), Some(&set("/h/.cache")));
+        assert_eq!(changes.get("XDG_STATE_HOME"), Some(&set("/h/.local/state")));
+        assert_eq!(changes.len(), 4);
+    }
+
+    #[test]
+    fn normal_instance_without_xdg_variables_changes_nothing() {
+        assert!(decide(&[]).is_empty());
+    }
+
+    #[test]
+    fn normal_instance_keeps_a_custom_config_home_outside_the_state_base() {
+        // Regression for the superseded rule, which rebased any value that differed from the default.
+        let changes = decide(&[("XDG_CONFIG_HOME", "/home/u/dotfiles/config")]);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn redirected_instance_keeps_a_custom_value_outside_the_state_base() {
+        let changes = decide(&[
+            ("XDG_STATE_HOME", REDIRECT),
+            ("XDG_CONFIG_HOME", "/home/u/dotfiles/config"),
+        ]);
+        assert!(!changes.contains_key("XDG_CONFIG_HOME"));
+        assert_eq!(changes.get("XDG_STATE_HOME"), Some(&set("/h/.local/state")));
+    }
+
+    #[test]
+    fn value_already_equal_to_the_daily_default_passes_through() {
+        let changes = decide(&[
+            ("XDG_STATE_HOME", "/h"),
+            ("XDG_CONFIG_HOME", "/h/.config"),
+        ]);
+        assert!(!changes.contains_key("XDG_CONFIG_HOME"));
+    }
+
+    #[test]
+    fn hatch_gives_the_child_exactly_the_hatch_value_under_redirect() {
+        let changes = decide(&[
+            ("XDG_STATE_HOME", REDIRECT),
+            ("XDG_CONFIG_HOME", "/h/.local/state/slashit-dogfood/config"),
+            ("SLASHIT_TERMINAL_XDG_CONFIG_HOME", "/h/.local/state/slashit-dogfood/config"),
+            ("SLASHIT_TERMINAL_XDG_STATE_HOME", "relative/state"),
+        ]);
+        assert_eq!(
+            changes.get("XDG_CONFIG_HOME"),
+            Some(&set("/h/.local/state/slashit-dogfood/config"))
+        );
+        assert_eq!(changes.get("XDG_STATE_HOME"), Some(&set("relative/state")));
+    }
+
+    #[test]
+    fn empty_hatch_is_ignored() {
+        let changes = decide(&[
+            ("XDG_STATE_HOME", REDIRECT),
+            ("XDG_CONFIG_HOME", "/h/.local/state/slashit-dogfood/config"),
+            ("SLASHIT_TERMINAL_XDG_CONFIG_HOME", ""),
+        ]);
+        assert_eq!(changes.get("XDG_CONFIG_HOME"), Some(&set("/h/.config")));
+    }
+
+    #[test]
+    fn state_base_match_is_by_path_component_not_string_prefix() {
+        let changes = decide(&[
+            ("XDG_STATE_HOME", REDIRECT),
+            ("XDG_CONFIG_HOME", "/h/.local/state/slashit-dogfood-old/config"),
+        ]);
+        assert!(!changes.contains_key("XDG_CONFIG_HOME"));
+    }
+
+    #[test]
+    fn empty_value_is_removed_and_relative_values_are_not_rebased() {
+        let changes = decide(&[
+            ("XDG_STATE_HOME", REDIRECT),
+            ("XDG_CONFIG_HOME", ""),
+            ("XDG_DATA_HOME", "local/slashit-dogfood/data"),
+            ("XDG_CACHE_HOME", "./.local/state/slashit-dogfood/cache"),
+        ]);
+        assert_eq!(changes.get("XDG_CONFIG_HOME"), Some(&XdgChange::Unset));
+        assert!(!changes.contains_key("XDG_DATA_HOME"));
+        assert!(!changes.contains_key("XDG_CACHE_HOME"));
+    }
+
+    #[test]
+    fn relative_state_home_does_not_activate_a_redirect() {
+        let changes = decide(&[
+            ("XDG_STATE_HOME", ".local/state/slashit-dogfood"),
+            ("XDG_CONFIG_HOME", "/h/.local/state/slashit-dogfood/config"),
+        ]);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn runtime_dir_is_never_changed() {
+        let changes = decide(&[
+            ("XDG_STATE_HOME", REDIRECT),
+            ("XDG_RUNTIME_DIR", "/run/user/1000/slashit-dogfood"),
+            ("SLASHIT_TERMINAL_XDG_RUNTIME_DIR", "/elsewhere"),
+        ]);
+        assert!(!changes.keys().any(|name| name.contains("RUNTIME")));
+    }
+
+    /// Spawns the real shell and compares the child's XDG environment with the
+    /// decision made from this process's environment. Run it on a disposable
+    /// environment, for example with XDG_STATE_HOME set to a redirected tree:
+    /// `cargo test -p slashit-ui test_spawn_pty_session_child_xdg_environment -- --ignored --exact`
+    #[test]
+    #[ignore] // Spawns a real shell
+    fn test_spawn_pty_session_child_xdg_environment() {
+        use std::io::{BufRead, BufReader};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"));
+        let process_env = |key: &str| std::env::var_os(key);
+        let expected = terminal_xdg_changes(process_env, &home);
+
+        let (mut session, reader) = super::super::manager::spawn_pty_session(
+            "XDG Terminal".to_string(),
+            200,
+            50,
+            None,
+        )
+        .expect("PTY spawn should succeed");
+
+        // The markers are split in the typed command so that only the printf output carries them.
+        session
+            .write(b"printf '%s\\n' __SLASH''IT_BEGIN__; env; printf '%s\\n' __SLASH''IT_END__\n")
+            .expect("write to the shell");
+
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut child_env: HashMap<String, String> = HashMap::new();
+        let mut inside = false;
+        let mut finished = false;
+        while let Ok(line) = rx.recv_timeout(Duration::from_secs(15)) {
+            // The line editor may prefix the marker line with terminal control sequences.
+            let line = line.trim_end_matches('\r');
+            if line.contains("__SLASHIT_BEGIN__") {
+                inside = true;
+            } else if line.contains("__SLASHIT_END__") {
+                finished = true;
+                break;
+            } else if inside {
+                if let Some((key, value)) = line.split_once('=') {
+                    child_env.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
+        assert!(finished, "the shell did not print its environment");
+        println!("child XDG environment: {:?}", child_env.iter().filter(|(k, _)| k.starts_with("XDG_") || k.starts_with("SLASHIT_TERMINAL_")).collect::<Vec<_>>());
+        println!("child environment entries: {}", child_env.len());
+
+        for (name, change) in &expected {
+            match change {
+                XdgChange::Set(value) => assert_eq!(
+                    child_env.get(*name).map(String::as_str),
+                    value.to_str(),
+                    "{name} in the child"
+                ),
+                XdgChange::Unset => assert!(!child_env.contains_key(*name), "{name} should be unset"),
+            }
+        }
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+            assert_eq!(
+                child_env.get("XDG_RUNTIME_DIR").map(String::as_str),
+                runtime.to_str(),
+                "XDG_RUNTIME_DIR must pass through"
+            );
+        }
+    }
+}

@@ -2,6 +2,8 @@
 pub mod manager;
 pub mod commands;
 pub mod store;
+#[cfg(unix)]
+mod terminal_env;
 
 pub use manager::PtyState;
 pub use commands::*;
