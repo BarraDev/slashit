@@ -720,6 +720,7 @@ fn DrawerHeader(
         <header class="flex items-start gap-3 px-5 py-4 border-b border-white/10">
             <div class="flex-1 min-w-0">
                 <h2 data-testid="task-drawer-title" class="text-base font-semibold text-white/90 break-words">{task.title.clone()}</h2>
+                <div class="mt-1"><crate::components::task_card::TaskIdCopy task_id=task.id /></div>
                 <span
                     data-testid="task-drawer-status"
                     data-status=status_key
@@ -749,8 +750,31 @@ fn DrawerHeader(
 fn TaskSummary(task: Task) -> impl IntoView {
     view! {
         <section class="space-y-2 text-sm">
-            {task.description.clone().filter(|d| !d.trim().is_empty()).map(|d| view! {
-                <p data-testid="task-drawer-description" class="text-white/60 whitespace-pre-wrap break-words line-clamp-6">{d}</p>
+            {task.description.clone().filter(|d| !d.trim().is_empty()).map(|d| {
+                let expanded = RwSignal::new(false);
+                view! {
+                    <div>
+                        <p
+                            data-testid="task-drawer-description"
+                            class=move || if expanded.get() {
+                                "text-white/60 whitespace-pre-wrap break-words"
+                            } else {
+                                "text-white/60 whitespace-pre-wrap break-words line-clamp-6"
+                            }
+                        >{d}</p>
+                        {view! {
+                            <button
+                                type="button"
+                                data-testid="task-drawer-description-toggle"
+                                class="mt-1 text-xs text-blue-300 hover:text-blue-200"
+                                aria-expanded=move || expanded.get().to_string()
+                                on:click=move |_| expanded.update(|v| *v = !*v)
+                            >
+                                {move || if expanded.get() { "Show less" } else { "Show full description" }}
+                            </button>
+                        }}
+                    </div>
+                }
             })}
             {task.qa_signoff.clone().map(|signoff| view! { <AiReviewSection signoff=signoff /> })}
             {(task.status == crate::models::TaskStatus::HumanReview && task.qa_signoff.is_none()).then(|| {

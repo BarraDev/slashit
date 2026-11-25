@@ -10,14 +10,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::cell::Cell;
 use std::rc::Rc;
-use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
-
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = ["navigator", "clipboard"], js_name = writeText, catch)]
-    fn clipboard_write_text(text: &str) -> Result<js_sys::Promise, JsValue>;
-}
+use crate::services::clipboard_service::write_text;
 
 /// What the dialog shows. Opening starts from `Loading`; closing drops whatever
 /// was loaded, so a reopened dialog never shows facts from an earlier read.
@@ -133,13 +126,7 @@ pub fn AboutSlashItDialog(show: RwSignal<bool>) -> impl IntoView {
         };
         let text = diagnostics_text(&about);
         spawn_local(async move {
-            let outcome = match clipboard_write_text(&text) {
-                Ok(promise) => JsFuture::from(promise)
-                    .await
-                    .map(|_| ())
-                    .map_err(|_| "the clipboard refused the text".to_string()),
-                Err(_) => Err("the clipboard is not available".to_string()),
-            };
+            let outcome = write_text(&text).await;
             copy_status.set(Some(match outcome {
                 Ok(()) => "Copied to the clipboard.".to_string(),
                 Err(error) => format!("Could not copy: {error}"),

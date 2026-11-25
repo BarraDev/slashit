@@ -4,6 +4,70 @@ use crate::components::attention::{AttentionChip, DeliveringChip};
 use crate::components::task_live::{project_run, RunBadge};
 use crate::models::{AgentStatus, AttentionReason, Task, TaskStatus, TaskCategory, TaskPriority, TaskPhase, QaStatus, ExternalRef, HumanReviewDecision};
 
+/// The eight-character form of a Task ID shown on cards and in the drawer.
+/// The CLI accepts the same prefix.
+pub fn short_task_id(id: &uuid::Uuid) -> String {
+    id.simple().to_string()[..8].to_string()
+}
+
+/// A discreet short Task ID with a button that copies the full UUID.
+///
+/// The button lives inside the draggable, clickable card, so it stops its own
+/// click and cancels a drag that starts on it.
+#[component]
+pub fn TaskIdCopy(task_id: uuid::Uuid) -> impl IntoView {
+    let full = task_id.to_string();
+    let short = short_task_id(&task_id);
+    let on_click = {
+        let full = full.clone();
+        move |e: web_sys::MouseEvent| {
+            e.stop_propagation();
+            e.prevent_default();
+            let full = full.clone();
+            leptos::task::spawn_local(async move {
+                match crate::services::clipboard_service::write_text(&full).await {
+                    Ok(()) => crate::components::toast::success("Task ID copied".to_string()),
+                    Err(error) => crate::components::toast::error(format!("Could not copy Task ID: {error}")),
+                }
+            });
+        }
+    };
+    view! {
+        <span class="inline-flex items-center gap-1 text-[10px] text-white/30 font-mono">
+            <span data-testid="task-short-id">{short.clone()}</span>
+            <button
+                type="button"
+                data-testid="task-copy-id"
+                class="p-0.5 rounded hover:bg-white/10 hover:text-white/70"
+                aria-label=format!("Copy full Task ID {full}")
+                title="Copy full Task ID"
+                draggable="false"
+                on:click=on_click
+                on:dragstart=move |e: web_sys::DragEvent| {
+                    e.prevent_default();
+                    e.stop_propagation();
+                }
+                on:mousedown=move |e: web_sys::MouseEvent| e.stop_propagation()
+            >
+                <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+            </button>
+        </span>
+    }
+}
+
+#[cfg(test)]
+mod short_id_tests {
+    use super::short_task_id;
+
+    #[test]
+    fn short_id_is_the_first_eight_hex_characters() {
+        let id = uuid::Uuid::parse_str("6f96fefa-1234-4abc-8def-000000000003").unwrap();
+        assert_eq!(short_task_id(&id), "6f96fefa");
+    }
+}
+
 /// Compact task card designed to fit well within Kanban columns
 /// Inspired by Auto Claude's clean, modern design
 #[component]
@@ -63,9 +127,10 @@ pub fn TaskCard(
             })}
 
             // Title - clean and prominent
-            <h4 data-testid="task-title" class="font-medium text-white/90 text-[13px] leading-snug mb-2.5 pr-6 line-clamp-2">
+            <h4 data-testid="task-title" title=task.title.clone() class="font-medium text-white/90 text-[13px] leading-snug mb-1 pr-6 line-clamp-2">
                 {task.title.clone()}
             </h4>
+            <div class="mb-2.5"><TaskIdCopy task_id=task.id /></div>
 
             // Needs you: first thing after the title, so it reads even when
             // the column's own colour is off-screen.

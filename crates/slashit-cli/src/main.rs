@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use slashit::{client, output};
+use slashit::{client, output, task_ref};
 use slashit_ipc::client::{ClientError, ClientOptions};
 use slashit_ipc::{InstanceInfo, IpcRequest};
 
@@ -250,6 +250,8 @@ async fn main() -> Result<()> {
     if let Commands::Daemon { command: DaemonCommands::Status } = &cli.command {
         return daemon_status(&options, cli.json).await;
     }
+    let mut cli = cli;
+    resolve_task_refs(&mut cli.command, &options).await;
     let request = request_for(&cli.command)?;
     if let IpcRequest::Quiesce { operation } = &request {
         // Printed before the send: if the reply is lost after the instance
@@ -299,6 +301,68 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Every Task reference a command carries, including dependencies.
+fn task_refs(command: &mut Commands) -> Vec<&mut String> {
+    match command {
+        Commands::Inspect { task_id }
+        | Commands::Runs { task_id }
+        | Commands::Move { task_id, .. }
+        | Commands::Edit { task_id, .. }
+        | Commands::SetModel { task_id, .. }
+        | Commands::SetReviewMode { task_id, .. }
+        | Commands::Delete { task_id }
+        | Commands::Enqueue { task_id } => vec![task_id],
+        Commands::SetDependencies { task_id, dependencies } => {
+            let mut refs = vec![task_id];
+            refs.extend(dependencies.iter_mut());
+            refs
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Replaces each Task reference with a full Task ID, or exits with status 1
+/// before anything is sent. A full UUID needs no lookup; a prefix is resolved
+/// from the Tasks the instance lists, so a mutation never acts on a guess.
+async fn resolve_task_refs(command: &mut Commands, options: &ClientOptions) {
+    let mut refs = task_refs(command);
+    if refs.is_empty() {
+        return;
+    }
+    let mut parsed = Vec::new();
+    for r in &refs {
+        match task_ref::parse(r) {
+            Ok(p) => parsed.push(p),
+            Err(e) => fail(&e),
+        }
+    }
+    let mut tasks = None;
+    if parsed.iter().any(|p| matches!(p, task_ref::TaskRef::Prefix(_))) {
+        let request = IpcRequest::ListTasks { project_id: None };
+        match slashit_ipc::client::send(&request, options).await {
+            Ok(response) if response.ok => tasks = Some(response.data),
+            Ok(response) => fail(&response.error.unwrap_or_else(|| "Unknown error".to_string())),
+            Err(e) => fail(&e.to_string()),
+        }
+    }
+    for (slot, p) in refs.iter_mut().zip(parsed) {
+        **slot = match p {
+            task_ref::TaskRef::Full(id) => id,
+            task_ref::TaskRef::Prefix(prefix) => {
+                match task_ref::resolve_prefix(&prefix, tasks.as_ref().unwrap_or(&serde_json::Value::Null)) {
+                    Ok(id) => id,
+                    Err(e) => fail(&e),
+                }
+            }
+        };
+    }
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("{}", output::error_line(message));
+    std::process::exit(1)
 }
 
 /// The path as an absolute one, resolved from this shell's directory. The
@@ -485,6 +549,18 @@ mod dispatch_tests {
     fn request_for_args(args: &[&str]) -> IpcRequest {
         let cli = Cli::try_parse_from(args).expect("the arguments parse");
         request_for(&cli.command).expect("the command maps to a request")
+    }
+
+    /// Every Task reference a command carries, dependencies included, is
+    /// offered for prefix resolution; commands without one offer none.
+    #[test]
+    fn task_refs_cover_ids_and_dependencies() {
+        let mut cli = Cli::try_parse_from(["slashit", "set-dependencies", "aaaaaaaa", "bbbbbbbb"])
+            .expect("the arguments parse");
+        let refs: Vec<String> = task_refs(&mut cli.command).into_iter().map(|r| r.clone()).collect();
+        assert_eq!(refs, ["aaaaaaaa", "bbbbbbbb"]);
+        let mut cli = Cli::try_parse_from(["slashit", "inspect", "aaaaaaaa"]).unwrap();
+        assert_eq!(task_refs(&mut cli.command).len(), 1);
     }
 
     /// `slashit runs` reaches the evidence verb, and only that verb: it must

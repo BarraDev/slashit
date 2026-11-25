@@ -1632,6 +1632,7 @@ async fn published_head_moved(
     // GitHub now reports B, and the drawer asks for it.
     gh.script_pr_view(&pr_view_answer(Some(&moved)))?;
     open_reviewed_drawer(driver, &executed).await?;
+    dismiss_toasts(driver).await?;
     click(driver, DRAWER_PR_REFRESH, "Refresh the pull request's status").await?;
     await_data_approval(driver, "published-moved", "the approval once GitHub reports another head").await?;
     let shown = await_text(
