@@ -544,7 +544,7 @@ async fn answer_human_message(
         append_system_prompt: None, disable_mcp: true, additional_dirs: vec![], isolate_customizations: false,
         json_schema: Some(crate::domain::conversation::coordinator_output_schema()),
     }).await;
-    let (output, run_lease) = match answer {
+    let (output, run_lease, mut turn_end) = match answer {
         Ok(answer) => answer,
         Err(reason) => return record_failed_turn(state, project_id, &reason).await,
     };
@@ -564,6 +564,7 @@ async fn answer_human_message(
     let saved = state.storage.save_conversation(&updated);
     drop(run_lease);
     saved.map_err(|error| reply_save_failure(&error))?;
+    turn_end.outcome = Outcome::Answered;
     Ok(snapshot(state, updated, None).await)
 }
 
@@ -762,16 +763,18 @@ pub async fn retry_project_message(
 /// One Coordinator turn: runs the Coordinator and answers its read-only
 /// lookups from current Task state until it returns a reply or a proposal.
 /// The returned lease is the last run's, so the Conversation stays marked live
-/// until the caller has persisted the result.
-async fn coordinator_turn(
+/// until the caller has persisted the result. A drive that fails writes its
+/// terminal line here; an answered one returns the [`TurnEnd`] the caller
+/// settles once the outcome is recorded.
+async fn coordinator_turn<'c>(
     state: &AppState,
     executor: &Arc<crate::queue::TaskExecutor>,
-    correlation: &Correlation,
+    correlation: &'c Correlation,
     project_id: Uuid,
     base_prompt: &str,
     limits: crate::coordinator_reads::PromptLimits,
     config_for: impl Fn(String) -> ClaudeRunConfig,
-) -> Result<(CoordinatorOutput, crate::queue::ProjectRunLease), String> {
+) -> Result<(CoordinatorOutput, crate::queue::ProjectRunLease, TurnEnd<'c>), String> {
     let tally = Mutex::new(TurnTally::default());
     let result = crate::coordinator_reads::drive(
         base_prompt,
@@ -798,9 +801,29 @@ async fn coordinator_turn(
         },
     )
     .await;
-    let tally = tally.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    diagnostics::emit(&diagnostics::turn_end_line(correlation, &tally, tally.final_outcome(result.is_ok())));
-    result
+    let tally = tally.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match result {
+        Ok((output, lease)) => Ok((output, lease, TurnEnd { correlation, tally, outcome: Outcome::Failed })),
+        Err(reason) => {
+            diagnostics::emit(&diagnostics::turn_end_line(correlation, &tally, tally.final_outcome(false)));
+            Err(reason)
+        }
+    }
+}
+
+/// The terminal `[coordinator-turn]` line of a turn whose provider answered,
+/// written when the caller is done with the turn. Every exit before the caller
+/// sets `outcome` to answered, including an early `?`, reports a failed turn.
+struct TurnEnd<'c> {
+    correlation: &'c Correlation,
+    tally: TurnTally,
+    outcome: Outcome,
+}
+
+impl Drop for TurnEnd<'_> {
+    fn drop(&mut self) {
+        diagnostics::emit(&diagnostics::turn_end_line(self.correlation, &self.tally, self.outcome));
+    }
 }
 
 /// The `[coordinator-context]` and `[coordinator-turn]` lines of a turn the
@@ -1276,7 +1299,7 @@ async fn continue_from_worker_result(
             return Err("Task executor is not ready".into());
         }
     };
-    let (output, run_lease) = coordinator_turn(state, &executor, &correlation, project_id, &prompt, limits, |prompt| ClaudeRunConfig {
+    let (output, run_lease, mut turn_end) = coordinator_turn(state, &executor, &correlation, project_id, &prompt, limits, |prompt| ClaudeRunConfig {
         prompt, working_dir: working_directory.path.clone(), tools: ToolAccess::ReadOnly, max_turns: Some(4), max_budget_usd: None,
         session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
         system_prompt: Some(FOLLOW_UP_SYSTEM_PROMPT.into()),
@@ -1319,6 +1342,7 @@ async fn continue_from_worker_result(
         .save_conversation(&conversation)
         .map_err(|error| ContinuationError::Persistence(error.to_string()))?;
     drop(run_lease);
+    turn_end.outcome = Outcome::Answered;
     Ok(conversation)
 }
 
@@ -2559,6 +2583,8 @@ mod tests {
             NullStructured,
             /// Fails, and makes `dir` read-only first, so the failure cannot be saved.
             FailAndFreeze(std::path::PathBuf),
+            /// Replies, and makes `dir` read-only first, so the reply cannot be saved.
+            ReplyAndFreeze(&'static str, std::path::PathBuf),
         }
 
         /// The run's final `result` event, with `output` wrapped as the `structured_output`
@@ -2577,6 +2603,11 @@ mod tests {
                 Step::Prose(text) => format!("printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{text}\"}}'"),
                 Step::NullStructured => "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"structured_output\":null}'".into(),
                 Step::FailAndFreeze(dir) => format!("chmod -R a-w '{}'; printf '%s\\n' 'provider unavailable' >&2; exit 2", dir.display()),
+                Step::ReplyAndFreeze(text, dir) => format!(
+                    "chmod -R a-w '{}'; {}",
+                    dir.display(),
+                    result_line(&format!(r#"{{"type":"reply","text":"{text}"}}"#))
+                ),
             }
         }
 
@@ -3004,6 +3035,34 @@ mod tests {
             assert_eq!(human_count(&conversation, "Second"), 1);
             assert!(matches!(conversation.entries.last().unwrap().kind, EntryKind::CoordinatorReply { .. }));
             assert_eq!(fx.runs(), 2);
+        }
+
+        /// The terminal turn line reports what was recorded, not what the
+        /// provider returned: a reply that cannot be saved ends a failed turn.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_turn_line_reports_the_recorded_outcome_not_the_provider_answer() {
+            let turn_lines = |lines: Vec<String>| {
+                lines.into_iter().filter(|line| line.starts_with("[coordinator-turn]")).collect::<Vec<_>>()
+            };
+
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Hello")]).await;
+            crate::coordinator_diagnostics::capture::start();
+            send(&fx, "Hi").await.expect("the reply is saved");
+            let saved = turn_lines(crate::coordinator_diagnostics::capture::finish());
+            assert_eq!(saved.len(), 1, "{saved:?}");
+            assert!(saved[0].contains("outcome=answered"), "{saved:?}");
+            // The fixture holds the PATH lock; the next fixture waits for it.
+            drop(fx);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let frozen = tmp.path().to_path_buf();
+            let fx = fixture(tmp, &[Step::ReplyAndFreeze("Hello", frozen.clone())]).await;
+            crate::coordinator_diagnostics::capture::start();
+            send(&fx, "Hi").await.expect_err("the reply could not be saved");
+            let unsaved = turn_lines(crate::coordinator_diagnostics::capture::finish());
+            std::process::Command::new("chmod").arg("-R").arg("u+w").arg(&frozen).status().unwrap();
+            assert_eq!(unsaved.len(), 1, "{unsaved:?}");
+            assert!(unsaved[0].contains("outcome=failed invocations=1"), "{unsaved:?}");
         }
 
         #[tokio::test(flavor = "multi_thread")]

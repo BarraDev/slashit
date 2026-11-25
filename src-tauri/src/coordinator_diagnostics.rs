@@ -204,7 +204,8 @@ impl TurnTally {
                 if report.outcome == Outcome::ReadRequested && !report.read_refused {
                     self.structured_reads += 1;
                 }
-                self.read_budget_exhausted |= report.read_refused;
+                self.read_budget_exhausted |=
+                    report.read_refused || self.structured_reads >= crate::coordinator_reads::READS_PER_TURN;
                 self.last_outcome = Some(report.outcome);
             }
         }
@@ -461,6 +462,20 @@ mod tests {
         assert_eq!(fields.get("invocations"), Some(&"4"));
         assert_eq!(fields.get("structured_reads"), Some(&"2"));
         assert_eq!(fields.get("read_budget_exhausted"), Some(&"true"));
+    }
+
+    #[test]
+    fn the_third_accepted_read_exhausts_the_budget_without_a_refusal() {
+        let turn = |reads: usize| {
+            let mut tally = TurnTally::default();
+            for _ in 0..reads {
+                tally.record(&invocation(Outcome::ReadRequested, false));
+            }
+            tally.record(&invocation(Outcome::Answered, false));
+            tally
+        };
+        assert!(turn(crate::coordinator_reads::READS_PER_TURN).read_budget_exhausted);
+        assert!(!turn(crate::coordinator_reads::READS_PER_TURN - 1).read_budget_exhausted);
     }
 
     #[test]
