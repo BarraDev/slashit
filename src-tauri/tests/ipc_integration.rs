@@ -590,7 +590,10 @@ async fn task_evidence_round_trips_over_the_local_endpoint() {
     assert_eq!(d["title"], "Wire evidence task");
     assert_eq!(d["runs"][0]["run"], 1);
     assert_eq!(d["runs"][0]["status"], "failed");
-    assert_eq!(d["runs"][0]["failure_reason"], "provider unreachable over the wire");
+    assert_eq!(
+        d["runs"][0]["failure_reason"],
+        "provider unreachable over the wire"
+    );
     assert_eq!(d["output"]["memory_only"], true);
 }
 
@@ -599,7 +602,9 @@ async fn task_evidence_fails_closed_on_an_unreadable_or_unknown_id() {
     let h = Harness::start().await;
 
     let bad = send(
-        &IpcRequest::GetTaskEvidence { task_id: "nope".into() },
+        &IpcRequest::GetTaskEvidence {
+            task_id: "nope".into(),
+        },
         &h.options(&h.local, None),
     )
     .await
@@ -669,7 +674,9 @@ async fn task_evidence_is_refused_without_the_tcp_token() {
     let wrong = envelope_roundtrip(
         &h.tcp,
         &serde_json::to_value(IpcEnvelope::with_auth(
-            IpcRequest::GetTaskEvidence { task_id: id.to_string() },
+            IpcRequest::GetTaskEvidence {
+                task_id: id.to_string(),
+            },
             "0".repeat(64),
         ))
         .unwrap(),
@@ -720,7 +727,6 @@ async fn task_evidence_fails_closed_on_a_malformed_envelope() {
         "a task_id of the wrong type is malformed: {error}"
     );
 }
-
 
 // ---------------------------------------------------------------------------
 // Single-instance ownership
@@ -1007,8 +1013,15 @@ async fn an_import_is_refused_to_an_unidentified_peer_and_admitted_locally() {
 #[tokio::test]
 async fn a_preview_is_refused_to_an_unidentified_peer_before_it_reads_the_file() {
     let h = Harness::start().await;
-    let missing = h._tmp.path().join("missing.json").to_string_lossy().into_owned();
-    let request = IpcRequest::PreviewImport { path: missing.clone() };
+    let missing = h
+        ._tmp
+        .path()
+        .join("missing.json")
+        .to_string_lossy()
+        .into_owned();
+    let request = IpcRequest::PreviewImport {
+        path: missing.clone(),
+    };
 
     let local = send(&request, &h.options(&h.local, None))
         .await
@@ -1020,8 +1033,14 @@ async fn a_preview_is_refused_to_an_unidentified_peer_before_it_reads_the_file()
         .expect("the request should be answered, not dropped");
     let error = error_of(&refused);
     assert!(error.contains("not available to clients"), "{error}");
-    assert!(!error.contains("could not read"), "reached the handler: {error}");
-    assert!(!error.contains(&missing), "the refusal echoed the path: {error}");
+    assert!(
+        !error.contains("could not read"),
+        "reached the handler: {error}"
+    );
+    assert!(
+        !error.contains(&missing),
+        "the refusal echoed the path: {error}"
+    );
 
     let bundle = h._tmp.path().join("bundle.json");
     let golden: &[u8] = include_bytes!("../src/portability/testdata/export-v1.golden.json");

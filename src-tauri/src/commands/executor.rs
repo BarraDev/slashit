@@ -10,8 +10,7 @@ pub async fn execute_task(
     task_id: String,
 ) -> Result<(), String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let executor = state.executor.get()
-        .ok_or("Executor not initialized")?;
+    let executor = state.executor.get().ok_or("Executor not initialized")?;
     executor.execute_task(task_id).await
 }
 
@@ -22,8 +21,7 @@ pub async fn stop_task_execution(
     task_id: String,
 ) -> Result<(), String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let executor = state.executor.get()
-        .ok_or("Executor not initialized")?;
+    let executor = state.executor.get().ok_or("Executor not initialized")?;
     executor.stop_task(task_id).await
 }
 
@@ -43,8 +41,7 @@ pub async fn get_task_run(
     task_id: String,
 ) -> Result<crate::queue::executor::TaskRunSnapshot, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let executor = state.executor.get()
-        .ok_or("Executor not initialized")?;
+    let executor = state.executor.get().ok_or("Executor not initialized")?;
     Ok(executor.task_run(task_id).await)
 }
 
@@ -54,8 +51,7 @@ pub async fn get_task_output(
     task_id: String,
 ) -> Result<Vec<AgentLogEntry>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let executor = state.executor.get()
-        .ok_or("Executor not initialized")?;
+    let executor = state.executor.get().ok_or("Executor not initialized")?;
     Ok(executor.get_task_output(task_id).await)
 }
 
@@ -65,7 +61,6 @@ pub async fn get_task_output(
 pub async fn get_live_runs(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<crate::queue::executor::LiveRun>, String> {
-    let executor = state.executor.get()
-        .ok_or("Executor not initialized")?;
+    let executor = state.executor.get().ok_or("Executor not initialized")?;
     Ok(executor.live_runs().await)
 }

@@ -28,7 +28,8 @@ use super::restack;
 /// edit made in the same moment and report a stale blob. Files Git ignores are
 /// not part of it, as they are not part of a commit.
 pub async fn checkout_snapshot(working_dir: &str) -> Result<String, String> {
-    let scratch = std::env::temp_dir().join(format!("slashit-snapshot-{}.index", uuid::Uuid::new_v4()));
+    let scratch =
+        std::env::temp_dir().join(format!("slashit-snapshot-{}.index", uuid::Uuid::new_v4()));
     let result = snapshot_with_index(working_dir, &scratch).await;
     let _ = tokio::fs::remove_file(&scratch).await;
     result
@@ -65,7 +66,14 @@ async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, 
     // The real index is read, not the scratch one. A path deleted since staging is
     // left out, as `add -A` would drop it.
     let staged = crate::host_process::tokio_command("git")
-        .args(["diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A", "-z"])
+        .args([
+            "diff",
+            "--cached",
+            "--no-renames",
+            "--name-only",
+            "--diff-filter=A",
+            "-z",
+        ])
         .current_dir(working_dir)
         .output()
         .await
@@ -126,21 +134,33 @@ pub enum Survival {
 /// Git runs with the C locale, with the user's diff, rename and whitespace
 /// settings turned off. A path that is not valid UTF-8, or trees that are gone,
 /// are [`Survival::Absent`]; a Git that cannot be run is [`Survival::Unknown`].
-pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, commit: &str) -> Survival {
+pub async fn effect_survives_in(
+    working_dir: &str,
+    before: &str,
+    after: &str,
+    commit: &str,
+) -> Survival {
     let git = |args: Vec<String>, index: Option<std::path::PathBuf>| async move {
         let mut cmd = crate::host_process::tokio_command("git");
-        cmd.args(["--literal-pathspecs", "-c", "apply.ignoreWhitespace=false", "-c", "apply.whitespace=nowarn"])
-            .args(&args)
-            .env("LC_ALL", "C")
-            .env("LANGUAGE", "C")
-            .current_dir(working_dir);
+        cmd.args([
+            "--literal-pathspecs",
+            "-c",
+            "apply.ignoreWhitespace=false",
+            "-c",
+            "apply.whitespace=nowarn",
+        ])
+        .args(&args)
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
+        .current_dir(working_dir);
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);
         }
         cmd.output().await.ok()
     };
     let strings = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
-    let succeeded = |o: &Option<std::process::Output>| o.as_ref().is_some_and(|o| o.status.success());
+    let succeeded =
+        |o: &Option<std::process::Output>| o.as_ref().is_some_and(|o| o.status.success());
     // Hunk positions of a patch: its `@@ -a,b +c,d @@` markers.
     let hunk_markers = |patch: &[u8]| -> Vec<String> {
         String::from_utf8_lossy(patch)
@@ -153,7 +173,11 @@ pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, co
     // Objects that exist but could not be read are unknown; objects that are
     // gone are not coming back.
     for (object, kind) in [(before, "tree"), (after, "tree"), (commit, "commit")] {
-        let probe = git(strings(&["cat-file", "-e", &format!("{object}^{{{kind}}}")]), None).await;
+        let probe = git(
+            strings(&["cat-file", "-e", &format!("{object}^{{{kind}}}")]),
+            None,
+        )
+        .await;
         match probe {
             None => return Survival::Unknown,
             Some(o) if !o.status.success() => return Survival::Absent,
@@ -162,14 +186,29 @@ pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, co
     }
 
     let raw = git(
-        strings(&["diff-tree", "-r", "-z", "--raw", "--no-renames", "--no-ext-diff", "--no-color", "--full-index", before, after]),
+        strings(&[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--raw",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-color",
+            "--full-index",
+            before,
+            after,
+        ]),
         None,
     )
     .await;
-    let Some(raw) = raw.filter(|o| o.status.success()) else { return Survival::Unknown };
+    let Some(raw) = raw.filter(|o| o.status.success()) else {
+        return Survival::Unknown;
+    };
     // A path that is not valid UTF-8 cannot be handed back to Git by name, so
     // nothing about it can be checked: never proven, never a lossy guess.
-    let Ok(text) = String::from_utf8(raw.stdout) else { return Survival::Absent };
+    let Ok(text) = String::from_utf8(raw.stdout) else {
+        return Survival::Absent;
+    };
     // ":<old mode> <new mode> <old blob> <new blob> <status>\0<path>\0" ...
     let mut parts = text.split('\0').filter(|p| !p.is_empty());
     let mut changes: Vec<(String, String, String, String)> = Vec::new(); // status, mode, blob, path
@@ -178,7 +217,12 @@ pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, co
         if fields.len() != 5 {
             return Survival::Unknown;
         }
-        changes.push((fields[4].to_string(), fields[1].to_string(), fields[3].to_string(), path.to_string()));
+        changes.push((
+            fields[4].to_string(),
+            fields[1].to_string(),
+            fields[3].to_string(),
+            path.to_string(),
+        ));
     }
     if changes.is_empty() {
         return Survival::Absent;
@@ -187,13 +231,21 @@ pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, co
     let mut listing = strings(&["ls-tree", "-r", "-z", "--full-tree", commit, "--"]);
     listing.extend(changes.iter().map(|c| c.3.clone()));
     let listed = git(listing, None).await;
-    let Some(listed) = listed.filter(|o| o.status.success()) else { return Survival::Unknown };
-    let Ok(listed) = String::from_utf8(listed.stdout) else { return Survival::Absent };
+    let Some(listed) = listed.filter(|o| o.status.success()) else {
+        return Survival::Unknown;
+    };
+    let Ok(listed) = String::from_utf8(listed.stdout) else {
+        return Survival::Absent;
+    };
     let mut in_commit: std::collections::HashMap<&str, (&str, &str)> = Default::default();
     for entry in listed.split('\0').filter(|e| !e.is_empty()) {
-        let Some((meta, path)) = entry.split_once('\t') else { return Survival::Unknown };
+        let Some((meta, path)) = entry.split_once('\t') else {
+            return Survival::Unknown;
+        };
         let mut f = meta.split(' ');
-        let (Some(mode), Some(_kind), Some(blob)) = (f.next(), f.next(), f.next()) else { return Survival::Unknown };
+        let (Some(mode), Some(_kind), Some(blob)) = (f.next(), f.next(), f.next()) else {
+            return Survival::Unknown;
+        };
         in_commit.insert(path, (mode, blob));
     }
 
@@ -226,12 +278,27 @@ pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, co
         }
         for path in needs_patch {
             let diff = git(
-                strings(&["diff-tree", "-p", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-color", before, after, "--", path]),
+                strings(&[
+                    "diff-tree",
+                    "-p",
+                    "--binary",
+                    "--full-index",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-color",
+                    before,
+                    after,
+                    "--",
+                    path,
+                ]),
                 None,
             )
             .await;
-            let Some(diff) = diff.filter(|o| o.status.success()) else { return Survival::Unknown };
-            if diff.stdout.is_empty() || tokio::fs::write(&patch_file, &diff.stdout).await.is_err() {
+            let Some(diff) = diff.filter(|o| o.status.success()) else {
+                return Survival::Unknown;
+            };
+            if diff.stdout.is_empty() || tokio::fs::write(&patch_file, &diff.stdout).await.is_err()
+            {
                 return Survival::Unknown;
             }
             let p = patch_file.display().to_string();
@@ -263,18 +330,35 @@ pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, co
             if !succeeded(&reversed) {
                 return Survival::Absent;
             }
-            let Some(tree) = git(strings(&["write-tree"]), Some(index.clone())).await.filter(|o| o.status.success()) else {
+            let Some(tree) = git(strings(&["write-tree"]), Some(index.clone()))
+                .await
+                .filter(|o| o.status.success())
+            else {
                 return Survival::Unknown;
             };
             let reverted = String::from_utf8_lossy(&tree.stdout).trim().to_string();
             // Putting it back must be a change at the same places the agent
             // made it: a hunk that only fit elsewhere moves them.
             let redo = git(
-                strings(&["diff-tree", "-p", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-color", &reverted, commit, "--", path]),
+                strings(&[
+                    "diff-tree",
+                    "-p",
+                    "--binary",
+                    "--full-index",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-color",
+                    &reverted,
+                    commit,
+                    "--",
+                    path,
+                ]),
                 None,
             )
             .await;
-            let Some(redo) = redo.filter(|o| o.status.success()) else { return Survival::Unknown };
+            let Some(redo) = redo.filter(|o| o.status.success()) else {
+                return Survival::Unknown;
+            };
             if hunk_markers(&redo.stdout) != hunk_markers(&diff.stdout) {
                 return Survival::Absent;
             }
@@ -353,8 +437,16 @@ mod tests {
     use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git").args(args).current_dir(dir).output().expect("run git");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -365,14 +457,20 @@ mod tests {
         let origin = tmp.path().join("origin.git");
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        git(tmp.path(), &["init", "-q", "--bare", origin.to_str().unwrap()]);
+        git(
+            tmp.path(),
+            &["init", "-q", "--bare", origin.to_str().unwrap()],
+        );
         git(&work, &["init", "-q", "-b", "task"]);
         git(&work, &["config", "user.email", "t@example.com"]);
         git(&work, &["config", "user.name", "T"]);
         std::fs::write(work.join("a.txt"), "a\n").unwrap();
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-q", "-m", "base"]);
-        git(&work, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
         git(&work, &["push", "-q", "-u", "origin", "task"]);
         (tmp, work)
     }
@@ -382,18 +480,34 @@ mod tests {
         let (_tmp, work) = checkout_with_origin();
         let dir = work.to_str().unwrap();
         let clean = checkout_snapshot(dir).await.unwrap();
-        assert_eq!(checkout_snapshot(dir).await.unwrap(), clean, "a snapshot is repeatable");
+        assert_eq!(
+            checkout_snapshot(dir).await.unwrap(),
+            clean,
+            "a snapshot is repeatable"
+        );
 
         std::fs::write(work.join("b.txt"), "new\n").unwrap();
         let with_new = checkout_snapshot(dir).await.unwrap();
         assert_ne!(with_new, clean, "an untracked file counts");
         std::fs::write(work.join("a.txt"), "edited\n").unwrap();
-        assert_ne!(checkout_snapshot(dir).await.unwrap(), with_new, "an edit counts");
+        assert_ne!(
+            checkout_snapshot(dir).await.unwrap(),
+            with_new,
+            "an edit counts"
+        );
         std::fs::remove_file(work.join("b.txt")).unwrap();
         std::fs::write(work.join("a.txt"), "a\n").unwrap();
-        assert_eq!(checkout_snapshot(dir).await.unwrap(), clean, "putting everything back is no change");
+        assert_eq!(
+            checkout_snapshot(dir).await.unwrap(),
+            clean,
+            "putting everything back is no change"
+        );
 
-        assert_eq!(git(&work, &["status", "--porcelain"]), "", "the checkout's own index is untouched");
+        assert_eq!(
+            git(&work, &["status", "--porcelain"]),
+            "",
+            "the checkout's own index is untouched"
+        );
         assert_eq!(git(&work, &["diff", "--cached", "--name-only"]), "");
     }
 
@@ -410,12 +524,23 @@ mod tests {
         let remote = RemoteBranch::refresh(dir, Some("task")).await;
         assert_eq!(remote.unavailable(), None);
         assert!(remote.contains(&pushed).await);
-        assert!(!remote.contains(&local_only).await, "committed locally is not delivered");
-        assert!(!remote.contains(&"0".repeat(40)).await, "an unknown commit is not contained");
+        assert!(
+            !remote.contains(&local_only).await,
+            "committed locally is not delivered"
+        );
+        assert!(
+            !remote.contains(&"0".repeat(40)).await,
+            "an unknown commit is not contained"
+        );
         assert!(!remote.contains("not-an-object-id").await);
 
         git(&work, &["push", "-q", "origin", "task"]);
-        assert!(RemoteBranch::refresh(dir, Some("task")).await.contains(&local_only).await);
+        assert!(
+            RemoteBranch::refresh(dir, Some("task"))
+                .await
+                .contains(&local_only)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -427,12 +552,28 @@ mod tests {
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-q", "-m", "fix"]);
         let fix = git(&work, &["rev-parse", "HEAD"]);
-        let twin = git(&work, &["commit-tree", &format!("{fix}^{{tree}}"), "-p", &base, "-m", "twin"]);
-        git(&work, &["push", "-q", "origin", &format!("{twin}:refs/heads/task")]);
+        let twin = git(
+            &work,
+            &[
+                "commit-tree",
+                &format!("{fix}^{{tree}}"),
+                "-p",
+                &base,
+                "-m",
+                "twin",
+            ],
+        );
+        git(
+            &work,
+            &["push", "-q", "origin", &format!("{twin}:refs/heads/task")],
+        );
 
         let remote = RemoteBranch::refresh(dir, Some("task")).await;
         assert!(remote.contains(&twin).await);
-        assert!(!remote.contains(&fix).await, "the same tree and parent under another ID is another commit");
+        assert!(
+            !remote.contains(&fix).await,
+            "the same tree and parent under another ID is another commit"
+        );
     }
 
     #[tokio::test]
@@ -445,14 +586,27 @@ mod tests {
         git(&work, &["commit", "-q", "-m", "fix"]);
         let fix = git(&work, &["rev-parse", "HEAD"]);
         git(&work, &["push", "-q", "origin", "task"]);
-        assert!(RemoteBranch::refresh(dir, Some("task")).await.contains(&fix).await);
+        assert!(
+            RemoteBranch::refresh(dir, Some("task"))
+                .await
+                .contains(&fix)
+                .await
+        );
 
         // Someone else rewrites the branch on the server.
         let origin = git(&work, &["remote", "get-url", "origin"]);
-        git(&work, &["--git-dir", &origin, "update-ref", "refs/heads/task", &base]);
+        git(
+            &work,
+            &["--git-dir", &origin, "update-ref", "refs/heads/task", &base],
+        );
         // The tracking ref still says the fix is there until it is refreshed.
         assert_eq!(git(&work, &["rev-parse", "origin/task"]), fix);
-        assert!(!RemoteBranch::refresh(dir, Some("task")).await.contains(&fix).await);
+        assert!(
+            !RemoteBranch::refresh(dir, Some("task"))
+                .await
+                .contains(&fix)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -460,12 +614,21 @@ mod tests {
         let (_tmp, work) = checkout_with_origin();
         let dir = work.to_str().unwrap();
         let pushed = git(&work, &["rev-parse", "HEAD"]);
-        git(&work, &["remote", "set-url", "origin", "/nonexistent/remote.git"]);
+        git(
+            &work,
+            &["remote", "set-url", "origin", "/nonexistent/remote.git"],
+        );
 
         let remote = RemoteBranch::refresh(dir, Some("task")).await;
         assert!(remote.unavailable().is_some());
         assert!(!remote.contains(&pushed).await);
-        assert!(RemoteBranch::refresh(dir, None).await.unavailable().is_some(), "no branch, no proof");
+        assert!(
+            RemoteBranch::refresh(dir, None)
+                .await
+                .unavailable()
+                .is_some(),
+            "no branch, no proof"
+        );
     }
 
     /// Snapshot trees before and after `change` runs in `work`, then put the
@@ -481,7 +644,8 @@ mod tests {
     }
 
     async fn survives(work: &Path, effect: &(String, String), commit: &str) -> bool {
-        effect_survives_in(work.to_str().unwrap(), &effect.0, &effect.1, commit).await == Survival::Present
+        effect_survives_in(work.to_str().unwrap(), &effect.0, &effect.1, commit).await
+            == Survival::Present
     }
 
     /// A reverted change whose lines also exist, with identical context,
@@ -491,15 +655,26 @@ mod tests {
     async fn a_match_found_only_at_an_offset_elsewhere_is_not_survival() {
         let (_tmp, work) = checkout_with_origin();
         let pad = "pad\npad\npad\n";
-        std::fs::write(work.join("f"), format!("{pad}q\nlog\nr\n{pad}mid\n{pad}q\nr\n{pad}")).unwrap();
+        std::fs::write(
+            work.join("f"),
+            format!("{pad}q\nlog\nr\n{pad}mid\n{pad}q\nr\n{pad}"),
+        )
+        .unwrap();
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-q", "-m", "two blocks"]);
         let head = git(&work, &["rev-parse", "HEAD"]);
         let effect = effect_of(&work, |w| {
-            std::fs::write(w.join("f"), format!("{pad}q\nlog\nr\n{pad}mid\n{pad}q\nlog\nr\n{pad}")).unwrap();
+            std::fs::write(
+                w.join("f"),
+                format!("{pad}q\nlog\nr\n{pad}mid\n{pad}q\nlog\nr\n{pad}"),
+            )
+            .unwrap();
         })
         .await;
-        assert!(!survives(&work, &effect, &head).await, "the change was reverted");
+        assert!(
+            !survives(&work, &effect, &head).await,
+            "the change was reverted"
+        );
     }
 
     /// A change that only toggles a file's executable bit survives only if
@@ -511,12 +686,17 @@ mod tests {
         let (_tmp, work) = checkout_with_origin();
         let head = git(&work, &["rev-parse", "HEAD"]);
         let effect = effect_of(&work, |w| {
-            std::fs::set_permissions(w.join("a.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(w.join("a.txt"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         })
         .await;
-        assert!(!survives(&work, &effect, &head).await, "the mode was never committed");
+        assert!(
+            !survives(&work, &effect, &head).await,
+            "the mode was never committed"
+        );
 
-        std::fs::set_permissions(work.join("a.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(work.join("a.txt"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-q", "-m", "mode"]);
         assert!(survives(&work, &effect, &git(&work, &["rev-parse", "HEAD"])).await);
@@ -531,7 +711,8 @@ mod tests {
         let (_tmp, work) = checkout_with_origin();
         let effect = effect_of(&work, |w| {
             std::fs::write(w.join("a.txt"), "a\nmore\n").unwrap();
-            std::fs::set_permissions(w.join("a.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(w.join("a.txt"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         })
         .await;
         std::fs::write(work.join("a.txt"), "a\nmore\n").unwrap();
@@ -552,7 +733,10 @@ mod tests {
         let effect = effect_of(&work, |w| std::fs::write(w.join("w.txt"), "a b\n").unwrap()).await;
         git(&work, &["config", "apply.ignoreWhitespace", "change"]);
         git(&work, &["config", "apply.whitespace", "fix"]);
-        assert!(!survives(&work, &effect, &head).await, "the collapsed spacing was never committed");
+        assert!(
+            !survives(&work, &effect, &head).await,
+            "the collapsed spacing was never committed"
+        );
     }
 
     /// A path that is not valid UTF-8 cannot be matched by name, so a change to
@@ -571,7 +755,10 @@ mod tests {
             std::fs::remove_file(w.join(std::ffi::OsStr::from_bytes(b"bad\xffname"))).unwrap();
         })
         .await;
-        assert!(!survives(&work, &effect, &head).await, "the file is still in the commit");
+        assert!(
+            !survives(&work, &effect, &head).await,
+            "the file is still in the commit"
+        );
     }
 
     /// Two identical blocks, the second already holding a `log` line. The agent
@@ -597,7 +784,10 @@ mod tests {
         git(&work, &["commit", "-q", "-m", "block one rewritten"]);
         let head = git(&work, &["rev-parse", "HEAD"]);
 
-        let saved: Vec<_> = ["LC_ALL", "LANGUAGE"].iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        let saved: Vec<_> = ["LC_ALL", "LANGUAGE"]
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
         // Safety: only this test touches these two variables.
         unsafe {
             std::env::set_var("LC_ALL", "de_DE.UTF-8");
@@ -612,7 +802,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(verdict, Survival::Absent, "the change only fits at block 2, not where it was made");
+        assert_eq!(
+            verdict,
+            Survival::Absent,
+            "the change only fits at block 2, not where it was made"
+        );
     }
 
     /// Reverse and forward both fit at the recorded place only for a patch
@@ -632,7 +826,10 @@ mod tests {
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-q", "-m", "other"]);
         let head = git(&work, &["rev-parse", "HEAD"]);
-        assert_ne!(effect_survives_in(dir, &before, &after, &head).await, Survival::Present);
+        assert_ne!(
+            effect_survives_in(dir, &before, &after, &head).await,
+            Survival::Present
+        );
     }
 
     /// A file the agent deleted that the commit still has is not a deletion
@@ -642,7 +839,10 @@ mod tests {
         let (_tmp, work) = checkout_with_origin();
         let head = git(&work, &["rev-parse", "HEAD"]);
         let effect = effect_of(&work, |w| std::fs::remove_file(w.join("a.txt")).unwrap()).await;
-        assert!(!survives(&work, &effect, &head).await, "a.txt is still in the commit");
+        assert!(
+            !survives(&work, &effect, &head).await,
+            "a.txt is still in the commit"
+        );
         git(&work, &["rm", "-q", "a.txt"]);
         git(&work, &["commit", "-q", "-m", "deleted"]);
         assert!(survives(&work, &effect, &git(&work, &["rev-parse", "HEAD"])).await);
@@ -682,6 +882,9 @@ mod tests {
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-q", "-m", "binary, but another one"]);
         let head = git(&work, &["rev-parse", "HEAD"]);
-        assert_ne!(effect_survives_in(dir, &before, &after, &head).await, Survival::Present);
+        assert_ne!(
+            effect_survives_in(dir, &before, &after, &head).await,
+            Survival::Present
+        );
     }
 }

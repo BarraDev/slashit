@@ -56,7 +56,9 @@ pub enum AcpError {
     NotInitialized,
     #[error("the agent did not return a usable session identifier")]
     InvalidSessionId,
-    #[error("the agent does not accept additional directories, so this session cannot be given them")]
+    #[error(
+        "the agent does not accept additional directories, so this session cannot be given them"
+    )]
     AdditionalDirectoriesUnsupported,
     #[error("{method} failed with JSON-RPC error {code}: {message}")]
     Rpc {
@@ -680,7 +682,10 @@ fn fail(shared: &Arc<Shared>, error: AcpError, kill: bool) {
             return;
         }
         // The first failure is the reason, even when a later one is reported.
-        state.failure.as_ref().map_or_else(|| error.to_string(), ToString::to_string)
+        state
+            .failure
+            .as_ref()
+            .map_or_else(|| error.to_string(), ToString::to_string)
     };
     fail_pending(shared, &error);
     if kill {
@@ -920,7 +925,9 @@ mod tests {
             group: process::GroupEnd::Unconfirmed("killpg: Operation not permitted".into()),
         })))
         .expect("the receiver is held");
-        let error = wait_for_exit(&mut rx).await.expect_err("an unconfirmed group fails");
+        let error = wait_for_exit(&mut rx)
+            .await
+            .expect_err("an unconfirmed group fails");
         assert!(error.contains("killpg: Operation not permitted"), "{error}");
     }
 
@@ -932,7 +939,9 @@ mod tests {
             group: process::GroupEnd::Ended,
         })))
         .expect("the receiver is held");
-        let status = wait_for_exit(&mut rx).await.expect("an ended group reports its status");
+        let status = wait_for_exit(&mut rx)
+            .await
+            .expect("an ended group reports its status");
         assert!(status.success());
     }
 }

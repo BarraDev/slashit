@@ -128,7 +128,10 @@ async fn recorded_checkouts(sources: &Sources) -> Vec<(RecordedCheckout, Option<
 /// repository's key canonicalizes its path, which may be on a slow mount, so
 /// this runs with the walk rather than on the async runtime, once per
 /// repository.
-fn with_worktree_roots(paths: &AppPaths, recorded: Vec<(RecordedCheckout, Option<String>)>) -> Vec<RecordedCheckout> {
+fn with_worktree_roots(
+    paths: &AppPaths,
+    recorded: Vec<(RecordedCheckout, Option<String>)>,
+) -> Vec<RecordedCheckout> {
     let mut roots: HashMap<String, PathBuf> = HashMap::new();
     recorded
         .into_iter()
@@ -136,7 +139,9 @@ fn with_worktree_roots(paths: &AppPaths, recorded: Vec<(RecordedCheckout, Option
             checkout.worktree_root = repository.map(|repo| {
                 roots
                     .entry(repo)
-                    .or_insert_with_key(|repo| paths.worktrees_root(&ProjectKey::for_path(Path::new(repo)).key))
+                    .or_insert_with_key(|repo| {
+                        paths.worktrees_root(&ProjectKey::for_path(Path::new(repo)).key)
+                    })
                     .clone()
             });
             checkout
@@ -154,9 +159,14 @@ pub(crate) fn filesystem_space(path: &Path) -> std::io::Result<FilesystemSpace> 
 /// otherwise read as Normal.
 fn space_of(total_bytes: u64, available_bytes: u64) -> std::io::Result<FilesystemSpace> {
     if total_bytes == 0 {
-        return Err(std::io::Error::other("the filesystem reported a size of zero"));
+        return Err(std::io::Error::other(
+            "the filesystem reported a size of zero",
+        ));
     }
-    Ok(FilesystemSpace { total_bytes, available_bytes })
+    Ok(FilesystemSpace {
+        total_bytes,
+        available_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -168,7 +178,10 @@ mod tests {
         assert!(space_of(0, 0).is_err());
         assert_eq!(
             space_of(10, 4).unwrap(),
-            FilesystemSpace { total_bytes: 10, available_bytes: 4 }
+            FilesystemSpace {
+                total_bytes: 10,
+                available_bytes: 4
+            }
         );
     }
 }

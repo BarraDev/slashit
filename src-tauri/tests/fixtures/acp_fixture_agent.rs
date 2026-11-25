@@ -168,7 +168,8 @@ fn dispatch(io: &mut Io, scenario: &str, message: &Value) {
                     json!({"configOptions": [{"id": "model", "currentValue": "opencode/flint-40b-free"}]}),
                 ),
                 _ => {
-                    *SELECTED_MODEL.lock().unwrap_or_else(|p| p.into_inner()) = Some(value.to_string());
+                    *SELECTED_MODEL.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some(value.to_string());
                     respond(
                         io,
                         &id,
@@ -260,7 +261,10 @@ fn stream_turn(io: &mut Io, id: &Value, session: &Value) {
 /// makes one change in its working directory, and ends the turn normally.
 fn edit_turn(io: &mut Io, id: &Value, session: &Value, message: &Value) {
     if let Some(record) = std::env::args().nth(2) {
-        let model = SELECTED_MODEL.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let model = SELECTED_MODEL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let body = json!({"prompt": message["params"]["prompt"], "model": model});
         std::fs::write(record, body.to_string()).expect("the prompt record is writable");
     }

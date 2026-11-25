@@ -27,7 +27,10 @@ fn no_worktree_diff(task_id: Uuid) -> String {
 ///
 /// A branch whose commit cannot be read is an error: showing the working tree
 /// instead would present content that the approval does not cover.
-async fn review_tip(state: &crate::AppState, task: &crate::domain::Task) -> Result<Option<String>, String> {
+async fn review_tip(
+    state: &crate::AppState,
+    task: &crate::domain::Task,
+) -> Result<Option<String>, String> {
     if task.status != crate::domain::TaskStatus::HumanReview
         || task.worktree_path.is_none()
         || task.branch_name.is_none()
@@ -50,7 +53,10 @@ async fn diff_to_tip(
     task: &crate::domain::Task,
     tip: &str,
 ) -> Result<crate::worktree::TaskDiff, crate::worktree::TaskDiffError> {
-    let base = task.base_commit.as_deref().ok_or(crate::worktree::TaskDiffError::UnknownBoundary)?;
+    let base = task
+        .base_commit
+        .as_deref()
+        .ok_or(crate::worktree::TaskDiffError::UnknownBoundary)?;
     let repo = crate::commands::integration::repo_path_of(state, task.project_id)
         .await
         .map_err(crate::worktree::TaskDiffError::Failed)?;
@@ -135,8 +141,12 @@ pub(crate) async fn fetch_review_changes(
     let Some(tip) = review_tip(state, &task).await? else {
         return Ok(None);
     };
-    let committed = diff_to_tip(state, &task, &tip).await.map_err(|e| describe(task_uuid, e))?;
-    let pending = crate::worktree::pending_task_diff(wt_path, &tip).await.map_err(|e| describe(task_uuid, e))?;
+    let committed = diff_to_tip(state, &task, &tip)
+        .await
+        .map_err(|e| describe(task_uuid, e))?;
+    let pending = crate::worktree::pending_task_diff(wt_path, &tip)
+        .await
+        .map_err(|e| describe(task_uuid, e))?;
     Ok(Some(ReviewChanges {
         tip,
         patch: committed.patch,

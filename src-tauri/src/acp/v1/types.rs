@@ -194,8 +194,14 @@ pub fn parse_session_update(params: &Value) -> Option<(String, SessionUpdate)> {
             if kind == "tool_call" {
                 SessionUpdate::ToolCall {
                     tool_call_id,
-                    title: update.get("title").and_then(Value::as_str).map(str::to_string),
-                    kind: update.get("kind").and_then(Value::as_str).map(str::to_string),
+                    title: update
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    kind: update
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     raw_input: update.get("rawInput").cloned(),
                     status,
                 }
@@ -439,7 +445,10 @@ mod tests {
             Some("ollama/llama3.2:3b")
         );
         assert_eq!(config_option_value(&result, "thought_level"), None);
-        assert_eq!(config_option_value(&json!({"configOptions": []}), "model"), None);
+        assert_eq!(
+            config_option_value(&json!({"configOptions": []}), "model"),
+            None
+        );
         assert_eq!(config_option_value(&json!({}), "model"), None);
         let not_a_string = json!({"configOptions": [{"id": "model", "currentValue": 3}]});
         assert_eq!(config_option_value(&not_a_string, "model"), None);

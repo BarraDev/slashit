@@ -47,10 +47,12 @@ pub async fn commit_checkout(
     branch: &str,
     message: &str,
 ) -> Result<CheckoutCommit, String> {
-    Ok(match commit(working_dir, branch, message, false, None).await? {
-        Some(commit) => CheckoutCommit::Committed { commit },
-        None => CheckoutCommit::NothingToCommit,
-    })
+    Ok(
+        match commit(working_dir, branch, message, false, None).await? {
+            Some(commit) => CheckoutCommit::Committed { commit },
+            None => CheckoutCommit::NothingToCommit,
+        },
+    )
 }
 
 /// [`commit_checkout`] for a caller that has checked the checkout's content as
@@ -64,10 +66,12 @@ pub async fn commit_checkout_verified(
     message: &str,
     expected_tree: &str,
 ) -> Result<CheckoutCommit, String> {
-    Ok(match commit(working_dir, branch, message, false, Some(expected_tree)).await? {
-        Some(commit) => CheckoutCommit::Committed { commit },
-        None => CheckoutCommit::NothingToCommit,
-    })
+    Ok(
+        match commit(working_dir, branch, message, false, Some(expected_tree)).await? {
+            Some(commit) => CheckoutCommit::Committed { commit },
+            None => CheckoutCommit::NothingToCommit,
+        },
+    )
 }
 
 /// [`commit_checkout`], except that a checkout without changes still gets a
@@ -109,18 +113,24 @@ pub async fn checkout_head_commit(working_dir: &str) -> Result<String, String> {
 pub async fn checkout_has_work(working_dir: &str, base: Option<&str>) -> Result<bool, String> {
     // `--untracked-files=normal` overrides `status.showUntrackedFiles=no`, which
     // would otherwise hide a new file that the run created.
-    let status = git(working_dir, &["status", "--porcelain", "--untracked-files=normal"])
-        .await
-        .map_err(|e| format!("git status failed: {e}"))?;
+    let status = git(
+        working_dir,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )
+    .await
+    .map_err(|e| format!("git status failed: {e}"))?;
     if !status.is_empty() {
         return Ok(true);
     }
     let Some(base) = base else {
         return Ok(false);
     };
-    let ahead = git(working_dir, &["rev-list", "--count", &format!("{base}..HEAD")])
-        .await
-        .map_err(|e| format!("git rev-list failed: {e}"))?;
+    let ahead = git(
+        working_dir,
+        &["rev-list", "--count", &format!("{base}..HEAD")],
+    )
+    .await
+    .map_err(|e| format!("git rev-list failed: {e}"))?;
     let ahead: u64 = ahead
         .parse()
         .map_err(|_| format!("git rev-list printed an unexpected count: {ahead}"))?;
@@ -157,7 +167,9 @@ async fn commit(
     }
 
     // The tip before this commit, so a commit that holds other content can be undone.
-    let before = git(working_dir, &["rev-parse", "--verify", "HEAD"]).await.ok();
+    let before = git(working_dir, &["rev-parse", "--verify", "HEAD"])
+        .await
+        .ok();
 
     let mut args = vec!["commit", "-q"];
     if allow_empty {
@@ -190,7 +202,9 @@ async fn commit(
 async fn undo_commit(working_dir: &str, before: Option<&str>, made: &str) -> String {
     const REFUSAL: &str = "a Git hook changed the staged content after it was checked";
     let Some(before) = before else {
-        return format!("{REFUSAL}, and the commit {made} could not be undone, so it stays on the task branch");
+        return format!(
+            "{REFUSAL}, and the commit {made} could not be undone, so it stays on the task branch"
+        );
     };
     match git(working_dir, &["reset", "-q", "--soft", before]).await {
         Ok(_) => format!("{REFUSAL}, so the commit was undone and nothing was committed"),
@@ -223,7 +237,10 @@ async fn refuse_unless_on_task_branch(working_dir: &str, branch: &str) -> Result
     let expected = format!("refs/heads/{branch}");
     if state.head_ref.as_deref() != Some(expected.as_str()) {
         let found = match &state.head_ref {
-            Some(other) => format!("branch {}", other.strip_prefix("refs/heads/").unwrap_or(other)),
+            Some(other) => format!(
+                "branch {}",
+                other.strip_prefix("refs/heads/").unwrap_or(other)
+            ),
             None => format!("a detached HEAD at {}", state.head),
         };
         return Err(format!(
@@ -250,7 +267,10 @@ async fn refuse_unless_on_task_branch(working_dir: &str, branch: &str) -> Result
 
 /// Whether a `git status --porcelain` line is an unmerged path.
 fn is_unmerged(line: &str) -> bool {
-    matches!(line.get(..2), Some("DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU"))
+    matches!(
+        line.get(..2),
+        Some("DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU")
+    )
 }
 
 /// Whether the index differs from `HEAD`. `git diff --cached --quiet` exits
@@ -318,7 +338,18 @@ pub async fn checkout_snapshot(working_dir: &str) -> Result<CheckoutSnapshot, St
         // staging everything would make, but `add -A` skips it here. Its additions are
         // added explicitly. A path deleted since staging is left out, as `add -A` drops it.
         // `--no-renames`: a staged rename into an ignored name is an addition too.
-        let staged = git(working_dir, &["diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A", "-z"]).await?;
+        let staged = git(
+            working_dir,
+            &[
+                "diff",
+                "--cached",
+                "--no-renames",
+                "--name-only",
+                "--diff-filter=A",
+                "-z",
+            ],
+        )
+        .await?;
         let forced: Vec<&str> = staged
             .split('\0')
             .filter(|p| !p.is_empty() && Path::new(working_dir).join(p).symlink_metadata().is_ok())
@@ -368,7 +399,13 @@ fn explain(output: &std::process::Output) -> String {
     let text = [stderr.trim(), stdout.trim()]
         .into_iter()
         .find(|t| !t.is_empty())
-        .map(|t| t.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" / "))
+        .map(|t| {
+            t.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
         .unwrap_or_else(|| format!("exited with {}", output.status));
     match text.char_indices().nth(LIMIT) {
         Some((cut, _)) => format!("{}...", &text[..cut]),
@@ -390,7 +427,11 @@ mod tests {
     use std::process::Command as StdCommand;
 
     fn git_ok(dir: &Path, args: &[&str]) -> String {
-        let output = StdCommand::new("git").args(args).current_dir(dir).output().expect("run git");
+        let output = StdCommand::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
         assert!(
             output.status.success(),
             "git {args:?} failed: {}",
@@ -413,7 +454,17 @@ mod tests {
         git_ok(&repo, &["add", "-A"]);
         git_ok(&repo, &["commit", "-q", "-m", "seed"]);
         let checkout = tmp.path().join("checkout");
-        git_ok(&repo, &["worktree", "add", "-q", "-b", "task", checkout.to_str().unwrap()]);
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task",
+                checkout.to_str().unwrap(),
+            ],
+        );
         (tmp, repo, checkout)
     }
 
@@ -431,7 +482,10 @@ mod tests {
         let tip = git_ok(&checkout, &["rev-parse", "task"]);
         assert_eq!(outcome, CheckoutCommit::Committed { commit: tip });
         assert_eq!(git_ok(&checkout, &["status", "--porcelain"]), "");
-        assert_eq!(git_ok(&checkout, &["log", "-1", "--format=%s", "task"]), "task: fix it");
+        assert_eq!(
+            git_ok(&checkout, &["log", "-1", "--format=%s", "task"]),
+            "task: fix it"
+        );
         assert_eq!(
             git_ok(&checkout, &["diff", "--name-status", "main", "task"]),
             "D\tgone.txt\nM\tkept.txt\nA\tnew.txt",
@@ -450,8 +504,15 @@ mod tests {
 
         std::fs::write(checkout.join("kept.txt"), "edited after the check\n").unwrap();
         let refused = commit_checkout_verified(dir, "task", "task: fix it", &checked).await;
-        assert!(refused.is_err(), "a change after the check is refused: {refused:?}");
-        assert_eq!(git_ok(&checkout, &["rev-parse", "task"]), head, "nothing was committed");
+        assert!(
+            refused.is_err(),
+            "a change after the check is refused: {refused:?}"
+        );
+        assert_eq!(
+            git_ok(&checkout, &["rev-parse", "task"]),
+            head,
+            "nothing was committed"
+        );
 
         std::fs::write(checkout.join("kept.txt"), "checked\n").unwrap();
         let outcome = commit_checkout_verified(dir, "task", "task: fix it", &checked)
@@ -473,27 +534,42 @@ mod tests {
 
         // Each step is checked against what `add -A` then `write-tree` would record.
         let steps: Vec<(&str, Box<dyn Fn(&Path)>)> = vec![
-            ("unstaged same-size edit", Box::new(|c: &Path| std::fs::write(c.join("a.txt"), "AAA\n").unwrap())),
-            ("staged-only edit", Box::new(|c: &Path| {
-                std::fs::write(c.join("b.txt"), "BBB\n").unwrap();
-                git_ok(c, &["add", "b.txt"]);
-            })),
-            ("staged then unstaged edit", Box::new(|c: &Path| std::fs::write(c.join("b.txt"), "bbX\n").unwrap())),
-            ("added and deleted files", Box::new(|c: &Path| {
-                std::fs::write(c.join("new.txt"), "new\n").unwrap();
-                std::fs::remove_file(c.join("c.txt")).unwrap();
-            })),
+            (
+                "unstaged same-size edit",
+                Box::new(|c: &Path| std::fs::write(c.join("a.txt"), "AAA\n").unwrap()),
+            ),
+            (
+                "staged-only edit",
+                Box::new(|c: &Path| {
+                    std::fs::write(c.join("b.txt"), "BBB\n").unwrap();
+                    git_ok(c, &["add", "b.txt"]);
+                }),
+            ),
+            (
+                "staged then unstaged edit",
+                Box::new(|c: &Path| std::fs::write(c.join("b.txt"), "bbX\n").unwrap()),
+            ),
+            (
+                "added and deleted files",
+                Box::new(|c: &Path| {
+                    std::fs::write(c.join("new.txt"), "new\n").unwrap();
+                    std::fs::remove_file(c.join("c.txt")).unwrap();
+                }),
+            ),
         ];
         #[cfg(unix)]
         let steps = {
             let mut steps = steps;
-            steps.push(("mode change and symlink", Box::new(|c: &Path| {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perm = std::fs::metadata(c.join("a.txt")).unwrap().permissions();
-                perm.set_mode(0o755);
-                std::fs::set_permissions(c.join("a.txt"), perm).unwrap();
-                std::os::unix::fs::symlink("a.txt", c.join("link")).unwrap();
-            })));
+            steps.push((
+                "mode change and symlink",
+                Box::new(|c: &Path| {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perm = std::fs::metadata(c.join("a.txt")).unwrap().permissions();
+                    perm.set_mode(0o755);
+                    std::fs::set_permissions(c.join("a.txt"), perm).unwrap();
+                    std::os::unix::fs::symlink("a.txt", c.join("link")).unwrap();
+                }),
+            ));
             steps
         };
         for (name, edit) in steps {
@@ -527,7 +603,10 @@ mod tests {
         let snapshot = checkout_snapshot(dir).await.unwrap().content;
         git_ok(&checkout, &["add", "-A"]);
         let staged = git_ok(&checkout, &["write-tree"]);
-        assert_eq!(snapshot, staged, "the snapshot reads the file as it is on disk");
+        assert_eq!(
+            snapshot, staged,
+            "the snapshot reads the file as it is on disk"
+        );
     }
 
     #[tokio::test]
@@ -560,9 +639,10 @@ mod tests {
         assert_eq!(outcome, Ok(CheckoutCommit::NothingToCommit));
         assert_eq!(git_ok(&checkout, &["rev-parse", "task"]), before);
 
-        let commit = commit_checkout_even_if_empty(checkout.to_str().unwrap(), "task", "task: empty")
-            .await
-            .expect("empty commit");
+        let commit =
+            commit_checkout_even_if_empty(checkout.to_str().unwrap(), "task", "task: empty")
+                .await
+                .expect("empty commit");
         let tip = git_ok(&checkout, &["rev-parse", "task"]);
         assert_ne!(tip, before);
         assert_eq!(commit, tip);
@@ -605,13 +685,15 @@ mod tests {
 
         assert!(matches!(outcome, CheckoutCommit::Committed { .. }));
         assert_eq!(git_ok(&checkout, &["show", "task:out[1].log"]), "forced");
-        assert!(StdCommand::new("git")
-            .args(["cat-file", "-e", "task:out1.log"])
-            .current_dir(&checkout)
-            .status()
-            .unwrap()
-            .code()
-            != Some(0));
+        assert!(
+            StdCommand::new("git")
+                .args(["cat-file", "-e", "task:out1.log"])
+                .current_dir(&checkout)
+                .status()
+                .unwrap()
+                .code()
+                != Some(0)
+        );
     }
 
     /// A staged rename into an ignored name is an addition the commit records, so the
@@ -657,10 +739,20 @@ mod tests {
             .await
             .expect_err("the commit holding the hook's file is refused");
 
-        assert!(error.contains("a Git hook changed the staged content"), "{error}");
+        assert!(
+            error.contains("a Git hook changed the staged content"),
+            "{error}"
+        );
         assert!(error.contains("undone"), "{error}");
-        assert_eq!(git_ok(&checkout, &["rev-parse", "task"]), before, "the commit was undone");
-        assert_eq!(std::fs::read_to_string(checkout.join("kept.txt")).unwrap(), "checked\n");
+        assert_eq!(
+            git_ok(&checkout, &["rev-parse", "task"]),
+            before,
+            "the commit was undone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("kept.txt")).unwrap(),
+            "checked\n"
+        );
         // The forced ignored file is still visible to status, so no clean check can
         // read the checkout as clean while it is there.
         let status = git_ok(&checkout, &["status", "--porcelain"]);
@@ -705,7 +797,10 @@ mod tests {
 
         assert!(error.starts_with("git add failed"), "{error}");
         assert!(error.contains("index.lock"), "{error}");
-        assert_eq!(git_ok(&repo, &["rev-parse", "main"]), git_ok(&checkout, &["rev-parse", "task"]));
+        assert_eq!(
+            git_ok(&repo, &["rev-parse", "main"]),
+            git_ok(&checkout, &["rev-parse", "task"])
+        );
     }
 
     /// A directory whose `.git` link is gone is not a checkout of its own;
@@ -722,7 +817,10 @@ mod tests {
             .await
             .expect_err("not a checkout of its own");
 
-        assert!(error.contains("not the top of its own Git working tree"), "{error}");
+        assert!(
+            error.contains("not the top of its own Git working tree"),
+            "{error}"
+        );
         assert_eq!(git_ok(&repo, &["rev-parse", "main"]), before);
         assert_eq!(git_ok(&repo, &["status", "--porcelain"]), "?? stray/");
     }
@@ -749,9 +847,15 @@ mod tests {
 
         assert!(error.contains(reason), "{error}");
         assert!(error.contains("nothing was committed"), "{error}");
-        assert_eq!(git_ok(repo, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+        assert_eq!(
+            git_ok(repo, &["for-each-ref", "--format=%(refname) %(objectname)"]),
+            refs
+        );
         assert_eq!(git_ok(checkout, &["rev-parse", "HEAD"]), head);
-        assert!(git_ok(checkout, &["status", "--porcelain"]).contains("?? new.txt"), "nothing is staged");
+        assert!(
+            git_ok(checkout, &["status", "--porcelain"]).contains("?? new.txt"),
+            "nothing is staged"
+        );
     }
 
     #[tokio::test]
@@ -765,7 +869,12 @@ mod tests {
     async fn a_checkout_on_another_branch_is_refused() {
         let (_tmp, repo, checkout) = repo_with_task_checkout();
         git_ok(&checkout, &["checkout", "-q", "-b", "elsewhere"]);
-        assert_refused(&checkout, &repo, "branch elsewhere checked out, not the task branch task").await;
+        assert_refused(
+            &checkout,
+            &repo,
+            "branch elsewhere checked out, not the task branch task",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -777,7 +886,11 @@ mod tests {
         std::fs::write(checkout.join("kept.txt"), "upstream side\n").unwrap();
         git_ok(&checkout, &["commit", "-q", "-am", "upstream side"]);
         git_ok(&checkout, &["checkout", "-q", "task"]);
-        let rebase = StdCommand::new("git").args(["rebase", "-q", "upstream"]).current_dir(&checkout).output().unwrap();
+        let rebase = StdCommand::new("git")
+            .args(["rebase", "-q", "upstream"])
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
         assert!(!rebase.status.success(), "the rebase stops on its conflict");
         assert_refused(&checkout, &repo, "in the middle of a rebase").await;
     }
@@ -796,7 +909,11 @@ mod tests {
         git_ok(&checkout, &["stash", "-q"]);
         std::fs::write(checkout.join("kept.txt"), "task side\n").unwrap();
         git_ok(&checkout, &["commit", "-q", "-am", "task side"]);
-        let pop = StdCommand::new("git").args(["stash", "pop", "-q"]).current_dir(&checkout).output().unwrap();
+        let pop = StdCommand::new("git")
+            .args(["stash", "pop", "-q"])
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
         assert!(!pop.status.success(), "the stash conflicts");
         assert_refused(&checkout, &repo, "unresolved conflicts (kept.txt)").await;
     }

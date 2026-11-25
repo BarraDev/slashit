@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
-use crate::commands::gui_admission::GuiMutation;
-use super::manager::{spawn_pty_session, resize_pty_session};
+use super::manager::{resize_pty_session, spawn_pty_session};
 use super::store::SessionMetadata;
+use crate::commands::gui_admission::GuiMutation;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
-use chrono::Utc;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PtyInfo {
@@ -56,18 +56,21 @@ pub async fn spawn_pty(
         crate::commands::project::refuse_if_project_removed(&state.project.projects, id).await?;
     }
 
-    println!("[PTY Backend] spawn_pty: name={}, size={}x{}, wd={:?}", name, cols, rows, working_directory);
+    println!(
+        "[PTY Backend] spawn_pty: name={}, size={}x{}, wd={:?}",
+        name, cols, rows, working_directory
+    );
 
     // Spawn the PTY session
-    let (mut session, mut reader) = spawn_pty_session(name.clone(), cols, rows, working_directory.clone())
-        .map_err(|e| {
+    let (mut session, mut reader) =
+        spawn_pty_session(name.clone(), cols, rows, working_directory.clone()).map_err(|e| {
             eprintln!("[PTY Backend] Failed to spawn PTY: {}", e);
             e
         })?;
     session.project_id = project_id.clone();
 
     let session_id = session.id;
-    
+
     let info = PtyInfo {
         id: session_id.to_string(),
         name: session.name.clone(),
@@ -76,7 +79,7 @@ pub async fn spawn_pty(
         is_new: true,
         project_id: project_id.clone(),
     };
-    
+
     let metadata = SessionMetadata {
         id: session_id,
         name: session.name.clone(),
@@ -90,21 +93,25 @@ pub async fn spawn_pty(
     };
     // Publish the session only once its record is written. On failure the
     // session is dropped here, which ends its shell, and no scrollback remains.
-    state.pty.register_session(session, metadata).await.inspect_err(|e| {
-        eprintln!("[PTY Backend] {}", e);
-    })?;
+    state
+        .pty
+        .register_session(session, metadata)
+        .await
+        .inspect_err(|e| {
+            eprintln!("[PTY Backend] {}", e);
+        })?;
 
     // Spawn a background thread to read PTY output and emit events
     let app_handle = app.clone();
     let session_id_str = session_id.to_string();
     let scrollback = state.pty.scrollback.clone();
     let session_uuid = session_id;
-    
+
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
 
         let mut consecutive_empty_reads = 0;
-        
+
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
@@ -119,7 +126,7 @@ pub async fn spawn_pty(
                 }
                 Ok(n) => {
                     consecutive_empty_reads = 0; // Reset counter on successful read
-                    
+
                     // Store in scrollback buffer using blocking lock
                     let data_copy = buf[..n].to_vec();
                     let scrollback_clone = scrollback.clone();
@@ -132,15 +139,17 @@ pub async fn spawn_pty(
                             .build()
                             .unwrap();
                         rt.block_on(async {
-                            scrollback_clone.append(sid_for_scrollback, &data_copy).await;
+                            scrollback_clone
+                                .append(sid_for_scrollback, &data_copy)
+                                .await;
                         });
                     });
-                    
+
                     let output = PtyOutput {
                         session_id: session_id_str.clone(),
                         data: buf[..n].to_vec(),
                     };
-                    
+
                     // Emit event to frontend
                     if let Err(e) = app_handle.emit("pty-output", output) {
                         eprintln!("[PTY Backend] Failed to emit event: {}", e);
@@ -153,8 +162,11 @@ pub async fn spawn_pty(
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         continue;
                     }
-                    eprintln!("[PTY Backend] Read ERROR for session {}: {}", session_id_str, e);
-                    
+                    eprintln!(
+                        "[PTY Backend] Read ERROR for session {}: {}",
+                        session_id_str, e
+                    );
+
                     // Emit exit event with error info
                     let exit_event = PtyExit {
                         session_id: session_id_str.clone(),
@@ -169,12 +181,11 @@ pub async fn spawn_pty(
             }
         }
 
-        
         // Add a small delay to ensure the last output is fully processed by the frontend
         // before we emit the exit event. This prevents the exit overlay from appearing
         // before the final output is rendered.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        
+
         // Determine exit code based on how we exited
         // If we got too many empty reads or a clean EOF, assume normal exit (code 0)
         // If we exited due to an error, report that
@@ -185,7 +196,7 @@ pub async fn spawn_pty(
             // We broke out of the loop - could be error or EOF
             (Some(0), "Shell exited".to_string())
         };
-        
+
         // Emit exit event to frontend
         let exit_event = PtyExit {
             session_id: session_id_str.clone(),
@@ -208,26 +219,21 @@ pub async fn write_pty(
     session_id: String,
     data: Vec<u8>,
 ) -> Result<(), String> {
-
-    
-    let uuid = Uuid::parse_str(&session_id)
-        .map_err(|e| {
-            eprintln!("[PTY Backend] Invalid session ID: {}", e);
-            format!("Invalid session ID: {}", e)
-        })?;
+    let uuid = Uuid::parse_str(&session_id).map_err(|e| {
+        eprintln!("[PTY Backend] Invalid session ID: {}", e);
+        format!("Invalid session ID: {}", e)
+    })?;
 
     let mut sessions = state.pty.sessions.lock().await;
-    let session = sessions
-        .get_mut(&uuid)
-        .ok_or_else(|| {
-            eprintln!("[PTY Backend] Session not found: {}", session_id);
-            "Session not found".to_string()
-        })?;
+    let session = sessions.get_mut(&uuid).ok_or_else(|| {
+        eprintln!("[PTY Backend] Session not found: {}", session_id);
+        "Session not found".to_string()
+    })?;
 
     session
         .write(&data)
         .map_err(|e| format!("Failed to write to PTY: {}", e))?;
-    
+
     Ok(())
 }
 
@@ -240,8 +246,7 @@ pub async fn resize_pty(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let uuid = Uuid::parse_str(&session_id)
-        .map_err(|e| format!("Invalid session ID: {}", e))?;
+    let uuid = Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session ID: {}", e))?;
 
     let mut sessions = state.pty.sessions.lock().await;
     let session = sessions
@@ -250,11 +255,11 @@ pub async fn resize_pty(
 
     // Resize the PTY master
     resize_pty_session(session, cols, rows)?;
-    
+
     // Update stored dimensions
     session.cols = cols;
     session.rows = rows;
-    
+
     Ok(())
 }
 
@@ -265,21 +270,20 @@ pub async fn kill_pty(
     state: tauri::State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<(), String> {
-    let uuid = Uuid::parse_str(&session_id)
-        .map_err(|e| format!("Invalid session ID: {}", e))?;
+    let uuid = Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session ID: {}", e))?;
 
     let mut sessions = state.pty.sessions.lock().await;
-    
+
     // Remove the session - dropping it will clean up the PTY
     sessions
         .remove(&uuid)
         .ok_or_else(|| "Session not found".to_string())?;
-    
+
     // Remove from store
     if let Err(e) = state.pty.store.remove_session(uuid) {
         eprintln!("[PTY Backend] Failed to remove session from store: {}", e);
     }
-    
+
     // Remove scrollback
     state.pty.scrollback.remove(uuid).await;
 
@@ -292,7 +296,7 @@ pub async fn list_pty_sessions(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<PtyInfo>, String> {
     let sessions = state.pty.sessions.lock().await;
-    
+
     let infos: Vec<PtyInfo> = sessions
         .values()
         .map(|session| PtyInfo {
@@ -314,10 +318,11 @@ pub async fn get_pty_scrollback(
     state: tauri::State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<Vec<u8>, String> {
-    let uuid = Uuid::parse_str(&session_id)
-        .map_err(|e| format!("Invalid session ID: {}", e))?;
-    
-    state.pty.scrollback
+    let uuid = Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session ID: {}", e))?;
+
+    state
+        .pty
+        .scrollback
         .get(uuid)
         .await
         .ok_or_else(|| "Scrollback not found".to_string())
@@ -368,19 +373,18 @@ pub async fn attach_pty_session(
     state: tauri::State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<PtyInfo, String> {
-    let uuid = Uuid::parse_str(&session_id)
-        .map_err(|e| format!("Invalid session ID: {}", e))?;
-    
+    let uuid = Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session ID: {}", e))?;
+
     // Update last attached time
     if let Err(e) = state.pty.store.mark_alive(uuid) {
         eprintln!("[PTY Backend] Failed to mark session alive: {}", e);
     }
-    
+
     let sessions = state.pty.sessions.lock().await;
     let session = sessions
         .get(&uuid)
         .ok_or_else(|| "Session not found".to_string())?;
-    
+
     Ok(PtyInfo {
         id: session.id.to_string(),
         name: session.name.clone(),

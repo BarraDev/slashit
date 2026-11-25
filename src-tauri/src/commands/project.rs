@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
-use crate::domain::{Project, ProjectScope, AgentType, AgentConfig, Task};
 use crate::config::{Storage, WorkspaceRegistry};
-use uuid::Uuid;
+use crate::domain::{AgentConfig, AgentType, Project, ProjectScope, Task};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 type Projects = Arc<RwLock<HashMap<Uuid, Project>>>;
 
@@ -110,8 +110,7 @@ pub async fn create_project(
     agent_type: AgentType,
 ) -> Result<Project, String> {
     let id = Uuid::new_v4();
-    let repository_id = repository_id
-        .and_then(|r| Uuid::parse_str(&r).ok());
+    let repository_id = repository_id.and_then(|r| Uuid::parse_str(&r).ok());
 
     let agent_config = get_default_agent_config(&agent_type);
     let now = chrono::Utc::now();
@@ -120,7 +119,13 @@ pub async fn create_project(
     // project its local base now, so that tasks keep starting there however
     // the primary checkout moves later. See `worktree::project_base`.
     let repository_path = match repository_id {
-        Some(id) => state.repository.repositories.read().await.get(&id).map(|r| r.local_path.clone()),
+        Some(id) => state
+            .repository
+            .repositories
+            .read()
+            .await
+            .get(&id)
+            .map(|r| r.local_path.clone()),
         None => None,
     };
     // A folder that already has an active Project is refused before the
@@ -156,7 +161,13 @@ pub async fn create_project(
         removed_at: None,
     };
 
-    create_project_committed(&state.project.projects, &state.repository.repositories, &state.storage, project).await
+    create_project_committed(
+        &state.project.projects,
+        &state.repository.repositories,
+        &state.storage,
+        project,
+    )
+    .await
 }
 
 /// Refuses a Project-scoped mutation when the Project has been removed. An
@@ -177,7 +188,13 @@ pub(crate) async fn refuse_if_task_project_removed(
     state: &crate::AppState,
     task_id: Uuid,
 ) -> Result<(), String> {
-    let project_id = state.task.tasks.read().await.get(&task_id).map(|t| t.project_id);
+    let project_id = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .map(|t| t.project_id);
     let Some(project_id) = project_id else {
         return Ok(());
     };
@@ -243,14 +260,20 @@ fn refuse_second_active_project(
     let Some(repository_id) = repository_id else {
         return Ok(());
     };
-    let wanted = repositories.get(&repository_id).map(|r| canonical_folder(&r.local_path));
+    let wanted = repositories
+        .get(&repository_id)
+        .map(|r| canonical_folder(&r.local_path));
     let same_checkout = |p: &Project| {
         p.repository_id == Some(repository_id)
             || wanted.as_ref().is_some_and(|wanted| {
-                p.repository_path(repositories).is_some_and(|path| canonical_folder(&path) == *wanted)
+                p.repository_path(repositories)
+                    .is_some_and(|path| canonical_folder(&path) == *wanted)
             })
     };
-    match projects.iter().find(|(id, p)| Some(**id) != except && !p.is_removed() && same_checkout(p)) {
+    match projects
+        .iter()
+        .find(|(id, p)| Some(**id) != except && !p.is_removed() && same_checkout(p))
+    {
         Some((_, active)) => Err(format!(
             "This folder is already open as Project '{}'. Nothing was changed.",
             active.name
@@ -325,7 +348,9 @@ async fn reopen_matching_removed_project(
     if !still_matches {
         return Ok(None);
     }
-    reopen_project_committed(projects, repositories, storage, id).await.map(Some)
+    reopen_project_committed(projects, repositories, storage, id)
+        .await
+        .map(Some)
 }
 
 /// The removed Project whose repository is `folder`. The most recently removed
@@ -473,7 +498,10 @@ async fn remove_project_committed(
             .get(&id)
             .ok_or_else(|| "This Project no longer exists.".to_string())?;
         let repositories_r = repositories.read().await;
-        (project.is_removed(), project.repository_path(&repositories_r))
+        (
+            project.is_removed(),
+            project.repository_path(&repositories_r),
+        )
     };
     if already_removed {
         // A removal adopted in memory after an unconfirmed write is confirmed by
@@ -510,14 +538,18 @@ async fn remove_project_committed(
     })?;
     let tasks_w = tasks.write().await;
     if let Some(message) = first_remove_refusal(&durable, &tasks_w, id, running, deliveries).await {
-        return Err(format!("This Project cannot be removed yet: {message}. Nothing was changed."));
+        return Err(format!(
+            "This Project cannot be removed yet: {message}. Nothing was changed."
+        ));
     }
 
     // A delivery marker can be raised without the board guard, so the check is
     // repeated once the Project map is held and before anything is written.
     let mut projects_w = projects.write().await;
     if let Some(message) = first_remove_refusal(&durable, &tasks_w, id, running, deliveries).await {
-        return Err(format!("This Project cannot be removed yet: {message}. Nothing was changed."));
+        return Err(format!(
+            "This Project cannot be removed yet: {message}. Nothing was changed."
+        ));
     }
     let mut proposed = projects_w.clone();
     let project = proposed
@@ -543,23 +575,19 @@ async fn remove_refusal_for_task(
     let title = &task.title;
     match task.status {
         Queue => {
-            return Some(format!("task {title:?} is in Queue; move it out of Queue first"))
-        }
-        InProgress => {
             return Some(format!(
-                "task {title:?} is in progress; stop it first"
+                "task {title:?} is in Queue; move it out of Queue first"
             ))
         }
+        InProgress => return Some(format!("task {title:?} is in progress; stop it first")),
         AiReview => {
             return Some(format!(
                 "task {title:?} is in AI review; wait for the review to finish"
             ))
         }
-        HumanReview => {
-            return Some(format!(
-                "task {title:?} is waiting for your review decision; approve or request changes first"
-            ))
-        }
+        HumanReview => return Some(format!(
+            "task {title:?} is waiting for your review decision; approve or request changes first"
+        )),
         _ => {}
     }
     if let Some(message) = live_work_refusal(task, running, deliveries).await {
@@ -586,7 +614,12 @@ async fn create_project_committed(
     let mut projects_w = projects.write().await;
     // Checked under the same write lock as the insert, so two concurrent
     // opens of one folder cannot both pass the check.
-    refuse_second_active_project(&projects_w, &*repositories.read().await, project.repository_id, None)?;
+    refuse_second_active_project(
+        &projects_w,
+        &*repositories.read().await,
+        project.repository_id,
+        None,
+    )?;
     let mut proposed = projects_w.clone();
     proposed.insert(project.id, project.clone());
 
@@ -604,7 +637,10 @@ async fn first_remove_refusal(
     running: Option<&dyn crate::lifecycle::ExecutionOwnership>,
     deliveries: Option<&crate::commands::human_review::DeliveriesInFlight>,
 ) -> Option<String> {
-    for task in durable.iter().chain(tasks.values().filter(|t| t.project_id == id)) {
+    for task in durable
+        .iter()
+        .chain(tasks.values().filter(|t| t.project_id == id))
+    {
         if let Some(message) = remove_refusal_for_task(task, running, deliveries).await {
             return Some(message);
         }
@@ -618,7 +654,11 @@ pub async fn list_projects(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<Project>, String> {
     let projects = state.project.projects.read().await;
-    Ok(projects.values().filter(|p| !p.is_removed()).cloned().collect())
+    Ok(projects
+        .values()
+        .filter(|p| !p.is_removed())
+        .cloned()
+        .collect())
 }
 
 #[tauri::command]
@@ -711,7 +751,10 @@ async fn lock_project_conversation_for_deletion(
         .map_err(|error| error.to_string())?
     {
         if project_run_is_live(conversation.id) {
-            return Err("Stop the active Project Conversation Run before removing or deleting this Project".into());
+            return Err(
+                "Stop the active Project Conversation Run before removing or deleting this Project"
+                    .into(),
+            );
         }
     }
     Ok(guard)
@@ -794,9 +837,7 @@ async fn delete_project_committed(
         .iter()
         .chain(tasks_w.values().filter(|t| t.project_id == id))
     {
-        if let Some(message) =
-            live_work_refusal(task, running, deliveries).await
-        {
+        if let Some(message) = live_work_refusal(task, running, deliveries).await {
             return Err(message);
         }
         if let Some(message) = project_task_refusal(task) {
@@ -823,9 +864,7 @@ async fn delete_project_committed(
             .iter()
             .chain(tasks_w.values().filter(|t| t.project_id == id))
         {
-            if let Some(message) =
-                live_work_refusal(task, running, deliveries).await
-            {
+            if let Some(message) = live_work_refusal(task, running, deliveries).await {
                 return Some(message);
             }
         }
@@ -956,10 +995,12 @@ async fn delete_project_committed(
         } else {
             let marked_before = storage
                 .pending_project_tasks_deletions()
-                .map_err(|e| format!(
-                    "The Project's Task cleanup could not start because its pending records \
+                .map_err(|e| {
+                    format!(
+                        "The Project's Task cleanup could not start because its pending records \
                      could not be read; nothing was deleted: {e}"
-                ))?
+                    )
+                })?
                 .into_iter()
                 .find(|record| record.project_id == id);
             let mut owed_files = board_files.clone();
@@ -975,10 +1016,12 @@ async fn delete_project_committed(
         if !removed {
             storage
                 .mark_project_tasks_deletion_pending(id, &owed_files)
-                .map_err(|e| format!(
-                    "The Project's Task records could not be cleaned up because their pending \
+                .map_err(|e| {
+                    format!(
+                        "The Project's Task records could not be cleaned up because their pending \
                      cleanup record could not be written; nothing was deleted: {e}"
-                ))?;
+                    )
+                })?;
         }
         if let Err(error) = storage.delete_task_files(&owed_files) {
             return Err(format!(
@@ -1067,12 +1110,7 @@ mod delete_junction_test_support {
     /// Arm the junction. The two channels are used in the deletion's own task:
     /// `arrived` from the arm point, and the `deletion proceeds` release from
     /// the test's task.
-    pub fn arm(
-        project_id: Uuid,
-    ) -> (
-        mpsc::UnboundedReceiver<()>,
-        mpsc::UnboundedSender<()>,
-    ) {
+    pub fn arm(project_id: Uuid) -> (mpsc::UnboundedReceiver<()>, mpsc::UnboundedSender<()>) {
         let (arrived_tx, arrived_rx) = mpsc::unbounded_channel();
         let (release_tx, release_rx) = mpsc::unbounded_channel();
         *JUNCTION.lock().unwrap() = Some(ArmedJunction {
@@ -1089,10 +1127,13 @@ mod delete_junction_test_support {
     /// it un-arms, so a second armed test will not wait here forever.
     pub async fn wait(project_id: Uuid) {
         const JUNCTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
-        let junction = JUNCTION.lock().unwrap().take_if(|junction| {
-            junction.project_id == project_id
-        });
-        let ArmedJunction { arrived, release, .. } = match junction {
+        let junction = JUNCTION
+            .lock()
+            .unwrap()
+            .take_if(|junction| junction.project_id == project_id);
+        let ArmedJunction {
+            arrived, release, ..
+        } = match junction {
             Some(junction) => junction,
             None => return,
         };
@@ -1170,7 +1211,16 @@ pub async fn update_project(
     // Project's lifecycle gate shared for the persist so a concurrent deletion
     // captures and removes this Project's board files by one coherent route.
     let _gate = state.task.project_gate.read(id).await;
-    update_project_committed(&state.project.projects, &state.repository.repositories, &state.storage, id, name, repository_id, agent_type).await
+    update_project_committed(
+        &state.project.projects,
+        &state.repository.repositories,
+        &state.storage,
+        id,
+        name,
+        repository_id,
+        agent_type,
+    )
+    .await
 }
 
 /// Core of [`update_project`]; see [`create_project_committed`] for why the
@@ -1203,7 +1253,12 @@ async fn update_project_committed(
             let repository_id = Uuid::parse_str(&repository_id).ok();
             // Under the write lock, excluding this Project: its own repository
             // is not a conflict.
-            refuse_second_active_project(&projects_w, &*repositories.read().await, repository_id, Some(id))?;
+            refuse_second_active_project(
+                &projects_w,
+                &*repositories.read().await,
+                repository_id,
+                Some(id),
+            )?;
             // A folder held by a removed Project is reserved for that Project: reopening
             // it would be refused as a second active Project on the checkout.
             let target_folder = {
@@ -1211,7 +1266,8 @@ async fn update_project_committed(
                 repository_id.and_then(|rid| repositories_r.get(&rid).map(|r| r.local_path.clone()))
             };
             if let Some(folder) = target_folder {
-                let held_by = removed_project_for_folder(&projects_w, &*repositories.read().await, &folder);
+                let held_by =
+                    removed_project_for_folder(&projects_w, &*repositories.read().await, &folder);
                 if held_by.is_some_and(|other| other != id) {
                     return Err(
                         "This folder belongs to a removed Project. Open the folder to restore that Project, or choose another folder. Nothing was changed."
@@ -1348,8 +1404,14 @@ pub(crate) async fn detach_project_from_workspace_core(
         format!("This Project's Task records cannot be read, so SlashIt cannot prove it is idle. Nothing was changed: {e}")
     })?;
     let tasks_r = state.task.tasks.read().await;
-    if let Some(message) =
-        first_remove_refusal(&durable, &tasks_r, project_id, running, Some(&state.task.deliveries)).await
+    if let Some(message) = first_remove_refusal(
+        &durable,
+        &tasks_r,
+        project_id,
+        running,
+        Some(&state.task.deliveries),
+    )
+    .await
     {
         return Err(format!(
             "This Project cannot leave its Workspace yet: {message}. Nothing was changed."
@@ -1583,7 +1645,10 @@ pub(crate) mod tests {
         );
         let valid = toml::to_string_pretty(&seeded).expect("serialize fixture");
         let poisoned = valid.replace("placement = \"managed\"", "placement = \"shared_root\"");
-        assert_ne!(poisoned, valid, "fixture must invalidate the placement variant");
+        assert_ne!(
+            poisoned, valid,
+            "fixture must invalidate the placement variant"
+        );
         std::fs::write(storage.paths().config_file(), &poisoned).expect("write fixture");
 
         let mut projects = HashMap::new();
@@ -1617,11 +1682,16 @@ pub(crate) mod tests {
 
         try_persist_projects(&storage, &projects).expect("should succeed against a missing config");
 
-        let loaded = storage.load_config().expect("should load the freshly written config");
+        let loaded = storage
+            .load_config()
+            .expect("should load the freshly written config");
         assert_eq!(loaded.projects.len(), 1);
         assert!(loaded.projects.contains_key(&id.to_string()));
         // Everything else should still be plain defaults.
-        assert_eq!(loaded.ui_preferences.theme, AppConfig::default().ui_preferences.theme);
+        assert_eq!(
+            loaded.ui_preferences.theme,
+            AppConfig::default().ui_preferences.theme
+        );
     }
 
     #[cfg(unix)]
@@ -1655,9 +1725,15 @@ pub(crate) mod tests {
         // Restore permissions so the file can be inspected and cleaned up.
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        assert!(result.is_err(), "a read failure must not be treated as success");
+        assert!(
+            result.is_err(),
+            "a read failure must not be treated as success"
+        );
         let on_disk = std::fs::read(&config_path).unwrap();
-        assert_eq!(on_disk, original_bytes, "config on disk must be untouched by a failed persist");
+        assert_eq!(
+            on_disk, original_bytes,
+            "config on disk must be untouched by a failed persist"
+        );
     }
 
     #[test]
@@ -1756,8 +1832,14 @@ pub(crate) mod tests {
     fn make_storage_with_unreadable_config() -> (Storage, TempDir) {
         use std::os::unix::fs::PermissionsExt;
         let (storage, temp) = create_test_storage();
-        storage.save_config(&AppConfig::default()).expect("seed config");
-        std::fs::set_permissions(storage.paths().config_file(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        storage
+            .save_config(&AppConfig::default())
+            .expect("seed config");
+        std::fs::set_permissions(
+            storage.paths().config_file(),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
         (storage, temp)
     }
 
@@ -1771,9 +1853,14 @@ pub(crate) mod tests {
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
         let new_project = make_test_project(Uuid::new_v4());
 
-        let result = create_project_committed(&projects, &no_repositories(), &storage, new_project.clone()).await;
+        let result =
+            create_project_committed(&projects, &no_repositories(), &storage, new_project.clone())
+                .await;
 
-        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
+        assert!(
+            result.is_err(),
+            "a persistence failure must be reported, not swallowed"
+        );
         assert!(
             projects.read().await.is_empty(),
             "memory must not contain a project disk never recorded"
@@ -1794,7 +1881,9 @@ pub(crate) mod tests {
         let document = storage.paths().conversation_file(conversation.id);
         let task = board_task(id);
         let tasks_file = board_tasks_file(id, &storage);
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let tasks = board(vec![task]);
         let projects: RwLock<HashMap<Uuid, Project>> =
             RwLock::new(HashMap::from([(id, make_test_project(id))]));
@@ -1894,7 +1983,9 @@ pub(crate) mod tests {
         std::fs::write(&document, "malformed Conversation").unwrap();
         let tasks_file = board_tasks_file(id, &storage);
         let done = board_task(id);
-        storage.save_project_tasks(id, std::slice::from_ref(&done)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&done))
+            .unwrap();
         assert!(
             tasks_file.exists(),
             "the Task file must exist before deletion, or its later absence proves nothing"
@@ -1942,24 +2033,40 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_project_created_by_a_write_that_could_not_confirm_durability_is_in_memory_and_on_disk() {
+    async fn a_project_created_by_a_write_that_could_not_confirm_durability_is_in_memory_and_on_disk(
+    ) {
         let (storage, _temp) = create_test_storage();
         storage.save_config(&AppConfig::default()).unwrap();
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
         let project = make_test_project(Uuid::new_v4());
 
         let _fault = fail_config(slashit_durable_fs::Stage::SyncDirectory);
-        let message = create_project_committed(&projects, &no_repositories(), &storage, project.clone())
-            .await
-            .expect_err("the caller must be told the durability is unconfirmed");
+        let message =
+            create_project_committed(&projects, &no_repositories(), &storage, project.clone())
+                .await
+                .expect_err("the caller must be told the durability is unconfirmed");
 
         assert!(message.contains("could not confirm"), "{message}");
         assert!(message.contains("Do not repeat"), "{message}");
-        assert!(!message.starts_with("Failed to"), "this is not a failed save: {message}");
-        assert!(projects.read().await.contains_key(&project.id), "memory follows the visible file");
+        assert!(
+            !message.starts_with("Failed to"),
+            "this is not a failed save: {message}"
+        );
+        assert!(
+            projects.read().await.contains_key(&project.id),
+            "memory follows the visible file"
+        );
         // The file and a restart agree with memory.
-        assert!(reopened(&storage).load_config().unwrap().projects.contains_key(&project.id.to_string()));
-        assert!(storage.load_config().unwrap().projects.contains_key(&project.id.to_string()));
+        assert!(reopened(&storage)
+            .load_config()
+            .unwrap()
+            .projects
+            .contains_key(&project.id.to_string()));
+        assert!(storage
+            .load_config()
+            .unwrap()
+            .projects
+            .contains_key(&project.id.to_string()));
     }
 
     #[tokio::test]
@@ -1970,11 +2077,21 @@ pub(crate) mod tests {
         let project = make_test_project(Uuid::new_v4());
 
         let _fault = fail_config(slashit_durable_fs::Stage::Replace);
-        let message = create_project_committed(&projects, &no_repositories(), &storage, project.clone()).await.unwrap_err();
+        let message =
+            create_project_committed(&projects, &no_repositories(), &storage, project.clone())
+                .await
+                .unwrap_err();
 
-        assert!(message.starts_with("Failed to persist project"), "{message}");
+        assert!(
+            message.starts_with("Failed to persist project"),
+            "{message}"
+        );
         assert!(projects.read().await.is_empty());
-        assert!(!reopened(&storage).load_config().unwrap().projects.contains_key(&project.id.to_string()));
+        assert!(!reopened(&storage)
+            .load_config()
+            .unwrap()
+            .projects
+            .contains_key(&project.id.to_string()));
     }
 
     /// A filesystem that cannot synchronize a directory cannot prove the
@@ -1987,14 +2104,19 @@ pub(crate) mod tests {
         let project = make_test_project(Uuid::new_v4());
         let id = project.id;
         storage
-            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .save_config(&AppConfig {
+                projects: HashMap::from([(id.to_string(), project.clone())]),
+                ..AppConfig::default()
+            })
             .unwrap();
         let conversation = storage.create_primary_conversation(id).unwrap();
         let pointer = storage.paths().primary_conversation_file(id);
         let document = storage.paths().conversation_file(conversation.id);
         let task = board_task(id);
         let tasks_file = board_tasks_file(id, &storage);
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let tasks = board(vec![task]);
         let projects = RwLock::new(HashMap::from([(id, project)]));
 
@@ -2006,36 +2128,68 @@ pub(crate) mod tests {
             let message = delete_project_committed(&projects, &tasks, &storage, None, None, id)
                 .await
                 .expect_err("a deletion nothing can confirm is not a completed deletion");
-            assert!(message.contains("not run") && message.contains("cannot"), "attempt {attempt}: {message}");
-            assert!(tasks_file.exists(), "attempt {attempt}: Task records must not be deleted");
-            assert!(pointer.exists() && document.exists(), "attempt {attempt}: the Conversation must not be deleted");
+            assert!(
+                message.contains("not run") && message.contains("cannot"),
+                "attempt {attempt}: {message}"
+            );
+            assert!(
+                tasks_file.exists(),
+                "attempt {attempt}: Task records must not be deleted"
+            );
+            assert!(
+                pointer.exists() && document.exists(),
+                "attempt {attempt}: the Conversation must not be deleted"
+            );
             assert!(tasks.read().await.values().any(|t| t.project_id == id));
         }
-        assert!(!storage.pending_project_tasks_deletions().unwrap().is_empty(), "the cleanup record is kept");
-        assert!(storage.pending_project_conversation_deletions().unwrap().contains(&id));
+        assert!(
+            !storage
+                .pending_project_tasks_deletions()
+                .unwrap()
+                .is_empty(),
+            "the cleanup record is kept"
+        );
+        assert!(storage
+            .pending_project_conversation_deletions()
+            .unwrap()
+            .contains(&id));
     }
 
     #[tokio::test]
-    async fn a_project_update_that_could_not_confirm_durability_is_adopted_not_reverted_by_the_next_save() {
+    async fn a_project_update_that_could_not_confirm_durability_is_adopted_not_reverted_by_the_next_save(
+    ) {
         let (storage, _temp) = create_test_storage();
         let project = make_test_project(Uuid::new_v4());
         let id = project.id;
         storage
-            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .save_config(&AppConfig {
+                projects: HashMap::from([(id.to_string(), project.clone())]),
+                ..AppConfig::default()
+            })
             .unwrap();
         let projects = RwLock::new(HashMap::from([(id, project)]));
 
         let fault = fail_config(slashit_durable_fs::Stage::SyncDirectory);
-        let message = update_project_committed(&projects, &no_repositories(), &storage, id, Some("Renamed".into()), None, None)
-            .await
-            .unwrap_err();
+        let message = update_project_committed(
+            &projects,
+            &no_repositories(),
+            &storage,
+            id,
+            Some("Renamed".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
         drop(fault);
         assert!(message.contains("could not confirm"), "{message}");
         assert_eq!(projects.read().await[&id].name, "Renamed");
 
         // The next, unrelated save writes memory; the rename must survive it.
         let other = make_test_project(Uuid::new_v4());
-        create_project_committed(&projects, &no_repositories(), &storage, other.clone()).await.unwrap();
+        create_project_committed(&projects, &no_repositories(), &storage, other.clone())
+            .await
+            .unwrap();
         let on_disk = reopened(&storage).load_config().unwrap();
         assert_eq!(on_disk.projects[&id.to_string()].name, "Renamed");
         assert!(on_disk.projects.contains_key(&other.id.to_string()));
@@ -2051,13 +2205,21 @@ pub(crate) mod tests {
 
         let mut second = make_test_project(Uuid::new_v4());
         second.repository_id = Some(repository);
-        let message = create_project_committed(&projects, &no_repositories(), &storage, second).await.unwrap_err();
+        let message = create_project_committed(&projects, &no_repositories(), &storage, second)
+            .await
+            .unwrap_err();
         assert!(message.contains("already open"), "{message}");
-        assert_eq!(projects.read().await.len(), 1, "a refused Project must not be inserted");
+        assert_eq!(
+            projects.read().await.len(),
+            1,
+            "a refused Project must not be inserted"
+        );
 
         let mut other = make_test_project(Uuid::new_v4());
         other.repository_id = Some(Uuid::new_v4());
-        create_project_committed(&projects, &no_repositories(), &storage, other).await.unwrap();
+        create_project_committed(&projects, &no_repositories(), &storage, other)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -2067,7 +2229,10 @@ pub(crate) mod tests {
         removed.repository_id = Some(repository);
         removed.removed_at = Some(chrono::Utc::now());
         let projects = HashMap::from([(removed.id, removed)]);
-        assert!(refuse_second_active_project(&projects, &HashMap::new(), Some(repository), None).is_ok());
+        assert!(
+            refuse_second_active_project(&projects, &HashMap::new(), Some(repository), None)
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -2082,7 +2247,13 @@ pub(crate) mod tests {
         let projects = RwLock::new(HashMap::from([(holder_id, holder), (other_id, other)]));
 
         let message = update_project_committed(
-            &projects, &no_repositories(), &storage, other_id, None, Some(repository.to_string()), None,
+            &projects,
+            &no_repositories(),
+            &storage,
+            other_id,
+            None,
+            Some(repository.to_string()),
+            None,
         )
         .await
         .unwrap_err();
@@ -2091,14 +2262,21 @@ pub(crate) mod tests {
 
         // The holder keeps its own repository: it is not a conflict with itself.
         update_project_committed(
-            &projects, &no_repositories(), &storage, holder_id, None, Some(repository.to_string()), None,
+            &projects,
+            &no_repositories(),
+            &storage,
+            holder_id,
+            None,
+            Some(repository.to_string()),
+            None,
         )
         .await
         .unwrap();
     }
 
     #[tokio::test]
-    async fn reopening_a_removed_project_is_refused_when_an_active_one_already_holds_its_repository() {
+    async fn reopening_a_removed_project_is_refused_when_an_active_one_already_holds_its_repository(
+    ) {
         let (storage, _temp) = create_test_storage();
         let repository = Uuid::new_v4();
         let mut removed = make_test_project(Uuid::new_v4());
@@ -2109,9 +2287,14 @@ pub(crate) mod tests {
         let removed_id = removed.id;
         let projects = RwLock::new(HashMap::from([(removed_id, removed), (active.id, active)]));
 
-        let message = reopen_project_committed(&projects, &no_repositories(), &storage, removed_id).await.unwrap_err();
+        let message = reopen_project_committed(&projects, &no_repositories(), &storage, removed_id)
+            .await
+            .unwrap_err();
         assert!(message.contains("already open"), "{message}");
-        assert!(projects.read().await[&removed_id].is_removed(), "the refused Project stays removed");
+        assert!(
+            projects.read().await[&removed_id].is_removed(),
+            "the refused Project stays removed"
+        );
     }
 
     /// Legacy config can hold two Repository records for one folder. A Project on
@@ -2139,7 +2322,8 @@ pub(crate) mod tests {
         let removed_id = removed.id;
         let projects = HashMap::from([(active.id, active), (removed_id, removed)]);
 
-        let message = refuse_second_active_project(&projects, &repositories, Some(second), None).unwrap_err();
+        let message =
+            refuse_second_active_project(&projects, &repositories, Some(second), None).unwrap_err();
         assert!(message.contains("already open"), "{message}");
 
         let projects = RwLock::new(projects);
@@ -2148,7 +2332,10 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(message.contains("already open"), "{message}");
-        assert!(projects.read().await[&removed_id].is_removed(), "the refused Project stays removed");
+        assert!(
+            projects.read().await[&removed_id].is_removed(),
+            "the refused Project stays removed"
+        );
     }
 
     /// The removed Project is reopened only while its folder still resolves to
@@ -2176,17 +2363,26 @@ pub(crate) mod tests {
         )]));
 
         let asked_path = asked.path().display().to_string();
-        let reopened = reopen_matching_removed_project(&projects, &repositories, &storage, &asked_path, id)
-            .await
-            .unwrap();
-        assert!(reopened.is_none(), "a folder that no longer matches reopens nothing");
+        let reopened =
+            reopen_matching_removed_project(&projects, &repositories, &storage, &asked_path, id)
+                .await
+                .unwrap();
+        assert!(
+            reopened.is_none(),
+            "a folder that no longer matches reopens nothing"
+        );
         assert!(projects.read().await[&id].is_removed());
 
         let named_path = named.path().display().to_string();
-        let reopened = reopen_matching_removed_project(&projects, &repositories, &storage, &named_path, id)
-            .await
-            .unwrap();
-        assert_eq!(reopened.map(|p| p.id), Some(id), "the folder it names reopens it");
+        let reopened =
+            reopen_matching_removed_project(&projects, &repositories, &storage, &named_path, id)
+                .await
+                .unwrap();
+        assert_eq!(
+            reopened.map(|p| p.id),
+            Some(id),
+            "the folder it names reopens it"
+        );
     }
 
     /// Reopening a removed folder and opening it as a new Project race on the
@@ -2217,9 +2413,15 @@ pub(crate) mod tests {
             .filter(|p| !p.is_removed() && p.repository_id == Some(repository))
             .map(|p| p.id)
             .collect();
-        assert_eq!(active.len(), 1, "exactly one active Project per folder, got {active:?}");
+        assert_eq!(
+            active.len(),
+            1,
+            "exactly one active Project per folder, got {active:?}"
+        );
         match (&reopened, &created) {
-            (Ok(project), Err(_)) => assert_eq!(project.id, removed_id, "the reopened identity is kept"),
+            (Ok(project), Err(_)) => {
+                assert_eq!(project.id, removed_id, "the reopened identity is kept")
+            }
             (Err(_), Ok(project)) => assert_eq!(active, vec![project.id]),
             other => panic!("unexpected outcome: {other:?}"),
         }
@@ -2229,19 +2431,25 @@ pub(crate) mod tests {
     /// confirming it: nothing destructive may run, the evidence is kept, and
     /// the retried deletion is what finishes it once the file is confirmed.
     #[tokio::test]
-    async fn a_project_deletion_the_config_could_not_confirm_keeps_every_record_and_deletes_nothing() {
+    async fn a_project_deletion_the_config_could_not_confirm_keeps_every_record_and_deletes_nothing(
+    ) {
         let (storage, _temp) = create_test_storage();
         let project = make_test_project(Uuid::new_v4());
         let id = project.id;
         storage
-            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .save_config(&AppConfig {
+                projects: HashMap::from([(id.to_string(), project.clone())]),
+                ..AppConfig::default()
+            })
             .unwrap();
         let conversation = storage.create_primary_conversation(id).unwrap();
         let pointer = storage.paths().primary_conversation_file(id);
         let document = storage.paths().conversation_file(conversation.id);
         let task = board_task(id);
         let tasks_file = board_tasks_file(id, &storage);
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let tasks = board(vec![task]);
         let projects = RwLock::new(HashMap::from([(id, project)]));
 
@@ -2251,33 +2459,69 @@ pub(crate) mod tests {
             .expect_err("a deletion whose commit is unconfirmed is not a completed deletion");
         drop(fault);
 
-        assert!(message.contains("could not") && message.contains("confirm"), "{message}");
+        assert!(
+            message.contains("could not") && message.contains("confirm"),
+            "{message}"
+        );
         // Memory and the visible file agree that the Project is gone...
         assert!(!projects.read().await.contains_key(&id));
-        assert!(!storage.load_config().unwrap().projects.contains_key(&id.to_string()));
+        assert!(!storage
+            .load_config()
+            .unwrap()
+            .projects
+            .contains_key(&id.to_string()));
         // ...but nothing that depended on it ran, and the evidence is intact.
-        assert!(tasks_file.exists(), "Task records must not be deleted on an unconfirmed commit");
+        assert!(
+            tasks_file.exists(),
+            "Task records must not be deleted on an unconfirmed commit"
+        );
         assert!(tasks.read().await.values().any(|t| t.project_id == id));
-        assert!(pointer.exists() && document.exists(), "the Conversation must not be deleted");
-        assert!(storage.paths().pending_project_tasks_deletion_file(id).exists());
-        assert!(storage.paths().pending_project_conversation_deletion_file(id).exists());
+        assert!(
+            pointer.exists() && document.exists(),
+            "the Conversation must not be deleted"
+        );
+        assert!(storage
+            .paths()
+            .pending_project_tasks_deletion_file(id)
+            .exists());
+        assert!(storage
+            .paths()
+            .pending_project_conversation_deletion_file(id)
+            .exists());
 
         // A restart in this state sees the Project gone and both records. They
         // are the reconciliation evidence: startup confirms the configuration
         // before it acts on them (see `app_core`), or drops them if the removal
         // did not survive.
         let restarted = reopened(&storage);
-        assert!(!restarted.load_config().unwrap().projects.contains_key(&id.to_string()));
+        assert!(!restarted
+            .load_config()
+            .unwrap()
+            .projects
+            .contains_key(&id.to_string()));
         assert!(restarted.has_pending_tasks_deletion_record(id).unwrap());
-        assert_eq!(restarted.pending_project_conversation_deletions().unwrap(), vec![id]);
+        assert_eq!(
+            restarted.pending_project_conversation_deletions().unwrap(),
+            vec![id]
+        );
 
         // The retry confirms the config first, then finishes.
-        assert!(delete_project_committed(&projects, &tasks, &storage, None, None, id).await.unwrap());
+        assert!(
+            delete_project_committed(&projects, &tasks, &storage, None, None, id)
+                .await
+                .unwrap()
+        );
         assert!(!tasks_file.exists());
         // A retried deletion leaves its Conversation leg, and the record that
         // owns it, to the next start's reconciliation (existing contract).
-        assert!(storage.paths().pending_project_conversation_deletion_file(id).exists());
-        assert!(!storage.paths().pending_project_tasks_deletion_file(id).exists());
+        assert!(storage
+            .paths()
+            .pending_project_conversation_deletion_file(id)
+            .exists());
+        assert!(!storage
+            .paths()
+            .pending_project_tasks_deletion_file(id)
+            .exists());
     }
 
     #[tokio::test]
@@ -2286,16 +2530,23 @@ pub(crate) mod tests {
         let project = make_test_project(Uuid::new_v4());
         let id = project.id;
         storage
-            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .save_config(&AppConfig {
+                projects: HashMap::from([(id.to_string(), project.clone())]),
+                ..AppConfig::default()
+            })
             .unwrap();
         let task = board_task(id);
         let tasks_file = board_tasks_file(id, &storage);
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let tasks = board(vec![task]);
         let projects = RwLock::new(HashMap::from([(id, project)]));
 
         let first = fail_config(slashit_durable_fs::Stage::SyncDirectory);
-        delete_project_committed(&projects, &tasks, &storage, None, None, id).await.unwrap_err();
+        delete_project_committed(&projects, &tasks, &storage, None, None, id)
+            .await
+            .unwrap_err();
         drop(first);
 
         // The confirmation rewrite fails too (here after the rename again).
@@ -2307,34 +2558,62 @@ pub(crate) mod tests {
 
         assert!(message.contains("not run"), "{message}");
         assert!(tasks_file.exists(), "no cleanup without a confirmed config");
-        assert!(storage.paths().pending_project_tasks_deletion_file(id).exists());
-        assert!(delete_project_committed(&projects, &tasks, &storage, None, None, id).await.unwrap());
+        assert!(storage
+            .paths()
+            .pending_project_tasks_deletion_file(id)
+            .exists());
+        assert!(
+            delete_project_committed(&projects, &tasks, &storage, None, None, id)
+                .await
+                .unwrap()
+        );
         assert!(!tasks_file.exists());
     }
 
     #[tokio::test]
-    async fn a_project_deletion_that_failed_before_publication_clears_its_records_and_changes_nothing() {
+    async fn a_project_deletion_that_failed_before_publication_clears_its_records_and_changes_nothing(
+    ) {
         let (storage, _temp) = create_test_storage();
         let project = make_test_project(Uuid::new_v4());
         let id = project.id;
         storage
-            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .save_config(&AppConfig {
+                projects: HashMap::from([(id.to_string(), project.clone())]),
+                ..AppConfig::default()
+            })
             .unwrap();
         let task = board_task(id);
         let tasks_file = board_tasks_file(id, &storage);
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let tasks = board(vec![task]);
         let projects = RwLock::new(HashMap::from([(id, project)]));
 
         let _fault = fail_config(slashit_durable_fs::Stage::Replace);
-        let message = delete_project_committed(&projects, &tasks, &storage, None, None, id).await.unwrap_err();
+        let message = delete_project_committed(&projects, &tasks, &storage, None, None, id)
+            .await
+            .unwrap_err();
 
-        assert!(message.starts_with("Failed to persist project deletion"), "{message}");
+        assert!(
+            message.starts_with("Failed to persist project deletion"),
+            "{message}"
+        );
         assert!(projects.read().await.contains_key(&id));
-        assert!(storage.load_config().unwrap().projects.contains_key(&id.to_string()));
+        assert!(storage
+            .load_config()
+            .unwrap()
+            .projects
+            .contains_key(&id.to_string()));
         assert!(tasks_file.exists());
-        assert!(!storage.paths().pending_project_tasks_deletion_file(id).exists());
-        assert!(!storage.paths().pending_project_conversation_deletion_file(id).exists());
+        assert!(!storage
+            .paths()
+            .pending_project_tasks_deletion_file(id)
+            .exists());
+        assert!(!storage
+            .paths()
+            .pending_project_conversation_deletion_file(id)
+            .exists());
     }
 
     #[tokio::test]
@@ -2342,10 +2621,12 @@ pub(crate) mod tests {
         let (storage, _temp) = create_test_storage();
         let project = make_test_project(Uuid::new_v4());
         let id = project.id;
-        storage.save_config(&AppConfig {
-            projects: HashMap::from([(id.to_string(), project)]),
-            ..AppConfig::default()
-        }).unwrap();
+        storage
+            .save_config(&AppConfig {
+                projects: HashMap::from([(id.to_string(), project)]),
+                ..AppConfig::default()
+            })
+            .unwrap();
         let conversation = storage.create_primary_conversation(id).unwrap();
         let pointer = storage.paths().primary_conversation_file(id);
         let document = storage.paths().conversation_file(conversation.id);
@@ -2355,13 +2636,21 @@ pub(crate) mod tests {
             &storage,
             id,
             |_| true,
-        ).await;
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(pointer.exists());
         assert!(document.exists());
-        assert!(storage.load_config_strict().unwrap().projects.contains_key(&id.to_string()));
-        assert!(!storage.paths().pending_project_conversation_deletion_file(id).exists());
+        assert!(storage
+            .load_config_strict()
+            .unwrap()
+            .projects
+            .contains_key(&id.to_string()));
+        assert!(!storage
+            .paths()
+            .pending_project_conversation_deletion_file(id)
+            .exists());
     }
 
     #[cfg(unix)]
@@ -2377,10 +2666,20 @@ pub(crate) mod tests {
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
         let result = update_project_committed(
-            &projects, &no_repositories(), &storage, id, Some("New Name".to_string()), None, None,
-        ).await;
+            &projects,
+            &no_repositories(),
+            &storage,
+            id,
+            Some("New Name".to_string()),
+            None,
+            None,
+        )
+        .await;
 
-        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
+        assert!(
+            result.is_err(),
+            "a persistence failure must be reported, not swallowed"
+        );
         assert_eq!(
             projects.read().await.get(&id).unwrap().name,
             original_name,
@@ -2399,11 +2698,14 @@ pub(crate) mod tests {
     fn registered_workspace() -> RegisteredWorkspace {
         let root = TempDir::new().expect("workspace root tempdir");
         let registry_dir = TempDir::new().expect("registry tempdir");
-        let mut registry = WorkspaceRegistry::load_from(registry_dir.path().join("workspaces.toml"))
-            .expect("a missing registry file should load empty");
+        let mut registry =
+            WorkspaceRegistry::load_from(registry_dir.path().join("workspaces.toml"))
+                .expect("a missing registry file should load empty");
         let workspace = crate::domain::Workspace::new(
             "ws".to_string(),
-            Some(crate::domain::WorkspaceRoot::try_new(root.path()).expect("real dir must validate")),
+            Some(
+                crate::domain::WorkspaceRoot::try_new(root.path()).expect("real dir must validate"),
+            ),
         );
         let id = workspace.id;
         registry.upsert(workspace).expect("upsert should succeed");
@@ -2424,9 +2726,15 @@ pub(crate) mod tests {
         let ws = registered_workspace();
         let workspace_id = ws.id;
 
-        let result = attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, workspace_id)
-            .await
-            .expect("attaching a standalone project should succeed");
+        let result = attach_project_to_workspace_committed(
+            &projects,
+            &ws.registry,
+            &storage,
+            id,
+            workspace_id,
+        )
+        .await
+        .expect("attaching a standalone project should succeed");
 
         assert_eq!(result.scope.workspace_id(), Some(workspace_id));
         assert_eq!(
@@ -2452,14 +2760,20 @@ pub(crate) mod tests {
         let mut existing = make_test_project(Uuid::new_v4());
         let id = existing.id;
         let original_workspace_id = Uuid::new_v4();
-        existing.scope = ProjectScope::InWorkspace { workspace_id: original_workspace_id };
+        existing.scope = ProjectScope::InWorkspace {
+            workspace_id: original_workspace_id,
+        };
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
         let ws = registered_workspace();
 
         let result =
-            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, ws.id).await;
+            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, ws.id)
+                .await;
 
-        assert!(result.is_err(), "re-parenting an already-attached project must be refused");
+        assert!(
+            result.is_err(),
+            "re-parenting an already-attached project must be refused"
+        );
         assert_eq!(
             projects.read().await.get(&id).unwrap().scope.workspace_id(),
             Some(original_workspace_id),
@@ -2473,11 +2787,19 @@ pub(crate) mod tests {
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
         let ws = registered_workspace();
 
-        let result =
-            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, Uuid::new_v4(), ws.id)
-                .await;
+        let result = attach_project_to_workspace_committed(
+            &projects,
+            &ws.registry,
+            &storage,
+            Uuid::new_v4(),
+            ws.id,
+        )
+        .await;
 
-        assert!(result.is_err(), "attaching a project that does not exist must be refused");
+        assert!(
+            result.is_err(),
+            "attaching a project that does not exist must be refused"
+        );
     }
 
     #[tokio::test]
@@ -2488,9 +2810,14 @@ pub(crate) mod tests {
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
         let ws = registered_workspace();
 
-        let result =
-            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, Uuid::new_v4())
-                .await;
+        let result = attach_project_to_workspace_committed(
+            &projects,
+            &ws.registry,
+            &storage,
+            id,
+            Uuid::new_v4(),
+        )
+        .await;
 
         assert_eq!(result.unwrap_err(), "Workspace not found");
         assert_eq!(
@@ -2523,7 +2850,8 @@ pub(crate) mod tests {
         let ws = registered_workspace();
 
         let result =
-            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, ws.id).await;
+            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, ws.id)
+                .await;
 
         let error = result.expect_err("a persistence failure must be reported, not swallowed");
         assert!(
@@ -2570,9 +2898,13 @@ pub(crate) mod tests {
         let id = existing.id;
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
-        let result = detach_project_from_workspace_committed(&projects, &storage, id, Uuid::new_v4()).await;
+        let result =
+            detach_project_from_workspace_committed(&projects, &storage, id, Uuid::new_v4()).await;
 
-        assert!(result.is_err(), "detaching an already-standalone project must be refused");
+        assert!(
+            result.is_err(),
+            "detaching an already-standalone project must be refused"
+        );
     }
 
     #[tokio::test]
@@ -2580,10 +2912,18 @@ pub(crate) mod tests {
         let (storage, _temp) = create_test_storage();
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
 
-        let result =
-            detach_project_from_workspace_committed(&projects, &storage, Uuid::new_v4(), Uuid::new_v4()).await;
+        let result = detach_project_from_workspace_committed(
+            &projects,
+            &storage,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        )
+        .await;
 
-        assert!(result.is_err(), "detaching a project that does not exist must be refused");
+        assert!(
+            result.is_err(),
+            "detaching a project that does not exist must be refused"
+        );
     }
 
     #[cfg(unix)]
@@ -2599,9 +2939,13 @@ pub(crate) mod tests {
         existing.scope = ProjectScope::InWorkspace { workspace_id };
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
-        let result = detach_project_from_workspace_committed(&projects, &storage, id, workspace_id).await;
+        let result =
+            detach_project_from_workspace_committed(&projects, &storage, id, workspace_id).await;
 
-        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
+        assert!(
+            result.is_err(),
+            "a persistence failure must be reported, not swallowed"
+        );
         assert_eq!(
             projects.read().await.get(&id).unwrap().scope.workspace_id(),
             Some(workspace_id),
@@ -2630,28 +2974,46 @@ pub(crate) mod tests {
         std::fs::write(&registry_file, "this is [[not toml").unwrap();
         let reloaded = WorkspaceRegistry::load_from(registry_file)
             .expect("a corrupt registry is quarantined, not fatal");
-        assert!(reloaded.get(&lost.id).is_none(), "the workspace must now be missing");
+        assert!(
+            reloaded.get(&lost.id).is_none(),
+            "the workspace must now be missing"
+        );
         let survivor = registered_workspace();
 
-        let refused =
-            attach_project_to_workspace_committed(&projects, &survivor.registry, &storage, id, survivor.id)
-                .await;
-        assert!(refused.is_err(), "a dangling membership must not be silently re-parented");
+        let refused = attach_project_to_workspace_committed(
+            &projects,
+            &survivor.registry,
+            &storage,
+            id,
+            survivor.id,
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "a dangling membership must not be silently re-parented"
+        );
 
         let detached = detach_project_from_workspace_committed(&projects, &storage, id, lost.id)
             .await
             .expect("detaching must not require the lost workspace to exist");
         assert_eq!(detached.scope.workspace_id(), None);
         assert_eq!(
-            storage.load_config().unwrap().projects[&id.to_string()].scope.workspace_id(),
+            storage.load_config().unwrap().projects[&id.to_string()]
+                .scope
+                .workspace_id(),
             None,
             "the detachment must be persisted"
         );
 
-        let reattached =
-            attach_project_to_workspace_committed(&projects, &survivor.registry, &storage, id, survivor.id)
-                .await
-                .expect("a detached project is attachable again");
+        let reattached = attach_project_to_workspace_committed(
+            &projects,
+            &survivor.registry,
+            &storage,
+            id,
+            survivor.id,
+        )
+        .await
+        .expect("a detached project is attachable again");
         assert_eq!(reattached.scope.workspace_id(), Some(survivor.id));
     }
 
@@ -2676,9 +3038,10 @@ pub(crate) mod tests {
             .await
             .expect("first move: attach to B");
 
-        let stale_detach = detach_project_from_workspace_committed(&projects, &storage, id, ws_a.id)
-            .await
-            .expect_err("a detach that names A must not detach the Project from B");
+        let stale_detach =
+            detach_project_from_workspace_committed(&projects, &storage, id, ws_a.id)
+                .await
+                .expect_err("a detach that names A must not detach the Project from B");
         let stale_attach =
             attach_project_to_workspace_committed(&projects, &ws_a.registry, &storage, id, ws_a.id)
                 .await
@@ -2774,13 +3137,25 @@ pub(crate) mod tests {
             tmp.path().join("cache"),
             tmp.path().join("runtime"),
         ));
-        let (state, _) = crate::app_core::build_state_with_paths(paths).await.expect("state");
+        let (state, _) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state");
         let project_id = Uuid::new_v4();
         let workspace_id = Uuid::new_v4();
         let mut project = make_test_project(project_id);
         project.scope = ProjectScope::InWorkspace { workspace_id };
-        state.project.projects.write().await.insert(project_id, project);
-        let task = crate::test_helpers::create_test_task_full("queued", project_id, crate::domain::TaskStatus::Backlog, 0);
+        state
+            .project
+            .projects
+            .write()
+            .await
+            .insert(project_id, project);
+        let task = crate::test_helpers::create_test_task_full(
+            "queued",
+            project_id,
+            crate::domain::TaskStatus::Backlog,
+            0,
+        );
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task);
 
@@ -2788,10 +3163,28 @@ pub(crate) mod tests {
         // detach is polled by hand: Pending proves it parked on that lease
         // (the project gate is uncontended and comes first) before the Queue
         // move lands.
-        let move_lease = state.task_lifecycle_locks.acquire(task_id).await.expect("the move takes its lease");
-        let mut detach = std::pin::pin!(detach_project_from_workspace_core(&state, project_id, workspace_id));
-        assert!(poll_once(detach.as_mut()).is_pending(), "the detach must park on the Task's lease");
-        state.task.tasks.write().await.get_mut(&task_id).expect("the Task").status = crate::domain::TaskStatus::Queue;
+        let move_lease = state
+            .task_lifecycle_locks
+            .acquire(task_id)
+            .await
+            .expect("the move takes its lease");
+        let mut detach = std::pin::pin!(detach_project_from_workspace_core(
+            &state,
+            project_id,
+            workspace_id
+        ));
+        assert!(
+            poll_once(detach.as_mut()).is_pending(),
+            "the detach must park on the Task's lease"
+        );
+        state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&task_id)
+            .expect("the Task")
+            .status = crate::domain::TaskStatus::Queue;
         drop(move_lease);
 
         let err = detach
@@ -2799,7 +3192,9 @@ pub(crate) mod tests {
             .expect_err("a queued Task keeps its Project in the Workspace");
         assert!(err.contains("is in Queue"), "{err}");
         assert_eq!(
-            state.project.projects.read().await[&project_id].scope.workspace_id(),
+            state.project.projects.read().await[&project_id]
+                .scope
+                .workspace_id(),
             Some(workspace_id)
         );
     }
@@ -2819,22 +3214,41 @@ pub(crate) mod tests {
     /// which is the ordering the real removal must never use.
     async fn removal_against_waiting_mutation(release_before_write: bool) -> Result<(), String> {
         let project_id = Uuid::new_v4();
-        let task = crate::test_helpers::create_test_task_full("waits", project_id, crate::domain::TaskStatus::Backlog, 0);
+        let task = crate::test_helpers::create_test_task_full(
+            "waits",
+            project_id,
+            crate::domain::TaskStatus::Backlog,
+            0,
+        );
         let task_id = task.id;
         let locks = Arc::new(crate::lifecycle::TaskLifecycleLocks::new());
-        let tasks: crate::lifecycle::Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
-        let projects = Arc::new(RwLock::new(HashMap::from([(project_id, make_test_project(project_id))])));
+        let tasks: crate::lifecycle::Tasks =
+            Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            make_test_project(project_id),
+        )])));
 
-        let removal_lease = locks.acquire(task_id).await.expect("the removal takes the lease");
+        let removal_lease = locks
+            .acquire(task_id)
+            .await
+            .expect("the removal takes the lease");
         let mut mutation = std::pin::pin!(async {
-            lease_active_task_in(&locks, &tasks, &projects, task_id).await.map(|_| ())
+            lease_active_task_in(&locks, &tasks, &projects, task_id)
+                .await
+                .map(|_| ())
         });
         assert!(
             poll_once(mutation.as_mut()).is_pending(),
             "the mutation must park on the removal's lease before the removal writes"
         );
         let removed = || async {
-            projects.write().await.get_mut(&project_id).expect("the Project").removed_at = Some(chrono::Utc::now());
+            projects
+                .write()
+                .await
+                .get_mut(&project_id)
+                .expect("the Project")
+                .removed_at = Some(chrono::Utc::now());
         };
         if release_before_write {
             drop(removal_lease);
@@ -2872,13 +3286,21 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn lease_active_task_in_passes_a_mutation_of_an_active_project() {
         let project_id = Uuid::new_v4();
-        let task = crate::test_helpers::create_test_task_full("active", project_id, crate::domain::TaskStatus::Backlog, 0);
+        let task = crate::test_helpers::create_test_task_full(
+            "active",
+            project_id,
+            crate::domain::TaskStatus::Backlog,
+            0,
+        );
         let task_id = task.id;
         let locks = crate::lifecycle::TaskLifecycleLocks::new();
-        let tasks: crate::lifecycle::Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let tasks: crate::lifecycle::Tasks =
+            Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
         let projects = RwLock::new(HashMap::from([(project_id, make_test_project(project_id))]));
 
-        assert!(lease_active_task_in(&locks, &tasks, &projects, task_id).await.is_ok());
+        assert!(lease_active_task_in(&locks, &tasks, &projects, task_id)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -2909,7 +3331,9 @@ pub(crate) mod tests {
         let (storage, _temp) = create_test_storage();
         let id = Uuid::new_v4();
         let mut config = AppConfig::default();
-        config.projects.insert(id.to_string(), make_test_project(id));
+        config
+            .projects
+            .insert(id.to_string(), make_test_project(id));
         storage.save_config(&config).unwrap();
         // A real (empty) board file: the deletion must dispose of exactly it,
         // and the racing creation must never touch the path again.
@@ -3140,7 +3564,9 @@ pub(crate) mod tests {
         let project = make_test_project(Uuid::new_v4());
         let id = project.id;
         let mut config = AppConfig::default();
-        config.projects.insert(id.to_string(), make_test_project(id));
+        config
+            .projects
+            .insert(id.to_string(), make_test_project(id));
         storage.save_config(&config).unwrap();
         let task = board_task(id);
         let tasks = seed_board(id, &storage, std::slice::from_ref(&task));
@@ -3250,7 +3676,9 @@ pub(crate) mod tests {
 
         // The board lives at the route derived from repository one.
         let task = board_task(id);
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let routed = storage.tasks_board_files(id);
         assert!(
             routed.iter().any(|p| p.exists()),
@@ -3307,7 +3735,10 @@ pub(crate) mod tests {
         let deleted = deleted.expect("the deletion must not panic");
         let updated = updated.expect("the update must not panic");
 
-        assert!(deleted.expect("the deletion must succeed"), "the deletion committed");
+        assert!(
+            deleted.expect("the deletion must succeed"),
+            "the deletion committed"
+        );
         assert!(
             matches!(updated, Ok(None)),
             "the queued update must find the Project gone, not re-route it: {updated:?}"
@@ -3343,7 +3774,9 @@ pub(crate) mod tests {
         // candidate is what an unrouted Project reads.
         let task = board_task(id);
         let tasks = board(Vec::new());
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let orphan = storage.tasks_board_files(id);
         assert!(orphan.first().is_some_and(|path| path.exists()));
         let orphan_path = orphan
@@ -3427,7 +3860,9 @@ pub(crate) mod tests {
         // attempt captured while the Project was still routed.
         let task = board_task(id);
         let tasks = board(Vec::new());
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let legacy = storage
             .tasks_board_files(id)
             .into_iter()
@@ -3497,13 +3932,14 @@ pub(crate) mod tests {
             .await
             .expect("the retry must not panic");
         assert!(retried);
-        assert!(!legacy.exists() && !routed.exists(), "everything the record named is gone");
         assert!(
-            !storage
-                .paths()
-                .pending_project_tasks_deletion_file(id)
-                .exists()
+            !legacy.exists() && !routed.exists(),
+            "everything the record named is gone"
         );
+        assert!(!storage
+            .paths()
+            .pending_project_tasks_deletion_file(id)
+            .exists());
     }
 
     /// A board rooted in a repository path carrying a line break cannot be
@@ -3536,10 +3972,14 @@ pub(crate) mod tests {
         storage.save_config(&config).unwrap();
 
         let task = board_task(id);
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let board_files = storage.tasks_board_files(id);
         assert!(
-            board_files.iter().any(|p| p.to_str().is_some_and(|t| t.contains('\n'))),
+            board_files
+                .iter()
+                .any(|p| p.to_str().is_some_and(|t| t.contains('\n'))),
             "this fixture must produce a board path with a newline: {board_files:?}"
         );
 
@@ -3549,7 +3989,9 @@ pub(crate) mod tests {
         let result = delete_project_committed(&projects, &tasks, &storage, None, None, id).await;
         let error = result.expect_err("the deletion must be refused");
         assert!(
-            error.contains("cannot faithfully") || error.contains("not valid UTF-8") || error.contains("line break"),
+            error.contains("cannot faithfully")
+                || error.contains("not valid UTF-8")
+                || error.contains("line break"),
             "the refusal must say why the paths are unrecordable: {error:?}"
         );
 
@@ -3791,10 +4233,11 @@ pub(crate) mod tests {
         // The retry record makes the next start finish what was owed; after
         // the fix locally, a retry deletes the task records now that the
         // directory allows deletion again.
-        assert!(storage.delete_task_files(&storage.tasks_board_files(id)).is_ok());
+        assert!(storage
+            .delete_task_files(&storage.tasks_board_files(id))
+            .is_ok());
         assert!(storage.clear_project_tasks_deletion_pending(id).is_ok());
     }
-
 
     /// The routed case of issue #193, which only the captured board files in
     /// the retry record can close once the Project is out of the config: a
@@ -3810,20 +4253,22 @@ pub(crate) mod tests {
         let id = project.id;
         let mut routed_project = project;
         routed_project.repository_id = Some(repository_id);
-        storage.save_config(&AppConfig {
-            repositories: HashMap::from([(
-                repository_id.to_string(),
-                crate::domain::Repository {
-                    id: repository_id,
-                    local_path: repo_dir.to_string_lossy().to_string(),
-                    remote_url: None,
-                    remote_type: None,
-                    created_at: chrono::Utc::now(),
-                },
-            )]),
-            projects: HashMap::from([(id.to_string(), routed_project.clone())]),
-            ..AppConfig::default()
-        }).unwrap();
+        storage
+            .save_config(&AppConfig {
+                repositories: HashMap::from([(
+                    repository_id.to_string(),
+                    crate::domain::Repository {
+                        id: repository_id,
+                        local_path: repo_dir.to_string_lossy().to_string(),
+                        remote_url: None,
+                        remote_type: None,
+                        created_at: chrono::Utc::now(),
+                    },
+                )]),
+                projects: HashMap::from([(id.to_string(), routed_project.clone())]),
+                ..AppConfig::default()
+            })
+            .unwrap();
         storage.load_config().unwrap();
         let board_files = storage.tasks_board_files(id);
         assert!(
@@ -3831,14 +4276,19 @@ pub(crate) mod tests {
             "a routed project records both its routed board and the legacy one"
         );
         let routed_file = &board_files[0];
-        assert!(routed_file != &board_files[1], "the two candidates must differ");
+        assert!(
+            routed_file != &board_files[1],
+            "the two candidates must differ"
+        );
 
         // A pending integration pins the record, so the refusal still holds
         // for a routed project, and the routed file survives it.
         let mut task = board_task(id);
         task.status = crate::domain::TaskStatus::InProgress;
         task.local_integration = Some(pending_integration());
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let tasks = board(vec![task]);
         let projects = RwLock::new(HashMap::from([(id, routed_project.clone())]));
         refused_obligation(
@@ -3852,7 +4302,9 @@ pub(crate) mod tests {
         // goes, by name, and no later save can bring a second copy back
         // through the legacy path.
         let done = board_task(id);
-        storage.save_project_tasks(id, std::slice::from_ref(&done)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&done))
+            .unwrap();
         let tasks = board(vec![done]);
         let projects = RwLock::new(HashMap::from([(id, routed_project.clone())]));
         assert!(
@@ -3865,7 +4317,10 @@ pub(crate) mod tests {
         }
         assert!(storage.load_project_tasks(id).unwrap().is_empty());
         // And a restart-side recreation of the marker records nothing new.
-        assert!(!storage.paths().pending_project_tasks_deletion_file(id).exists());
+        assert!(!storage
+            .paths()
+            .pending_project_tasks_deletion_file(id)
+            .exists());
     }
 
     #[tokio::test]
@@ -3883,28 +4338,29 @@ pub(crate) mod tests {
                 .unwrap()
         );
 
-        let recreated = crate::lifecycle::create(&gate, &tasks, &projects, &storage, id, |existing| {
-            let tags = crate::domain::NewTask {
-                reviewer_model: None,
-                id: Uuid::new_v4(),
-                project_id: id,
-                title: "Too late".to_string(),
-                description: None,
-                model: "test".to_string(),
-                planning_mode: false,
-                dependencies: Vec::new(),
-                category: Default::default(),
-                priority: Default::default(),
-                complexity: Default::default(),
-                impact: Default::default(),
-                security_severity: Default::default(),
-                github_issue_url: None,
-                gitlab_issue_url: None,
-                linear_ticket_id: None,
-            };
-            crate::domain::Task::new_backlog(existing, tags)
-        })
-        .await;
+        let recreated =
+            crate::lifecycle::create(&gate, &tasks, &projects, &storage, id, |existing| {
+                let tags = crate::domain::NewTask {
+                    reviewer_model: None,
+                    id: Uuid::new_v4(),
+                    project_id: id,
+                    title: "Too late".to_string(),
+                    description: None,
+                    model: "test".to_string(),
+                    planning_mode: false,
+                    dependencies: Vec::new(),
+                    category: Default::default(),
+                    priority: Default::default(),
+                    complexity: Default::default(),
+                    impact: Default::default(),
+                    security_severity: Default::default(),
+                    github_issue_url: None,
+                    gitlab_issue_url: None,
+                    linear_ticket_id: None,
+                };
+                crate::domain::Task::new_backlog(existing, tags)
+            })
+            .await;
         assert!(
             recreated.is_err(),
             "a Task must not be created for a deleted Project"
@@ -3930,8 +4386,12 @@ pub(crate) mod tests {
             refuse_if_project_removed(&projects, removed_id).await,
             Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string())
         );
-        assert!(refuse_if_project_removed(&projects, active_id).await.is_ok());
-        assert!(refuse_if_project_removed(&projects, Uuid::new_v4()).await.is_ok());
+        assert!(refuse_if_project_removed(&projects, active_id)
+            .await
+            .is_ok());
+        assert!(refuse_if_project_removed(&projects, Uuid::new_v4())
+            .await
+            .is_ok());
     }
 
     /// A removed Project is inactive: creating a Task for it is refused, and no
@@ -3948,35 +4408,40 @@ pub(crate) mod tests {
         let tasks = board(vec![]);
         let gate = crate::lifecycle::ProjectLifecycleGate::new();
 
-        let created = crate::lifecycle::create(&gate, &tasks, &projects, &storage, id, |existing| {
-            let tags = crate::domain::NewTask {
-                reviewer_model: None,
-                id: Uuid::new_v4(),
-                project_id: id,
-                title: "Refused".to_string(),
-                description: None,
-                model: "test".to_string(),
-                planning_mode: false,
-                dependencies: Vec::new(),
-                category: Default::default(),
-                priority: Default::default(),
-                complexity: Default::default(),
-                impact: Default::default(),
-                security_severity: Default::default(),
-                github_issue_url: None,
-                gitlab_issue_url: None,
-                linear_ticket_id: None,
-            };
-            crate::domain::Task::new_backlog(existing, tags)
-        })
-        .await;
+        let created =
+            crate::lifecycle::create(&gate, &tasks, &projects, &storage, id, |existing| {
+                let tags = crate::domain::NewTask {
+                    reviewer_model: None,
+                    id: Uuid::new_v4(),
+                    project_id: id,
+                    title: "Refused".to_string(),
+                    description: None,
+                    model: "test".to_string(),
+                    planning_mode: false,
+                    dependencies: Vec::new(),
+                    category: Default::default(),
+                    priority: Default::default(),
+                    complexity: Default::default(),
+                    impact: Default::default(),
+                    security_severity: Default::default(),
+                    github_issue_url: None,
+                    gitlab_issue_url: None,
+                    linear_ticket_id: None,
+                };
+                crate::domain::Task::new_backlog(existing, tags)
+            })
+            .await;
 
         assert_eq!(
             created.expect_err("a removed Project admits no Task"),
             crate::domain::project::PROJECT_REMOVED_REFUSAL
         );
         assert!(tasks.read().await.is_empty(), "no Task entered the board");
-        assert_eq!(storage.load_project_tasks(id).unwrap().len(), 0, "no Task file was written");
+        assert_eq!(
+            storage.load_project_tasks(id).unwrap().len(),
+            0,
+            "no Task file was written"
+        );
     }
 
     /// A Tauri-flavored creation for same project id must be blocked while
@@ -4071,12 +4536,16 @@ pub(crate) mod tests {
         let mut project = make_test_project(id);
         project.repository_id = Some(repository_id);
         let mut config = AppConfig::default();
-        config.repositories.insert(repository_id.to_string(), repository.clone());
+        config
+            .repositories
+            .insert(repository_id.to_string(), repository.clone());
         config.projects.insert(id.to_string(), project.clone());
         storage.save_config(&config).unwrap();
 
         let task = board_task(id);
-        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&task))
+            .unwrap();
         let tasks = board(vec![task]);
         let routed_file = storage
             .tasks_board_files(id)
@@ -4088,7 +4557,10 @@ pub(crate) mod tests {
             .paths()
             .project_state_dir(&key, id, &repo_root, StateLocation::InProject)
             .join("tasks.toml");
-        assert_ne!(routed_file, destination_file, "the migration must change the route");
+        assert_ne!(
+            routed_file, destination_file,
+            "the migration must change the route"
+        );
 
         let projects = Arc::new(RwLock::new(HashMap::from([(id, project)])));
         let repositories = RwLock::new(HashMap::from([(repository_id, repository)]));
@@ -4096,8 +4568,12 @@ pub(crate) mod tests {
         let gate = crate::lifecycle::ProjectLifecycleGate::new();
         let lease_locks = crate::lifecycle::TaskLifecycleLocks::new();
         let del_task = tokio::spawn({
-            let (projects, tasks, storage, gate) =
-                (projects.clone(), tasks.clone(), storage.clone(), gate.clone());
+            let (projects, tasks, storage, gate) = (
+                projects.clone(),
+                tasks.clone(),
+                storage.clone(),
+                gate.clone(),
+            );
             async move {
                 let _gate = gate.write(id).await;
                 let _leases = crate::lifecycle::hold_project_task_leases(&lease_locks, &tasks, id)
@@ -4146,7 +4622,10 @@ pub(crate) mod tests {
             "no orphan Task file may appear at the migration's destination"
         );
         assert!(!projects.read().await.contains_key(&id));
-        assert!(!storage.paths().pending_project_tasks_deletion_file(id).exists());
+        assert!(!storage
+            .paths()
+            .pending_project_tasks_deletion_file(id)
+            .exists());
     }
 
     #[cfg(unix)]
@@ -4240,10 +4719,23 @@ pub(crate) mod tests {
             .await
             .expect("an idle Project can be removed");
 
-        let removed = projects.read().await.get(&id).cloned().expect("the Project is kept");
+        let removed = projects
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("the Project is kept");
         assert!(removed.is_removed(), "memory holds the removal");
-        let on_disk = storage.load_config().unwrap().projects.get(&id.to_string()).cloned();
-        assert!(on_disk.is_some_and(|p| p.removed_at.is_some()), "the removal is on disk");
+        let on_disk = storage
+            .load_config()
+            .unwrap()
+            .projects
+            .get(&id.to_string())
+            .cloned();
+        assert!(
+            on_disk.is_some_and(|p| p.removed_at.is_some()),
+            "the removal is on disk"
+        );
     }
 
     #[tokio::test]
@@ -4257,12 +4749,19 @@ pub(crate) mod tests {
         );
         let tasks = board(vec![queued]);
 
-        let refusal = remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
-            .await
-            .expect_err("a queued Task must stop removal");
+        let refusal =
+            remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+                .await
+                .expect_err("a queued Task must stop removal");
 
-        assert!(refusal.contains("in Queue"), "the refusal names the cause: {refusal}");
-        assert!(!projects.read().await[&id].is_removed(), "nothing was changed");
+        assert!(
+            refusal.contains("in Queue"),
+            "the refusal names the cause: {refusal}"
+        );
+        assert!(
+            !projects.read().await[&id].is_removed(),
+            "nothing was changed"
+        );
     }
 
     #[tokio::test]
@@ -4274,16 +4773,21 @@ pub(crate) mod tests {
         let repositories = RwLock::new(HashMap::new());
         let tasks = board(vec![]);
 
-        let refusal = remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
-            .await
-            .expect_err("a Project that cannot be reopened must not be removed");
+        let refusal =
+            remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
+                .await
+                .expect_err("a Project that cannot be reopened must not be removed");
 
         assert!(refusal.contains("no folder"), "{refusal}");
         assert!(!projects.read().await[&id].is_removed());
     }
 
     /// Writes the in-memory Project to the config file, so a refusal can be checked on disk.
-    async fn persist_project(storage: &Storage, projects: &RwLock<HashMap<Uuid, Project>>, id: Uuid) {
+    async fn persist_project(
+        storage: &Storage,
+        projects: &RwLock<HashMap<Uuid, Project>>,
+        id: Uuid,
+    ) {
         let project = projects.read().await[&id].clone();
         storage
             .save_config(&AppConfig {
@@ -4419,7 +4923,9 @@ pub(crate) mod tests {
             crate::domain::TaskStatus::Backlog,
             0,
         );
-        storage.save_project_tasks(id, std::slice::from_ref(&backlog)).unwrap();
+        storage
+            .save_project_tasks(id, std::slice::from_ref(&backlog))
+            .unwrap();
         let original_name = projects.read().await[&id].name.clone();
         let tasks = board(vec![backlog]);
         remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
@@ -4429,25 +4935,41 @@ pub(crate) mod tests {
             .repository_path(&*repositories.read().await)
             .unwrap();
 
-        let found = removed_project_for_folder(&*projects.read().await, &*repositories.read().await, &folder);
+        let found = removed_project_for_folder(
+            &*projects.read().await,
+            &*repositories.read().await,
+            &folder,
+        );
         assert_eq!(found, Some(id), "the folder finds its removed Project");
 
-        let reopened = reopen_project_committed(&projects, &repositories, &storage, id).await.unwrap();
+        let reopened = reopen_project_committed(&projects, &repositories, &storage, id)
+            .await
+            .unwrap();
 
         assert_eq!(reopened.id, id, "same identity");
         assert_eq!(reopened.name, original_name, "same name");
         assert!(!reopened.is_removed(), "active again");
         assert_eq!(projects.read().await.len(), 1, "no duplicate Project");
-        assert_eq!(storage.load_project_tasks(id).unwrap().len(), 1, "Tasks survive");
+        assert_eq!(
+            storage.load_project_tasks(id).unwrap().len(),
+            1,
+            "Tasks survive"
+        );
     }
 
     #[tokio::test]
     async fn a_folder_that_no_removed_project_uses_finds_nothing() {
         let (_storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
-        let folder = projects.read().await[&id].repository_path(&*repositories.read().await).unwrap();
+        let folder = projects.read().await[&id]
+            .repository_path(&*repositories.read().await)
+            .unwrap();
         // Active, not removed: the folder must not be treated as a reopen.
         assert_eq!(
-            removed_project_for_folder(&*projects.read().await, &*repositories.read().await, &folder),
+            removed_project_for_folder(
+                &*projects.read().await,
+                &*repositories.read().await,
+                &folder
+            ),
             None
         );
     }
@@ -4456,7 +4978,10 @@ pub(crate) mod tests {
     fn the_removal_marker_is_absent_from_the_file_until_set() {
         let project = make_test_project(Uuid::new_v4());
         let text = toml::to_string(&project).unwrap();
-        assert!(!text.contains("removed_at"), "an active Project keeps the old shape");
+        assert!(
+            !text.contains("removed_at"),
+            "an active Project keeps the old shape"
+        );
         let parsed: Project = toml::from_str(&text).unwrap();
         assert!(!parsed.is_removed());
     }
@@ -4470,15 +4995,18 @@ pub(crate) mod tests {
     ) {
         let mut w = projects.write().await;
         w.get_mut(&id).unwrap().scope = ProjectScope::InWorkspace { workspace_id };
-        storage.save_config(&{
-            let mut config = storage.load_config().unwrap();
-            config.projects = w.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
-            config
-        }).unwrap();
+        storage
+            .save_config(&{
+                let mut config = storage.load_config().unwrap();
+                config.projects = w.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                config
+            })
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn removing_a_workspace_member_keeps_its_membership_and_an_unrelated_standalone_project() {
+    async fn removing_a_workspace_member_keeps_its_membership_and_an_unrelated_standalone_project()
+    {
         let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
         let workspace_id = Uuid::new_v4();
         attach_for_test(&projects, &storage, id, workspace_id).await;
@@ -4493,8 +5021,15 @@ pub(crate) mod tests {
 
         let memory = projects.read().await;
         assert!(memory[&id].is_removed());
-        assert_eq!(memory[&id].scope.workspace_id(), Some(workspace_id), "membership kept in memory");
-        assert!(!memory[&standalone_id].is_removed(), "the unrelated Project stays active");
+        assert_eq!(
+            memory[&id].scope.workspace_id(),
+            Some(workspace_id),
+            "membership kept in memory"
+        );
+        assert!(
+            !memory[&standalone_id].is_removed(),
+            "the unrelated Project stays active"
+        );
         assert_eq!(memory[&standalone_id].scope.workspace_id(), None);
         drop(memory);
         let on_disk = storage.load_config().unwrap().projects;
@@ -4510,21 +5045,37 @@ pub(crate) mod tests {
         let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
         let workspace_id = Uuid::new_v4();
         attach_for_test(&projects, &storage, id, workspace_id).await;
-        remove_project_committed(&projects, &repositories, &board(vec![]), &storage, None, None, id)
-            .await
-            .unwrap();
+        remove_project_committed(
+            &projects,
+            &repositories,
+            &board(vec![]),
+            &storage,
+            None,
+            None,
+            id,
+        )
+        .await
+        .unwrap();
         let before = projects.read().await[&id].clone();
 
-        let refusal = detach_project_from_workspace_committed(&projects, &storage, id, workspace_id)
-            .await
-            .expect_err("a removed member must not be detached");
+        let refusal =
+            detach_project_from_workspace_committed(&projects, &storage, id, workspace_id)
+                .await
+                .expect_err("a removed member must not be detached");
 
         assert_eq!(refusal, crate::domain::project::PROJECT_REMOVED_REFUSAL);
         let after = projects.read().await[&id].clone();
-        assert_eq!(after.scope.workspace_id(), Some(workspace_id), "scope unchanged");
+        assert_eq!(
+            after.scope.workspace_id(),
+            Some(workspace_id),
+            "scope unchanged"
+        );
         assert_eq!(after.removed_at, before.removed_at, "removal unchanged");
         let on_disk = storage.load_config().unwrap().projects;
-        assert_eq!(on_disk[&id.to_string()].scope.workspace_id(), Some(workspace_id));
+        assert_eq!(
+            on_disk[&id.to_string()].scope.workspace_id(),
+            Some(workspace_id)
+        );
     }
 
     /// The command refuses a member with unfinished Task work before any write, and
@@ -4534,8 +5085,14 @@ pub(crate) mod tests {
         use tauri::Manager;
 
         for (status, reason) in [
-            (crate::domain::TaskStatus::Queue, "is in Queue; move it out of Queue first"),
-            (crate::domain::TaskStatus::InProgress, "is in progress; stop it first"),
+            (
+                crate::domain::TaskStatus::Queue,
+                "is in Queue; move it out of Queue first",
+            ),
+            (
+                crate::domain::TaskStatus::InProgress,
+                "is in progress; stop it first",
+            ),
             (
                 crate::domain::TaskStatus::HumanReview,
                 "is waiting for your review decision",
@@ -4572,11 +5129,18 @@ pub(crate) mod tests {
             .expect_err("a member with unfinished Task work must not be detached");
 
             assert!(refusal.contains(reason), "{label}: {refusal}");
-            assert!(refusal.contains("Nothing was changed"), "{label}: {refusal}");
+            assert!(
+                refusal.contains("Nothing was changed"),
+                "{label}: {refusal}"
+            );
             let scope = app.state::<crate::AppState>().project.projects.read().await[&id]
                 .scope
                 .workspace_id();
-            assert_eq!(scope, Some(workspace_id), "{label}: the Workspace is unchanged");
+            assert_eq!(
+                scope,
+                Some(workspace_id),
+                "{label}: the Workspace is unchanged"
+            );
         }
     }
 
@@ -4585,15 +5149,29 @@ pub(crate) mod tests {
         let (storage, _temp, projects, repositories, id) = project_with_folder(vec![]).await;
         let workspace_id = Uuid::new_v4();
         attach_for_test(&projects, &storage, id, workspace_id).await;
-        remove_project_committed(&projects, &repositories, &board(vec![]), &storage, None, None, id)
+        remove_project_committed(
+            &projects,
+            &repositories,
+            &board(vec![]),
+            &storage,
+            None,
+            None,
+            id,
+        )
+        .await
+        .unwrap();
+
+        let reopened = reopen_project_committed(&projects, &repositories, &storage, id)
             .await
             .unwrap();
 
-        let reopened = reopen_project_committed(&projects, &repositories, &storage, id).await.unwrap();
-
         assert_eq!(reopened.id, id, "the original UUID");
         assert!(!reopened.is_removed());
-        assert_eq!(reopened.scope.workspace_id(), Some(workspace_id), "the original Workspace");
+        assert_eq!(
+            reopened.scope.workspace_id(),
+            Some(workspace_id),
+            "the original Workspace"
+        );
     }
 
     #[tokio::test]
@@ -4609,11 +5187,27 @@ pub(crate) mod tests {
             let (detached, removed) = if detach_first {
                 tokio::join!(
                     detach_project_from_workspace_committed(&projects, &storage, id, workspace_id),
-                    remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id),
+                    remove_project_committed(
+                        &projects,
+                        &repositories,
+                        &tasks,
+                        &storage,
+                        None,
+                        None,
+                        id
+                    ),
                 )
             } else {
                 let (r, d) = tokio::join!(
-                    remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id),
+                    remove_project_committed(
+                        &projects,
+                        &repositories,
+                        &tasks,
+                        &storage,
+                        None,
+                        None,
+                        id
+                    ),
                     detach_project_from_workspace_committed(&projects, &storage, id, workspace_id),
                 );
                 (d, r)
@@ -4627,8 +5221,16 @@ pub(crate) mod tests {
                 Ok(_) => assert_eq!(memory.scope.workspace_id(), None, "order {detach_first}"),
                 // Removal won: the detach must have been refused and left the membership.
                 Err(reason) => {
-                    assert_eq!(reason, crate::domain::project::PROJECT_REMOVED_REFUSAL, "order {detach_first}");
-                    assert_eq!(memory.scope.workspace_id(), Some(workspace_id), "order {detach_first}");
+                    assert_eq!(
+                        reason,
+                        crate::domain::project::PROJECT_REMOVED_REFUSAL,
+                        "order {detach_first}"
+                    );
+                    assert_eq!(
+                        memory.scope.workspace_id(),
+                        Some(workspace_id),
+                        "order {detach_first}"
+                    );
                 }
             }
         }
@@ -4659,8 +5261,12 @@ pub(crate) mod tests {
         let mut first = Box::pin(crate::lifecycle::enqueue_current(
             &tasks, &storage, &projects, &locks, None, task_id,
         ));
-        let waited = tokio::time::timeout(std::time::Duration::from_millis(100), first.as_mut()).await;
-        assert!(waited.is_err(), "the Queue entry must wait for the removal's lease");
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(100), first.as_mut()).await;
+        assert!(
+            waited.is_err(),
+            "the Queue entry must wait for the removal's lease"
+        );
 
         remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
             .await
@@ -4689,16 +5295,31 @@ pub(crate) mod tests {
         let tasks = board(vec![]);
         {
             let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
-            let first = remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id).await;
+            let first = remove_project_committed(
+                &projects,
+                &repositories,
+                &tasks,
+                &storage,
+                None,
+                None,
+                id,
+            )
+            .await;
             assert!(first.is_err(), "the save is not confirmed");
         }
-        assert!(projects.read().await[&id].is_removed(), "the removal was adopted in memory");
+        assert!(
+            projects.read().await[&id].is_removed(),
+            "the removal was adopted in memory"
+        );
 
         remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, id)
             .await
             .expect("the retry confirms the save");
         let on_disk = storage.load_config().expect("config").projects;
-        assert!(on_disk[&id.to_string()].is_removed(), "the removal is on disk after the retry");
+        assert!(
+            on_disk[&id.to_string()].is_removed(),
+            "the removal is on disk after the retry"
+        );
     }
 
     /// Reopening needs the folder to exist. A missing folder is refused, and an
@@ -4710,7 +5331,10 @@ pub(crate) mod tests {
         assert!(reopen_folder_available(&present).is_ok());
         let missing = temp.path().join("gone").to_string_lossy().to_string();
         let refusal = reopen_folder_available(&missing).expect_err("a missing folder is refused");
-        assert!(refusal.contains("unavailable") && refusal.contains("Nothing was changed"), "{refusal}");
+        assert!(
+            refusal.contains("unavailable") && refusal.contains("Nothing was changed"),
+            "{refusal}"
+        );
     }
 
     /// Legacy records can open one folder as two active Projects. Both must be
@@ -4730,14 +5354,28 @@ pub(crate) mod tests {
             .await
             .expect("the first duplicate is removed");
         assert!(projects.read().await[&id].is_removed());
-        assert!(!projects.read().await[&other_id].is_removed(), "the other duplicate stays active");
+        assert!(
+            !projects.read().await[&other_id].is_removed(),
+            "the other duplicate stays active"
+        );
 
         let reopen = reopen_project_committed(&projects, &repositories, &storage, id).await;
-        assert!(reopen.is_err_and(|e| e.contains("already open")), "reopening beside an active Project is refused");
+        assert!(
+            reopen.is_err_and(|e| e.contains("already open")),
+            "reopening beside an active Project is refused"
+        );
 
-        remove_project_committed(&projects, &repositories, &tasks, &storage, None, None, other_id)
-            .await
-            .expect("the second duplicate is removed too, so there is no deadlock");
+        remove_project_committed(
+            &projects,
+            &repositories,
+            &tasks,
+            &storage,
+            None,
+            None,
+            other_id,
+        )
+        .await
+        .expect("the second duplicate is removed too, so there is no deadlock");
     }
 
     /// A removed Project keeps its folder. Reassigning another active Project to
@@ -4745,10 +5383,20 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reassigning_a_project_to_a_folder_a_removed_project_holds_is_refused() {
         let (storage, temp, projects, repositories, removed_id) = project_with_folder(vec![]).await;
-        let held_repository = projects.read().await[&removed_id].repository_id.expect("a repository");
-        remove_project_committed(&projects, &repositories, &board(vec![]), &storage, None, None, removed_id)
-            .await
-            .expect("the idle Project is removed");
+        let held_repository = projects.read().await[&removed_id]
+            .repository_id
+            .expect("a repository");
+        remove_project_committed(
+            &projects,
+            &repositories,
+            &board(vec![]),
+            &storage,
+            None,
+            None,
+            removed_id,
+        )
+        .await
+        .expect("the idle Project is removed");
 
         let other_folder = temp.path().join("other");
         std::fs::create_dir_all(&other_folder).unwrap();
@@ -4756,7 +5404,10 @@ pub(crate) mod tests {
         let mut active = make_test_project(Uuid::new_v4());
         active.repository_id = Some(other_repository.id);
         let active_id = active.id;
-        repositories.write().await.insert(other_repository.id, other_repository);
+        repositories
+            .write()
+            .await
+            .insert(other_repository.id, other_repository);
         projects.write().await.insert(active_id, active);
 
         let before = projects.read().await[&active_id].repository_id;
@@ -4771,8 +5422,15 @@ pub(crate) mod tests {
         )
         .await
         .expect_err("the folder belongs to a removed Project");
-        assert!(refusal.contains("belongs to a removed Project"), "{refusal}");
-        assert_eq!(projects.read().await[&active_id].repository_id, before, "nothing was changed");
+        assert!(
+            refusal.contains("belongs to a removed Project"),
+            "{refusal}"
+        );
+        assert_eq!(
+            projects.read().await[&active_id].repository_id,
+            before,
+            "nothing was changed"
+        );
     }
 
     /// The reverse order: a Task that entered Queue first makes the removal

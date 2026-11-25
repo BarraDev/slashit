@@ -113,7 +113,12 @@ const CHANGED: &str = "changed while it was being measured";
 /// link: a link at `path` is measured as the link, and a link in between
 /// makes the walk fail rather than measure somewhere else. A missing `path`
 /// is [`WalkError::NotFound`], distinct from an empty one.
-pub fn measure(anchor: &Path, path: &Path, exclude: &[&str], limits: WalkLimits) -> Result<TreeSize, WalkError> {
+pub fn measure(
+    anchor: &Path,
+    path: &Path,
+    exclude: &[&str],
+    limits: WalkLimits,
+) -> Result<TreeSize, WalkError> {
     walk(anchor, path, exclude, limits, &mut Hooks::default())
 }
 
@@ -153,21 +158,36 @@ struct Entry {
 }
 
 /// The components of `path` below `anchor`, each an ordinary name.
-fn components_below<'p>(anchor: &Path, path: &'p Path) -> Result<Vec<&'p std::ffi::OsStr>, WalkError> {
-    let rel = path
-        .strip_prefix(anchor)
-        .map_err(|_| WalkError::Unreadable(format!("{} is not below {}", path.display(), anchor.display())))?;
+fn components_below<'p>(
+    anchor: &Path,
+    path: &'p Path,
+) -> Result<Vec<&'p std::ffi::OsStr>, WalkError> {
+    let rel = path.strip_prefix(anchor).map_err(|_| {
+        WalkError::Unreadable(format!(
+            "{} is not below {}",
+            path.display(),
+            anchor.display()
+        ))
+    })?;
     rel.components()
         .map(|c| match c {
             Component::Normal(name) => Ok(name),
-            _ => Err(WalkError::Unreadable(format!("{} is not a plain path below its root", path.display()))),
+            _ => Err(WalkError::Unreadable(format!(
+                "{} is not a plain path below its root",
+                path.display()
+            ))),
         })
         .collect()
 }
 
 /// Shared bookkeeping for one entry: count it once, and say whether the
 /// walk should go into it.
-fn count(size: &mut TreeSize, seen: &mut HardLinks, entry: &Entry, root_device: Option<u64>) -> bool {
+fn count(
+    size: &mut TreeSize,
+    seen: &mut HardLinks,
+    entry: &Entry,
+    root_device: Option<u64>,
+) -> bool {
     size.entries += 1;
     if !seen.first_sighting(entry) {
         return false;
@@ -284,8 +304,13 @@ mod unix {
         // there on, nothing is followed.
         let (parent, name): (OwnedFd, &OsStr) = match components.split_last() {
             Some((last, between)) => {
-                let mut dir = openat(CWD, anchor, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
-                    .map_err(unreadable)?;
+                let mut dir = openat(
+                    CWD,
+                    anchor,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(unreadable)?;
                 for component in between {
                     dir = openat(&dir, *component, DIR_FLAGS, Mode::empty()).map_err(unreadable)?;
                 }
@@ -296,8 +321,13 @@ mod unix {
                     WalkError::Unreadable(format!("{} has no name to measure", anchor.display()))
                 })?;
                 let parent = anchor.parent().unwrap_or(Path::new("/"));
-                let dir = openat(CWD, parent, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
-                    .map_err(unreadable)?;
+                let dir = openat(
+                    CWD,
+                    parent,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(unreadable)?;
                 (dir, name)
             }
         };
@@ -342,7 +372,12 @@ mod unix {
         while let Some(next) = walk.pending.pop() {
             walk.hooks.list(&next.path);
             let size = &mut *walk.size;
-            let fd = match openat(&*next.parent, next.name.as_os_str(), DIR_FLAGS, Mode::empty()) {
+            let fd = match openat(
+                &*next.parent,
+                next.name.as_os_str(),
+                DIR_FLAGS,
+                Mode::empty(),
+            ) {
                 Ok(fd) => fd,
                 // Gone since it was listed: nothing left to count.
                 Err(Errno::NOENT) => continue,
@@ -371,7 +406,9 @@ mod unix {
             match walk.list(Rc::new(fd), &next.path, next.depth) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Stop) => break,
-                Err(e) => walk.size.skip(format!("{}: {e}", relative(path, &next.path))),
+                Err(e) => walk
+                    .size
+                    .skip(format!("{}: {e}", relative(path, &next.path))),
             }
         }
         Ok(size)
@@ -395,62 +432,70 @@ mod unix {
     }
 
     impl Walk<'_, '_> {
-    /// Count the entries of the open directory `fd`, and queue the
-    /// directories among them.
-    fn list(&mut self, fd: Rc<OwnedFd>, dir: &Path, depth: usize) -> io::Result<Flow> {
-        let (root, exclude, limits) = (self.root, self.exclude, self.limits);
-        let size = &mut *self.size;
-        // Reads through a fresh handle to the same directory (`openat(fd,
-        // ".")`), never by path.
-        let entries = Dir::read_from(&*fd).map_err(error)?;
-        for dirent in entries {
-            let dirent = match dirent {
-                Ok(dirent) => dirent,
-                Err(e) => {
-                    size.skip(format!("{}: {}", relative(root, dir), error(e)));
+        /// Count the entries of the open directory `fd`, and queue the
+        /// directories among them.
+        fn list(&mut self, fd: Rc<OwnedFd>, dir: &Path, depth: usize) -> io::Result<Flow> {
+            let (root, exclude, limits) = (self.root, self.exclude, self.limits);
+            let size = &mut *self.size;
+            // Reads through a fresh handle to the same directory (`openat(fd,
+            // ".")`), never by path.
+            let entries = Dir::read_from(&*fd).map_err(error)?;
+            for dirent in entries {
+                let dirent = match dirent {
+                    Ok(dirent) => dirent,
+                    Err(e) => {
+                        size.skip(format!("{}: {}", relative(root, dir), error(e)));
+                        continue;
+                    }
+                };
+                let name = OsStr::from_bytes(dirent.file_name().to_bytes());
+                if name == "." || name == ".." {
                     continue;
                 }
-            };
-            let name = OsStr::from_bytes(dirent.file_name().to_bytes());
-            if name == "." || name == ".." {
-                continue;
-            }
-            if depth == 0 && exclude.iter().any(|excluded| name == *excluded) {
-                continue;
-            }
-            if size.entries >= limits.max_entries {
-                size.hit_limit = true;
-                size.skip(format!("{}: more than {} entries", relative(root, dir), limits.max_entries));
-                return Ok(Flow::Stop);
-            }
-            let path = dir.join(name);
-            self.hooks.stat(&path);
-            let st = match statat(&*fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(st) => entry(&st),
-                Err(Errno::NOENT) => continue,
-                Err(e) => {
-                    size.skip(format!("{}: {}", relative(root, &path), error(e)));
+                if depth == 0 && exclude.iter().any(|excluded| name == *excluded) {
                     continue;
                 }
-            };
-            if !count(size, self.seen, &st, self.root_device) {
-                continue;
+                if size.entries >= limits.max_entries {
+                    size.hit_limit = true;
+                    size.skip(format!(
+                        "{}: more than {} entries",
+                        relative(root, dir),
+                        limits.max_entries
+                    ));
+                    return Ok(Flow::Stop);
+                }
+                let path = dir.join(name);
+                self.hooks.stat(&path);
+                let st = match statat(&*fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(st) => entry(&st),
+                    Err(Errno::NOENT) => continue,
+                    Err(e) => {
+                        size.skip(format!("{}: {}", relative(root, &path), error(e)));
+                        continue;
+                    }
+                };
+                if !count(size, self.seen, &st, self.root_device) {
+                    continue;
+                }
+                if depth + 1 >= limits.max_depth {
+                    size.hit_limit = true;
+                    size.skip(format!(
+                        "{}: deeper than {} levels",
+                        relative(root, &path),
+                        limits.max_depth
+                    ));
+                    continue;
+                }
+                self.pending.push(Pending {
+                    parent: fd.clone(),
+                    name: name.to_os_string(),
+                    path,
+                    depth: depth + 1,
+                    identity: st.identity,
+                });
             }
-            if depth + 1 >= limits.max_depth {
-                size.hit_limit = true;
-                size.skip(format!("{}: deeper than {} levels", relative(root, &path), limits.max_depth));
-                continue;
-            }
-            self.pending.push(Pending {
-                parent: fd.clone(),
-                name: name.to_os_string(),
-                path,
-                depth: depth + 1,
-                identity: st.identity,
-            });
+            Ok(Flow::Continue)
         }
-        Ok(Flow::Continue)
-    }
     }
 
     pub(in crate::storage_accounting) fn is_link_meta(meta: &std::fs::Metadata) -> bool {
@@ -541,7 +586,8 @@ mod portable {
             // Read by path, so check the directory still looks like the one
             // that was listed: a junction put in its place would have been
             // followed.
-            let unchanged = fs::symlink_metadata(&dir).is_ok_and(|after| fingerprint(&after) == fingerprint(&before));
+            let unchanged = fs::symlink_metadata(&dir)
+                .is_ok_and(|after| fingerprint(&after) == fingerprint(&before));
             if !unchanged {
                 if depth == 0 {
                     return Err(WalkError::Unreadable(CHANGED.to_string()));
@@ -555,7 +601,11 @@ mod portable {
                 }
                 if size.entries >= limits.max_entries {
                     size.hit_limit = true;
-                    size.skip(format!("{}: more than {} entries", relative(path, &dir), limits.max_entries));
+                    size.skip(format!(
+                        "{}: more than {} entries",
+                        relative(path, &dir),
+                        limits.max_entries
+                    ));
                     return Ok(size);
                 }
                 let child = dirent.path();
@@ -574,7 +624,11 @@ mod portable {
                 }
                 if depth + 1 >= limits.max_depth {
                     size.hit_limit = true;
-                    size.skip(format!("{}: deeper than {} levels", relative(path, &child), limits.max_depth));
+                    size.skip(format!(
+                        "{}: deeper than {} levels",
+                        relative(path, &child),
+                        limits.max_depth
+                    ));
                     continue;
                 }
                 pending.push((child, depth + 1, meta));
@@ -588,7 +642,11 @@ mod portable {
     /// Windows a failed `FindNextFileW` also ends the listing, so the rest
     /// of the directory is never seen and the result must not read as
     /// complete.
-    pub(super) fn listed<T>(entries: impl IntoIterator<Item = io::Result<T>>, size: &mut TreeSize, dir: &str) -> Vec<T> {
+    pub(super) fn listed<T>(
+        entries: impl IntoIterator<Item = io::Result<T>>,
+        size: &mut TreeSize,
+        dir: &str,
+    ) -> Vec<T> {
         let mut kept = Vec::new();
         for entry in entries {
             match entry {
@@ -629,7 +687,11 @@ mod tests {
     use std::fs;
 
     /// A root measured as its own anchor.
-    fn measure_tree(root: &Path, exclude: &[&str], limits: WalkLimits) -> Result<TreeSize, WalkError> {
+    fn measure_tree(
+        root: &Path,
+        exclude: &[&str],
+        limits: WalkLimits,
+    ) -> Result<TreeSize, WalkError> {
         measure(root, root, exclude, limits)
     }
 
@@ -673,7 +735,10 @@ mod tests {
         write(&tmp.path().join("src/target/nested"), 1_000_000);
         let size = measure_tree(tmp.path(), &["target"], WalkLimits::default()).unwrap();
         // Only the root's own `target` is excluded; a nested one is not.
-        assert!(size.bytes >= 1_004_096 && size.bytes < 1_100_000, "{size:?}");
+        assert!(
+            size.bytes >= 1_004_096 && size.bytes < 1_100_000,
+            "{size:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -684,7 +749,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(&tmp.path().join("small"), 100);
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("escape")).unwrap();
-        std::os::unix::fs::symlink(outside.path().join("huge"), tmp.path().join("file-link")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("huge"), tmp.path().join("file-link"))
+            .unwrap();
         // A loop, which following would never finish.
         std::os::unix::fs::symlink(tmp.path(), tmp.path().join("loop")).unwrap();
 
@@ -694,7 +760,13 @@ mod tests {
         assert!(size.bytes < 100_000, "{size:?}");
 
         // A root that is itself a link is measured as the link.
-        let as_root = measure(tmp.path(), &tmp.path().join("escape"), &[], WalkLimits::default()).unwrap();
+        let as_root = measure(
+            tmp.path(),
+            &tmp.path().join("escape"),
+            &[],
+            WalkLimits::default(),
+        )
+        .unwrap();
         assert_eq!(as_root.links_not_followed, 1);
         assert!(as_root.root_is_link);
         assert!(!size.root_is_link);
@@ -750,7 +822,10 @@ mod tests {
         assert!(!size.is_complete());
         assert_eq!(size.entries, 5);
         assert_eq!(size.skipped, 1);
-        assert!(size.first_skip_reason.unwrap().contains("more than 5 entries"));
+        assert!(size
+            .first_skip_reason
+            .unwrap()
+            .contains("more than 5 entries"));
 
         write(&tmp.path().join("a/b/c/d"), 10);
         let shallow = measure_tree(
@@ -788,7 +863,14 @@ mod tests {
             before_list: Some(&mut before_list),
             before_stat: Some(&mut before_stat),
         };
-        let size = walk(tmp.path(), tmp.path(), &[], WalkLimits::default(), &mut hooks).unwrap();
+        let size = walk(
+            tmp.path(),
+            tmp.path(),
+            &[],
+            WalkLimits::default(),
+            &mut hooks,
+        )
+        .unwrap();
 
         assert!(size.is_complete(), "{size:?}");
         assert!(size.bytes >= 10_000 && size.bytes < 100_000, "{size:?}");
@@ -800,18 +882,29 @@ mod tests {
     /// than a smaller number that reads as complete.
     #[test]
     fn a_listing_that_fails_part_way_is_partial_not_smaller() {
-        let mut size = TreeSize { bytes: 30_000, entries: 3, ..TreeSize::default() };
+        let mut size = TreeSize {
+            bytes: 30_000,
+            entries: 3,
+            ..TreeSize::default()
+        };
         assert!(size.is_complete());
-        let entries = vec![Ok("a"), Ok("b"), Err(io::Error::other("enumeration failed")), Ok("c")];
+        let entries = vec![
+            Ok("a"),
+            Ok("b"),
+            Err(io::Error::other("enumeration failed")),
+            Ok("c"),
+        ];
         let kept = portable::listed(entries, &mut size, "d");
         assert_eq!(kept, ["a", "b", "c"]);
         assert!(!size.is_complete());
         assert_eq!(size.skipped, 1);
         assert_eq!((size.bytes, size.entries), (30_000, 3));
-        assert_eq!(size.first_skip_reason.as_deref(), Some("d: enumeration failed"));
+        assert_eq!(
+            size.first_skip_reason.as_deref(),
+            Some("d: enumeration failed")
+        );
     }
 }
-
 
 /// A directory swapped between being listed and being opened: the window
 /// a pathname walk leaves open. Unix only, where the walk closes it; see the
@@ -852,10 +945,23 @@ mod containment {
                 swap_for_link(path, t.outside.path());
             }
         };
-        let mut hooks = Hooks { before_list: Some(&mut swap), before_stat: None };
-        let size = walk(t.tmp.path(), t.tmp.path(), &[], WalkLimits::default(), &mut hooks).unwrap();
+        let mut hooks = Hooks {
+            before_list: Some(&mut swap),
+            before_stat: None,
+        };
+        let size = walk(
+            t.tmp.path(),
+            t.tmp.path(),
+            &[],
+            WalkLimits::default(),
+            &mut hooks,
+        )
+        .unwrap();
 
-        assert!(size.bytes < OUTSIDE as u64, "the outside tree was counted: {size:?}");
+        assert!(
+            size.bytes < OUTSIDE as u64,
+            "the outside tree was counted: {size:?}"
+        );
         assert!(!size.is_complete(), "{size:?}");
         assert!(size.first_skip_reason.unwrap().contains(CHANGED));
     }
@@ -871,8 +977,18 @@ mod containment {
                 fs::rename(path.with_file_name("other"), path).unwrap();
             }
         };
-        let mut hooks = Hooks { before_list: Some(&mut swap), before_stat: None };
-        let size = walk(t.tmp.path(), t.tmp.path(), &[], WalkLimits::default(), &mut hooks).unwrap();
+        let mut hooks = Hooks {
+            before_list: Some(&mut swap),
+            before_stat: None,
+        };
+        let size = walk(
+            t.tmp.path(),
+            t.tmp.path(),
+            &[],
+            WalkLimits::default(),
+            &mut hooks,
+        )
+        .unwrap();
 
         assert!(!size.is_complete(), "{size:?}");
         assert!(size.first_skip_reason.unwrap().contains(CHANGED));
@@ -887,7 +1003,10 @@ mod containment {
                 swap_for_link(path, t.outside.path());
             }
         };
-        let mut hooks = Hooks { before_list: Some(&mut swap), before_stat: None };
+        let mut hooks = Hooks {
+            before_list: Some(&mut swap),
+            before_stat: None,
+        };
         match walk(t.tmp.path(), &sub, &[], WalkLimits::default(), &mut hooks) {
             Err(WalkError::Unreadable(reason)) => assert!(reason.contains(CHANGED), "{reason}"),
             other => panic!("expected a failure, got {other:?}"),
@@ -901,11 +1020,27 @@ mod containment {
         fs::write(t.outside.path().join("b/big"), vec![3u8; OUTSIDE]).unwrap();
         symlink(t.outside.path(), t.tmp.path().join("a")).unwrap();
 
-        let result = measure(t.tmp.path(), &t.tmp.path().join("a/b"), &[], WalkLimits::default());
-        assert!(matches!(result, Err(WalkError::Unreadable(_))), "{result:?}");
+        let result = measure(
+            t.tmp.path(),
+            &t.tmp.path().join("a/b"),
+            &[],
+            WalkLimits::default(),
+        );
+        assert!(
+            matches!(result, Err(WalkError::Unreadable(_))),
+            "{result:?}"
+        );
         // And a path that climbs out of the anchor is refused outright.
-        let climbing = measure(t.tmp.path(), &t.tmp.path().join("../x"), &[], WalkLimits::default());
-        assert!(matches!(climbing, Err(WalkError::Unreadable(_))), "{climbing:?}");
+        let climbing = measure(
+            t.tmp.path(),
+            &t.tmp.path().join("../x"),
+            &[],
+            WalkLimits::default(),
+        );
+        assert!(
+            matches!(climbing, Err(WalkError::Unreadable(_))),
+            "{climbing:?}"
+        );
     }
 
     /// Races a real swapper against real walks. The assertion holds for
@@ -920,7 +1055,8 @@ mod containment {
         symlink(t.outside.path(), &link).unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swapper = {
-            let (sub, parked, link, stop) = (sub.clone(), parked.clone(), link.clone(), stop.clone());
+            let (sub, parked, link, stop) =
+                (sub.clone(), parked.clone(), link.clone(), stop.clone());
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     // `sub` alternates between the real directory and a link
@@ -934,7 +1070,10 @@ mod containment {
         };
         for _ in 0..2000 {
             if let Ok(size) = measure(t.tmp.path(), t.tmp.path(), &[], WalkLimits::default()) {
-                assert!(size.bytes < OUTSIDE as u64, "a walk escaped into the outside tree: {size:?}");
+                assert!(
+                    size.bytes < OUTSIDE as u64,
+                    "a walk escaped into the outside tree: {size:?}"
+                );
             }
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -971,8 +1110,18 @@ mod portable_detection {
                 symlink(outside.path(), path).unwrap();
             }
         };
-        let mut hooks = Hooks { before_list: Some(&mut swap), before_stat: None };
-        let size = portable::walk(tmp.path(), tmp.path(), &[], WalkLimits::default(), &mut hooks).unwrap();
+        let mut hooks = Hooks {
+            before_list: Some(&mut swap),
+            before_stat: None,
+        };
+        let size = portable::walk(
+            tmp.path(),
+            tmp.path(),
+            &[],
+            WalkLimits::default(),
+            &mut hooks,
+        )
+        .unwrap();
         assert!(size.bytes < OUTSIDE as u64, "{size:?}");
         assert!(size.first_skip_reason.unwrap().contains(CHANGED));
     }

@@ -42,13 +42,18 @@ impl DeliveriesInFlight {
     /// Counted, so two overlapping attempts do not end each other's mark.
     pub(crate) fn start(&self, task_id: Uuid) -> DeliveryMark {
         *self.lock().entry(task_id).or_default() += 1;
-        DeliveryMark { deliveries: self.clone(), task_id }
+        DeliveryMark {
+            deliveries: self.clone(),
+            task_id,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, u32>> {
         // The map is always left consistent, so a panic elsewhere while it
         // was held is no reason to stop answering.
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -82,13 +87,19 @@ pub struct ApprovalOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PrDelivery {
-    Created { url: String },
+    Created {
+        url: String,
+    },
     /// The attempt failed. The approval stands, and the reason is also
     /// recorded on the task for as long as no pull request exists.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     /// SlashIt cannot open a pull request for this project, so none was
     /// attempted: nothing was pushed.
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+    },
 }
 
 /// Approve the changes of a task in Human Review, and optionally open a pull
@@ -204,8 +215,15 @@ const PUBLISHED_HEAD_FRESH_SECONDS: i64 = 2 * crate::pr_status::POLL_INTERVAL.as
 /// The published head as the cache holds it at `now`. Only the latest attempt
 /// counts: a failed attempt makes the head unknown even when an earlier one
 /// read it, and so does an answer older than [`PUBLISHED_HEAD_FRESH_SECONDS`].
-fn published_head(entry: Option<&crate::pr_status::PrStatusEntry>, now: chrono::DateTime<chrono::Utc>) -> PublishedHead {
-    let unknown = |why: String| PublishedHead { head: None, observed_at: None, unverified: Some(why) };
+fn published_head(
+    entry: Option<&crate::pr_status::PrStatusEntry>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> PublishedHead {
+    let unknown = |why: String| PublishedHead {
+        head: None,
+        observed_at: None,
+        unverified: Some(why),
+    };
     let Some(entry) = entry else {
         return unknown("GitHub has not answered about this pull request yet.".to_string());
     };
@@ -214,14 +232,18 @@ fn published_head(entry: Option<&crate::pr_status::PrStatusEntry>, now: chrono::
     }
     match entry.status.as_ref().and_then(|s| s.head_oid.clone()) {
         Some(head) => match entry.fetched_at {
-            Some(at) if (now - at).num_seconds() <= PUBLISHED_HEAD_FRESH_SECONDS => {
-                PublishedHead { head: Some(head), observed_at: Some(at), unverified: None }
-            }
+            Some(at) if (now - at).num_seconds() <= PUBLISHED_HEAD_FRESH_SECONDS => PublishedHead {
+                head: Some(head),
+                observed_at: Some(at),
+                unverified: None,
+            },
             Some(_) => unknown(format!(
                 "GitHub's last answer about the pull request's head is more than {} minutes old.",
                 PUBLISHED_HEAD_FRESH_SECONDS / 60
             )),
-            None => unknown("GitHub's answer about the pull request's head has no read time.".to_string()),
+            None => unknown(
+                "GitHub's answer about the pull request's head has no read time.".to_string(),
+            ),
         },
         None => unknown("GitHub's answer did not name the pull request's head commit.".to_string()),
     }
@@ -236,22 +258,30 @@ fn published_head(entry: Option<&crate::pr_status::PrStatusEntry>, now: chrono::
 fn published_key(task: &Task) -> Option<Result<crate::pr_status::PrKey, String>> {
     let address = task.authoritative_pr_url()?;
     let referenced = task.external_refs.iter().find_map(|r| match r {
-        crate::domain::ExternalRef::GithubPr { url, repo, number, .. } if url == address => {
-            Some(crate::pr_status::PrKey::new(repo.as_str(), *number))
-        }
+        crate::domain::ExternalRef::GithubPr {
+            url, repo, number, ..
+        } if url == address => Some(crate::pr_status::PrKey::new(repo.as_str(), *number)),
         _ => None,
     });
-    let key = referenced.or_else(|| match crate::commands::pr::parse_pr_url_to_ref(address)? {
-        crate::domain::ExternalRef::GithubPr { repo, number, .. } => Some(crate::pr_status::PrKey::new(repo, number)),
-        _ => None,
-    });
-    Some(key.ok_or_else(|| "the pull request's address cannot be read as a GitHub pull request".to_string()))
+    let key = referenced.or_else(
+        || match crate::commands::pr::parse_pr_url_to_ref(address)? {
+            crate::domain::ExternalRef::GithubPr { repo, number, .. } => {
+                Some(crate::pr_status::PrKey::new(repo, number))
+            }
+            _ => None,
+        },
+    );
+    Some(key.ok_or_else(|| {
+        "the pull request's address cannot be read as a GitHub pull request".to_string()
+    }))
 }
 
 #[cfg(test)]
 mod published_head_tests {
     use super::*;
-    use crate::pr_status::{parse_pr_status, PrFetchError, PrFetchErrorKind, PrStatus, PrStatusEntry};
+    use crate::pr_status::{
+        parse_pr_status, PrFetchError, PrFetchErrorKind, PrStatus, PrStatusEntry,
+    };
     use serde_json::json;
 
     const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -273,7 +303,10 @@ mod published_head_tests {
 
     #[test]
     fn a_head_the_latest_attempt_read_is_the_published_head() {
-        let read = published_head(Some(&entry(Some(read_head(HEAD)), None)), chrono::Utc::now());
+        let read = published_head(
+            Some(&entry(Some(read_head(HEAD)), None)),
+            chrono::Utc::now(),
+        );
         assert_eq!(read.head.as_deref(), Some(HEAD));
         assert!(read.observed_at.is_some());
         assert_eq!(read.unverified, None);
@@ -285,17 +318,34 @@ mod published_head_tests {
         assert_eq!(none.head, None);
         assert!(none.unverified.is_some_and(|w| w.contains("not answered")));
 
-        let abbreviated = published_head(Some(&entry(Some(read_head("0123456")), None)), chrono::Utc::now());
-        assert_eq!(abbreviated.head, None, "an abbreviated head cannot be checked against a commit");
+        let abbreviated = published_head(
+            Some(&entry(Some(read_head("0123456")), None)),
+            chrono::Utc::now(),
+        );
+        assert_eq!(
+            abbreviated.head, None,
+            "an abbreviated head cannot be checked against a commit"
+        );
         assert!(abbreviated.unverified.is_some());
     }
 
     #[test]
     fn a_failed_latest_attempt_hides_the_head_an_earlier_one_read() {
-        let error = PrFetchError { kind: PrFetchErrorKind::Timeout, message: "took too long".into() };
-        let failed = published_head(Some(&entry(Some(read_head(HEAD)), Some(error))), chrono::Utc::now());
-        assert_eq!(failed.head, None, "an earlier head says nothing about the pull request now");
-        assert!(failed.unverified.is_some_and(|w| w.contains("took too long")));
+        let error = PrFetchError {
+            kind: PrFetchErrorKind::Timeout,
+            message: "took too long".into(),
+        };
+        let failed = published_head(
+            Some(&entry(Some(read_head(HEAD)), Some(error))),
+            chrono::Utc::now(),
+        );
+        assert_eq!(
+            failed.head, None,
+            "an earlier head says nothing about the pull request now"
+        );
+        assert!(failed
+            .unverified
+            .is_some_and(|w| w.contains("took too long")));
     }
 
     /// A head read long ago may have been overtaken by a push nobody has seen,
@@ -310,7 +360,11 @@ mod published_head_tests {
         assert!(stale.unverified.is_some_and(|w| w.contains("more than")));
 
         old.fetched_at = Some(now - chrono::Duration::seconds(PUBLISHED_HEAD_FRESH_SECONDS));
-        assert_eq!(published_head(Some(&old), now).head.as_deref(), Some(HEAD), "a head at the limit is still fresh");
+        assert_eq!(
+            published_head(Some(&old), now).head.as_deref(),
+            Some(HEAD),
+            "a head at the limit is still fresh"
+        );
     }
 
     /// A Task linked by `pr_url` alone is still checked at the address it names,
@@ -324,14 +378,21 @@ mod published_head_tests {
             0,
         );
         task.pr_url = Some("https://github.com/BarraDev/slashit/pull/355".to_string());
-        let key = published_key(&task).expect("a pull request is recorded").expect("its address is readable");
+        let key = published_key(&task)
+            .expect("a pull request is recorded")
+            .expect("its address is readable");
         assert_eq!(key, crate::pr_status::PrKey::new("BarraDev/slashit", 355));
 
         task.pr_url = Some("https://example.com/not-github".to_string());
-        assert!(published_key(&task).expect("a pull request is recorded").is_err());
+        assert!(published_key(&task)
+            .expect("a pull request is recorded")
+            .is_err());
 
         task.pr_url = None;
-        assert!(published_key(&task).is_none(), "no pull request is recorded");
+        assert!(
+            published_key(&task).is_none(),
+            "no pull request is recorded"
+        );
     }
 }
 
@@ -367,23 +428,33 @@ pub async fn get_approval_status(
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     // The whole answer is bounded, both Git reads in it. A stopped read drops
     // its queries, and each query's child is killed with it.
-    tokio::time::timeout(crate::commands::pr::COVERAGE_READ_BOUND, approval_status(&state, task_id))
-        .await
-        .unwrap_or_else(|_| {
-            Err(format!(
-                "Reading the approval's coverage took longer than {} seconds and was stopped.",
-                crate::commands::pr::COVERAGE_READ_BOUND.as_secs()
-            ))
-        })
+    tokio::time::timeout(
+        crate::commands::pr::COVERAGE_READ_BOUND,
+        approval_status(&state, task_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "Reading the approval's coverage took longer than {} seconds and was stopped.",
+            crate::commands::pr::COVERAGE_READ_BOUND.as_secs()
+        ))
+    })
 }
 
-pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> Result<ApprovalStatus, String> {
+pub(crate) async fn approval_status(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<ApprovalStatus, String> {
     let task = current(state, task_id).await.ok_or("Task not found")?;
     let approved_tip = task.human_review.approved_tip().map(str::to_string);
     // Read from the status cache: no GitHub request and no repository access.
     let published = published_key(&task).map(|key| match key {
         Ok(key) => published_head(state.pr_statuses.get(&key).as_ref(), chrono::Utc::now()),
-        Err(why) => PublishedHead { head: None, observed_at: None, unverified: Some(why) },
+        Err(why) => PublishedHead {
+            head: None,
+            observed_at: None,
+            unverified: Some(why),
+        },
     });
     let none = |coverage| ApprovalStatus {
         coverage,
@@ -405,17 +476,27 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
         // without touching the repository: this is asked again while the panel
         // is shown, and a read must not export.
         let branch_tip = crate::commands::pr::task_branch_tip_read_only(state, task_id).await?;
-        return Ok(ApprovalStatus { branch_tip, ..none(ApprovalCoverage::NotApplicable) });
+        return Ok(ApprovalStatus {
+            branch_tip,
+            ..none(ApprovalCoverage::NotApplicable)
+        });
     }
     let branch_tip = crate::commands::pr::task_branch_tip_read_only(state, task_id).await?;
     let refusal = match task.human_review.binds(true, branch_tip.as_deref()) {
-        Ok(()) => return Ok(ApprovalStatus { branch_tip, ..none(ApprovalCoverage::Current) }),
+        Ok(()) => {
+            return Ok(ApprovalStatus {
+                branch_tip,
+                ..none(ApprovalCoverage::Current)
+            })
+        }
         Err(refusal) => refusal,
     };
     let coverage = match refusal {
         crate::domain::task::ApprovalBindingRefusal::Unrecorded => ApprovalCoverage::Unrecorded,
         crate::domain::task::ApprovalBindingRefusal::Moved { .. } => ApprovalCoverage::Moved,
-        crate::domain::task::ApprovalBindingRefusal::BranchMissing { .. } => ApprovalCoverage::BranchMissing,
+        crate::domain::task::ApprovalBindingRefusal::BranchMissing { .. } => {
+            ApprovalCoverage::BranchMissing
+        }
     };
     let mut rewritten = None;
     if let (ApprovalCoverage::Moved, Some(approved), Some(tip), Ok(repo)) = (
@@ -432,7 +513,12 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
             .ok()
             .map(|is_ancestor| !is_ancestor);
     }
-    Ok(ApprovalStatus { branch_tip, rewritten, reason: Some(refusal.to_string()), ..none(coverage) })
+    Ok(ApprovalStatus {
+        branch_tip,
+        rewritten,
+        reason: Some(refusal.to_string()),
+        ..none(coverage)
+    })
 }
 
 /// Approve the Task branch as it is now, after it moved past the commit that
@@ -469,7 +555,10 @@ pub(crate) async fn approve_again(
         || task.external_refs.iter().any(|r| r.is_pr())
         || state.task.deliveries.contains(task.id)
     {
-        return Err("This task has a pull request, or one is being opened, so its approval is not renewed.".to_string());
+        return Err(
+            "This task has a pull request, or one is being opened, so its approval is not renewed."
+                .to_string(),
+        );
     }
     if task.integrating_current_approval() {
         return Err(
@@ -518,7 +607,9 @@ pub(crate) async fn approve_again(
         .map_err(|e| format!("The approval was not saved: {e}"))?
         .ok_or("Task not found")?;
     if task.human_review.approved_tip() != Some(tip) {
-        return Err("The task changed while it was being approved, so nothing was recorded.".to_string());
+        return Err(
+            "The task changed while it was being approved, so nothing was recorded.".to_string(),
+        );
     }
     Ok(task)
 }
@@ -537,7 +628,11 @@ const TIP_NOT_READ: &str =
 /// before. For a task with a branch, the approval is refused unless both sides
 /// name the same commit: a commit that cannot be read now is never approved
 /// blind, because the approval would then cover a state nobody was shown.
-fn shown_tip_is_current(has_branch: bool, shown: Option<&str>, current: Option<&str>) -> Result<(), String> {
+fn shown_tip_is_current(
+    has_branch: bool,
+    shown: Option<&str>,
+    current: Option<&str>,
+) -> Result<(), String> {
     if !has_branch {
         return Ok(());
     }
@@ -571,7 +666,10 @@ pub(crate) async fn approve(
         return Ok(ApprovalOutcome { task, pr: None });
     }
     let pr = deliver(state, task_id).await;
-    Ok(ApprovalOutcome { task: current(state, task_id).await.unwrap_or(task), pr: Some(pr) })
+    Ok(ApprovalOutcome {
+        task: current(state, task_id).await.unwrap_or(task),
+        pr: Some(pr),
+    })
 }
 
 /// Approve as a person would who was shown the branch's current commit. For
@@ -604,7 +702,10 @@ pub(crate) async fn retry_delivery(
         );
     }
     let pr = deliver(state, task_id).await;
-    Ok(ApprovalOutcome { task: current(state, task_id).await.unwrap_or(task), pr: Some(pr) })
+    Ok(ApprovalOutcome {
+        task: current(state, task_id).await.unwrap_or(task),
+        pr: Some(pr),
+    })
 }
 
 /// Complete an approved task locally: the one lifecycle terminalization, asked
@@ -663,7 +764,9 @@ pub(crate) async fn complete_locally(
             }
         }
     }
-    complete_leased(state, task_id).await.map_err(|refusal| refusal.to_string())
+    complete_leased(state, task_id)
+        .await
+        .map_err(|refusal| refusal.to_string())
 }
 
 /// What has to hold for approved changes to be completed locally, whoever
@@ -686,7 +789,11 @@ pub(crate) fn check_completable(state: &crate::AppState, task: &Task) -> Result<
                 .to_string(),
         );
     }
-    if task.local_integration.as_ref().is_some_and(|r| r.is_pending()) {
+    if task
+        .local_integration
+        .as_ref()
+        .is_some_and(|r| r.is_pending())
+    {
         return Err(
             "An integration of this task into a local branch was started and not finished. \
              Resume or discard it first."
@@ -764,7 +871,9 @@ async fn record_approval(
         .map_err(|e| format!("The approval was not saved: {e}"))?
         .ok_or("Task not found")?;
     if !task.human_review.is_approved() {
-        return Err("The task changed while it was being approved, so nothing was recorded.".to_string());
+        return Err(
+            "The task changed while it was being approved, so nothing was recorded.".to_string(),
+        );
     }
     Ok(task)
 }
@@ -818,11 +927,17 @@ async fn request_changes(
     let project_id = task.project_id;
     let now = chrono::Utc::now();
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
-        let Some(t) = staged.get_mut(&task_id) else { return };
+        let Some(t) = staged.get_mut(&task_id) else {
+            return;
+        };
         if t.status != TaskStatus::HumanReview || t.human_review.is_approved() {
             return;
         }
-        t.human_review.push(HumanReviewDecision::ChangesRequested, Some(feedback.clone()), now);
+        t.human_review.push(
+            HumanReviewDecision::ChangesRequested,
+            Some(feedback.clone()),
+            now,
+        );
         t.human_review.pr_error = None;
         // The AI review described the changes being sent back; the next run
         // gets its own.
@@ -873,7 +988,8 @@ async fn deliver(state: &crate::AppState, task_id: Uuid) -> PrDelivery {
                     t.human_review.pr_error = None;
                 }
             };
-            let _ = crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &clear).await;
+            let _ =
+                crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &clear).await;
             PrDelivery::Created { url }
         }
         Err(reason) => record_pr_failure(state, task_id, reason).await,
@@ -936,8 +1052,14 @@ mod shown_tip_tests {
     /// was shown.
     #[test]
     fn an_unreadable_branch_commit_is_refused_and_never_approved_blind() {
-        assert_eq!(shown_tip_is_current(true, None, None), Err(TIP_NOT_READ.to_string()));
-        assert_eq!(shown_tip_is_current(true, Some(TIP), None), Err(TIP_NOT_READ.to_string()));
+        assert_eq!(
+            shown_tip_is_current(true, None, None),
+            Err(TIP_NOT_READ.to_string())
+        );
+        assert_eq!(
+            shown_tip_is_current(true, Some(TIP), None),
+            Err(TIP_NOT_READ.to_string())
+        );
     }
 
     /// Missing evidence on the client: nothing was shown, but a commit is readable.
@@ -950,7 +1072,10 @@ mod shown_tip_tests {
     /// Stale tip: the branch moved after the commit was shown.
     #[test]
     fn an_approval_of_a_commit_the_branch_has_left_is_refused() {
-        assert_eq!(shown_tip_is_current(true, Some(TIP), Some(LATER)), Err(MOVED_BEFORE_APPROVAL.to_string()));
+        assert_eq!(
+            shown_tip_is_current(true, Some(TIP), Some(LATER)),
+            Err(MOVED_BEFORE_APPROVAL.to_string())
+        );
     }
 
     /// A task without a branch has no commit to show, and stays approvable.
@@ -988,7 +1113,8 @@ mod tests {
     async fn seed_in_review(state: &crate::AppState, tmp: &tempfile::TempDir) -> (Uuid, Uuid) {
         let (repo, project_id, _base) = repo_and_project(state, tmp).await;
         git(&repo, &["branch", "task-under-review"]);
-        let mut task = create_test_task_full("under review", project_id, TaskStatus::HumanReview, 0);
+        let mut task =
+            create_test_task_full("under review", project_id, TaskStatus::HumanReview, 0);
         task.description = Some(DESCRIPTION.to_string());
         task.branch_name = Some("task-under-review".to_string());
         task.worktree_path = Some("/tmp/checkout-under-review".to_string());
@@ -1002,7 +1128,10 @@ mod tests {
         task.human_review.record_arrival();
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task.clone());
-        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
         (project_id, task_id)
     }
 
@@ -1026,7 +1155,9 @@ mod tests {
             let arrival = t.human_review.arrivals;
             t.record_activity(crate::domain::task::ActivityKind::ReadyForReview { arrival });
         };
-        crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend).await.unwrap();
+        crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend)
+            .await
+            .unwrap();
     }
 
     /// Runs the executor's poller until the Task reaches `wanted` or fails.
@@ -1035,7 +1166,11 @@ mod tests {
     /// running is left alone between passes.
     #[cfg(unix)]
     async fn poll_until(state: &crate::AppState, task_id: Uuid, wanted: TaskStatus) -> Task {
-        let executor = state.executor.get().expect("an executor is attached").clone();
+        let executor = state
+            .executor
+            .get()
+            .expect("an executor is attached")
+            .clone();
         for _ in 0..400 {
             let task = state.task.tasks.read().await[&task_id].clone();
             if task.status == wanted || task.status == TaskStatus::Error {
@@ -1065,12 +1200,20 @@ mod tests {
 
         let removal_side = async {
             tokio::task::yield_now().await;
-            state.project.projects.write().await.get_mut(&project_id).expect("the Project").removed_at =
-                Some(chrono::Utc::now());
+            state
+                .project
+                .projects
+                .write()
+                .await
+                .get_mut(&project_id)
+                .expect("the Project")
+                .removed_at = Some(chrono::Utc::now());
             drop(removal);
         };
-        let (_, outcome) =
-            tokio::join!(removal_side, request_changes(&state, task_id, "Also count lines."));
+        let (_, outcome) = tokio::join!(
+            removal_side,
+            request_changes(&state, task_id, "Also count lines.")
+        );
 
         assert_eq!(
             outcome.expect_err("the request must be refused"),
@@ -1093,12 +1236,20 @@ mod tests {
         let (tmp, state) = test_state().await;
         let (project_id, task_id) = seed_in_review(&state, &tmp).await;
 
-        request_changes(&state, task_id, "Also count lines.").await.expect("first request");
+        request_changes(&state, task_id, "Also count lines.")
+            .await
+            .expect("first request");
         arrive_again(&state, task_id).await;
-        request_changes(&state, task_id, "And bytes.").await.expect("second request");
+        request_changes(&state, task_id, "And bytes.")
+            .await
+            .expect("second request");
         arrive_again(&state, task_id).await;
-        approve_shown(&state, task_id, false).await.expect("approved");
-        approve_shown(&state, task_id, false).await.expect("approving again changes nothing");
+        approve_shown(&state, task_id, false)
+            .await
+            .expect("approved");
+        approve_shown(&state, task_id, false)
+            .await
+            .expect("approving again changes nothing");
         record_pr_failure(&state, task_id, "gh: HTTP 422".to_string()).await;
         record_pr_failure(&state, task_id, "gh: HTTP 422".to_string()).await;
 
@@ -1117,17 +1268,24 @@ mod tests {
                 "Pull request not created: gh: HTTP 422",
             ]
         );
-        assert!(task.needs_you(false).is_some(), "current state still comes from the record");
+        assert!(
+            task.needs_you(false).is_some(),
+            "current state still comes from the record"
+        );
     }
 
     /// The timeline the drawer shows, one line per row, from the record.
     fn task_timeline(task: &Task) -> Vec<String> {
-        let decisions = task.human_review.entries.iter().map(|e| slashit_activity::Decision {
-            sequence: e.sequence,
-            at: e.decided_at,
-            approved: e.decision == HumanReviewDecision::Approved,
-            feedback: e.feedback.as_deref(),
-        });
+        let decisions = task
+            .human_review
+            .entries
+            .iter()
+            .map(|e| slashit_activity::Decision {
+                sequence: e.sequence,
+                at: e.decided_at,
+                approved: e.decision == HumanReviewDecision::Approved,
+                feedback: e.feedback.as_deref(),
+            });
         slashit_activity::timeline(task.created_at, decisions, &task.activity)
             .iter()
             .map(|item| match item.detail() {
@@ -1142,18 +1300,40 @@ mod tests {
         let (tmp, state) = test_state().await;
         let (project_id, task_id) = seed_in_review(&state, &tmp).await;
 
-        let task = request_changes(&state, task_id, "  Also count lines.\n").await.expect("recorded");
+        let task = request_changes(&state, task_id, "  Also count lines.\n")
+            .await
+            .expect("recorded");
 
         assert_eq!(task.status, TaskStatus::Queue);
-        assert_eq!(task.description.as_deref(), Some(DESCRIPTION), "the description is untouched");
-        assert_eq!(task.human_review.pending_feedback(), vec!["Also count lines."]);
+        assert_eq!(
+            task.description.as_deref(),
+            Some(DESCRIPTION),
+            "the description is untouched"
+        );
+        assert_eq!(
+            task.human_review.pending_feedback(),
+            vec!["Also count lines."]
+        );
         let entry = task.human_review.entries.last().unwrap();
         assert_eq!(entry.decision, HumanReviewDecision::ChangesRequested);
         assert_eq!((entry.sequence, entry.arrival), (1, 1));
-        assert!(task.qa_signoff.is_none(), "the old AI review is about the changes sent back");
-        assert_eq!(task.overall_progress, 0, "the execution state is reset for the rerun");
-        assert_eq!(task.branch_name.as_deref(), Some("task-under-review"), "the branch is kept");
-        assert!(task.worktree_path.is_some(), "the checkout is kept for the next run");
+        assert!(
+            task.qa_signoff.is_none(),
+            "the old AI review is about the changes sent back"
+        );
+        assert_eq!(
+            task.overall_progress, 0,
+            "the execution state is reset for the rerun"
+        );
+        assert_eq!(
+            task.branch_name.as_deref(),
+            Some("task-under-review"),
+            "the branch is kept"
+        );
+        assert!(
+            task.worktree_path.is_some(),
+            "the checkout is kept for the next run"
+        );
 
         let persisted = on_disk(&state, project_id, task_id);
         assert_eq!(persisted.status, TaskStatus::Queue);
@@ -1183,7 +1363,10 @@ mod tests {
         task.review_mode = ReviewMode::Manual;
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task.clone());
-        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
         crate::test_helpers::attach_test_executor(&state);
 
         // The fake Worker writes a number that changes on every run, so the
@@ -1204,13 +1387,22 @@ mod tests {
         // Run 1: the poller starts the Task, and the poller sends the finished
         // Manual run to Human Review.
         let first = poll_until(&state, task_id, TaskStatus::HumanReview).await;
-        assert_eq!(first.status, TaskStatus::HumanReview, "{:?}", first.error_message);
+        assert_eq!(
+            first.status,
+            TaskStatus::HumanReview,
+            "{:?}",
+            first.error_message
+        );
         assert!(first.qa_signoff.is_none(), "no AI verdict is invented");
         let first_handoff = first.worker_handoff.clone().expect("run 1 has its record");
         assert_eq!(first_handoff.run, Some(1));
         assert_eq!(first_handoff.review_mode, ReviewMode::Manual);
         assert!(!first_handoff.review_mode_unproven);
-        assert_eq!(agent.launches("claude"), 1, "one coding run and no reviewer");
+        assert_eq!(
+            agent.launches("claude"),
+            1,
+            "one coding run and no reviewer"
+        );
 
         // A person asks for changes. The Task goes back to Queue with its
         // feedback, and its checkout and branch are kept.
@@ -1221,20 +1413,49 @@ mod tests {
 
         // Run 2: the poller starts it again through the same executor path.
         let second = poll_until(&state, task_id, TaskStatus::HumanReview).await;
-        assert_eq!(second.status, TaskStatus::HumanReview, "{:?}", second.error_message);
+        assert_eq!(
+            second.status,
+            TaskStatus::HumanReview,
+            "{:?}",
+            second.error_message
+        );
         assert!(second.qa_signoff.is_none(), "no AI verdict is invented");
-        let handoff = second.worker_handoff.clone().expect("run 2 has its own record");
-        assert_eq!(handoff.run, Some(2), "the record is numbered as the second run");
-        assert_eq!(handoff.review_mode, ReviewMode::Manual, "Manual is fixed at run 2's start");
-        assert!(!handoff.review_mode_unproven, "the record is proven, not rebuilt");
+        let handoff = second
+            .worker_handoff
+            .clone()
+            .expect("run 2 has its own record");
+        assert_eq!(
+            handoff.run,
+            Some(2),
+            "the record is numbered as the second run"
+        );
+        assert_eq!(
+            handoff.review_mode,
+            ReviewMode::Manual,
+            "Manual is fixed at run 2's start"
+        );
+        assert!(
+            !handoff.review_mode_unproven,
+            "the record is proven, not rebuilt"
+        );
         assert_ne!(
             handoff.start_head, first_handoff.start_head,
             "a new record, started from the commit run 1 made"
         );
-        assert_eq!(agent.launches("claude"), 2, "two coding runs, and still no reviewer");
-        assert!(second.activity.iter().any(|e| matches!(e.kind, ActivityKind::RunStarted { run: 2, .. })));
+        assert_eq!(
+            agent.launches("claude"),
+            2,
+            "two coding runs, and still no reviewer"
+        );
+        assert!(second
+            .activity
+            .iter()
+            .any(|e| matches!(e.kind, ActivityKind::RunStarted { run: 2, .. })));
         assert!(
-            !second.activity.iter().any(|e| matches!(e.kind, ActivityKind::AiReviewStarted { .. })),
+            !second
+                .activity
+                .iter()
+                .any(|e| matches!(e.kind, ActivityKind::AiReviewStarted { .. })),
             "no AI review ran on either run"
         );
         let skipped: Vec<u32> = second
@@ -1245,9 +1466,16 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(skipped, [1, 2], "each Manual run records its skipped AI review once");
+        assert_eq!(
+            skipped,
+            [1, 2],
+            "each Manual run records its skipped AI review once"
+        );
         let checkout = second.worktree_path.clone().expect("the checkout is kept");
-        assert_eq!(git(Path::new(&checkout), &["show", "HEAD:agent_work.txt"]), "run 2");
+        assert_eq!(
+            git(Path::new(&checkout), &["show", "HEAD:agent_work.txt"]),
+            "run 2"
+        );
 
         // The records survive a reload from the board on disk.
         let persisted = on_disk(&state, project_id, task_id);
@@ -1257,7 +1485,11 @@ mod tests {
         assert_eq!(persisted_handoff.run, Some(2));
         assert_eq!(persisted_handoff.review_mode, ReviewMode::Manual);
         assert_eq!(persisted_handoff.start_head, handoff.start_head);
-        assert_eq!(persisted.human_review.entries.len(), 1, "one change request was recorded");
+        assert_eq!(
+            persisted.human_review.entries.len(),
+            1,
+            "one change request was recorded"
+        );
     }
 
     /// Changes cannot be requested while an earlier cleanup of the Task's
@@ -1270,10 +1502,15 @@ mod tests {
         let mut task = on_disk(&state, project_id, task_id);
         task.cleanup_in_flight = true;
         state.task.tasks.write().await.insert(task_id, task.clone());
-        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
         let before = on_disk(&state, project_id, task_id);
         let executor = crate::test_helpers::attach_test_executor(&state);
-        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+        let cleaned_up = executor
+            .register_fake_running_execution_for_test(task_id)
+            .await;
 
         let Err(refusal) = request_changes(&state, task_id, "Also count lines.").await else {
             panic!("a Task with unfinished cleanup must not be queued by a review decision");
@@ -1286,9 +1523,18 @@ mod tests {
         );
         let after = on_disk(&state, project_id, task_id);
         assert_eq!(after.status, TaskStatus::HumanReview);
-        assert_eq!(after.human_review.entries.len(), before.human_review.entries.len());
-        assert!(after.human_review.pending_feedback().is_empty(), "no feedback is recorded");
-        assert_eq!(state.task.tasks.read().await[&task_id].status, TaskStatus::HumanReview);
+        assert_eq!(
+            after.human_review.entries.len(),
+            before.human_review.entries.len()
+        );
+        assert!(
+            after.human_review.pending_feedback().is_empty(),
+            "no feedback is recorded"
+        );
+        assert_eq!(
+            state.task.tasks.read().await[&task_id].status,
+            TaskStatus::HumanReview
+        );
     }
 
     /// Requesting changes is a decision, not new work, so it is recorded on
@@ -1307,20 +1553,37 @@ mod tests {
         std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
         std::fs::write(&lease_path, b"").unwrap();
 
-        let task = request_changes(&state, task_id, "Also count lines.").await.expect("recorded while paused");
+        let task = request_changes(&state, task_id, "Also count lines.")
+            .await
+            .expect("recorded while paused");
         assert_eq!(task.status, TaskStatus::Queue);
-        assert_eq!(on_disk(&state, project_id, task_id).status, TaskStatus::Queue);
+        assert_eq!(
+            on_disk(&state, project_id, task_id).status,
+            TaskStatus::Queue
+        );
 
         crate::test_helpers::attach_test_executor(&state);
         let app = tauri::test::mock_app();
         app.manage(state);
-        let waiting = crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await;
-        assert!(waiting.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{waiting:?}");
+        let waiting =
+            crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await;
+        assert!(
+            waiting
+                .as_ref()
+                .is_err_and(|m| m.starts_with("New work paused")),
+            "{waiting:?}"
+        );
         let state: tauri::State<'_, crate::AppState> = app.state();
-        assert_eq!(on_disk(&state, project_id, task_id).status, TaskStatus::Queue);
+        assert_eq!(
+            on_disk(&state, project_id, task_id).status,
+            TaskStatus::Queue
+        );
 
         disk.set_available(300 * GIB);
-        let promoted = crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await.expect("promoted");
+        let promoted =
+            crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state())
+                .await
+                .expect("promoted");
         assert_eq!(promoted, Some(task_id.to_string()));
     }
 
@@ -1331,7 +1594,9 @@ mod tests {
         let before = on_disk(&state, project_id, task_id);
 
         for blank in ["", "   ", "\n\t"] {
-            let refused = request_changes(&state, task_id, blank).await.expect_err("blank");
+            let refused = request_changes(&state, task_id, blank)
+                .await
+                .expect_err("blank");
             assert!(refused.contains("Describe the changes"), "{refused}");
         }
         let too_long = "x".repeat(MAX_FEEDBACK_CHARS + 1);
@@ -1346,16 +1611,24 @@ mod tests {
     async fn approved_changes_cannot_also_be_sent_back_and_vice_versa() {
         let (tmp, state) = test_state().await;
         let (_project_id, approved) = seed_in_review(&state, &tmp).await;
-        approve_shown(&state, approved, false).await.expect("approved");
-        let refused = request_changes(&state, approved, "change it").await.expect_err("approved");
+        approve_shown(&state, approved, false)
+            .await
+            .expect("approved");
+        let refused = request_changes(&state, approved, "change it")
+            .await
+            .expect_err("approved");
         assert!(refused.contains("already approved"), "{refused}");
         let task = current(&state, approved).await.unwrap();
         assert_eq!(task.status, TaskStatus::HumanReview);
         assert_eq!(task.human_review.entries.len(), 1);
 
         let (_project_id, sent_back) = seed_in_review(&state, &tmp).await;
-        request_changes(&state, sent_back, "change it").await.expect("recorded");
-        let refused = approve_shown(&state, sent_back, false).await.expect_err("queued now");
+        request_changes(&state, sent_back, "change it")
+            .await
+            .expect("recorded");
+        let refused = approve_shown(&state, sent_back, false)
+            .await
+            .expect_err("queued now");
         assert!(refused.contains("Human Review"), "{refused}");
     }
 
@@ -1369,25 +1642,48 @@ mod tests {
         let (_p, moved) = seed_in_review(&state, &tmp).await;
         let (_p, queued) = seed_in_review(&state, &tmp).await;
         approve_shown(&state, moved, false).await.expect("approved");
-        approve_shown(&state, queued, false).await.expect("approved");
+        approve_shown(&state, queued, false)
+            .await
+            .expect("approved");
         let app = tauri::test::mock_app();
         app.manage(state);
 
         for status in [TaskStatus::Queue, TaskStatus::HumanReview] {
-            crate::commands::task::update_task_status(GuiMutation::untracked(), app.state(), moved.to_string(), status, None)
-                .await
-                .expect("moved");
-        }
-        crate::commands::queue::add_to_queue(GuiMutation::untracked(), app.state(), queued.to_string()).await.expect("queued");
-        crate::commands::task::update_task_status(GuiMutation::untracked(), app.state(), queued.to_string(), TaskStatus::HumanReview, None)
+            crate::commands::task::update_task_status(
+                GuiMutation::untracked(),
+                app.state(),
+                moved.to_string(),
+                status,
+                None,
+            )
             .await
-            .expect("moved back");
+            .expect("moved");
+        }
+        crate::commands::queue::add_to_queue(
+            GuiMutation::untracked(),
+            app.state(),
+            queued.to_string(),
+        )
+        .await
+        .expect("queued");
+        crate::commands::task::update_task_status(
+            GuiMutation::untracked(),
+            app.state(),
+            queued.to_string(),
+            TaskStatus::HumanReview,
+            None,
+        )
+        .await
+        .expect("moved back");
 
         let state: tauri::State<'_, crate::AppState> = app.state();
         for id in [moved, queued] {
             let task = current(&state, id).await.unwrap();
             assert_eq!(task.status, TaskStatus::HumanReview);
-            assert!(!task.human_review.is_approved(), "the approval was of other changes");
+            assert!(
+                !task.human_review.is_approved(),
+                "the approval was of other changes"
+            );
             assert!(task.human_review.current_decision().is_none());
             assert_eq!(task.human_review.entries.len(), 1, "the history keeps it");
             assert!(retry_delivery(&state, id).await.is_err());
@@ -1402,10 +1698,21 @@ mod tests {
     async fn changes_already_requested_in_this_review_cannot_also_be_approved() {
         let (tmp, state) = test_state().await;
         let (_p, task_id) = seed_in_review(&state, &tmp).await;
-        request_changes(&state, task_id, "fix it").await.expect("recorded");
+        request_changes(&state, task_id, "fix it")
+            .await
+            .expect("recorded");
         // Put back in Human Review without a run, as a manual move would.
-        state.task.tasks.write().await.get_mut(&task_id).unwrap().status = TaskStatus::HumanReview;
-        let refused = approve_shown(&state, task_id, false).await.expect_err("changes were requested");
+        state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&task_id)
+            .unwrap()
+            .status = TaskStatus::HumanReview;
+        let refused = approve_shown(&state, task_id, false)
+            .await
+            .expect_err("changes were requested");
         assert!(refused.contains("already requested"), "{refused}");
     }
 
@@ -1415,7 +1722,9 @@ mod tests {
     async fn a_later_review_starts_undecided_and_keeps_the_earlier_feedback() {
         let (tmp, state) = test_state().await;
         let (_project_id, task_id) = seed_in_review(&state, &tmp).await;
-        request_changes(&state, task_id, "first round of feedback").await.expect("recorded");
+        request_changes(&state, task_id, "first round of feedback")
+            .await
+            .expect("recorded");
 
         // What the executor does when the rerun reaches Human Review.
         {
@@ -1430,7 +1739,9 @@ mod tests {
         assert!(task.human_review.pending_feedback().is_empty());
         assert_eq!(task.human_review.arrivals, 2);
 
-        request_changes(&state, task_id, "second round").await.expect("recorded");
+        request_changes(&state, task_id, "second round")
+            .await
+            .expect("recorded");
         let task = current(&state, task_id).await.unwrap();
         let history: Vec<_> = task
             .human_review
@@ -1458,30 +1769,51 @@ mod tests {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .output()
             .expect("run git");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// jj with a fixed identity, for the commits these tests make with jj.
     fn jj(dir: &std::path::Path, args: &[&str]) -> String {
-        let mut all = vec!["--config", "user.name=Test", "--config", "user.email=test@example.com"];
+        let mut all = vec![
+            "--config",
+            "user.name=Test",
+            "--config",
+            "user.email=test@example.com",
+        ];
         all.extend_from_slice(args);
         let out = std::process::Command::new("jj")
             .args(&all)
             .current_dir(dir)
             .output()
             .expect("run jj");
-        assert!(out.status.success(), "jj {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "jj {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// The commit `refs/heads/<branch>` names in the backing Git directory of
     /// a jj workspace, if it is there at all.
-    fn git_ref_at(git_dir: &std::path::Path, branch: &str, cwd: &std::path::Path) -> Option<String> {
+    fn git_ref_at(
+        git_dir: &std::path::Path,
+        branch: &str,
+        cwd: &std::path::Path,
+    ) -> Option<String> {
         let out = std::process::Command::new("git")
             .arg("--git-dir")
             .arg(git_dir)
-            .args(["for-each-ref", "--format=%(objectname)", &format!("refs/heads/{branch}")])
+            .args([
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/heads/{branch}"),
+            ])
             .current_dir(cwd)
             .output()
             .expect("for-each-ref");
@@ -1506,7 +1838,11 @@ mod tests {
     async fn repo_and_project(
         state: &crate::AppState,
         tmp: &tempfile::TempDir,
-    ) -> (std::path::PathBuf, Uuid, crate::domain::project::ProjectBase) {
+    ) -> (
+        std::path::PathBuf,
+        Uuid,
+        crate::domain::project::ProjectBase,
+    ) {
         // A directory of its own, so one test can seed several projects.
         let repo = tmp.path().join(format!("repo-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&repo).unwrap();
@@ -1531,7 +1867,9 @@ mod tests {
                 created_at: chrono::Utc::now(),
             },
         );
-        let base = crate::domain::project::ProjectBase::LocalBranch { branch: "main".to_string() };
+        let base = crate::domain::project::ProjectBase::LocalBranch {
+            branch: "main".to_string(),
+        };
         state.project.projects.write().await.insert(
             project_id,
             crate::domain::Project {
@@ -1575,7 +1913,8 @@ mod tests {
         git(&worktree, &["add", "."]);
         git(&worktree, &["commit", "-q", "-m", "task work"]);
 
-        let mut task = create_test_task_full("finish locally", project_id, TaskStatus::HumanReview, 0);
+        let mut task =
+            create_test_task_full("finish locally", project_id, TaskStatus::HumanReview, 0);
         task.branch_name = Some(branch.clone());
         task.worktree_path = Some(info.path.clone());
         task.base_commit = Some(git(&repo, &["rev-parse", "main"]));
@@ -1583,8 +1922,19 @@ mod tests {
         task.human_review.record_arrival();
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task.clone());
-        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
-        Local { _tmp: tmp, state, repo, project_id, task_id, branch, worktree }
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
+        Local {
+            _tmp: tmp,
+            state,
+            repo,
+            project_id,
+            task_id,
+            branch,
+            worktree,
+        }
     }
 
     impl Local {
@@ -1592,14 +1942,21 @@ mod tests {
             on_disk(&self.state, self.project_id, self.task_id)
         }
         async fn approve(&self) {
-            approve_shown(&self.state, self.task_id, false).await.expect("approved");
+            approve_shown(&self.state, self.task_id, false)
+                .await
+                .expect("approved");
         }
         async fn complete(&self) -> Result<Task, String> {
             complete_locally(&self.state, self.task_id, false).await
         }
         fn branch_exists(&self) -> bool {
             std::process::Command::new("git")
-                .args(["rev-parse", "--verify", "-q", &format!("refs/heads/{}", self.branch)])
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("refs/heads/{}", self.branch),
+                ])
                 .current_dir(&self.repo)
                 .output()
                 .unwrap()
@@ -1612,9 +1969,15 @@ mod tests {
             let task = current(&self.state, self.task_id).await.unwrap();
             assert_eq!(task.status, TaskStatus::HumanReview);
             assert!(!task.completed_locally());
-            assert_eq!(task.overall_progress, 90, "a refusal does not touch progress");
+            assert_eq!(
+                task.overall_progress, 90,
+                "a refusal does not touch progress"
+            );
             assert!(task.worktree_path.is_some());
-            assert!(self.worktree.join("work.txt").exists(), "the checkout is still there");
+            assert!(
+                self.worktree.join("work.txt").exists(),
+                "the checkout is still there"
+            );
             assert!(self.branch_exists());
             let disk = self.on_disk();
             assert_eq!(disk.status, TaskStatus::HumanReview);
@@ -1624,7 +1987,10 @@ mod tests {
     }
 
     fn completions(task: &Task) -> usize {
-        task.activity.iter().filter(|e| e.kind == slashit_activity::Kind::CompletedLocally {}).count()
+        task.activity
+            .iter()
+            .filter(|e| e.kind == slashit_activity::Kind::CompletedLocally {})
+            .count()
     }
 
     #[tokio::test]
@@ -1638,7 +2004,10 @@ mod tests {
 
         assert_eq!(done.status, TaskStatus::Done);
         assert!(done.completed_locally());
-        assert_eq!(done.overall_progress, 100, "a finished task shows it, as a merged one does");
+        assert_eq!(
+            done.overall_progress, 100,
+            "a finished task shows it, as a merged one does"
+        );
         assert_eq!(done.phase, crate::domain::task::TaskPhase::Complete);
         assert!(done.worktree_path.is_none(), "the checkout is released");
         assert!(!local.worktree.exists(), "and removed");
@@ -1646,16 +2015,31 @@ mod tests {
         assert!(done.pr_url.is_none() && done.external_refs.iter().all(|r| !r.is_pr()));
         assert_eq!(done.branch_name.as_deref(), Some(local.branch.as_str()));
         assert!(local.branch_exists(), "the branch survives");
-        assert_eq!(git(&local.repo, &["rev-parse", &local.branch]), branch_before, "with its commits");
-        assert_eq!(git(&local.repo, &["rev-parse", "main"]), main_before, "and nothing reached main");
-        assert!(done.human_review.is_approved(), "the approval stays on the record");
+        assert_eq!(
+            git(&local.repo, &["rev-parse", &local.branch]),
+            branch_before,
+            "with its commits"
+        );
+        assert_eq!(
+            git(&local.repo, &["rev-parse", "main"]),
+            main_before,
+            "and nothing reached main"
+        );
+        assert!(
+            done.human_review.is_approved(),
+            "the approval stays on the record"
+        );
         assert_eq!(done.human_review.entries.len(), 1);
         assert_eq!(done.human_review.arrivals, 1);
 
         let timeline = task_timeline(&done);
         assert_eq!(
             timeline[timeline.len() - 3..],
-            ["You approved the changes", "Moved to Done", "Completed locally, not merged"]
+            [
+                "You approved the changes",
+                "Moved to Done",
+                "Completed locally, not merged"
+            ]
         );
 
         // A restart reads the same thing.
@@ -1704,19 +2088,42 @@ mod tests {
             .await
             .expect("readable")
             .expect("a Task in Human Review");
-        assert!(shown.patch.contains("work.txt") && !shown.patch.contains("extra.txt"), "{}", shown.patch);
+        assert!(
+            shown.patch.contains("work.txt") && !shown.patch.contains("extra.txt"),
+            "{}",
+            shown.patch
+        );
         assert!(!shown.patch.contains("unstaged line"), "{}", shown.patch);
-        assert!(shown.pending_patch.contains("extra.txt") && shown.pending_patch.contains("unstaged line"));
-        assert!(!shown.pending_patch.contains("+work\n"), "committed content is not repeated as pending");
+        assert!(
+            shown.pending_patch.contains("extra.txt")
+                && shown.pending_patch.contains("unstaged line")
+        );
+        assert!(
+            !shown.pending_patch.contains("+work\n"),
+            "committed content is not repeated as pending"
+        );
 
         // The plain diff commands show the same primary content.
-        let plain = crate::commands::jj::fetch_task_diff(&local.state, local.task_id).await.unwrap();
-        assert_eq!((plain.patch, plain.stat), (shown.patch.clone(), shown.stat.clone()));
+        let plain = crate::commands::jj::fetch_task_diff(&local.state, local.task_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (plain.patch, plain.stat),
+            (shown.patch.clone(), shown.stat.clone())
+        );
 
         // Pending edits do not stop an approval, and it binds the shown commit.
-        approve(&local.state, local.task_id, false, Some(&shown.tip)).await.expect("approved");
-        assert_eq!(local.on_disk().human_review.approved_tip(), Some(shown.tip.as_str()));
-        assert!(local.worktree.join("extra.txt").exists(), "nothing touched the checkout");
+        approve(&local.state, local.task_id, false, Some(&shown.tip))
+            .await
+            .expect("approved");
+        assert_eq!(
+            local.on_disk().human_review.approved_tip(),
+            Some(shown.tip.as_str())
+        );
+        assert!(
+            local.worktree.join("extra.txt").exists(),
+            "nothing touched the checkout"
+        );
     }
 
     /// Direction 2, the one that matters: an uncommitted edit that undoes
@@ -1730,9 +2137,19 @@ mod tests {
             .await
             .unwrap()
             .expect("a Task in Human Review");
-        assert!(shown.patch.contains("+work"), "the committed content is shown: {}", shown.patch);
-        assert!(shown.pending_patch.contains("-work"), "the deletion is shown as pending: {}", shown.pending_patch);
-        let plain = crate::commands::jj::fetch_task_diff(&local.state, local.task_id).await.unwrap();
+        assert!(
+            shown.patch.contains("+work"),
+            "the committed content is shown: {}",
+            shown.patch
+        );
+        assert!(
+            shown.pending_patch.contains("-work"),
+            "the deletion is shown as pending: {}",
+            shown.pending_patch
+        );
+        let plain = crate::commands::jj::fetch_task_diff(&local.state, local.task_id)
+            .await
+            .unwrap();
         assert!(plain.patch.contains("+work"), "{}", plain.patch);
     }
 
@@ -1749,13 +2166,23 @@ mod tests {
         git(&local.worktree, &["add", "."]);
         git(&local.worktree, &["commit", "-q", "-m", "later"]);
 
-        let refused = approve(&local.state, local.task_id, false, Some(&shown.tip)).await.expect_err("moved");
+        let refused = approve(&local.state, local.task_id, false, Some(&shown.tip))
+            .await
+            .expect_err("moved");
         assert!(!refused.is_empty());
-        assert!(local.on_disk().human_review.approved_tip().is_none(), "nothing was recorded");
-        let now = crate::commands::jj::fetch_review_changes(&local.state, local.task_id).await.unwrap().unwrap();
+        assert!(
+            local.on_disk().human_review.approved_tip().is_none(),
+            "nothing was recorded"
+        );
+        let now = crate::commands::jj::fetch_review_changes(&local.state, local.task_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_ne!(now.tip, shown.tip);
         assert!(now.patch.contains("later.txt"));
-        approve(&local.state, local.task_id, false, Some(&now.tip)).await.expect("the new commit, as shown");
+        approve(&local.state, local.task_id, false, Some(&now.tip))
+            .await
+            .expect("the new commit, as shown");
     }
 
     /// A Task in Human Review whose branch commit cannot be read shows an error,
@@ -1767,8 +2194,16 @@ mod tests {
             let mut tasks = local.state.task.tasks.write().await;
             tasks.get_mut(&local.task_id).unwrap().branch_name = Some("no-such-branch".into());
         }
-        assert!(crate::commands::jj::fetch_review_changes(&local.state, local.task_id).await.is_err());
-        assert!(crate::commands::jj::fetch_task_diff(&local.state, local.task_id).await.is_err());
+        assert!(
+            crate::commands::jj::fetch_review_changes(&local.state, local.task_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            crate::commands::jj::fetch_task_diff(&local.state, local.task_id)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1778,10 +2213,15 @@ mod tests {
             let mut tasks = local.state.task.tasks.write().await;
             tasks.get_mut(&local.task_id).unwrap().status = TaskStatus::InProgress;
         }
-        assert_eq!(crate::commands::jj::fetch_review_changes(&local.state, local.task_id).await, Ok(None));
+        assert_eq!(
+            crate::commands::jj::fetch_review_changes(&local.state, local.task_id).await,
+            Ok(None)
+        );
         // The checkout's own diff is still the working-tree one for a running Task.
         std::fs::write(local.worktree.join("extra.txt"), "x\n").unwrap();
-        let plain = crate::commands::jj::fetch_task_diff(&local.state, local.task_id).await.unwrap();
+        let plain = crate::commands::jj::fetch_task_diff(&local.state, local.task_id)
+            .await
+            .unwrap();
         assert!(plain.patch.contains("extra.txt"));
     }
 
@@ -1793,7 +2233,9 @@ mod tests {
         local.untouched().await;
 
         // Changes requested then back in review: still no approval.
-        request_changes(&local.state, local.task_id, "more").await.expect("sent back");
+        request_changes(&local.state, local.task_id, "more")
+            .await
+            .expect("sent back");
         {
             let mut tasks = local.state.task.tasks.write().await;
             let t = tasks.get_mut(&local.task_id).unwrap();
@@ -1809,11 +2251,22 @@ mod tests {
     async fn a_task_outside_human_review_cannot_be_completed_locally() {
         let local = local_project().await;
         local.approve().await;
-        local.state.task.tasks.write().await.get_mut(&local.task_id).unwrap().status = TaskStatus::InProgress;
+        local
+            .state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&local.task_id)
+            .unwrap()
+            .status = TaskStatus::InProgress;
         let refused = local.complete().await.expect_err("working");
         assert!(refused.contains("Human Review"), "{refused}");
         assert!(local.worktree.join("work.txt").exists());
-        assert!(!current(&local.state, local.task_id).await.unwrap().completed_locally());
+        assert!(!current(&local.state, local.task_id)
+            .await
+            .unwrap()
+            .completed_locally());
     }
 
     #[tokio::test]
@@ -1821,14 +2274,21 @@ mod tests {
         let local = local_project().await;
         local.approve().await;
         let executor = crate::test_helpers::attach_test_executor(&local.state);
-        executor.register_fake_reviewing_owner_for_test(local.task_id).await;
+        executor
+            .register_fake_reviewing_owner_for_test(local.task_id)
+            .await;
 
         let refused = local.complete().await.expect_err("owned");
         assert!(refused.contains("still running"), "{refused}");
         local.untouched().await;
-        assert_eq!(executor.running_task_count().await, 1, "refusing does not stop or end anything");
+        assert_eq!(
+            executor.running_task_count().await,
+            1,
+            "refusing does not stop or end anything"
+        );
         assert!(
-            crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), local.task_id).await,
+            crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), local.task_id)
+                .await,
             "the owner is still there"
         );
     }
@@ -1853,22 +2313,39 @@ mod tests {
         assert!(refused.contains("was kept"), "{refused}");
         local.untouched().await;
         let task = current(&local.state, local.task_id).await.unwrap();
-        assert!(task.error_message.as_deref().is_some_and(|m| m.contains("was kept")));
+        assert!(task
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("was kept")));
         assert!(!task.cleanup_in_flight, "the attempt is over");
-        assert!(local.worktree.join("unsaved.txt").exists(), "nothing the person wrote is gone");
+        assert!(
+            local.worktree.join("unsaved.txt").exists(),
+            "nothing the person wrote is gone"
+        );
         assert_eq!(completions(&task), 0, "and no completion was claimed");
 
         // Dealt with, asked again.
         git(&local.worktree, &["add", "."]);
         git(&local.worktree, &["commit", "-q", "-m", "keep it"]);
         // Committing it changed the branch, which the approval did not cover.
-        let refused = local.complete().await.expect_err("a commit nobody approved");
+        let refused = local
+            .complete()
+            .await
+            .expect_err("a commit nobody approved");
         assert!(refused.contains("changed since"), "{refused}");
-        approve_again(&local.state, local.task_id, &local.tip()).await.expect("approved as it is now");
-        let done = local.complete().await.expect("completed on the second request");
+        approve_again(&local.state, local.task_id, &local.tip())
+            .await
+            .expect("approved as it is now");
+        let done = local
+            .complete()
+            .await
+            .expect("completed on the second request");
         assert_eq!(done.status, TaskStatus::Done);
         assert_eq!(completions(&done), 1);
-        assert!(done.error_message.is_none(), "the earlier refusal is cleared");
+        assert!(
+            done.error_message.is_none(),
+            "the earlier refusal is cleared"
+        );
         assert!(!local.worktree.exists());
         assert!(local.branch_exists());
     }
@@ -1886,10 +2363,16 @@ mod tests {
         for again in [&second, &third] {
             assert_eq!(again.status, TaskStatus::Done);
             assert_eq!(completions(again), 1);
-            assert_eq!(again.activity, first.activity, "no second entry, no second move");
+            assert_eq!(
+                again.activity, first.activity,
+                "no second entry, no second move"
+            );
             assert_eq!(again.updated_at, first.updated_at, "nothing was written");
         }
-        assert_eq!(serde_json::to_value(local.on_disk()).unwrap(), on_disk_first);
+        assert_eq!(
+            serde_json::to_value(local.on_disk()).unwrap(),
+            on_disk_first
+        );
     }
 
     #[tokio::test]
@@ -1897,13 +2380,19 @@ mod tests {
         let local = local_project().await;
         local.approve().await;
         let (a, b) = tokio::join!(local.complete(), local.complete());
-        let (a, b) = (a.expect("one completes"), b.expect("the other sees it done"));
+        let (a, b) = (
+            a.expect("one completes"),
+            b.expect("the other sees it done"),
+        );
         assert_eq!(a.status, TaskStatus::Done);
         assert_eq!(b.status, TaskStatus::Done);
         let task = current(&local.state, local.task_id).await.unwrap();
         assert_eq!(completions(&task), 1);
         assert_eq!(
-            task.activity.iter().filter(|e| matches!(e.kind, slashit_activity::Kind::Moved { .. })).count(),
+            task.activity
+                .iter()
+                .filter(|e| matches!(e.kind, slashit_activity::Kind::Moved { .. }))
+                .count(),
             1
         );
     }
@@ -1921,10 +2410,22 @@ mod tests {
                 let t = tasks.get_mut(&local.task_id).unwrap();
                 t.cleanup_in_flight = true;
                 let snapshot = t.clone();
-                local.state.storage.save_project_tasks(local.project_id, &[snapshot]).unwrap();
+                local
+                    .state
+                    .storage
+                    .save_project_tasks(local.project_id, &[snapshot])
+                    .unwrap();
             }
             if removed_before_crash {
-                git(&local.repo, &["worktree", "remove", "--force", local.worktree.to_str().unwrap()]);
+                git(
+                    &local.repo,
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        local.worktree.to_str().unwrap(),
+                    ],
+                );
             }
             // What a restart sees: nothing is Done, nothing is lost.
             let after_crash = local.on_disk();
@@ -1933,7 +2434,11 @@ mod tests {
             assert!(after_crash.human_review.is_approved());
 
             let done = local.complete().await.expect("finished");
-            assert_eq!(done.status, TaskStatus::Done, "removed_before_crash={removed_before_crash}");
+            assert_eq!(
+                done.status,
+                TaskStatus::Done,
+                "removed_before_crash={removed_before_crash}"
+            );
             assert!(!done.cleanup_in_flight);
             assert!(done.worktree_path.is_none());
             assert_eq!(completions(&done), 1);
@@ -1945,15 +2450,29 @@ mod tests {
     #[tokio::test]
     async fn a_project_that_can_open_a_pull_request_is_not_completed_locally() {
         let local = local_project().await;
-        git(&local.repo, &["remote", "add", "origin", "https://github.com/BarraDev/example.git"]);
+        git(
+            &local.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/BarraDev/example.git",
+            ],
+        );
         local.approve().await;
 
-        let refused = local.complete().await.expect_err("delivered by pull request");
+        let refused = local
+            .complete()
+            .await
+            .expect_err("delivered by pull request");
         assert!(refused.contains("Create PR"), "{refused}");
         local.untouched().await;
 
         // Delivery still sees the project as it did.
-        assert_eq!(pr_availability(&local.state, local.task_id).await, Ok(PrAvailability::Available));
+        assert_eq!(
+            pr_availability(&local.state, local.task_id).await,
+            Ok(PrAvailability::Available)
+        );
     }
 
     /// Asked for by name, a project with a GitHub remote finishes locally:
@@ -1962,25 +2481,47 @@ mod tests {
     #[tokio::test]
     async fn a_project_with_a_github_remote_finishes_locally_when_that_is_chosen() {
         let local = local_project().await;
-        git(&local.repo, &["remote", "add", "origin", "https://github.com/BarraDev/example.git"]);
+        git(
+            &local.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/BarraDev/example.git",
+            ],
+        );
         local.approve().await;
         let main_before = git(&local.repo, &["rev-parse", "main"]);
 
-        let done = complete_locally(&local.state, local.task_id, true).await.expect("chosen explicitly");
+        let done = complete_locally(&local.state, local.task_id, true)
+            .await
+            .expect("chosen explicitly");
         assert!(done.completed_locally());
         assert_eq!(done.status, TaskStatus::Done);
         assert!(done.pr_url.is_none());
         assert!(local.branch_exists(), "the branch keeps the work");
         assert!(done.worktree_path.is_none());
-        assert_eq!(git(&local.repo, &["rev-parse", "main"]), main_before, "nothing was merged");
-        assert!(!local.state.task.deliveries.contains(local.task_id), "no pull request was started");
+        assert_eq!(
+            git(&local.repo, &["rev-parse", "main"]),
+            main_before,
+            "nothing was merged"
+        );
+        assert!(
+            !local.state.task.deliveries.contains(local.task_id),
+            "no pull request was started"
+        );
         assert_eq!(completions(&done), 1);
 
         // Asked again, it answers and records nothing more.
-        let again = complete_locally(&local.state, local.task_id, true).await.unwrap();
+        let again = complete_locally(&local.state, local.task_id, true)
+            .await
+            .unwrap();
         assert_eq!(completions(&again), 1);
         // The project's default delivery is still the pull request.
-        assert_eq!(pr_availability(&local.state, local.task_id).await, Ok(PrAvailability::Available));
+        assert_eq!(
+            pr_availability(&local.state, local.task_id).await,
+            Ok(PrAvailability::Available)
+        );
     }
 
     /// The explicit choice never reaches a task that has, or is getting, a
@@ -1988,29 +2529,60 @@ mod tests {
     #[tokio::test]
     async fn choosing_to_finish_locally_does_not_override_a_pull_request_or_the_approval() {
         let local = local_project().await;
-        git(&local.repo, &["remote", "add", "origin", "https://github.com/BarraDev/example.git"]);
+        git(
+            &local.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/BarraDev/example.git",
+            ],
+        );
 
-        let refused = complete_locally(&local.state, local.task_id, true).await.expect_err("not approved");
+        let refused = complete_locally(&local.state, local.task_id, true)
+            .await
+            .expect_err("not approved");
         assert!(refused.contains("Approve the changes"), "{refused}");
         local.approve().await;
 
         let guard = local.state.task.deliveries.start(local.task_id);
-        let refused = complete_locally(&local.state, local.task_id, true).await.expect_err("being opened");
+        let refused = complete_locally(&local.state, local.task_id, true)
+            .await
+            .expect_err("being opened");
         assert!(refused.contains("pull request"), "{refused}");
         drop(guard);
-        local.state.task.tasks.write().await.get_mut(&local.task_id).unwrap().pr_url =
-            Some("https://github.com/BarraDev/example/pull/1".to_string());
-        let refused = complete_locally(&local.state, local.task_id, true).await.expect_err("has one");
+        local
+            .state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&local.task_id)
+            .unwrap()
+            .pr_url = Some("https://github.com/BarraDev/example/pull/1".to_string());
+        let refused = complete_locally(&local.state, local.task_id, true)
+            .await
+            .expect_err("has one");
         assert!(refused.contains("pull request"), "{refused}");
-        assert!(local.worktree.join("work.txt").exists(), "the checkout was left alone");
+        assert!(
+            local.worktree.join("work.txt").exists(),
+            "the checkout was left alone"
+        );
     }
 
     #[tokio::test]
     async fn a_task_with_a_pull_request_is_not_completed_locally() {
         let local = local_project().await;
         local.approve().await;
-        local.state.task.tasks.write().await.get_mut(&local.task_id).unwrap().pr_url =
-            Some("https://github.com/BarraDev/example/pull/1".to_string());
+        local
+            .state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&local.task_id)
+            .unwrap()
+            .pr_url = Some("https://github.com/BarraDev/example/pull/1".to_string());
         let refused = local.complete().await.expect_err("has a pull request");
         assert!(refused.contains("pull request"), "{refused}");
         assert!(local.worktree.join("work.txt").exists());
@@ -2019,7 +2591,15 @@ mod tests {
     #[tokio::test]
     async fn a_remote_that_is_not_github_still_completes_locally() {
         let local = local_project().await;
-        git(&local.repo, &["remote", "add", "origin", "https://gitlab.example.com/o/r.git"]);
+        git(
+            &local.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.example.com/o/r.git",
+            ],
+        );
         local.approve().await;
         let done = local.complete().await.expect("completed");
         assert!(done.completed_locally());
@@ -2035,7 +2615,10 @@ mod tests {
         let first = deliveries.start(task_id);
         let second = deliveries.start(task_id);
         drop(first);
-        assert!(deliveries.contains(task_id), "the second attempt is still running");
+        assert!(
+            deliveries.contains(task_id),
+            "the second attempt is still running"
+        );
         drop(second);
         assert!(!deliveries.contains(task_id));
     }
@@ -2043,17 +2626,29 @@ mod tests {
     #[tokio::test]
     async fn an_approval_records_the_exact_commit_that_was_approved() {
         let local = local_project().await;
-        let tip = git(&local.repo, &["rev-parse", &format!("refs/heads/{}", local.branch)]);
+        let tip = git(
+            &local.repo,
+            &["rev-parse", &format!("refs/heads/{}", local.branch)],
+        );
         local.approve().await;
         let task = local.on_disk();
         assert_eq!(task.human_review.approved_tip(), Some(tip.as_str()));
 
         // Work committed afterwards is not covered by it.
-        git(&local.worktree, &["config", "user.email", "test@example.com"]);
+        git(
+            &local.worktree,
+            &["config", "user.email", "test@example.com"],
+        );
         std::fs::write(local.worktree.join("later.txt"), "later\n").unwrap();
         git(&local.worktree, &["add", "."]);
-        git(&local.worktree, &["commit", "-q", "-m", "after the approval"]);
-        assert_eq!(local.on_disk().human_review.approved_tip(), Some(tip.as_str()));
+        git(
+            &local.worktree,
+            &["commit", "-q", "-m", "after the approval"],
+        );
+        assert_eq!(
+            local.on_disk().human_review.approved_tip(),
+            Some(tip.as_str())
+        );
     }
 
     #[tokio::test]
@@ -2061,8 +2656,17 @@ mod tests {
         let (tmp, state) = test_state().await;
         let (project_id, task_id) = seed_in_review(&state, &tmp).await;
         // Without a branch there is no commit to show, so none is required.
-        state.task.tasks.write().await.get_mut(&task_id).expect("seeded").branch_name = None;
-        approve_shown(&state, task_id, false).await.expect("approved");
+        state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&task_id)
+            .expect("seeded")
+            .branch_name = None;
+        approve_shown(&state, task_id, false)
+            .await
+            .expect("approved");
         let task = on_disk(&state, project_id, task_id);
         assert!(task.human_review.is_approved());
         assert_eq!(task.human_review.approved_tip(), None);
@@ -2080,12 +2684,17 @@ mod tests {
         task.branch_name = None;
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task.clone());
-        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
 
         crate::commands::task::set_task_status(&state, task_id, TaskStatus::HumanReview, None)
             .await
             .expect("a Backlog task can be moved into Human Review");
-        approve_shown(&state, task_id, false).await.expect("approved without a branch");
+        approve_shown(&state, task_id, false)
+            .await
+            .expect("approved without a branch");
 
         let app = tauri::test::mock_app();
         app.manage(state);
@@ -2100,12 +2709,24 @@ mod tests {
 
         let state = app.state::<crate::AppState>();
         let linked = on_disk(&state, project_id, task_id);
-        assert!(linked.human_review.is_approved(), "the approval is recorded");
-        assert_eq!(linked.human_review.approved_tip(), None, "no commit was bound to it");
-        let status = approval_status(&state, task_id).await.expect("the status is read");
+        assert!(
+            linked.human_review.is_approved(),
+            "the approval is recorded"
+        );
+        assert_eq!(
+            linked.human_review.approved_tip(),
+            None,
+            "no commit was bound to it"
+        );
+        let status = approval_status(&state, task_id)
+            .await
+            .expect("the status is read");
         assert_eq!(status.coverage, ApprovalCoverage::NotApplicable);
         assert_eq!(status.approved_tip, None);
-        assert!(status.published.is_some(), "the linked pull request is reported, not hidden");
+        assert!(
+            status.published.is_some(),
+            "the linked pull request is reported, not hidden"
+        );
         assert_eq!(
             status.pull_request.as_deref(),
             Some("https://github.com/BarraDev/slashit/pull/7"),
@@ -2135,12 +2756,23 @@ mod tests {
         // Clone A, the Task checkout's repository, publishes its branch.
         let remote = root.join("remote.git");
         git(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
-        git(&local.repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(
+            &local.repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
         git(&local.repo, &["push", "-q", "origin", &local.branch]);
 
         // Another clone pushes B to the pull request's branch.
         let other = root.join("other");
-        git(&root, &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
         git(&other, &["config", "user.email", "test@example.com"]);
         git(&other, &["config", "user.name", "Test"]);
         git(&other, &["checkout", "-q", &local.branch]);
@@ -2151,7 +2783,13 @@ mod tests {
         let head = git(&other, &["rev-parse", "HEAD"]);
         assert_ne!(head, approved);
         assert_eq!(
-            git(&local.repo, &["rev-parse", &format!("refs/remotes/origin/{}", local.branch)]),
+            git(
+                &local.repo,
+                &[
+                    "rev-parse",
+                    &format!("refs/remotes/origin/{}", local.branch)
+                ]
+            ),
             approved,
             "clone A has not fetched: its remote-tracking ref still names A"
         );
@@ -2186,17 +2824,34 @@ mod tests {
             &gh,
             "#!/bin/sh\nd=\"$(dirname \"$0\")\"\nif [ -f \"$d/fail\" ]; then echo 'connection reset' >&2; exit 1; fi\ncat \"$d/answer.json\"\n",
         );
-        local.state.pr_statuses = std::sync::Arc::new(PrStatuses::with_program(gh, std::time::Duration::from_secs(20)));
-        let published = |status: &ApprovalStatus| status.published.clone().expect("the pull request is recorded");
+        local.state.pr_statuses = std::sync::Arc::new(PrStatuses::with_program(
+            gh,
+            std::time::Duration::from_secs(20),
+        ));
+        let published = |status: &ApprovalStatus| {
+            status
+                .published
+                .clone()
+                .expect("the pull request is recorded")
+        };
 
         // Before the poll has asked, nothing says what the pull request is.
         let before = approval_status(&local.state, local.task_id).await.unwrap();
-        assert_eq!(before.coverage, ApprovalCoverage::Current, "the local branch alone reads current");
+        assert_eq!(
+            before.coverage,
+            ApprovalCoverage::Current,
+            "the local branch alone reads current"
+        );
         assert_eq!(published(&before).head, None);
         assert!(published(&before).unverified.is_some());
 
         // The poll asks GitHub: the head is B, while the approval and the branch stay at A.
-        local.state.pr_statuses.refresh(&key).await.expect("GitHub answers");
+        local
+            .state
+            .pr_statuses
+            .refresh(&key)
+            .await
+            .expect("GitHub answers");
         let status = approval_status(&local.state, local.task_id).await.unwrap();
         assert_eq!(status.coverage, ApprovalCoverage::Current);
         assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()));
@@ -2208,36 +2863,73 @@ mod tests {
         std::fs::write(dir.join("fail"), "").unwrap();
         assert!(local.state.pr_statuses.refresh(&key).await.is_err());
         let failed = approval_status(&local.state, local.task_id).await.unwrap();
-        assert_eq!(published(&failed).head, None, "a failed answer never keeps the earlier head as current");
-        assert!(published(&failed).unverified.is_some_and(|why| why.contains("could not be asked")));
+        assert_eq!(
+            published(&failed).head,
+            None,
+            "a failed answer never keeps the earlier head as current"
+        );
+        assert!(published(&failed)
+            .unverified
+            .is_some_and(|why| why.contains("could not be asked")));
 
         // GitHub answers again.
         std::fs::remove_file(dir.join("fail")).unwrap();
-        local.state.pr_statuses.refresh(&key).await.expect("GitHub answers again");
-        assert_eq!(published(&approval_status(&local.state, local.task_id).await.unwrap()).head.as_deref(), Some(head.as_str()));
+        local
+            .state
+            .pr_statuses
+            .refresh(&key)
+            .await
+            .expect("GitHub answers again");
+        assert_eq!(
+            published(&approval_status(&local.state, local.task_id).await.unwrap())
+                .head
+                .as_deref(),
+            Some(head.as_str())
+        );
 
         // Nothing was fetched or moved to make that observation.
         assert_eq!(local.tip(), approved);
         assert_eq!(
-            git(&local.repo, &["rev-parse", &format!("refs/remotes/origin/{}", local.branch)]),
+            git(
+                &local.repo,
+                &[
+                    "rev-parse",
+                    &format!("refs/remotes/origin/{}", local.branch)
+                ]
+            ),
             approved
         );
     }
 
     impl Local {
         fn tip(&self) -> String {
-            git(&self.repo, &["rev-parse", &format!("refs/heads/{}", self.branch)])
+            git(
+                &self.repo,
+                &["rev-parse", &format!("refs/heads/{}", self.branch)],
+            )
         }
         /// A later commit on the Task branch, made in its checkout.
         fn advance(&self) -> String {
             std::fs::write(self.worktree.join("later.txt"), "later\n").unwrap();
             git(&self.worktree, &["add", "."]);
-            git(&self.worktree, &["commit", "-q", "-m", "after the approval"]);
+            git(
+                &self.worktree,
+                &["commit", "-q", "-m", "after the approval"],
+            );
             self.tip()
         }
         /// The approved commit replaced by another, so it is no longer on the branch.
         fn rewrite(&self) -> String {
-            git(&self.worktree, &["commit", "-q", "--amend", "-m", "rewritten after the approval"]);
+            git(
+                &self.worktree,
+                &[
+                    "commit",
+                    "-q",
+                    "--amend",
+                    "-m",
+                    "rewritten after the approval",
+                ],
+            );
             self.tip()
         }
     }
@@ -2254,7 +2946,11 @@ mod tests {
         local.untouched().await;
         assert_eq!(local.tip(), later, "no commit is discarded");
         let task = local.on_disk();
-        assert_eq!(task.human_review.approved_tip(), Some(approved.as_str()), "the approval stays as it was");
+        assert_eq!(
+            task.human_review.approved_tip(),
+            Some(approved.as_str()),
+            "the approval stays as it was"
+        );
         assert_eq!(task.human_review.entries.len(), 1);
     }
 
@@ -2266,15 +2962,22 @@ mod tests {
         let rewritten = local.rewrite();
         assert_ne!(approved, rewritten);
 
-        let refused = local.complete().await.expect_err("the approved commit is gone");
+        let refused = local
+            .complete()
+            .await
+            .expect_err("the approved commit is gone");
         assert!(refused.contains("changed since"), "{refused}");
         local.untouched().await;
         assert_eq!(local.tip(), rewritten);
-        assert_eq!(local.on_disk().human_review.approved_tip(), Some(approved.as_str()));
+        assert_eq!(
+            local.on_disk().human_review.approved_tip(),
+            Some(approved.as_str())
+        );
     }
 
     #[tokio::test]
-    async fn an_approval_without_a_recorded_commit_is_not_completed_locally_for_a_task_with_a_branch() {
+    async fn an_approval_without_a_recorded_commit_is_not_completed_locally_for_a_task_with_a_branch(
+    ) {
         let local = local_project().await;
         local.approve().await;
         {
@@ -2294,7 +2997,9 @@ mod tests {
         let approved = local.tip();
 
         // Still at the approved commit: nothing to renew.
-        let same = approve_again(&local.state, local.task_id, &approved).await.expect("no-op");
+        let same = approve_again(&local.state, local.task_id, &approved)
+            .await
+            .expect("no-op");
         assert_eq!(same.human_review.entries.len(), 1);
 
         let later = local.advance();
@@ -2305,15 +3010,28 @@ mod tests {
         assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()));
 
         // A commit other than the one on the branch now is refused.
-        let stale = approve_again(&local.state, local.task_id, &approved).await.expect_err("not the tip");
+        let stale = approve_again(&local.state, local.task_id, &approved)
+            .await
+            .expect_err("not the tip");
         assert!(stale.contains("moved after it was shown"), "{stale}");
         assert_eq!(local.on_disk().human_review.entries.len(), 1);
 
-        let renewed = approve_again(&local.state, local.task_id, &later).await.expect("approved");
+        let renewed = approve_again(&local.state, local.task_id, &later)
+            .await
+            .expect("approved");
         assert_eq!(renewed.human_review.approved_tip(), Some(later.as_str()));
         assert_eq!(local.on_disk().human_review.entries.len(), 2);
-        assert_eq!(approval_status(&local.state, local.task_id).await.unwrap().coverage, ApprovalCoverage::Current);
-        let done = local.complete().await.expect("the renewed approval completes it");
+        assert_eq!(
+            approval_status(&local.state, local.task_id)
+                .await
+                .unwrap()
+                .coverage,
+            ApprovalCoverage::Current
+        );
+        let done = local
+            .complete()
+            .await
+            .expect("the renewed approval completes it");
         assert_eq!(done.status, TaskStatus::Done);
     }
 
@@ -2334,22 +3052,48 @@ mod tests {
         assert_ne!(approved, moved);
         let status = approval_status(&local.state, local.task_id).await.unwrap();
         assert_eq!(status.coverage, ApprovalCoverage::Moved);
-        assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()), "the approval covers A, and says so");
-        assert_eq!(status.branch_tip.as_deref(), Some(moved.as_str()), "the branch is at B, and that is reported");
+        assert_eq!(
+            status.approved_tip.as_deref(),
+            Some(approved.as_str()),
+            "the approval covers A, and says so"
+        );
+        assert_eq!(
+            status.branch_tip.as_deref(),
+            Some(moved.as_str()),
+            "the branch is at B, and that is reported"
+        );
         assert_eq!(status.rewritten, Some(false), "A is still on the branch");
         let reason = status.reason.clone().unwrap_or_default();
-        assert!(reason.contains(&approved[..12]) && reason.contains(&moved[..12]), "{reason}");
+        assert!(
+            reason.contains(&approved[..12]) && reason.contains(&moved[..12]),
+            "{reason}"
+        );
 
         // Approving the branch as it is now makes that approval the current
         // one; the earlier approval stays in the history.
-        approve_again(&local.state, local.task_id, &moved).await.expect("approved");
+        approve_again(&local.state, local.task_id, &moved)
+            .await
+            .expect("approved");
         let task = local.on_disk();
-        assert_eq!(task.human_review.approved_tip(), Some(moved.as_str()), "the renewed approval is the current one");
+        assert_eq!(
+            task.human_review.approved_tip(),
+            Some(moved.as_str()),
+            "the renewed approval is the current one"
+        );
         assert!(
-            task.human_review.entries.iter().any(|e| e.approved_tip.as_deref() == Some(approved.as_str())),
+            task.human_review
+                .entries
+                .iter()
+                .any(|e| e.approved_tip.as_deref() == Some(approved.as_str())),
             "the earlier approval is kept in the history"
         );
-        assert_eq!(approval_status(&local.state, local.task_id).await.unwrap().coverage, ApprovalCoverage::Current);
+        assert_eq!(
+            approval_status(&local.state, local.task_id)
+                .await
+                .unwrap()
+                .coverage,
+            ApprovalCoverage::Current
+        );
 
         // The branch moves again: the renewed approval is the one reported
         // stale; the first is never shown as current.
@@ -2360,10 +3104,17 @@ mod tests {
         let status = approval_status(&local.state, local.task_id).await.unwrap();
         assert_eq!(status.coverage, ApprovalCoverage::Moved);
         assert_eq!(status.approved_tip.as_deref(), Some(moved.as_str()));
-        assert_ne!(status.approved_tip.as_deref(), Some(approved.as_str()), "an earlier approval is never the current one");
+        assert_ne!(
+            status.approved_tip.as_deref(),
+            Some(approved.as_str()),
+            "an earlier approval is never the current one"
+        );
         assert_eq!(status.branch_tip.as_deref(), Some(later.as_str()));
         let reason = status.reason.clone().unwrap_or_default();
-        assert!(reason.contains(&moved[..12]) && reason.contains(&later[..12]), "{reason}");
+        assert!(
+            reason.contains(&moved[..12]) && reason.contains(&later[..12]),
+            "{reason}"
+        );
     }
 
     /// The race the drawer can lose: the person is shown one commit, the
@@ -2385,7 +3136,10 @@ mod tests {
         assert_eq!(local.tip(), moved, "the branch is left where it is");
         let task = local.on_disk();
         assert!(!task.human_review.is_approved(), "nothing was approved");
-        assert!(task.human_review.entries.is_empty(), "no decision was recorded");
+        assert!(
+            task.human_review.entries.is_empty(),
+            "no decision was recorded"
+        );
 
         // The approval that carries no commit at all is refused the same way.
         let unshown = approve(&local.state, local.task_id, false, None)
@@ -2395,9 +3149,21 @@ mod tests {
         assert!(!local.on_disk().human_review.is_approved());
 
         // A fresh inspection shows the moved commit, and approving it records it.
-        assert_eq!(approval_status(&local.state, local.task_id).await.unwrap().branch_tip.as_deref(), Some(moved.as_str()));
-        approve(&local.state, local.task_id, false, Some(&moved)).await.expect("approved as shown");
-        assert_eq!(local.on_disk().human_review.approved_tip(), Some(moved.as_str()));
+        assert_eq!(
+            approval_status(&local.state, local.task_id)
+                .await
+                .unwrap()
+                .branch_tip
+                .as_deref(),
+            Some(moved.as_str())
+        );
+        approve(&local.state, local.task_id, false, Some(&moved))
+            .await
+            .expect("approved as shown");
+        assert_eq!(
+            local.on_disk().human_review.approved_tip(),
+            Some(moved.as_str())
+        );
     }
 
     #[tokio::test]
@@ -2415,7 +3181,14 @@ mod tests {
     async fn an_undecided_task_whose_commit_cannot_be_read_is_an_error() {
         let local = local_project().await;
         let not_a_repository = tempfile::tempdir().unwrap();
-        for repo in local.state.repository.repositories.write().await.values_mut() {
+        for repo in local
+            .state
+            .repository
+            .repositories
+            .write()
+            .await
+            .values_mut()
+        {
             repo.local_path = not_a_repository.path().to_str().unwrap().to_string();
         }
         assert!(approval_status(&local.state, local.task_id).await.is_err());
@@ -2425,7 +3198,15 @@ mod tests {
     #[tokio::test]
     async fn an_undecided_task_whose_branch_is_absent_names_no_commit_without_error() {
         let local = local_project().await;
-        local.state.task.tasks.write().await.get_mut(&local.task_id).unwrap().branch_name = Some("no-such-branch".into());
+        local
+            .state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&local.task_id)
+            .unwrap()
+            .branch_name = Some("no-such-branch".into());
         let status = approval_status(&local.state, local.task_id).await.unwrap();
         assert_eq!(status.coverage, ApprovalCoverage::NotApplicable);
         assert!(status.branch_tip.is_none());
@@ -2437,8 +3218,13 @@ mod tests {
         local.approve().await;
         let rewritten = local.rewrite();
         let status = approval_status(&local.state, local.task_id).await.unwrap();
-        assert_eq!((status.coverage, status.rewritten), (ApprovalCoverage::Moved, Some(true)));
-        approve_again(&local.state, local.task_id, &rewritten).await.expect("approved");
+        assert_eq!(
+            (status.coverage, status.rewritten),
+            (ApprovalCoverage::Moved, Some(true))
+        );
+        approve_again(&local.state, local.task_id, &rewritten)
+            .await
+            .expect("approved");
     }
 
     /// The read-only read answers in a jj repository too, where the branch's
@@ -2455,11 +3241,25 @@ mod tests {
         // repository from the workspace, so a ref read there is a read of the
         // bookmark's export, never of something git can reach on its own.
         let ws = tmp.path().join(format!("jj-{}", Uuid::new_v4()));
-        jj(tmp.path(), &["git", "init", "--no-colocate", ws.to_str().unwrap()]);
+        jj(
+            tmp.path(),
+            &["git", "init", "--no-colocate", ws.to_str().unwrap()],
+        );
         std::fs::write(ws.join("README.md"), "base\n").unwrap();
         jj(&ws, &["commit", "-m", "task commit"]);
         jj(&ws, &["bookmark", "create", "task-branch", "-r", "@-"]);
-        let approved = jj(&ws, &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "task-branch"]);
+        let approved = jj(
+            &ws,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "-r",
+                "task-branch",
+            ],
+        );
 
         // A project whose repository is that workspace, and a task in Human
         // Review whose branch is the bookmark.
@@ -2505,20 +3305,51 @@ mod tests {
         task.human_review.record_arrival();
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task.clone());
-        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
 
         // The approval is made through the export path, as a delivery would
         // read the branch: it records the commit the export put into Git's
         // refs.
-        approve_shown(&state, task_id, false).await.expect("approved");
-        assert_eq!(on_disk(&state, project_id, task_id).human_review.approved_tip(), Some(approved.as_str()));
+        approve_shown(&state, task_id, false)
+            .await
+            .expect("approved");
+        assert_eq!(
+            on_disk(&state, project_id, task_id)
+                .human_review
+                .approved_tip(),
+            Some(approved.as_str())
+        );
 
         // The bookmark moves with jj alone, as a person working in jj does,
         // and the export that recorded the approval does not happen again:
         // Git's refs still hold the approved commit.
         jj(&ws, &["--ignore-working-copy", "new", "-m", "moved on"]);
-        jj(&ws, &["--ignore-working-copy", "bookmark", "set", "task-branch", "-r", "@-"]);
-        let moved = jj(&ws, &["--ignore-working-copy", "log", "--no-graph", "-T", "commit_id", "-r", "task-branch"]);
+        jj(
+            &ws,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "set",
+                "task-branch",
+                "-r",
+                "@-",
+            ],
+        );
+        let moved = jj(
+            &ws,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "-r",
+                "task-branch",
+            ],
+        );
         assert_ne!(moved, approved, "the fixture must have moved the bookmark");
         let git_dir = ws.join(".jj/repo/store/git");
         assert_eq!(
@@ -2532,11 +3363,26 @@ mod tests {
         // exports nothing, being one the panel may ask on a cadence.
         let status = approval_status(&state, task_id).await.unwrap();
         assert_eq!(status.coverage, ApprovalCoverage::Moved);
-        assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()), "the approval covers what it recorded");
-        assert_eq!(status.branch_tip.as_deref(), Some(moved.as_str()), "the branch is where the bookmark is now");
-        assert_eq!(status.rewritten, Some(false), "the approved commit is still on the branch");
+        assert_eq!(
+            status.approved_tip.as_deref(),
+            Some(approved.as_str()),
+            "the approval covers what it recorded"
+        );
+        assert_eq!(
+            status.branch_tip.as_deref(),
+            Some(moved.as_str()),
+            "the branch is where the bookmark is now"
+        );
+        assert_eq!(
+            status.rewritten,
+            Some(false),
+            "the approved commit is still on the branch"
+        );
         let reason = status.reason.clone().unwrap_or_default();
-        assert!(reason.contains(&approved[..12]) && reason.contains(&moved[..12]), "{reason}");
+        assert!(
+            reason.contains(&approved[..12]) && reason.contains(&moved[..12]),
+            "{reason}"
+        );
         assert_eq!(
             git_ref_at(&git_dir, "task-branch", tmp.path()),
             Some(approved),
@@ -2565,7 +3411,9 @@ mod tests {
                 completes_task: true,
             });
         }
-        let refused = approve_again(&local.state, local.task_id, &local.tip()).await.expect_err("integrating");
+        let refused = approve_again(&local.state, local.task_id, &local.tip())
+            .await
+            .expect_err("integrating");
         assert!(refused.contains("integration"), "{refused}");
         assert_eq!(local.on_disk().human_review.entries.len(), 1);
     }
@@ -2574,13 +3422,28 @@ mod tests {
     async fn an_approval_that_never_recorded_its_commit_is_renewed_by_approving_what_was_shown() {
         let local = local_project().await;
         local.approve().await;
-        local.state.task.tasks.write().await.get_mut(&local.task_id).unwrap().human_review.entries[0].approved_tip = None;
+        local
+            .state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&local.task_id)
+            .unwrap()
+            .human_review
+            .entries[0]
+            .approved_tip = None;
         let status = approval_status(&local.state, local.task_id).await.unwrap();
         assert_eq!(status.coverage, ApprovalCoverage::Unrecorded);
         assert_eq!(status.branch_tip.as_deref(), Some(local.tip().as_str()));
 
-        let renewed = approve_again(&local.state, local.task_id, &local.tip()).await.expect("approved");
-        assert_eq!(renewed.human_review.approved_tip(), Some(local.tip().as_str()));
+        let renewed = approve_again(&local.state, local.task_id, &local.tip())
+            .await
+            .expect("approved");
+        assert_eq!(
+            renewed.human_review.approved_tip(),
+            Some(local.tip().as_str())
+        );
         local.complete().await.expect("completes");
     }
 
@@ -2606,6 +3469,8 @@ mod tests {
                 completes_task: false,
             });
         }
-        approve_again(&local.state, local.task_id, &local.tip()).await.expect("approved");
+        approve_again(&local.state, local.task_id, &local.tip())
+            .await
+            .expect("approved");
     }
 }

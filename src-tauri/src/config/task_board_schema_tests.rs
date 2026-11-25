@@ -22,12 +22,11 @@ use uuid::Uuid;
 use super::storage::ProjectTasksFile;
 use crate::domain::conversation::ExistingCheckoutEvidence;
 use crate::domain::task::{
-    ApprovedExecution, BranchOrigin, CheckoutAdmission, DependencyAdmission,
-    DependencyRequirement, ExecutedApproval, ExternalRef, FixEffect, FixedContent,
-    HumanReviewDecision, NewAttemptDecision, PendingRepublish, PrCommentKind, PrReviewApplyResult,
-    PrReviewComment, PrReviewDecision, PrReviewItem, PrReviewPlan, QaSignoff, QaStatus,
-    ReviewFixResidue, Subtask, Task, UnconfirmedPrCreate, WorkerHandoff, WorkerHandoffStage,
-    WorkerResultAcceptance,
+    ApprovedExecution, BranchOrigin, CheckoutAdmission, DependencyAdmission, DependencyRequirement,
+    ExecutedApproval, ExternalRef, FixEffect, FixedContent, HumanReviewDecision,
+    NewAttemptDecision, PendingRepublish, PrCommentKind, PrReviewApplyResult, PrReviewComment,
+    PrReviewDecision, PrReviewItem, PrReviewPlan, QaSignoff, QaStatus, ReviewFixResidue, Subtask,
+    Task, UnconfirmedPrCreate, WorkerHandoff, WorkerHandoffStage, WorkerResultAcceptance,
 };
 use crate::domain::{IntegrationState, IntegrationStrategy, LocalIntegration};
 
@@ -45,34 +44,85 @@ fn commit(c: char) -> String {
 /// match has no wildcard: a new kind does not compile until it is listed.
 fn every_activity_kind() -> Vec<Kind> {
     let kinds = vec![
-        Kind::Moved { from: Column::Backlog, to: Column::Queue },
-        Kind::RunStarted { run: 1, addressing_feedback: true },
-        Kind::ToolUsed { run: 1, tool: "Read".into(), detail: Some("a.rs".into()), count: 2 },
+        Kind::Moved {
+            from: Column::Backlog,
+            to: Column::Queue,
+        },
+        Kind::RunStarted {
+            run: 1,
+            addressing_feedback: true,
+        },
+        Kind::ToolUsed {
+            run: 1,
+            tool: "Read".into(),
+            detail: Some("a.rs".into()),
+            count: 2,
+        },
         Kind::ToolsOmitted { run: 1, count: 3 },
         Kind::RunCompleted { run: 1 },
-        Kind::RunResult { run: 1, result: RunResult::Available { text: "done".into() } },
+        Kind::RunResult {
+            run: 1,
+            result: RunResult::Available {
+                text: "done".into(),
+            },
+        },
         Kind::RunResult {
             run: 2,
-            result: RunResult::Truncated { text: "cut".into(), original_chars: 9_000 },
+            result: RunResult::Truncated {
+                text: "cut".into(),
+                original_chars: 9_000,
+            },
         },
-        Kind::RunResult { run: 3, result: RunResult::Unavailable { reason: "none".into() } },
-        Kind::RecoveryRequired { run: Some(1), reason: "crashed".into() },
+        Kind::RunResult {
+            run: 3,
+            result: RunResult::Unavailable {
+                reason: "none".into(),
+            },
+        },
+        Kind::RecoveryRequired {
+            run: Some(1),
+            reason: "crashed".into(),
+        },
         Kind::NewAttemptAuthorized { run: 1 },
-        Kind::RunFailed { run: Some(1), reason: "failed".into() },
-        Kind::Stopped { from: Column::InProgress },
-        Kind::Interrupted { from: Column::InProgress },
+        Kind::RunFailed {
+            run: Some(1),
+            reason: "failed".into(),
+        },
+        Kind::Stopped {
+            from: Column::InProgress,
+        },
+        Kind::Interrupted {
+            from: Column::InProgress,
+        },
         Kind::AiReviewStarted { review: 1 },
         Kind::AiReviewApproved { review: 1 },
-        Kind::AiReviewChangesRequested { review: 2, issues: 3 },
-        Kind::AiReviewFailed { review: 3, reason: "failed".into() },
-        Kind::AiReviewSkipped { review: 4, reason: "skipped".into() },
+        Kind::AiReviewChangesRequested {
+            review: 2,
+            issues: 3,
+        },
+        Kind::AiReviewFailed {
+            review: 3,
+            reason: "failed".into(),
+        },
+        Kind::AiReviewSkipped {
+            review: 4,
+            reason: "skipped".into(),
+        },
         Kind::AiFixStarted { review: 2 },
         Kind::AiFixApplied { review: 2 },
         Kind::AiFixUnchanged { review: 3 },
-        Kind::AiFixFailed { review: 4, reason: "failed".into() },
+        Kind::AiFixFailed {
+            review: 4,
+            reason: "failed".into(),
+        },
         Kind::ReadyForReview { arrival: 1 },
-        Kind::DeliveryFailed { reason: "refused".into() },
-        Kind::PrLinked { url: "https://github.com/o/r/pull/1".into(), number: Some(1) },
+        Kind::DeliveryFailed {
+            reason: "refused".into(),
+        },
+        Kind::PrLinked {
+            url: "https://github.com/o/r/pull/1".into(),
+            number: Some(1),
+        },
         Kind::PrMerged { number: 1 },
         Kind::PrClosed { number: 2 },
         Kind::CompletedLocally {},
@@ -151,7 +201,11 @@ fn full_task(project_id: Uuid) -> Task {
     task.dependencies = vec![Uuid::new_v4()];
     task.worktree_id = Some(Uuid::new_v4());
     task.jj_change_id = Some("change".into());
-    task.subtasks = vec![Subtask { id: Uuid::new_v4(), title: "sub".into(), completed: true }];
+    task.subtasks = vec![Subtask {
+        id: Uuid::new_v4(),
+        title: "sub".into(),
+        completed: true,
+    }];
     task.github_issue_url = Some("https://github.com/o/r/issues/1".into());
     task.gitlab_issue_url = Some("https://gitlab.com/o/r/-/issues/1".into());
     task.linear_ticket_id = Some("LIN-1".into());
@@ -171,8 +225,13 @@ fn full_task(project_id: Uuid) -> Task {
             state: Some("MERGED".into()),
             merge_commit: Some(commit('a')),
         },
-        ExternalRef::GitlabIssue { url: "https://gitlab.com/o/r/-/issues/1".into() },
-        ExternalRef::JiraTicket { key: "PLAT-1".into(), project: "PLAT".into() },
+        ExternalRef::GitlabIssue {
+            url: "https://gitlab.com/o/r/-/issues/1".into(),
+        },
+        ExternalRef::JiraTicket {
+            key: "PLAT-1".into(),
+            project: "PLAT".into(),
+        },
         ExternalRef::LinearTicket { id: "LIN-1".into() },
     ];
     task.qa_signoff = Some(QaSignoff {
@@ -182,7 +241,8 @@ fn full_task(project_id: Uuid) -> Task {
         session_id: Uuid::new_v4(),
     });
     task.human_review.record_arrival();
-    task.human_review.push(HumanReviewDecision::Approved, Some("fine".into()), at(2));
+    task.human_review
+        .push(HumanReviewDecision::Approved, Some("fine".into()), at(2));
     {
         let entry = task.human_review.entries.last_mut().unwrap();
         entry.approved_tip = Some(commit('b'));
@@ -212,7 +272,9 @@ fn full_task(project_id: Uuid) -> Task {
         ],
     });
     task.base_commit = Some(commit('d'));
-    task.branch_origin = Some(BranchOrigin::DefaultBase { branch: Some("main".into()) });
+    task.branch_origin = Some(BranchOrigin::DefaultBase {
+        branch: Some("main".into()),
+    });
     task.pr_reply_records = vec![crate::domain::pr_reply_history::PrReplyRecord {
         host: "github.com".into(),
         repository: "barradev/slashit".into(),
@@ -305,7 +367,10 @@ fn full_task(project_id: Uuid) -> Task {
             fix_uncommitted: true,
             fix_commit: Some(commit('8')),
             proposed_change_override: Some("human".into()),
-            fix_effect: Some(FixEffect { before_tree: commit('9'), after_tree: commit('0') }),
+            fix_effect: Some(FixEffect {
+                before_tree: commit('9'),
+                after_tree: commit('0'),
+            }),
             reply_posted: true,
             reply_uncertain: false,
             last_agent_summary: Some("agent".into()),
@@ -329,12 +394,19 @@ fn full_task(project_id: Uuid) -> Task {
             push_error: Some("push".into()),
             auto_reply: Some(true),
         }),
-        fixed_content: vec![FixedContent { comment_id: 1, fingerprint: "print".into() }],
+        fixed_content: vec![FixedContent {
+            comment_id: 1,
+            fingerprint: "print".into(),
+        }],
     });
     task.activity = every_activity_kind()
         .into_iter()
         .zip(1..)
-        .map(|(kind, seq)| Entry { seq, at: at(10), kind })
+        .map(|(kind, seq)| Entry {
+            seq,
+            at: at(10),
+            kind,
+        })
         .collect();
     task.worker_handoff = Some(WorkerHandoff {
         task_id: task.id,
@@ -414,16 +486,29 @@ fn variant_tasks(project_id: Uuid) -> Vec<Task> {
         });
         task
     };
-    let mut stacked = stage(WorkerHandoffStage::CommittedAwaitingReview { commit: commit('a') });
-    stacked.branch_origin = Some(BranchOrigin::Stacked { parent_branch: "parent".into() });
+    let mut stacked = stage(WorkerHandoffStage::CommittedAwaitingReview {
+        commit: commit('a'),
+    });
+    stacked.branch_origin = Some(BranchOrigin::Stacked {
+        parent_branch: "parent".into(),
+    });
     let mut local = stage(WorkerHandoffStage::RecoveryRequired {
         reason: "crashed".into(),
         observed_commit: Some(commit('b')),
     });
-    local.branch_origin = Some(BranchOrigin::LocalBase { branch: "develop".into() });
-    let resolved = stage(WorkerHandoffStage::ResolvedToAiReview { commit: commit('c') });
+    local.branch_origin = Some(BranchOrigin::LocalBase {
+        branch: "develop".into(),
+    });
+    let resolved = stage(WorkerHandoffStage::ResolvedToAiReview {
+        commit: commit('c'),
+    });
     // The empty requirement and a task with no optional field set at all.
-    vec![stacked, local, resolved, crate::test_helpers::create_test_task("Bare")]
+    vec![
+        stacked,
+        local,
+        resolved,
+        crate::test_helpers::create_test_task("Bare"),
+    ]
 }
 
 fn full_board(project_id: Uuid) -> ProjectTasksFile {
@@ -516,7 +601,11 @@ fn every_table_of_the_board_refuses_an_unsupported_key() {
     let value = toml::Value::try_from(full_board(Uuid::new_v4())).unwrap();
     let mut paths = Vec::new();
     table_paths(&value, &mut Vec::new(), &mut paths);
-    assert!(paths.len() > 100, "the fixture reaches {} tables", paths.len());
+    assert!(
+        paths.len() > 100,
+        "the fixture reaches {} tables",
+        paths.len()
+    );
 
     let mut accepted = Vec::new();
     // Declared names per shape, and the keys the fixture holds for that shape.
@@ -558,7 +647,10 @@ fn every_table_of_the_board_refuses_an_unsupported_key() {
     }
     accepted.sort();
     accepted.dedup();
-    assert!(accepted.is_empty(), "tables that accept an unsupported key: {accepted:?}");
+    assert!(
+        accepted.is_empty(),
+        "tables that accept an unsupported key: {accepted:?}"
+    );
 
     // Every field a table declares is populated somewhere in the fixture. A
     // legacy alias is declared but never written.
@@ -597,7 +689,9 @@ fn an_unknown_tag_of_every_tagged_payload_is_refused() {
         let owner = match path.last() {
             Some(Step::Key(key)) => Some(key.as_str()),
             // Only the elements of `external_refs` are tagged arrays.
-            Some(Step::Index(_)) if matches!(path.get(path.len() - 2), Some(Step::Key(k)) if k == "external_refs") => None,
+            Some(Step::Index(_)) if matches!(path.get(path.len() - 2), Some(Step::Key(k)) if k == "external_refs") => {
+                None
+            }
             _ => continue,
         };
         let Some(tag) = tag_of(owner) else { continue };
@@ -622,7 +716,11 @@ fn an_unknown_field_inside_checkout_admission_evidence_is_refused_not_dropped() 
     let value = toml::Value::try_from(full_board(Uuid::new_v4())).unwrap();
     let mut edited = value.clone();
     let task = at_path_mut(&mut edited, &[Step::Key("tasks".into()), Step::Index(0)]);
-    let admission = task.get_mut("checkout_admission").unwrap().as_table_mut().unwrap();
+    let admission = task
+        .get_mut("checkout_admission")
+        .unwrap()
+        .as_table_mut()
+        .unwrap();
     admission.insert("verified_by".into(), "a newer build".into());
     let error = toml::from_str::<ProjectTasksFile>(&board_text(&edited)).unwrap_err();
     assert!(error.message().contains("verified_by"), "{error}");
@@ -630,7 +728,9 @@ fn an_unknown_field_inside_checkout_admission_evidence_is_refused_not_dropped() 
     // And a malformed shape in the same place is an error, not an absent value.
     let mut edited = value;
     let task = at_path_mut(&mut edited, &[Step::Key("tasks".into()), Step::Index(0)]);
-    task.as_table_mut().unwrap().insert("checkout_admission".into(), "garbage".into());
+    task.as_table_mut()
+        .unwrap()
+        .insert("checkout_admission".into(), "garbage".into());
     assert!(toml::from_str::<ProjectTasksFile>(&board_text(&edited)).is_err());
 }
 
@@ -640,7 +740,9 @@ fn a_board_without_its_optional_fields_still_loads() {
     // The last Task sets no optional field, as an earlier record would not.
     let task = at_path_mut(&mut bare, &[Step::Key("tasks".into()), Step::Index(4)]);
     let keys: Vec<String> = task.as_table().unwrap().keys().cloned().collect();
-    assert!(!keys.iter().any(|k| k == "checkout_admission" || k == "activity"));
+    assert!(!keys
+        .iter()
+        .any(|k| k == "checkout_admission" || k == "activity"));
     let parsed: ProjectTasksFile = toml::from_str(&board_text(&bare)).expect("bare record loads");
     assert!(parsed.tasks[4].checkout_admission.is_none());
     assert!(parsed.tasks[4].activity.is_empty());

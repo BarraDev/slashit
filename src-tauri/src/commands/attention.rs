@@ -38,7 +38,10 @@ pub fn summarize(
     let mut by_project: BTreeMap<Uuid, Vec<(i32, Uuid, AttentionReason)>> = BTreeMap::new();
     for task in tasks.values() {
         if let Some(reason) = task.needs_you(delivery_in_flight(task.id)) {
-            by_project.entry(task.project_id).or_default().push((task.position, task.id, reason));
+            by_project
+                .entry(task.project_id)
+                .or_default()
+                .push((task.position, task.id, reason));
         }
     }
     by_project
@@ -65,7 +68,11 @@ pub async fn get_attention_summary(
     let deliveries = &state.task.deliveries;
     let mut summary = summarize(&tasks, |id| deliveries.contains(id));
     let projects = state.project.projects.read().await;
-    summary.retain(|p| projects.get(&p.project_id).is_some_and(|project| !project.is_removed()));
+    summary.retain(|p| {
+        projects
+            .get(&p.project_id)
+            .is_some_and(|project| !project.is_removed())
+    });
     Ok(summary)
 }
 
@@ -91,9 +98,13 @@ mod tests {
         let failed = task(a, TaskStatus::Error, 1);
         let review = task(a, TaskStatus::HumanReview, 0);
         let mut approved = task(b, TaskStatus::HumanReview, 0);
-        approved.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        approved
+            .human_review
+            .push(HumanReviewDecision::Approved, None, chrono::Utc::now());
         let mut pr_failed = task(b, TaskStatus::HumanReview, 1);
-        pr_failed.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        pr_failed
+            .human_review
+            .push(HumanReviewDecision::Approved, None, chrono::Utc::now());
         pr_failed.human_review.pr_error = Some("gh failed".into());
         let running = task(quiet, TaskStatus::InProgress, 0);
 
@@ -108,13 +119,22 @@ mod tests {
                 ProjectAttention {
                     project_id: a,
                     tasks: vec![
-                        TaskAttention { task_id: review.id, reason: AttentionReason::Review },
-                        TaskAttention { task_id: failed.id, reason: AttentionReason::Failed },
+                        TaskAttention {
+                            task_id: review.id,
+                            reason: AttentionReason::Review
+                        },
+                        TaskAttention {
+                            task_id: failed.id,
+                            reason: AttentionReason::Failed
+                        },
                     ],
                 },
                 ProjectAttention {
                     project_id: b,
-                    tasks: vec![TaskAttention { task_id: pr_failed.id, reason: AttentionReason::PrNotCreated }],
+                    tasks: vec![TaskAttention {
+                        task_id: pr_failed.id,
+                        reason: AttentionReason::PrNotCreated
+                    }],
                 },
             ]
         );
@@ -141,13 +161,19 @@ mod tests {
             summarize(&with_it, |_| false).last(),
             Some(&ProjectAttention {
                 project_id: quiet,
-                tasks: vec![TaskAttention { task_id: unfinished.id, reason: AttentionReason::IntegrationUnfinished }],
+                tasks: vec![TaskAttention {
+                    task_id: unfinished.id,
+                    reason: AttentionReason::IntegrationUnfinished
+                }],
             })
         );
 
         // While its pull request is being opened again, the task in `b`
         // waits on SlashIt, and `b` drops out.
         let summary = summarize(&all, |id| id == pr_failed.id);
-        assert_eq!(summary.iter().map(|p| p.project_id).collect::<Vec<_>>(), vec![a]);
+        assert_eq!(
+            summary.iter().map(|p| p.project_id).collect::<Vec<_>>(),
+            vec![a]
+        );
     }
 }

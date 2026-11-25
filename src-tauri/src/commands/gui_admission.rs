@@ -163,7 +163,10 @@ mod tests {
     /// `(name, parameter list)` of every `#[tauri::command]` function.
     fn commands() -> Vec<(String, String)> {
         let mut files = Vec::new();
-        rust_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        rust_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
         let mut found = Vec::new();
         for file in files {
             let source = std::fs::read_to_string(&file).expect("read source file");
@@ -173,7 +176,9 @@ mod tests {
             while let Some(at) = rest.find("#[tauri::command]") {
                 let line_start = rest[..at].rfind('\n').map_or(0, |i| i + 1);
                 let is_attribute = rest[line_start..at].trim().is_empty()
-                    && rest[at + "#[tauri::command]".len()..].trim_start_matches([' ', '\r']).starts_with('\n');
+                    && rest[at + "#[tauri::command]".len()..]
+                        .trim_start_matches([' ', '\r'])
+                        .starts_with('\n');
                 rest = &rest[at + "#[tauri::command]".len()..];
                 if !is_attribute {
                     continue;
@@ -209,7 +214,10 @@ mod tests {
     #[test]
     fn every_desktop_command_is_classified() {
         let commands = commands();
-        assert!(commands.len() > 150, "the scan must find the command surface");
+        assert!(
+            commands.len() > 150,
+            "the scan must find the command surface"
+        );
 
         let unclassified: Vec<_> = commands
             .iter()
@@ -242,9 +250,15 @@ mod tests {
             .map(|name| name.trim().rsplit("::").next().unwrap_or_default())
             .filter(|name| !name.is_empty() && !names.contains(name))
             .collect();
-        assert!(unscanned.is_empty(), "registered but not found by the scan: {unscanned:?}");
+        assert!(
+            unscanned.is_empty(),
+            "registered but not found by the scan: {unscanned:?}"
+        );
         for listed in READ_ONLY.iter().chain(LIFECYCLE) {
-            assert!(names.contains(listed), "{listed} is classified but is not a command");
+            assert!(
+                names.contains(listed),
+                "{listed} is classified but is not a command"
+            );
         }
         for (name, params) in &commands {
             if READ_ONLY.contains(&name.as_str()) || LIFECYCLE.contains(&name.as_str()) {

@@ -15,7 +15,8 @@ use tokio::sync::watch;
 use crate::domain::storage_usage::{StorageStatus, StorageSummary};
 
 /// Produces one measurement. Called only while no other is running.
-pub type Measure = Box<dyn Fn() -> BoxFuture<'static, Result<StorageSummary, String>> + Send + Sync>;
+pub type Measure =
+    Box<dyn Fn() -> BoxFuture<'static, Result<StorageSummary, String>> + Send + Sync>;
 
 pub struct StorageAccounting {
     shared: Arc<Shared>,
@@ -90,7 +91,9 @@ impl StorageAccounting {
                 Err(e) => progress.last_error = Some(e),
             }
             progress.measuring = false;
-            shared.finished.send_modify(|count| *count = count.wrapping_add(1));
+            shared
+                .finished
+                .send_modify(|count| *count = count.wrapping_add(1));
         });
     }
 }
@@ -98,7 +101,9 @@ impl StorageAccounting {
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, Progress> {
         // Nothing panics while holding it; recover the data regardless.
-        self.progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn status(&self) -> StorageStatus {
@@ -182,7 +187,11 @@ mod tests {
             let status = waiter.await.unwrap();
             assert_eq!(status.summary.unwrap().slashit_owned_bytes, 1);
         }
-        assert_eq!(started.load(Ordering::SeqCst), 1, "no request started a second walk");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "no request started a second walk"
+        );
         assert!(!accounting.status().measuring);
     }
 
@@ -193,7 +202,15 @@ mod tests {
         assert!(accounting.status().summary.is_none());
 
         gate.add_permits(1);
-        assert_eq!(accounting.refresh().await.summary.unwrap().slashit_owned_bytes, 1);
+        assert_eq!(
+            accounting
+                .refresh()
+                .await
+                .summary
+                .unwrap()
+                .slashit_owned_bytes,
+            1
+        );
 
         let a = accounting.clone();
         let second = tokio::spawn(async move { a.refresh().await });
@@ -204,7 +221,10 @@ mod tests {
         assert_eq!(during.summary.unwrap().slashit_owned_bytes, 1);
 
         gate.add_permits(1);
-        assert_eq!(second.await.unwrap().summary.unwrap().slashit_owned_bytes, 2);
+        assert_eq!(
+            second.await.unwrap().summary.unwrap().slashit_owned_bytes,
+            2
+        );
     }
 
     #[tokio::test]
@@ -222,7 +242,15 @@ mod tests {
             })
         }));
 
-        assert_eq!(accounting.refresh().await.summary.unwrap().slashit_owned_bytes, 7);
+        assert_eq!(
+            accounting
+                .refresh()
+                .await
+                .summary
+                .unwrap()
+                .slashit_owned_bytes,
+            7
+        );
 
         let failed = accounting.refresh().await;
         assert_eq!(failed.last_error.as_deref(), Some("disk vanished"));
@@ -230,7 +258,10 @@ mod tests {
         assert!(!failed.measuring);
 
         let panicked = accounting.refresh().await;
-        assert!(panicked.last_error.unwrap().contains("stopped unexpectedly"));
+        assert!(panicked
+            .last_error
+            .unwrap()
+            .contains("stopped unexpectedly"));
         assert_eq!(panicked.summary.unwrap().slashit_owned_bytes, 7);
         assert!(!panicked.measuring, "a panic must not leave the slot taken");
     }

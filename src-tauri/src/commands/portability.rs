@@ -107,7 +107,8 @@ pub async fn choose_export_destination(
         .save_file(move |path| {
             let _ = tx.send(path.map(|p| p.to_string()));
         });
-    rx.await.map_err(|_| "The save dialog closed unexpectedly".to_string())
+    rx.await
+        .map_err(|_| "The save dialog closed unexpectedly".to_string())
 }
 
 /// Write one Project's export to a new file. Refuses an existing path.
@@ -143,7 +144,8 @@ pub async fn choose_import_file(app: AppHandle) -> Result<Option<String>, String
         .pick_file(move |path| {
             let _ = tx.send(path.map(|p| p.to_string()));
         });
-    rx.await.map_err(|_| "The open dialog closed unexpectedly".to_string())
+    rx.await
+        .map_err(|_| "The open dialog closed unexpectedly".to_string())
 }
 
 /// The journey's choice, when `IMPORT_CHOICE_VAR` names one. The outer `None`
@@ -188,7 +190,10 @@ mod tests {
     fn a_suggested_name_cannot_carry_a_path() {
         assert_eq!(suggested_file_name("../etc/x"), "etcx.slashit-project.json");
         assert_eq!(suggested_file_name("  "), "project.slashit-project.json");
-        assert_eq!(suggested_file_name("Alpha 2"), "Alpha 2.slashit-project.json");
+        assert_eq!(
+            suggested_file_name("Alpha 2"),
+            "Alpha 2.slashit-project.json"
+        );
     }
 
     #[test]
@@ -202,10 +207,19 @@ mod tests {
             durable: false,
         };
         match import_outcome(Ok(report)) {
-            ImportOutcome::Applied { project_name, tasks, repository_remote, durable, .. } => {
+            ImportOutcome::Applied {
+                project_name,
+                tasks,
+                repository_remote,
+                durable,
+                ..
+            } => {
                 assert_eq!(project_name, "Alpha");
                 assert_eq!(tasks, 3);
-                assert_eq!(repository_remote.as_deref(), Some("https://example.invalid/r.git"));
+                assert_eq!(
+                    repository_remote.as_deref(),
+                    Some("https://example.invalid/r.git")
+                );
                 assert!(!durable, "an unconfirmed apply must stay unconfirmed");
             }
             other => panic!("expected Applied, got {other:?}"),
@@ -221,10 +235,14 @@ mod tests {
         }])));
         assert!(matches!(refused, ImportOutcome::Refused { .. }));
 
-        let stale = import_outcome(Err(ApplyError::ChecksumMismatch { found: "abc".into() }));
+        let stale = import_outcome(Err(ApplyError::ChecksumMismatch {
+            found: "abc".into(),
+        }));
         assert!(matches!(stale, ImportOutcome::ChecksumMismatch { .. }));
 
-        let unreadable = import_outcome(Err(ApplyError::File("the export path must be absolute".into())));
+        let unreadable = import_outcome(Err(ApplyError::File(
+            "the export path must be absolute".into(),
+        )));
         assert!(matches!(unreadable, ImportOutcome::Invalid { .. }));
 
         let failed = import_outcome(Err(ApplyError::Failed("reverted".into())));

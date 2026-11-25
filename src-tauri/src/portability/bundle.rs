@@ -334,12 +334,19 @@ fn validate(payload: &Payload) -> Result<(), BundleError> {
     // Repository identity, and the branch new Tasks start from, which the
     // importing side will name to Git: each is checked by shape, never looked
     // up in the importing repository.
-    if let Some(url) = payload.repository.as_ref().and_then(|r| r.remote_url.as_deref()) {
+    if let Some(url) = payload
+        .repository
+        .as_ref()
+        .and_then(|r| r.remote_url.as_deref())
+    {
         check_remote_identity(url)?;
     }
     if let Some(base) = &payload.project.base {
         if !is_branch_name(base.branch()) {
-            return malformed(format!("the project base {:?} is not a branch name", base.branch()));
+            return malformed(format!(
+                "the project base {:?} is not a branch name",
+                base.branch()
+            ));
         }
     }
     let mut ids: HashSet<Uuid> = HashSet::new();
@@ -407,14 +414,25 @@ fn validate(payload: &Payload) -> Result<(), BundleError> {
             .base_commit
             .iter()
             .map(|c| ("base_commit", c))
-            .chain(task.human_review.entries.iter().filter_map(|e| e.approved_tip.as_ref().map(|c| ("approved_tip", c))))
+            .chain(
+                task.human_review
+                    .entries
+                    .iter()
+                    .filter_map(|e| e.approved_tip.as_ref().map(|c| ("approved_tip", c))),
+            )
             .chain(task.external_refs.iter().filter_map(|r| match r {
-                ExternalRef::GithubPr { merge_commit: Some(c), .. } => Some(("merge_commit", c)),
+                ExternalRef::GithubPr {
+                    merge_commit: Some(c),
+                    ..
+                } => Some(("merge_commit", c)),
                 _ => None,
             }));
         for (field, commit) in commits {
             if !is_commit_id(commit) {
-                return malformed(format!("task {} has a {field} that is not a commit identifier", task.id));
+                return malformed(format!(
+                    "task {} has a {field} that is not a commit identifier",
+                    task.id
+                ));
             }
         }
         let review = &task.human_review;
@@ -473,8 +491,13 @@ fn check_web_address(task_id: Uuid, url: &str) -> Result<(), BundleError> {
 /// A colon inside that user part (`user:secret@host:path`) is a password, so it
 /// is refused the same way. A local path is not an scp-style remote.
 fn check_remote_identity(url: &str) -> Result<(), BundleError> {
-    if url.is_empty() || url.len() > 2048 || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err(BundleError::Malformed("the repository remote is not one plain token".into()));
+    if url.is_empty()
+        || url.len() > 2048
+        || url.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(BundleError::Malformed(
+            "the repository remote is not one plain token".into(),
+        ));
     }
     // A colon before the first `@` is inside the user part; one after it is in the host or path.
     let carries_user_information = |head: &str| match (head.find(':'), head.find('@')) {
@@ -485,20 +508,26 @@ fn check_remote_identity(url: &str) -> Result<(), BundleError> {
         let authority = rest.split('/').next().unwrap_or_default();
         if authority.contains('@') {
             return Err(BundleError::Unsafe(
-                "the repository remote carries user information, which may hold a credential".into(),
+                "the repository remote carries user information, which may hold a credential"
+                    .into(),
             ));
         }
         if url.contains(['?', '#']) {
-            return Err(BundleError::Malformed("the repository remote has a query or fragment".into()));
+            return Err(BundleError::Malformed(
+                "the repository remote has a query or fragment".into(),
+            ));
         }
     } else {
         if carries_user_information(url.split('/').next().unwrap_or_default()) {
             return Err(BundleError::Unsafe(
-                "the repository remote carries user information, which may hold a credential".into(),
+                "the repository remote carries user information, which may hold a credential"
+                    .into(),
             ));
         }
         if url.contains(['?', '#']) {
-            return Err(BundleError::Malformed("the repository remote has a query or fragment".into()));
+            return Err(BundleError::Malformed(
+                "the repository remote has a query or fragment".into(),
+            ));
         }
     }
     Ok(())
@@ -515,7 +544,9 @@ fn is_branch_name(name: &str) -> bool {
         && !name.contains("..")
         && !name.contains("//")
         && !name.contains("@{")
-        && !name.chars().any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
 }
 
 /// A SHA-1 or SHA-256 object identifier, by shape only.

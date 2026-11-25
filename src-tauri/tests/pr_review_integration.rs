@@ -58,7 +58,13 @@ async fn sync_with_approvals(
     working_dir: String,
     plan: PrReviewPlan,
     approved: &[slashit_ui_lib::commands::pr::ApprovedPublicReply],
-) -> Result<(slashit_ui_lib::commands::pr::SyncPrRepliesResult, PrReviewPlan), String> {
+) -> Result<
+    (
+        slashit_ui_lib::commands::pr::SyncPrRepliesResult,
+        PrReviewPlan,
+    ),
+    String,
+> {
     slashit_ui_lib::commands::pr::sync_pr_review_replies_persisting(
         task,
         working_dir,
@@ -193,7 +199,10 @@ impl MockEnv {
 
     /// The residue ledger for `task`: a board that holds it, and storage in this
     /// environment's temporary directory.
-    fn ledger_for(&self, task: &slashit_ui_lib::domain::task::Task) -> slashit_ui_lib::review_fix_residue::Ledger {
+    fn ledger_for(
+        &self,
+        task: &slashit_ui_lib::domain::task::Task,
+    ) -> slashit_ui_lib::review_fix_residue::Ledger {
         let root = self._tmp.path();
         let paths = slashit_ui_lib::config::paths::AppPaths::with_roots(
             root.join("config"),
@@ -203,10 +212,9 @@ impl MockEnv {
         );
         slashit_ui_lib::review_fix_residue::Ledger {
             authority: std::sync::Arc::new(slashit_ui_lib::lifecycle::TaskLifecycleLocks::new()),
-            tasks: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from([(
-                task.id,
-                task.clone(),
-            )]))),
+            tasks: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from(
+                [(task.id, task.clone())],
+            ))),
             storage: slashit_ui_lib::config::Storage::with_paths(paths),
         }
     }
@@ -228,7 +236,10 @@ impl MockEnv {
         self.git_out(&["push", "-q", "origin", "test-branch"]);
         (
             self.git_out(&["rev-parse", "HEAD"]),
-            slashit_ui_lib::domain::task::FixEffect { before_tree, after_tree },
+            slashit_ui_lib::domain::task::FixEffect {
+                before_tree,
+                after_tree,
+            },
         )
     }
 
@@ -254,10 +265,16 @@ impl MockEnv {
     /// The prompt of every `claude` run, in order.
     fn claude_prompts(&self) -> Vec<String> {
         let log = fs::read_to_string(&self.claude_prompts).unwrap_or_default();
-        let mut prompts: Vec<String> =
-            log.split(&format!("\n{END_PROMPT}\n")).map(str::to_string).collect();
+        let mut prompts: Vec<String> = log
+            .split(&format!("\n{END_PROMPT}\n"))
+            .map(str::to_string)
+            .collect();
         // Every prompt is terminated, which leaves one empty piece.
-        assert_eq!(prompts.pop().as_deref(), Some(""), "a truncated prompt log:\n{log}");
+        assert_eq!(
+            prompts.pop().as_deref(),
+            Some(""),
+            "a truncated prompt log:\n{log}"
+        );
         prompts
     }
 
@@ -293,7 +310,9 @@ impl Drop for MockEnv {
 /// run's prompt alone in the file named by `$run_prompt`.
 #[cfg(unix)]
 fn record_claude_run(log: &Path, prompts: &Path) -> String {
-    let dir = prompts.parent().expect("the prompt log lives in a directory");
+    let dir = prompts
+        .parent()
+        .expect("the prompt log lives in a directory");
     format!(
         "for a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\n\
          prev=; for a in \"$@\"; do if [ \"$prev\" = --append-system-prompt-file ]; then printf '%s\\n' '---APPEND-PROMPT---' >> {log:?}; cat \"$a\" >> {log:?}; printf '\\n%s\\n' '---END-APPEND---' >> {log:?}; fi; prev=\"$a\"; done\n\
@@ -317,7 +336,8 @@ fn record_claude_run(log: &Path, prompts: &Path) -> String {
 /// a pass.
 #[cfg(unix)]
 fn claude_cli_contract() -> (String, String) {
-    let before = "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' '2.1.325 (Claude Code)'; exit 0; fi\n";
+    let before =
+        "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' '2.1.325 (Claude Code)'; exit 0; fi\n";
     let after = "mode=dontAsk; prev=; for a in \"$@\"; do if [ \"$prev\" = \"--permission-mode\" ]; then mode=\"$a\"; fi; prev=\"$a\"; done\n\
          printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"permissionMode\":\"'\"$mode\"'\"}'\n";
     (before.to_string(), after.to_string())
@@ -327,7 +347,10 @@ fn claude_cli_contract() -> (String, String) {
 /// stdin.
 #[cfg(unix)]
 fn assert_not_in_argv(claude_log: &str, text: &str) {
-    assert!(!claude_log.contains(text), "{text:?} was passed in argv:\n{claude_log}");
+    assert!(
+        !claude_log.contains(text),
+        "{text:?} was passed in argv:\n{claude_log}"
+    );
 }
 
 /// Assert a single recorded `claude` invocation ran read-only: only Read,
@@ -338,12 +361,28 @@ fn assert_not_in_argv(claude_log: &str, text: &str) {
 fn assert_read_only_invocation(claude_log: &str, what: &str) {
     let args: Vec<&str> = claude_log.lines().collect();
     let value_of = |flag: &str| {
-        args.iter().position(|a| *a == flag).and_then(|i| args.get(i + 1).copied())
+        args.iter()
+            .position(|a| *a == flag)
+            .and_then(|i| args.get(i + 1).copied())
     };
-    assert_eq!(value_of("--tools"), Some("Read,Glob,Grep"), "{what}: --tools, got:\n{claude_log}");
-    assert_eq!(value_of("--permission-mode"), Some("dontAsk"), "{what}, got:\n{claude_log}");
-    assert!(args.contains(&"--restricted"), "{what}: --restricted, got:\n{claude_log}");
-    assert!(args.contains(&"--strict-mcp-config"), "{what}: no MCP, got:\n{claude_log}");
+    assert_eq!(
+        value_of("--tools"),
+        Some("Read,Glob,Grep"),
+        "{what}: --tools, got:\n{claude_log}"
+    );
+    assert_eq!(
+        value_of("--permission-mode"),
+        Some("dontAsk"),
+        "{what}, got:\n{claude_log}"
+    );
+    assert!(
+        args.contains(&"--restricted"),
+        "{what}: --restricted, got:\n{claude_log}"
+    );
+    assert!(
+        args.contains(&"--strict-mcp-config"),
+        "{what}: no MCP, got:\n{claude_log}"
+    );
     assert!(
         !args.contains(&"--dangerously-skip-permissions"),
         "{what} must not bypass permissions, got:\n{claude_log}"
@@ -378,15 +417,22 @@ async fn dry_run_invokes_claude_only_no_gh_no_push() {
     let (task, plan) = create_test_pr_review_setup();
 
     let opts = AddressPrReviewOptions {
-        auto_push: true,   // must be ignored in dry-run
+        auto_push: true, // must be ignored in dry-run
         dry_run: true,
     };
 
-        let ledger = env.ledger_for(&task);
-    let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
-            .await
-            .expect("dry-run apply succeeds");
+    let ledger = env.ledger_for(&task);
+    let (result, updated_plan) = address_pr_review_inner(
+        task,
+        env.working_dir_str(),
+        plan,
+        opts,
+        no_progress(),
+        never_cancelled(),
+        ledger,
+    )
+    .await
+    .expect("dry-run apply succeeds");
 
     assert_eq!(env.claude_invocations(), 1, "claude called exactly once");
     assert_eq!(
@@ -431,7 +477,11 @@ async fn dry_run_invokes_claude_only_no_gh_no_push() {
     );
     assert_read_only_invocation(&claude_log, "the dry-run helper");
     let prompts = env.claude_prompts();
-    assert!(prompts[0].contains("Delete the variable."), "the item reaches claude on stdin:\n{}", prompts[0]);
+    assert!(
+        prompts[0].contains("Delete the variable."),
+        "the item reaches claude on stdin:\n{}",
+        prompts[0]
+    );
     assert_not_in_argv(&claude_log, "Delete the variable.");
 }
 
@@ -447,19 +497,31 @@ async fn full_apply_publishes_no_reply_and_leaves_it_for_sync() {
         dry_run: false,
     };
 
-        let ledger = env.ledger_for(&task);
-    let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
-            .await
-            .expect("full apply succeeds");
+    let ledger = env.ledger_for(&task);
+    let (result, updated_plan) = address_pr_review_inner(
+        task,
+        env.working_dir_str(),
+        plan,
+        opts,
+        no_progress(),
+        never_cancelled(),
+        ledger,
+    )
+    .await
+    .expect("full apply succeeds");
     // Real applies (dry_run=false) must persist on the plan so the next modal
     // open knows when the last real apply happened (used by `show_only_new`).
-    let persisted = updated_plan.last_apply.expect("real apply persists last_apply");
+    let persisted = updated_plan
+        .last_apply
+        .expect("real apply persists last_apply");
     assert_eq!(persisted.fixed_ids, vec![101]);
     assert!(!persisted.dry_run);
 
     assert_eq!(env.claude_invocations(), 1, "claude called exactly once");
-    assert!(result.pushed, "the fix is pushed before its reply says it is fixed");
+    assert!(
+        result.pushed,
+        "the fix is pushed before its reply says it is fixed"
+    );
     assert!(!result.dry_run, "full apply must not set the dry_run flag");
     assert_eq!(
         updated_plan.items[0].fix_commit.as_deref(),
@@ -478,7 +540,10 @@ async fn full_apply_publishes_no_reply_and_leaves_it_for_sync() {
         "no reply errors expected, got: {:?}",
         result.reply_errors
     );
-    assert!(!updated_plan.items[0].reply_posted, "Apply never records a reply as posted");
+    assert!(
+        !updated_plan.items[0].reply_posted,
+        "Apply never records a reply as posted"
+    );
     let gh_log = env.read_gh_log();
     assert!(
         !gh_log.contains("/replies"),
@@ -505,14 +570,20 @@ async fn full_apply_publishes_no_reply_and_leaves_it_for_sync() {
         claude_log
     );
     assert!(
-        !claude_log.lines().any(|a| a == "--restricted" || a == "--tools"),
+        !claude_log
+            .lines()
+            .any(|a| a == "--restricted" || a == "--tools"),
         "the approved apply agent keeps its full tool set, got:\n{}",
         claude_log
     );
     // Its prompt reaches it on stdin, never in argv.
     let prompts = env.claude_prompts();
     assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].contains("Delete the variable."), "the item reaches claude on stdin:\n{}", prompts[0]);
+    assert!(
+        prompts[0].contains("Delete the variable."),
+        "the item reaches claude on stdin:\n{}",
+        prompts[0]
+    );
     assert_not_in_argv(&claude_log, "Delete the variable.");
 }
 
@@ -654,12 +725,16 @@ async fn discuss_round_never_writes_the_human_override() {
     let (task, mut plan) = create_test_discuss_setup();
     plan.items[0].proposed_change_override = Some("Human wording".to_string());
 
-    let merged = discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
-        .await
-        .expect("discuss merges successfully");
+    let merged =
+        discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
+            .await
+            .expect("discuss merges successfully");
 
     assert_eq!(merged.items[0].proposed_change, "Helper rewrote this.");
-    assert_eq!(merged.items[0].proposed_change_override.as_deref(), Some("Human wording"));
+    assert_eq!(
+        merged.items[0].proposed_change_override.as_deref(),
+        Some("Human wording")
+    );
     assert_eq!(merged.items[0].effective_proposed_change(), "Human wording");
 }
 
@@ -673,31 +748,48 @@ async fn discuss_round_merges_updates_without_reordering_or_touching_skip() {
     let env = MockEnv::setup(claude_json);
     let (task, plan) = create_test_discuss_setup();
 
-    let merged = discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
-        .await
-        .expect("discuss merges successfully");
+    let merged =
+        discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
+            .await
+            .expect("discuss merges successfully");
 
     assert_eq!(env.claude_invocations(), 1, "claude called exactly once");
     assert_eq!(env.gh_invocations(), 0, "discuss never calls gh");
 
     // Items still in input order (201, 202, 203).
     let ids: Vec<Option<u64>> = merged.items.iter().map(|i| i.comment_id).collect();
-    assert_eq!(ids, vec![Some(201), Some(202), Some(203)], "merge must not reorder");
+    assert_eq!(
+        ids,
+        vec![Some(201), Some(202), Some(203)],
+        "merge must not reorder"
+    );
 
     // 201 converted to Fix, user_note cleared, approved flipped to true.
     let converted = &merged.items[0];
     assert!(matches!(converted.decision, PrReviewDecision::Fix));
-    assert!(converted.approved, "Fix items are auto-approved by parse_review_items");
-    assert!(converted.user_note.is_empty(), "user_note must be cleared after merge");
+    assert!(
+        converted.approved,
+        "Fix items are auto-approved by parse_review_items"
+    );
+    assert!(
+        converted.user_note.is_empty(),
+        "user_note must be cleared after merge"
+    );
     assert_eq!(converted.summary, "Add retry with backoff");
     assert!(converted.reasoning.contains("User confirmed"));
     assert!(converted.proposed_change.contains("retry_with_backoff"));
 
     // 202 still Question, reasoning refreshed, user_note cleared, not approved.
     let still_question = &merged.items[1];
-    assert!(matches!(still_question.decision, PrReviewDecision::Question));
+    assert!(matches!(
+        still_question.decision,
+        PrReviewDecision::Question
+    ));
     assert!(!still_question.approved);
-    assert!(still_question.user_note.is_empty(), "user_note cleared even when still Question");
+    assert!(
+        still_question.user_note.is_empty(),
+        "user_note cleared even when still Question"
+    );
     assert!(
         still_question.reasoning.contains("5000 or 10000"),
         "reasoning should carry the agent's follow-up, got: {:?}",
@@ -741,13 +833,27 @@ async fn a_non_collaborator_fix_is_applied_only_after_the_user_approves_it() {
     plan.comments[0].author = "coderabbitai[bot]".to_string();
     plan.items[1].user_note.clear(); // only the bot's item is discussed
 
-    let merged = discuss_pr_review_questions_inner(task.clone(), env.working_dir_str(), plan, never_cancelled())
-        .await
-        .expect("discuss merges successfully");
+    let merged = discuss_pr_review_questions_inner(
+        task.clone(),
+        env.working_dir_str(),
+        plan,
+        never_cancelled(),
+    )
+    .await
+    .expect("discuss merges successfully");
     let item = &merged.items[0];
-    assert!(matches!(item.decision, PrReviewDecision::Fix), "still triaged as a fix");
-    assert!(!item.approved, "a non-collaborator's fix is not pre-approved");
-    assert_eq!(merged.comments[0].body, "Should we retry on failure?", "the comment stays readable");
+    assert!(
+        matches!(item.decision, PrReviewDecision::Fix),
+        "still triaged as a fix"
+    );
+    assert!(
+        !item.approved,
+        "a non-collaborator's fix is not pre-approved"
+    );
+    assert_eq!(
+        merged.comments[0].body, "Should we retry on failure?",
+        "the comment stays readable"
+    );
 
     // The mock discuss helper leaves a scratch file in the checkout. An apply
     // refuses edits no fix made, so it is cleared as a person would.
@@ -757,28 +863,55 @@ async fn a_non_collaborator_fix_is_applied_only_after_the_user_approves_it() {
         .status()
         .expect("run git")
         .success());
-    let opts = AddressPrReviewOptions { auto_push: true, dry_run: false };
+    let opts = AddressPrReviewOptions {
+        auto_push: true,
+        dry_run: false,
+    };
     let ledger = env.ledger_for(&task);
     let err = address_pr_review_inner(
-        task.clone(), env.working_dir_str(), merged.clone(), opts.clone(), no_progress(), never_cancelled(), ledger)
+        task.clone(),
+        env.working_dir_str(),
+        merged.clone(),
+        opts.clone(),
+        no_progress(),
+        never_cancelled(),
+        ledger,
+    )
     .await
     .expect_err("nothing is approved yet");
     assert!(err.contains("No approved fix items"), "got: {err}");
-    assert_eq!(env.claude_invocations(), 1, "only the read-only discuss helper ran");
+    assert_eq!(
+        env.claude_invocations(),
+        1,
+        "only the read-only discuss helper ran"
+    );
     assert_eq!(env.gh_invocations(), 0, "nothing was pushed or posted");
 
     // The user ticks the item: the explicit approval boundary.
     let mut approved = merged;
     approved.items[0].approved = true;
-    let opts = AddressPrReviewOptions { auto_push: true, ..opts };
+    let opts = AddressPrReviewOptions {
+        auto_push: true,
+        ..opts
+    };
     let ledger = env.ledger_for(&task);
     let (result, _) = address_pr_review_inner(
-        task, env.working_dir_str(), approved, opts, no_progress(), never_cancelled(), ledger)
+        task,
+        env.working_dir_str(),
+        approved,
+        opts,
+        no_progress(),
+        never_cancelled(),
+        ledger,
+    )
     .await
     .expect("the approved fix is applied");
     assert_eq!(result.fixed_ids, vec![201]);
     assert_eq!(env.claude_invocations(), 2, "the apply agent ran once");
-    assert_eq!(result.replies_posted, 0, "approving a fix publishes no reply");
+    assert_eq!(
+        result.replies_posted, 0,
+        "approving a fix publishes no reply"
+    );
     assert!(
         !env.read_gh_log().contains("/replies"),
         "no reply endpoint was reached on approval"
@@ -793,9 +926,10 @@ async fn discuss_without_pending_questions_errors_before_calling_claude() {
     // Default 2-item plan has 1 Fix + 1 Skip — no Question items with notes.
     let (task, plan) = create_test_pr_review_setup();
 
-    let err = discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
-        .await
-        .expect_err("should error when nothing to discuss");
+    let err =
+        discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
+            .await
+            .expect_err("should error when nothing to discuss");
     assert!(err.contains("No Question items with notes"), "got: {err}");
     assert_eq!(env.claude_invocations(), 0);
     assert_eq!(env.gh_invocations(), 0);
@@ -818,11 +952,23 @@ async fn empty_approved_set_returns_error_and_does_not_call_claude() {
     };
 
     let ledger = env.ledger_for(&task);
-    let err = address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
-        .await
-        .expect_err("should error when no items are approved");
+    let err = address_pr_review_inner(
+        task,
+        env.working_dir_str(),
+        plan,
+        opts,
+        no_progress(),
+        never_cancelled(),
+        ledger,
+    )
+    .await
+    .expect_err("should error when no items are approved");
     assert!(err.contains("No approved fix items"), "got: {err}");
-    assert_eq!(env.claude_invocations(), 0, "claude must not run when there is nothing to do");
+    assert_eq!(
+        env.claude_invocations(),
+        0,
+        "claude must not run when there is nothing to do"
+    );
     assert_eq!(env.gh_invocations(), 0);
 }
 
@@ -944,9 +1090,17 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
     });
 
     let ledger = env.ledger_for(&task);
-    let (result, _plan) = address_pr_review_inner(task, env.working_dir_str(), plan, opts, sink, never_cancelled(), ledger)
-        .await
-        .expect("two-fix apply succeeds");
+    let (result, _plan) = address_pr_review_inner(
+        task,
+        env.working_dir_str(),
+        plan,
+        opts,
+        sink,
+        never_cancelled(),
+        ledger,
+    )
+    .await
+    .expect("two-fix apply succeeds");
 
     // Per-item loop: one claude invocation per approved Fix item.
     assert_eq!(
@@ -961,7 +1115,8 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
 
     // agent_summary aggregates per-item headers; each comment id appears once.
     assert!(
-        result.agent_summary.contains("comment 301") && result.agent_summary.contains("comment 302"),
+        result.agent_summary.contains("comment 301")
+            && result.agent_summary.contains("comment 302"),
         "agent_summary must include per-item headers, got: {}",
         result.agent_summary,
     );
@@ -972,7 +1127,13 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     assert_eq!(
         kinds,
-        vec!["item_started", "item_succeeded", "item_started", "item_succeeded", "all_done"],
+        vec![
+            "item_started",
+            "item_succeeded",
+            "item_started",
+            "item_succeeded",
+            "all_done"
+        ],
         "unexpected progress sequence: {:?}",
         kinds,
     );
@@ -1001,34 +1162,66 @@ async fn rerunning_apply_does_not_make_a_delivered_fix_again() {
     };
 
     // Round 1
-        let ledger = env.ledger_for(&task);
-    let (round1, plan_after_round1) =
-        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts.clone(), no_progress(), never_cancelled(), ledger)
-            .await
-            .expect("round 1 succeeds");
+    let ledger = env.ledger_for(&task);
+    let (round1, plan_after_round1) = address_pr_review_inner(
+        task.clone(),
+        env.working_dir_str(),
+        plan,
+        opts.clone(),
+        no_progress(),
+        never_cancelled(),
+        ledger,
+    )
+    .await
+    .expect("round 1 succeeds");
     assert_eq!(round1.fixed_ids, vec![301, 302]);
     assert_eq!(round1.replies_posted, 0, "Apply publishes no reply");
     // Both fixes are recorded on the persisted plan; neither reply is posted.
     for it in plan_after_round1.items.iter().filter(|i| i.approved) {
-        assert!(it.fix_done, "fix_done must be true after a successful round");
+        assert!(
+            it.fix_done,
+            "fix_done must be true after a successful round"
+        );
         assert!(!it.reply_posted, "Apply never marks a reply posted");
-        assert!(it.last_agent_summary.is_some(), "summary must be cached on success");
+        assert!(
+            it.last_agent_summary.is_some(),
+            "summary must be cached on success"
+        );
     }
     let claude_calls_round1 = env.claude_invocations();
     let gh_calls_round1 = env.gh_invocations();
-    assert_eq!(claude_calls_round1, 2, "round 1 should invoke claude per item");
-    assert_eq!(gh_calls_round1, 0, "round 1 makes no gh call: Apply publishes no reply");
+    assert_eq!(
+        claude_calls_round1, 2,
+        "round 1 should invoke claude per item"
+    );
+    assert_eq!(
+        gh_calls_round1, 0,
+        "round 1 makes no gh call: Apply publishes no reply"
+    );
 
     // Round 2 — same task, the now-stamped plan
-        let ledger = env.ledger_for(&task);
-    let (round2, plan_after_round2) =
-        address_pr_review_inner(task, env.working_dir_str(), plan_after_round1, opts, no_progress(), never_cancelled(), ledger)
-            .await
-            .expect("round 2 succeeds");
-    assert_eq!(env.claude_invocations(), claude_calls_round1,
-        "round 2 must not call claude — both items already fix_done");
-    assert_eq!(env.gh_invocations(), gh_calls_round1,
-        "round 2 must not call gh: Apply publishes no reply");
+    let ledger = env.ledger_for(&task);
+    let (round2, plan_after_round2) = address_pr_review_inner(
+        task,
+        env.working_dir_str(),
+        plan_after_round1,
+        opts,
+        no_progress(),
+        never_cancelled(),
+        ledger,
+    )
+    .await
+    .expect("round 2 succeeds");
+    assert_eq!(
+        env.claude_invocations(),
+        claude_calls_round1,
+        "round 2 must not call claude — both items already fix_done"
+    );
+    assert_eq!(
+        env.gh_invocations(),
+        gh_calls_round1,
+        "round 2 must not call gh: Apply publishes no reply"
+    );
     assert!(round2.fixed_ids.is_empty(), "no new fixes this round");
     assert_eq!(round2.replies_posted, 0);
     for it in plan_after_round2.items.iter().filter(|i| i.approved) {
@@ -1063,18 +1256,35 @@ async fn rerunning_apply_with_a_pending_reply_skips_claude_and_leaves_the_reply_
         dry_run: false,
     };
 
-        let ledger = env.ledger_for(&task);
-    let (result, updated_plan) =
-        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
-            .await
-            .expect("recovery apply succeeds");
+    let ledger = env.ledger_for(&task);
+    let (result, updated_plan) = address_pr_review_inner(
+        task.clone(),
+        env.working_dir_str(),
+        plan,
+        opts,
+        no_progress(),
+        never_cancelled(),
+        ledger,
+    )
+    .await
+    .expect("recovery apply succeeds");
 
-    assert_eq!(env.claude_invocations(), 0,
-        "agent must not be invoked when the only pending step is a reply");
-    assert_eq!(env.gh_invocations(), 0, "Apply posts no reply, deferred or not");
+    assert_eq!(
+        env.claude_invocations(),
+        0,
+        "agent must not be invoked when the only pending step is a reply"
+    );
+    assert_eq!(
+        env.gh_invocations(),
+        0,
+        "Apply posts no reply, deferred or not"
+    );
     assert!(result.fixed_ids.is_empty(), "no new fixes this round");
     assert_eq!(result.replies_posted, 0);
-    assert!(!updated_plan.items[0].reply_posted, "the reply waits for approval");
+    assert!(
+        !updated_plan.items[0].reply_posted,
+        "the reply waits for approval"
+    );
     assert!(
         result.agent_summary.contains("fix already on disk"),
         "summary should note the reused fix, got: {}",
@@ -1134,14 +1344,24 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
         gh_log.lines().any(|l| l == "api") && gh_log.lines().any(|l| l == "user"),
         "sync verifies the posting account before it looks for existing replies"
     );
-    assert_eq!(env.gh_invocations(), 1, "sync should reply exactly once (only item 0)");
+    assert_eq!(
+        env.gh_invocations(),
+        1,
+        "sync should reply exactly once (only item 0)"
+    );
     assert_eq!(result.replied, 1);
     assert_eq!(result.discovered, 0);
     assert_eq!(result.unmatched, 0);
     assert_eq!(result.fix_pending, 0);
     assert!(result.errors.is_empty());
-    assert!(updated_plan.items[0].reply_posted, "deferred reply flipped to posted");
-    assert!(updated_plan.items[1].reply_posted, "untouched item stays posted");
+    assert!(
+        updated_plan.items[0].reply_posted,
+        "deferred reply flipped to posted"
+    );
+    assert!(
+        updated_plan.items[1].reply_posted,
+        "untouched item stays posted"
+    );
 }
 
 #[cfg(unix)]
@@ -1170,13 +1390,19 @@ async fn sync_pr_review_replies_discovers_a_legacy_reply_and_never_rewrites_it()
     plan.items[0].pr_reply_text = None;
     // Item 1: leave fix_pending so it doesn't add noise to the gh call count.
 
-    let (result, updated_plan) =
-        sync_with_approvals(task, env.working_dir_str(), plan, &[]).await
-            .expect("sync succeeds");
+    let (result, updated_plan) = sync_with_approvals(task, env.working_dir_str(), plan, &[])
+        .await
+        .expect("sync succeeds");
 
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
-    assert_eq!(result.discovered, 1, "the legacy reply's id should be discovered via in_reply_to_id");
-    assert_eq!(result.replied, 0, "nothing was approved, so nothing is posted");
+    assert_eq!(
+        result.discovered, 1,
+        "the legacy reply's id should be discovered via in_reply_to_id"
+    );
+    assert_eq!(
+        result.replied, 0,
+        "nothing was approved, so nothing is posted"
+    );
     assert_eq!(result.unmatched, 0);
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     assert_eq!(
@@ -1216,18 +1442,34 @@ async fn sync_pr_review_replies_adopts_no_reply_written_by_a_different_account()
     plan.items[0].reply_comment_id = None;
     plan.items[0].pr_reply_text = None;
 
-    let (result, updated_plan) =
-        sync_with_approvals(task, env.working_dir_str(), plan, &[]).await
-            .expect("sync succeeds");
+    let (result, updated_plan) = sync_with_approvals(task, env.working_dir_str(), plan, &[])
+        .await
+        .expect("sync succeeds");
 
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
-    assert_eq!(result.discovered, 0, "no reply by another account is ours to adopt");
-    assert_eq!(result.unmatched, 1, "the item's own reply stays unaccounted for");
+    assert_eq!(
+        result.discovered, 0,
+        "no reply by another account is ours to adopt"
+    );
+    assert_eq!(
+        result.unmatched, 1,
+        "the item's own reply stays unaccounted for"
+    );
     assert_eq!(result.replied, 0);
-    assert_eq!(env.gh_invocations(), 0, "no POST and no PATCH reached GitHub");
+    assert_eq!(
+        env.gh_invocations(),
+        0,
+        "no POST and no PATCH reached GitHub"
+    );
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
-    assert_eq!(updated_plan.items[0].reply_comment_id, None, "adoption was refused, nothing recorded");
-    assert!(updated_plan.items[0].pr_reply_text.is_none(), "no body claims a rewrite that never happened");
+    assert_eq!(
+        updated_plan.items[0].reply_comment_id, None,
+        "adoption was refused, nothing recorded"
+    );
+    assert!(
+        updated_plan.items[0].pr_reply_text.is_none(),
+        "no body claims a rewrite that never happened"
+    );
 }
 
 #[cfg(unix)]
@@ -1264,7 +1506,10 @@ async fn sync_pr_review_replies_posts_no_reply_the_account_cannot_verify() {
     .expect("sync succeeds");
 
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
-    assert_eq!(result.replied, 0, "no reply was posted without a verified account");
+    assert_eq!(
+        result.replied, 0,
+        "no reply was posted without a verified account"
+    );
     assert_eq!(env.gh_invocations(), 0, "no POST reached GitHub");
     assert_eq!(result.errors.len(), 1, "errors: {:?}", result.errors);
     assert!(
@@ -1272,8 +1517,14 @@ async fn sync_pr_review_replies_posts_no_reply_the_account_cannot_verify() {
         "the refusal names the unverifiable account: {:?}",
         result.errors[0],
     );
-    assert!(!updated_plan.items[0].reply_posted, "nothing was marked posted");
-    assert_eq!(updated_plan.items[0].reply_comment_id, None, "no reply id was recorded");
+    assert!(
+        !updated_plan.items[0].reply_posted,
+        "nothing was marked posted"
+    );
+    assert_eq!(
+        updated_plan.items[0].reply_comment_id, None,
+        "no reply id was recorded"
+    );
 }
 
 #[cfg(unix)]
@@ -1285,10 +1536,14 @@ async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
     // Both items: approved=Fix, fix_done=false (defaults). Sync should classify
     // them as fix_pending without touching gh.
 
-    let (result, _plan) =
-        sync_with_approvals(task, env.working_dir_str(), plan, &[]).await
-            .expect("sync succeeds");
-    assert_eq!(env.gh_invocations(), 0, "no replies posted when nothing is fix_done");
+    let (result, _plan) = sync_with_approvals(task, env.working_dir_str(), plan, &[])
+        .await
+        .expect("sync succeeds");
+    assert_eq!(
+        env.gh_invocations(),
+        0,
+        "no replies posted when nothing is fix_done"
+    );
     assert_eq!(result.replied, 0);
     assert_eq!(result.fix_pending, 2);
     assert_eq!(result.discovered, 0);
@@ -1314,8 +1569,15 @@ async fn sync_posts_nothing_the_person_did_not_approve() {
 
     assert_eq!(result.replied, 0, "{result:?}");
     assert_eq!(result.awaiting_approval, 1, "{result:?}");
-    assert!(!env.read_gh_log().contains("/replies"), "gh log:\n{}", env.read_gh_log());
-    assert!(!updated_plan.items[0].reply_posted, "nothing was marked posted");
+    assert!(
+        !env.read_gh_log().contains("/replies"),
+        "gh log:\n{}",
+        env.read_gh_log()
+    );
+    assert!(
+        !updated_plan.items[0].reply_posted,
+        "nothing was marked posted"
+    );
 }
 
 /// A fix committed but not on `origin` has not reached the pull request, so
@@ -1333,21 +1595,40 @@ async fn an_unpushed_fix_gets_no_reply_from_apply_or_sync() {
         .expect("run git");
     assert!(status.success());
     let (task, plan) = create_test_pr_review_setup();
-    let opts = AddressPrReviewOptions { auto_push: false, dry_run: false };
+    let opts = AddressPrReviewOptions {
+        auto_push: false,
+        dry_run: false,
+    };
 
-        let ledger = env.ledger_for(&task);
-    let (result, mut plan) =
-        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
-            .await
-            .expect("full apply succeeds");
+    let ledger = env.ledger_for(&task);
+    let (result, mut plan) = address_pr_review_inner(
+        task.clone(),
+        env.working_dir_str(),
+        plan,
+        opts,
+        no_progress(),
+        never_cancelled(),
+        ledger,
+    )
+    .await
+    .expect("full apply succeeds");
     assert_eq!(result.fixed_ids, vec![101]);
     assert!(!result.pushed);
     assert_eq!(result.replies_posted, 0, "{result:?}");
-    assert!(plan.items[0].fix_uncommitted && !plan.items[0].reply_posted, "{:?}", plan.items[0]);
+    assert!(
+        plan.items[0].fix_uncommitted && !plan.items[0].reply_posted,
+        "{:?}",
+        plan.items[0]
+    );
 
     plan.backfill_lifecycle_from_last_apply();
-    assert!(!plan.items[0].reply_posted, "the backfill does not invent the reply");
-    let (synced, _plan) = sync_with_approvals(task, env.working_dir_str(), plan, &[]).await.expect("sync succeeds");
+    assert!(
+        !plan.items[0].reply_posted,
+        "the backfill does not invent the reply"
+    );
+    let (synced, _plan) = sync_with_approvals(task, env.working_dir_str(), plan, &[])
+        .await
+        .expect("sync succeeds");
     assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
     assert_eq!(env.gh_invocations(), 0, "gh log:\n{}", env.read_gh_log());
 }
@@ -1382,11 +1663,20 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
     plan.backfill_lifecycle_from_last_apply();
 
     // Item 0 (comment 301): fixed AND replied — both flags flip.
-    assert!(plan.items[0].fix_done, "fix_done should backfill from fixed_ids");
-    assert!(plan.items[0].reply_posted, "reply_posted should backfill when no reply error for this id");
+    assert!(
+        plan.items[0].fix_done,
+        "fix_done should backfill from fixed_ids"
+    );
+    assert!(
+        plan.items[0].reply_posted,
+        "reply_posted should backfill when no reply error for this id"
+    );
     // Item 1 (comment 302): fixed but the reply errored — only fix_done flips.
     assert!(plan.items[1].fix_done);
-    assert!(!plan.items[1].reply_posted, "failed reply must keep reply_posted=false");
+    assert!(
+        !plan.items[1].reply_posted,
+        "failed reply must keep reply_posted=false"
+    );
 
     // Re-running backfill is a no-op (idempotent).
     plan.backfill_lifecycle_from_last_apply();
@@ -1429,8 +1719,13 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
         it.reply_posted = false;
     }
     dry_plan.backfill_lifecycle_from_last_apply();
-    assert!(dry_plan.items.iter().all(|i| !i.fix_done && !i.reply_posted),
-        "dry-run last_apply must not flip lifecycle flags");
+    assert!(
+        dry_plan
+            .items
+            .iter()
+            .all(|i| !i.fix_done && !i.reply_posted),
+        "dry-run last_apply must not flip lifecycle flags"
+    );
 }
 
 /// A plan whose last apply fixed and replied to comments 301 and 302 at
@@ -1471,9 +1766,18 @@ fn backfill_lifecycle_does_not_restore_a_comment_edited_after_the_last_apply() {
 
     plan.backfill_lifecycle_from_last_apply();
 
-    assert!(!plan.items[0].fix_done, "an edited comment must not inherit fix_done");
-    assert!(!plan.items[0].reply_posted, "an edited comment must not inherit reply_posted");
-    assert!(plan.items[1].fix_done && plan.items[1].reply_posted, "an unchanged comment keeps the backfill");
+    assert!(
+        !plan.items[0].fix_done,
+        "an edited comment must not inherit fix_done"
+    );
+    assert!(
+        !plan.items[0].reply_posted,
+        "an edited comment must not inherit reply_posted"
+    );
+    assert!(
+        plan.items[1].fix_done && plan.items[1].reply_posted,
+        "an unchanged comment keeps the backfill"
+    );
 }
 
 #[test]
@@ -1513,7 +1817,10 @@ fn backfill_lifecycle_keeps_fix_uncommitted_when_the_comment_was_edited() {
 
     plan.backfill_lifecycle_from_last_apply();
 
-    assert!(plan.items[0].fix_uncommitted, "the checkout fact survives the edit");
+    assert!(
+        plan.items[0].fix_uncommitted,
+        "the checkout fact survives the edit"
+    );
     assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted);
 }
 
@@ -1544,17 +1851,36 @@ async fn apply_reruns_the_fix_for_a_comment_edited_after_the_apply_that_fixed_it
     plan.comments[0].updated_at = Some(applied_at + chrono::Duration::seconds(60));
     // What `address_pr_review` does before every apply.
     plan.backfill_lifecycle_from_last_apply();
-    let opts = AddressPrReviewOptions { auto_push: false, dry_run: false };
+    let opts = AddressPrReviewOptions {
+        auto_push: false,
+        dry_run: false,
+    };
 
-        let ledger = env.ledger_for(&task);
-    let (result, _plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), ledger)
-            .await
-            .expect("apply succeeds");
+    let ledger = env.ledger_for(&task);
+    let (result, _plan) = address_pr_review_inner(
+        task,
+        env.working_dir_str(),
+        plan,
+        opts,
+        no_progress(),
+        never_cancelled(),
+        ledger,
+    )
+    .await
+    .expect("apply succeeds");
 
-    assert_eq!(env.claude_invocations(), 1, "the edited comment is fixed afresh");
+    assert_eq!(
+        env.claude_invocations(),
+        1,
+        "the edited comment is fixed afresh"
+    );
     assert_eq!(result.fixed_ids, vec![101], "{result:?}");
-    assert_eq!(env.gh_invocations(), 0, "no reply rests on the pre-edit fix:\n{}", env.read_gh_log());
+    assert_eq!(
+        env.gh_invocations(),
+        0,
+        "no reply rests on the pre-edit fix:\n{}",
+        env.read_gh_log()
+    );
 }
 
 #[test]
@@ -1587,13 +1913,23 @@ fn backfill_lifecycle_from_last_apply_never_attempted_reply_leaves_reply_posted_
     plan.backfill_lifecycle_from_last_apply();
 
     // fix_done still backfills from fixed_ids regardless of auto_reply...
-    assert!(plan.items[0].fix_done, "fix_done should backfill from fixed_ids");
-    assert!(plan.items[1].fix_done, "fix_done should backfill from fixed_ids");
+    assert!(
+        plan.items[0].fix_done,
+        "fix_done should backfill from fixed_ids"
+    );
+    assert!(
+        plan.items[1].fix_done,
+        "fix_done should backfill from fixed_ids"
+    );
     // ...but reply_posted must NOT be inferred when no reply was attempted.
-    assert!(!plan.items[0].reply_posted,
-        "reply_posted must stay false when auto_reply=false, even though the fix succeeded");
-    assert!(!plan.items[1].reply_posted,
-        "reply_posted must stay false when auto_reply=false, even though the fix succeeded");
+    assert!(
+        !plan.items[0].reply_posted,
+        "reply_posted must stay false when auto_reply=false, even though the fix succeeded"
+    );
+    assert!(
+        !plan.items[1].reply_posted,
+        "reply_posted must stay false when auto_reply=false, even though the fix succeeded"
+    );
 }
 
 #[test]
@@ -1610,9 +1946,12 @@ fn backfill_lifecycle_from_last_apply_does_not_guess_for_a_legacy_result_missing
         "skipped_ids": [],
         "replies_posted": 1
     }"#;
-    let legacy: PrReviewApplyResult =
-        serde_json::from_str(legacy_json).expect("legacy result without auto_reply must still parse");
-    assert_eq!(legacy.auto_reply, None, "a missing field must deserialize as unknown, not false");
+    let legacy: PrReviewApplyResult = serde_json::from_str(legacy_json)
+        .expect("legacy result without auto_reply must still parse");
+    assert_eq!(
+        legacy.auto_reply, None,
+        "a missing field must deserialize as unknown, not false"
+    );
 
     let (_task, mut plan) = create_test_two_fix_setup();
     assert!(!plan.items[0].fix_done);
@@ -1629,10 +1968,14 @@ fn backfill_lifecycle_from_last_apply_does_not_guess_for_a_legacy_result_missing
     // fixed items it belongs to. With `auto_reply` unknown, backfill must not
     // guess by flipping either one — that is Sync's job, using per-comment
     // evidence instead of an aggregate count.
-    assert!(!plan.items[0].reply_posted,
-        "an ambiguous legacy result must not mark either item as replied");
-    assert!(!plan.items[1].reply_posted,
-        "an ambiguous legacy result must not mark either item as replied");
+    assert!(
+        !plan.items[0].reply_posted,
+        "an ambiguous legacy result must not mark either item as replied"
+    );
+    assert!(
+        !plan.items[1].reply_posted,
+        "an ambiguous legacy result must not mark either item as replied"
+    );
 }
 
 /// A stand-in `claude` that obeys prompt injection: when its prompt carries
@@ -1642,7 +1985,10 @@ fn backfill_lifecycle_from_last_apply_does_not_guess_for_a_legacy_result_missing
 fn install_obedient_claude(env: &MockEnv, clean: &str, injected: &str) {
     let line = |result: &str| {
         let json = serde_json::json!({ "type": "result", "result": result }).to_string();
-        assert!(!json.contains('\''), "the fixture JSON is single-quoted in sh");
+        assert!(
+            !json.contains('\''),
+            "the fixture JSON is single-quoted in sh"
+        );
         json
     };
     let (before, after) = claude_cli_contract();
@@ -1703,14 +2049,20 @@ async fn an_outsider_cannot_steer_triage_into_a_pre_approved_fix() {
     ];
 
     let (items, raw) = triage_pr_comments(
-        &task, "https://github.com/test-org/test-repo/pull/42", &env.working_dir_str(), &comments,
+        &task,
+        "https://github.com/test-org/test-repo/pull/42",
+        &env.working_dir_str(),
+        &comments,
         never_cancelled(),
     )
     .await
     .expect("triage succeeds");
 
     let log = env.read_claude_log();
-    let runs: Vec<&str> = log.split("---END-ARGS---").filter(|r| !r.trim().is_empty()).collect();
+    let runs: Vec<&str> = log
+        .split("---END-ARGS---")
+        .filter(|r| !r.trim().is_empty())
+        .collect();
     assert_eq!(runs.len(), 2, "one run per trust group, got:\n{log}");
     for run in &runs {
         assert_read_only_invocation(run, "a triage run");
@@ -1718,14 +2070,21 @@ async fn an_outsider_cannot_steer_triage_into_a_pre_approved_fix() {
     // The comment text reaches each run on stdin, never in argv.
     let prompts = env.claude_prompts();
     assert_eq!(prompts.len(), 2, "one prompt per run");
-    assert!(prompts[0].contains(MEMBER_COMMENT) && !prompts[0].contains("OUTSIDER-INJECTION"),
-        "the collaborator run sees only collaborator text:\n{}", prompts[0]);
-    assert!(prompts[1].contains("OUTSIDER-INJECTION") && !prompts[1].contains(MEMBER_COMMENT),
-        "the other run sees only the other text:\n{}", prompts[1]);
+    assert!(
+        prompts[0].contains(MEMBER_COMMENT) && !prompts[0].contains("OUTSIDER-INJECTION"),
+        "the collaborator run sees only collaborator text:\n{}",
+        prompts[0]
+    );
+    assert!(
+        prompts[1].contains("OUTSIDER-INJECTION") && !prompts[1].contains(MEMBER_COMMENT),
+        "the other run sees only the other text:\n{}",
+        prompts[1]
+    );
     assert_not_in_argv(&log, MEMBER_COMMENT);
     assert_not_in_argv(&log, "OUTSIDER-INJECTION");
 
-    let got: Vec<_> = items.iter()
+    let got: Vec<_> = items
+        .iter()
         .map(|i| (i.comment_id, i.approved, i.proposed_change.as_str()))
         .collect();
     assert_eq!(
@@ -1737,7 +2096,10 @@ async fn an_outsider_cannot_steer_triage_into_a_pre_approved_fix() {
         "forged and duplicate items are gone"
     );
     assert!(!items.iter().any(|i| i.proposed_change.contains("curl")));
-    assert!(raw.contains("## Triage of collaborator comments") && raw.contains("## Triage of other comments"));
+    assert!(
+        raw.contains("## Triage of collaborator comments")
+            && raw.contains("## Triage of other comments")
+    );
 }
 
 #[cfg(unix)]
@@ -1747,16 +2109,28 @@ async fn triage_with_only_outsider_comments_runs_once_and_approves_nothing() {
     let env = MockEnv::setup("unused");
     install_obedient_claude(&env, CLEAN_TRIAGE, INJECTED_TRIAGE);
     let task = create_test_task("Triage");
-    let comments = vec![triage_comment(302, "CONTRIBUTOR", "someone", OUTSIDER_COMMENT)];
+    let comments = vec![triage_comment(
+        302,
+        "CONTRIBUTOR",
+        "someone",
+        OUTSIDER_COMMENT,
+    )];
 
     let (items, _) = triage_pr_comments(
-        &task, "https://github.com/test-org/test-repo/pull/42", &env.working_dir_str(), &comments,
+        &task,
+        "https://github.com/test-org/test-repo/pull/42",
+        &env.working_dir_str(),
+        &comments,
         never_cancelled(),
     )
     .await
     .expect("triage succeeds");
 
-    assert_eq!(env.claude_invocations(), 1, "the empty collaborator run is skipped");
+    assert_eq!(
+        env.claude_invocations(),
+        1,
+        "the empty collaborator run is skipped"
+    );
     let got: Vec<_> = items.iter().map(|i| (i.comment_id, i.approved)).collect();
     assert_eq!(got, vec![(Some(302), false)]);
 }
@@ -1782,12 +2156,16 @@ async fn discuss_runs_once_per_trust_group_and_only_the_collaborator_run_grants(
     plan.comments[1].author_association = Some("NONE".to_string());
     plan.comments[1].body = OUTSIDER_DISCUSS_COMMENT.to_string();
 
-    let merged = discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
-        .await
-        .expect("discuss merges successfully");
+    let merged =
+        discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
+            .await
+            .expect("discuss merges successfully");
 
     let log = env.read_claude_log();
-    let runs: Vec<&str> = log.split("---END-ARGS---").filter(|r| !r.trim().is_empty()).collect();
+    let runs: Vec<&str> = log
+        .split("---END-ARGS---")
+        .filter(|r| !r.trim().is_empty())
+        .collect();
     assert_eq!(runs.len(), 2, "one run per trust group, got:\n{log}");
     for run in &runs {
         assert_read_only_invocation(run, "a discuss run");
@@ -1795,18 +2173,30 @@ async fn discuss_runs_once_per_trust_group_and_only_the_collaborator_run_grants(
     let prompts = env.claude_prompts();
     assert_eq!(prompts.len(), 2, "one prompt per run");
     let member_body = "Should we retry on failure?";
-    assert!(prompts[0].contains(member_body) && !prompts[0].contains("OUTSIDER-INJECTION"),
-        "the collaborator run sees only collaborator items:\n{}", prompts[0]);
-    assert!(prompts[1].contains("OUTSIDER-INJECTION") && !prompts[1].contains(member_body),
-        "the other run sees only other items:\n{}", prompts[1]);
-    assert!(!prompts[1].contains("Unsure whether retry is desired."),
-        "nor the member item's reasoning:\n{}", prompts[1]);
+    assert!(
+        prompts[0].contains(member_body) && !prompts[0].contains("OUTSIDER-INJECTION"),
+        "the collaborator run sees only collaborator items:\n{}",
+        prompts[0]
+    );
+    assert!(
+        prompts[1].contains("OUTSIDER-INJECTION") && !prompts[1].contains(member_body),
+        "the other run sees only other items:\n{}",
+        prompts[1]
+    );
+    assert!(
+        !prompts[1].contains("Unsure whether retry is desired."),
+        "nor the member item's reasoning:\n{}",
+        prompts[1]
+    );
     assert_not_in_argv(&log, member_body);
     assert_not_in_argv(&log, "OUTSIDER-INJECTION");
 
     let member = &merged.items[0];
     assert!(member.approved, "the collaborator-only run may grant");
-    assert_eq!(member.reasoning, "User confirmed.", "the outsider run did not rewrite it");
+    assert_eq!(
+        member.reasoning, "User confirmed.",
+        "the outsider run did not rewrite it"
+    );
     assert_eq!(member.proposed_change, "retry(3)");
 
     let outsider = &merged.items[1];
@@ -1829,16 +2219,23 @@ async fn a_non_granting_discuss_run_clears_approval_when_it_changes_the_item() {
     plan.items[1].approved = true;
     plan.items[1].proposed_change = "what the user approved".to_string();
 
-    let merged = discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
-        .await
-        .expect("discuss merges successfully");
+    let merged =
+        discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
+            .await
+            .expect("discuss merges successfully");
 
     assert_eq!(env.claude_invocations(), 1);
     let item = &merged.items[1];
     assert_eq!(item.proposed_change, "5000ms");
     assert!(!item.approved, "the user approved a different change");
-    assert!(!merged.items[0].approved, "the member item was not pending and is untouched");
-    assert_eq!(merged.items[0].reasoning, "Unsure whether retry is desired.");
+    assert!(
+        !merged.items[0].approved,
+        "the member item was not pending and is untouched"
+    );
+    assert_eq!(
+        merged.items[0].reasoning,
+        "Unsure whether retry is desired."
+    );
 }
 
 #[test]
@@ -1848,10 +2245,16 @@ fn fix_commit_round_trips_and_a_plan_saved_before_it_reads_as_having_none() {
     let json = serde_json::to_value(&plan).unwrap();
     let read: PrReviewPlan = serde_json::from_value(json.clone()).unwrap();
     assert_eq!(read.items[0].fix_commit, plan.items[0].fix_commit);
-    assert!(json["items"][1].get("fix_commit").is_none(), "an item without one writes nothing");
+    assert!(
+        json["items"][1].get("fix_commit").is_none(),
+        "an item without one writes nothing"
+    );
 
     let mut legacy = json;
-    legacy["items"][0].as_object_mut().unwrap().remove("fix_commit");
+    legacy["items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("fix_commit");
     let read: PrReviewPlan = serde_json::from_value(legacy).unwrap();
     assert_eq!(read.items[0].fix_commit, None);
 }
@@ -1882,6 +2285,14 @@ fn backfill_does_not_infer_a_posted_reply_for_a_fix_with_a_recorded_commit() {
     // Item 0 has a commit; item 1 is a fix saved by a build that recorded none.
     plan.items[0].fix_commit = Some("b".repeat(40));
     plan.backfill_lifecycle_from_last_apply();
-    assert!(plan.items[0].fix_done && !plan.items[0].reply_posted, "{:?}", plan.items[0]);
-    assert!(plan.items[1].fix_done && plan.items[1].reply_posted, "history is kept: {:?}", plan.items[1]);
+    assert!(
+        plan.items[0].fix_done && !plan.items[0].reply_posted,
+        "{:?}",
+        plan.items[0]
+    );
+    assert!(
+        plan.items[1].fix_done && plan.items[1].reply_posted,
+        "history is kept: {:?}",
+        plan.items[1]
+    );
 }

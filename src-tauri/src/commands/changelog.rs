@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
-use crate::domain::changelog::{ChangelogSource, ChangelogOptions, GitCommit};
+use crate::domain::changelog::{ChangelogOptions, ChangelogSource, GitCommit};
 
 #[derive(Clone)]
 pub struct ChangelogState;
@@ -30,9 +30,9 @@ pub async fn generate_changelog(
         ChangelogSource::GitHistory => {
             Ok("# Changelog\n\n## Git History\n\nNo git history available.".to_string())
         }
-        ChangelogSource::BranchComparison => {
-            Ok("# Changelog\n\n## Branch Comparison\n\nNo branch comparison available.".to_string())
-        }
+        ChangelogSource::BranchComparison => Ok(
+            "# Changelog\n\n## Branch Comparison\n\nNo branch comparison available.".to_string(),
+        ),
     }
 }
 

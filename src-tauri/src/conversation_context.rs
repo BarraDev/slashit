@@ -44,8 +44,7 @@ use uuid::Uuid;
 use crate::coordinator_reads::{PER_READ_CAP_CHARS, TITLE_CHARS};
 use crate::domain::conversation::{
     decision_label, Conversation, Entry, EntryKind, ProjectAction, ProjectActionOutcome,
-    ProjectActionStatus, TaskMutation, DECISION_SCOPE, HISTORY_SEMANTICS,
-    TASK_INDEX_LIMIT,
+    ProjectActionStatus, TaskMutation, DECISION_SCOPE, HISTORY_SEMANTICS, TASK_INDEX_LIMIT,
 };
 
 /// Experimental total budget for one provider invocation, in logical characters.
@@ -70,7 +69,10 @@ pub struct ContextBudget {
 
 impl Default for ContextBudget {
     fn default() -> Self {
-        Self { total_chars: CONTEXT_BUDGET_CHARS, per_read_cap_chars: PER_READ_CAP_CHARS }
+        Self {
+            total_chars: CONTEXT_BUDGET_CHARS,
+            per_read_cap_chars: PER_READ_CAP_CHARS,
+        }
     }
 }
 
@@ -96,7 +98,10 @@ pub struct ReturnedAction<'a> {
 pub enum TurnInput<'a> {
     /// An ordinary turn or Retry: the current Human message and the Project's
     /// whole Task index, in `list_tasks` order.
-    Ordinary { message: &'a str, tasks: &'a [Value] },
+    Ordinary {
+        message: &'a str,
+        tasks: &'a [Value],
+    },
     /// Legacy Worker-result mediation: no message and no Task index.
     Continuation(ReturnedAction<'a>),
 }
@@ -132,7 +137,13 @@ pub enum ContextError {
 impl std::fmt::Display for ContextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self::RequiredExceedsBudget {
-            component, required_chars, budget_chars, fixed_chars, read_reserve_chars, turn_chars, structure_chars,
+            component,
+            required_chars,
+            budget_chars,
+            fixed_chars,
+            read_reserve_chars,
+            turn_chars,
+            structure_chars,
         } = self;
         write!(
             f,
@@ -187,8 +198,14 @@ pub fn cut_field(text: &str, ceiling: usize, record: Uuid, shortened: &mut usize
     *shortened += 1;
     let head_len = ceiling * 2 / 3;
     let tail_len = ceiling - head_len;
-    let head_end = text.char_indices().nth(head_len).map_or(text.len(), |(index, _)| index);
-    let tail_start = text.char_indices().nth(total - tail_len).map_or(text.len(), |(index, _)| index);
+    let head_end = text
+        .char_indices()
+        .nth(head_len)
+        .map_or(text.len(), |(index, _)| index);
+    let tail_start = text
+        .char_indices()
+        .nth(total - tail_len)
+        .map_or(text.len(), |(index, _)| index);
     format!(
         "{}[... {} of {total} characters omitted by SlashIt; original_chars={total}; record {record} ...]{}",
         &text[..head_end],
@@ -223,9 +240,22 @@ impl Rendered<'_> {
 
 /// Renders one entry from the Conversation's records. `None` when the record
 /// the entry refers to is missing, which keeps the entry out of the projection.
-fn describe(conversation: &Conversation, entry: &Entry, pressure: bool) -> Option<(&'static str, Value, usize)> {
-    let mut c = Cutter { record: entry.id, shortened: 0 };
-    let evidence = |ceiling: usize| if pressure { ceiling.min(PRESSURE_EVIDENCE_CEILING) } else { ceiling };
+fn describe(
+    conversation: &Conversation,
+    entry: &Entry,
+    pressure: bool,
+) -> Option<(&'static str, Value, usize)> {
+    let mut c = Cutter {
+        record: entry.id,
+        shortened: 0,
+    };
+    let evidence = |ceiling: usize| {
+        if pressure {
+            ceiling.min(PRESSURE_EVIDENCE_CEILING)
+        } else {
+            ceiling
+        }
+    };
     let task_action = |id: &Uuid| conversation.actions.iter().find(|action| action.id == *id);
     let (kind, mut value): (&'static str, Value) = match &entry.kind {
         EntryKind::HumanMessage { text } | EntryKind::CoordinatorReply { text } => (
@@ -234,21 +264,34 @@ fn describe(conversation: &Conversation, entry: &Entry, pressure: bool) -> Optio
         ),
         EntryKind::ActionProposed { action_id } => {
             let action = task_action(action_id)?;
-            ("action_proposed", json!({
+            (
+                "action_proposed",
+                json!({
                 "kind":"action_proposed","target_task_id":action.target_task_id,
                 "target_task_title":c.cut(&action.target_task_title, TARGET_TITLE_CEILING),
                 "request":c.cut(&action.request, REQUEST_CEILING),
-                "explanation":c.cut(&action.explanation, EXPLANATION_CEILING)}))
+                "explanation":c.cut(&action.explanation, EXPLANATION_CEILING)}),
+            )
         }
-        EntryKind::ActionDecision { action_id, approved, request } => {
+        EntryKind::ActionDecision {
+            action_id,
+            approved,
+            request,
+        } => {
             let action = task_action(action_id)?;
-            ("action_decision", json!({
+            (
+                "action_decision",
+                json!({
                 "kind":"action_decision","approved":approved,"decision":decision_label(*approved),"scope":DECISION_SCOPE,
                 "target_task_id":action.target_task_id,
                 "target_task_title":c.cut(&action.target_task_title, TARGET_TITLE_CEILING),
-                "request":c.cut(request.as_deref().unwrap_or(&action.request), REQUEST_CEILING)}))
+                "request":c.cut(request.as_deref().unwrap_or(&action.request), REQUEST_CEILING)}),
+            )
         }
-        EntryKind::WorkerStarted { action_id } => ("worker_started", json!({"kind":"worker_started","action_id":action_id})),
+        EntryKind::WorkerStarted { action_id } => (
+            "worker_started",
+            json!({"kind":"worker_started","action_id":action_id}),
+        ),
         EntryKind::WorkerResult { action_id, result } => (
             "worker_result",
             json!({"kind":"worker_result","action_id":action_id,"result":c.cut(result, evidence(WORKER_RESULT_CEILING))}),
@@ -259,17 +302,33 @@ fn describe(conversation: &Conversation, entry: &Entry, pressure: bool) -> Optio
         ),
         EntryKind::ProjectActionProposed { action_id } => {
             let action = conversation.project_action(*action_id)?;
-            ("project_action_proposed", json!({"kind":"project_action_proposed","action_id":action_id,"summary":action.mutation.summary()}))
+            (
+                "project_action_proposed",
+                json!({"kind":"project_action_proposed","action_id":action_id,"summary":action.mutation.summary()}),
+            )
         }
-        EntryKind::ProjectActionDecision { action_id, approved } => {
+        EntryKind::ProjectActionDecision {
+            action_id,
+            approved,
+        } => {
             let action = conversation.project_action(*action_id)?;
-            ("project_action_decision", json!({"kind":"project_action_decision","action_id":action_id,"approved":approved,"decision":decision_label(*approved),"scope":DECISION_SCOPE,"summary":action.mutation.summary()}))
+            (
+                "project_action_decision",
+                json!({"kind":"project_action_decision","action_id":action_id,"approved":approved,"decision":decision_label(*approved),"scope":DECISION_SCOPE,"summary":action.mutation.summary()}),
+            )
         }
         EntryKind::ProjectActionApplied { action_id, task_id } => (
             "project_action_applied",
-            match conversation.project_action(*action_id).and_then(|action| action.outcome.as_ref()) {
-                Some(ProjectActionOutcome::AlreadyQueued { .. }) => json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id,"outcome":"found_already_queued"}),
-                _ => json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id}),
+            match conversation
+                .project_action(*action_id)
+                .and_then(|action| action.outcome.as_ref())
+            {
+                Some(ProjectActionOutcome::AlreadyQueued { .. }) => {
+                    json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id,"outcome":"found_already_queued"})
+                }
+                _ => {
+                    json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id})
+                }
             },
         ),
         EntryKind::ProjectActionRefused { action_id, reason } => (
@@ -303,7 +362,9 @@ fn proposal_ref(action: &ProjectAction, shortened: &mut usize) -> ProposalRef {
         TaskMutation::EditTask { target_task_id, .. } => ("edit_task", Some(*target_task_id)),
         TaskMutation::MoveTask { target_task_id, .. } => ("move_task", Some(*target_task_id)),
         TaskMutation::EnqueueTask { target_task_id, .. } => ("enqueue_task", Some(*target_task_id)),
-        TaskMutation::ExecuteRequest { target_task_id, .. } => ("execute_request", Some(*target_task_id)),
+        TaskMutation::ExecuteRequest { target_task_id, .. } => {
+            ("execute_request", Some(*target_task_id))
+        }
     };
     ProposalRef {
         action_id: action.id,
@@ -311,7 +372,12 @@ fn proposal_ref(action: &ProjectAction, shortened: &mut usize) -> ProposalRef {
         target_task_id,
         status: action.status,
         created_at: action.created_at,
-        summary: cut_field(&action.mutation.summary(), PROPOSAL_SUMMARY_CEILING, action.id, shortened),
+        summary: cut_field(
+            &action.mutation.summary(),
+            PROPOSAL_SUMMARY_CEILING,
+            action.id,
+            shortened,
+        ),
     }
 }
 
@@ -407,10 +473,19 @@ struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    fn render(&self, proposals: usize, tasks: usize, history: &[Rendered], omitted: Option<&HistoryOmitted>) -> String {
+    fn render(
+        &self,
+        proposals: usize,
+        tasks: usize,
+        history: &[Rendered],
+        omitted: Option<&HistoryOmitted>,
+    ) -> String {
         let omitted_proposals = self.proposals_total - proposals;
         let projection = Projection {
-            project: ProjectView { name: self.project_name, root: self.project_root },
+            project: ProjectView {
+                name: self.project_name,
+                root: self.project_root,
+            },
             history_semantics: HISTORY_SEMANTICS,
             tasks: self.tasks.map(|(shown, _)| &shown[..tasks]),
             tasks_total: self.tasks.map(|(_, total)| total),
@@ -418,7 +493,11 @@ impl Frame<'_> {
             tasks_truncated: self.tasks.map(|(_, total)| total > tasks),
             open_proposals_total: self.proposals_total,
             open_proposals_omitted: omitted_proposals,
-            open_proposals_oldest_omitted_created_at: if omitted_proposals > 0 { self.oldest_open } else { None },
+            open_proposals_oldest_omitted_created_at: if omitted_proposals > 0 {
+                self.oldest_open
+            } else {
+                None
+            },
             open_proposals: &self.proposals[..proposals],
             history_omitted: omitted,
             recent_history: history.iter().map(|item| &item.value).collect(),
@@ -432,7 +511,13 @@ impl Frame<'_> {
     /// The length `render` would return, without serializing the history. `history`
     /// is the characters and count of the included entries; the empty array already
     /// in the base is the `[]` of an empty history.
-    fn projected_chars(&self, proposals: usize, tasks: usize, omitted: Option<&HistoryOmitted>, history: (usize, usize)) -> usize {
+    fn projected_chars(
+        &self,
+        proposals: usize,
+        tasks: usize,
+        omitted: Option<&HistoryOmitted>,
+        history: (usize, usize),
+    ) -> usize {
         let (history_chars, count) = history;
         let base = chars(&self.render(proposals, tasks, &[], omitted));
         if count == 0 {
@@ -453,10 +538,20 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
     let conversation = request.conversation;
     let mut turn_shortened = 0usize;
 
-    let (site, tasks_input, message, returned): (ContextSite, Option<&[Value]>, Option<&str>, Option<Value>) = match request.turn {
-        TurnInput::Ordinary { message, tasks } => (ContextSite::Ordinary, Some(tasks), Some(message), None),
+    let (site, tasks_input, message, returned): (
+        ContextSite,
+        Option<&[Value]>,
+        Option<&str>,
+        Option<Value>,
+    ) = match request.turn {
+        TurnInput::Ordinary { message, tasks } => {
+            (ContextSite::Ordinary, Some(tasks), Some(message), None)
+        }
         TurnInput::Continuation(action) => {
-            let mut c = Cutter { record: action.action_id, shortened: 0 };
+            let mut c = Cutter {
+                record: action.action_id,
+                shortened: 0,
+            };
             let value = json!({
                 "target_task": {"id": action.target_task_id, "title": c.cut(action.target_task_title, TARGET_TITLE_CEILING)},
                 "explanation": c.cut(action.explanation, EXPLANATION_CEILING),
@@ -479,8 +574,13 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
                     let mut task = task.clone();
                     let mut shortened = 0;
                     if let Some(title) = task.get("title").and_then(Value::as_str) {
-                        let id = task.get("id").and_then(Value::as_str).and_then(|id| Uuid::parse_str(id).ok()).unwrap_or_default();
-                        task["title"] = Value::String(cut_field(title, TITLE_CHARS, id, &mut shortened));
+                        let id = task
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                            .unwrap_or_default();
+                        task["title"] =
+                            Value::String(cut_field(title, TITLE_CHARS, id, &mut shortened));
                     }
                     task_shortened.push(shortened);
                     task
@@ -514,7 +614,12 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
         .entries
         .iter()
         .filter_map(|entry| {
-            describe(conversation, entry, false).map(|(kind, value, shortened)| Rendered { entry, kind, value, shortened })
+            describe(conversation, entry, false).map(|(kind, value, shortened)| Rendered {
+                entry,
+                kind,
+                value,
+                shortened,
+            })
         })
         .collect();
     let total_entries = all.len();
@@ -538,13 +643,29 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
     // complete history that fits is accepted even when this skeleton does not,
     // since the omission summary can make the skeleton the longer of the two.
     let skeleton_chars = frame.projected_chars(0, 0, all_omitted.as_ref(), (0, 0));
-    if !fits(skeleton_chars) && !fits(frame.projected_chars(0, 0, None, (history_chars, total_entries))) {
-        let turn_chars = message.map_or_else(|| returned.as_ref().map_or(0, |value| chars(&value.to_string())), chars);
+    if !fits(skeleton_chars)
+        && !fits(frame.projected_chars(0, 0, None, (history_chars, total_entries)))
+    {
+        let turn_chars = message.map_or_else(
+            || {
+                returned
+                    .as_ref()
+                    .map_or(0, |value| chars(&value.to_string()))
+            },
+            chars,
+        );
         let structure_chars = skeleton_chars.saturating_sub(turn_chars);
         let mut parts = [
             (request.fixed_chars, "fixed_prompt"),
             (request.read_reserve_chars, "read_reserve"),
-            (turn_chars, if message.is_some() { "current_message" } else { "returned_action" }),
+            (
+                turn_chars,
+                if message.is_some() {
+                    "current_message"
+                } else {
+                    "returned_action"
+                },
+            ),
             (structure_chars, "structure"),
         ];
         parts.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
@@ -561,11 +682,15 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
 
     // 1. open proposals, 2. Task index, 3. history; each with what remains.
     let mut kp = 0;
-    while kp < proposals.len() && fits(frame.projected_chars(kp + 1, 0, all_omitted.as_ref(), (0, 0))) {
+    while kp < proposals.len()
+        && fits(frame.projected_chars(kp + 1, 0, all_omitted.as_ref(), (0, 0)))
+    {
         kp += 1;
     }
     let mut kt = 0;
-    while kt < clipped_tasks.len() && fits(frame.projected_chars(kp, kt + 1, all_omitted.as_ref(), (0, 0))) {
+    while kt < clipped_tasks.len()
+        && fits(frame.projected_chars(kp, kt + 1, all_omitted.as_ref(), (0, 0)))
+    {
         kt += 1;
     }
     let mut from = 0;
@@ -575,7 +700,8 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
                 continue;
             }
             if let Some((_, value, shortened)) = describe(conversation, item.entry, true) {
-                history_chars = history_chars - chars(&item.value.to_string()) + chars(&value.to_string());
+                history_chars =
+                    history_chars - chars(&item.value.to_string()) + chars(&value.to_string());
                 item.value = value;
                 item.shortened = shortened;
             }
@@ -587,7 +713,14 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
         let mut prefix = OmissionTally::default();
         let mut included_chars = history_chars;
         let mut included = total_entries;
-        while from < total_entries && !fits(frame.projected_chars(kp, kt, prefix.summary().as_ref(), (included_chars, included))) {
+        while from < total_entries
+            && !fits(frame.projected_chars(
+                kp,
+                kt,
+                prefix.summary().as_ref(),
+                (included_chars, included),
+            ))
+        {
             prefix.add(&all[from]);
             included_chars -= chars(&all[from].value.to_string());
             included -= 1;
@@ -621,7 +754,10 @@ pub fn build_coordinator_context(request: &ContextRequest) -> Result<BuiltContex
         tasks_included: kt,
         tasks_total: tasks_input.map_or(0, <[Value]>::len),
     };
-    Ok(BuiltContext { projection, snapshot })
+    Ok(BuiltContext {
+        projection,
+        snapshot,
+    })
 }
 
 /// The default-budget projection of `conversation` for `message`, as JSON, for
@@ -632,7 +768,10 @@ pub(crate) fn projection_for_test(conversation: &Conversation, message: &str) ->
         conversation,
         project_name: "Project",
         project_root: None,
-        turn: TurnInput::Ordinary { message, tasks: &[] },
+        turn: TurnInput::Ordinary {
+            message,
+            tasks: &[],
+        },
         budget: ContextBudget::default(),
         fixed_chars: 0,
         read_reserve_chars: 0,
@@ -647,19 +786,32 @@ mod tests {
     use crate::domain::conversation::{Role, TaskAction};
     use crate::domain::TaskStatus;
 
-    fn request<'a>(conversation: &'a Conversation, message: &'a str, tasks: &'a [Value], total: usize) -> ContextRequest<'a> {
+    fn request<'a>(
+        conversation: &'a Conversation,
+        message: &'a str,
+        tasks: &'a [Value],
+        total: usize,
+    ) -> ContextRequest<'a> {
         ContextRequest {
             conversation,
             project_name: "Project",
             project_root: None,
             turn: TurnInput::Ordinary { message, tasks },
-            budget: ContextBudget { total_chars: total, per_read_cap_chars: PER_READ_CAP_CHARS },
+            budget: ContextBudget {
+                total_chars: total,
+                per_read_cap_chars: PER_READ_CAP_CHARS,
+            },
             fixed_chars: 0,
             read_reserve_chars: 0,
         }
     }
 
-    fn build(conversation: &Conversation, message: &str, tasks: &[Value], total: usize) -> BuiltContext {
+    fn build(
+        conversation: &Conversation,
+        message: &str,
+        tasks: &[Value],
+        total: usize,
+    ) -> BuiltContext {
         build_coordinator_context(&request(conversation, message, tasks, total)).expect("fits")
     }
 
@@ -672,11 +824,24 @@ mod tests {
     }
 
     fn failure(conversation: &mut Conversation, text: &str) {
-        conversation.push(Role::Coordinator, EntryKind::RunFailed { role: Role::Worker, message: text.into(), retryable: false });
+        conversation.push(
+            Role::Coordinator,
+            EntryKind::RunFailed {
+                role: Role::Worker,
+                message: text.into(),
+                retryable: false,
+            },
+        );
     }
 
     fn worker_result(conversation: &mut Conversation, text: &str) {
-        conversation.push(Role::Worker, EntryKind::WorkerResult { action_id: Uuid::new_v4(), result: text.into() });
+        conversation.push(
+            Role::Worker,
+            EntryKind::WorkerResult {
+                action_id: Uuid::new_v4(),
+                result: text.into(),
+            },
+        );
     }
 
     fn proposal(conversation: &mut Conversation, seconds: i64) -> Uuid {
@@ -692,7 +857,10 @@ mod tests {
         action.created_at = DateTime::<Utc>::from_timestamp(1_700_000_000 + seconds, 0).unwrap();
         let id = action.id;
         conversation.project_actions.push(action);
-        conversation.push(Role::Coordinator, EntryKind::ProjectActionProposed { action_id: id });
+        conversation.push(
+            Role::Coordinator,
+            EntryKind::ProjectActionProposed { action_id: id },
+        );
         id
     }
 
@@ -706,7 +874,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self, bound: usize) -> usize {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 33) as usize) % bound
         }
     }
@@ -744,9 +915,29 @@ mod tests {
         message(&mut conversation, "hello");
         proposal(&mut conversation, 1);
         let built = build(&conversation, "now", &tasks(2, "t"), CONTEXT_BUDGET_CHARS);
-        let keys = ["\"project\":", "\"history_semantics\":", "\"tasks\":", "\"tasks_total\":", "\"open_proposals_total\":", "\"open_proposals\":", "\"recent_history\":", "\"current_message\":"];
-        let positions: Vec<usize> = keys.iter().map(|key| built.projection.find(key).unwrap_or_else(|| panic!("{key}"))).collect();
-        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{positions:?}");
+        let keys = [
+            "\"project\":",
+            "\"history_semantics\":",
+            "\"tasks\":",
+            "\"tasks_total\":",
+            "\"open_proposals_total\":",
+            "\"open_proposals\":",
+            "\"recent_history\":",
+            "\"current_message\":",
+        ];
+        let positions: Vec<usize> = keys
+            .iter()
+            .map(|key| {
+                built
+                    .projection
+                    .find(key)
+                    .unwrap_or_else(|| panic!("{key}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{positions:?}"
+        );
         assert!(built.projection.ends_with("\"now\"}"));
     }
 
@@ -756,8 +947,14 @@ mod tests {
         message(&mut conversation, &"a".repeat(MESSAGE_CEILING + 500));
         let id = conversation.entries[0].id;
         let built = build(&conversation, "now", &[], CONTEXT_BUDGET_CHARS);
-        let text = json_of(&built)["recent_history"][0]["text"].as_str().unwrap().to_owned();
-        assert!(text.contains(&format!("original_chars={}", MESSAGE_CEILING + 500)), "{text}");
+        let text = json_of(&built)["recent_history"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            text.contains(&format!("original_chars={}", MESSAGE_CEILING + 500)),
+            "{text}"
+        );
         assert!(text.contains(&id.to_string()));
         assert!(built.snapshot.shortened_fields == 1);
         assert!(json_of(&built).get("history_omitted").is_none());
@@ -766,7 +963,12 @@ mod tests {
     #[test]
     fn cuts_never_split_a_scalar_and_count_scalars_not_bytes() {
         let mut shortened = 0;
-        for text in ["é".repeat(50), "😀".repeat(50), "e\u{301}".repeat(50), "日本語".repeat(20)] {
+        for text in [
+            "é".repeat(50),
+            "😀".repeat(50),
+            "e\u{301}".repeat(50),
+            "日本語".repeat(20),
+        ] {
             assert_ne!(text.chars().count(), text.len());
             for ceiling in [0, 1, 2, 7, 30, 49] {
                 let cut = cut_field(&text, ceiling, Uuid::nil(), &mut shortened);
@@ -785,7 +987,10 @@ mod tests {
         let raw = "\"\\\n\t\u{1}".repeat(10);
         message(&mut conversation, &raw);
         let built = build(&conversation, &raw, &[], CONTEXT_BUDGET_CHARS);
-        assert_eq!(built.snapshot.projection_chars, built.projection.chars().count());
+        assert_eq!(
+            built.snapshot.projection_chars,
+            built.projection.chars().count()
+        );
         let escaped = serde_json::to_string(&raw).unwrap().chars().count();
         assert!(escaped > raw.chars().count());
         assert!(built.projection.chars().count() >= 2 * escaped);
@@ -826,21 +1031,49 @@ mod tests {
                 let mut req = request(&conversation, "now", &index, total);
                 req.fixed_chars = fixed;
                 req.read_reserve_chars = reserve;
-                let Ok(built) = build_coordinator_context(&req) else { continue };
-                assert!(fixed + reserve + built.projection.chars().count() <= total, "round {round} total {total}");
-                let projectable = conversation.entries.iter().filter(|entry| describe(&conversation, entry, false).is_some()).count();
+                let Ok(built) = build_coordinator_context(&req) else {
+                    continue;
+                };
+                assert!(
+                    fixed + reserve + built.projection.chars().count() <= total,
+                    "round {round} total {total}"
+                );
+                let projectable = conversation
+                    .entries
+                    .iter()
+                    .filter(|entry| describe(&conversation, entry, false).is_some())
+                    .count();
                 let included = built.snapshot.included_entry_ids.len();
                 assert_eq!(included + built.snapshot.omitted_count, projectable);
                 // The included entries are the newest ones, in order.
-                let ids: Vec<Uuid> = conversation.entries.iter().filter(|entry| describe(&conversation, entry, false).is_some()).map(|entry| entry.id).collect();
-                assert_eq!(built.snapshot.included_entry_ids, ids[projectable - included..]);
+                let ids: Vec<Uuid> = conversation
+                    .entries
+                    .iter()
+                    .filter(|entry| describe(&conversation, entry, false).is_some())
+                    .map(|entry| entry.id)
+                    .collect();
+                assert_eq!(
+                    built.snapshot.included_entry_ids,
+                    ids[projectable - included..]
+                );
                 let value = json_of(&built);
                 if let Some(omitted) = value.get("history_omitted") {
-                    let by_kind: u64 = omitted["by_kind"].as_object().unwrap().values().map(|count| count.as_u64().unwrap()).sum();
+                    let by_kind: u64 = omitted["by_kind"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .map(|count| count.as_u64().unwrap())
+                        .sum();
                     assert_eq!(by_kind as usize, built.snapshot.omitted_count);
                 }
-                assert_eq!(built.snapshot.tasks_included, value["tasks_included"].as_u64().unwrap() as usize);
-                assert_eq!(value["tasks_truncated"] == true, index.len() > built.snapshot.tasks_included);
+                assert_eq!(
+                    built.snapshot.tasks_included,
+                    value["tasks_included"].as_u64().unwrap() as usize
+                );
+                assert_eq!(
+                    value["tasks_truncated"] == true,
+                    index.len() > built.snapshot.tasks_included
+                );
             }
         }
     }
@@ -853,7 +1086,11 @@ mod tests {
             let built = build(&conversation, "now", &[], 10_000_000);
             let history = json_of(&built)["recent_history"].clone();
             for rendered in history.as_array().unwrap() {
-                let entry = conversation.entries.iter().find(|entry| json!(entry.id) == rendered["entry_id"]).unwrap();
+                let entry = conversation
+                    .entries
+                    .iter()
+                    .find(|entry| json!(entry.id) == rendered["entry_id"])
+                    .unwrap();
                 let (_, alone, _) = describe(&conversation, entry, false).unwrap();
                 assert_eq!(&alone, rendered);
             }
@@ -868,14 +1105,29 @@ mod tests {
         worker_result(&mut conversation, &"r".repeat(WORKER_RESULT_CEILING));
         worker_result(&mut conversation, &"s".repeat(WORKER_RESULT_CEILING));
         // Fits at ceilings: ~10.2k. Allow room for one shortened result only.
-        let full = build(&conversation, "now", &[], 1_000_000).snapshot.projection_chars;
+        let full = build(&conversation, "now", &[], 1_000_000)
+            .snapshot
+            .projection_chars;
         let built = build(&conversation, "now", &[], full - 1_500);
         let history = json_of(&built)["recent_history"].clone();
         let history = history.as_array().unwrap();
-        assert_eq!(history.len(), 3, "nothing is omitted when shortening is enough");
+        assert_eq!(
+            history.len(),
+            3,
+            "nothing is omitted when shortening is enough"
+        );
         assert_eq!(history[0]["text"].as_str().unwrap(), human);
-        assert!(history[1]["result"].as_str().unwrap().contains("original_chars=3000"));
-        assert!(!history[2]["result"].as_str().unwrap().contains("original_chars"), "the newest result is shortened last");
+        assert!(history[1]["result"]
+            .as_str()
+            .unwrap()
+            .contains("original_chars=3000"));
+        assert!(
+            !history[2]["result"]
+                .as_str()
+                .unwrap()
+                .contains("original_chars"),
+            "the newest result is shortened last"
+        );
         assert_eq!(built.snapshot.shortened_fields, 1);
     }
 
@@ -908,8 +1160,14 @@ mod tests {
         assert_eq!(value["open_proposals"].as_array().unwrap().len(), 20);
         assert_eq!(value["open_proposals_total"], 25);
         assert_eq!(value["open_proposals_omitted"], 5);
-        assert_eq!(value["open_proposals"][0]["created_at"], json!(conversation.project_actions[24].created_at));
-        assert_eq!(value["open_proposals_oldest_omitted_created_at"], json!(conversation.project_actions[0].created_at));
+        assert_eq!(
+            value["open_proposals"][0]["created_at"],
+            json!(conversation.project_actions[24].created_at)
+        );
+        assert_eq!(
+            value["open_proposals_oldest_omitted_created_at"],
+            json!(conversation.project_actions[0].created_at)
+        );
     }
 
     #[test]
@@ -940,8 +1198,16 @@ mod tests {
         assert_eq!(value["tasks_total"], 45);
         assert_eq!(value["tasks_included"], 40);
         assert_eq!(value["tasks_truncated"], true);
-        assert!(value["tasks"][0]["title"].as_str().unwrap().contains("original_chars=250"));
-        let complete = json_of(&build(&conversation, "hi", &index[..3], CONTEXT_BUDGET_CHARS));
+        assert!(value["tasks"][0]["title"]
+            .as_str()
+            .unwrap()
+            .contains("original_chars=250"));
+        let complete = json_of(&build(
+            &conversation,
+            "hi",
+            &index[..3],
+            CONTEXT_BUDGET_CHARS,
+        ));
         assert_eq!(complete["tasks_truncated"], false);
         assert_eq!(complete["tasks_included"], 3);
     }
@@ -950,7 +1216,9 @@ mod tests {
     fn the_task_index_shrinks_under_pressure_and_says_so() {
         let conversation = Conversation::new(Uuid::new_v4());
         let index = tasks(30, "title");
-        let full = build(&conversation, "hi", &index, 1_000_000).snapshot.projection_chars;
+        let full = build(&conversation, "hi", &index, 1_000_000)
+            .snapshot
+            .projection_chars;
         let built = build(&conversation, "hi", &index, full / 2);
         let value = json_of(&built);
         let included = value["tasks_included"].as_u64().unwrap() as usize;
@@ -964,13 +1232,23 @@ mod tests {
     fn required_content_over_budget_is_an_error_naming_the_component() {
         let conversation = Conversation::new(Uuid::new_v4());
         let big = "m".repeat(5_000);
-        let error = build_coordinator_context(&request(&conversation, &big, &[], 3_000)).unwrap_err();
-        let ContextError::RequiredExceedsBudget { component, budget_chars, turn_chars, .. } = &error;
-        assert_eq!((*component, *budget_chars, *turn_chars), ("current_message", 3_000, 5_000));
+        let error =
+            build_coordinator_context(&request(&conversation, &big, &[], 3_000)).unwrap_err();
+        let ContextError::RequiredExceedsBudget {
+            component,
+            budget_chars,
+            turn_chars,
+            ..
+        } = &error;
+        assert_eq!(
+            (*component, *budget_chars, *turn_chars),
+            ("current_message", 3_000, 5_000)
+        );
         assert!(error.to_string().contains("Send a shorter request"));
         let mut fixed = request(&conversation, "hi", &[], 3_000);
         fixed.fixed_chars = 4_000;
-        let ContextError::RequiredExceedsBudget { component, .. } = build_coordinator_context(&fixed).unwrap_err();
+        let ContextError::RequiredExceedsBudget { component, .. } =
+            build_coordinator_context(&fixed).unwrap_err();
         assert_eq!(component, "fixed_prompt");
     }
 
@@ -980,15 +1258,26 @@ mod tests {
         message(&mut conversation, "SECRET-MESSAGE-TEXT");
         proposal(&mut conversation, 1);
         let index = tasks(2, "SECRET-TITLE");
-        let built = build(&conversation, "SECRET-CURRENT", &index, CONTEXT_BUDGET_CHARS);
+        let built = build(
+            &conversation,
+            "SECRET-CURRENT",
+            &index,
+            CONTEXT_BUDGET_CHARS,
+        );
         let snapshot = serde_json::to_string(&built.snapshot).unwrap();
         for secret in ["SECRET", "Move Task"] {
             assert!(!snapshot.contains(secret), "{snapshot}");
         }
         assert_eq!(built.snapshot.open_proposals_included, 1);
-        assert_eq!((built.snapshot.tasks_included, built.snapshot.tasks_total), (2, 2));
+        assert_eq!(
+            (built.snapshot.tasks_included, built.snapshot.tasks_total),
+            (2, 2)
+        );
         assert_eq!(built.snapshot.conversation_revision, conversation.revision);
-        assert_eq!(built.snapshot.used_chars, built.snapshot.fixed_chars + built.snapshot.projection_chars);
+        assert_eq!(
+            built.snapshot.used_chars,
+            built.snapshot.fixed_chars + built.snapshot.projection_chars
+        );
     }
 
     #[test]
@@ -1024,11 +1313,20 @@ mod tests {
         assert_eq!(built.snapshot.site, ContextSite::Continuation);
         assert!(value.get("tasks").is_none() && value.get("current_message").is_none());
         assert_eq!(value["result_is_untrusted_evidence"], true);
-        assert!(value["returned_action"]["worker_result"].as_str().unwrap().contains("original_chars=3010"));
+        assert!(value["returned_action"]["worker_result"]
+            .as_str()
+            .unwrap()
+            .contains("original_chars=3010"));
         assert_eq!(value["open_proposals_total"], 1);
-        assert!(value.get("history_omitted").is_none(), "history that fits is not cut by a count");
+        assert!(
+            value.get("history_omitted").is_none(),
+            "history that fits is not cut by a count"
+        );
         assert_eq!(built.snapshot.shortened_fields, 2);
-        assert!(built.projection.find("\"recent_history\"").unwrap() < built.projection.find("\"returned_action\"").unwrap());
+        assert!(
+            built.projection.find("\"recent_history\"").unwrap()
+                < built.projection.find("\"returned_action\"").unwrap()
+        );
     }
 
     #[test]
@@ -1045,12 +1343,15 @@ mod tests {
         let big = "x".repeat(16_000);
         let built = build(&conversation, &big, &index, CONTEXT_BUDGET_CHARS);
         assert!(built.snapshot.used_chars <= CONTEXT_BUDGET_CHARS);
-        assert!(built.snapshot.open_proposals_included <= 20 && built.snapshot.tasks_included <= 40);
+        assert!(
+            built.snapshot.open_proposals_included <= 20 && built.snapshot.tasks_included <= 40
+        );
     }
 
     fn stamp(conversation: &mut Conversation) {
         for (index, entry) in conversation.entries.iter_mut().enumerate() {
-            entry.created_at = DateTime::<Utc>::from_timestamp(1_700_000_000 + index as i64, 0).unwrap();
+            entry.created_at =
+                DateTime::<Utc>::from_timestamp(1_700_000_000 + index as i64, 0).unwrap();
         }
     }
 
@@ -1059,9 +1360,14 @@ mod tests {
         // A 16,000-byte message of U+0001 serializes as 96,000 characters, over the 64,000 default.
         let conversation = Conversation::new(Uuid::new_v4());
         let message = "\u{1}".repeat(16_000);
-        let error = build_coordinator_context(&request(&conversation, &message, &[], CONTEXT_BUDGET_CHARS))
-            .expect_err("the escaped message does not fit the default budget");
-        let ContextError::RequiredExceedsBudget { required_chars, budget_chars, .. } = &error;
+        let error =
+            build_coordinator_context(&request(&conversation, &message, &[], CONTEXT_BUDGET_CHARS))
+                .expect_err("the escaped message does not fit the default budget");
+        let ContextError::RequiredExceedsBudget {
+            required_chars,
+            budget_chars,
+            ..
+        } = &error;
         assert_eq!(*budget_chars, CONTEXT_BUDGET_CHARS);
         assert!(*required_chars > CONTEXT_BUDGET_CHARS);
     }
@@ -1127,10 +1433,17 @@ mod tests {
             let mut conversation = random_conversation(&mut Lcg(seed));
             stamp(&mut conversation);
             let index = tasks(3, "t");
-            let built = build_coordinator_context(&request(&conversation, "now", &index, budget)).expect("fits");
+            let built = build_coordinator_context(&request(&conversation, "now", &index, budget))
+                .expect("fits");
             let snapshot = &built.snapshot;
             assert_eq!(
-                (snapshot.projection_chars, snapshot.omitted_count, snapshot.included_entry_ids.len(), snapshot.open_proposals_included, snapshot.tasks_included),
+                (
+                    snapshot.projection_chars,
+                    snapshot.omitted_count,
+                    snapshot.included_entry_ids.len(),
+                    snapshot.open_proposals_included,
+                    snapshot.tasks_included
+                ),
                 (chars, omitted, included, open, task_count),
                 "seed {seed}, budget {budget}"
             );
@@ -1143,16 +1456,29 @@ mod tests {
     fn a_thousand_long_entries_select_the_recorded_newest_suffix() {
         let mut conversation = Conversation::new(Uuid::new_v4());
         for index in 0..1_000 {
-            message(&mut conversation, &format!("{index:04}{}", "m".repeat(3_996)));
+            message(
+                &mut conversation,
+                &format!("{index:04}{}", "m".repeat(3_996)),
+            );
         }
         stamp(&mut conversation);
         let built = build(&conversation, "now", &[], CONTEXT_BUDGET_CHARS);
         let snapshot = &built.snapshot;
         assert_eq!(
-            (snapshot.projection_chars, snapshot.omitted_count, snapshot.included_entry_ids.len()),
+            (
+                snapshot.projection_chars,
+                snapshot.omitted_count,
+                snapshot.included_entry_ids.len()
+            ),
             (62_708, 985, 15)
         );
-        assert!(built.projection.contains("0999mmmm"), "the newest entry is kept");
-        assert!(!built.projection.contains("0984mmmm"), "the entry before the kept suffix is omitted");
+        assert!(
+            built.projection.contains("0999mmmm"),
+            "the newest entry is kept"
+        );
+        assert!(
+            !built.projection.contains("0984mmmm"),
+            "the entry before the kept suffix is omitted"
+        );
     }
 }

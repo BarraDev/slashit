@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: MPL-2.0
+use crate::commands::github::read_issue_state;
 use crate::commands::gui_admission::GuiMutation;
-use crate::domain::{
-    Task, NewTask, TaskStatus, TaskCategory, TaskPriority, TaskComplexity,
-    TaskImpact, SecuritySeverity, TaskPhase, Subtask,
-};
-use crate::domain::task::{CodingProvider, ExternalRef};
 use crate::domain::github_issue_link::{
     already_linked_message, attach_github_issue, holds_issue, parse_issue_url,
 };
-use crate::commands::github::read_issue_state;
+use crate::domain::task::{CodingProvider, ExternalRef};
+use crate::domain::{
+    NewTask, SecuritySeverity, Subtask, Task, TaskCategory, TaskComplexity, TaskImpact, TaskPhase,
+    TaskPriority, TaskStatus,
+};
 use crate::lifecycle::{classify_status_transition, StatusTransitionEffect};
 use crate::queue::{PromotionChoice, PromotionOutcome};
-use uuid::Uuid;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 /// Assemble the handles [`crate::lifecycle::terminalize`] needs out of an
 /// `AppState`.
@@ -143,7 +143,12 @@ pub async fn create_task(
         &state.storage,
         project_id,
         move |existing| {
-            crate::domain::task_dependencies::check_targets(existing, id, project_id, &dependencies)?;
+            crate::domain::task_dependencies::check_targets(
+                existing,
+                id,
+                project_id,
+                &dependencies,
+            )?;
             let mut task = Task::new_backlog(existing, new);
             task.review_mode = review_mode;
             task.provider = provider;
@@ -209,7 +214,14 @@ pub(crate) async fn set_task_status(
 ) -> Result<Option<Task>, String> {
     if matches!(status, TaskStatus::Done) {
         let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
-        if let Some(old_status) = state.task.tasks.read().await.get(&task_id).map(|t| t.status.clone()) {
+        if let Some(old_status) = state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .map(|t| t.status.clone())
+        {
             refuse_unconfirmed_close(&old_status, close_without_merge)?;
         }
         return match crate::lifecycle::terminalize_leased(
@@ -246,8 +258,13 @@ pub(crate) async fn set_task_status(
     let queue_refusal = match queue_refusal {
         Some(refusal) => Some(refusal),
         None => {
-            crate::lifecycle::removed_project_queue_refusal(&state.task.tasks, &state.project.projects, task_id, &status)
-                .await
+            crate::lifecycle::removed_project_queue_refusal(
+                &state.task.tasks,
+                &state.project.projects,
+                task_id,
+                &status,
+            )
+            .await
         }
     };
 
@@ -322,7 +339,9 @@ pub(crate) async fn set_task_status(
             .await?
         {
             PromotionOutcome::Promoted(task) => Ok(Some(*task)),
-            refused => Err(executor.queued_promotion_refusal(Some(task_id), &refused).await),
+            refused => Err(executor
+                .queued_promotion_refusal(Some(task_id), &refused)
+                .await),
         };
     }
 
@@ -384,15 +403,22 @@ pub async fn set_task_dependencies(
 /// exactly as they were.
 pub(crate) async fn set_task_dependencies_via(
     tasks: &crate::lifecycle::Tasks,
-    projects: &tokio::sync::RwLock<std::collections::HashMap<Uuid, crate::domain::project::Project>>,
+    projects: &tokio::sync::RwLock<
+        std::collections::HashMap<Uuid, crate::domain::project::Project>,
+    >,
     storage: &crate::config::Storage,
     task_lifecycle_locks: &crate::lifecycle::TaskLifecycleLocks,
     task_id: Uuid,
     dependencies: Vec<String>,
 ) -> Result<Option<Task>, String> {
     let requested = crate::domain::task_dependencies::parse_requested(&dependencies)?;
-    let _lease =
-        crate::commands::project::lease_active_task_in(task_lifecycle_locks, tasks, projects, task_id).await?;
+    let _lease = crate::commands::project::lease_active_task_in(
+        task_lifecycle_locks,
+        tasks,
+        projects,
+        task_id,
+    )
+    .await?;
 
     // Checked against every Task first, so a Task of another Project is named
     // as such. The write checks again against the Tasks it stages.
@@ -415,7 +441,9 @@ pub(crate) async fn set_task_dependencies_via(
             }
             Ok(false) => false,
             Err(error) => {
-                *refusal.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                *refusal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
                 false
             }
         }
@@ -426,7 +454,10 @@ pub(crate) async fn set_task_dependencies_via(
         crate::lifecycle::record_classified_if_changed(tasks, storage, task_id, &revise).await;
     #[cfg(test)]
     crate::lifecycle::after_write_seam();
-    if let Some(error) = refusal.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+    if let Some(error) = refusal
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
         return Err(error);
     }
     match written {
@@ -611,8 +642,14 @@ pub async fn link_github_issue(
         return Err(already_linked_message(&issue));
     }
     let issue_state = read_issue_state(OsStr::new("gh"), &issue.repo, issue.number).await?;
-    attach_github_issue_serialized(&state.task.tasks, &state.storage, task_id, &issue, &issue_state)
-        .await
+    attach_github_issue_serialized(
+        &state.task.tasks,
+        &state.storage,
+        task_id,
+        &issue,
+        &issue_state,
+    )
+    .await
 }
 
 /// The write behind [`link_github_issue`]. The repeated-link check runs again
@@ -696,12 +733,18 @@ pub async fn link_pr(
         if let Some(task) = staged.get_mut(&task_id) {
             task.pr_url = Some(pr_url.clone());
             // Also add to external_refs if not already there
-            if !task.external_refs.iter().any(|r| matches!(r, ExternalRef::GithubPr { url, .. } if url == &pr_url)) {
+            if !task
+                .external_refs
+                .iter()
+                .any(|r| matches!(r, ExternalRef::GithubPr { url, .. } if url == &pr_url))
+            {
                 // Parse: https://github.com/{owner}/{repo}/pull/{number}
                 let parts: Vec<&str> = pr_url.trim_end_matches('/').split('/').collect();
                 if let Some(pull_idx) = parts.iter().position(|&p| p == "pull") {
                     if let Some(gh_idx) = parts.iter().position(|&p| p == "github.com") {
-                        if let (Some(number_str), true) = (parts.get(pull_idx + 1), gh_idx + 2 < pull_idx) {
+                        if let (Some(number_str), true) =
+                            (parts.get(pull_idx + 1), gh_idx + 2 < pull_idx)
+                        {
                             if let Ok(number) = number_str.parse::<u32>() {
                                 let repo = format!("{}/{}", parts[gh_idx + 1], parts[gh_idx + 2]);
                                 task.external_refs.push(ExternalRef::GithubPr {
@@ -763,14 +806,17 @@ pub async fn unstick_task(
 /// instead of re-deciding how the fields are stored.
 pub(crate) async fn set_task_model_and_review_mode(
     tasks: &crate::lifecycle::Tasks,
-    projects: &tokio::sync::RwLock<std::collections::HashMap<Uuid, crate::domain::project::Project>>,
+    projects: &tokio::sync::RwLock<
+        std::collections::HashMap<Uuid, crate::domain::project::Project>,
+    >,
     locks: &crate::lifecycle::TaskLifecycleLocks,
     storage: &crate::config::Storage,
     task_id: Uuid,
     model: Option<String>,
     review_mode: Option<crate::domain::task::ReviewMode>,
 ) -> Result<Option<Task>, String> {
-    let _lease = crate::commands::project::lease_active_task_in(locks, tasks, projects, task_id).await?;
+    let _lease =
+        crate::commands::project::lease_active_task_in(locks, tasks, projects, task_id).await?;
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
             if let Some(m) = model.clone() {
@@ -1009,9 +1055,14 @@ pub async fn reorder_task(
 
     let Some((project_id, old_status, unfinished_integration, queue_refusal)) = ({
         let tasks = state.task.tasks.read().await;
-        tasks
-            .get(&task_id)
-            .map(|t| (t.project_id, t.status.clone(), t.integration_unfinished_refusal(), t.queue_entry_refusal()))
+        tasks.get(&task_id).map(|t| {
+            (
+                t.project_id,
+                t.status.clone(),
+                t.integration_unfinished_refusal(),
+                t.queue_entry_refusal(),
+            )
+        })
     }) else {
         return Ok(None);
     };
@@ -1020,7 +1071,10 @@ pub async fn reorder_task(
     // Refused before anything else, under the lease, so no owner is ended, no
     // status written and no execution state reset -- and answered with the
     // task as it is, which the caller shows instead of what it expected.
-    if expected_status.as_ref().is_some_and(|expected| *expected != old_status) {
+    if expected_status
+        .as_ref()
+        .is_some_and(|expected| *expected != old_status)
+    {
         return Ok(state.task.tasks.read().await.get(&task_id).cloned());
     }
 
@@ -1051,7 +1105,10 @@ pub async fn reorder_task(
 
     // Same as `update_task_status`: refused before anything is ended or
     // written while new work is paused for disk space.
-    state.start_guard.check_move(&old_status, &target_status).await?;
+    state
+        .start_guard
+        .check_move(&old_status, &target_status)
+        .await?;
 
     let effect = if old_status == target_status {
         StatusTransitionEffect::None
@@ -1126,14 +1183,22 @@ pub async fn reorder_task(
             if let Some(task) = staged.get_mut(&promoted_id) {
                 task.record_move(&TaskStatus::Queue);
             }
-            renumber_column(staged, project_id, promoted_id, &TaskStatus::InProgress, new_position);
+            renumber_column(
+                staged,
+                project_id,
+                promoted_id,
+                &TaskStatus::InProgress,
+                new_position,
+            );
         };
         return match executor
             .promote_queued(PromotionChoice::Exact(task_id), place)
             .await?
         {
             PromotionOutcome::Promoted(task) => Ok(Some(*task)),
-            refused => Err(executor.queued_promotion_refusal(Some(task_id), &refused).await),
+            refused => Err(executor
+                .queued_promotion_refusal(Some(task_id), &refused)
+                .await),
         };
     }
 
@@ -1216,7 +1281,14 @@ pub async fn remove_external_ref(
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
-    remove_external_ref_chosen_locked(&state.task.tasks, &state.storage, task_id, ref_index, &expected).await
+    remove_external_ref_chosen_locked(
+        &state.task.tasks,
+        &state.storage,
+        task_id,
+        ref_index,
+        &expected,
+    )
+    .await
 }
 
 /// [`remove_external_ref_serialized`] for a caller that names the reference it
@@ -1235,7 +1307,11 @@ pub(crate) async fn remove_external_ref_chosen_serialized(
     expected: &ExternalRef,
 ) -> Result<Option<Task>, String> {
     let guards_lifecycle = matches!(expected, ExternalRef::GithubPr { .. });
-    let _lease = if guards_lifecycle { Some(locks.acquire(task_id).await?) } else { None };
+    let _lease = if guards_lifecycle {
+        Some(locks.acquire(task_id).await?)
+    } else {
+        None
+    };
     remove_external_ref_chosen_locked(tasks, storage, task_id, ref_index, expected).await
 }
 
@@ -1263,7 +1339,11 @@ pub(crate) async fn remove_external_ref_chosen_locked(
             let Some(task) = staged.get_mut(&task_id) else {
                 return false;
             };
-            if !task.external_refs.get(ref_index).is_some_and(|now| same_link(&expected, now)) {
+            if !task
+                .external_refs
+                .get(ref_index)
+                .is_some_and(|now| same_link(&expected, now))
+            {
                 moved.store(true, std::sync::atomic::Ordering::SeqCst);
                 return false;
             }
@@ -1363,8 +1443,10 @@ pub(crate) async fn remove_external_ref_serialized(
     };
     match chosen {
         Some(chosen) => {
-            remove_external_ref_chosen_serialized(tasks, storage, locks, task_id, ref_index, &chosen)
-                .await
+            remove_external_ref_chosen_serialized(
+                tasks, storage, locks, task_id, ref_index, &chosen,
+            )
+            .await
         }
         // Nothing is at that index, so there is nothing to remove.
         None => Ok(tasks.read().await.get(&task_id).cloned()),
@@ -1394,7 +1476,9 @@ pub fn update_task_status_logic(
         task.status = status.clone();
         task.updated_at = chrono::Utc::now();
 
-        if let StatusTransitionEffect::ResetExecutionState = classify_status_transition(&old_status, &status) {
+        if let StatusTransitionEffect::ResetExecutionState =
+            classify_status_transition(&old_status, &status)
+        {
             task.reset_execution_state();
         }
 
@@ -1438,7 +1522,6 @@ pub fn remove_external_ref_logic(
     }
 }
 
-
 /// Core reorder logic extracted for testability.
 ///
 /// Delegates the position arithmetic to the production [`renumber_column`] and
@@ -1481,8 +1564,8 @@ pub fn reorder_task_logic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{create_test_task_full, Uuid};
     use crate::domain::TaskStatus;
+    use crate::test_helpers::{create_test_task_full, Uuid};
 
     /// Helper to create a HashMap of tasks for testing
     fn create_test_tasks_map(tasks: Vec<Task>) -> HashMap<Uuid, Task> {
@@ -1491,8 +1574,14 @@ mod tests {
     /// Every status the board has today, so the exhaustive cases below stay
     /// exhaustive when a new one is added.
     const ALL_STATUSES: [TaskStatus; 8] = [
-        TaskStatus::Backlog, TaskStatus::Queue, TaskStatus::InProgress, TaskStatus::AiReview,
-        TaskStatus::HumanReview, TaskStatus::Done, TaskStatus::PrCreated, TaskStatus::Error,
+        TaskStatus::Backlog,
+        TaskStatus::Queue,
+        TaskStatus::InProgress,
+        TaskStatus::AiReview,
+        TaskStatus::HumanReview,
+        TaskStatus::Done,
+        TaskStatus::PrCreated,
+        TaskStatus::Error,
     ];
 
     /// A task that failed a run: it carries the error the run reported, and
@@ -1532,10 +1621,17 @@ mod tests {
             .expect("the task exists");
 
         assert_eq!(updated.status, TaskStatus::Queue);
-        assert_eq!(updated.phase, TaskPhase::Idle, "phase must reset so the poller picks it up");
+        assert_eq!(
+            updated.phase,
+            TaskPhase::Idle,
+            "phase must reset so the poller picks it up"
+        );
         assert_eq!(updated.phase_progress, 0);
         assert_eq!(updated.overall_progress, 0);
-        assert_eq!(updated.error_message, None, "the previous failure must not linger");
+        assert_eq!(
+            updated.error_message, None,
+            "the previous failure must not linger"
+        );
         assert_eq!(
             updated.worktree_path.as_deref(),
             Some("/tmp/wt/task-abcd1234"),
@@ -1562,10 +1658,17 @@ mod tests {
             .expect("the task exists");
 
         assert_eq!(reordered.status, TaskStatus::Queue);
-        assert_eq!(reordered.phase, TaskPhase::Idle, "phase must reset so the poller picks it up");
+        assert_eq!(
+            reordered.phase,
+            TaskPhase::Idle,
+            "phase must reset so the poller picks it up"
+        );
         assert_eq!(reordered.phase_progress, 0);
         assert_eq!(reordered.overall_progress, 0);
-        assert_eq!(reordered.error_message, None, "the previous failure must not linger");
+        assert_eq!(
+            reordered.error_message, None,
+            "the previous failure must not linger"
+        );
         assert_eq!(
             reordered.worktree_path.as_deref(),
             Some("/tmp/wt/task-abcd1234"),
@@ -1599,7 +1702,10 @@ mod tests {
         assert_eq!(updated.phase, TaskPhase::Idle);
         assert_eq!(updated.overall_progress, 0);
         assert_eq!(updated.error_message, None);
-        assert_eq!(updated.worktree_path.as_deref(), Some("/tmp/wt/task-abcd1234"));
+        assert_eq!(
+            updated.worktree_path.as_deref(),
+            Some("/tmp/wt/task-abcd1234")
+        );
         assert_eq!(updated.branch_name.as_deref(), Some("task-abcd1234"));
     }
 
@@ -1609,7 +1715,11 @@ mod tests {
         // places it is abandoned. Preserving the worktree is the safe default;
         // discarding one is a separate explicit action.
         for old in &ALL_STATUSES {
-            for new in [TaskStatus::Backlog, TaskStatus::Queue, TaskStatus::InProgress] {
+            for new in [
+                TaskStatus::Backlog,
+                TaskStatus::Queue,
+                TaskStatus::InProgress,
+            ] {
                 assert_eq!(
                     classify_status_transition(old, &new),
                     StatusTransitionEffect::ResetExecutionState,
@@ -1699,8 +1809,14 @@ mod tests {
             let dragged = reorder_task_logic(&mut by_drag, task_id, Some(new.clone()), 0)
                 .expect("the task exists");
 
-            assert_eq!(commanded.status, dragged.status, "status differs for -> {new:?}");
-            assert_eq!(commanded.phase, dragged.phase, "phase differs for -> {new:?}");
+            assert_eq!(
+                commanded.status, dragged.status,
+                "status differs for -> {new:?}"
+            );
+            assert_eq!(
+                commanded.phase, dragged.phase,
+                "phase differs for -> {new:?}"
+            );
             assert_eq!(
                 commanded.phase_progress, dragged.phase_progress,
                 "phase_progress differs for -> {new:?}"
@@ -1731,21 +1847,21 @@ mod tests {
         let task1 = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
         let task2 = create_test_task_full("Task 2", project_id, TaskStatus::Backlog, 1);
         let task3 = create_test_task_full("Task 3", project_id, TaskStatus::Backlog, 2);
-        
+
         let task1_id = task1.id;
         let task2_id = task2.id;
         let task3_id = task3.id;
-        
+
         let mut tasks = create_test_tasks_map(vec![task1, task2, task3]);
-        
+
         // Move task1 from position 0 to position 2 (end)
         let result = reorder_task_logic(&mut tasks, task1_id, None, 2);
-        
+
         assert!(result.is_some());
         let updated_task = result.unwrap();
         assert_eq!(updated_task.position, 2);
         assert_eq!(updated_task.status, TaskStatus::Backlog);
-        
+
         // Verify other tasks shifted up
         assert_eq!(tasks.get(&task2_id).unwrap().position, 0);
         assert_eq!(tasks.get(&task3_id).unwrap().position, 1);
@@ -1758,20 +1874,20 @@ mod tests {
         let task1 = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
         let task2 = create_test_task_full("Task 2", project_id, TaskStatus::Backlog, 1);
         let task3 = create_test_task_full("Task 3", project_id, TaskStatus::Backlog, 2);
-        
+
         let task1_id = task1.id;
         let task2_id = task2.id;
         let task3_id = task3.id;
-        
+
         let mut tasks = create_test_tasks_map(vec![task1, task2, task3]);
-        
+
         // Move task3 from position 2 to position 0 (start)
         let result = reorder_task_logic(&mut tasks, task3_id, None, 0);
-        
+
         assert!(result.is_some());
         let updated_task = result.unwrap();
         assert_eq!(updated_task.position, 0);
-        
+
         // Verify other tasks shifted down
         assert_eq!(tasks.get(&task1_id).unwrap().position, 1);
         assert_eq!(tasks.get(&task2_id).unwrap().position, 2);
@@ -1784,29 +1900,24 @@ mod tests {
         let task1 = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
         let task2 = create_test_task_full("Task 2", project_id, TaskStatus::Backlog, 1);
         let task3 = create_test_task_full("Task 3", project_id, TaskStatus::InProgress, 0);
-        
+
         let task1_id = task1.id;
         let task2_id = task2.id;
         let task3_id = task3.id;
-        
+
         let mut tasks = create_test_tasks_map(vec![task1, task2, task3]);
-        
+
         // Move task1 from Backlog to InProgress at position 0 (before task3)
-        let result = reorder_task_logic(
-            &mut tasks,
-            task1_id,
-            Some(TaskStatus::InProgress),
-            0,
-        );
-        
+        let result = reorder_task_logic(&mut tasks, task1_id, Some(TaskStatus::InProgress), 0);
+
         assert!(result.is_some());
         let updated_task = result.unwrap();
         assert_eq!(updated_task.status, TaskStatus::InProgress);
         assert_eq!(updated_task.position, 0);
-        
+
         // task3 should have shifted to position 1
         assert_eq!(tasks.get(&task3_id).unwrap().position, 1);
-        
+
         // task2 should remain at position 0 in Backlog (now only task in that column)
         // Actually, task2 stays in Backlog but since we don't reorder it, its position stays 1
         // But it's the only one left in Backlog, so logically it would be "first"
@@ -1819,20 +1930,20 @@ mod tests {
         let project_id = Uuid::new_v4();
         let task1 = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
         let task2 = create_test_task_full("Task 2", project_id, TaskStatus::Backlog, 1);
-        
+
         let task1_id = task1.id;
         let task2_id = task2.id;
-        
+
         let mut tasks = create_test_tasks_map(vec![task1, task2]);
-        
+
         // Try to move task1 to position 100 (way beyond valid range)
         let result = reorder_task_logic(&mut tasks, task1_id, None, 100);
-        
+
         assert!(result.is_some());
         let updated_task = result.unwrap();
         // Should be clamped to position 1 (max valid position with 2 tasks)
         assert_eq!(updated_task.position, 1);
-        
+
         // task2 should be at position 0
         assert_eq!(tasks.get(&task2_id).unwrap().position, 0);
     }
@@ -1843,14 +1954,14 @@ mod tests {
         let project_id = Uuid::new_v4();
         let task1 = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
         let task2 = create_test_task_full("Task 2", project_id, TaskStatus::Backlog, 1);
-        
+
         let task2_id = task2.id;
-        
+
         let mut tasks = create_test_tasks_map(vec![task1, task2]);
-        
+
         // Try to move task2 to position -5 (negative)
         let result = reorder_task_logic(&mut tasks, task2_id, None, -5);
-        
+
         assert!(result.is_some());
         let updated_task = result.unwrap();
         // Should be clamped to position 0
@@ -1861,13 +1972,13 @@ mod tests {
     fn test_reorder_nonexistent_task_returns_none() {
         let project_id = Uuid::new_v4();
         let task1 = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
-        
+
         let mut tasks = create_test_tasks_map(vec![task1]);
-        
+
         // Try to reorder a task that doesn't exist
         let fake_id = Uuid::new_v4();
         let result = reorder_task_logic(&mut tasks, fake_id, None, 0);
-        
+
         assert!(result.is_none());
     }
 
@@ -1877,19 +1988,14 @@ mod tests {
         let project_id = Uuid::new_v4();
         let task1 = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
         let task2 = create_test_task_full("Task 2", project_id, TaskStatus::Backlog, 1);
-        
+
         let task1_id = task1.id;
-        
+
         let mut tasks = create_test_tasks_map(vec![task1, task2]);
-        
+
         // Move task1 to InProgress (empty column)
-        let result = reorder_task_logic(
-            &mut tasks,
-            task1_id,
-            Some(TaskStatus::InProgress),
-            0,
-        );
-        
+        let result = reorder_task_logic(&mut tasks, task1_id, Some(TaskStatus::InProgress), 0);
+
         assert!(result.is_some());
         let updated_task = result.unwrap();
         assert_eq!(updated_task.status, TaskStatus::InProgress);
@@ -1903,24 +2009,19 @@ mod tests {
         let mut task1 = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
         task1.description = Some("Important description".to_string());
         task1.priority = crate::domain::TaskPriority::High;
-        
+
         let original_id = task1.id;
         let original_title = task1.title.clone();
         let original_description = task1.description.clone();
-        
+
         let mut tasks = create_test_tasks_map(vec![task1]);
-        
+
         // Move to a different column
-        let result = reorder_task_logic(
-            &mut tasks,
-            original_id,
-            Some(TaskStatus::InProgress),
-            0,
-        );
-        
+        let result = reorder_task_logic(&mut tasks, original_id, Some(TaskStatus::InProgress), 0);
+
         assert!(result.is_some());
         let updated_task = result.unwrap();
-        
+
         // Verify other fields are preserved
         assert_eq!(updated_task.id, original_id);
         assert_eq!(updated_task.title, original_title);
@@ -1937,22 +2038,22 @@ mod tests {
         let task3 = create_test_task_full("Task 3", project_id, TaskStatus::Backlog, 2);
         let task4 = create_test_task_full("Task 4", project_id, TaskStatus::Backlog, 3);
         let task5 = create_test_task_full("Task 5", project_id, TaskStatus::Backlog, 4);
-        
+
         let task1_id = task1.id;
         let task2_id = task2.id;
         let task3_id = task3.id;
         let task4_id = task4.id;
         let task5_id = task5.id;
-        
+
         let mut tasks = create_test_tasks_map(vec![task1, task2, task3, task4, task5]);
-        
+
         // Move task5 (position 4) to position 1
         let result = reorder_task_logic(&mut tasks, task5_id, None, 1);
-        
+
         assert!(result.is_some());
         let updated_task = result.unwrap();
         assert_eq!(updated_task.position, 1);
-        
+
         // Expected order: task1(0), task5(1), task2(2), task3(3), task4(4)
         assert_eq!(tasks.get(&task1_id).unwrap().position, 0);
         assert_eq!(tasks.get(&task5_id).unwrap().position, 1);
@@ -1966,23 +2067,23 @@ mod tests {
         // Ensure tasks from different projects don't affect each other
         let project_a = Uuid::new_v4();
         let project_b = Uuid::new_v4();
-        
+
         let task_a1 = create_test_task_full("Task A1", project_a, TaskStatus::Backlog, 0);
         let task_a2 = create_test_task_full("Task A2", project_a, TaskStatus::Backlog, 1);
         let task_b1 = create_test_task_full("Task B1", project_b, TaskStatus::Backlog, 0);
         let task_b2 = create_test_task_full("Task B2", project_b, TaskStatus::Backlog, 1);
-        
+
         let task_a1_id = task_a1.id;
         let task_b1_id = task_b1.id;
         let task_b2_id = task_b2.id;
-        
+
         let mut tasks = create_test_tasks_map(vec![task_a1, task_a2, task_b1, task_b2]);
-        
+
         // Move task_a1 to position 1 in project A
         let result = reorder_task_logic(&mut tasks, task_a1_id, None, 1);
-        
+
         assert!(result.is_some());
-        
+
         // Project B tasks should be unaffected
         assert_eq!(tasks.get(&task_b1_id).unwrap().position, 0);
         assert_eq!(tasks.get(&task_b2_id).unwrap().position, 1);
@@ -2000,12 +2101,7 @@ mod tests {
         // Small delay to ensure timestamp difference
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        let result = reorder_task_logic(
-            &mut tasks,
-            task1_id,
-            Some(TaskStatus::InProgress),
-            0,
-        );
+        let result = reorder_task_logic(&mut tasks, task1_id, Some(TaskStatus::InProgress), 0);
 
         assert!(result.is_some());
         let updated_task = result.unwrap();
@@ -2238,16 +2334,29 @@ mod tests {
         assert!(result.is_some());
         let updated = result.unwrap();
         assert_eq!(updated.external_refs.len(), 3);
-        assert!(matches!(&updated.external_refs[0], ExternalRef::GithubIssue { number: 1, .. }));
-        assert!(matches!(&updated.external_refs[1], ExternalRef::JiraTicket { .. }));
-        assert!(matches!(&updated.external_refs[2], ExternalRef::GithubIssue { number: 3, .. }));
+        assert!(matches!(
+            &updated.external_refs[0],
+            ExternalRef::GithubIssue { number: 1, .. }
+        ));
+        assert!(matches!(
+            &updated.external_refs[1],
+            ExternalRef::JiraTicket { .. }
+        ));
+        assert!(matches!(
+            &updated.external_refs[2],
+            ExternalRef::GithubIssue { number: 3, .. }
+        ));
     }
 
     #[test]
     fn test_remove_external_ref_at_index_zero() {
         let project_id = Uuid::new_v4();
         let mut task = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
-        task.external_refs = vec![make_github_issue_ref(1), make_jira_ref("PROJ-50"), make_github_issue_ref(3)];
+        task.external_refs = vec![
+            make_github_issue_ref(1),
+            make_jira_ref("PROJ-50"),
+            make_github_issue_ref(3),
+        ];
         let task_id = task.id;
         let mut tasks = create_test_tasks_map(vec![task]);
 
@@ -2256,8 +2365,14 @@ mod tests {
         let updated = result.unwrap();
         assert_eq!(updated.external_refs.len(), 2);
         // First element should now be the Jira ref (shifted from index 1)
-        assert!(matches!(&updated.external_refs[0], ExternalRef::JiraTicket { .. }));
-        assert!(matches!(&updated.external_refs[1], ExternalRef::GithubIssue { number: 3, .. }));
+        assert!(matches!(
+            &updated.external_refs[0],
+            ExternalRef::JiraTicket { .. }
+        ));
+        assert!(matches!(
+            &updated.external_refs[1],
+            ExternalRef::GithubIssue { number: 3, .. }
+        ));
     }
 
     #[test]
@@ -2369,29 +2484,60 @@ mod lifecycle_ownership {
         app.manage(state);
 
         for confirmed in [None, Some(false)] {
-            let refused = update_task_status(GuiMutation::untracked(), app.state(), by_status.to_string(), TaskStatus::Done, confirmed)
-                .await
-                .expect_err("not confirmed");
+            let refused = update_task_status(
+                GuiMutation::untracked(),
+                app.state(),
+                by_status.to_string(),
+                TaskStatus::Done,
+                confirmed,
+            )
+            .await
+            .expect_err("not confirmed");
             assert_eq!(refused, CLOSE_WITHOUT_MERGE_REQUIRED);
-            let refused = reorder_task(GuiMutation::untracked(), app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, confirmed, None)
-                .await
-                .expect_err("not confirmed");
+            let refused = reorder_task(
+                GuiMutation::untracked(),
+                app.state(),
+                by_drag.to_string(),
+                Some(TaskStatus::Done),
+                0,
+                confirmed,
+                None,
+            )
+            .await
+            .expect_err("not confirmed");
             assert_eq!(refused, CLOSE_WITHOUT_MERGE_REQUIRED);
         }
         let state: tauri::State<'_, crate::AppState> = app.state();
         for id in [by_status, by_drag] {
-            assert_eq!(state.task.tasks.read().await[&id].status, TaskStatus::HumanReview);
+            assert_eq!(
+                state.task.tasks.read().await[&id].status,
+                TaskStatus::HumanReview
+            );
         }
 
-        let closed = update_task_status(GuiMutation::untracked(), app.state(), by_status.to_string(), TaskStatus::Done, Some(true))
-            .await
-            .expect("confirmed")
-            .expect("the task exists");
+        let closed = update_task_status(
+            GuiMutation::untracked(),
+            app.state(),
+            by_status.to_string(),
+            TaskStatus::Done,
+            Some(true),
+        )
+        .await
+        .expect("confirmed")
+        .expect("the task exists");
         assert_eq!(closed.status, TaskStatus::Done);
-        let closed = reorder_task(GuiMutation::untracked(), app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, Some(true), None)
-            .await
-            .expect("confirmed")
-            .expect("the task exists");
+        let closed = reorder_task(
+            GuiMutation::untracked(),
+            app.state(),
+            by_drag.to_string(),
+            Some(TaskStatus::Done),
+            0,
+            Some(true),
+            None,
+        )
+        .await
+        .expect("confirmed")
+        .expect("the task exists");
         assert_eq!(closed.status, TaskStatus::Done);
     }
 
@@ -2404,15 +2550,29 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let done = update_task_status(GuiMutation::untracked(), app.state(), from_backlog.to_string(), TaskStatus::Done, None)
-            .await
-            .expect("no guard")
-            .expect("exists");
+        let done = update_task_status(
+            GuiMutation::untracked(),
+            app.state(),
+            from_backlog.to_string(),
+            TaskStatus::Done,
+            None,
+        )
+        .await
+        .expect("no guard")
+        .expect("exists");
         assert_eq!(done.status, TaskStatus::Done);
-        let done = reorder_task(GuiMutation::untracked(), app.state(), from_pr.to_string(), Some(TaskStatus::Done), 0, None, None)
-            .await
-            .expect("no guard")
-            .expect("exists");
+        let done = reorder_task(
+            GuiMutation::untracked(),
+            app.state(),
+            from_pr.to_string(),
+            Some(TaskStatus::Done),
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect("no guard")
+        .expect("exists");
         assert_eq!(done.status, TaskStatus::Done);
     }
 
@@ -2438,9 +2598,11 @@ mod lifecycle_ownership {
         // once with it, where the board refuses any write.
         let mut seeded = Vec::new();
         for with_recovery in [false, true] {
-            let mut task = create_test_task_full("queued with evidence", project_id, TaskStatus::Queue, 0);
+            let mut task =
+                create_test_task_full("queued with evidence", project_id, TaskStatus::Queue, 0);
             task.error_message = Some("the last run failed".into());
-            task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
+            task.human_review
+                .approve(Some("a".repeat(40)), chrono::Utc::now());
             if with_recovery {
                 task.worker_handoff = Some(crate::domain::WorkerHandoff {
                     review_mode: Default::default(),
@@ -2465,13 +2627,30 @@ mod lifecycle_ownership {
             let board = {
                 let mut tasks = state.task.tasks.write().await;
                 tasks.insert(task_id, task);
-                tasks.values().filter(|t| t.project_id == project_id).cloned().collect::<Vec<_>>()
+                tasks
+                    .values()
+                    .filter(|t| t.project_id == project_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
             };
-            state.storage.save_project_tasks(project_id, &board).expect("seed the board");
-            let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
-            let memory_before = serde_json::to_value(state.task.tasks.read().await[&task_id].clone()).unwrap();
-            let disk_before = serde_json::to_value(persisted_task(&state, project_id, task_id)).unwrap();
-            seeded.push((with_recovery, task_id, cleaned_up, memory_before, disk_before));
+            state
+                .storage
+                .save_project_tasks(project_id, &board)
+                .expect("seed the board");
+            let cleaned_up = executor
+                .register_fake_running_execution_for_test(task_id)
+                .await;
+            let memory_before =
+                serde_json::to_value(state.task.tasks.read().await[&task_id].clone()).unwrap();
+            let disk_before =
+                serde_json::to_value(persisted_task(&state, project_id, task_id)).unwrap();
+            seeded.push((
+                with_recovery,
+                task_id,
+                cleaned_up,
+                memory_before,
+                disk_before,
+            ));
         }
 
         let app = tauri::test::mock_app();
@@ -2489,12 +2668,23 @@ mod lifecycle_ownership {
                 "with recovery {with_recovery}: a request that changes nothing must not end the owner"
             );
             let state = app.state::<crate::AppState>();
-            let memory_after = serde_json::to_value(state.task.tasks.read().await[&task_id].clone()).unwrap();
-            let disk_after = serde_json::to_value(persisted_task(&state, project_id, task_id)).unwrap();
-            assert_eq!(memory_after, memory_before, "with recovery {with_recovery}: memory is unchanged");
-            assert_eq!(disk_after, disk_before, "with recovery {with_recovery}: the record is not rewritten");
+            let memory_after =
+                serde_json::to_value(state.task.tasks.read().await[&task_id].clone()).unwrap();
+            let disk_after =
+                serde_json::to_value(persisted_task(&state, project_id, task_id)).unwrap();
+            assert_eq!(
+                memory_after, memory_before,
+                "with recovery {with_recovery}: memory is unchanged"
+            );
+            assert_eq!(
+                disk_after, disk_before,
+                "with recovery {with_recovery}: the record is not rewritten"
+            );
             let written = persisted_task(&state, project_id, task_id);
-            assert_eq!(written.error_message.as_deref(), Some("the last run failed"));
+            assert_eq!(
+                written.error_message.as_deref(),
+                Some("the last run failed")
+            );
             assert!(written.human_review.is_approved());
             assert_eq!(written.worker_handoff.is_some(), with_recovery);
         }
@@ -2505,12 +2695,21 @@ mod lifecycle_ownership {
         let (_tmp, state) = test_state().await;
         let executor = attach_test_executor(&state);
         let task_id = seed(&state, TaskStatus::InProgress).await;
-        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+        let cleaned_up = executor
+            .register_fake_running_execution_for_test(task_id)
+            .await;
 
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
+        let result = update_task_status(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            TaskStatus::Backlog,
+            None,
+        )
+        .await;
 
         assert!(result.is_ok(), "the transition must succeed: {result:?}");
         assert!(
@@ -2535,12 +2734,21 @@ mod lifecycle_ownership {
         let (_tmp, state) = test_state().await;
         let executor = attach_test_executor(&state);
         let task_id = seed(&state, TaskStatus::AiReview).await;
-        let cleaned_up = executor.register_fake_reviewing_owner_for_test(task_id).await;
+        let cleaned_up = executor
+            .register_fake_reviewing_owner_for_test(task_id)
+            .await;
 
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
+        let result = update_task_status(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            TaskStatus::Backlog,
+            None,
+        )
+        .await;
 
         assert!(result.is_ok(), "the transition must succeed: {result:?}");
         assert!(
@@ -2556,12 +2764,21 @@ mod lifecycle_ownership {
         let (_tmp, state) = test_state().await;
         let executor = attach_test_executor(&state);
         let task_id = seed(&state, TaskStatus::InProgress).await;
-        executor.register_unkillable_running_execution_for_test(task_id).await;
+        executor
+            .register_unkillable_running_execution_for_test(task_id)
+            .await;
 
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
+        let result = update_task_status(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            TaskStatus::Backlog,
+            None,
+        )
+        .await;
 
         assert!(
             result.is_err(),
@@ -2604,7 +2821,14 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
+        let result = update_task_status(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            TaskStatus::Backlog,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "{result:?}");
 
         let live: &crate::AppState = app.state::<crate::AppState>().inner();
@@ -2615,8 +2839,7 @@ mod lifecycle_ownership {
             "the front door's own status must be the final word"
         );
         assert_eq!(
-            after.title,
-            "owner's own cleanup ran",
+            after.title, "owner's own cleanup ran",
             "the owner's own write, made on its way out while this command held the lease, \
              must have already landed -- proving it ran fully before the front door's commit \
              rather than racing or following it"
@@ -2628,13 +2851,24 @@ mod lifecycle_ownership {
         let (_tmp, state) = test_state().await;
         let executor = attach_test_executor(&state);
         let task_id = seed(&state, TaskStatus::InProgress).await;
-        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+        let cleaned_up = executor
+            .register_fake_running_execution_for_test(task_id)
+            .await;
 
         let app = tauri::test::mock_app();
         app.manage(state);
 
         // Same column: `new_status` names the column the task is already in.
-        let result = reorder_task(GuiMutation::untracked(), app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
+        let result = reorder_task(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            Some(TaskStatus::InProgress),
+            0,
+            None,
+            None,
+        )
+        .await;
 
         assert!(result.is_ok(), "{result:?}");
         assert!(
@@ -2653,12 +2887,23 @@ mod lifecycle_ownership {
         let (_tmp, state) = test_state().await;
         let executor = attach_test_executor(&state);
         let task_id = seed(&state, TaskStatus::InProgress).await;
-        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+        let cleaned_up = executor
+            .register_fake_running_execution_for_test(task_id)
+            .await;
 
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = reorder_task(GuiMutation::untracked(), app.state(), task_id.to_string(), Some(TaskStatus::Backlog), 0, None, None).await;
+        let result = reorder_task(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            Some(TaskStatus::Backlog),
+            0,
+            None,
+            None,
+        )
+        .await;
 
         assert!(result.is_ok(), "{result:?}");
         assert!(
@@ -2674,7 +2919,14 @@ mod lifecycle_ownership {
     async fn a_drag_into_queue_is_refused_while_a_cleanup_is_unfinished() {
         let (_tmp, state) = test_state().await;
         let task_id = seed(&state, TaskStatus::Backlog).await;
-        state.task.tasks.write().await.get_mut(&task_id).expect("seeded").cleanup_in_flight = true;
+        state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&task_id)
+            .expect("seeded")
+            .cleanup_in_flight = true;
         let app = tauri::test::mock_app();
         app.manage(state);
 
@@ -2694,7 +2946,10 @@ mod lifecycle_ownership {
         let live = app.state::<crate::AppState>();
         let task = live.task.tasks.read().await[&task_id].clone();
         assert_eq!(task.status, TaskStatus::Backlog);
-        assert!(task.cleanup_in_flight, "the refusal leaves the record as it was");
+        assert!(
+            task.cleanup_in_flight,
+            "the refusal leaves the record as it was"
+        );
     }
 
     /// A stale enqueue: the person saw the task in one column and asked to
@@ -2711,12 +2966,15 @@ mod lifecycle_ownership {
             task.phase_progress = 40;
             task.overall_progress = 30;
         }
-        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+        let cleaned_up = executor
+            .register_fake_running_execution_for_test(task_id)
+            .await;
 
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = reorder_task(GuiMutation::untracked(), 
+        let result = reorder_task(
+            GuiMutation::untracked(),
             app.state(),
             task_id.to_string(),
             Some(TaskStatus::Queue),
@@ -2762,12 +3020,20 @@ mod lifecycle_ownership {
     async fn a_stale_retry_leaves_an_already_queued_task_as_it_is() {
         let (_tmp, state) = test_state().await;
         let task_id = seed(&state, TaskStatus::Queue).await;
-        let before = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+        let before = state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
+            .unwrap();
 
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let answered = reorder_task(GuiMutation::untracked(), 
+        let answered = reorder_task(
+            GuiMutation::untracked(),
             app.state(),
             task_id.to_string(),
             Some(TaskStatus::Queue),
@@ -2794,7 +3060,8 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let answered = reorder_task(GuiMutation::untracked(), 
+        let answered = reorder_task(
+            GuiMutation::untracked(),
             app.state(),
             task_id.to_string(),
             Some(TaskStatus::Queue),
@@ -2839,7 +3106,10 @@ mod disk_pressure {
         let task = create_test_task_full("under test", project_id, status, 0);
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task.clone());
-        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
         (task_id, project_id)
     }
 
@@ -2854,7 +3124,9 @@ mod disk_pressure {
     }
 
     fn paused(result: &Result<Option<Task>, String>) -> bool {
-        result.as_ref().is_err_and(|m| m.starts_with("New work paused"))
+        result
+            .as_ref()
+            .is_err_and(|m| m.starts_with("New work paused"))
     }
 
     #[tokio::test]
@@ -2867,13 +3139,34 @@ mod disk_pressure {
         app.manage(state);
         let state: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        let result = update_task_status(GuiMutation::untracked(), app.state(), by_status.to_string(), TaskStatus::InProgress, None).await;
+        let result = update_task_status(
+            GuiMutation::untracked(),
+            app.state(),
+            by_status.to_string(),
+            TaskStatus::InProgress,
+            None,
+        )
+        .await;
         assert!(paused(&result), "{result:?}");
-        assert_eq!(on_disk(state, project_a, by_status).status, TaskStatus::Backlog);
-        assert_eq!(state.task.tasks.read().await[&by_status].status, TaskStatus::Backlog);
+        assert_eq!(
+            on_disk(state, project_a, by_status).status,
+            TaskStatus::Backlog
+        );
+        assert_eq!(
+            state.task.tasks.read().await[&by_status].status,
+            TaskStatus::Backlog
+        );
 
-        let result =
-            reorder_task(GuiMutation::untracked(), app.state(), by_drag.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
+        let result = reorder_task(
+            GuiMutation::untracked(),
+            app.state(),
+            by_drag.to_string(),
+            Some(TaskStatus::InProgress),
+            0,
+            None,
+            None,
+        )
+        .await;
         assert!(paused(&result), "{result:?}");
         let task = on_disk(state, project_b, by_drag);
         assert_eq!(task.status, TaskStatus::Error, "not reset, not moved");
@@ -2885,15 +3178,28 @@ mod disk_pressure {
         let (_tmp, state) = state_on(&disk).await;
         let executor = attach_test_executor(&state);
         let (task_id, _) = seed(&state, TaskStatus::AiReview).await;
-        let review_ended = executor.register_fake_reviewing_owner_for_test(task_id).await;
+        let review_ended = executor
+            .register_fake_reviewing_owner_for_test(task_id)
+            .await;
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result =
-            reorder_task(GuiMutation::untracked(), app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
+        let result = reorder_task(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            Some(TaskStatus::InProgress),
+            0,
+            None,
+            None,
+        )
+        .await;
 
         assert!(paused(&result), "{result:?}");
-        assert!(!review_ended.load(std::sync::atomic::Ordering::SeqCst), "the review keeps running");
+        assert!(
+            !review_ended.load(std::sync::atomic::Ordering::SeqCst),
+            "the review keeps running"
+        );
         assert!(executor.is_task_running(task_id).await);
     }
 
@@ -2907,10 +3213,19 @@ mod disk_pressure {
         app.manage(state);
         let state: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        let result = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::InProgress, None).await;
+        let result = update_task_status(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+            TaskStatus::InProgress,
+            None,
+        )
+        .await;
 
         assert!(
-            result.as_ref().is_err_and(|m| m.contains("couldn't verify free disk space")),
+            result
+                .as_ref()
+                .is_err_and(|m| m.contains("couldn't verify free disk space")),
             "{result:?}"
         );
         let task = on_disk(state, project_id, task_id);
@@ -2928,7 +3243,8 @@ mod disk_pressure {
         app.manage(state);
 
         // The drawer's Start: enqueue, as seen in Backlog.
-        let queued = reorder_task(GuiMutation::untracked(), 
+        let queued = reorder_task(
+            GuiMutation::untracked(),
             app.state(),
             started.to_string(),
             Some(TaskStatus::Queue),
@@ -2942,10 +3258,16 @@ mod disk_pressure {
         assert_eq!(queued.status, TaskStatus::Queue, "it waits in the queue");
 
         disk.set_available(100 * GIB); // Warning
-        let moved = update_task_status(GuiMutation::untracked(), app.state(), dragged.to_string(), TaskStatus::InProgress, None)
-            .await
-            .expect("Warning does not pause new work")
-            .expect("the task exists");
+        let moved = update_task_status(
+            GuiMutation::untracked(),
+            app.state(),
+            dragged.to_string(),
+            TaskStatus::InProgress,
+            None,
+        )
+        .await
+        .expect("Warning does not pause new work")
+        .expect("the task exists");
         assert_eq!(moved.status, TaskStatus::InProgress);
     }
 
@@ -2959,12 +3281,24 @@ mod disk_pressure {
         app.manage(state);
         let state: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        let result = crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await;
-        assert!(result.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{result:?}");
-        assert_eq!(on_disk(state, project_id, task_id).status, TaskStatus::Queue);
+        let result =
+            crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|m| m.starts_with("New work paused")),
+            "{result:?}"
+        );
+        assert_eq!(
+            on_disk(state, project_id, task_id).status,
+            TaskStatus::Queue
+        );
 
         disk.set_available(300 * GIB);
-        let promoted = crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await.expect("promoted");
+        let promoted =
+            crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state())
+                .await
+                .expect("promoted");
         assert_eq!(promoted, Some(task_id.to_string()));
     }
 
@@ -2977,10 +3311,23 @@ mod disk_pressure {
         app.manage(state);
         let state: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        let refused = crate::commands::worktree::create_worktree(GuiMutation::untracked(), app.state(), task_id.to_string()).await;
-        assert!(refused.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{refused:?}");
+        let refused = crate::commands::worktree::create_worktree(
+            GuiMutation::untracked(),
+            app.state(),
+            task_id.to_string(),
+        )
+        .await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|m| m.starts_with("New work paused")),
+            "{refused:?}"
+        );
         assert!(on_disk(state, project_id, task_id).worktree_path.is_none());
-        assert!(state.agent.executions.read().await.is_empty(), "nothing was recorded");
+        assert!(
+            state.agent.executions.read().await.is_empty(),
+            "nothing was recorded"
+        );
     }
 
     #[tokio::test]
@@ -2990,7 +3337,9 @@ mod disk_pressure {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let pause = crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap();
+        let pause = crate::commands::storage_usage::get_new_work_pause(app.state())
+            .await
+            .unwrap();
         assert_eq!(
             pause,
             Some(crate::domain::storage_usage::StartBlock::CriticalDisk {
@@ -2999,10 +3348,17 @@ mod disk_pressure {
             })
         );
         disk.set_available(100 * GIB);
-        assert_eq!(crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap(), None);
+        assert_eq!(
+            crate::commands::storage_usage::get_new_work_pause(app.state())
+                .await
+                .unwrap(),
+            None
+        );
         disk.fail();
         assert!(matches!(
-            crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap(),
+            crate::commands::storage_usage::get_new_work_pause(app.state())
+                .await
+                .unwrap(),
             Some(crate::domain::storage_usage::StartBlock::DiskSpaceUnavailable { .. })
         ));
     }
@@ -3036,14 +3392,23 @@ mod human_review_close_confirmation {
         let task = create_test_task_full("under test", project_id, TaskStatus::HumanReview, 0);
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task.clone());
-        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
 
         let refused = set_task_status(&state, task_id, TaskStatus::Done, None)
             .await
             .expect_err("an unconfirmed close from Human Review must be refused");
         assert_eq!(refused, CLOSE_WITHOUT_MERGE_REQUIRED);
         assert_eq!(
-            state.task.tasks.read().await.get(&task_id).map(|t| t.status.clone()),
+            state
+                .task
+                .tasks
+                .read()
+                .await
+                .get(&task_id)
+                .map(|t| t.status.clone()),
             Some(TaskStatus::HumanReview),
             "a refused close must leave the task in Human Review"
         );
@@ -3063,24 +3428,34 @@ mod human_review_close_confirmation {
         let (_tmp, state) = test_state().await;
         let project_id = Uuid::new_v4();
         let mut task = create_test_task_full("under test", project_id, TaskStatus::HumanReview, 0);
-        task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
+        task.human_review
+            .approve(Some("a".repeat(40)), chrono::Utc::now());
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task.clone());
-        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
 
         let away = set_task_status(&state, task_id, TaskStatus::AiReview, None)
             .await
             .expect("a move out of Human Review is allowed")
             .expect("the task is found");
         assert_eq!(away.status, TaskStatus::AiReview);
-        assert!(!away.human_review.is_approved(), "the approval is withdrawn when the task leaves review");
+        assert!(
+            !away.human_review.is_approved(),
+            "the approval is withdrawn when the task leaves review"
+        );
 
         let back = set_task_status(&state, task_id, TaskStatus::HumanReview, None)
             .await
             .expect("a manual move back into review is allowed")
             .expect("the task is found");
         assert_eq!(back.status, TaskStatus::HumanReview);
-        assert!(!back.human_review.is_approved(), "a return without a new arrival is undecided");
+        assert!(
+            !back.human_review.is_approved(),
+            "a return without a new arrival is undecided"
+        );
     }
 }
 
@@ -3110,7 +3485,10 @@ mod queue_entry_from_a_status_move {
         let project_id = task.project_id;
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task.clone());
-        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
         (project_id, task_id)
     }
 
@@ -3127,11 +3505,14 @@ mod queue_entry_from_a_status_move {
     #[tokio::test]
     async fn a_status_move_into_queue_refuses_unfinished_cleanup() {
         let (_tmp, state) = test_state().await;
-        let mut task = create_test_task_full("cleaning up", Uuid::new_v4(), TaskStatus::HumanReview, 0);
+        let mut task =
+            create_test_task_full("cleaning up", Uuid::new_v4(), TaskStatus::HumanReview, 0);
         task.cleanup_in_flight = true;
         let (project_id, task_id) = seed(&state, task).await;
         let executor = crate::test_helpers::attach_test_executor(&state);
-        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+        let cleaned_up = executor
+            .register_fake_running_execution_for_test(task_id)
+            .await;
 
         let Err(refusal) = set_task_status(&state, task_id, TaskStatus::Queue, None).await else {
             panic!("a Task with unfinished cleanup must not enter Queue");
@@ -3143,8 +3524,14 @@ mod queue_entry_from_a_status_move {
             "a move that will be refused must not end the owner"
         );
         assert!(executor.is_task_running(task_id).await);
-        assert_eq!(state.task.tasks.read().await[&task_id].status, TaskStatus::HumanReview);
-        assert_eq!(persisted(&state, project_id, task_id).status, TaskStatus::HumanReview);
+        assert_eq!(
+            state.task.tasks.read().await[&task_id].status,
+            TaskStatus::HumanReview
+        );
+        assert_eq!(
+            persisted(&state, project_id, task_id).status,
+            TaskStatus::HumanReview
+        );
     }
 
     #[tokio::test]
@@ -3167,7 +3554,9 @@ mod queue_entry_from_a_status_move {
         });
         let (project_id, task_id) = seed(&state, task).await;
         let executor = crate::test_helpers::attach_test_executor(&state);
-        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+        let cleaned_up = executor
+            .register_fake_running_execution_for_test(task_id)
+            .await;
 
         let Err(refusal) = set_task_status(&state, task_id, TaskStatus::Queue, None).await else {
             panic!("a Task whose Worker is still running must not enter Queue");
@@ -3179,8 +3568,14 @@ mod queue_entry_from_a_status_move {
             "a queue request that cannot be written must leave the live Worker running"
         );
         assert!(executor.is_task_running(task_id).await);
-        assert_eq!(state.task.tasks.read().await[&task_id].status, TaskStatus::InProgress);
-        assert_eq!(persisted(&state, project_id, task_id).status, TaskStatus::InProgress);
+        assert_eq!(
+            state.task.tasks.read().await[&task_id].status,
+            TaskStatus::InProgress
+        );
+        assert_eq!(
+            persisted(&state, project_id, task_id).status,
+            TaskStatus::InProgress
+        );
     }
 
     #[tokio::test]
@@ -3234,14 +3629,22 @@ mod task_dependency_contract {
 
     /// A running application over a fresh state root, with two Projects that
     /// each hold Tasks added by the caller.
-    async fn app_with(tasks: Vec<Task>, projects: &[Uuid]) -> (tempfile::TempDir, Arc<AppPaths>, App) {
+    async fn app_with(
+        tasks: Vec<Task>,
+        projects: &[Uuid],
+    ) -> (tempfile::TempDir, Arc<AppPaths>, App) {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let paths = paths_in(&tmp);
         let (state, _report) = crate::app_core::build_state_with_paths(paths.clone())
             .await
             .expect("state should build under a fresh tempdir");
         for id in projects {
-            state.project.projects.write().await.insert(*id, project(*id));
+            state
+                .project
+                .projects
+                .write()
+                .await
+                .insert(*id, project(*id));
         }
         {
             let mut memory = state.task.tasks.write().await;
@@ -3249,8 +3652,15 @@ mod task_dependency_contract {
                 memory.insert(task.id, task.clone());
             }
             for id in projects {
-                let board: Vec<Task> = memory.values().filter(|t| t.project_id == *id).cloned().collect();
-                state.storage.save_project_tasks(*id, &board).expect("seed the board");
+                let board: Vec<Task> = memory
+                    .values()
+                    .filter(|t| t.project_id == *id)
+                    .cloned()
+                    .collect();
+                state
+                    .storage
+                    .save_project_tasks(*id, &board)
+                    .expect("seed the board");
             }
         }
         let app = tauri::test::mock_app();
@@ -3288,7 +3698,11 @@ mod task_dependency_contract {
     }
 
     /// Both copies of a Task: the one in memory and the one the board file holds.
-    async fn both_copies(app: &App, project_id: Uuid, task_id: Uuid) -> (serde_json::Value, serde_json::Value) {
+    async fn both_copies(
+        app: &App,
+        project_id: Uuid,
+        task_id: Uuid,
+    ) -> (serde_json::Value, serde_json::Value) {
         let state = app.state::<crate::AppState>();
         let memory = state.task.tasks.read().await[&task_id].clone();
         let disk = state
@@ -3298,7 +3712,10 @@ mod task_dependency_contract {
             .into_iter()
             .find(|t| t.id == task_id)
             .expect("the task must be on disk");
-        (serde_json::to_value(memory).unwrap(), serde_json::to_value(disk).unwrap())
+        (
+            serde_json::to_value(memory).unwrap(),
+            serde_json::to_value(disk).unwrap(),
+        )
     }
 
     /// The Tasks of `project_id` as the board file holds them, in id order.
@@ -3315,7 +3732,11 @@ mod task_dependency_contract {
         ids
     }
 
-    async fn create(app: &App, project_id: Uuid, dependencies: Vec<String>) -> Result<Task, String> {
+    async fn create(
+        app: &App,
+        project_id: Uuid,
+        dependencies: Vec<String>,
+    ) -> Result<Task, String> {
         create_task(
             GuiMutation::untracked(),
             app.state(),
@@ -3381,18 +3802,35 @@ mod task_dependency_contract {
         let project_id = Uuid::new_v4();
         let (_tmp, _paths, app) = app_with(vec![], &[project_id]).await;
 
-        for (asked, expected) in [(Some(Manual), Manual), (Some(Automatic), Automatic), (None, Automatic)] {
-            let created = create_in_mode(&app, project_id, asked).await.expect("created");
+        for (asked, expected) in [
+            (Some(Manual), Manual),
+            (Some(Automatic), Automatic),
+            (None, Automatic),
+        ] {
+            let created = create_in_mode(&app, project_id, asked)
+                .await
+                .expect("created");
             assert_eq!(created.review_mode, expected);
             let (memory, disk) = both_copies(&app, project_id, created.id).await;
-            let mode = |v: &serde_json::Value| v.get("review_mode").and_then(|m| m.as_str()).map(str::to_owned);
+            let mode = |v: &serde_json::Value| {
+                v.get("review_mode")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_owned)
+            };
             let stored = (mode(&memory), mode(&disk));
             match expected {
                 Manual => assert_eq!(stored, (Some("manual".into()), Some("manual".into()))),
                 Automatic => assert_eq!(stored, (None, None), "the default is omitted"),
             }
-            let reloaded = app.state::<crate::AppState>().storage.load_project_tasks(project_id).expect("reload");
-            let reloaded = reloaded.into_iter().find(|t| t.id == created.id).expect("present");
+            let reloaded = app
+                .state::<crate::AppState>()
+                .storage
+                .load_project_tasks(project_id)
+                .expect("reload");
+            let reloaded = reloaded
+                .into_iter()
+                .find(|t| t.id == created.id)
+                .expect("present");
             assert_eq!(reloaded.review_mode, expected);
         }
     }
@@ -3404,7 +3842,11 @@ mod task_dependency_contract {
             .args(args)
             .output()
             .expect("git runs");
-        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A Task created through `create_task` and then passed through the
@@ -3448,8 +3890,14 @@ mod task_dependency_contract {
         }
         let executor = crate::test_helpers::attach_test_executor(&state);
 
-        for (asked, expected) in [(Some(Manual), Manual), (Some(Automatic), Automatic), (None, Automatic)] {
-            let created = create_in_mode(&app, project_id, asked).await.expect("created");
+        for (asked, expected) in [
+            (Some(Manual), Manual),
+            (Some(Automatic), Automatic),
+            (None, Automatic),
+        ] {
+            let created = create_in_mode(&app, project_id, asked)
+                .await
+                .expect("created");
             executor
                 .record_run_start_for_test(created.id, repo.to_str().unwrap())
                 .await
@@ -3465,14 +3913,21 @@ mod task_dependency_contract {
                 .expect("present");
             for task in [memory, disk] {
                 let handoff = task.worker_handoff.expect("the start wrote a handoff");
-                assert!(matches!(handoff.stage, crate::domain::WorkerHandoffStage::Started {}));
+                assert!(matches!(
+                    handoff.stage,
+                    crate::domain::WorkerHandoffStage::Started {}
+                ));
                 assert_eq!(handoff.review_mode, expected, "asked {asked:?}");
                 assert!(!handoff.review_mode_unproven);
             }
         }
     }
 
-    async fn set(app: &App, task_id: Uuid, dependencies: Vec<Uuid>) -> Result<Option<Task>, String> {
+    async fn set(
+        app: &App,
+        task_id: Uuid,
+        dependencies: Vec<Uuid>,
+    ) -> Result<Option<Task>, String> {
         set_task_dependencies(
             GuiMutation::untracked(),
             app.state(),
@@ -3488,7 +3943,9 @@ mod task_dependency_contract {
         let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
         let (_tmp, _paths, app) = app_with(vec![parent.clone()], &[project_id]).await;
 
-        let created = create(&app, project_id, vec![parent.id.to_string()]).await.expect("a valid dependency is written");
+        let created = create(&app, project_id, vec![parent.id.to_string()])
+            .await
+            .expect("a valid dependency is written");
 
         assert_eq!(created.dependencies, vec![parent.id]);
         let (memory, disk) = both_copies(&app, project_id, created.id).await;
@@ -3529,19 +3986,48 @@ mod task_dependency_contract {
         let before_memory = app.state::<crate::AppState>().task.tasks.read().await.len();
 
         let cases: Vec<(&str, Vec<String>, &str)> = vec![
-            ("malformed", vec!["not-a-task".to_string()], "not a valid Task identifier"),
-            ("duplicate", vec![parent.id.to_string(), parent.id.to_string()], "more than once"),
-            ("two dependencies", vec![parent.id.to_string(), other.id.to_string()], "one other Task"),
-            ("nonexistent", vec![Uuid::new_v4().to_string()], "not found in this Project"),
-            ("another Project", vec![foreign.id.to_string()], "belongs to another Project"),
+            (
+                "malformed",
+                vec!["not-a-task".to_string()],
+                "not a valid Task identifier",
+            ),
+            (
+                "duplicate",
+                vec![parent.id.to_string(), parent.id.to_string()],
+                "more than once",
+            ),
+            (
+                "two dependencies",
+                vec![parent.id.to_string(), other.id.to_string()],
+                "one other Task",
+            ),
+            (
+                "nonexistent",
+                vec![Uuid::new_v4().to_string()],
+                "not found in this Project",
+            ),
+            (
+                "another Project",
+                vec![foreign.id.to_string()],
+                "belongs to another Project",
+            ),
         ];
         for (label, dependencies, expected) in cases {
-            let error = create(&app, project_id, dependencies).await.expect_err(label);
+            let error = create(&app, project_id, dependencies)
+                .await
+                .expect_err(label);
             assert!(error.contains(expected), "{label}: {error}");
         }
 
-        assert_eq!(board_ids(&app, project_id), before_board, "no Task was written");
-        assert_eq!(app.state::<crate::AppState>().task.tasks.read().await.len(), before_memory);
+        assert_eq!(
+            board_ids(&app, project_id),
+            before_board,
+            "no Task was written"
+        );
+        assert_eq!(
+            app.state::<crate::AppState>().task.tasks.read().await.len(),
+            before_memory
+        );
     }
 
     #[tokio::test]
@@ -3549,15 +4035,28 @@ mod task_dependency_contract {
         let project_id = Uuid::new_v4();
         let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
         let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
-        let (_tmp, _paths, app) = app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
+        let (_tmp, _paths, app) =
+            app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
 
-        let set_once = set(&app, child.id, vec![parent.id]).await.expect("set").expect("the task exists");
+        let set_once = set(&app, child.id, vec![parent.id])
+            .await
+            .expect("set")
+            .expect("the task exists");
         assert_eq!(set_once.dependencies, vec![parent.id]);
-        assert_eq!(both_copies(&app, project_id, child.id).await.1["dependencies"], serde_json::json!([parent.id]));
+        assert_eq!(
+            both_copies(&app, project_id, child.id).await.1["dependencies"],
+            serde_json::json!([parent.id])
+        );
 
-        let cleared = set(&app, child.id, vec![]).await.expect("clear").expect("the task exists");
+        let cleared = set(&app, child.id, vec![])
+            .await
+            .expect("clear")
+            .expect("the task exists");
         assert!(cleared.dependencies.is_empty());
-        assert_eq!(both_copies(&app, project_id, child.id).await.1["dependencies"], serde_json::json!([]));
+        assert_eq!(
+            both_copies(&app, project_id, child.id).await.1["dependencies"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]
@@ -3566,14 +4065,22 @@ mod task_dependency_contract {
         let foreign_project = Uuid::new_v4();
         let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
         let foreign = task(foreign_project, "foreign", TaskStatus::Backlog, vec![]);
-        let (_tmp, _paths, app) = app_with(vec![child.clone(), foreign.clone()], &[project_id, foreign_project]).await;
+        let (_tmp, _paths, app) = app_with(
+            vec![child.clone(), foreign.clone()],
+            &[project_id, foreign_project],
+        )
+        .await;
         let before = both_copies(&app, project_id, child.id).await;
 
         let self_error = set(&app, child.id, vec![child.id]).await.expect_err("self");
         assert!(self_error.contains("itself"), "{self_error}");
-        let missing = set(&app, child.id, vec![Uuid::new_v4()]).await.expect_err("nonexistent");
+        let missing = set(&app, child.id, vec![Uuid::new_v4()])
+            .await
+            .expect_err("nonexistent");
         assert!(missing.contains("not found in this Project"), "{missing}");
-        let foreign_error = set(&app, child.id, vec![foreign.id]).await.expect_err("foreign");
+        let foreign_error = set(&app, child.id, vec![foreign.id])
+            .await
+            .expect_err("foreign");
         assert!(foreign_error.contains("another Project"), "{foreign_error}");
         let malformed = set_task_dependencies(
             GuiMutation::untracked(),
@@ -3583,7 +4090,10 @@ mod task_dependency_contract {
         )
         .await
         .expect_err("malformed");
-        assert!(malformed.contains("not a valid Task identifier"), "{malformed}");
+        assert!(
+            malformed.contains("not a valid Task identifier"),
+            "{malformed}"
+        );
 
         assert_eq!(both_copies(&app, project_id, child.id).await, before);
     }
@@ -3594,17 +4104,24 @@ mod task_dependency_contract {
         let a = task(project_id, "a", TaskStatus::Backlog, vec![]);
         let b = task(project_id, "b", TaskStatus::Backlog, vec![a.id]);
         let c = task(project_id, "c", TaskStatus::Backlog, vec![b.id]);
-        let (_tmp, _paths, app) = app_with(vec![a.clone(), b.clone(), c.clone()], &[project_id]).await;
+        let (_tmp, _paths, app) =
+            app_with(vec![a.clone(), b.clone(), c.clone()], &[project_id]).await;
         let before_a = both_copies(&app, project_id, a.id).await;
         let before_b = both_copies(&app, project_id, b.id).await;
 
         let direct = set(&app, a.id, vec![b.id]).await.expect_err("direct cycle");
         assert!(direct.contains("depend on itself"), "{direct}");
-        let indirect = set(&app, a.id, vec![c.id]).await.expect_err("indirect cycle");
+        let indirect = set(&app, a.id, vec![c.id])
+            .await
+            .expect_err("indirect cycle");
         assert!(indirect.contains("depend on itself"), "{indirect}");
 
         assert_eq!(both_copies(&app, project_id, a.id).await, before_a);
-        assert_eq!(both_copies(&app, project_id, b.id).await, before_b, "the cycle partner is untouched");
+        assert_eq!(
+            both_copies(&app, project_id, b.id).await,
+            before_b,
+            "the cycle partner is untouched"
+        );
     }
 
     #[tokio::test]
@@ -3615,10 +4132,13 @@ mod task_dependency_contract {
         // by its status before the checkout is looked at.
         let mut running = task(project_id, "running", TaskStatus::Backlog, vec![]);
         running.branch_name = Some("slashit/running".to_string());
-        let (_tmp, _paths, app) = app_with(vec![parent.clone(), running.clone()], &[project_id]).await;
+        let (_tmp, _paths, app) =
+            app_with(vec![parent.clone(), running.clone()], &[project_id]).await;
         let before = both_copies(&app, project_id, running.id).await;
 
-        let error = set(&app, running.id, vec![parent.id]).await.expect_err("a checkout exists");
+        let error = set(&app, running.id, vec![parent.id])
+            .await
+            .expect_err("a checkout exists");
         assert!(error.contains("checkout"), "{error}");
         assert_eq!(both_copies(&app, project_id, running.id).await, before);
     }
@@ -3696,7 +4216,11 @@ mod task_dependency_contract {
     }
 
     /// An Edit with every field unchanged except the ones a test names.
-    fn edit_of(task_id: Uuid, model: Option<&str>, dependencies: Option<Vec<Uuid>>) -> UpdateTaskParams {
+    fn edit_of(
+        task_id: Uuid,
+        model: Option<&str>,
+        dependencies: Option<Vec<Uuid>>,
+    ) -> UpdateTaskParams {
         UpdateTaskParams {
             task_id: task_id.to_string(),
             title: Some("renamed".to_string()),
@@ -3727,9 +4251,14 @@ mod task_dependency_contract {
         let id = child.id;
         let staged = HashMap::from([(id, child)]);
 
-        let alias = edit_model(&staged, id, None, Some("sonnet")).expect_err("a Claude alias is not an OpenCode model");
+        let alias = edit_model(&staged, id, None, Some("sonnet"))
+            .expect_err("a Claude alias is not an OpenCode model");
         assert!(alias.contains("was not saved"), "{alias}");
-        assert_eq!(edit_model(&staged, id, None, None), Ok(None), "an Edit naming nothing judges nothing");
+        assert_eq!(
+            edit_model(&staged, id, None, None),
+            Ok(None),
+            "an Edit naming nothing judges nothing"
+        );
         assert_eq!(
             edit_model(&staged, id, Some(CodingProvider::OpenCode), None),
             Ok(Some("ollama/llama3.2:3b".to_string())),
@@ -3754,7 +4283,8 @@ mod task_dependency_contract {
         let project_id = Uuid::new_v4();
         let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
         let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
-        let (_tmp, _paths, app) = app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
+        let (_tmp, _paths, app) =
+            app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
         let before = both_copies(&app, project_id, child.id).await;
 
         let bad_model = update_task(
@@ -3765,7 +4295,11 @@ mod task_dependency_contract {
         .await
         .expect_err("a malformed model is refused");
         assert!(bad_model.contains("was not saved"), "{bad_model}");
-        assert_eq!(both_copies(&app, project_id, child.id).await, before, "no dependency, title or model is written");
+        assert_eq!(
+            both_copies(&app, project_id, child.id).await,
+            before,
+            "no dependency, title or model is written"
+        );
 
         let bad_dependency = update_task(
             GuiMutation::untracked(),
@@ -3775,7 +4309,11 @@ mod task_dependency_contract {
         .await
         .expect_err("a Task cannot depend on itself");
         assert!(!bad_dependency.is_empty(), "the refusal has a reason");
-        assert_eq!(both_copies(&app, project_id, child.id).await, before, "no model or title is written either");
+        assert_eq!(
+            both_copies(&app, project_id, child.id).await,
+            before,
+            "no model or title is written either"
+        );
     }
 
     /// A valid Edit writes its dependency, model and title in the one write,
@@ -3785,7 +4323,8 @@ mod task_dependency_contract {
         let project_id = Uuid::new_v4();
         let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
         let child = task(project_id, "child", TaskStatus::Backlog, vec![]);
-        let (_tmp, _paths, app) = app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
+        let (_tmp, _paths, app) =
+            app_with(vec![parent.clone(), child.clone()], &[project_id]).await;
 
         let updated = update_task(
             GuiMutation::untracked(),
@@ -3799,8 +4338,14 @@ mod task_dependency_contract {
         assert_eq!(updated.model, "opus");
 
         let (memory, disk) = both_copies(&app, project_id, child.id).await;
-        assert_eq!(memory["dependencies"], serde_json::json!([parent.id.to_string()]));
-        assert_eq!(disk["dependencies"], serde_json::json!([parent.id.to_string()]));
+        assert_eq!(
+            memory["dependencies"],
+            serde_json::json!([parent.id.to_string()])
+        );
+        assert_eq!(
+            disk["dependencies"],
+            serde_json::json!([parent.id.to_string()])
+        );
         assert_eq!(disk["model"], "opus");
         assert_eq!(disk["title"], "renamed");
     }
@@ -3813,7 +4358,8 @@ mod task_dependency_contract {
         let parent = task(project_id, "parent", TaskStatus::Backlog, vec![]);
         let mut running = task(project_id, "running", TaskStatus::Backlog, vec![]);
         running.branch_name = Some("slashit/running".to_string());
-        let (_tmp, _paths, app) = app_with(vec![parent.clone(), running.clone()], &[project_id]).await;
+        let (_tmp, _paths, app) =
+            app_with(vec![parent.clone(), running.clone()], &[project_id]).await;
         let before = both_copies(&app, project_id, running.id).await;
 
         let error = update_task(
@@ -3832,8 +4378,17 @@ mod task_dependency_contract {
         let project_id = Uuid::new_v4();
         let parent_a = task(project_id, "a", TaskStatus::Backlog, vec![]);
         let parent_b = task(project_id, "b", TaskStatus::Backlog, vec![]);
-        let legacy = task(project_id, "legacy", TaskStatus::Backlog, vec![parent_a.id, parent_b.id]);
-        let (_tmp, _paths, app) = app_with(vec![parent_a.clone(), parent_b.clone(), legacy.clone()], &[project_id]).await;
+        let legacy = task(
+            project_id,
+            "legacy",
+            TaskStatus::Backlog,
+            vec![parent_a.id, parent_b.id],
+        );
+        let (_tmp, _paths, app) = app_with(
+            vec![parent_a.clone(), parent_b.clone(), legacy.clone()],
+            &[project_id],
+        )
+        .await;
 
         update_task(
             GuiMutation::untracked(),
@@ -3861,7 +4416,10 @@ mod task_dependency_contract {
 
         let (memory, disk) = both_copies(&app, project_id, legacy.id).await;
         assert_eq!(memory["title"], "renamed");
-        assert_eq!(disk["dependencies"], serde_json::json!([parent_a.id, parent_b.id]));
+        assert_eq!(
+            disk["dependencies"],
+            serde_json::json!([parent_a.id, parent_b.id])
+        );
     }
 
     #[tokio::test]
@@ -3869,8 +4427,17 @@ mod task_dependency_contract {
         let project_id = Uuid::new_v4();
         let parent_a = task(project_id, "a", TaskStatus::Backlog, vec![]);
         let parent_b = task(project_id, "b", TaskStatus::Backlog, vec![]);
-        let legacy = task(project_id, "legacy", TaskStatus::Backlog, vec![parent_a.id, parent_b.id]);
-        let (_tmp, _paths, app) = app_with(vec![parent_a.clone(), parent_b.clone(), legacy.clone()], &[project_id]).await;
+        let legacy = task(
+            project_id,
+            "legacy",
+            TaskStatus::Backlog,
+            vec![parent_a.id, parent_b.id],
+        );
+        let (_tmp, _paths, app) = app_with(
+            vec![parent_a.clone(), parent_b.clone(), legacy.clone()],
+            &[project_id],
+        )
+        .await;
         let before = both_copies(&app, project_id, legacy.id).await;
 
         for requested in [vec![], vec![parent_a.id]] {
@@ -4075,7 +4642,11 @@ mod issue_reference_write_tests {
         let mut task = create_test_task("refs");
         // The caller chose `o/r#3` while it sat at index 1. Another reference
         // then took index 1, so index 1 is now `o/r#2`.
-        task.external_refs = vec![issue_ref("o/r", 1), issue_ref("o/r", 2), issue_ref("o/r", 3)];
+        task.external_refs = vec![
+            issue_ref("o/r", 1),
+            issue_ref("o/r", 2),
+            issue_ref("o/r", 3),
+        ];
         let board = Board::new(task).await;
 
         let refusal = remove_external_ref_chosen_serialized(
@@ -4090,14 +4661,22 @@ mod issue_reference_write_tests {
         assert!(refusal.is_err(), "{refusal:?}");
         assert_eq!(
             board.reloaded().external_refs,
-            vec![issue_ref("o/r", 1), issue_ref("o/r", 2), issue_ref("o/r", 3)]
+            vec![
+                issue_ref("o/r", 1),
+                issue_ref("o/r", 2),
+                issue_ref("o/r", 3)
+            ]
         );
     }
 
     #[tokio::test]
     async fn a_removal_takes_the_reference_the_caller_chose() {
         let mut task = create_test_task("refs");
-        task.external_refs = vec![issue_ref("o/r", 1), issue_ref("o/r", 2), issue_ref("o/r", 3)];
+        task.external_refs = vec![
+            issue_ref("o/r", 1),
+            issue_ref("o/r", 2),
+            issue_ref("o/r", 3),
+        ];
         let board = Board::new(task).await;
 
         let updated = remove_external_ref_chosen_serialized(
@@ -4111,7 +4690,10 @@ mod issue_reference_write_tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(updated.external_refs, vec![issue_ref("o/r", 1), issue_ref("o/r", 3)]);
+        assert_eq!(
+            updated.external_refs,
+            vec![issue_ref("o/r", 1), issue_ref("o/r", 3)]
+        );
         assert_eq!(board.reloaded().external_refs, updated.external_refs);
     }
 
@@ -4459,7 +5041,11 @@ mod issue_reference_write_tests {
         assert_eq!(updated.github_issue_url, None);
 
         let reloaded = board.reloaded();
-        assert!(reloaded.external_refs.is_empty(), "{:?}", reloaded.external_refs);
+        assert!(
+            reloaded.external_refs.is_empty(),
+            "{:?}",
+            reloaded.external_refs
+        );
         assert_eq!(reloaded.github_issue_url, None);
     }
 

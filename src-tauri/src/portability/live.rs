@@ -63,8 +63,13 @@ impl Live<'_> {
     ///
     /// `project_id` is echoed as the caller wrote it, so the reply and the
     /// not-found message name what the caller asked for.
-    pub async fn export(&self, project_id: &str, destination: &str) -> Result<ExportOutcome, String> {
-        let id = Uuid::parse_str(project_id).map_err(|_| format!("Invalid project_id: {project_id}"))?;
+    pub async fn export(
+        &self,
+        project_id: &str,
+        destination: &str,
+    ) -> Result<ExportOutcome, String> {
+        let id =
+            Uuid::parse_str(project_id).map_err(|_| format!("Invalid project_id: {project_id}"))?;
         let target = absolute(destination)?;
         let gate = self.gate.read(id).await;
         let leases =
@@ -78,10 +83,7 @@ impl Live<'_> {
                 None => Err(format!("Project {project_id} not found")),
                 Some(project) => {
                     let repository = project.repository_id.and_then(|id| repositories.get(&id));
-                    let mine: Vec<&Task> = tasks
-                        .values()
-                        .filter(|t| t.project_id == id)
-                        .collect();
+                    let mine: Vec<&Task> = tasks.values().filter(|t| t.project_id == id).collect();
                     export::build_payload(project, repository, &mine)
                 }
             }

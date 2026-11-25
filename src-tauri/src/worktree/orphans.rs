@@ -97,7 +97,14 @@ pub async fn owners_in_repository(
         .read()
         .await
         .values()
-        .map(|t| (t.id, t.project_id, t.worktree_path.clone(), t.branch_name.clone()))
+        .map(|t| {
+            (
+                t.id,
+                t.project_id,
+                t.worktree_path.clone(),
+                t.branch_name.clone(),
+            )
+        })
         .collect();
     let repo_of_project: HashMap<Uuid, Option<String>> = {
         let projects = projects.read().await;
@@ -208,13 +215,33 @@ async fn git(repo: &str, args: &[&str]) -> Result<String, String> {
 /// Whether the checkout at `path` has uncommitted changes or untracked
 /// files, asked without taking any lock.
 async fn is_dirty(path: &str) -> Result<bool, String> {
-    let status = git(path, &["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"]).await?;
+    let status = git(
+        path,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+    )
+    .await?;
     Ok(!status.is_empty())
 }
 
 /// Every ref of `repo` under `refs/heads`, `refs/remotes` and `refs/tags`.
 async fn durable_candidates(repo: &str) -> Result<Vec<String>, String> {
-    let listed = git(repo, &["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"]).await?;
+    let listed = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+    )
+    .await?;
     Ok(listed.lines().map(str::to_string).collect())
 }
 
@@ -225,7 +252,11 @@ impl WorktreeManager {
     /// Fails, rather than listing less, when git cannot list worktrees or
     /// branches at all; a question that fails for one item is reported on
     /// that item.
-    pub async fn scan_orphans(&self, repo_path: &str, owners: &Owners) -> Result<OrphanScan, String> {
+    pub async fn scan_orphans(
+        &self,
+        repo_path: &str,
+        owners: &Owners,
+    ) -> Result<OrphanScan, String> {
         let listing = Self::worktree_listing(repo_path).await?;
         let records = ListedWorktree::parse(&listing);
         let root = resolved_path(&self.managed_root(repo_path));
@@ -237,8 +268,12 @@ impl WorktreeManager {
             if resolved == primary || resolved == root || !resolved.starts_with(&root) {
                 continue;
             }
-            let branch = record.branch.map(|b| b.trim_start_matches("refs/heads/").to_string());
-            if owners.owns_path(record.path) || branch.as_deref().is_some_and(|b| owners.owns_branch(b)) {
+            let branch = record
+                .branch
+                .map(|b| b.trim_start_matches("refs/heads/").to_string());
+            if owners.owns_path(record.path)
+                || branch.as_deref().is_some_and(|b| owners.owns_branch(b))
+            {
                 continue;
             }
             checkouts.push(inspect_checkout(repo_path, &listing, record, branch).await);
@@ -252,7 +287,10 @@ impl WorktreeManager {
             .map(str::to_string)
             .collect();
         // Another orphan is not a durable home: it may be reclaimed too.
-        let excluded: HashSet<String> = orphan_names.iter().map(|n| format!("refs/heads/{n}")).collect();
+        let excluded: HashSet<String> = orphan_names
+            .iter()
+            .map(|n| format!("refs/heads/{n}"))
+            .collect();
         let durable: Vec<String> = refs.into_iter().filter(|r| !excluded.contains(r)).collect();
         let mut branches = Vec::new();
         for name in orphan_names {
@@ -264,7 +302,10 @@ impl WorktreeManager {
         }
         checkouts.sort_by(|a, b| a.path.cmp(&b.path));
         branches.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(OrphanScan { checkouts, branches })
+        Ok(OrphanScan {
+            checkouts,
+            branches,
+        })
     }
 
     /// Remove the orphaned checkout at `path`, on explicit request.
@@ -293,7 +334,8 @@ impl WorktreeManager {
         if let Some(refusal) = &orphan.refusal {
             return Err(refusal.clone());
         }
-        self.remove(&orphan.path, repo_path, orphan.branch.as_deref()).await
+        self.remove(&orphan.path, repo_path, orphan.branch.as_deref())
+            .await
     }
 
     /// Delete the orphaned task branch `name`, on explicit request.
@@ -317,12 +359,18 @@ impl WorktreeManager {
         if let Some(refusal) = &orphan.refusal {
             return Err(refusal.clone());
         }
-        let tip = orphan.tip.as_deref().ok_or("the branch's tip is not known")?;
+        let tip = orphan
+            .tip
+            .as_deref()
+            .ok_or("the branch's tip is not known")?;
         let name = super::checked_task_branch(name)?;
-        git(repo_path, &["update-ref", "-d", &format!("refs/heads/{name}"), tip])
-            .await
-            .map(|_| ())
-            .map_err(|why| format!("{name} was not deleted: {why}"))
+        git(
+            repo_path,
+            &["update-ref", "-d", &format!("refs/heads/{name}"), tip],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|why| format!("{name} was not deleted: {why}"))
     }
 }
 
@@ -368,14 +416,29 @@ async fn inspect_checkout(
                 }
             }
         }
-        CheckoutRegistration::MissingPrunable { .. } => out.presence = CheckoutPresence::MissingRegistered,
-        CheckoutRegistration::MissingLocked { path: p, branch: b, reason } => {
-            out.presence = CheckoutPresence::MissingLocked;
-            out.refusal = Some(locked_registration_notice(repo_path, &p, b.as_deref(), reason.as_deref()));
+        CheckoutRegistration::MissingPrunable { .. } => {
+            out.presence = CheckoutPresence::MissingRegistered
         }
-        CheckoutRegistration::Unknown(why) => out.refusal = Some(format!("{path} could not be inspected: {why}")),
+        CheckoutRegistration::MissingLocked {
+            path: p,
+            branch: b,
+            reason,
+        } => {
+            out.presence = CheckoutPresence::MissingLocked;
+            out.refusal = Some(locked_registration_notice(
+                repo_path,
+                &p,
+                b.as_deref(),
+                reason.as_deref(),
+            ));
+        }
+        CheckoutRegistration::Unknown(why) => {
+            out.refusal = Some(format!("{path} could not be inspected: {why}"))
+        }
         CheckoutRegistration::NotRegistered => {
-            out.refusal = Some(format!("git does not register {path}, so it cannot be reclaimed here"));
+            out.refusal = Some(format!(
+                "git does not register {path}, so it cannot be reclaimed here"
+            ));
         }
     }
     // The same refusal an ordinary cleanup makes for a detached checkout.
@@ -402,21 +465,45 @@ async fn inspect_branch(
         checked_out_at,
         refusal: None,
     };
-    let tip = match git(repo_path, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}^{{commit}}")]).await {
+    let tip = match git(
+        repo_path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{name}^{{commit}}"),
+        ],
+    )
+    .await
+    {
         Ok(tip) => tip.trim().to_string(),
         Err(why) => {
-            out.refusal = Some(format!("{name}'s tip could not be read ({why}), so nothing was changed."));
+            out.refusal = Some(format!(
+                "{name}'s tip could not be read ({why}), so nothing was changed."
+            ));
             return out;
         }
     };
     out.tip = Some(tip.clone());
     let reaching = match git(
         repo_path,
-        &["for-each-ref", "--contains", &tip, "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"],
+        &[
+            "for-each-ref",
+            "--contains",
+            &tip,
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
     )
     .await
     {
-        Ok(listed) => listed.lines().filter(|r| durable.iter().any(|d| d == r)).map(str::to_string).collect::<Vec<_>>(),
+        Ok(listed) => listed
+            .lines()
+            .filter(|r| durable.iter().any(|d| d == r))
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
         Err(why) => {
             out.refusal = Some(format!(
                 "which refs reach {name} could not be asked ({why}), so it is not known whether \
@@ -480,7 +567,10 @@ async fn unique_commits(repo: &str, tip: &str, durable: &[String]) -> Result<u32
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     written.map_err(|e| e.to_string())?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().map_err(|e: std::num::ParseIntError| e.to_string())
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())
 }
 
 #[cfg(test)]
@@ -496,7 +586,11 @@ mod tests {
             .current_dir(dir)
             .output()
             .expect("spawn git");
-        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
@@ -508,7 +602,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = tempfile::Builder::new().prefix("slashit-orphans-").tempdir().unwrap();
+            let root = tempfile::Builder::new()
+                .prefix("slashit-orphans-")
+                .tempdir()
+                .unwrap();
             let repo = root.path().join("repo");
             std::fs::create_dir_all(&repo).unwrap();
             git_in(&repo, &["init", "-q", "-b", "main"]);
@@ -520,7 +617,11 @@ mod tests {
                 root.path().join("runtime"),
             );
             let manager = WorktreeManager::new(Arc::new(paths));
-            Self { _root: root, repo, manager }
+            Self {
+                _root: root,
+                repo,
+                manager,
+            }
         }
 
         fn repo(&self) -> &str {
@@ -533,7 +634,17 @@ mod tests {
             let branch = WorktreeManager::branch_for_task(id);
             let dir = self.manager.managed_root(self.repo()).join(&branch);
             std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
-            git_in(&self.repo, &["worktree", "add", "-q", "-b", &branch, dir.to_str().unwrap()]);
+            git_in(
+                &self.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &branch,
+                    dir.to_str().unwrap(),
+                ],
+            );
             (branch, dir)
         }
 
@@ -545,13 +656,19 @@ mod tests {
         }
 
         async fn scan(&self, owners: &Owners) -> OrphanScan {
-            self.manager.scan_orphans(self.repo(), owners).await.expect("scan")
+            self.manager
+                .scan_orphans(self.repo(), owners)
+                .await
+                .expect("scan")
         }
     }
 
     fn owning(id: Uuid, branch: Option<&str>, path: Option<&Path>) -> Owners {
         Owners {
-            checkout_paths: path.map(|p| p.to_string_lossy().to_string()).into_iter().collect(),
+            checkout_paths: path
+                .map(|p| p.to_string_lossy().to_string())
+                .into_iter()
+                .collect(),
             branches: branch.map(str::to_string).into_iter().collect(),
             task_ids: vec![id],
         }
@@ -575,7 +692,10 @@ mod tests {
         let id = Uuid::new_v4();
         let branch = WorktreeManager::branch_for_task(id);
         git_in(&f.repo, &["branch", &branch]);
-        assert_eq!(f.scan(&owning(Uuid::new_v4(), Some(&branch), None)).await, OrphanScan::default());
+        assert_eq!(
+            f.scan(&owning(Uuid::new_v4(), Some(&branch), None)).await,
+            OrphanScan::default()
+        );
         // The name earlier versions gave the task is kept by its id's prefix.
         let early = format!("task-{}", &id.to_string()[..8]);
         git_in(&f.repo, &["branch", &early]);
@@ -596,7 +716,11 @@ mod tests {
         assert_eq!(c.refusal, None);
         // The branch is checked out there, so it is listed and not deletable yet.
         assert_eq!(scan.branches.len(), 1);
-        assert!(scan.branches[0].refusal.as_deref().unwrap().contains("checked out at"));
+        assert!(scan.branches[0]
+            .refusal
+            .as_deref()
+            .unwrap()
+            .contains("checked out at"));
         assert!(dir.exists());
     }
 
@@ -604,10 +728,30 @@ mod tests {
     async fn worktrees_outside_the_managed_root_are_never_listed() {
         let f = Fixture::new();
         let outside = f._root.path().join("elsewhere");
-        git_in(&f.repo, &["worktree", "add", "-q", "-b", "feature", outside.to_str().unwrap()]);
+        git_in(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                outside.to_str().unwrap(),
+            ],
+        );
         let named_like_a_task = f._root.path().join("other");
         let branch = WorktreeManager::branch_for_task(Uuid::new_v4());
-        git_in(&f.repo, &["worktree", "add", "-q", "-b", &branch, named_like_a_task.to_str().unwrap()]);
+        git_in(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                named_like_a_task.to_str().unwrap(),
+            ],
+        );
         let scan = f.scan(&Owners::default()).await;
         assert!(scan.checkouts.is_empty(), "{scan:?}");
         // Its task-shaped branch is an orphan branch, but only as a branch
@@ -625,7 +769,10 @@ mod tests {
         let scan = f.scan(&Owners::default()).await;
         assert_eq!(scan.checkouts[0].dirty, Some(true));
         let path = scan.checkouts[0].path.clone();
-        let refused = f.manager.reclaim_orphan_checkout(f.repo(), &Owners::default(), &path).await;
+        let refused = f
+            .manager
+            .reclaim_orphan_checkout(f.repo(), &Owners::default(), &path)
+            .await;
         assert!(refused.unwrap_err().contains("uncommitted"));
         assert!(dir.join("notes.txt").exists());
     }
@@ -635,7 +782,17 @@ mod tests {
         let f = Fixture::new();
         let branch = WorktreeManager::branch_for_task(Uuid::new_v4());
         let dir = f._root.path().join("scratch");
-        git_in(&f.repo, &["worktree", "add", "-q", "-b", &branch, dir.to_str().unwrap()]);
+        git_in(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                dir.to_str().unwrap(),
+            ],
+        );
         f.commit_in(&dir, "a.txt");
         f.commit_in(&dir, "b.txt");
         git_in(&f.repo, &["worktree", "remove", dir.to_str().unwrap()]);
@@ -644,9 +801,15 @@ mod tests {
         assert_eq!(b.unique_commits, Some(2));
         assert_eq!(b.pushed, Some(false));
         assert!(b.refusal.as_deref().unwrap().contains("2 commit(s)"));
-        let refused = f.manager.reclaim_orphan_branch(f.repo(), &Owners::default(), &branch).await;
+        let refused = f
+            .manager
+            .reclaim_orphan_branch(f.repo(), &Owners::default(), &branch)
+            .await;
         assert!(refused.is_err());
-        git_in(&f.repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+        git_in(
+            &f.repo,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        );
     }
 
     #[tokio::test]
@@ -656,8 +819,13 @@ mod tests {
         git_in(&f.repo, &["branch", &merged]);
         let scan = f.scan(&Owners::default()).await;
         assert_eq!(scan.branches[0].refusal, None);
-        assert!(scan.branches[0].durable_refs.contains(&"refs/heads/main".to_string()));
-        f.manager.reclaim_orphan_branch(f.repo(), &Owners::default(), &merged).await.expect("reclaim");
+        assert!(scan.branches[0]
+            .durable_refs
+            .contains(&"refs/heads/main".to_string()));
+        f.manager
+            .reclaim_orphan_branch(f.repo(), &Owners::default(), &merged)
+            .await
+            .expect("reclaim");
         assert!(f.scan(&Owners::default()).await.branches.is_empty());
         let listed = git_in(&f.repo, &["branch", "--list", &merged]);
         assert!(listed.is_empty());
@@ -669,13 +837,19 @@ mod tests {
         let a = WorktreeManager::branch_for_task(Uuid::new_v4());
         let b = WorktreeManager::branch_for_task(Uuid::new_v4());
         let dir = f._root.path().join("scratch");
-        git_in(&f.repo, &["worktree", "add", "-q", "-b", &a, dir.to_str().unwrap()]);
+        git_in(
+            &f.repo,
+            &["worktree", "add", "-q", "-b", &a, dir.to_str().unwrap()],
+        );
         f.commit_in(&dir, "a.txt");
         git_in(&f.repo, &["worktree", "remove", dir.to_str().unwrap()]);
         git_in(&f.repo, &["branch", &b, &a]);
         let scan = f.scan(&Owners::default()).await;
         assert_eq!(scan.branches.len(), 2);
-        assert!(scan.branches.iter().all(|b| b.refusal.is_some()), "{scan:?}");
+        assert!(
+            scan.branches.iter().all(|b| b.refusal.is_some()),
+            "{scan:?}"
+        );
     }
 
     #[tokio::test]
@@ -684,7 +858,10 @@ mod tests {
         let (branch, dir) = f.managed_checkout(Uuid::new_v4());
         std::fs::remove_dir_all(&dir).unwrap();
         let scan = f.scan(&Owners::default()).await;
-        assert_eq!(scan.checkouts[0].presence, CheckoutPresence::MissingRegistered);
+        assert_eq!(
+            scan.checkouts[0].presence,
+            CheckoutPresence::MissingRegistered
+        );
         assert_eq!(scan.checkouts[0].dirty, None);
         assert_eq!(scan.checkouts[0].refusal, None);
         f.manager
@@ -694,7 +871,13 @@ mod tests {
         let scan = f.scan(&Owners::default()).await;
         assert!(scan.checkouts.is_empty());
         // The checkout's branch is a separate decision and is still there.
-        assert_eq!(scan.branches.iter().map(|b| b.name.clone()).collect::<Vec<_>>(), vec![branch]);
+        assert_eq!(
+            scan.branches
+                .iter()
+                .map(|b| b.name.clone())
+                .collect::<Vec<_>>(),
+            vec![branch]
+        );
     }
 
     #[tokio::test]
@@ -705,8 +888,17 @@ mod tests {
         let scan = f.scan(&Owners::default()).await;
         let c = &scan.checkouts[0];
         assert_eq!(c.dirty, None);
-        assert!(c.refusal.as_deref().unwrap().contains("could not be inspected"), "{c:?}");
-        let refused = f.manager.reclaim_orphan_checkout(f.repo(), &Owners::default(), &c.path).await;
+        assert!(
+            c.refusal
+                .as_deref()
+                .unwrap()
+                .contains("could not be inspected"),
+            "{c:?}"
+        );
+        let refused = f
+            .manager
+            .reclaim_orphan_checkout(f.repo(), &Owners::default(), &c.path)
+            .await;
         assert!(refused.is_err());
         assert!(dir.exists());
     }
@@ -716,7 +908,11 @@ mod tests {
         let f = Fixture::new();
         let missing = f._root.path().join("not-a-repo");
         std::fs::create_dir_all(&missing).unwrap();
-        assert!(f.manager.scan_orphans(missing.to_str().unwrap(), &Owners::default()).await.is_err());
+        assert!(f
+            .manager
+            .scan_orphans(missing.to_str().unwrap(), &Owners::default())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -728,7 +924,10 @@ mod tests {
             .await
             .expect("reclaim");
         assert!(!dir.exists());
-        git_in(&f.repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+        git_in(
+            &f.repo,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        );
     }
 
     /// Work only a detached `HEAD` names is protected by the same refusal an
@@ -743,7 +942,10 @@ mod tests {
         let c = &scan.checkouts[0];
         assert_eq!(c.dirty, Some(false));
         assert!(c.refusal.as_deref().unwrap().contains(&commit), "{c:?}");
-        let refused = f.manager.reclaim_orphan_checkout(f.repo(), &Owners::default(), &c.path).await;
+        let refused = f
+            .manager
+            .reclaim_orphan_checkout(f.repo(), &Owners::default(), &c.path)
+            .await;
         assert!(refused.unwrap_err().contains("unreachable"));
         assert!(dir.join("lost.txt").exists());
     }
@@ -755,8 +957,15 @@ mod tests {
         let (_, clean) = f.managed_checkout(Uuid::new_v4());
         std::fs::write(dirty.join("wip.txt"), "x").unwrap();
         let none = Owners::default();
-        assert!(f.manager.reclaim_orphan_checkout(f.repo(), &none, dirty.to_str().unwrap()).await.is_err());
-        f.manager.reclaim_orphan_checkout(f.repo(), &none, clean.to_str().unwrap()).await.expect("clean");
+        assert!(f
+            .manager
+            .reclaim_orphan_checkout(f.repo(), &none, dirty.to_str().unwrap())
+            .await
+            .is_err());
+        f.manager
+            .reclaim_orphan_checkout(f.repo(), &none, clean.to_str().unwrap())
+            .await
+            .expect("clean");
         assert!(dirty.join("wip.txt").exists());
         assert!(!clean.exists());
         let scan = f.scan(&none).await;
@@ -770,10 +979,16 @@ mod tests {
         let id = Uuid::new_v4();
         let (branch, dir) = f.managed_checkout(id);
         let owners = owning(id, Some(&branch), Some(&dir));
-        let refused = f.manager.reclaim_orphan_checkout(f.repo(), &owners, dir.to_str().unwrap()).await;
+        let refused = f
+            .manager
+            .reclaim_orphan_checkout(f.repo(), &owners, dir.to_str().unwrap())
+            .await;
         assert!(refused.unwrap_err().contains("not an orphaned"));
         assert!(dir.exists());
-        let refused = f.manager.reclaim_orphan_branch(f.repo(), &owners, &branch).await;
+        let refused = f
+            .manager
+            .reclaim_orphan_branch(f.repo(), &owners, &branch)
+            .await;
         assert!(refused.unwrap_err().contains("not an orphaned"));
     }
 
@@ -781,7 +996,10 @@ mod tests {
     async fn a_branch_is_never_deleted_while_a_checkout_has_it() {
         let f = Fixture::new();
         let (branch, dir) = f.managed_checkout(Uuid::new_v4());
-        let refused = f.manager.reclaim_orphan_branch(f.repo(), &Owners::default(), &branch).await;
+        let refused = f
+            .manager
+            .reclaim_orphan_branch(f.repo(), &Owners::default(), &branch)
+            .await;
         assert!(refused.unwrap_err().contains("checked out at"));
         assert!(dir.exists());
     }
@@ -802,38 +1020,45 @@ mod tests {
             let project_id = Uuid::new_v4();
             let repository_id = repo.map(|path| {
                 let id = Uuid::new_v4();
-                futures_lite_block(repositories.write()).insert(id, Repository {
+                futures_lite_block(repositories.write()).insert(
                     id,
-                    local_path: path.to_string_lossy().to_string(),
-                    remote_url: None,
-                    remote_type: None,
-                    created_at: chrono::Utc::now(),
-                });
+                    Repository {
+                        id,
+                        local_path: path.to_string_lossy().to_string(),
+                        remote_url: None,
+                        remote_type: None,
+                        created_at: chrono::Utc::now(),
+                    },
+                );
                 id
             });
-            let mut task = crate::test_helpers::create_test_task_full("t", project_id, TaskStatus::Queue, 0);
+            let mut task =
+                crate::test_helpers::create_test_task_full("t", project_id, TaskStatus::Queue, 0);
             task.branch_name = Some(branch.to_string());
             task.worktree_path = Some(format!("/somewhere/{branch}"));
-            futures_lite_block(projects.write()).insert(project_id, Project {
-                id: project_id,
-                name: "p".to_string(),
-                repository_id,
-                scope: crate::domain::ProjectScope::Standalone,
-                state_location: crate::config::paths::StateLocation::External,
-                base: None,
-                agent_type: crate::domain::AgentType::ClaudeCode,
-                agent_config: crate::domain::AgentConfig {
+            futures_lite_block(projects.write()).insert(
+                project_id,
+                Project {
+                    id: project_id,
+                    name: "p".to_string(),
+                    repository_id,
+                    scope: crate::domain::ProjectScope::Standalone,
+                    state_location: crate::config::paths::StateLocation::External,
+                    base: None,
                     agent_type: crate::domain::AgentType::ClaudeCode,
-                    command: "claude".to_string(),
-                    args: Vec::new(),
-                    env: HashMap::new(),
-                    model: None,
-                    api_key: None,
+                    agent_config: crate::domain::AgentConfig {
+                        agent_type: crate::domain::AgentType::ClaudeCode,
+                        command: "claude".to_string(),
+                        args: Vec::new(),
+                        env: HashMap::new(),
+                        model: None,
+                        api_key: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    removed_at: None,
                 },
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-                removed_at: None,
-            });
+            );
             futures_lite_block(tasks.write()).insert(task.id, task);
         };
         add(Some(&f.repo), "mine");
@@ -856,8 +1081,15 @@ mod tests {
         let (_, dir) = f.managed_checkout(Uuid::new_v4());
         git_in(&f.repo, &["worktree", "lock", dir.to_str().unwrap()]);
         let scan = f.scan(&Owners::default()).await;
-        assert!(scan.checkouts[0].refusal.as_deref().unwrap().contains("locked"));
-        let refused = f.manager.reclaim_orphan_checkout(f.repo(), &Owners::default(), &scan.checkouts[0].path).await;
+        assert!(scan.checkouts[0]
+            .refusal
+            .as_deref()
+            .unwrap()
+            .contains("locked"));
+        let refused = f
+            .manager
+            .reclaim_orphan_checkout(f.repo(), &Owners::default(), &scan.checkouts[0].path)
+            .await;
         assert!(refused.is_err());
         assert!(dir.exists());
     }

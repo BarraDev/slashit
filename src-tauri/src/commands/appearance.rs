@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
-use crate::domain::appearance::{Theme, AppearanceMode, ThemeColors};
+use crate::domain::appearance::{AppearanceMode, Theme, ThemeColors};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -166,7 +166,9 @@ fn default_theme() -> Theme {
 }
 
 #[tauri::command]
-pub async fn get_appearance_mode(state: tauri::State<'_, crate::AppState>) -> Result<AppearanceMode, String> {
+pub async fn get_appearance_mode(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<AppearanceMode, String> {
     Ok(state.appearance.appearance_mode.lock().unwrap().clone())
 }
 
@@ -183,7 +185,9 @@ pub async fn set_appearance_mode(
 }
 
 #[tauri::command]
-pub async fn get_use_project_rail(state: tauri::State<'_, crate::AppState>) -> Result<bool, String> {
+pub async fn get_use_project_rail(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<bool, String> {
     Ok(*state.appearance.use_project_rail.lock().unwrap())
 }
 

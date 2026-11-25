@@ -14,7 +14,9 @@ use uuid::Uuid;
 pub enum ProjectScope {
     #[default]
     Standalone,
-    InWorkspace { workspace_id: Uuid },
+    InWorkspace {
+        workspace_id: Uuid,
+    },
 }
 
 impl ProjectScope {
@@ -138,7 +140,9 @@ impl Project {
     /// the other correctly leaves unset.
     pub fn repository_path(&self, repositories: &HashMap<Uuid, Repository>) -> Option<String> {
         let repository_id = self.repository_id?;
-        repositories.get(&repository_id).map(|r| r.local_path.clone())
+        repositories
+            .get(&repository_id)
+            .map(|r| r.local_path.clone())
     }
 }
 

@@ -614,7 +614,11 @@ pub(crate) async fn accept_result(
     let task_id = request.task_id;
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
     // Checked under the lease: removal holds this lease while it writes `removed_at`.
-    crate::commands::project::refuse_if_project_removed(&state.project.projects, request.project_id).await?;
+    crate::commands::project::refuse_if_project_removed(
+        &state.project.projects,
+        request.project_id,
+    )
+    .await?;
 
     let task = state
         .task
@@ -1140,7 +1144,15 @@ mod tests {
     async fn an_accept_waiting_on_a_removal_is_refused_and_writes_nothing() {
         let fx = fixture().await;
         let task_id = fx.task_id;
-        let before = fx.state.task.tasks.read().await.get(&task_id).cloned().expect("the Task");
+        let before = fx
+            .state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
+            .expect("the Task");
         let removal = fx
             .state
             .task_lifecycle_locks
@@ -1150,15 +1162,36 @@ mod tests {
 
         let removal_side = async {
             tokio::task::yield_now().await;
-            fx.state.project.projects.write().await.get_mut(&fx.project_id).expect("the Project").removed_at =
-                Some(chrono::Utc::now());
+            fx.state
+                .project
+                .projects
+                .write()
+                .await
+                .get_mut(&fx.project_id)
+                .expect("the Project")
+                .removed_at = Some(chrono::Utc::now());
             drop(removal);
         };
-        let (_, outcome) = tokio::join!(removal_side, accept_result(&fx.state, fx.request(task_id)));
+        let (_, outcome) =
+            tokio::join!(removal_side, accept_result(&fx.state, fx.request(task_id)));
 
-        assert!(outcome.is_err(), "the accept must be refused, got {outcome:?}");
-        assert_eq!(outcome.unwrap_err(), crate::domain::project::PROJECT_REMOVED_REFUSAL);
-        let after = fx.state.task.tasks.read().await.get(&task_id).cloned().expect("the Task");
+        assert!(
+            outcome.is_err(),
+            "the accept must be refused, got {outcome:?}"
+        );
+        assert_eq!(
+            outcome.unwrap_err(),
+            crate::domain::project::PROJECT_REMOVED_REFUSAL
+        );
+        let after = fx
+            .state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
+            .expect("the Task");
         assert_eq!(after.status, before.status);
         assert_eq!(
             format!("{:?}", after.worker_handoff),
@@ -1529,11 +1562,10 @@ mod tests {
         let fx = fixture().await;
         git(&fx.checkout, &["reset", "-q", "--hard", &fx.start]);
         fx.edit(|t| {
-            t.worker_handoff.as_mut().unwrap().stage =
-                WorkerHandoffStage::RecoveryRequired {
-                    reason: "not published".into(),
-                    observed_commit: Some(fx.start.clone()),
-                };
+            t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::RecoveryRequired {
+                reason: "not published".into(),
+                observed_commit: Some(fx.start.clone()),
+            };
         })
         .await;
         let mut request = fx.request(Uuid::new_v4());
@@ -1576,11 +1608,10 @@ mod tests {
         let other = "c".repeat(40);
         git(&fx.checkout, &["reset", "-q", "--hard", &fx.start]);
         fx.edit(|t| {
-            t.worker_handoff.as_mut().unwrap().stage =
-                WorkerHandoffStage::RecoveryRequired {
-                    reason: "not published".into(),
-                    observed_commit: Some(other.clone()),
-                };
+            t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::RecoveryRequired {
+                reason: "not published".into(),
+                observed_commit: Some(other.clone()),
+            };
         })
         .await;
         let mut request = fx.request(Uuid::new_v4());
@@ -2093,10 +2124,7 @@ mod tests {
         let executor = fx.state.executor.get().unwrap().clone();
         // The run was started in Manual mode, and its run record says so.
         executor
-            .start_run_in_review_mode_for_test(
-                fx.task_id,
-                crate::domain::task::ReviewMode::Manual,
-            )
+            .start_run_in_review_mode_for_test(fx.task_id, crate::domain::task::ReviewMode::Manual)
             .await;
 
         executor.spawn_review_for_test(fx.task_id).await;

@@ -49,7 +49,11 @@ pub fn create(app: &App) -> tauri::Result<WebviewWindow> {
 /// The origin the application's own content is served from: the dev server in
 /// a development build, and the embedded-asset origin otherwise.
 fn app_origin(dev_url: Option<&Url>) -> Url {
-    app_origin_for(tauri::is_dev(), dev_url, cfg!(any(windows, target_os = "android")))
+    app_origin_for(
+        tauri::is_dev(),
+        dev_url,
+        cfg!(any(windows, target_os = "android")),
+    )
 }
 
 fn app_origin_for(is_dev: bool, dev_url: Option<&Url>, windows_style: bool) -> Url {
@@ -88,7 +92,10 @@ mod tests {
     #[test]
     fn production_origin_follows_the_platform_scheme() {
         assert_eq!(app_origin_for(false, None, false), url("tauri://localhost"));
-        assert_eq!(app_origin_for(false, None, true), url("http://tauri.localhost"));
+        assert_eq!(
+            app_origin_for(false, None, true),
+            url("http://tauri.localhost")
+        );
     }
 
     #[test]
@@ -151,7 +158,10 @@ mod tests {
     fn the_windows_origin_is_exact() {
         let origin = url("http://tauri.localhost/");
         assert!(is_app_navigation(&url("http://tauri.localhost/x"), &origin));
-        assert!(!is_app_navigation(&url("https://tauri.localhost/x"), &origin));
+        assert!(!is_app_navigation(
+            &url("https://tauri.localhost/x"),
+            &origin
+        ));
         assert!(!is_app_navigation(&url("tauri://localhost/"), &origin));
     }
 }

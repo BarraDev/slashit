@@ -559,7 +559,9 @@ exit 0
         let status_file = std::fs::read_to_string(format!("/proc/{descendant}/status"))
             .expect("the descendant is running");
         assert!(
-            !status_file.lines().any(|line| line.starts_with("State:\tZ")),
+            !status_file
+                .lines()
+                .any(|line| line.starts_with("State:\tZ")),
             "the descendant is already a zombie: {status_file}"
         );
         assert_eq!(
@@ -630,7 +632,9 @@ exit 0
         let pidfile = dir.path().join("descendant.pid");
         let lease = acquire(&path).unwrap().expect("unix lease");
         let child = spawn_leader_leaving_a_survivor(&lease, &path, &pidfile);
-        lease.record_group(child.id().unwrap()).expect("record group");
+        lease
+            .record_group(child.id().unwrap())
+            .expect("record group");
         drop(lease);
         let survivor = await_survivor(child, &path, &pidfile).await;
 
@@ -669,7 +673,12 @@ exit 0
         unsafe { libc::killpg(pid, libc::SIGKILL) };
         let _ = child.wait().await;
         wait_until_proven_absent(&path).await;
-        assert!(settled(|| acquire(&path).map_err(|error| error.to_string())).await.unwrap().is_some());
+        assert!(
+            settled(|| acquire(&path).map_err(|error| error.to_string()))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -701,7 +710,9 @@ exit 0
         wait_until_group_gone(pid as i32).await;
         // The mark was not replaced, so the failed record does not read as absence.
         wait_until_lock_free(&path).await;
-        assert!(matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started")));
+        assert!(
+            matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started"))
+        );
     }
 
     #[tokio::test]
@@ -714,7 +725,9 @@ exit 0
         lease.mark_spawning().unwrap();
         drop(lease);
         wait_until_lock_free(&path).await;
-        assert!(matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started")));
+        assert!(
+            matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started"))
+        );
     }
 
     #[tokio::test]
@@ -734,7 +747,9 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let path = lease_path(&dir);
         std::fs::write(&path, b"12x\n").unwrap();
-        assert!(matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started")));
+        assert!(
+            matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started"))
+        );
     }
 
     /// Linux only: the leader finds its descriptors through `/proc`.
@@ -797,7 +812,10 @@ exit 0
     async fn a_launch_is_admitted_when_nothing_is_recorded_or_running() {
         let dir = tempfile::tempdir().unwrap();
         let path = lease_path(&dir);
-        assert!(acquire_proven_when_lock_free(&path).await.unwrap().is_some());
+        assert!(acquire_proven_when_lock_free(&path)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -810,7 +828,10 @@ exit 0
         wait_until_lock_free(&path).await;
 
         let refused = acquire_proven_when_lock_free(&path).await;
-        assert!(matches!(&refused, Err(reason) if reason.contains("may have started")), "{refused:?}");
+        assert!(
+            matches!(&refused, Err(reason) if reason.contains("may have started")),
+            "{refused:?}"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "spawning\n");
     }
 
@@ -837,7 +858,11 @@ exit 0
             matches!(&refused, Err(reason) if reason.contains("process group")),
             "{refused:?}"
         );
-        assert_eq!(recorded, format!("{pid}\n"), "the recorded group is not overwritten");
+        assert_eq!(
+            recorded,
+            format!("{pid}\n"),
+            "the recorded group is not overwritten"
+        );
 
         // The group is what refused: once it is empty, the same record admits.
         survivor.end();
@@ -882,7 +907,10 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let path = lease_path(&dir);
         drop(acquire(&path).unwrap().expect("unix lease"));
-        assert_eq!(settled(|| prove_absent_for_start(&path, false)).await, Ok(()));
+        assert_eq!(
+            settled(|| prove_absent_for_start(&path, false)).await,
+            Ok(())
+        );
     }
 }
 

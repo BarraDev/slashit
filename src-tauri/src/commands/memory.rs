@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
-use crate::domain::memory::{Memory, MemoryMetadata, GraphStatus};
+use crate::domain::memory::{GraphStatus, Memory, MemoryMetadata};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -54,7 +54,11 @@ pub async fn get_graph_status() -> Result<GraphStatus, String> {
 }
 
 #[tauri::command]
-pub async fn store_memory(_gui: GuiMutation, content: String, metadata: MemoryMetadata) -> Result<Memory, String> {
+pub async fn store_memory(
+    _gui: GuiMutation,
+    content: String,
+    metadata: MemoryMetadata,
+) -> Result<Memory, String> {
     Ok(Memory {
         id: Uuid::new_v4().to_string(),
         content,

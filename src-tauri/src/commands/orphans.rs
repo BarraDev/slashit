@@ -30,10 +30,9 @@ async fn context(state: &crate::AppState, project_id: &str) -> Result<(String, O
         .ok_or("The project's repository is not known")?;
     // A board that cannot be read hides its tasks, and what they own would
     // then look like nobody's.
-    let unreadable = state
-        .storage
-        .unreadable_task_files()
-        .map_err(|e| format!("The task boards could not be listed ({e}), so nothing is known to be an orphan."))?;
+    let unreadable = state.storage.unreadable_task_files().map_err(|e| {
+        format!("The task boards could not be listed ({e}), so nothing is known to be an orphan.")
+    })?;
     if let Some(file) = unreadable.first() {
         return Err(format!(
             "The task board {} could not be read, so tasks may exist that SlashIt cannot see and \
@@ -60,7 +59,10 @@ pub async fn scan_orphans(
     project_id: String,
 ) -> Result<OrphanScan, String> {
     let (repo_path, owners) = context(&state, &project_id).await?;
-    state.worktree_manager.scan_orphans(&repo_path, &owners).await
+    state
+        .worktree_manager
+        .scan_orphans(&repo_path, &owners)
+        .await
 }
 
 /// Remove one orphaned Task Checkout, never forcing. Its branch stays.
@@ -72,7 +74,10 @@ pub async fn reclaim_orphan_checkout(
     path: String,
 ) -> Result<(), String> {
     let (repo_path, owners) = context(&state, &project_id).await?;
-    state.worktree_manager.reclaim_orphan_checkout(&repo_path, &owners, &path).await
+    state
+        .worktree_manager
+        .reclaim_orphan_checkout(&repo_path, &owners, &path)
+        .await
 }
 
 /// Delete one orphaned task branch whose commits another durable ref has.
@@ -84,5 +89,8 @@ pub async fn reclaim_orphan_branch(
     branch: String,
 ) -> Result<(), String> {
     let (repo_path, owners) = context(&state, &project_id).await?;
-    state.worktree_manager.reclaim_orphan_branch(&repo_path, &owners, &branch).await
+    state
+        .worktree_manager
+        .reclaim_orphan_branch(&repo_path, &owners, &branch)
+        .await
 }

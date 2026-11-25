@@ -242,7 +242,8 @@ pub async fn resolve(
     executor: Option<&crate::queue::TaskExecutor>,
 ) -> Result<(), String> {
     // Refuses a removed Project under the lease: this clears a Task record.
-    let _lease = crate::commands::project::lease_active_task_in(authority, tasks, projects, task_id).await?;
+    let _lease =
+        crate::commands::project::lease_active_task_in(authority, tasks, projects, task_id).await?;
     // Checked under the lease: a run or review registers under it, so none can
     // start between this check and the clear. A live attempt means its agent may
     // still be editing the checkout, so the record must stay.
@@ -437,8 +438,13 @@ impl Ledger {
         .map_err(|e| format!("the AI Review fix's edits were not committed, because its record could not be updated: {e}"))?;
         let outcome = match branch {
             Some(branch) => {
-                crate::worktree::commit_checkout_verified(working_dir, branch, message, verified_tree)
-                    .await
+                crate::worktree::commit_checkout_verified(
+                    working_dir,
+                    branch,
+                    message,
+                    verified_tree,
+                )
+                .await
             }
             None => Err("this Task records no branch".to_string()),
         };
@@ -470,7 +476,11 @@ impl Ledger {
                         &self.tasks,
                         &self.storage,
                         task_id,
-                        Some(ReviewFixResidue { reason, commit_authorized: false, ..current }),
+                        Some(ReviewFixResidue {
+                            reason,
+                            commit_authorized: false,
+                            ..current
+                        }),
                     )
                     .await
                     {
@@ -493,11 +503,17 @@ impl Ledger {
                     &self.tasks,
                     &self.storage,
                     task_id,
-                    Some(ReviewFixResidue { reason, commit_authorized: false, ..current }),
+                    Some(ReviewFixResidue {
+                        reason,
+                        commit_authorized: false,
+                        ..current
+                    }),
                 )
                 .await
                 {
-                    return Err(format!("{error}; the AI Review fix record could not be updated either: {e}"));
+                    return Err(format!(
+                        "{error}; the AI Review fix record could not be updated either: {e}"
+                    ));
                 }
             }
         }
@@ -529,7 +545,10 @@ mod tests {
 
     /// The content the checkout holds now, as a commit must find it staged.
     async fn snapshot_of(dir: &str) -> String {
-        crate::worktree::checkout_snapshot(dir).await.unwrap().content
+        crate::worktree::checkout_snapshot(dir)
+            .await
+            .unwrap()
+            .content
     }
 
     struct Fx {
@@ -867,10 +886,17 @@ mod tests {
             .begin_attempt(fx.task_id, fx.checkout.to_str().unwrap())
             .await
             .unwrap();
-        let before = residue(&fx).await.expect("an unresolved record exists before the refusal");
+        let before = residue(&fx)
+            .await
+            .expect("an unresolved record exists before the refusal");
         let mut project = crate::commands::project::tests::make_test_project(fx.project_id);
         project.removed_at = Some(chrono::Utc::now());
-        fx.state.project.projects.write().await.insert(fx.project_id, project);
+        fx.state
+            .project
+            .projects
+            .write()
+            .await
+            .insert(fx.project_id, project);
 
         let refused = resolve(
             &fx.ledger.authority,
@@ -887,19 +913,32 @@ mod tests {
             refused.expect_err("a removed Project's record is not cleared"),
             crate::domain::project::PROJECT_REMOVED_REFUSAL
         );
-        assert_eq!(residue(&fx).await, Some(before), "the unresolved record is unchanged");
+        assert_eq!(
+            residue(&fx).await,
+            Some(before),
+            "the unresolved record is unchanged"
+        );
     }
 
     #[tokio::test]
     async fn a_task_gate_blocks_only_its_own_task() {
         let task = Uuid::new_v4();
         let held = record_gate(task).await;
-        let same = tokio::time::timeout(std::time::Duration::from_millis(50), record_gate(task)).await;
+        let same =
+            tokio::time::timeout(std::time::Duration::from_millis(50), record_gate(task)).await;
         assert!(same.is_err(), "the Task's own writes wait for the gate");
-        let other = tokio::time::timeout(std::time::Duration::from_secs(1), record_gate(Uuid::new_v4())).await;
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            record_gate(Uuid::new_v4()),
+        )
+        .await;
         assert!(other.is_ok(), "another Task's writes do not wait for it");
         drop(held);
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), record_gate(task)).await.is_ok());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), record_gate(task))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -983,7 +1022,14 @@ mod tests {
 
         let outcome = fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot_of(&dir).await)
+            .commit_fix(
+                fx.task_id,
+                attempt,
+                Some("task-x"),
+                &dir,
+                "task: fix",
+                &snapshot_of(&dir).await,
+            )
             .await
             .unwrap();
         assert!(
@@ -1002,7 +1048,10 @@ mod tests {
         let dir = fx.checkout.to_str().unwrap().to_string();
         let attempt = fx.ledger.begin_attempt(fx.task_id, &dir).await.unwrap();
         std::fs::write(fx.checkout.join("a.txt"), "fixed\n").unwrap();
-        fx.ledger.authorize_commit(fx.task_id, attempt).await.unwrap();
+        fx.ledger
+            .authorize_commit(fx.task_id, attempt)
+            .await
+            .unwrap();
         // The marker write (the first) succeeds; the clearing and fallback writes fail.
         let fault = slashit_durable_fs::fault::fail_every_after(
             slashit_durable_fs::Stage::Replace,
@@ -1013,7 +1062,14 @@ mod tests {
         // The commit was made, but its record could not be settled: that is a failed fix.
         let error = fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot)
+            .commit_fix(
+                fx.task_id,
+                attempt,
+                Some("task-x"),
+                &dir,
+                "task: fix",
+                &snapshot,
+            )
             .await
             .expect_err("a commit whose record stays unsettled is not reported as applied");
         assert!(error.contains("could not be cleared"), "{error}");
@@ -1021,15 +1077,36 @@ mod tests {
 
         let durable = reloaded(&fx).expect("the record survives both failures");
         assert!(durable.reason.contains("outcome"), "{}", durable.reason);
-        assert!(!durable.commit_authorized, "no second commit can be authorized");
-        assert_eq!(residue(&fx).await.as_ref(), Some(&durable), "memory matches the durable record");
-        assert!(fx.ledger.admit_commit(fx.task_id).await.is_err(), "ordinary commits stay refused");
+        assert!(
+            !durable.commit_authorized,
+            "no second commit can be authorized"
+        );
+        assert_eq!(
+            residue(&fx).await.as_ref(),
+            Some(&durable),
+            "memory matches the durable record"
+        );
+        assert!(
+            fx.ledger.admit_commit(fx.task_id).await.is_err(),
+            "ordinary commits stay refused"
+        );
         assert!(fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot)
+            .commit_fix(
+                fx.task_id,
+                attempt,
+                Some("task-x"),
+                &dir,
+                "task: fix",
+                &snapshot
+            )
             .await
             .is_err());
-        assert_eq!(commit_count(&fx.checkout), "2", "exactly one commit was made");
+        assert_eq!(
+            commit_count(&fx.checkout),
+            "2",
+            "exactly one commit was made"
+        );
     }
 
     #[tokio::test]
@@ -1053,23 +1130,46 @@ mod tests {
         // The commit is made, but it is an error: the record could not be settled.
         let error = fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot_of(&dir).await)
+            .commit_fix(
+                fx.task_id,
+                attempt,
+                Some("task-x"),
+                &dir,
+                "task: fix",
+                &snapshot_of(&dir).await,
+            )
             .await
             .expect_err("a commit whose record stays unsettled is not reported as applied");
-        assert!(error.contains("committed as") && error.contains("could not be cleared"), "{error}");
+        assert!(
+            error.contains("committed as") && error.contains("could not be cleared"),
+            "{error}"
+        );
         assert_eq!(commit_count(&fx.checkout), "2");
 
         let kept = residue(&fx).await.expect("the record is kept, not cleared");
-        assert!(!kept.commit_authorized, "the commit is not authorized again");
+        assert!(
+            !kept.commit_authorized,
+            "the commit is not authorized again"
+        );
         assert!(
             kept.reason.contains("committed as") && kept.reason.contains("could not be cleared"),
             "{}",
             kept.reason
         );
-        assert!(fx.ledger.admit_commit(fx.task_id).await.is_err(), "ordinary commits stay refused");
+        assert!(
+            fx.ledger.admit_commit(fx.task_id).await.is_err(),
+            "ordinary commits stay refused"
+        );
         assert!(fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "task: fix", &snapshot_of(&dir).await)
+            .commit_fix(
+                fx.task_id,
+                attempt,
+                Some("task-x"),
+                &dir,
+                "task: fix",
+                &snapshot_of(&dir).await
+            )
             .await
             .is_err());
         assert_eq!(commit_count(&fx.checkout), "2", "no second commit was made");
@@ -1086,7 +1186,11 @@ mod tests {
         .await
         .expect("the clean checkout on the Task branch reconciles");
         assert!(residue(&fx).await.is_none());
-        assert_eq!(status_of(&fx).await, TaskStatus::HumanReview, "reconciling is not approval");
+        assert_eq!(
+            status_of(&fx).await,
+            TaskStatus::HumanReview,
+            "reconciling is not approval"
+        );
     }
 
     #[tokio::test]
@@ -1102,12 +1206,26 @@ mod tests {
 
         assert!(fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "m", &snapshot_of(&dir).await)
+            .commit_fix(
+                fx.task_id,
+                attempt,
+                Some("task-x"),
+                &dir,
+                "m",
+                &snapshot_of(&dir).await
+            )
             .await
             .is_err());
         assert!(fx
             .ledger
-            .commit_fix(fx.task_id, Uuid::new_v4(), Some("task-x"), &dir, "m", &snapshot_of(&dir).await)
+            .commit_fix(
+                fx.task_id,
+                Uuid::new_v4(),
+                Some("task-x"),
+                &dir,
+                "m",
+                &snapshot_of(&dir).await
+            )
             .await
             .is_err());
         assert_eq!(commit_count(&fx.checkout), "1", "no commit was made");
@@ -1198,7 +1316,14 @@ mod tests {
         git(&fx.checkout, &["checkout", "-q", "-b", "elsewhere"]);
         assert!(fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "m", &snapshot_of(&dir).await)
+            .commit_fix(
+                fx.task_id,
+                attempt,
+                Some("task-x"),
+                &dir,
+                "m",
+                &snapshot_of(&dir).await
+            )
             .await
             .is_err());
         let kept = residue(&fx).await.expect("the record is kept");
@@ -1210,7 +1335,14 @@ mod tests {
         git(&fx.checkout, &["checkout", "-q", "task-x"]);
         assert!(fx
             .ledger
-            .commit_fix(fx.task_id, attempt, Some("task-x"), &dir, "m", &snapshot_of(&dir).await)
+            .commit_fix(
+                fx.task_id,
+                attempt,
+                Some("task-x"),
+                &dir,
+                "m",
+                &snapshot_of(&dir).await
+            )
             .await
             .is_err());
         assert_eq!(commit_count(&fx.checkout), "1", "no commit was made");
@@ -1301,7 +1433,10 @@ mod tests {
             // Running as root: the permission bit does not hide the path.
             return;
         }
-        assert!(refused.is_err(), "an unreadable checkout must refuse: {refused:?}");
+        assert!(
+            refused.is_err(),
+            "an unreadable checkout must refuse: {refused:?}"
+        );
         assert!(residue(&fx).await.is_some(), "the record stays");
     }
 

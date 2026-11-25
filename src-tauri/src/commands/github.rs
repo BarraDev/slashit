@@ -74,7 +74,8 @@ async fn run_gh(args: &[&str]) -> Result<serde_json::Value, String> {
 
 /// The fields every Issue read asks `gh` for. `url` is the address GitHub
 /// reports, which a transferred Issue answers at its new home.
-const ISSUE_FIELDS: &str = "number,title,body,state,labels,assignees,comments,createdAt,updatedAt,url";
+const ISSUE_FIELDS: &str =
+    "number,title,body,state,labels,assignees,comments,createdAt,updatedAt,url";
 
 /// The `gh issue list --state` values. The state is part of the query, so a
 /// closed Issue is only listed when the caller asked for closed Issues.
@@ -173,7 +174,9 @@ fn issues_from_json(json: &serde_json::Value) -> Result<Vec<GithubIssue>, String
 #[tauri::command]
 pub async fn get_issues(repo: String, state: String) -> Result<Vec<GithubIssue>, String> {
     if !ISSUE_LIST_STATES.contains(&state.as_str()) {
-        return Err(format!("The Issue state must be open, closed or all, not {state}"));
+        return Err(format!(
+            "The Issue state must be open, closed or all, not {state}"
+        ));
     }
     check_gh().await?;
 
@@ -201,7 +204,16 @@ pub async fn get_issue(repo: String, number: i32) -> Result<GithubIssue, String>
 /// `gh issue view` for one Issue, as GitHub answered it.
 async fn view_issue(repo: &str, number: i32) -> Result<serde_json::Value, String> {
     check_gh().await?;
-    run_gh(&["issue", "view", &number.to_string(), "--repo", repo, "--json", ISSUE_FIELDS]).await
+    run_gh(&[
+        "issue",
+        "view",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--json",
+        ISSUE_FIELDS,
+    ])
+    .await
 }
 
 /// Refuse an answer that does not name the Issue asked for. An Issue
@@ -214,9 +226,14 @@ fn check_issue_address(
     number: u32,
     advice: &str,
 ) -> Result<(), String> {
-    let url = json.get("url").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let url = json
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
     let Ok(home) = parse_issue_url(url) else {
-        return Err(format!("GitHub did not answer with issue #{number} in {repo}"));
+        return Err(format!(
+            "GitHub did not answer with issue #{number} in {repo}"
+        ));
     };
     if !home.repo.eq_ignore_ascii_case(repo) {
         return Err(format!(
@@ -226,7 +243,9 @@ fn check_issue_address(
     }
     let answered = json.get("number").and_then(serde_json::Value::as_u64);
     if home.number != number || answered != Some(u64::from(number)) {
-        return Err(format!("GitHub did not answer with issue #{number} in {repo}"));
+        return Err(format!(
+            "GitHub did not answer with issue #{number} in {repo}"
+        ));
     }
     Ok(())
 }
@@ -266,12 +285,7 @@ async fn read_issue_state_within(
         .kill_on_drop(true);
     let output = tokio::time::timeout(limit, command.output())
         .await
-        .map_err(|_| {
-            format!(
-                "GitHub did not answer within {} seconds",
-                limit.as_secs()
-            )
-        })?
+        .map_err(|_| format!("GitHub did not answer within {} seconds", limit.as_secs()))?
         .map_err(|e| {
             format!("Could not run gh ({e}). Install the GitHub CLI and run gh auth login.")
         })?;
@@ -306,7 +320,8 @@ pub async fn create_task_from_issue(
     project_id: String,
 ) -> Result<Task, String> {
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
-    crate::commands::project::refuse_if_project_removed(&state.project.projects, project_id).await?;
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, project_id)
+        .await?;
     let address = crate::domain::github_issue_link::parse_issue_url(&format!(
         "https://github.com/{repo}/issues/{issue_number}"
     ))?;
@@ -663,9 +678,12 @@ mod issue_read_tests {
         let moved = serde_json::json!({
             "number": 12, "url": "https://github.com/new/repo/issues/12"
         });
-        let refusal = check_issue_address(&moved, "old/repo", 7, "No Task was created.")
-            .unwrap_err();
-        assert!(refusal.contains("https://github.com/new/repo/issues/12"), "{refusal}");
+        let refusal =
+            check_issue_address(&moved, "old/repo", 7, "No Task was created.").unwrap_err();
+        assert!(
+            refusal.contains("https://github.com/new/repo/issues/12"),
+            "{refusal}"
+        );
         assert!(refusal.contains("No Task was created."), "{refusal}");
 
         let same = serde_json::json!({
@@ -677,7 +695,10 @@ mod issue_read_tests {
             "number": 8, "url": "https://github.com/old/repo/issues/8"
         });
         let mismatch = check_issue_address(&renumbered, "old/repo", 7, "unused").unwrap_err();
-        assert!(mismatch.contains("did not answer with issue #7"), "{mismatch}");
+        assert!(
+            mismatch.contains("did not answer with issue #7"),
+            "{mismatch}"
+        );
     }
 
     #[cfg(unix)]
@@ -687,7 +708,10 @@ mod issue_read_tests {
         let error = read_issue_state(OsStr::new("false"), "o/r", 7)
             .await
             .unwrap_err();
-        assert!(error.contains("could not return issue #7 in o/r"), "{error}");
+        assert!(
+            error.contains("could not return issue #7 in o/r"),
+            "{error}"
+        );
     }
 
     /// A `gh` that never answers is abandoned at the bound, and its process is
@@ -705,7 +729,11 @@ mod issue_read_tests {
             .await
             .unwrap_err();
         assert!(error.contains("did not answer within"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -802,7 +830,10 @@ mod issue_create_tests {
     }
 
     fn address(repo: &str, number: u32) -> IssueAddress {
-        IssueAddress { repo: repo.to_string(), number }
+        IssueAddress {
+            repo: repo.to_string(),
+            number,
+        }
     }
 
     #[test]
@@ -819,19 +850,29 @@ mod issue_create_tests {
     #[test]
     fn the_created_task_takes_category_and_priority_from_real_labels() {
         let issue = issue_from_json(&gh_issue()).expect("realistic answer");
-        assert!(matches!(map_labels_to_category(&issue.labels), TaskCategory::BugFix));
-        assert!(matches!(map_labels_to_priority(&issue.labels), TaskPriority::High));
+        assert!(matches!(
+            map_labels_to_category(&issue.labels),
+            TaskCategory::BugFix
+        ));
+        assert!(matches!(
+            map_labels_to_priority(&issue.labels),
+            TaskPriority::High
+        ));
     }
 
     #[test]
     fn malformed_answers_are_refused_not_filled_in() {
         let mut no_created = gh_issue();
         no_created.as_object_mut().unwrap().remove("createdAt");
-        assert!(issue_from_json(&no_created).unwrap_err().contains("createdAt"));
+        assert!(issue_from_json(&no_created)
+            .unwrap_err()
+            .contains("createdAt"));
 
         let mut bad_time = gh_issue();
         bad_time["updatedAt"] = serde_json::json!("yesterday");
-        assert!(issue_from_json(&bad_time).unwrap_err().contains("updatedAt"));
+        assert!(issue_from_json(&bad_time)
+            .unwrap_err()
+            .contains("updatedAt"));
 
         let mut lowercase = gh_issue();
         lowercase["state"] = serde_json::json!("open");
@@ -841,7 +882,10 @@ mod issue_create_tests {
         no_number.as_object_mut().unwrap().remove("number");
         assert!(issue_from_json(&no_number).is_err());
 
-        assert!(issues_from_json(&gh_issue()).is_err(), "a single issue is not a list");
+        assert!(
+            issues_from_json(&gh_issue()).is_err(),
+            "a single issue is not a list"
+        );
     }
 
     #[test]
@@ -873,14 +917,22 @@ mod issue_create_tests {
         let project_id = insert_project(&state).await;
 
         let first = create_issue_task(&state, linked_task(project_id, "o/r", 7), address("o/r", 7));
-        let second = create_issue_task(&state, linked_task(project_id, "O/R", 7), address("O/R", 7));
+        let second =
+            create_issue_task(&state, linked_task(project_id, "O/R", 7), address("O/R", 7));
         let (a, b) = tokio::join!(first, second);
 
-        assert_eq!([a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(), 1, "{a:?} {b:?}");
+        assert_eq!(
+            [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "{a:?} {b:?}"
+        );
         let refused = a.err().or(b.err()).expect("one request was refused");
         assert!(refused.contains("already linked"), "{refused}");
         assert_eq!(state.task.tasks.read().await.len(), 1);
-        assert_eq!(state.storage.load_project_tasks(project_id).unwrap().len(), 1);
+        assert_eq!(
+            state.storage.load_project_tasks(project_id).unwrap().len(),
+            1
+        );
     }
 
     /// Another Project may create its own Task for the same Issue, and a
@@ -897,7 +949,8 @@ mod issue_create_tests {
         create_issue_task(&state, linked_task(second, "o/r", 7), address("o/r", 7))
             .await
             .expect("another Project is independent");
-        let refused = create_issue_task(&state, linked_task(first, "o/r", 7), address("o/r", 7)).await;
+        let refused =
+            create_issue_task(&state, linked_task(first, "o/r", 7), address("o/r", 7)).await;
         assert!(refused.is_err());
 
         assert_eq!(state.storage.load_project_tasks(first).unwrap().len(), 1);

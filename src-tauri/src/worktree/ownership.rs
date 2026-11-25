@@ -66,7 +66,10 @@ pub async fn refuse_shared_task_branch(
     // A folder git cannot create a Task Checkout from is refused here, first,
     // saying what to do, rather than with whatever the branch lookups below
     // would make of it.
-    if let Some(refused) = super::vcs::detect(std::path::Path::new(repo_path)).await?.refusal(repo_path) {
+    if let Some(refused) = super::vcs::detect(std::path::Path::new(repo_path))
+        .await?
+        .refusal(repo_path)
+    {
         return Err(refused);
     }
     let recorded = {
@@ -291,7 +294,11 @@ mod tests {
             .current_dir(dir)
             .output()
             .expect("spawn git");
-        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn new_repository(dir: &Path) -> String {
@@ -350,15 +357,23 @@ mod tests {
                 };
                 self.projects.write().await.insert(project_id, project);
             }
-            let mut task = crate::test_helpers::create_test_task_full("t", project_id, TaskStatus::Queue, 0);
+            let mut task =
+                crate::test_helpers::create_test_task_full("t", project_id, TaskStatus::Queue, 0);
             task.id = id;
             task.branch_name = branch.map(str::to_string);
             self.tasks.write().await.insert(id, task);
         }
 
         async fn refuse(&self, task_id: Uuid, repo_path: &str) -> Result<(), String> {
-            refuse_shared_task_branch(&self.tasks, &self.projects, &self.repositories, task_id, BRANCH, repo_path)
-                .await
+            refuse_shared_task_branch(
+                &self.tasks,
+                &self.projects,
+                &self.repositories,
+                task_id,
+                BRANCH,
+                repo_path,
+            )
+            .await
         }
     }
 
@@ -370,9 +385,24 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = new_repository(&temp.path().join("repo"));
         let linked = temp.path().join("linked");
-        git(Path::new(&repo), &["worktree", "add", "-q", "-b", "other", "--", linked.to_str().unwrap()]);
+        git(
+            Path::new(&repo),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other",
+                "--",
+                linked.to_str().unwrap(),
+            ],
+        );
 
-        for other_path in [repo.clone(), format!("{repo}/"), linked.to_string_lossy().to_string()] {
+        for other_path in [
+            repo.clone(),
+            format!("{repo}/"),
+            linked.to_string_lossy().to_string(),
+        ] {
             let board = Board::default();
             board.add(A, Some(BRANCH), Some(&other_path)).await;
             board.add(B, None, Some(&repo)).await;
@@ -420,7 +450,9 @@ mod tests {
         let repo = new_repository(&temp.path().join("repo"));
         let board = Board::default();
         board.add(A, None, Some(&repo)).await;
-        board.add(B, Some("task-recorded-elsewhere"), Some(&repo)).await;
+        board
+            .add(B, Some("task-recorded-elsewhere"), Some(&repo))
+            .await;
 
         assert_eq!(board.refuse(A, &repo).await, Ok(()));
     }
@@ -442,16 +474,29 @@ mod tests {
         let board = Board::default();
         board.add(B, None, Some(&repo)).await;
         let refused = refuse_shared_task_branch(
-            &board.tasks, &board.projects, &board.repositories, B, &generated, &repo,
+            &board.tasks,
+            &board.projects,
+            &board.repositories,
+            B,
+            &generated,
+            &repo,
         )
         .await
         .expect_err("an unclaimed pre-full-id branch refuses");
-        assert!(refused.contains(&format!("git branch -m {BRANCH} {generated}")), "{refused}");
+        assert!(
+            refused.contains(&format!("git branch -m {BRANCH} {generated}")),
+            "{refused}"
+        );
 
         board.add(A, Some(BRANCH), Some(&elsewhere)).await;
         assert!(
             refuse_shared_task_branch(
-                &board.tasks, &board.projects, &board.repositories, B, &generated, &repo,
+                &board.tasks,
+                &board.projects,
+                &board.repositories,
+                B,
+                &generated,
+                &repo,
             )
             .await
             .is_err(),
@@ -463,7 +508,12 @@ mod tests {
         board.add(B, None, Some(&repo)).await;
         assert_eq!(
             refuse_shared_task_branch(
-                &board.tasks, &board.projects, &board.repositories, B, &generated, &repo,
+                &board.tasks,
+                &board.projects,
+                &board.repositories,
+                B,
+                &generated,
+                &repo,
             )
             .await,
             Ok(())
@@ -478,12 +528,20 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = new_repository(&temp.path().join("repo"));
         git(Path::new(&repo), &["branch", BRANCH]);
-        for recorded in [super::super::WorktreeManager::branch_for_task(A), "feature/a".to_string()] {
+        for recorded in [
+            super::super::WorktreeManager::branch_for_task(A),
+            "feature/a".to_string(),
+        ] {
             let board = Board::default();
             board.add(A, Some(&recorded), Some(&repo)).await;
             assert_eq!(
                 refuse_shared_task_branch(
-                    &board.tasks, &board.projects, &board.repositories, A, &recorded, &repo,
+                    &board.tasks,
+                    &board.projects,
+                    &board.repositories,
+                    A,
+                    &recorded,
+                    &repo,
                 )
                 .await,
                 Ok(()),
@@ -505,7 +563,12 @@ mod tests {
 
         let generated = super::super::WorktreeManager::branch_for_task(B);
         assert!(refuse_shared_task_branch(
-            &board.tasks, &board.projects, &board.repositories, B, &generated, &plain,
+            &board.tasks,
+            &board.projects,
+            &board.repositories,
+            B,
+            &generated,
+            &plain,
         )
         .await
         .is_err());
@@ -557,7 +620,10 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stdout}\n{stderr}");
-        assert!(stdout.contains("1 passed"), "the test did not run: {stdout}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the test did not run: {stdout}"
+        );
     }
 
     /// A task that records no branch starts when no branch of the name
@@ -575,29 +641,52 @@ mod tests {
             let board = &board;
             async move {
                 refuse_shared_task_branch(
-                    &board.tasks, &board.projects, &board.repositories, B, &generated, &repo_path,
+                    &board.tasks,
+                    &board.projects,
+                    &board.repositories,
+                    B,
+                    &generated,
+                    &repo_path,
                 )
                 .await
             }
         };
 
-        assert_eq!(refuse(repo.clone()).await, Ok(()), "no branch of the earlier name");
+        assert_eq!(
+            refuse(repo.clone()).await,
+            Ok(()),
+            "no branch of the earlier name"
+        );
 
         git(Path::new(&repo), &["branch", BRANCH]);
-        let refused = refuse(repo.clone()).await.expect_err("the earlier name is there");
-        assert!(refused.contains(&format!("while branch {BRANCH} is in its repository")), "{refused}");
+        let refused = refuse(repo.clone())
+            .await
+            .expect_err("the earlier name is there");
+        assert!(
+            refused.contains(&format!("while branch {BRANCH} is in its repository")),
+            "{refused}"
+        );
         git(Path::new(&repo), &["branch", "-D", BRANCH]);
 
         // A ref git cannot read is not an absence.
-        std::fs::write(Path::new(&repo).join(".git/refs/heads").join(BRANCH), "garbage\n").unwrap();
+        std::fs::write(
+            Path::new(&repo).join(".git/refs/heads").join(BRANCH),
+            "garbage\n",
+        )
+        .unwrap();
         let refused = refuse(repo.clone()).await.expect_err("an unreadable ref");
-        assert!(refused.contains("Could not check for local branch"), "{refused}");
+        assert!(
+            refused.contains("Could not check for local branch"),
+            "{refused}"
+        );
 
         let plain = temp.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         // Not a repository at all is refused before any branch is looked
         // up, saying what the project needs.
-        let refused = refuse(plain.to_string_lossy().to_string()).await.expect_err("not a repository");
+        let refused = refuse(plain.to_string_lossy().to_string())
+            .await
+            .expect_err("not a repository");
         assert!(refused.contains("not under version control"), "{refused}");
     }
 }

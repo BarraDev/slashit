@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MPL-2.0
-use crate::commands::gui_admission::GuiMutation;
-use crate::domain::Repository;
-use crate::config::Storage;
 use crate::commands::file::{git_location, GitLocation};
+use crate::commands::gui_admission::GuiMutation;
+use crate::config::Storage;
+use crate::domain::Repository;
 use crate::worktree::vcs::{self, Vcs};
 use crate::worktree::vcs_init::{self, VcsInitKind};
-use uuid::Uuid;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 type Repositories = Arc<RwLock<HashMap<Uuid, Repository>>>;
 
@@ -115,7 +115,9 @@ async fn ensure_vcs_initialized(
     if !needs_init {
         return Ok(false);
     }
-    let path_str = path.to_str().ok_or("The folder's path is not valid UTF-8")?;
+    let path_str = path
+        .to_str()
+        .ok_or("The folder's path is not valid UTF-8")?;
     vcs_init::initialize(path_str, kind, expected_files).await?;
     Ok(true)
 }
@@ -230,9 +232,11 @@ async fn create_repository_committed(
     // cannot each mint a record. A folder keeps one Repository UUID whether or
     // not the call supplies a remote.
     let canonical = canonical_or_raw(Path::new(&repository.local_path));
-    if let Some(existing) =
-        registered_repository_for(&repositories_w, &canonical, repository.remote_url.as_deref())?
-    {
+    if let Some(existing) = registered_repository_for(
+        &repositories_w,
+        &canonical,
+        repository.remote_url.as_deref(),
+    )? {
         return Ok(existing);
     }
     let mut proposed = repositories_w.clone();
@@ -302,10 +306,10 @@ pub async fn get_repository(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::file::is_git_repo_root;
     use crate::config::paths::AppPaths;
     use crate::config::storage::AppConfig;
     use tempfile::TempDir;
-    use crate::commands::file::is_git_repo_root;
 
     fn create_test_storage() -> (Storage, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -346,10 +350,15 @@ mod tests {
         try_persist_repositories(&storage, &repositories)
             .expect("should succeed against a missing config");
 
-        let loaded = storage.load_config().expect("should load the freshly written config");
+        let loaded = storage
+            .load_config()
+            .expect("should load the freshly written config");
         assert_eq!(loaded.repositories.len(), 1);
         assert!(loaded.repositories.contains_key(&id.to_string()));
-        assert_eq!(loaded.ui_preferences.theme, AppConfig::default().ui_preferences.theme);
+        assert_eq!(
+            loaded.ui_preferences.theme,
+            AppConfig::default().ui_preferences.theme
+        );
     }
 
     #[cfg(unix)]
@@ -383,9 +392,15 @@ mod tests {
         // Restore permissions so the file can be inspected and cleaned up.
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        assert!(result.is_err(), "a read failure must not be treated as success");
+        assert!(
+            result.is_err(),
+            "a read failure must not be treated as success"
+        );
         let on_disk = std::fs::read(&config_path).unwrap();
-        assert_eq!(on_disk, original_bytes, "config on disk must be untouched by a failed persist");
+        assert_eq!(
+            on_disk, original_bytes,
+            "config on disk must be untouched by a failed persist"
+        );
     }
 
     #[cfg(unix)]
@@ -397,15 +412,24 @@ mod tests {
         }
 
         let (storage, _temp) = create_test_storage();
-        storage.save_config(&AppConfig::default()).expect("seed config");
-        std::fs::set_permissions(storage.paths().config_file(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        storage
+            .save_config(&AppConfig::default())
+            .expect("seed config");
+        std::fs::set_permissions(
+            storage.paths().config_file(),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let new_repo = make_test_repository(Uuid::new_v4());
 
         let result = create_repository_committed(&repositories, &storage, new_repo).await;
 
-        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
+        assert!(
+            result.is_err(),
+            "a persistence failure must be reported, not swallowed"
+        );
         assert!(
             repositories.read().await.is_empty(),
             "memory must not contain a repository disk never recorded"
@@ -423,11 +447,22 @@ mod tests {
         first.local_path = path.clone();
         let mut second = make_test_repository(Uuid::new_v4());
         second.local_path = path;
-        let registered = create_repository_committed(&repositories, &storage, first).await.unwrap();
-        let reopened = create_repository_committed(&repositories, &storage, second).await.unwrap();
+        let registered = create_repository_committed(&repositories, &storage, first)
+            .await
+            .unwrap();
+        let reopened = create_repository_committed(&repositories, &storage, second)
+            .await
+            .unwrap();
 
-        assert_eq!(reopened.id, registered.id, "the folder keeps its first identity");
-        assert_eq!(repositories.read().await.len(), 1, "no second record is minted");
+        assert_eq!(
+            reopened.id, registered.id,
+            "the folder keeps its first identity"
+        );
+        assert_eq!(
+            repositories.read().await.len(),
+            1,
+            "no second record is minted"
+        );
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
@@ -447,19 +482,39 @@ mod tests {
 
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                folder.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await;
 
         assert!(result.is_ok(), "expected success, got {:?}", result.err());
-        assert!(is_git_repo_root(&folder), "folder must be a real git repository");
+        assert!(
+            is_git_repo_root(&folder),
+            "folder must be a real git repository"
+        );
         let toplevel = git(&folder, &["rev-parse", "--is-inside-work-tree"]);
-        assert!(toplevel.status.success(), "git must recognize the folder as a work tree");
+        assert!(
+            toplevel.status.success(),
+            "git must recognize the folder as a work tree"
+        );
         // Git named the branch, from the (isolated) `init.defaultBranch`,
         // and it has a first commit a task can start from.
         let head = git(&folder, &["symbolic-ref", "HEAD"]);
-        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "refs/heads/trunk-xyz");
-        assert!(git(&folder, &["rev-parse", "--verify", "refs/heads/trunk-xyz"]).status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "refs/heads/trunk-xyz"
+        );
+        assert!(
+            git(&folder, &["rev-parse", "--verify", "refs/heads/trunk-xyz"])
+                .status
+                .success()
+        );
     }
 
     /// A folder registered as plain, then asked to become Git, is initialized and
@@ -470,19 +525,36 @@ mod tests {
         let folder = temp.path().join("project");
         std::fs::create_dir_all(&folder).unwrap();
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let first = create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, None, None)
-            .await
-            .expect("the plain folder is registered");
+        let first = create_repository_core(
+            &repositories,
+            &storage,
+            folder.to_string_lossy().to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the plain folder is registered");
         assert!(!is_git_repo_root(&folder));
 
         let second = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                folder.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await
         .expect("the requested initialization runs");
         assert_eq!(second.id, first.id, "the existing record is reused");
-        assert!(is_git_repo_root(&folder), "the requested Git initialization must run");
+        assert!(
+            is_git_repo_root(&folder),
+            "the requested Git initialization must run"
+        );
     }
 
     /// A registered folder that later sits inside another repository is refused
@@ -494,12 +566,27 @@ mod tests {
         let child = parent.join("child");
         std::fs::create_dir_all(&child).unwrap();
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, None, None)
-            .await
-            .expect("the child folder is registered first");
+        create_repository_core(
+            &repositories,
+            &storage,
+            child.to_string_lossy().to_string(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the child folder is registered first");
         assert!(git(&parent, &["init"]).status.success());
 
-        let again = create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, None, None).await;
+        let again = create_repository_core(
+            &repositories,
+            &storage,
+            child.to_string_lossy().to_string(),
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(
             again.is_err_and(|e| e.contains("inside git repository")),
             "a registered subdirectory of another checkout must be refused"
@@ -535,9 +622,15 @@ mod tests {
         )
         .await
         .expect_err("a different remote conflicts");
-        assert!(conflict.contains("conflicts with its stored remote"), "{conflict}");
+        assert!(
+            conflict.contains("conflicts with its stored remote"),
+            "{conflict}"
+        );
         for secret in ["hunter2", "stored.git", "supplied.git", "other.example.com"] {
-            assert!(!conflict.contains(secret), "the conflict repeated {secret}: {conflict}");
+            assert!(
+                !conflict.contains(secret),
+                "the conflict repeated {secret}: {conflict}"
+            );
         }
     }
 
@@ -555,14 +648,29 @@ mod tests {
 
         vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                folder.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await
         .expect("initialized");
 
         let tree = git(&folder, &["ls-tree", "-r", "--name-only", "HEAD"]);
-        assert_eq!(String::from_utf8_lossy(&tree.stdout).lines().collect::<Vec<_>>(), [".gitignore", "notes.txt"]);
-        assert!(folder.join("build/out.bin").is_file(), "an ignored file stays where it was");
+        assert_eq!(
+            String::from_utf8_lossy(&tree.stdout)
+                .lines()
+                .collect::<Vec<_>>(),
+            [".gitignore", "notes.txt"]
+        );
+        assert!(
+            folder.join("build/out.bin").is_file(),
+            "an ignored file stays where it was"
+        );
     }
 
     /// With no commit identity configured nothing is initialized and
@@ -577,7 +685,14 @@ mod tests {
 
         let refused = vcs_init::test_env::scope(
             vcs_init::test_env::without_identity(temp.path()),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                folder.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await
         .expect_err("no identity");
@@ -596,12 +711,22 @@ mod tests {
 
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, None, None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                folder.to_string_lossy().to_string(),
+                None,
+                None,
+                None,
+            ),
         )
         .await;
 
         assert!(result.is_ok(), "expected success, got {:?}", result.err());
-        assert!(!folder.join(".git").exists(), "no git initialization must occur when unchecked");
+        assert!(
+            !folder.join(".git").exists(),
+            "no git initialization must occur when unchecked"
+        );
     }
 
     #[tokio::test]
@@ -614,19 +739,31 @@ mod tests {
         git(&folder, &["config", "user.name", "Test"]);
         std::fs::write(folder.join("README.md"), "hello").unwrap();
         git(&folder, &["add", "README.md"]);
-        assert!(git(&folder, &["commit", "-q", "-m", "init"]).status.success());
+        assert!(git(&folder, &["commit", "-q", "-m", "init"])
+            .status
+            .success());
         let head_before = git(&folder, &["rev-parse", "HEAD"]).stdout;
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                folder.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await;
 
         assert!(result.is_ok(), "expected success, got {:?}", result.err());
         let head_after = git(&folder, &["rev-parse", "HEAD"]).stdout;
-        assert_eq!(head_before, head_after, "existing repository history must survive untouched");
+        assert_eq!(
+            head_before, head_after,
+            "existing repository history must survive untouched"
+        );
     }
 
     fn init_committed_repo(dir: &std::path::Path) {
@@ -656,7 +793,14 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                child.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await;
 
@@ -665,7 +809,10 @@ mod tests {
             err.contains("already inside git repository"),
             "error must actionably explain the folder is already part of a repository: {err}"
         );
-        assert!(!child.join(".git").exists(), "no nested .git may be created under the child");
+        assert!(
+            !child.join(".git").exists(),
+            "no nested .git may be created under the child"
+        );
         assert!(
             repositories.read().await.is_empty(),
             "a refused path must never be registered as a repository"
@@ -688,11 +835,21 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, None, None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                child.to_string_lossy().to_string(),
+                None,
+                None,
+                None,
+            ),
         )
         .await;
 
-        assert!(result.is_err(), "an unchecked subdirectory selection must still be refused");
+        assert!(
+            result.is_err(),
+            "an unchecked subdirectory selection must still be refused"
+        );
         assert!(
             repositories.read().await.is_empty(),
             "a refused path must never be registered as a repository"
@@ -719,11 +876,21 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                child.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await;
 
-        assert!(result.is_err(), "the authoritative backend check must override the stale signal");
+        assert!(
+            result.is_err(),
+            "the authoritative backend check must override the stale signal"
+        );
     }
 
     #[tokio::test]
@@ -738,13 +905,27 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, nested.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                nested.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await;
 
-        assert!(result.is_ok(), "an intentional nested repository must be accepted: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "an intentional nested repository must be accepted: {:?}",
+            result.err()
+        );
         let head_after = git(&nested, &["rev-parse", "HEAD"]).stdout;
-        assert_eq!(head_before, head_after, "the nested repository's own history must survive untouched");
+        assert_eq!(
+            head_before, head_after,
+            "the nested repository's own history must survive untouched"
+        );
     }
 
     #[tokio::test]
@@ -753,22 +934,46 @@ mod tests {
         let repo = temp.path().join("repo");
         init_committed_repo(&repo);
         let worktree = temp.path().join("worktree");
+        assert!(git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "wt-branch",
+                worktree.to_str().unwrap()
+            ]
+        )
+        .status
+        .success());
         assert!(
-            git(&repo, &["worktree", "add", "-b", "wt-branch", worktree.to_str().unwrap()])
-                .status
-                .success()
+            worktree.join(".git").is_file(),
+            "sanity check: worktree .git must be a file"
         );
-        assert!(worktree.join(".git").is_file(), "sanity check: worktree .git must be a file");
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, worktree.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                worktree.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await;
 
-        assert!(result.is_ok(), "a linked worktree must be accepted as its own root: {:?}", result.err());
-        assert!(worktree.join(".git").is_file(), "the worktree's .git file must not be replaced by a real git init");
+        assert!(
+            result.is_ok(),
+            "a linked worktree must be accepted as its own root: {:?}",
+            result.err()
+        );
+        assert!(
+            worktree.join(".git").is_file(),
+            "the worktree's .git file must not be replaced by a real git init"
+        );
     }
 
     #[cfg(unix)]
@@ -788,13 +993,23 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                folder.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await;
 
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(result.is_err(), "a failed git init must not be reported as success");
+        assert!(
+            result.is_err(),
+            "a failed git init must not be reported as success"
+        );
         assert!(
             repositories.read().await.is_empty(),
             "no repository must be registered when git init failed"
@@ -810,21 +1025,39 @@ mod tests {
         }
 
         let (storage, temp) = create_test_storage();
-        storage.save_config(&AppConfig::default()).expect("seed config");
+        storage
+            .save_config(&AppConfig::default())
+            .expect("seed config");
         let folder = temp.path().join("project");
         std::fs::create_dir_all(&folder).unwrap();
-        std::fs::set_permissions(storage.paths().config_file(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(
+            storage.paths().config_file(),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+            create_repository_core(
+                &repositories,
+                &storage,
+                folder.to_string_lossy().to_string(),
+                None,
+                Some(VcsInitKind::Git),
+                None,
+            ),
         )
         .await;
 
-        std::fs::set_permissions(storage.paths().config_file(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(
+            storage.paths().config_file(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
 
-        let err = result.expect_err("persistence failure must be reported, not swallowed as success");
+        let err =
+            result.expect_err("persistence failure must be reported, not swallowed as success");
         assert!(
             err.contains("Version control was initialized"),
             "error must make clear git init already happened: {err}"
@@ -853,14 +1086,25 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
 
-        let first = create_repository_committed(&repositories, &storage, repo_at(&folder, Some("https://github.com/a/one")))
-            .await
-            .unwrap();
-        let again = create_repository_committed(&repositories, &storage, repo_at(&folder, Some("https://github.com/a/one")))
-            .await
-            .unwrap();
+        let first = create_repository_committed(
+            &repositories,
+            &storage,
+            repo_at(&folder, Some("https://github.com/a/one")),
+        )
+        .await
+        .unwrap();
+        let again = create_repository_committed(
+            &repositories,
+            &storage,
+            repo_at(&folder, Some("https://github.com/a/one")),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(again.id, first.id, "one folder, one identity, even with a remote");
+        assert_eq!(
+            again.id, first.id,
+            "one folder, one identity, even with a remote"
+        );
         assert_eq!(repositories.read().await.len(), 1);
     }
 
@@ -870,18 +1114,29 @@ mod tests {
         let folder = temp.path().join("repo");
         std::fs::create_dir_all(&folder).unwrap();
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let first = create_repository_committed(&repositories, &storage, repo_at(&folder, Some("https://github.com/a/one")))
-            .await
-            .unwrap();
+        let first = create_repository_committed(
+            &repositories,
+            &storage,
+            repo_at(&folder, Some("https://github.com/a/one")),
+        )
+        .await
+        .unwrap();
 
-        let err = create_repository_committed(&repositories, &storage, repo_at(&folder, Some("https://github.com/a/two")))
-            .await
-            .expect_err("a conflicting remote must be refused");
+        let err = create_repository_committed(
+            &repositories,
+            &storage,
+            repo_at(&folder, Some("https://github.com/a/two")),
+        )
+        .await
+        .expect_err("a conflicting remote must be refused");
 
         assert!(err.contains("conflicts"), "{err}");
         let map = repositories.read().await;
         assert_eq!(map.len(), 1);
-        assert_eq!(map[&first.id].remote_url.as_deref(), Some("https://github.com/a/one"));
+        assert_eq!(
+            map[&first.id].remote_url.as_deref(),
+            Some("https://github.com/a/one")
+        );
     }
 
     #[tokio::test]
@@ -890,16 +1145,25 @@ mod tests {
         let folder = temp.path().join("repo");
         std::fs::create_dir_all(&folder).unwrap();
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let first = create_repository_committed(&repositories, &storage, repo_at(&folder, None)).await.unwrap();
-
-        let err = create_repository_committed(&repositories, &storage, repo_at(&folder, Some("https://github.com/a/one")))
+        let first = create_repository_committed(&repositories, &storage, repo_at(&folder, None))
             .await
-            .expect_err("a supplied remote is not silently written onto a stored record");
+            .unwrap();
+
+        let err = create_repository_committed(
+            &repositories,
+            &storage,
+            repo_at(&folder, Some("https://github.com/a/one")),
+        )
+        .await
+        .expect_err("a supplied remote is not silently written onto a stored record");
 
         assert!(err.contains("conflicts"), "{err}");
         let map = repositories.read().await;
         assert_eq!(map.len(), 1);
-        assert_eq!(map[&first.id].remote_url, None, "the stored record keeps no remote");
+        assert_eq!(
+            map[&first.id].remote_url, None,
+            "the stored record keeps no remote"
+        );
     }
 
     #[tokio::test]
@@ -912,8 +1176,12 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let remote = Some("https://github.com/a/shared");
 
-        let a = create_repository_committed(&repositories, &storage, repo_at(&one, remote)).await.unwrap();
-        let b = create_repository_committed(&repositories, &storage, repo_at(&two, remote)).await.unwrap();
+        let a = create_repository_committed(&repositories, &storage, repo_at(&one, remote))
+            .await
+            .unwrap();
+        let b = create_repository_committed(&repositories, &storage, repo_at(&two, remote))
+            .await
+            .unwrap();
 
         assert_ne!(a.id, b.id);
         assert_eq!(repositories.read().await.len(), 2);

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
+use super::conversations::ConversationDraft;
 use crate::config::paths::{AppPaths, ProjectKey};
 use crate::domain::task::ExternalRef;
 use crate::domain::{AgentConfig, Conversation, Project, Repository, Task};
-use super::conversations::ConversationDraft;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -153,7 +153,10 @@ impl std::fmt::Display for ConfigWriteError {
                 "the change is in place but not confirmed durable (it may be lost if the \
                  computer stops before the next successful save): {e:#}"
             ),
-            Self::Unconfirmable(e) => write!(f, "the change cannot be confirmed durable on this storage location: {e:#}"),
+            Self::Unconfirmable(e) => write!(
+                f,
+                "the change cannot be confirmed durable on this storage location: {e:#}"
+            ),
         }
     }
 }
@@ -309,30 +312,52 @@ pub(crate) fn parse_github_url(url: &str, is_pr: bool) -> Option<ExternalRef> {
     let repo = repo_part.split(segment).next()?.to_string();
 
     if is_pr {
-        Some(ExternalRef::GithubPr { url: url.to_string(), number, repo, state: None , merge_commit: None})
+        Some(ExternalRef::GithubPr {
+            url: url.to_string(),
+            number,
+            repo,
+            state: None,
+            merge_commit: None,
+        })
     } else {
-        Some(ExternalRef::GithubIssue { url: url.to_string(), number, repo, state: None })
+        Some(ExternalRef::GithubIssue {
+            url: url.to_string(),
+            number,
+            repo,
+            state: None,
+        })
     }
 }
 
 fn migrate_task_refs(task: &mut Task) {
-    if !task.external_refs.is_empty() { return; }
+    if !task.external_refs.is_empty() {
+        return;
+    }
 
     if let Some(url) = task.github_issue_url.as_ref() {
-        if let Some(r) = parse_github_url(url, false) { task.external_refs.push(r); }
+        if let Some(r) = parse_github_url(url, false) {
+            task.external_refs.push(r);
+        }
     }
     if let Some(url) = task.pr_url.as_ref() {
-        if let Some(r) = parse_github_url(url, true) { task.external_refs.push(r); }
+        if let Some(r) = parse_github_url(url, true) {
+            task.external_refs.push(r);
+        }
     }
     if let Some(key) = task.jira_issue_key.as_ref() {
         let project = key.split('-').next().unwrap_or("").to_string();
-        task.external_refs.push(ExternalRef::JiraTicket { key: key.clone(), project });
+        task.external_refs.push(ExternalRef::JiraTicket {
+            key: key.clone(),
+            project,
+        });
     }
     if let Some(id) = task.linear_ticket_id.as_ref() {
-        task.external_refs.push(ExternalRef::LinearTicket { id: id.clone() });
+        task.external_refs
+            .push(ExternalRef::LinearTicket { id: id.clone() });
     }
     if let Some(url) = task.gitlab_issue_url.as_ref() {
-        task.external_refs.push(ExternalRef::GitlabIssue { url: url.clone() });
+        task.external_refs
+            .push(ExternalRef::GitlabIssue { url: url.clone() });
     }
 }
 
@@ -485,7 +510,10 @@ impl Storage {
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).with_context(|| format!("Failed to read Conversation draft {path:?}")),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to read Conversation draft {path:?}"))
+            }
         };
         let draft = serde_json::from_slice(&bytes)
             .with_context(|| format!("Failed to parse Conversation draft {path:?}"))?;
@@ -494,16 +522,27 @@ impl Storage {
 
     /// Save a composer draft unless a newer one is already stored. Returns
     /// `false` when the draft was older and nothing changed.
-    pub fn save_conversation_draft(&self, project_id: Uuid, draft: &ConversationDraft) -> Result<bool> {
+    pub fn save_conversation_draft(
+        &self,
+        project_id: Uuid,
+        draft: &ConversationDraft,
+    ) -> Result<bool> {
         if project_id.is_nil() {
             anyhow::bail!("Project identity must be valid");
         }
         draft.validate().map_err(anyhow::Error::msg)?;
-        let _guard = self.draft_tx.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.load_conversation_draft(project_id)?.is_some_and(|stored| stored.seq > draft.seq) {
+        let _guard = self
+            .draft_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .load_conversation_draft(project_id)?
+            .is_some_and(|stored| stored.seq > draft.seq)
+        {
             return Ok(false);
         }
-        let bytes = serde_json::to_vec_pretty(draft).context("Failed to serialize Conversation draft")?;
+        let bytes =
+            serde_json::to_vec_pretty(draft).context("Failed to serialize Conversation draft")?;
         write_private_atomic(&self.paths.conversation_draft_file(project_id), &bytes)
             .map_err(|e| write_failure(e, "atomically persist Conversation draft"))?;
         Ok(true)
@@ -519,7 +558,10 @@ impl Storage {
                 // a crash during creation can leave a document-only orphan.
                 // A pending Project-deletion marker authorizes a strict scan
                 // for documents that prove their own id and Project owner.
-                if self.pending_project_conversation_deletions()?.contains(&project_id) {
+                if self
+                    .pending_project_conversation_deletions()?
+                    .contains(&project_id)
+                {
                     self.delete_unpointed_project_conversations(project_id)?;
                 }
                 return Ok(());
@@ -528,15 +570,18 @@ impl Storage {
         }
         let raw = fs::read_to_string(&pointer)
             .with_context(|| format!("Failed to read Conversation pointer {pointer:?}"))?;
-        let conversation_id = raw.trim().parse::<Uuid>()
+        let conversation_id = raw
+            .trim()
+            .parse::<Uuid>()
             .with_context(|| format!("Invalid Conversation identity in pointer {pointer:?}"))?;
         let document = self.paths.conversation_file(conversation_id);
         match fs::symlink_metadata(&document) {
             Ok(metadata) if metadata.file_type().is_file() => {}
             Ok(_) => anyhow::bail!("Conversation document is not a regular file: {document:?}"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::remove_file(&pointer)
-                    .with_context(|| format!("Failed to remove stale Conversation pointer {pointer:?}"))?;
+                fs::remove_file(&pointer).with_context(|| {
+                    format!("Failed to remove stale Conversation pointer {pointer:?}")
+                })?;
                 return Ok(());
             }
             Err(error) => return Err(error).context("Failed to inspect Conversation document"),
@@ -546,7 +591,9 @@ impl Storage {
         let conversation: Conversation = serde_json::from_slice(&bytes)
             .with_context(|| format!("Failed to parse Conversation {document:?}"))?;
         if conversation.id != conversation_id || conversation.project_id != project_id {
-            anyhow::bail!("Conversation identity or Project owner does not match pointer {pointer:?}");
+            anyhow::bail!(
+                "Conversation identity or Project owner does not match pointer {pointer:?}"
+            );
         }
         fs::remove_file(&document)
             .with_context(|| format!("Failed to remove Project Conversation {document:?}"))?;
@@ -564,9 +611,14 @@ impl Storage {
         };
         for entry in entries {
             let entry = entry.context("Failed to read Conversation directory entry")?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue; };
-            let Some(id) = name.strip_suffix(".json") else { continue; };
-            let conversation_id = id.parse::<Uuid>()
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let conversation_id = id
+                .parse::<Uuid>()
                 .with_context(|| format!("Invalid Conversation filename {:?}", entry.path()))?;
             if name != format!("{conversation_id}.json") {
                 anyhow::bail!("Non-canonical Conversation filename {:?}", entry.path());
@@ -577,16 +629,17 @@ impl Storage {
             if !metadata.file_type().is_file() {
                 anyhow::bail!("Conversation document is not a regular file: {path:?}");
             }
-            let bytes = fs::read(&path)
-                .with_context(|| format!("Failed to read Conversation {path:?}"))?;
+            let bytes =
+                fs::read(&path).with_context(|| format!("Failed to read Conversation {path:?}"))?;
             let conversation: Conversation = serde_json::from_slice(&bytes)
                 .with_context(|| format!("Failed to parse Conversation {path:?}"))?;
             if conversation.id != conversation_id {
                 anyhow::bail!("Conversation identity does not match filename {path:?}");
             }
             if conversation.project_id == project_id {
-                fs::remove_file(&path)
-                    .with_context(|| format!("Failed to remove unpointed Project Conversation {path:?}"))?;
+                fs::remove_file(&path).with_context(|| {
+                    format!("Failed to remove unpointed Project Conversation {path:?}")
+                })?;
             }
         }
         Ok(())
@@ -597,7 +650,9 @@ impl Storage {
     /// it also authorizes the strict scan for document-only orphans in
     /// [`Self::delete_project_conversation`].
     pub fn mark_project_conversation_deletion_pending(&self, project_id: Uuid) -> Result<()> {
-        let path = self.paths.pending_project_conversation_deletion_file(project_id);
+        let path = self
+            .paths
+            .pending_project_conversation_deletion_file(project_id);
         write_private_atomic(&path, project_id.to_string().as_bytes())
             .map(|_| ())
             .map_err(|e| write_failure(e, "persist pending Project Conversation cleanup"))
@@ -608,11 +663,15 @@ impl Storage {
     /// because its removal never committed. Clearing an absent record is a
     /// no-op so recovery can be repeated.
     pub fn clear_project_conversation_deletion_pending(&self, project_id: Uuid) -> Result<()> {
-        let path = self.paths.pending_project_conversation_deletion_file(project_id);
+        let path = self
+            .paths
+            .pending_project_conversation_deletion_file(project_id);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).with_context(|| format!("Failed to clear cleanup record {path:?}")),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to clear cleanup record {path:?}"))
+            }
         }
     }
 
@@ -627,16 +686,27 @@ impl Storage {
         let mut pending = Vec::new();
         for entry in entries {
             let entry = entry.context("Failed to read Conversation cleanup directory entry")?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue; };
-            let Some(id) = name.strip_suffix(".delete-pending") else { continue; };
-            let project_id = id.parse::<Uuid>()
-                .with_context(|| format!("Invalid Project id in cleanup record {:?}", entry.path()))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".delete-pending") else {
+                continue;
+            };
+            let project_id = id.parse::<Uuid>().with_context(|| {
+                format!("Invalid Project id in cleanup record {:?}", entry.path())
+            })?;
             let recorded_id: Uuid = fs::read_to_string(entry.path())
                 .with_context(|| format!("Failed to read cleanup record {:?}", entry.path()))?
-                .trim().parse()
-                .with_context(|| format!("Invalid Project id in cleanup record {:?}", entry.path()))?;
+                .trim()
+                .parse()
+                .with_context(|| {
+                    format!("Invalid Project id in cleanup record {:?}", entry.path())
+                })?;
             if recorded_id != project_id {
-                anyhow::bail!("Project id does not match cleanup record {:?}", entry.path());
+                anyhow::bail!(
+                    "Project id does not match cleanup record {:?}",
+                    entry.path()
+                );
             }
             pending.push(project_id);
         }
@@ -701,9 +771,9 @@ impl Storage {
         match fs::metadata(self.paths.pending_project_tasks_deletion_file(project_id)) {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(anyhow::Error::new(error).context(
-                "Failed to read pending Task cleanup record",
-            )),
+            Err(error) => {
+                Err(anyhow::Error::new(error).context("Failed to read pending Task cleanup record"))
+            }
         }
     }
 
@@ -716,8 +786,9 @@ impl Storage {
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error)
-                .with_context(|| format!("Failed to clear cleanup record {path:?}")),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to clear cleanup record {path:?}"))
+            }
         }
     }
 
@@ -745,8 +816,9 @@ impl Storage {
                     entry.path()
                 )
             })?;
-            let raw = fs::read_to_string(entry.path())
-                .with_context(|| format!("Failed to read Task cleanup record {:?}", entry.path()))?;
+            let raw = fs::read_to_string(entry.path()).with_context(|| {
+                format!("Failed to read Task cleanup record {:?}", entry.path())
+            })?;
             let mut lines = raw.lines();
             let recorded_id: Uuid = lines
                 .next()
@@ -760,7 +832,10 @@ impl Storage {
                     )
                 })?;
             if recorded_id != project_id {
-                anyhow::bail!("Project id does not match Task cleanup record {:?}", entry.path());
+                anyhow::bail!(
+                    "Project id does not match Task cleanup record {:?}",
+                    entry.path()
+                );
             }
             let board_files = lines
                 .map(PathBuf::from)
@@ -795,7 +870,9 @@ impl Storage {
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).with_context(|| format!("Failed to clear import record {path:?}")),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to clear import record {path:?}"))
+            }
         }
     }
 
@@ -822,7 +899,10 @@ impl Storage {
             // checked against it and never trusted on its own. Only the canonical
             // spelling is accepted, because clearing a record rebuilds its path
             // from the id, so another spelling could never be removed.
-            let project_id = id.parse::<Uuid>().ok().filter(|uuid| uuid.to_string() == id);
+            let project_id = id
+                .parse::<Uuid>()
+                .ok()
+                .filter(|uuid| uuid.to_string() == id);
             let problem = match project_id {
                 None => Some("the file name is not a canonical Project id".to_string()),
                 Some(expected) => match fs::read_to_string(&path) {
@@ -980,9 +1060,9 @@ impl Storage {
     /// [`Self::read_config_strict`], which `update_config` uses instead.
     fn read_config(&self) -> Result<AppConfig> {
         if self.config_file.exists() {
-            let contents = fs::read_to_string(&self.config_file)
-                .context("Failed to read config file")?;
-            
+            let contents =
+                fs::read_to_string(&self.config_file).context("Failed to read config file")?;
+
             // Try to parse the config file
             match toml::from_str::<AppConfig>(&contents) {
                 Ok(config) => Ok(config),
@@ -999,15 +1079,20 @@ impl Storage {
                             eprintln!("  Context: ...{}...", &contents[context_start..context_end]);
                         }
                     }
-                    
+
                     // Try partial recovery: parse as generic TOML value first
                     if let Ok(value) = toml::from_str::<toml::Value>(&contents) {
-                        eprintln!("  Config file is valid TOML but doesn't match AppConfig structure");
-                        eprintln!("  Top-level keys: {:?}", value.as_table().map(|t| t.keys().collect::<Vec<_>>()));
-                        
+                        eprintln!(
+                            "  Config file is valid TOML but doesn't match AppConfig structure"
+                        );
+                        eprintln!(
+                            "  Top-level keys: {:?}",
+                            value.as_table().map(|t| t.keys().collect::<Vec<_>>())
+                        );
+
                         // Attempt to extract what we can
                         let mut config = AppConfig::default();
-                        
+
                         // Try to recover UI preferences
                         if let Some(ui) = value.get("ui_preferences") {
                             if let Ok(ui_prefs) = ui.clone().try_into::<UiPreferences>() {
@@ -1015,7 +1100,7 @@ impl Storage {
                                 eprintln!("  Recovered: ui_preferences");
                             }
                         }
-                        
+
                         // Try to recover JJ config
                         if let Some(jj) = value.get("jj_config") {
                             if let Ok(jj_config) = jj.clone().try_into::<JjConfig>() {
@@ -1023,19 +1108,23 @@ impl Storage {
                                 eprintln!("  Recovered: jj_config");
                             }
                         }
-                        
+
                         // Try to recover the Queue settings: forgetting an
                         // `auto_promote = false` would start queued Tasks the
                         // person had paused.
                         if let Some(queue) = value.get("queue") {
-                            if let Ok(queue_config) = queue.clone().try_into::<crate::config::QueueConfig>() {
+                            if let Ok(queue_config) =
+                                queue.clone().try_into::<crate::config::QueueConfig>()
+                            {
                                 config.queue = queue_config;
                                 eprintln!("  Recovered: queue");
                             }
                         }
 
-                        eprintln!("  Using partial recovery with defaults for unrecoverable sections");
-                        
+                        eprintln!(
+                            "  Using partial recovery with defaults for unrecoverable sections"
+                        );
+
                         // Backup the old config before we potentially overwrite it
                         let backup_path = self.config_file.with_extension("toml.backup");
                         if let Err(e) = fs::copy(&self.config_file, &backup_path) {
@@ -1043,10 +1132,10 @@ impl Storage {
                         } else {
                             eprintln!("  Backed up old config to: {:?}", backup_path);
                         }
-                        
+
                         return Ok(config);
                     }
-                    
+
                     // Config file is corrupted/invalid TOML - backup and reset
                     eprintln!("  Config file is not valid TOML, backing up and resetting");
                     let backup_path = self.config_file.with_extension("toml.corrupted");
@@ -1055,7 +1144,7 @@ impl Storage {
                     } else {
                         eprintln!("  Moved corrupted config to: {:?}", backup_path);
                     }
-                    
+
                     Ok(AppConfig::default())
                 }
             }
@@ -1088,8 +1177,8 @@ impl Storage {
             return Ok(AppConfig::default());
         }
 
-        let contents = fs::read_to_string(&self.config_file)
-            .context("Failed to read config file")?;
+        let contents =
+            fs::read_to_string(&self.config_file).context("Failed to read config file")?;
 
         toml::from_str::<AppConfig>(&contents).map_err(|parse_error| {
             anyhow::anyhow!(
@@ -1145,7 +1234,9 @@ impl Storage {
         // No wrapping `context` on purpose: callers render this with `{e}`,
         // which shows only the outermost layer, and the reader's own message
         // is the one that tells the user which file to repair and why.
-        let mut config = self.read_config_strict().map_err(ConfigWriteError::NotPublished)?;
+        let mut config = self
+            .read_config_strict()
+            .map_err(ConfigWriteError::NotPublished)?;
         mutate(&mut config);
         self.write_config(&config)
     }
@@ -1164,7 +1255,10 @@ impl Storage {
     /// rewrite succeeds, yet the result is [`ConfigWriteError::Unconfirmable`],
     /// because "the filesystem would not say" is not "the filesystem said yes".
     pub fn confirm_config_durable(&self) -> std::result::Result<(), ConfigWriteError> {
-        if !self.config_unconfirmed.load(std::sync::atomic::Ordering::SeqCst) {
+        if !self
+            .config_unconfirmed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Ok(());
         }
         self.update_config(|_| {})?;
@@ -1174,11 +1268,15 @@ impl Storage {
     /// Whether the last configuration write could not be confirmed durable.
     /// Read-only: unlike [`Self::confirm_config_durable`], it writes nothing.
     pub fn config_is_unconfirmed(&self) -> bool {
-        self.config_unconfirmed.load(std::sync::atomic::Ordering::SeqCst)
+        self.config_unconfirmed
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn require_config_confirmed(&self) -> std::result::Result<(), ConfigWriteError> {
-        if self.config_unconfirmed.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .config_unconfirmed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(ConfigWriteError::Unconfirmable(anyhow::anyhow!(
                 "the filesystem holding the configuration does not support synchronizing a directory"
             )));
@@ -1194,7 +1292,8 @@ impl Storage {
     pub fn reconfirm_config_durable(&self) -> std::result::Result<(), ConfigWriteError> {
         // Unconfirmed until a write completes, so a failure here (including one
         // before publication) keeps every later barrier in this process closed.
-        self.config_unconfirmed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.config_unconfirmed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.update_config(|_| {})?;
         self.require_config_confirmed()
     }
@@ -1224,15 +1323,18 @@ impl Storage {
                 // `Unsupported` is a write that succeeded without anyone being
                 // able to confirm the replacement itself: the barrier stays
                 // closed, but an ordinary save is not refused for it.
-                self.config_unconfirmed
-                    .store(!committed.is_fully_durable(), std::sync::atomic::Ordering::SeqCst);
+                self.config_unconfirmed.store(
+                    !committed.is_fully_durable(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
                 self.refresh_routes(config);
                 Ok(())
             }
             Err(error) if error.is_published() => {
                 // The file holds this config now, so the routes derived from
                 // it follow it before the failure is reported.
-                self.config_unconfirmed.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.config_unconfirmed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 self.refresh_routes(config);
                 Err(ConfigWriteError::PublishedNotDurable(
                     anyhow::Error::new(error).context("Failed to write config file"),
@@ -1763,8 +1865,7 @@ impl Storage {
         if legacy_dir.is_dir() {
             for entry in fs::read_dir(&legacy_dir).context("Failed to read tasks directory")? {
                 let path = entry?.path();
-                if path.extension().is_some_and(|ext| ext == "toml")
-                    && !seen_files.contains(&path)
+                if path.extension().is_some_and(|ext| ext == "toml") && !seen_files.contains(&path)
                 {
                     let owner = path
                         .file_stem()
@@ -1789,12 +1890,10 @@ impl Storage {
 
     fn board_at(path: PathBuf, legacy: &Path) -> (PathBuf, TasksFileState) {
         match Self::inspect_tasks_file(&path) {
-            TasksFileState::Absent if legacy != path => {
-                match Self::inspect_tasks_file(legacy) {
-                    TasksFileState::Absent => (path, TasksFileState::Absent),
-                    state => (legacy.to_path_buf(), state),
-                }
-            }
+            TasksFileState::Absent if legacy != path => match Self::inspect_tasks_file(legacy) {
+                TasksFileState::Absent => (path, TasksFileState::Absent),
+                state => (legacy.to_path_buf(), state),
+            },
             state => (path, state),
         }
     }
@@ -1817,12 +1916,7 @@ impl Storage {
     /// disk, so a stale or empty in-memory board cannot get past a file that
     /// is bad now; [`Self::unloaded_boards`] covers the one that is good now
     /// but was bad when memory was built.
-    fn ensure_board_replaceable(
-        &self,
-        project_id: Uuid,
-        path: &Path,
-        legacy: &Path,
-    ) -> Result<()> {
+    fn ensure_board_replaceable(&self, project_id: Uuid, path: &Path, legacy: &Path) -> Result<()> {
         let (_, state) = Self::board_at(path.to_path_buf(), legacy);
         if let TasksFileState::Unreadable(e) = state {
             return Err(e.into());
@@ -1847,7 +1941,10 @@ impl Storage {
     /// synchronized here. `Unsupported` means a board write can succeed without
     /// surviving a power loss, so a caller that must not lose the write checks
     /// this first. It flushes the directory's entries and changes no content.
-    pub fn board_directory_sync(&self, project_id: Uuid) -> Result<slashit_durable_fs::DirectorySync> {
+    pub fn board_directory_sync(
+        &self,
+        project_id: Uuid,
+    ) -> Result<slashit_durable_fs::DirectorySync> {
         let path = self.tasks_path(project_id);
         let dir = path
             .parent()
@@ -1906,8 +2003,12 @@ impl Storage {
         };
         let contents = toml::to_string_pretty(&tasks_file).context("Failed to serialize tasks")?;
 
-        let staged = slashit_durable_fs::stage(&path, contents.as_bytes(), slashit_durable_fs::Permissions::Preserve)
-            .map_err(|e| write_failure(e, "write tasks file"))?;
+        let staged = slashit_durable_fs::stage(
+            &path,
+            contents.as_bytes(),
+            slashit_durable_fs::Permissions::Preserve,
+        )
+        .map_err(|e| write_failure(e, "write tasks file"))?;
         // The last look at the file being replaced, as close to the rename as
         // the protocol allows. Dropping `staged` removes the temporary file.
         self.ensure_board_replaceable(project_id, &path, &legacy)?;
@@ -1918,7 +2019,9 @@ impl Storage {
         // all: removing the only other copy while the new file's entry is
         // unproven could lose the board. The routed file shadows the legacy
         // one, so keeping it costs nothing.
-        let committed = staged.publish().map_err(|e| write_failure(e, "write tasks file"))?;
+        let committed = staged
+            .publish()
+            .map_err(|e| write_failure(e, "write tasks file"))?;
 
         if legacy != path && legacy.is_file() && committed.is_fully_durable() {
             // A legacy copy that cannot be read is the only record of
@@ -1950,7 +2053,11 @@ impl Storage {
         let path = self.tasks_path(project_id);
         let legacy = self.legacy_tasks_path(project_id);
         self.ensure_board_replaceable(project_id, &path, &legacy)?;
-        if self.tasks_board_files(project_id).iter().any(|file| file.exists()) {
+        if self
+            .tasks_board_files(project_id)
+            .iter()
+            .any(|file| file.exists())
+        {
             anyhow::bail!("a Task board already exists for this Project");
         }
         let tasks_file = ProjectTasksFile {
@@ -1958,8 +2065,12 @@ impl Storage {
             tasks: tasks.to_vec(),
         };
         let contents = toml::to_string_pretty(&tasks_file).context("Failed to serialize tasks")?;
-        slashit_durable_fs::stage(&path, contents.as_bytes(), slashit_durable_fs::Permissions::Preserve)
-            .map_err(|e| write_failure(e, "stage tasks file"))
+        slashit_durable_fs::stage(
+            &path,
+            contents.as_bytes(),
+            slashit_durable_fs::Permissions::Preserve,
+        )
+        .map_err(|e| write_failure(e, "stage tasks file"))
     }
 
     pub fn delete_task_files(&self, board_files: &[PathBuf]) -> Result<()> {
@@ -2118,7 +2229,10 @@ mod tests {
 
         assert!(storage.delete_project_conversation(project_id).is_err());
         assert!(pointer.exists());
-        assert!(fs::symlink_metadata(document).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(document)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(target.exists());
     }
 
@@ -2181,7 +2295,9 @@ mod tests {
         let foreign = storage.create_primary_conversation(Uuid::new_v4()).unwrap();
         let foreign_document = storage.paths.conversation_file(foreign.id);
         fs::remove_file(storage.paths.primary_conversation_file(foreign.project_id)).unwrap();
-        storage.mark_project_conversation_deletion_pending(project_id).unwrap();
+        storage
+            .mark_project_conversation_deletion_pending(project_id)
+            .unwrap();
 
         storage.delete_project_conversation(project_id).unwrap();
         storage.delete_project_conversation(project_id).unwrap();
@@ -2189,16 +2305,24 @@ mod tests {
         assert!(!document.exists());
         assert!(!pointer.exists());
         assert!(foreign_document.exists());
-        assert!(storage.paths.pending_project_conversation_deletion_file(project_id).exists());
+        assert!(storage
+            .paths
+            .pending_project_conversation_deletion_file(project_id)
+            .exists());
     }
 
     #[test]
     fn pending_project_conversation_cleanup_survives_storage_restart() {
         let (storage, _dir) = create_test_storage();
         let project_id = Uuid::new_v4();
-        storage.mark_project_conversation_deletion_pending(project_id).unwrap();
+        storage
+            .mark_project_conversation_deletion_pending(project_id)
+            .unwrap();
         let restarted = Storage::with_paths(storage.paths().clone());
-        assert_eq!(restarted.pending_project_conversation_deletions().unwrap(), vec![project_id]);
+        assert_eq!(
+            restarted.pending_project_conversation_deletions().unwrap(),
+            vec![project_id]
+        );
     }
 
     #[test]
@@ -2207,8 +2331,16 @@ mod tests {
         assert!(storage.unreadable_task_files().unwrap().is_empty());
         let legacy = storage.legacy_tasks_dir();
         fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join(format!("{}.toml", Uuid::new_v4())), "tasks = [ not toml").unwrap();
-        fs::write(legacy.join(format!("{}.toml", Uuid::new_v4())), "version = 1\ntasks = []\n").unwrap();
+        fs::write(
+            legacy.join(format!("{}.toml", Uuid::new_v4())),
+            "tasks = [ not toml",
+        )
+        .unwrap();
+        fs::write(
+            legacy.join(format!("{}.toml", Uuid::new_v4())),
+            "version = 1\ntasks = []\n",
+        )
+        .unwrap();
         assert_eq!(storage.unreadable_task_files().unwrap().len(), 1);
         assert!(storage.load_all_tasks().unwrap().is_empty());
     }
@@ -2241,7 +2373,9 @@ mod tests {
             ("malformed TOML", b"tasks = [ not toml".to_vec()),
             (
                 "unknown status",
-                valid.replacen("status = \"backlog\"", "status = \"from_the_future\"", 1).into_bytes(),
+                valid
+                    .replacen("status = \"backlog\"", "status = \"from_the_future\"", 1)
+                    .into_bytes(),
             ),
             ("not UTF-8", vec![0xff, 0xfe, 0x00, 0x80]),
             (
@@ -2273,8 +2407,10 @@ mod tests {
             (
                 "unknown empty table on a Task",
                 board_text_edited(valid, |table| {
-                    first_task_mut(table)
-                        .insert("future_table".into(), toml::Value::Table(toml::Table::new()));
+                    first_task_mut(table).insert(
+                        "future_table".into(),
+                        toml::Value::Table(toml::Table::new()),
+                    );
                 }),
             ),
             (
@@ -2330,8 +2466,10 @@ mod tests {
             (
                 "malformed checkout_admission",
                 board_text_edited(valid, |table| {
-                    first_task_mut(table)
-                        .insert("checkout_admission".into(), "a shape this build does not know".into());
+                    first_task_mut(table).insert(
+                        "checkout_admission".into(),
+                        "a shape this build does not know".into(),
+                    );
                 }),
             ),
             (
@@ -2360,8 +2498,12 @@ mod tests {
                         },
                     };
                     let mut entry = toml::Value::try_from(entry).unwrap();
-                    entry.as_table_mut().unwrap().insert("future_field".into(), "newer".into());
-                    first_task_mut(table).insert("activity".into(), toml::Value::Array(vec![entry]));
+                    entry
+                        .as_table_mut()
+                        .unwrap()
+                        .insert("future_field".into(), "newer".into());
+                    first_task_mut(table)
+                        .insert("activity".into(), toml::Value::Array(vec![entry]));
                 }),
             ),
         ]
@@ -2384,7 +2526,9 @@ mod tests {
     }
 
     fn first_task_mut(table: &mut toml::Table) -> &mut toml::Table {
-        table["tasks"].as_array_mut().unwrap()[0].as_table_mut().unwrap()
+        table["tasks"].as_array_mut().unwrap()[0]
+            .as_table_mut()
+            .unwrap()
     }
 
     /// A Task-level Activity list holding one entry of a kind this build does
@@ -2410,12 +2554,18 @@ mod tests {
         let project_id = Uuid::new_v4();
         let mut task = crate::test_helpers::create_test_task("Long history");
         for run in 1..=300u32 {
-            task.record_activity(ActivityKind::RunStarted { run, addressing_feedback: false });
+            task.record_activity(ActivityKind::RunStarted {
+                run,
+                addressing_feedback: false,
+            });
             task.record_activity(ActivityKind::RunCompleted { run });
             let text = "a provider's final answer ".repeat(20);
             let result = slashit_activity::RunResult::from_provider(Ok(text));
             task.record_activity(ActivityKind::RunResult { run, result });
-            task.record_activity(ActivityKind::AiReviewSkipped { review: run, reason: "disabled".into() });
+            task.record_activity(ActivityKind::AiReviewSkipped {
+                review: run,
+                reason: "disabled".into(),
+            });
             task.record_activity(ActivityKind::ReadyForReview { arrival: run });
         }
         task.record_activity(ActivityKind::CompletedLocally {});
@@ -2423,13 +2573,22 @@ mod tests {
         let before = task.activity.len();
         assert_eq!(before, 1_501);
 
-        storage.save_project_tasks(project_id, &[task.clone()]).expect("save the board");
-        let bytes = std::fs::metadata(storage.tasks_path(project_id)).unwrap().len();
+        storage
+            .save_project_tasks(project_id, &[task.clone()])
+            .expect("save the board");
+        let bytes = std::fs::metadata(storage.tasks_path(project_id))
+            .unwrap()
+            .len();
         eprintln!("board with {before} milestones: {bytes} bytes");
-        let loaded = storage.load_project_tasks(project_id).expect("load the board");
+        let loaded = storage
+            .load_project_tasks(project_id)
+            .expect("load the board");
         let restarted = loaded.iter().find(|t| t.id == task.id).expect("the Task");
 
-        assert_eq!(restarted.activity, task.activity, "no milestone was dropped");
+        assert_eq!(
+            restarted.activity, task.activity,
+            "no milestone was dropped"
+        );
         assert_eq!(restarted.next_run(), 301);
         assert_eq!(restarted.next_review(), 301);
         assert!(restarted.completed_locally());
@@ -2452,8 +2611,9 @@ mod tests {
         let (storage, dir) = create_test_storage();
         eprintln!("scratch directory: {}", dir.path().display());
         let project_id = Uuid::new_v4();
-        let mut tasks: Vec<Task> =
-            (0..TASKS).map(|i| crate::test_helpers::create_test_task(&format!("Task {i}"))).collect();
+        let mut tasks: Vec<Task> = (0..TASKS)
+            .map(|i| crate::test_helpers::create_test_task(&format!("Task {i}")))
+            .collect();
         let mut save_micros: Vec<u128> = Vec::new();
         let mut save = |tasks: &[Task]| {
             let started = Instant::now();
@@ -2465,10 +2625,16 @@ mod tests {
                 let text = "a provider's final answer, about a screenful of text. ".repeat(40);
                 let result = slashit_activity::RunResult::from_provider(Ok(text));
                 let events = [
-                    ActivityKind::RunStarted { run, addressing_feedback: false },
+                    ActivityKind::RunStarted {
+                        run,
+                        addressing_feedback: false,
+                    },
                     ActivityKind::RunCompleted { run },
                     ActivityKind::RunResult { run, result },
-                    ActivityKind::AiReviewSkipped { review: run, reason: "AI review is off".into() },
+                    ActivityKind::AiReviewSkipped {
+                        review: run,
+                        reason: "AI review is off".into(),
+                    },
                     ActivityKind::ReadyForReview { arrival: run },
                 ];
                 for event in events {
@@ -2477,13 +2643,20 @@ mod tests {
                 }
             }
             if run % 25 == 0 {
-                let bytes = std::fs::metadata(storage.tasks_path(project_id)).unwrap().len();
+                let bytes = std::fs::metadata(storage.tasks_path(project_id))
+                    .unwrap()
+                    .len();
                 let entries: usize = tasks.iter().map(|t| t.activity.len()).sum();
-                eprintln!("after {run} runs per Task: {entries} milestones in total, board {bytes} bytes");
+                eprintln!(
+                    "after {run} runs per Task: {entries} milestones in total, board {bytes} bytes"
+                );
             }
         }
         let milestones: usize = tasks.iter().map(|t| t.activity.len()).sum();
-        let json: usize = tasks.iter().map(|t| serde_json::to_vec(&t.activity).unwrap().len()).sum();
+        let json: usize = tasks
+            .iter()
+            .map(|t| serde_json::to_vec(&t.activity).unwrap().len())
+            .sum();
         let in_memory = milestones * std::mem::size_of::<slashit_activity::Entry>();
         save_micros.sort_unstable();
         let at = |q: f64| save_micros[((save_micros.len() - 1) as f64 * q) as usize];
@@ -2517,9 +2690,16 @@ mod tests {
             }],
         });
 
-        storage.save_project_tasks(project_id, &[task.clone()]).expect("write production Task board");
-        let loaded = storage.load_project_tasks(project_id).expect("read production Task board");
-        let restarted = loaded.iter().find(|saved| saved.id == task.id).expect("saved Task");
+        storage
+            .save_project_tasks(project_id, &[task.clone()])
+            .expect("write production Task board");
+        let loaded = storage
+            .load_project_tasks(project_id)
+            .expect("read production Task board");
+        let restarted = loaded
+            .iter()
+            .find(|saved| saved.id == task.id)
+            .expect("saved Task");
 
         assert_eq!(restarted.checkout_admission, task.checkout_admission);
         let admission = restarted.checkout_admission.as_ref().unwrap();
@@ -2529,17 +2709,23 @@ mod tests {
         assert_eq!(admission.repository_id, repository_id);
         assert_eq!(admission.branch, "task/board-round-trip");
         assert_eq!(admission.admitted_commit, "a".repeat(40));
-        assert_eq!(admission.dependencies, vec![DependencyAdmission {
-            task_id: dependency_id,
-            requirement: DependencyRequirement::Commits(vec!["b".repeat(40), "c".repeat(40)]),
-        }]);
+        assert_eq!(
+            admission.dependencies,
+            vec![DependencyAdmission {
+                task_id: dependency_id,
+                requirement: DependencyRequirement::Commits(vec!["b".repeat(40), "c".repeat(40)]),
+            }]
+        );
     }
 
     #[test]
     fn a_missing_file_and_an_empty_board_are_both_loadable_but_different() {
         let (storage, _dir) = create_test_storage();
         let missing = Uuid::new_v4();
-        assert!(matches!(storage.project_board(missing).1, TasksFileState::Absent));
+        assert!(matches!(
+            storage.project_board(missing).1,
+            TasksFileState::Absent
+        ));
         assert!(storage.load_project_tasks(missing).unwrap().is_empty());
 
         let empty = Uuid::new_v4();
@@ -2550,8 +2736,12 @@ mod tests {
         ));
         assert!(storage.load_project_tasks(empty).unwrap().is_empty());
         // Both stay writable.
-        storage.save_project_tasks(missing, &board_with_pending_integration(missing)).unwrap();
-        storage.save_project_tasks(empty, &board_with_pending_integration(empty)).unwrap();
+        storage
+            .save_project_tasks(missing, &board_with_pending_integration(missing))
+            .unwrap();
+        storage
+            .save_project_tasks(empty, &board_with_pending_integration(empty))
+            .unwrap();
     }
 
     #[test]
@@ -2565,7 +2755,10 @@ mod tests {
 
             let loaded = storage.load_project_tasks(project_id);
             let error = loaded.expect_err(what);
-            assert!(error.downcast_ref::<UnreadableTasksFile>().is_some(), "{what}");
+            assert!(
+                error.downcast_ref::<UnreadableTasksFile>().is_some(),
+                "{what}"
+            );
 
             // The ordinary create/update path: an empty in-memory board plus
             // one new Task, then a later update of it.
@@ -2578,7 +2771,11 @@ mod tests {
                 let refusal = error.downcast_ref::<UnreadableTasksFile>().expect(what);
                 assert_eq!(refusal.path, path, "{what}");
                 assert!(error.to_string().contains("will not overwrite"), "{what}");
-                assert_eq!(fs::read(&path).unwrap(), bytes, "{what}: bytes must not change");
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    bytes,
+                    "{what}: bytes must not change"
+                );
             }
 
             // Nothing was left behind next to it, and a restart sees the same.
@@ -2586,9 +2783,16 @@ mod tests {
                 .unwrap()
                 .map(|e| e.unwrap().file_name())
                 .collect();
-            assert_eq!(leftovers.len(), 1, "{what}: no temp file may remain: {leftovers:?}");
+            assert_eq!(
+                leftovers.len(),
+                1,
+                "{what}: no temp file may remain: {leftovers:?}"
+            );
             let restarted = Storage::with_paths(storage.paths().clone());
-            assert!(restarted.save_project_tasks(project_id, &[fresh]).is_err(), "{what}");
+            assert!(
+                restarted.save_project_tasks(project_id, &[fresh]).is_err(),
+                "{what}"
+            );
             assert_eq!(fs::read(&path).unwrap(), bytes, "{what}");
         }
     }
@@ -2598,14 +2802,19 @@ mod tests {
         let (storage, _dir) = create_test_storage();
         let broken = Uuid::new_v4();
         let healthy = Uuid::new_v4();
-        storage.save_project_tasks(healthy, &board_with_pending_integration(healthy)).unwrap();
+        storage
+            .save_project_tasks(healthy, &board_with_pending_integration(healthy))
+            .unwrap();
         let broken_path = storage.tasks_path(broken);
         fs::create_dir_all(broken_path.parent().unwrap()).unwrap();
         fs::write(&broken_path, b"tasks = [ not toml").unwrap();
 
         let loaded = storage.load_all_tasks().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(storage.unreadable_task_files().unwrap(), vec![broken_path.clone()]);
+        assert_eq!(
+            storage.unreadable_task_files().unwrap(),
+            vec![broken_path.clone()]
+        );
 
         let mut more = board_with_pending_integration(healthy);
         more.push(crate::test_helpers::create_test_task("Second"));
@@ -2647,13 +2856,25 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         let loaded = storage.load_project_tasks(project_id).expect("board loads");
-        assert_eq!(loaded[0].worktree_id, Some(worktree), "legacy workspace_id is still read");
-        assert!(loaded[0].checkout_admission.is_none(), "a Task with no attestation stays unknown");
+        assert_eq!(
+            loaded[0].worktree_id,
+            Some(worktree),
+            "legacy workspace_id is still read"
+        );
+        assert!(
+            loaded[0].checkout_admission.is_none(),
+            "a Task with no attestation stays unknown"
+        );
         assert_eq!(loaded[0].human_review.entries.len(), 1);
 
-        storage.save_project_tasks(project_id, &loaded).expect("board saves");
+        storage
+            .save_project_tasks(project_id, &loaded)
+            .expect("board saves");
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains(&format!("worktree_id = \"{worktree}\"")), "value written under the new name");
+        assert!(
+            saved.contains(&format!("worktree_id = \"{worktree}\"")),
+            "value written under the new name"
+        );
         assert!(!saved.contains("workspace_id"));
         let reloaded = Storage::with_paths(storage.paths().clone());
         let again = reloaded.load_project_tasks(project_id).unwrap();
@@ -2666,7 +2887,9 @@ mod tests {
         let (storage, _dir) = create_test_storage();
         let broken = Uuid::new_v4();
         let healthy = Uuid::new_v4();
-        storage.save_project_tasks(healthy, &board_with_pending_integration(healthy)).unwrap();
+        storage
+            .save_project_tasks(healthy, &board_with_pending_integration(healthy))
+            .unwrap();
         let broken_path = storage.tasks_path(broken);
         fs::create_dir_all(broken_path.parent().unwrap()).unwrap();
         let bytes = board_text_edited(&valid_board_text(broken), |table| {
@@ -2676,7 +2899,10 @@ mod tests {
 
         let loaded = storage.load_all_tasks().unwrap();
         assert_eq!(loaded.len(), 1, "the healthy project's Task still loads");
-        assert_eq!(storage.unreadable_task_files().unwrap(), vec![broken_path.clone()]);
+        assert_eq!(
+            storage.unreadable_task_files().unwrap(),
+            vec![broken_path.clone()]
+        );
 
         let mut more = board_with_pending_integration(healthy);
         more.push(crate::test_helpers::create_test_task("Second"));
@@ -2707,22 +2933,31 @@ mod tests {
                 requirement: DependencyRequirement::Branchless,
             }],
         });
-        storage.save_project_tasks(project_id, &[admitted.clone()]).unwrap();
+        storage
+            .save_project_tasks(project_id, &[admitted.clone()])
+            .unwrap();
         let loaded = storage.load_project_tasks(project_id).unwrap();
         assert_eq!(loaded[0].checkout_admission, admitted.checkout_admission);
 
         let path = storage.tasks_path(project_id);
         let bytes = board_text_edited(&valid_board_text(project_id), |table| {
-            first_task_mut(table)
-                .insert("checkout_admission".into(), "a shape this build does not know".into());
+            first_task_mut(table).insert(
+                "checkout_admission".into(),
+                "a shape this build does not know".into(),
+            );
         });
         fs::write(&path, &bytes).unwrap();
 
-        let error = storage.load_project_tasks(project_id).expect_err("malformed evidence refused");
+        let error = storage
+            .load_project_tasks(project_id)
+            .expect_err("malformed evidence refused");
         assert!(error.downcast_ref::<UnreadableTasksFile>().is_some());
         assert!(error.to_string().contains("checkout_admission"), "{error}");
         let saved = storage
-            .save_project_tasks(project_id, &[crate::test_helpers::create_test_task("Fresh")])
+            .save_project_tasks(
+                project_id,
+                &[crate::test_helpers::create_test_task("Fresh")],
+            )
             .expect_err("a rewrite that would drop the evidence is refused");
         assert!(saved.downcast_ref::<UnreadableTasksFile>().is_some());
         assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -2754,7 +2989,9 @@ mod tests {
     fn a_stale_board_cannot_overwrite_a_file_that_went_bad_after_it_was_loaded() {
         let (storage, _dir) = create_test_storage();
         let project_id = Uuid::new_v4();
-        storage.save_project_tasks(project_id, &board_with_pending_integration(project_id)).unwrap();
+        storage
+            .save_project_tasks(project_id, &board_with_pending_integration(project_id))
+            .unwrap();
         let in_memory = storage.load_project_tasks(project_id).unwrap();
 
         let path = storage.tasks_path(project_id);
@@ -2771,7 +3008,9 @@ mod tests {
         let project_id = Uuid::new_v4();
         route_project_to(&storage, project_id, &repo);
 
-        storage.save_project_tasks(project_id, &board_with_pending_integration(project_id)).unwrap();
+        storage
+            .save_project_tasks(project_id, &board_with_pending_integration(project_id))
+            .unwrap();
         let routed = storage.tasks_path(project_id);
         assert_ne!(routed, storage.legacy_tasks_path(project_id));
         fs::write(&routed, b"tasks = [ not toml").unwrap();
@@ -2806,7 +3045,9 @@ mod tests {
         let routed = storage.tasks_path(project_id);
         fs::create_dir_all(routed.parent().unwrap()).unwrap();
         fs::write(&routed, valid_board_text(project_id)).unwrap();
-        storage.save_project_tasks(project_id, &board_with_pending_integration(project_id)).unwrap();
+        storage
+            .save_project_tasks(project_id, &board_with_pending_integration(project_id))
+            .unwrap();
         assert_eq!(fs::read(&legacy).unwrap(), b"tasks = [ not toml");
     }
 
@@ -2843,13 +3084,17 @@ mod tests {
         let project_id = Uuid::new_v4();
         let mut first = crate::test_helpers::create_test_task("first");
         first.project_id = project_id;
-        storage.save_project_tasks(project_id, std::slice::from_ref(&first)).unwrap();
+        storage
+            .save_project_tasks(project_id, std::slice::from_ref(&first))
+            .unwrap();
         let before = fs::read(storage.tasks_path(project_id)).unwrap();
 
         let mut second = crate::test_helpers::create_test_task("second");
         second.project_id = project_id;
         let _fault = fault::fail_at(Stage::SyncTemp, std::io::ErrorKind::Other);
-        let error = storage.save_project_tasks(project_id, &[first, second]).unwrap_err();
+        let error = storage
+            .save_project_tasks(project_id, &[first, second])
+            .unwrap_err();
 
         assert!(!write_error(&error).is_published(), "{error:#}");
         assert_eq!(fs::read(storage.tasks_path(project_id)).unwrap(), before);
@@ -2881,7 +3126,10 @@ mod tests {
         assert!(write_error(&error).is_published(), "{error:#}");
         assert!(storage.tasks_path(project_id).is_file());
         // ...but the move is not confirmed, so the old copy is not retired.
-        assert!(legacy.exists(), "the legacy board must outlive an unconfirmed move");
+        assert!(
+            legacy.exists(),
+            "the legacy board must outlive an unconfirmed move"
+        );
         // A later successful save completes the move.
         storage.save_project_tasks(project_id, &tasks).unwrap();
         assert!(!legacy.exists());
@@ -2915,18 +3163,29 @@ mod tests {
         let routed = route_project_to(&donor, project_id, &repo);
 
         let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
-        let error = storage.update_config(|config| *config = routed.clone()).unwrap_err();
+        let error = storage
+            .update_config(|config| *config = routed.clone())
+            .unwrap_err();
 
         assert!(error.is_published(), "{error:#}");
-        assert!(storage.routed_state_dir(project_id).is_some(), "routes follow the visible config");
-        assert!(storage.read_config_strict().unwrap().projects.contains_key(&project_id.to_string()));
+        assert!(
+            storage.routed_state_dir(project_id).is_some(),
+            "routes follow the visible config"
+        );
+        assert!(storage
+            .read_config_strict()
+            .unwrap()
+            .projects
+            .contains_key(&project_id.to_string()));
     }
 
     #[test]
     fn an_unconfirmed_config_is_rewritten_by_the_barrier_and_only_then_confirmed() {
         use slashit_durable_fs::{fault, Stage};
         let (storage, _dir) = create_test_storage();
-        storage.confirm_config_durable().expect("nothing to confirm is not a failure");
+        storage
+            .confirm_config_durable()
+            .expect("nothing to confirm is not a failure");
 
         let fault_a = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
         let error = storage
@@ -2942,10 +3201,15 @@ mod tests {
         assert_eq!(storage.load_config().unwrap().ui_preferences.theme, "light");
 
         // The rewrite that completes is the confirmation, and clears the state.
-        storage.confirm_config_durable().expect("the retry completes");
+        storage
+            .confirm_config_durable()
+            .expect("the retry completes");
         let trace = fault::trace();
         storage.confirm_config_durable().unwrap();
-        assert!(trace.stages().is_empty(), "a confirmed config is not rewritten again");
+        assert!(
+            trace.stages().is_empty(),
+            "a confirmed config is not rewritten again"
+        );
     }
 
     /// A Conversation is read from disk at the start of every request, never held
@@ -2959,24 +3223,44 @@ mod tests {
         let mut conversation = storage.create_primary_conversation(project_id).unwrap();
         conversation.push(
             crate::domain::Role::Human,
-            crate::domain::EntryKind::HumanMessage { text: "first".into() },
+            crate::domain::EntryKind::HumanMessage {
+                text: "first".into(),
+            },
         );
 
         let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
         let error = storage.save_conversation(&conversation).unwrap_err();
         drop(fault);
         assert!(board_write_published(&error), "{error:#}");
-        assert!(format!("{error}").contains("not confirmed durable"), "{error:#}");
+        assert!(
+            format!("{error}").contains("not confirmed durable"),
+            "{error:#}"
+        );
 
         // The next request: load, extend, save. The earlier entry is still there.
-        let mut reloaded = storage.load_primary_conversation(project_id).unwrap().unwrap();
+        let mut reloaded = storage
+            .load_primary_conversation(project_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(reloaded.entries.len(), 1);
         reloaded.push(
             crate::domain::Role::Human,
-            crate::domain::EntryKind::HumanMessage { text: "second".into() },
+            crate::domain::EntryKind::HumanMessage {
+                text: "second".into(),
+            },
         );
-        storage.save_conversation(&reloaded).expect("the next save completes");
-        assert_eq!(storage.load_primary_conversation(project_id).unwrap().unwrap().entries.len(), 2);
+        storage
+            .save_conversation(&reloaded)
+            .expect("the next save completes");
+        assert_eq!(
+            storage
+                .load_primary_conversation(project_id)
+                .unwrap()
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -3011,14 +3295,22 @@ mod tests {
         // ... but nothing destructive may lean on it, however often it is asked.
         for _ in 0..2 {
             let error = storage.confirm_config_durable().unwrap_err();
-            assert!(matches!(error, ConfigWriteError::Unconfirmable(_)), "{error:?}");
+            assert!(
+                matches!(error, ConfigWriteError::Unconfirmable(_)),
+                "{error:?}"
+            );
             assert!(!error.is_published());
         }
-        assert!(matches!(storage.reconfirm_config_durable().unwrap_err(), ConfigWriteError::Unconfirmable(_)));
+        assert!(matches!(
+            storage.reconfirm_config_durable().unwrap_err(),
+            ConfigWriteError::Unconfirmable(_)
+        ));
 
         // The same storage on a filesystem that can answer clears it.
         drop(fault);
-        storage.confirm_config_durable().expect("a synced rewrite confirms");
+        storage
+            .confirm_config_durable()
+            .expect("a synced rewrite confirms");
         storage.confirm_config_durable().unwrap();
     }
 
@@ -3035,13 +3327,18 @@ mod tests {
         assert!(legacy.is_file());
         let (donor, _donor_dir) = create_test_storage();
         let routed = route_project_to(&donor, project_id, &repo);
-        storage.update_config(|config| *config = routed.clone()).unwrap();
+        storage
+            .update_config(|config| *config = routed.clone())
+            .unwrap();
         assert_ne!(storage.tasks_path(project_id), legacy);
 
         let _fault = fault::fail_every(Stage::SyncDirectory, std::io::ErrorKind::Unsupported);
         storage.save_project_tasks(project_id, &[]).unwrap();
         assert!(storage.tasks_path(project_id).is_file());
-        assert!(legacy.is_file(), "the only other copy stays while the new entry is unproven");
+        assert!(
+            legacy.is_file(),
+            "the only other copy stays while the new entry is unproven"
+        );
     }
 
     #[test]
@@ -3056,8 +3353,13 @@ mod tests {
         }
         // Not published, yet the barrier is closed until a write completes.
         let _trace = fault::trace();
-        storage.confirm_config_durable().expect("the retry completes");
-        assert!(_trace.stages().contains(&Stage::Replace), "the barrier rewrote the config");
+        storage
+            .confirm_config_durable()
+            .expect("the retry completes");
+        assert!(
+            _trace.stages().contains(&Stage::Replace),
+            "the barrier rewrote the config"
+        );
     }
 
     #[test]
@@ -3086,7 +3388,10 @@ mod tests {
         let stages = trace.stages();
         let sync_temp = stages.iter().position(|s| *s == Stage::SyncTemp).unwrap();
         let replace = stages.iter().position(|s| *s == Stage::Replace).unwrap();
-        let sync_dir = stages.iter().position(|s| *s == Stage::SyncDirectory).unwrap();
+        let sync_dir = stages
+            .iter()
+            .position(|s| *s == Stage::SyncDirectory)
+            .unwrap();
         assert!(sync_temp < replace && replace < sync_dir, "{stages:?}");
         drop(trace);
 
@@ -3145,7 +3450,9 @@ mod tests {
         let path = storage.tasks_path(project_id);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"tasks = [ not toml").unwrap();
-        storage.delete_task_files(&storage.tasks_board_files(project_id)).unwrap();
+        storage
+            .delete_task_files(&storage.tasks_board_files(project_id))
+            .unwrap();
         assert!(!path.exists());
     }
 
@@ -3178,7 +3485,9 @@ mod tests {
         assert!(storage.save_project_tasks(project_id, &[]).is_err());
         assert_eq!(fs::read_to_string(&routed).unwrap(), routed_text);
         assert_eq!(fs::read(&legacy).unwrap(), legacy_bytes);
-        assert!(String::from_utf8(legacy_bytes).unwrap().contains("[tasks.local_integration]"));
+        assert!(String::from_utf8(legacy_bytes)
+            .unwrap()
+            .contains("[tasks.local_integration]"));
         // Neither a second attempt nor a restart-less retry changes anything.
         assert!(storage.save_project_tasks(project_id, &[]).is_err());
         assert_eq!(fs::read_to_string(&routed).unwrap(), routed_text);
@@ -3221,7 +3530,7 @@ mod tests {
     #[test]
     fn test_appconfig_default_values() {
         let config = AppConfig::default();
-        
+
         assert!(config.projects.is_empty());
         assert!(config.repositories.is_empty());
         assert!(config.agent_configs.is_empty());
@@ -3235,7 +3544,7 @@ mod tests {
         // Empty TOML should use all defaults
         let toml_str = "";
         let config: AppConfig = toml::from_str(toml_str).expect("Should parse empty TOML");
-        
+
         assert!(config.projects.is_empty());
         assert!(config.repositories.is_empty());
         assert_eq!(config.jj_config.default_branch, "main");
@@ -3250,7 +3559,7 @@ mod tests {
 theme = "light"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Should parse partial TOML");
-        
+
         // Specified values should be used
         assert_eq!(config.ui_preferences.theme, "light");
         // Missing sidebar_width should use default
@@ -3270,9 +3579,12 @@ user_email = "test@example.com"
 default_branch = "develop"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Should parse jj_config only");
-        
+
         assert_eq!(config.jj_config.user_name, Some("Test User".to_string()));
-        assert_eq!(config.jj_config.user_email, Some("test@example.com".to_string()));
+        assert_eq!(
+            config.jj_config.user_email,
+            Some("test@example.com".to_string())
+        );
         assert_eq!(config.jj_config.default_branch, "develop");
         // Other sections should have defaults
         assert!(config.projects.is_empty());
@@ -3290,8 +3602,9 @@ sidebar_width = 350
 [jj_config]
 default_branch = "main"
 "#;
-        let config: AppConfig = toml::from_str(toml_str).expect("Should parse without repositories");
-        
+        let config: AppConfig =
+            toml::from_str(toml_str).expect("Should parse without repositories");
+
         // repositories should default to empty HashMap
         assert!(config.repositories.is_empty());
         assert!(config.projects.is_empty());
@@ -3303,9 +3616,9 @@ default_branch = "main"
     #[test]
     fn test_load_config_no_file_returns_default() {
         let (storage, _temp) = create_test_storage();
-        
+
         let config = storage.load_config().expect("Should load default config");
-        
+
         assert!(config.projects.is_empty());
         assert_eq!(config.ui_preferences.theme, "dark");
     }
@@ -3313,20 +3626,20 @@ default_branch = "main"
     #[test]
     fn test_save_and_load_config_roundtrip() {
         let (storage, _temp) = create_test_storage();
-        
+
         // Create a config with some data
         let mut config = AppConfig::default();
         config.ui_preferences.theme = "custom-theme".to_string();
         config.ui_preferences.sidebar_width = 400;
         config.jj_config.user_name = Some("Test User".to_string());
         config.jj_config.default_branch = "develop".to_string();
-        
+
         // Save it
         storage.save_config(&config).expect("Should save config");
-        
+
         // Load it back
         let loaded = storage.load_config().expect("Should load config");
-        
+
         assert_eq!(loaded.ui_preferences.theme, "custom-theme");
         assert_eq!(loaded.ui_preferences.sidebar_width, 400);
         assert_eq!(loaded.jj_config.user_name, Some("Test User".to_string()));
@@ -3354,10 +3667,10 @@ foo = "bar"
 baz = 123
 "#;
         fs::write(&storage.config_file, weird_toml).expect("Should write test file");
-        
+
         // Should still load successfully, using defaults for missing/invalid parts
         let config = storage.load_config().expect("Should load with recovery");
-        
+
         // The valid parts should be recovered
         assert_eq!(config.ui_preferences.theme, "light");
         assert_eq!(config.ui_preferences.sidebar_width, 250);
@@ -3433,12 +3746,15 @@ baz = 123
         let written = toml::to_string_pretty(&seed).expect("serialize");
         assert!(written.contains("placement = \"managed\""), "{written}");
 
-        for (spelling, expected) in
-            [("auto", WorktreePlacement::Auto), ("managed", WorktreePlacement::Managed)]
-        {
+        for (spelling, expected) in [
+            ("auto", WorktreePlacement::Auto),
+            ("managed", WorktreePlacement::Managed),
+        ] {
             let (storage, _temp) = create_test_storage();
-            let on_disk = written
-                .replace("placement = \"managed\"", &format!("placement = \"{spelling}\""));
+            let on_disk = written.replace(
+                "placement = \"managed\"",
+                &format!("placement = \"{spelling}\""),
+            );
             fs::write(&storage.config_file, &on_disk).expect("write fixture");
 
             let read = storage.read_config_strict().expect(spelling);
@@ -3447,8 +3763,15 @@ baz = 123
                 .update_config(|config| config.ui_preferences.theme = "light".to_string())
                 .expect(spelling);
             let after = storage.read_config_strict().expect(spelling);
-            assert_eq!(after.jj_config.user_name.as_deref(), Some("Kept"), "{spelling}");
-            assert_eq!(after.worktree.placement, expected, "{spelling}: the spelling is kept");
+            assert_eq!(
+                after.jj_config.user_name.as_deref(),
+                Some("Kept"),
+                "{spelling}"
+            );
+            assert_eq!(
+                after.worktree.placement, expected,
+                "{spelling}: the spelling is kept"
+            );
         }
     }
 
@@ -3459,7 +3782,9 @@ baz = 123
         fs::write(&storage.config_file, &poisoned).expect("write fixture");
 
         let result = storage.update_config(|config| {
-            config.projects.insert("new".to_string(), unreachable_project());
+            config
+                .projects
+                .insert("new".to_string(), unreachable_project());
         });
 
         assert!(
@@ -3506,7 +3831,9 @@ baz = 123
 
         storage
             .update_config(|config| {
-                config.projects.insert("new".to_string(), unreachable_project());
+                config
+                    .projects
+                    .insert("new".to_string(), unreachable_project());
             })
             .expect("a fully parsable config must still be updatable");
 
@@ -3576,17 +3903,19 @@ baz = 123
     #[test]
     fn test_load_config_corrupted_toml_returns_default() {
         let (storage, _temp) = create_test_storage();
-        
+
         // Write completely invalid TOML
         let corrupted = "this is not valid TOML { [ ] } @#$%";
         fs::write(&storage.config_file, corrupted).expect("Should write test file");
-        
+
         // Should return default config (after backing up the corrupted file)
-        let config = storage.load_config().expect("Should handle corrupted config");
-        
+        let config = storage
+            .load_config()
+            .expect("Should handle corrupted config");
+
         assert!(config.projects.is_empty());
         assert_eq!(config.ui_preferences.theme, "dark");
-        
+
         // Check that a backup was created
         let backup_path = storage.config_file.with_extension("toml.corrupted");
         assert!(backup_path.exists(), "Corrupted config should be backed up");
@@ -3596,11 +3925,11 @@ baz = 123
 
     #[test]
     fn test_project_persistence_in_config() {
-        use crate::domain::{Project, AgentType, AgentConfig};
+        use crate::domain::{AgentConfig, AgentType, Project};
         use std::collections::HashMap;
-        
+
         let (storage, _temp) = create_test_storage();
-        
+
         // Create a config with projects
         let mut config = AppConfig::default();
         let project_id = Uuid::new_v4();
@@ -3625,24 +3954,27 @@ baz = 123
             removed_at: None,
         };
         config.projects.insert(project_id.to_string(), project);
-        
+
         // Save and reload
         storage.save_config(&config).expect("Should save config");
         let loaded = storage.load_config().expect("Should load config");
-        
+
         assert_eq!(loaded.projects.len(), 1);
         assert!(loaded.projects.contains_key(&project_id.to_string()));
-        assert_eq!(loaded.projects.get(&project_id.to_string()).unwrap().name, "Test Project");
+        assert_eq!(
+            loaded.projects.get(&project_id.to_string()).unwrap().name,
+            "Test Project"
+        );
     }
 
     // ==================== Repository Persistence Tests ====================
 
     #[test]
     fn test_repository_persistence_in_config() {
-        use crate::domain::{Repository, RemoteType};
-        
+        use crate::domain::{RemoteType, Repository};
+
         let (storage, _temp) = create_test_storage();
-        
+
         // Create a config with repositories
         let mut config = AppConfig::default();
         let repo_id = Uuid::new_v4();
@@ -3654,14 +3986,21 @@ baz = 123
             created_at: chrono::Utc::now(),
         };
         config.repositories.insert(repo_id.to_string(), repo);
-        
+
         // Save and reload
         storage.save_config(&config).expect("Should save config");
         let loaded = storage.load_config().expect("Should load config");
-        
+
         assert_eq!(loaded.repositories.len(), 1);
         assert!(loaded.repositories.contains_key(&repo_id.to_string()));
-        assert_eq!(loaded.repositories.get(&repo_id.to_string()).unwrap().local_path, "/path/to/repo");
+        assert_eq!(
+            loaded
+                .repositories
+                .get(&repo_id.to_string())
+                .unwrap()
+                .local_path,
+            "/path/to/repo"
+        );
     }
 
     // ==================== JjConfig Tests ====================
@@ -3669,7 +4008,7 @@ baz = 123
     #[test]
     fn test_jjconfig_default() {
         let config = JjConfig::default();
-        
+
         assert!(config.user_name.is_none());
         assert!(config.user_email.is_none());
         assert_eq!(config.default_branch, "main");
@@ -3682,7 +4021,7 @@ baz = 123
 user_name = "Test"
 "#;
         let config: JjConfig = toml::from_str(toml_str).expect("Should parse");
-        
+
         assert_eq!(config.user_name, Some("Test".to_string()));
         assert!(config.user_email.is_none());
         assert_eq!(config.default_branch, "main"); // default
@@ -3693,7 +4032,7 @@ user_name = "Test"
     #[test]
     fn test_uipreferences_default() {
         let prefs = UiPreferences::default();
-        
+
         assert_eq!(prefs.theme, "dark");
         assert_eq!(prefs.sidebar_width, 300);
     }
@@ -3703,7 +4042,7 @@ user_name = "Test"
         // Parse with only theme specified
         let toml_str = r#"theme = "light""#;
         let prefs: UiPreferences = toml::from_str(toml_str).expect("Should parse");
-        
+
         assert_eq!(prefs.theme, "light");
         assert_eq!(prefs.sidebar_width, 300); // default
     }
@@ -3713,20 +4052,24 @@ user_name = "Test"
     #[test]
     fn test_save_and_load_project_tasks() {
         let (storage, _temp) = create_test_storage();
-        
+
         let project_id = Uuid::new_v4();
         let task = crate::test_helpers::create_test_task("Test Task");
         let mut task = task;
         task.project_id = project_id;
-        
+
         let tasks = vec![task.clone()];
-        
+
         // Save tasks
-        storage.save_project_tasks(project_id, &tasks).expect("Should save tasks");
-        
+        storage
+            .save_project_tasks(project_id, &tasks)
+            .expect("Should save tasks");
+
         // Load tasks
-        let loaded = storage.load_project_tasks(project_id).expect("Should load tasks");
-        
+        let loaded = storage
+            .load_project_tasks(project_id)
+            .expect("Should load tasks");
+
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].title, "Test Task");
         assert_eq!(loaded[0].project_id, project_id);
@@ -3735,31 +4078,37 @@ user_name = "Test"
     #[test]
     fn test_load_nonexistent_project_tasks_returns_empty() {
         let (storage, _temp) = create_test_storage();
-        
+
         let project_id = Uuid::new_v4();
-        let tasks = storage.load_project_tasks(project_id).expect("Should return empty vec");
-        
+        let tasks = storage
+            .load_project_tasks(project_id)
+            .expect("Should return empty vec");
+
         assert!(tasks.is_empty());
     }
 
     #[test]
     fn test_delete_project_tasks() {
         let (storage, _temp) = create_test_storage();
-        
+
         let project_id = Uuid::new_v4();
         let task = crate::test_helpers::create_test_task("Test Task");
         let tasks = vec![task];
-        
+
         // Save tasks
-        storage.save_project_tasks(project_id, &tasks).expect("Should save");
-        
+        storage
+            .save_project_tasks(project_id, &tasks)
+            .expect("Should save");
+
         // An unroutable project (no config loaded) keeps the legacy filename.
         let path = storage.legacy_tasks_path(project_id);
         assert!(path.exists());
-        
+
         // Delete tasks
-        storage.delete_task_files(&storage.tasks_board_files(project_id)).expect("Should delete");
-        
+        storage
+            .delete_task_files(&storage.tasks_board_files(project_id))
+            .expect("Should delete");
+
         // Verify file is gone
         assert!(!path.exists());
     }
@@ -3782,8 +4131,12 @@ user_name = "Test"
         task3.project_id = project1_id;
 
         // Save tasks
-        storage.save_project_tasks(project1_id, &[task1, task3]).expect("Should save");
-        storage.save_project_tasks(project2_id, &[task2]).expect("Should save");
+        storage
+            .save_project_tasks(project1_id, &[task1, task3])
+            .expect("Should save");
+        storage
+            .save_project_tasks(project2_id, &[task2])
+            .expect("Should save");
 
         // Load all tasks
         let all_tasks = storage.load_all_tasks().expect("Should load all");
@@ -4167,11 +4520,16 @@ user_name = "Test"
         let routed = storage.tasks_path(project_id);
         fs::create_dir_all(routed.parent().unwrap()).unwrap();
         fs::write(&routed, &bytes).unwrap();
-        let error = storage.load_project_tasks(project_id).expect_err("routed board refused");
+        let error = storage
+            .load_project_tasks(project_id)
+            .expect_err("routed board refused");
         let message = error.to_string();
         assert!(message.contains("future_field"), "{message}");
         let saved = storage
-            .save_project_tasks(project_id, &[crate::test_helpers::create_test_task("Fresh")])
+            .save_project_tasks(
+                project_id,
+                &[crate::test_helpers::create_test_task("Fresh")],
+            )
             .expect_err("routed board not replaced");
         assert!(saved.downcast_ref::<UnreadableTasksFile>().is_some());
         assert_eq!(fs::read(&routed).unwrap(), bytes);
@@ -4184,10 +4542,16 @@ user_name = "Test"
         fs::write(&legacy, &bytes).unwrap();
         assert!(storage.load_project_tasks(project_id).is_err());
         assert!(storage
-            .save_project_tasks(project_id, &[crate::test_helpers::create_test_task("Fresh")])
+            .save_project_tasks(
+                project_id,
+                &[crate::test_helpers::create_test_task("Fresh")]
+            )
             .is_err());
         assert_eq!(fs::read(&legacy).unwrap(), bytes);
-        assert!(!routed.exists(), "no routed board may be created over the legacy one");
+        assert!(
+            !routed.exists(),
+            "no routed board may be created over the legacy one"
+        );
     }
 
     #[test]
@@ -4259,7 +4623,9 @@ user_name = "Test"
             "B task"
         );
 
-        storage.delete_task_files(&storage.tasks_board_files(project_b)).unwrap();
+        storage
+            .delete_task_files(&storage.tasks_board_files(project_b))
+            .unwrap();
         assert_eq!(
             storage.load_project_tasks(project_a).unwrap()[0].title,
             "A task"
@@ -4329,13 +4695,16 @@ user_name = "Test"
     fn a_board_path_with_a_line_break_is_refused_rather_than_encoded_lossily() {
         let (storage, _temp) = create_test_storage();
         let project_id = Uuid::new_v4();
-        let broken = storage.legacy_tasks_path(project_id).with_file_name("line\nbreak.toml");
+        let broken = storage
+            .legacy_tasks_path(project_id)
+            .with_file_name("line\nbreak.toml");
 
         let error = storage
             .mark_project_tasks_deletion_pending(project_id, std::slice::from_ref(&broken))
             .expect_err("a line break cannot survive the record format");
         assert!(
-            error.to_string().contains("line break") || error.to_string().contains("one path per line"),
+            error.to_string().contains("line break")
+                || error.to_string().contains("one path per line"),
             "{error:?}"
         );
         assert!(
@@ -4357,27 +4726,20 @@ user_name = "Test"
 
         let (storage, _temp) = create_test_storage();
         let project_id = Uuid::new_v4();
-        let lossy_to_be = PathBuf::from(std::ffi::OsString::from_vec(
-            b"state/\xff/repo".to_vec(),
-        ));
+        let lossy_to_be = PathBuf::from(std::ffi::OsString::from_vec(b"state/\xff/repo".to_vec()));
 
         assert!(lossy_to_be.to_str().is_none(), "fixture must be non-UTF-8");
         let error = storage
-            .mark_project_tasks_deletion_pending(
-                project_id,
-                std::slice::from_ref(&lossy_to_be),
-            )
+            .mark_project_tasks_deletion_pending(project_id, std::slice::from_ref(&lossy_to_be))
             .expect_err("a non-UTF-8 path cannot survive the record format");
         assert!(
             error.to_string().contains("UTF-8") || error.to_string().contains("faithfully"),
             "{error:?}"
         );
-        assert!(
-            !storage
-                .paths()
-                .pending_project_tasks_deletion_file(project_id)
-                .exists()
-        );
+        assert!(!storage
+            .paths()
+            .pending_project_tasks_deletion_file(project_id)
+            .exists());
         assert!(!pending_list_contains(&storage, project_id));
     }
 
@@ -4418,8 +4780,15 @@ user_name = "Test"
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&storage.config_file).unwrap().permissions().mode();
-            assert_eq!(mode & 0o077, 0, "config.toml must not be group/world readable");
+            let mode = fs::metadata(&storage.config_file)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "config.toml must not be group/world readable"
+            );
         }
     }
 
@@ -4433,7 +4802,12 @@ user_name = "Test"
         let result = parse_github_url("https://github.com/owner/repo/issues/123", false);
         assert!(result.is_some());
         match result.unwrap() {
-            ExternalRef::GithubIssue { number, repo, url, state } => {
+            ExternalRef::GithubIssue {
+                number,
+                repo,
+                url,
+                state,
+            } => {
                 assert_eq!(number, 123);
                 assert_eq!(repo, "owner/repo");
                 assert_eq!(url, "https://github.com/owner/repo/issues/123");
@@ -4448,7 +4822,13 @@ user_name = "Test"
         let result = parse_github_url("https://github.com/owner/repo/pull/456", true);
         assert!(result.is_some());
         match result.unwrap() {
-            ExternalRef::GithubPr { number, repo, url, state, .. } => {
+            ExternalRef::GithubPr {
+                number,
+                repo,
+                url,
+                state,
+                ..
+            } => {
                 assert_eq!(number, 456);
                 assert_eq!(repo, "owner/repo");
                 assert_eq!(url, "https://github.com/owner/repo/pull/456");
@@ -4520,7 +4900,9 @@ user_name = "Test"
     #[test]
     fn test_migrate_task_refs_already_migrated_skipped() {
         let mut task = crate::test_helpers::create_test_task("Already Migrated");
-        task.external_refs.push(ExternalRef::LinearTicket { id: "existing".to_string() });
+        task.external_refs.push(ExternalRef::LinearTicket {
+            id: "existing".to_string(),
+        });
         task.github_issue_url = Some("https://github.com/owner/repo/issues/1".to_string());
 
         migrate_task_refs(&mut task);
@@ -4627,11 +5009,26 @@ user_name = "Test"
 
         assert_eq!(task.external_refs.len(), 5);
         // Verify order: GithubIssue, GithubPr, JiraTicket, LinearTicket, GitlabIssue
-        assert!(matches!(&task.external_refs[0], ExternalRef::GithubIssue { number: 10, .. }));
-        assert!(matches!(&task.external_refs[1], ExternalRef::GithubPr { number: 20, .. }));
-        assert!(matches!(&task.external_refs[2], ExternalRef::JiraTicket { .. }));
-        assert!(matches!(&task.external_refs[3], ExternalRef::LinearTicket { .. }));
-        assert!(matches!(&task.external_refs[4], ExternalRef::GitlabIssue { .. }));
+        assert!(matches!(
+            &task.external_refs[0],
+            ExternalRef::GithubIssue { number: 10, .. }
+        ));
+        assert!(matches!(
+            &task.external_refs[1],
+            ExternalRef::GithubPr { number: 20, .. }
+        ));
+        assert!(matches!(
+            &task.external_refs[2],
+            ExternalRef::JiraTicket { .. }
+        ));
+        assert!(matches!(
+            &task.external_refs[3],
+            ExternalRef::LinearTicket { .. }
+        ));
+        assert!(matches!(
+            &task.external_refs[4],
+            ExternalRef::GitlabIssue { .. }
+        ));
     }
 
     #[test]
@@ -4654,8 +5051,14 @@ user_name = "Test"
 
         // Malformed github URL is skipped, but jira and linear still migrate
         assert_eq!(task.external_refs.len(), 2);
-        assert!(matches!(&task.external_refs[0], ExternalRef::JiraTicket { .. }));
-        assert!(matches!(&task.external_refs[1], ExternalRef::LinearTicket { .. }));
+        assert!(matches!(
+            &task.external_refs[0],
+            ExternalRef::JiraTicket { .. }
+        ));
+        assert!(matches!(
+            &task.external_refs[1],
+            ExternalRef::LinearTicket { .. }
+        ));
     }
 
     #[test]
@@ -4693,7 +5096,11 @@ user_name = "Test"
     }
 
     fn draft(seq: u64, text: &str) -> ConversationDraft {
-        ConversationDraft { seq, text: text.into(), pending_send: None }
+        ConversationDraft {
+            seq,
+            text: text.into(),
+            pending_send: None,
+        }
     }
 
     #[test]
@@ -4702,21 +5109,52 @@ user_name = "Test"
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         assert!(storage.load_conversation_draft(first).unwrap().is_none());
-        assert!(storage.save_conversation_draft(first, &draft(1, "first project")).unwrap());
-        assert!(storage.save_conversation_draft(second, &draft(1, "second project")).unwrap());
-        assert_eq!(storage.load_conversation_draft(first).unwrap().unwrap().text, "first project");
-        assert_eq!(storage.load_conversation_draft(second).unwrap().unwrap().text, "second project");
+        assert!(storage
+            .save_conversation_draft(first, &draft(1, "first project"))
+            .unwrap());
+        assert!(storage
+            .save_conversation_draft(second, &draft(1, "second project"))
+            .unwrap());
+        assert_eq!(
+            storage
+                .load_conversation_draft(first)
+                .unwrap()
+                .unwrap()
+                .text,
+            "first project"
+        );
+        assert_eq!(
+            storage
+                .load_conversation_draft(second)
+                .unwrap()
+                .unwrap()
+                .text,
+            "second project"
+        );
     }
 
     #[test]
     fn an_older_draft_write_never_replaces_a_newer_one() {
         let (storage, _dir) = create_test_storage();
         let project = Uuid::new_v4();
-        assert!(storage.save_conversation_draft(project, &draft(5, "newer")).unwrap());
-        assert!(!storage.save_conversation_draft(project, &draft(4, "older")).unwrap());
-        assert_eq!(storage.load_conversation_draft(project).unwrap().unwrap().text, "newer");
+        assert!(storage
+            .save_conversation_draft(project, &draft(5, "newer"))
+            .unwrap());
+        assert!(!storage
+            .save_conversation_draft(project, &draft(4, "older"))
+            .unwrap());
+        assert_eq!(
+            storage
+                .load_conversation_draft(project)
+                .unwrap()
+                .unwrap()
+                .text,
+            "newer"
+        );
         // An equal sequence is a repeat of the same write, so it is accepted.
-        assert!(storage.save_conversation_draft(project, &draft(5, "newer")).unwrap());
+        assert!(storage
+            .save_conversation_draft(project, &draft(5, "newer"))
+            .unwrap());
     }
 
     #[test]
@@ -4724,7 +5162,9 @@ user_name = "Test"
         let (storage, _dir) = create_test_storage();
         let project = Uuid::new_v4();
         storage.create_primary_conversation(project).unwrap();
-        storage.save_conversation_draft(project, &draft(1, "unsent")).unwrap();
+        storage
+            .save_conversation_draft(project, &draft(1, "unsent"))
+            .unwrap();
         storage.delete_project_conversation(project).unwrap();
         assert!(storage.load_conversation_draft(project).unwrap().is_none());
     }
@@ -4735,14 +5175,25 @@ user_name = "Test"
         let project = Uuid::new_v4();
         storage.create_primary_conversation(project).unwrap();
         let document = storage.paths.conversation_file(
-            storage.load_primary_conversation(project).unwrap().unwrap().id,
+            storage
+                .load_primary_conversation(project)
+                .unwrap()
+                .unwrap()
+                .id,
         );
-        storage.save_conversation_draft(project, &draft(1, "unsent")).unwrap();
+        storage
+            .save_conversation_draft(project, &draft(1, "unsent"))
+            .unwrap();
         // Without the pointer, deletion takes the strict scan of every `*.json`; the draft must not be one of them.
         std::fs::remove_file(storage.paths.primary_conversation_file(project)).unwrap();
-        storage.mark_project_conversation_deletion_pending(project).unwrap();
+        storage
+            .mark_project_conversation_deletion_pending(project)
+            .unwrap();
         storage.delete_project_conversation(project).unwrap();
-        assert!(!document.exists(), "the Conversation document is removed by the scan");
+        assert!(
+            !document.exists(),
+            "the Conversation document is removed by the scan"
+        );
         assert!(storage.load_conversation_draft(project).unwrap().is_none());
     }
 }

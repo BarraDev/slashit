@@ -72,7 +72,9 @@ impl StartGuard {
             let file = PathBuf::from(file);
             return Self::new(Arc::new(move || debug_space(&file)));
         }
-        Self::new(Arc::new(move || crate::storage_accounting::filesystem_space(&data_dir)))
+        Self::new(Arc::new(move || {
+            crate::storage_accounting::filesystem_space(&data_dir)
+        }))
     }
 
     /// Whether a new task execution may begin right now.
@@ -146,9 +148,10 @@ fn debug_space(file: &std::path::Path) -> io::Result<FilesystemSpace> {
     let text = std::fs::read_to_string(file)?;
     let mut numbers = text.split_whitespace().map(str::parse::<u64>);
     match (numbers.next(), numbers.next(), numbers.next()) {
-        (Some(Ok(total_bytes)), Some(Ok(available_bytes)), None) => {
-            Ok(FilesystemSpace { total_bytes, available_bytes })
-        }
+        (Some(Ok(total_bytes)), Some(Ok(available_bytes)), None) => Ok(FilesystemSpace {
+            total_bytes,
+            available_bytes,
+        }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{} does not hold two byte counts", file.display()),
@@ -175,7 +178,10 @@ mod tests {
     async fn every_check_reads_the_filesystem_again() {
         let available = Arc::new(AtomicU64::new(10 * GIB));
         let guard = guard_reading(available.clone());
-        assert!(matches!(guard.check().await, Err(StartBlock::CriticalDisk { .. })));
+        assert!(matches!(
+            guard.check().await,
+            Err(StartBlock::CriticalDisk { .. })
+        ));
         available.store(200 * GIB, Ordering::SeqCst);
         assert_eq!(guard.check().await, Ok(()));
     }
@@ -184,19 +190,38 @@ mod tests {
     /// Settings > Storage reports -- including the cap on a small disk.
     #[tokio::test]
     async fn a_small_disk_pauses_at_the_capped_critical_threshold() {
-        for (total, critical) in [(20 * GIB, 4 * GIB), (100 * GIB, 20 * GIB), (500 * GIB, 40 * GIB)] {
-            assert_eq!(PressurePolicy::default().thresholds(total).critical_below_bytes, critical);
+        for (total, critical) in [
+            (20 * GIB, 4 * GIB),
+            (100 * GIB, 20 * GIB),
+            (500 * GIB, 40 * GIB),
+        ] {
+            assert_eq!(
+                PressurePolicy::default()
+                    .thresholds(total)
+                    .critical_below_bytes,
+                critical
+            );
             let available = Arc::new(AtomicU64::new(critical));
             let reading = available.clone();
             let guard = StartGuard::new(Arc::new(move || {
-                Ok(FilesystemSpace { total_bytes: total, available_bytes: reading.load(Ordering::SeqCst) })
+                Ok(FilesystemSpace {
+                    total_bytes: total,
+                    available_bytes: reading.load(Ordering::SeqCst),
+                })
             }));
 
-            assert_eq!(guard.check().await, Ok(()), "{total}: exactly at the threshold");
+            assert_eq!(
+                guard.check().await,
+                Ok(()),
+                "{total}: exactly at the threshold"
+            );
             available.store(critical - 1, Ordering::SeqCst);
             assert_eq!(
                 guard.check().await,
-                Err(StartBlock::CriticalDisk { available_bytes: critical - 1, critical_below_bytes: critical }),
+                Err(StartBlock::CriticalDisk {
+                    available_bytes: critical - 1,
+                    critical_below_bytes: critical
+                }),
                 "{total}"
             );
         }
@@ -234,7 +259,11 @@ mod tests {
                 other => panic!("expected an unknown-space block, got {other:?}"),
             }
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "later checks wait for the stuck one");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "later checks wait for the stuck one"
+        );
         drop(release);
     }
 
@@ -251,12 +280,18 @@ mod tests {
             (HumanReview, Queue),
             (Queue, Backlog),
         ] {
-            assert_eq!(guard.check_move(&from, &to).await, Ok(()), "{from:?} -> {to:?}");
+            assert_eq!(
+                guard.check_move(&from, &to).await,
+                Ok(()),
+                "{from:?} -> {to:?}"
+            );
         }
         for from in [Backlog, Queue, Error, AiReview, HumanReview, Done] {
             let refused = guard.check_move(&from, &InProgress).await;
             assert!(
-                refused.as_ref().is_err_and(|m| m.starts_with("New work paused")),
+                refused
+                    .as_ref()
+                    .is_err_and(|m| m.starts_with("New work paused")),
                 "{from:?} -> InProgress: {refused:?}"
             );
         }
@@ -278,7 +313,10 @@ mod tests {
         std::fs::write(&file, "1000 250\n").unwrap();
         assert_eq!(
             debug_space(&file).unwrap(),
-            FilesystemSpace { total_bytes: 1000, available_bytes: 250 }
+            FilesystemSpace {
+                total_bytes: 1000,
+                available_bytes: 250
+            }
         );
         for bad in ["", "1000", "1000 x", "1 2 3"] {
             std::fs::write(&file, bad).unwrap();

@@ -5,30 +5,30 @@ mod commit;
 mod default_base;
 pub mod delivery;
 mod diff;
-pub mod new_attempt;
 pub mod integration;
 mod manager;
+pub mod new_attempt;
 mod orphans;
 mod ownership;
 pub mod project_base;
 pub mod readiness;
-pub mod remote_head;
 mod registry_lock;
+pub mod remote_head;
 pub mod restack;
 pub mod vcs;
 pub mod vcs_init;
 
 pub use branch::{checked_base_branch, checked_task_branch, looks_like_task_branch};
-pub use default_base::{resolve_default_base, ResolvedBase};
 pub use commit::{
     checkout_has_work, checkout_head_commit, checkout_snapshot, commit_checkout,
     commit_checkout_verified, CheckoutCommit,
 };
+pub use default_base::{resolve_default_base, ResolvedBase};
 pub use diff::{committed_task_diff, pending_task_diff, task_diff, TaskDiff, TaskDiffError};
+pub(crate) use manager::same_path;
 pub use manager::{
     carries_locked_registration_notice, locked_registration_notice, CheckoutRegistration,
     CheckoutState, WorktreeInfo, WorktreeManager, WorktreeRecovery,
 };
 pub use orphans::{owners_in_repository, OrphanScan, Owners};
-pub(crate) use manager::same_path;
 pub use ownership::{refuse_shared_task_branch, tasks_sharing_a_recorded_branch};

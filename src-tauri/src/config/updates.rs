@@ -79,17 +79,21 @@ impl UpdatePreferences {
         };
         let text = toml::to_string_pretty(&stored)
             .map_err(|e| ConfigWriteError::NotPublished(anyhow::Error::new(e)))?;
-        slashit_durable_fs::write_atomic(&path, text.as_bytes(), slashit_durable_fs::Permissions::Preserve)
-            .map(|_| ())
-            .map_err(|e| {
-                let published = e.is_published();
-                let error = anyhow::Error::new(e).context("Failed to write the update channel");
-                if published {
-                    ConfigWriteError::PublishedNotDurable(error)
-                } else {
-                    ConfigWriteError::NotPublished(error)
-                }
-            })
+        slashit_durable_fs::write_atomic(
+            &path,
+            text.as_bytes(),
+            slashit_durable_fs::Permissions::Preserve,
+        )
+        .map(|_| ())
+        .map_err(|e| {
+            let published = e.is_published();
+            let error = anyhow::Error::new(e).context("Failed to write the update channel");
+            if published {
+                ConfigWriteError::PublishedNotDurable(error)
+            } else {
+                ConfigWriteError::NotPublished(error)
+            }
+        })
     }
 }
 
@@ -109,9 +113,17 @@ mod tests {
     fn a_malformed_or_unknown_file_reads_as_stable() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("updates.toml");
-        for text in ["channel = \"beta\"\n", "channel = [\n", "channel = \"Prerelease\"\n"] {
+        for text in [
+            "channel = \"beta\"\n",
+            "channel = [\n",
+            "channel = \"Prerelease\"\n",
+        ] {
             std::fs::write(&path, text).unwrap();
-            assert_eq!(UpdatePreferences::load_from(&path).channel, ReleaseChannel::Stable, "{text:?}");
+            assert_eq!(
+                UpdatePreferences::load_from(&path).channel,
+                ReleaseChannel::Stable,
+                "{text:?}"
+            );
         }
     }
 
@@ -129,8 +141,14 @@ mod tests {
         }
         .save(&paths)
         .unwrap();
-        assert_eq!(UpdatePreferences::load(&paths).channel, ReleaseChannel::Prerelease);
+        assert_eq!(
+            UpdatePreferences::load(&paths).channel,
+            ReleaseChannel::Prerelease
+        );
         UpdatePreferences::default().save(&paths).unwrap();
-        assert_eq!(UpdatePreferences::load(&paths).channel, ReleaseChannel::Stable);
+        assert_eq!(
+            UpdatePreferences::load(&paths).channel,
+            ReleaseChannel::Stable
+        );
     }
 }

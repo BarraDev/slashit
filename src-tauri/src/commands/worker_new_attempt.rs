@@ -315,13 +315,13 @@ async fn prepare(
     if registered_repository != Some(request.repository_id) {
         refusals.push("The Project repository differs from the one recorded for this run.".into());
     }
-    if let Err(message) = crate::worktree::new_attempt::board_can_confirm(&state.storage, task.project_id)
+    if let Err(message) =
+        crate::worktree::new_attempt::board_can_confirm(&state.storage, task.project_id)
     {
         refusals.push(message);
     }
 
-    let repo_path = match crate::commands::integration::repo_path_of(state, task.project_id).await
-    {
+    let repo_path = match crate::commands::integration::repo_path_of(state, task.project_id).await {
         Ok(path) => Some(path),
         Err(message) => {
             refusals.push(message);
@@ -331,11 +331,9 @@ async fn prepare(
 
     if let Some(repo) = repo_path.as_deref() {
         let repo_dir = std::path::Path::new(repo);
-        let tip = super::worker_recovery::commit_at(
-            repo_dir,
-            &format!("refs/heads/{}", request.branch),
-        )
-        .await;
+        let tip =
+            super::worker_recovery::commit_at(repo_dir, &format!("refs/heads/{}", request.branch))
+                .await;
         if tip.is_none() {
             refusals.push("The recorded branch cannot be resolved to a commit.".into());
         }
@@ -994,12 +992,7 @@ mod tests {
             review_mode_unproven: false,
             reviewer_model: None,
         });
-        fx.state
-            .task
-            .tasks
-            .write()
-            .await
-            .insert(other.id, other);
+        fx.state.task.tasks.write().await.insert(other.id, other);
 
         let reason = refusal(record_decision(&fx.state, request).await);
 
@@ -1050,7 +1043,10 @@ mod tests {
         record_decision(&fx.state, request).await.unwrap();
 
         assert_eq!(fx.repo_state(), repo_before);
-        assert_eq!(std::fs::read_to_string(fx.checkout.join("work.txt")).unwrap(), "dirty");
+        assert_eq!(
+            std::fs::read_to_string(fx.checkout.join("work.txt")).unwrap(),
+            "dirty"
+        );
     }
 
     /// A confirmed new attempt whose Workspace root is missing is refused before it
@@ -1069,20 +1065,52 @@ mod tests {
             Some(crate::domain::WorkspaceRoot::from_trusted(vanished)),
         );
         let workspace_id = workspace.id;
-        fx.state.workspace.registry.write().await.upsert(workspace).expect("upsert");
-        fx.state.project.projects.write().await.get_mut(&fx.project_id).expect("project").scope =
-            crate::domain::ProjectScope::InWorkspace { workspace_id };
+        fx.state
+            .workspace
+            .registry
+            .write()
+            .await
+            .upsert(workspace)
+            .expect("upsert");
+        fx.state
+            .project
+            .projects
+            .write()
+            .await
+            .get_mut(&fx.project_id)
+            .expect("project")
+            .scope = crate::domain::ProjectScope::InWorkspace { workspace_id };
         let executor = fx.state.executor.get().unwrap().clone();
 
-        assert!(fx.task().await.new_attempt_confirmed, "the decision is confirmed before the start");
-        let refusal = executor.start_new_attempt(fx.task_id, id).await.expect_err("the root is missing");
+        assert!(
+            fx.task().await.new_attempt_confirmed,
+            "the decision is confirmed before the start"
+        );
+        let refusal = executor
+            .start_new_attempt(fx.task_id, id)
+            .await
+            .expect_err("the root is missing");
         assert!(refusal.contains("is missing"), "{refusal}");
 
         let task = fx.task().await;
-        assert_eq!(task.status, crate::domain::TaskStatus::Error, "the refusal is recorded");
-        assert_eq!(fx.on_disk().status, crate::domain::TaskStatus::Error, "and durable");
-        assert_eq!(task.worker_handoff, recovery_before, "the recovery evidence is kept");
-        assert!(!task.new_attempt_confirmed, "the attempt must be confirmed again");
+        assert_eq!(
+            task.status,
+            crate::domain::TaskStatus::Error,
+            "the refusal is recorded"
+        );
+        assert_eq!(
+            fx.on_disk().status,
+            crate::domain::TaskStatus::Error,
+            "and durable"
+        );
+        assert_eq!(
+            task.worker_handoff, recovery_before,
+            "the recovery evidence is kept"
+        );
+        assert!(
+            !task.new_attempt_confirmed,
+            "the attempt must be confirmed again"
+        );
     }
 
     /// A confirmed decision starts exactly one run, consumes itself in the same
@@ -1100,7 +1128,11 @@ mod tests {
         executor.start_new_attempt(fx.task_id, id).await.unwrap();
 
         let task = fx.task().await;
-        assert_eq!(new_attempt_runs(&task), 1, "exactly one new run is recorded");
+        assert_eq!(
+            new_attempt_runs(&task),
+            1,
+            "exactly one new run is recorded"
+        );
         assert!(task.new_attempt.is_none(), "the authorization is consumed");
         assert!(!task.new_attempt_confirmed);
         assert_eq!(
@@ -1142,7 +1174,9 @@ mod tests {
         let fx = fixture().await;
         let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
         let id = Uuid::new_v4();
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         fx.write("notes.txt", "changed after the decision");
         let before = fx.board().await;
         let executor = fx.state.executor.get().unwrap().clone();
@@ -1161,7 +1195,9 @@ mod tests {
         let fx = fixture().await;
         let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
         let id = Uuid::new_v4();
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         std::fs::write(fx.checkout.join("later.txt"), "later").unwrap();
         git(&fx.checkout, &["add", "-A"]);
         git(&fx.checkout, &["commit", "-q", "-m", "later"]);
@@ -1182,12 +1218,17 @@ mod tests {
         let fx = fixture().await;
         let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
         let id = Uuid::new_v4();
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         let executor = fx.state.executor.get().unwrap().clone();
         executor.start_new_attempt(fx.task_id, id).await.unwrap();
         assert!(agent_invoked(&agent).await);
 
-        let second = executor.start_new_attempt(fx.task_id, id).await.unwrap_err();
+        let second = executor
+            .start_new_attempt(fx.task_id, id)
+            .await
+            .unwrap_err();
 
         assert!(second.contains("already has an agent"), "{second}");
         assert_eq!(agent.launches("claude"), 1);
@@ -1203,7 +1244,9 @@ mod tests {
         let fx = fixture().await;
         let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
         let id = Uuid::new_v4();
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         let first = fx.state.executor.get().unwrap().clone();
         first.start_new_attempt(fx.task_id, id).await.unwrap();
         assert!(agent_invoked(&agent).await);
@@ -1236,7 +1279,9 @@ mod tests {
         let fx = fixture().await;
         let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
         let id = Uuid::new_v4();
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         let executor = fx.state.executor.get().unwrap().clone();
 
         let refused = {
@@ -1251,7 +1296,11 @@ mod tests {
             1,
             "the start reached the published-but-not-durable path"
         );
-        assert_eq!(agent.invocations(), "", "nothing launches on an unconfirmed start");
+        assert_eq!(
+            agent.invocations(),
+            "",
+            "nothing launches on an unconfirmed start"
+        );
 
         let restarted = crate::test_helpers::build_test_executor(&fx.state);
         restarted.poll_once_for_test().await;
@@ -1295,7 +1344,9 @@ mod tests {
             .collect();
         fx.state.storage.save_config(&config).unwrap();
         let paths = std::sync::Arc::new(fx.state.storage.paths().clone());
-        let (state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
+        let (state, _) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .unwrap();
         let executor = attach_test_executor(&state);
         executor.poll_once_for_test().await;
         (state, executor)
@@ -1320,7 +1371,11 @@ mod tests {
     /// A process that holds the Task's lease the way a provider does, so the
     /// next process meets it as a live provider it cannot see.
     #[cfg(unix)]
-    fn orphan_provider(executor: &crate::queue::TaskExecutor, task_id: Uuid, script: &str) -> tokio::process::Child {
+    fn orphan_provider(
+        executor: &crate::queue::TaskExecutor,
+        task_id: Uuid,
+        script: &str,
+    ) -> tokio::process::Child {
         let lease = crate::agents::provider_lease::acquire(&executor.provider_lease_path(task_id))
             .unwrap()
             .expect("a lease on unix");
@@ -1348,7 +1403,9 @@ mod tests {
         let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
         let id = Uuid::new_v4();
         fx.write("dirty.txt", "work the person has not committed");
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         assert_eq!(
             fx.on_disk().new_attempt.as_ref().map(|d| d.decision_id),
             Some(id),
@@ -1362,10 +1419,17 @@ mod tests {
             task_in(&state, fx.task_id).await.new_attempt.is_none(),
             "the reloaded process does not hold the authorization"
         );
-        let reason = executor.start_new_attempt(fx.task_id, id).await.unwrap_err();
+        let reason = executor
+            .start_new_attempt(fx.task_id, id)
+            .await
+            .unwrap_err();
         assert_eq!(reason, "No new attempt is authorized for this Task.");
         assert_eq!(agent.invocations(), "", "nothing launches after a reload");
-        assert_eq!(fx.repo_state(), before, "checkout and Git references are preserved");
+        assert_eq!(
+            fx.repo_state(),
+            before,
+            "checkout and Git references are preserved"
+        );
         assert_eq!(
             std::fs::read_to_string(fx.checkout.join("dirty.txt")).unwrap(),
             "work the person has not committed"
@@ -1422,7 +1486,11 @@ mod tests {
             task.worker_handoff
         );
         assert_eq!(task.worker_handoff.as_ref().and_then(|h| h.run), Some(2));
-        assert_eq!(agent.invocations(), "", "no provider is launched by the reload");
+        assert_eq!(
+            agent.invocations(),
+            "",
+            "no provider is launched by the reload"
+        );
 
         // The decision binds the recovery the reloaded process reconciled, for run 2.
         let recovery_reason = match &task.worker_handoff.as_ref().unwrap().stage {
@@ -1438,10 +1506,21 @@ mod tests {
             matches!(outcome, AuthorizeNewAttemptOutcome::Authorized { .. }),
             "{outcome:?}"
         );
-        let reason = executor.start_new_attempt(fx.task_id, id).await.unwrap_err();
+        let reason = executor
+            .start_new_attempt(fx.task_id, id)
+            .await
+            .unwrap_err();
         assert!(reason.contains("still holds"), "{reason}");
-        assert_eq!(agent.invocations(), "", "the held checkout launches nothing");
-        assert_eq!(fx.repo_state(), before, "checkout and Git references are preserved");
+        assert_eq!(
+            agent.invocations(),
+            "",
+            "the held checkout launches nothing"
+        );
+        assert_eq!(
+            fx.repo_state(),
+            before,
+            "checkout and Git references are preserved"
+        );
 
         let _ = orphan.wait().await;
         wait_until_absent(&executor, fx.task_id).await;
@@ -1464,17 +1543,24 @@ mod tests {
         let fx = fixture().await;
         let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
         let id = Uuid::new_v4();
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         let executor = fx.state.executor.get().unwrap().clone();
 
         let refused = {
             // The board probe passes. The start's sync and the hold's sync both fail.
-            let _fault = fault::fail_every_after(Stage::SyncDirectory, std::io::ErrorKind::Other, 1);
+            let _fault =
+                fault::fail_every_after(Stage::SyncDirectory, std::io::ErrorKind::Other, 1);
             executor.start_new_attempt(fx.task_id, id).await
         };
 
         assert!(refused.is_err(), "{refused:?}");
-        assert_eq!(agent.invocations(), "", "nothing launches on an unconfirmed start");
+        assert_eq!(
+            agent.invocations(),
+            "",
+            "nothing launches on an unconfirmed start"
+        );
         for (source, task) in [("memory", fx.task().await), ("disk", fx.on_disk())] {
             assert!(
                 matches!(
@@ -1485,9 +1571,20 @@ mod tests {
                 "{source}: {:?}",
                 task.worker_handoff
             );
-            assert_eq!(task.worker_handoff.as_ref().and_then(|h| h.run), Some(2), "{source}");
-            assert_eq!(new_attempt_runs(&task), 1, "{source}: run 2 was recorded once");
-            assert!(task.new_attempt.is_none(), "{source}: the authorization was consumed");
+            assert_eq!(
+                task.worker_handoff.as_ref().and_then(|h| h.run),
+                Some(2),
+                "{source}"
+            );
+            assert_eq!(
+                new_attempt_runs(&task),
+                1,
+                "{source}: run 2 was recorded once"
+            );
+            assert!(
+                task.new_attempt.is_none(),
+                "{source}: the authorization was consumed"
+            );
         }
         assert!(
             crate::agents::provider_lease::prove_absent(&executor.provider_lease_path(fx.task_id))
@@ -1527,7 +1624,9 @@ mod tests {
         let fx = fixture().await;
         let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
         let id = Uuid::new_v4();
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         let executor = fx.state.executor.get().unwrap().clone();
 
         let refused = {
@@ -1544,8 +1643,15 @@ mod tests {
 
         let reason = refused.unwrap_err();
         assert!(reason.contains("not confirmed durable"), "{reason}");
-        assert!(reason.contains("recovery hold could not be recorded"), "{reason}");
-        assert_eq!(agent.invocations(), "", "nothing launches on an unconfirmed start");
+        assert!(
+            reason.contains("recovery hold could not be recorded"),
+            "{reason}"
+        );
+        assert_eq!(
+            agent.invocations(),
+            "",
+            "nothing launches on an unconfirmed start"
+        );
         // A fork in another test can hold a copy of the lease descriptor until its
         // exec, so absence is awaited rather than read once.
         wait_until_absent(&executor, fx.task_id).await;
@@ -1558,9 +1664,20 @@ mod tests {
                 "{source}: {:?}",
                 task.worker_handoff
             );
-            assert_eq!(task.worker_handoff.as_ref().and_then(|h| h.run), Some(2), "{source}");
-            assert_eq!(new_attempt_runs(&task), 1, "{source}: run 2 was recorded once");
-            assert!(task.new_attempt.is_none(), "{source}: the authorization was consumed");
+            assert_eq!(
+                task.worker_handoff.as_ref().and_then(|h| h.run),
+                Some(2),
+                "{source}"
+            );
+            assert_eq!(
+                new_attempt_runs(&task),
+                1,
+                "{source}: run 2 was recorded once"
+            );
+            assert!(
+                task.new_attempt.is_none(),
+                "{source}: the authorization was consumed"
+            );
         }
 
         let (state, _) = restart(&fx).await;
@@ -1584,7 +1701,9 @@ mod tests {
         let fx = fixture().await;
         let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
         let id = Uuid::new_v4();
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         let reloaded = fx.on_disk();
         assert!(reloaded.new_attempt.is_some());
         fx.edit(move |t| *t = reloaded).await;
@@ -1612,7 +1731,10 @@ mod tests {
 
         let refused = executor.execute_task(fx.task_id).await.unwrap_err();
 
-        assert!(refused.contains("unresolved Worker recovery evidence"), "{refused}");
+        assert!(
+            refused.contains("unresolved Worker recovery evidence"),
+            "{refused}"
+        );
         assert_eq!(agent.invocations(), "");
         assert!(fx.task().await.new_attempt.is_some());
     }
@@ -1643,13 +1765,18 @@ mod tests {
         let fx = fixture().await;
         let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
         let id = Uuid::new_v4();
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         let before = fx.board().await;
         let executor = fx.state.executor.get().unwrap().clone();
 
         let reason = {
             let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Unsupported);
-            executor.start_new_attempt(fx.task_id, id).await.unwrap_err()
+            executor
+                .start_new_attempt(fx.task_id, id)
+                .await
+                .unwrap_err()
         };
 
         assert!(reason.contains("cannot synchronize"), "{reason}");
@@ -1665,7 +1792,9 @@ mod tests {
         let fx = fixture().await;
         let _agent = FakeProgram::install("claude", "cat >/dev/null; exit 1").await;
         let id = Uuid::new_v4();
-        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        record_decision(&fx.state, fx.request(id).await)
+            .await
+            .unwrap();
         let executor = fx.state.executor.get().unwrap().clone();
         executor.start_new_attempt(fx.task_id, id).await.unwrap();
 
@@ -1709,7 +1838,10 @@ mod tests {
         assert_eq!(evidence.run, Some(1));
         assert_eq!(evidence.expected_head.as_deref(), Some(fx.head().as_str()));
         assert_eq!(evidence.dirty_paths, vec!["notes.txt"]);
-        assert!(evidence.dirty_fingerprint.as_deref().is_some_and(|d| d.starts_with("sha256:")));
+        assert!(evidence
+            .dirty_fingerprint
+            .as_deref()
+            .is_some_and(|d| d.starts_with("sha256:")));
         assert_eq!(fx.board().await, before);
         assert_eq!(fx.repo_state(), repo_before);
     }

@@ -90,7 +90,10 @@ impl PrPublication {
     /// Whether this record still needs the remote to be read before anything
     /// else may publish.
     pub fn needs_reconciliation(&self) -> bool {
-        matches!(self.state, PublicationState::Pending {} | PublicationState::Unknown { .. })
+        matches!(
+            self.state,
+            PublicationState::Pending {} | PublicationState::Unknown { .. }
+        )
     }
 }
 
@@ -177,7 +180,9 @@ pub fn classify_outcome(
         },
         Ok(after) => match push {
             Err(error) if after.as_deref() == remote_before => PublicationState::Refused {
-                reason: format!("the remote refused the push, and its branch did not change: {error}"),
+                reason: format!(
+                    "the remote refused the push, and its branch did not change: {error}"
+                ),
             },
             Err(error) => PublicationState::Unknown {
                 reason: format!(
@@ -208,10 +213,12 @@ pub fn reconcile(
     commit_on_remote: Option<bool>,
 ) -> Option<PublicationState> {
     let head = remote_now.as_ref().ok()?;
-    let refused = || PublicationState::Refused {
+    let refused = || {
+        PublicationState::Refused {
         reason: "the remote branch does not contain the commit, so an earlier publication did not reach \
                  it. Nothing was pushed by that record, and it is safe to publish again."
             .to_string(),
+    }
     };
     match commit_on_remote {
         Some(true) => Some(PublicationState::Published {}),
@@ -236,14 +243,20 @@ pub enum Replay {
 /// Decide what an existing record means for a new request to publish
 /// `commit` from `branch` to `pr_url`. A published record answers the request
 /// only when it is for the same commit, branch and pull request.
-pub fn replay(existing: Option<&PrPublication>, commit: &str, branch: &str, pr_url: &str) -> Replay {
+pub fn replay(
+    existing: Option<&PrPublication>,
+    commit: &str,
+    branch: &str,
+    pr_url: &str,
+) -> Replay {
     match existing {
         None => Replay::Start,
         Some(record) if record.needs_reconciliation() => Replay::MustReconcile,
-        Some(record) if record.state == PublicationState::Published {}
-            && record.commit == commit
-            && record.branch == branch
-            && record.pr_url == pr_url =>
+        Some(record)
+            if record.state == PublicationState::Published {}
+                && record.commit == commit
+                && record.branch == branch
+                && record.pr_url == pr_url =>
         {
             Replay::AlreadyPublished
         }
@@ -295,7 +308,9 @@ mod tests {
     fn a_closed_or_merged_pull_request_is_refused() {
         let mut observed = ready();
         observed.pull_request.open = false;
-        assert!(start_refusal(NEW, BRANCH, &observed).unwrap().contains("closed or merged"));
+        assert!(start_refusal(NEW, BRANCH, &observed)
+            .unwrap()
+            .contains("closed or merged"));
     }
 
     #[test]
@@ -313,7 +328,9 @@ mod tests {
     fn a_branch_that_moved_since_the_person_chose_the_commit_is_refused() {
         let mut moved = ready();
         moved.local_tip = Some(OLD.to_string());
-        assert!(start_refusal(NEW, BRANCH, &moved).unwrap().contains("no longer at the commit"));
+        assert!(start_refusal(NEW, BRANCH, &moved)
+            .unwrap()
+            .contains("no longer at the commit"));
 
         let mut missing = ready();
         missing.local_tip = None;
@@ -324,7 +341,9 @@ mod tests {
     fn a_missing_remote_branch_is_refused() {
         let mut gone = ready();
         gone.remote_head = None;
-        assert!(start_refusal(NEW, BRANCH, &gone).unwrap().contains("missing on the remote"));
+        assert!(start_refusal(NEW, BRANCH, &gone)
+            .unwrap()
+            .contains("missing on the remote"));
     }
 
     #[test]
@@ -340,7 +359,10 @@ mod tests {
     fn a_landed_push_is_published_even_when_the_push_reported_an_error() {
         let after = Ok(Some(NEW.to_string()));
         let push = Err("connection reset".to_string());
-        assert_eq!(classify_outcome(NEW, Some(OLD), &after, &push), PublicationState::Published {});
+        assert_eq!(
+            classify_outcome(NEW, Some(OLD), &after, &push),
+            PublicationState::Published {}
+        );
     }
 
     #[test]
@@ -401,26 +423,46 @@ mod tests {
         ));
         assert_eq!(reconcile(&pending, &Ok(Some("3".repeat(40))), None), None);
         // An unreadable remote settles nothing, whatever the ancestry says.
-        assert_eq!(reconcile(&pending, &Err("offline".to_string()), Some(true)), None);
+        assert_eq!(
+            reconcile(&pending, &Err("offline".to_string()), Some(true)),
+            None
+        );
     }
 
     #[test]
     fn a_pending_or_unknown_record_forces_reconciliation_before_a_new_request() {
-        assert_eq!(replay(Some(&record(PublicationState::Pending {})), NEW, BRANCH, PR), Replay::MustReconcile);
+        assert_eq!(
+            replay(Some(&record(PublicationState::Pending {})), NEW, BRANCH, PR),
+            Replay::MustReconcile
+        );
         let unknown = record(PublicationState::Unknown { reason: "x".into() });
-        assert_eq!(replay(Some(&unknown), NEW, BRANCH, PR), Replay::MustReconcile);
+        assert_eq!(
+            replay(Some(&unknown), NEW, BRANCH, PR),
+            Replay::MustReconcile
+        );
     }
 
     #[test]
     fn a_duplicate_request_for_a_published_commit_is_answered_without_a_push() {
         let published = record(PublicationState::Published {});
-        assert_eq!(replay(Some(&published), NEW, BRANCH, PR), Replay::AlreadyPublished);
+        assert_eq!(
+            replay(Some(&published), NEW, BRANCH, PR),
+            Replay::AlreadyPublished
+        );
         // A different commit is a new request.
         assert_eq!(replay(Some(&published), OLD, BRANCH, PR), Replay::Start);
         // The same commit and pull request from another branch is a new request.
-        assert_eq!(replay(Some(&published), NEW, "other-branch", PR), Replay::Start);
         assert_eq!(
-            replay(Some(&published), NEW, BRANCH, "https://github.com/BarraDev/slashit/pull/10"),
+            replay(Some(&published), NEW, "other-branch", PR),
+            Replay::Start
+        );
+        assert_eq!(
+            replay(
+                Some(&published),
+                NEW,
+                BRANCH,
+                "https://github.com/BarraDev/slashit/pull/10"
+            ),
             Replay::Start
         );
     }

@@ -31,7 +31,7 @@ mod task_tests {
         let feature = TaskCategory::Feature;
         let bugfix = TaskCategory::BugFix;
         let refactoring = TaskCategory::Refactoring;
-        
+
         assert!(matches!(feature, TaskCategory::Feature));
         assert!(matches!(bugfix, TaskCategory::BugFix));
         assert!(matches!(refactoring, TaskCategory::Refactoring));
@@ -57,8 +57,8 @@ mod task_tests {
 #[cfg(test)]
 mod project_tests {
     use super::*;
-    use uuid::Uuid;
     use std::collections::HashMap;
+    use uuid::Uuid;
 
     #[test]
     fn test_project_creation() {
@@ -82,7 +82,7 @@ mod project_tests {
             updated_at: chrono::Utc::now(),
             removed_at: None,
         };
-        
+
         assert_eq!(project.name, "Test Project");
         assert!(matches!(project.agent_type, AgentType::ClaudeCode));
     }
@@ -108,12 +108,18 @@ env = {}
         assert_eq!(project.base, None);
         assert!(!toml::to_string(&project).unwrap().contains("base"));
 
-        project.base = Some(ProjectBase::LocalBranch { branch: "trunk-xyz".to_string() });
+        project.base = Some(ProjectBase::LocalBranch {
+            branch: "trunk-xyz".to_string(),
+        });
         let written = toml::to_string(&project).unwrap();
-        assert!(written.contains("[base]\nkind = \"local_branch\"\nbranch = \"trunk-xyz\""), "{written}");
+        assert!(
+            written.contains("[base]\nkind = \"local_branch\"\nbranch = \"trunk-xyz\""),
+            "{written}"
+        );
         let read: Project = toml::from_str(&written).unwrap();
         assert_eq!(read.base, project.base);
-        let read: Project = serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        let read: Project =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
         assert_eq!(read.base, project.base);
     }
 
@@ -135,7 +141,10 @@ mod workspace_tests {
         let root = WorkspaceRoot::from_trusted(PathBuf::from("/home/u/Repo/ps"));
         let workspace = Workspace::new("ps".to_string(), Some(root));
         assert_eq!(workspace.name, "ps");
-        assert_eq!(workspace.root_path.as_ref().expect("a root").as_path(), Path::new("/home/u/Repo/ps"));
+        assert_eq!(
+            workspace.root_path.as_ref().expect("a root").as_path(),
+            Path::new("/home/u/Repo/ps")
+        );
     }
 
     /// A grouping-only Workspace writes no root key, and an older record that
@@ -153,7 +162,10 @@ mod workspace_tests {
             uuid::Uuid::new_v4()
         );
         let loaded: Workspace = toml::from_str(&older).expect("an older record loads");
-        assert_eq!(loaded.root_path.expect("kept").as_path(), Path::new("/home/u/Repo/ps"));
+        assert_eq!(
+            loaded.root_path.expect("kept").as_path(),
+            Path::new("/home/u/Repo/ps")
+        );
     }
 }
 
@@ -434,9 +446,7 @@ mod external_ref_tests {
 
     #[test]
     fn test_linear_ticket_empty_id() {
-        let r = ExternalRef::LinearTicket {
-            id: "".to_string(),
-        };
+        let r = ExternalRef::LinearTicket { id: "".to_string() };
         assert_eq!(r.label(), "");
     }
 

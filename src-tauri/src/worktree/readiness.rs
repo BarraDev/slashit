@@ -7,10 +7,12 @@
 //! and is reported beside it, never as a condition of it. Everything here
 //! only reads.
 
-use super::default_base::{local_branch_commit, resolve_default_base, resolve_remote_base, ResolvedBase};
-use super::restack::exact_ref;
+use super::default_base::{
+    local_branch_commit, resolve_default_base, resolve_remote_base, ResolvedBase,
+};
 use super::project_base::{self, Proposal};
 use super::remote_head::{remote_state, RemoteState};
+use super::restack::exact_ref;
 use super::vcs::{self, Head, Vcs};
 use crate::domain::ProjectBase;
 use serde::Serialize;
@@ -115,7 +117,11 @@ pub async fn readiness(
         remote,
         project_base: project_base.map(|b| b.branch().to_string()),
         prefers_local: project_base.is_some_and(ProjectBase::prefers_local),
-        standing: if supported { standing(repo, repo_path, project_base).await } else { None },
+        standing: if supported {
+            standing(repo, repo_path, project_base).await
+        } else {
+            None
+        },
         base,
         blocked,
         proposal,
@@ -128,13 +134,23 @@ pub async fn readiness(
 /// How the project's local base branch compares with origin's. `None` when
 /// there is no local base, no remote-tracking branch to compare, or Git
 /// cannot tell.
-async fn standing(repo: &Path, repo_path: &str, project_base: Option<&ProjectBase>) -> Option<BaseStanding> {
+async fn standing(
+    repo: &Path,
+    repo_path: &str,
+    project_base: Option<&ProjectBase>,
+) -> Option<BaseStanding> {
     let local_branch = project_base?.branch().to_string();
-    let local = local_branch_commit(repo, &local_branch).await.ok().flatten()?;
+    let local = local_branch_commit(repo, &local_branch)
+        .await
+        .ok()
+        .flatten()?;
     let (remote_branch, remote) = match resolve_remote_base(repo, repo_path).await {
         Ok(Some(base)) => (base.branch, base.commit),
         _ => {
-            let tip = exact_ref(repo, &format!("refs/remotes/origin/{local_branch}")).await.ok().flatten()?;
+            let tip = exact_ref(repo, &format!("refs/remotes/origin/{local_branch}"))
+                .await
+                .ok()
+                .flatten()?;
             (local_branch.clone(), tip)
         }
     };
@@ -147,10 +163,17 @@ async fn standing(repo: &Path, repo_path: &str, project_base: Option<&ProjectBas
             (0, 0) => BaseComparison::Same,
             (commits, 0) => BaseComparison::LocalAhead { commits },
             (0, commits) => BaseComparison::RemoteAhead { commits },
-            (local_only, remote_only) => BaseComparison::Diverged { local_only, remote_only },
+            (local_only, remote_only) => BaseComparison::Diverged {
+                local_only,
+                remote_only,
+            },
         }
     };
-    Some(BaseStanding { local_branch, remote_branch: format!("origin/{remote_branch}"), comparison })
+    Some(BaseStanding {
+        local_branch,
+        remote_branch: format!("origin/{remote_branch}"),
+        comparison,
+    })
 }
 
 /// How many commits `to` has that `from` does not.

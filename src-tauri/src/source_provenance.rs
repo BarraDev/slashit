@@ -103,7 +103,9 @@ mod tests {
         // tree never supports an exact claim.
         assert_eq!(
             classify(Some(COMMIT), tree_from_status(Some(""))),
-            Provenance::Unverified { commit: COMMIT.to_string() }
+            Provenance::Unverified {
+                commit: COMMIT.to_string()
+            }
         );
     }
 
@@ -112,7 +114,9 @@ mod tests {
         let status = Some(" M src-tauri/src/lib.rs\n");
         assert_eq!(
             classify(Some(COMMIT), tree_from_status(status)),
-            Provenance::Modified { commit: COMMIT.to_string() }
+            Provenance::Modified {
+                commit: COMMIT.to_string()
+            }
         );
     }
 
@@ -127,7 +131,9 @@ mod tests {
         assert_eq!(tree_from_status(None), Tree::Unavailable);
         assert_eq!(
             classify(Some(COMMIT), tree_from_status(None)),
-            Provenance::Unverified { commit: COMMIT.to_string() }
+            Provenance::Unverified {
+                commit: COMMIT.to_string()
+            }
         );
     }
 
@@ -166,7 +172,11 @@ mod tests {
         assert_eq!(parse(""), None);
         assert_eq!(parse("modified"), None);
         assert_eq!(parse(&format!("dirty:{COMMIT}")), None);
-        assert_eq!(parse(&format!("clean:{COMMIT}")), None, "clean is never a recorded state");
+        assert_eq!(
+            parse(&format!("clean:{COMMIT}")),
+            None,
+            "clean is never a recorded state"
+        );
         assert_eq!(parse("modified:"), None);
         assert_eq!(parse("modified:not-a-commit"), None);
         assert_eq!(parse("unverified:abc"), None, "too short to name a commit");

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::domain::file::FileItem;
+use chrono::{DateTime, Utc};
 use std::fs;
 use std::path::{Path, PathBuf};
-use chrono::{DateTime, Utc};
 use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
@@ -68,13 +68,19 @@ pub(crate) fn within_root(root: &Path, path: &str) -> Result<PathBuf, String> {
     if !requested.is_absolute() {
         return Err("A file path must be absolute.".to_string());
     }
-    let resolved = requested
-        .canonicalize()
-        .map_err(|e| format!("Path does not exist or cannot be read: {} ({e})", requested.display()))?;
+    let resolved = requested.canonicalize().map_err(|e| {
+        format!(
+            "Path does not exist or cannot be read: {} ({e})",
+            requested.display()
+        )
+    })?;
     if resolved.starts_with(root) {
         Ok(resolved)
     } else {
-        Err(format!("{} is outside this Project's folder.", requested.display()))
+        Err(format!(
+            "{} is outside this Project's folder.",
+            requested.display()
+        ))
     }
 }
 
@@ -84,7 +90,8 @@ pub(crate) fn within_root(root: &Path, path: &str) -> Result<PathBuf, String> {
 /// what the read commands open. A link that points outside keeps its own
 /// metadata, so the target's type and size never reach the listing.
 fn listed_metadata(root: &Path, entry: &fs::DirEntry) -> std::io::Result<fs::Metadata> {
-    if entry.file_type()?.is_symlink() && within_root(root, &entry.path().to_string_lossy()).is_ok() {
+    if entry.file_type()?.is_symlink() && within_root(root, &entry.path().to_string_lossy()).is_ok()
+    {
         if let Ok(target) = fs::metadata(entry.path()) {
             return Ok(target);
         }
@@ -104,23 +111,30 @@ pub async fn list_files(
     let mut items = Vec::new();
 
     if path.is_dir() {
-        let entries = fs::read_dir(&path)
-            .map_err(|e| format!("Failed to read directory: {}", e))?;
+        let entries =
+            fs::read_dir(&path).map_err(|e| format!("Failed to read directory: {}", e))?;
 
         for entry in entries {
             let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-            let metadata = listed_metadata(&root, &entry).map_err(|e| format!("Failed to read metadata: {}", e))?;
+            let metadata = listed_metadata(&root, &entry)
+                .map_err(|e| format!("Failed to read metadata: {}", e))?;
 
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|t| DateTime::<Utc>::from_timestamp(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64, 0));
+            let modified = metadata.modified().ok().and_then(|t| {
+                DateTime::<Utc>::from_timestamp(
+                    t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64,
+                    0,
+                )
+            });
 
             items.push(FileItem {
                 name: entry.file_name().to_string_lossy().to_string(),
                 path: entry.path().to_string_lossy().to_string(),
                 is_dir: metadata.is_dir(),
-                size: if metadata.is_file() { Some(metadata.len()) } else { None },
+                size: if metadata.is_file() {
+                    Some(metadata.len())
+                } else {
+                    None
+                },
                 modified,
             });
         }
@@ -145,8 +159,7 @@ pub async fn read_file(
 ) -> Result<String, String> {
     let root = project_root_for(&state, &project_id).await?;
     let path = within_root(&root, &path)?;
-    fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read file: {}", e))
+    fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))
 }
 
 #[tauri::command]
@@ -223,7 +236,9 @@ pub(crate) async fn git_location(path: &Path) -> Result<GitLocation, String> {
     if canonical_path == canonical_toplevel {
         Ok(GitLocation::RepoRoot)
     } else {
-        Ok(GitLocation::InsideRepo { root: canonical_toplevel })
+        Ok(GitLocation::InsideRepo {
+            root: canonical_toplevel,
+        })
     }
 }
 
@@ -250,12 +265,18 @@ pub struct GitDetection {
 #[tauri::command]
 pub async fn check_is_git_repo(path: String) -> Result<GitDetection, String> {
     match git_location(&PathBuf::from(&path)).await? {
-        GitLocation::RepoRoot => Ok(GitDetection { is_git_repo: true, ancestor_root: None }),
+        GitLocation::RepoRoot => Ok(GitDetection {
+            is_git_repo: true,
+            ancestor_root: None,
+        }),
         GitLocation::InsideRepo { root } => Ok(GitDetection {
             is_git_repo: true,
             ancestor_root: Some(root.to_string_lossy().to_string()),
         }),
-        GitLocation::NotARepo => Ok(GitDetection { is_git_repo: false, ancestor_root: None }),
+        GitLocation::NotARepo => Ok(GitDetection {
+            is_git_repo: false,
+            ancestor_root: None,
+        }),
     }
 }
 
@@ -287,7 +308,10 @@ mod git_location_tests {
         let repo = temp.path().join("repo");
         init_committed_repo(&repo);
 
-        assert!(matches!(git_location(&repo).await.unwrap(), GitLocation::RepoRoot));
+        assert!(matches!(
+            git_location(&repo).await.unwrap(),
+            GitLocation::RepoRoot
+        ));
     }
 
     #[tokio::test]
@@ -313,7 +337,10 @@ mod git_location_tests {
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
 
-        assert!(matches!(git_location(&outside).await.unwrap(), GitLocation::NotARepo));
+        assert!(matches!(
+            git_location(&outside).await.unwrap(),
+            GitLocation::NotARepo
+        ));
     }
 
     #[tokio::test]
@@ -324,7 +351,10 @@ mod git_location_tests {
         let nested = repo.join("nested");
         init_committed_repo(&nested);
 
-        assert!(matches!(git_location(&nested).await.unwrap(), GitLocation::RepoRoot));
+        assert!(matches!(
+            git_location(&nested).await.unwrap(),
+            GitLocation::RepoRoot
+        ));
     }
 
     #[tokio::test]
@@ -333,17 +363,27 @@ mod git_location_tests {
         let repo = temp.path().join("repo");
         init_committed_repo(&repo);
         let worktree = temp.path().join("worktree");
-        assert!(
-            git(&repo, &["worktree", "add", "-b", "wt-branch", worktree.to_str().unwrap()])
-                .status
-                .success()
-        );
+        assert!(git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "wt-branch",
+                worktree.to_str().unwrap()
+            ]
+        )
+        .status
+        .success());
 
         assert!(
             worktree.join(".git").is_file(),
             "a linked worktree's .git must be a file, not a directory, for this test to be meaningful"
         );
-        assert!(matches!(git_location(&worktree).await.unwrap(), GitLocation::RepoRoot));
+        assert!(matches!(
+            git_location(&worktree).await.unwrap(),
+            GitLocation::RepoRoot
+        ));
     }
 
     #[tokio::test]
@@ -354,8 +394,13 @@ mod git_location_tests {
         let child = repo.join("child");
         std::fs::create_dir_all(&child).unwrap();
 
-        let detection = check_is_git_repo(child.to_string_lossy().to_string()).await.unwrap();
-        assert!(detection.is_git_repo, "a child of a repository is still git-backed");
+        let detection = check_is_git_repo(child.to_string_lossy().to_string())
+            .await
+            .unwrap();
+        assert!(
+            detection.is_git_repo,
+            "a child of a repository is still git-backed"
+        );
         assert_eq!(
             detection.ancestor_root.as_deref(),
             Some(repo.canonicalize().unwrap().to_string_lossy().as_ref()),
@@ -366,10 +411,12 @@ mod git_location_tests {
     #[tokio::test]
     async fn check_is_git_repo_on_nonexistent_path_returns_err_not_panic() {
         let result = check_is_git_repo("/nonexistent/path/that/does/not/exist".to_string()).await;
-        assert!(result.is_err(), "an inaccessible path must be reported as an error, not silently classified");
+        assert!(
+            result.is_err(),
+            "an inaccessible path must be reported as an error, not silently classified"
+        );
     }
 }
-
 
 #[cfg(test)]
 mod containment_tests {
@@ -395,8 +442,14 @@ mod containment_tests {
     fn a_file_and_the_root_itself_inside_the_project_are_allowed() {
         let (_temp, alpha, _beta) = fixture();
         let notes = alpha.join("docs/notes.md");
-        assert_eq!(within_root(&alpha, &notes.to_string_lossy()).unwrap(), notes.canonicalize().unwrap());
-        assert_eq!(within_root(&alpha, &alpha.to_string_lossy()).unwrap(), alpha);
+        assert_eq!(
+            within_root(&alpha, &notes.to_string_lossy()).unwrap(),
+            notes.canonicalize().unwrap()
+        );
+        assert_eq!(
+            within_root(&alpha, &alpha.to_string_lossy()).unwrap(),
+            alpha
+        );
     }
 
     #[test]
@@ -463,7 +516,10 @@ mod containment_tests {
         let link = alpha.join("alias.md");
         std::os::unix::fs::symlink(alpha.join("docs/notes.md"), &link).unwrap();
         let resolved = within_root(&alpha, &link.to_string_lossy()).unwrap();
-        assert_eq!(resolved, alpha.join("docs/notes.md").canonicalize().unwrap());
+        assert_eq!(
+            resolved,
+            alpha.join("docs/notes.md").canonicalize().unwrap()
+        );
     }
 
     #[cfg(unix)]
@@ -489,10 +545,14 @@ mod containment_tests {
     fn a_link_pointing_outside_the_project_does_not_list_its_target() {
         let (temp, alpha, _beta) = fixture();
         std::os::unix::fs::symlink(temp.path(), alpha.join("up")).unwrap();
-        std::os::unix::fs::symlink(temp.path().join("outside.txt"), alpha.join("escape.txt")).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("outside.txt"), alpha.join("escape.txt"))
+            .unwrap();
         for name in ["up", "escape.txt"] {
             let metadata = listed(&alpha, name);
-            assert!(!metadata.is_dir(), "{name} listed as a directory of another Project");
+            assert!(
+                !metadata.is_dir(),
+                "{name} listed as a directory of another Project"
+            );
             assert!(!metadata.is_file(), "{name} listed with a target's size");
         }
     }

@@ -18,9 +18,17 @@ pub const READ_ONLY_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
 /// `--tools`. Redundant while `--tools` behaves as documented; it keeps the
 /// run read-only if a later CLI adds one of these back to the default set.
 pub const READ_ONLY_DENIED_TOOLS: &[&str] = &[
-    "Bash", "PowerShell", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
+    "Bash",
+    "PowerShell",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
     // The subagent tool, under its older and current names.
-    "Task", "Agent", "Skill",
+    "Task",
+    "Agent",
+    "Skill",
 ];
 
 /// The oldest Claude Code release that accepts `--restricted`.
@@ -41,7 +49,11 @@ pub fn auto_unsupported_reason(version_output: &str) -> Option<String> {
         .trim_end_matches(|c: char| !c.is_ascii_digit());
     let parse = |text: &str| -> Option<(u64, u64, u64)> {
         let mut parts = text.split('.').map(str::parse::<u64>);
-        Some((parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?))
+        Some((
+            parts.next()?.ok()?,
+            parts.next()?.ok()?,
+            parts.next()?.ok()?,
+        ))
     };
     let minimum = parse(AUTO_MIN_VERSION).expect("AUTO_MIN_VERSION is a plain version");
     match parse(found) {
@@ -103,7 +115,12 @@ async fn ensure_auto_supported() -> Result<(), String> {
     }
     #[cfg(not(test))]
     {
-        let version = read_claude_version("claude", provider_env(std::env::vars_os()), VERSION_PROBE_TIMEOUT).await?;
+        let version = read_claude_version(
+            "claude",
+            provider_env(std::env::vars_os()),
+            VERSION_PROBE_TIMEOUT,
+        )
+        .await?;
         match auto_unsupported_reason(&version) {
             Some(reason) => Err(reason),
             None => Ok(()),
@@ -153,7 +170,9 @@ async fn read_claude_version(
         Ok(Err(e)) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            Err(format!("SlashIt could not read the Claude Code version: {e}"))
+            Err(format!(
+                "SlashIt could not read the Claude Code version: {e}"
+            ))
         }
         Err(_) => {
             let _ = child.start_kill();
@@ -175,26 +194,75 @@ async fn read_claude_version(
 /// is not replaced. The provider settings are kept so that a Bedrock, Vertex
 /// or Foundry configuration, and a proxy or CA bundle, keep working.
 const PROVIDER_ENV_NAMES: &[&str] = &[
-    "HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TZ",
-    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_USE_MANTLE",
-    "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_VERTEX_AUTH", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH", "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
-    "CLAUDE_CODE_SKIP_MANTLE_AUTH", "CLOUD_ML_REGION",
-    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
-    "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
-    "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE",
-    "AWS_SHARED_CREDENTIALS_FILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-    "AWS_BEARER_TOKEN_BEDROCK", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
-    "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CA_BUNDLE",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "TZ",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    "CLOUD_ML_REGION",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CA_BUNDLE",
     // Windows has no HOME: the profile is USERPROFILE (or HOMEDRIVE and
     // HOMEPATH), and Claude Code reads its sign-in from there. The system
     // variables are needed for any Windows process to start.
-    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
-    "USERNAME", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "USERNAME",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
 ];
 
 /// Name prefixes kept for the same reasons as [`PROVIDER_ENV_NAMES`]:
@@ -305,13 +373,19 @@ pub fn result_failure_reason(event: &serde_json::Value) -> Option<String> {
     if event.get("type").and_then(|t| t.as_str()) != Some("result") {
         return None;
     }
-    let is_error = event.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+    let is_error = event
+        .get("is_error")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
     let subtype = event.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
     if !is_error && !subtype.contains("error") && !subtype.contains("max_turns") {
         return None;
     }
 
-    let terminal_reason = event.get("terminal_reason").and_then(|s| s.as_str()).unwrap_or("");
+    let terminal_reason = event
+        .get("terminal_reason")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
     let mut reason = if !subtype.is_empty() && subtype != "success" {
         subtype.to_string()
     } else if !terminal_reason.is_empty() {
@@ -350,7 +424,10 @@ pub fn result_failure_reason(event: &serde_json::Value) -> Option<String> {
 /// `s` on one line: its non-blank lines, ended by `\n` or `\r`, joined with
 /// ` / `.
 fn one_line(s: &str) -> String {
-    s.split(['\n', '\r']).filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" / ")
+    s.split(['\n', '\r'])
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// `s` on one line (see [`one_line`]), cut to its first `max` characters
@@ -414,9 +491,11 @@ fn failed_exit_reason(
     let signal: Option<i32> = None;
 
     let (head, structured, prompt_failure) = match (status.code(), signal) {
-        (Some(code), _) => {
-            (format!("Exit code {code}"), result_event.and_then(result_failure_reason), prompt_failure)
-        }
+        (Some(code), _) => (
+            format!("Exit code {code}"),
+            result_event.and_then(result_failure_reason),
+            prompt_failure,
+        ),
         (None, Some(signal)) => (format!("Terminated by signal {signal}"), None, None),
         (None, None) => ("Exit code unknown".to_string(), None, None),
     };
@@ -628,7 +707,12 @@ fn isolated_settings(
     working_dir: &std::path::Path,
     instruction_env: Option<(&str, &str)>,
 ) -> String {
-    isolated_settings_with(child_env, working_dir, instruction_env, env_names_ignore_case())
+    isolated_settings_with(
+        child_env,
+        working_dir,
+        instruction_env,
+        env_names_ignore_case(),
+    )
 }
 
 /// [`isolated_settings`] with the name comparison given explicitly, so both
@@ -642,7 +726,10 @@ fn isolated_settings_with(
     let child_value = |name: &str| {
         child_env
             .iter()
-            .find(|(key, _)| key.to_str().is_some_and(|key| env_name_matches(key, name, ignore_case)))
+            .find(|(key, _)| {
+                key.to_str()
+                    .is_some_and(|key| env_name_matches(key, name, ignore_case))
+            })
             .and_then(|(_, value)| value.to_str())
             .unwrap_or("")
             .to_string()
@@ -660,12 +747,18 @@ fn isolated_settings_with(
                 .into_iter()
                 .find(|home| !home.is_empty());
             if let Some(home) = home {
-                value = std::path::Path::new(&home).join(".claude").to_string_lossy().into_owned();
+                value = std::path::Path::new(&home)
+                    .join(".claude")
+                    .to_string_lossy()
+                    .into_owned();
             }
         }
         env.insert((*name).to_string(), value.into());
     }
-    env.insert(ISOLATED_TELEMETRY_ENV.0.to_string(), ISOLATED_TELEMETRY_ENV.1.into());
+    env.insert(
+        ISOLATED_TELEMETRY_ENV.0.to_string(),
+        ISOLATED_TELEMETRY_ENV.1.into(),
+    );
     if let Some((name, value)) = instruction_env {
         env.insert(name.to_string(), value.into());
     }
@@ -716,7 +809,12 @@ impl IsolatedSettingsFile {
         working_dir: &std::path::Path,
         instruction_env: Option<(&str, &str)>,
     ) -> Result<Self, String> {
-        Self::create_in(&std::env::temp_dir(), child_env, working_dir, instruction_env)
+        Self::create_in(
+            &std::env::temp_dir(),
+            child_env,
+            working_dir,
+            instruction_env,
+        )
     }
 
     /// [`Self::create`] in `dir`. Fails closed: if the file cannot be created
@@ -792,8 +890,14 @@ mod prompt_file_location_tests {
         let dir = prompt_file_dir_from(None, Some(data.clone())).expect("a data directory");
         if cfg!(unix) {
             assert_eq!(dir, data.join("slashit").join("run"));
-            assert!(!dir.starts_with(std::env::temp_dir()), "{dir:?} is under the temporary directory");
-            assert!(prompt_file_dir_from(Some(OsStr::new("")), None).is_none(), "no directory is chosen");
+            assert!(
+                !dir.starts_with(std::env::temp_dir()),
+                "{dir:?} is under the temporary directory"
+            );
+            assert!(
+                prompt_file_dir_from(Some(OsStr::new("")), None).is_none(),
+                "no directory is chosen"
+            );
         }
     }
 }
@@ -864,7 +968,11 @@ fn ancestor_instruction_excludes(working_dir: &std::path::Path) -> Vec<serde_jso
     working_dir
         .ancestors()
         .skip(1)
-        .flat_map(|dir| ANCESTOR_INSTRUCTION_FILES.iter().map(move |name| dir.join(name)))
+        .flat_map(|dir| {
+            ANCESTOR_INSTRUCTION_FILES
+                .iter()
+                .map(move |name| dir.join(name))
+        })
         .filter_map(|path| path.to_str().map(|text| text.to_string().into()))
         .collect()
 }
@@ -883,7 +991,9 @@ const ADDITIONAL_DIRS_CLAUDE_MD_ENV: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_
 
 /// The environment a run needs for its `--add-dir` directories to contribute
 /// instruction files, or `None` when it has none.
-fn additional_dirs_instruction_env(config: &ClaudeRunConfig) -> Option<(&'static str, &'static str)> {
+fn additional_dirs_instruction_env(
+    config: &ClaudeRunConfig,
+) -> Option<(&'static str, &'static str)> {
     (!config.additional_dirs.is_empty()).then_some((ADDITIONAL_DIRS_CLAUDE_MD_ENV, "1"))
 }
 
@@ -939,7 +1049,11 @@ pub fn claude_args(
             push("--restricted");
             true
         }
-        ToolAccess::Full { auto_approve, permission_mode, denied_tools } => {
+        ToolAccess::Full {
+            auto_approve,
+            permission_mode,
+            denied_tools,
+        } => {
             // Under `auto` the classifier decides each call, so an approval
             // list would pre-approve tools it should review. Without the list,
             // a session that silently fell back to Manual denies every call
@@ -1191,7 +1305,8 @@ impl ClaudeRunner {
         config: ClaudeRunConfig,
         lease: Option<ProviderLease>,
     ) -> Result<Self, LaunchError> {
-        if matches!(&config.tools, ToolAccess::Full { permission_mode: Some(mode), .. } if mode == "auto") {
+        if matches!(&config.tools, ToolAccess::Full { permission_mode: Some(mode), .. } if mode == "auto")
+        {
             ensure_auto_supported()
                 .await
                 .map_err(LaunchError::before_spawn)?;
@@ -1360,8 +1475,7 @@ impl ClaudeRunner {
         let prompt_written = Arc::new(AtomicBool::new(false));
         let leader_pid = child.id();
         // An Auto run is held to the mode it asked for; see `auto_mode_mismatch`.
-        let expect_auto =
-            matches!(&config.tools, ToolAccess::Full { permission_mode: Some(mode), .. } if mode == "auto");
+        let expect_auto = matches!(&config.tools, ToolAccess::Full { permission_mode: Some(mode), .. } if mode == "auto");
 
         let runner = Self {
             child: Arc::new(Mutex::new(child)),
@@ -1390,8 +1504,11 @@ impl ClaudeRunner {
         let handle = runner.start_reader(stdout);
         *runner.reader_handle.lock().await = Some(handle);
         *runner.stderr_handle.lock().await = stderr.map(Self::start_stderr_drain);
-        *runner.prompt_writer.lock().await =
-            Some(Self::start_prompt_writer(stdin, config.prompt, prompt_written));
+        *runner.prompt_writer.lock().await = Some(Self::start_prompt_writer(
+            stdin,
+            config.prompt,
+            prompt_written,
+        ));
 
         Ok(runner)
     }
@@ -1457,9 +1574,9 @@ impl ClaudeRunner {
         match writer.await {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(error),
-            Err(tauri::Error::JoinError(error)) if error.is_panic() => {
-                Some(format!("The task writing the prompt to claude's stdin panicked: {error}"))
-            }
+            Err(tauri::Error::JoinError(error)) if error.is_panic() => Some(format!(
+                "The task writing the prompt to claude's stdin panicked: {error}"
+            )),
             Err(_) => Some("claude exited before it read the whole prompt from stdin".to_string()),
         }
     }
@@ -1526,7 +1643,9 @@ impl ClaudeRunner {
         }
         match event.get("structured_output") {
             Some(value) if value.is_object() => Ok(value.to_string()),
-            Some(value) if !value.is_null() => Err("Claude structured output is not a JSON object".into()),
+            Some(value) if !value.is_null() => {
+                Err("Claude structured output is not a JSON object".into())
+            }
             _ => Err("Claude result event did not contain structured output".into()),
         }
     }
@@ -1598,7 +1717,10 @@ impl ClaudeRunner {
             if let Ok(mut pid) = self.leader_pid.lock() {
                 *pid = None;
             }
-            child.kill().await.map_err(|e| format!("Failed to kill claude: {}", e))
+            child
+                .kill()
+                .await
+                .map_err(|e| format!("Failed to kill claude: {}", e))
         };
 
         // Taken only after the child lock is released: `wait()` holds that
@@ -1741,7 +1863,10 @@ impl ClaudeRunner {
         if let Ok(mut pid) = self.leader_pid.lock() {
             *pid = None;
         }
-        let status = child.wait().await.map_err(|e| format!("Wait failed: {}", e))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("Wait failed: {}", e))?;
 
         // Recorded before either of the two `Err` returns below so a caller
         // that only wants the raw exit outcome (not this method's own blend
@@ -1793,7 +1918,10 @@ impl ClaudeRunner {
 
         if !status.success() {
             if !stderr_text.is_empty() {
-                self.accumulated_output.write().await.push_str(&format!("\n--- STDERR ---\n{}", stderr_text));
+                self.accumulated_output
+                    .write()
+                    .await
+                    .push_str(&format!("\n--- STDERR ---\n{}", stderr_text));
             }
             if let Some(reason) = restricted_unsupported_reason(&stderr_text) {
                 return Err(reason);
@@ -1822,15 +1950,20 @@ impl ClaudeRunner {
         // Any error result counts, even one a later success followed.
         if self.result_is_error.load(Ordering::SeqCst) {
             let event = self.result_event.read().await;
-            return Err(event.as_ref().and_then(result_failure_reason).unwrap_or_else(|| "error".to_string()));
+            return Err(event
+                .as_ref()
+                .and_then(result_failure_reason)
+                .unwrap_or_else(|| "error".to_string()));
         }
 
         // A clean exit is not proof of Auto. The mode is confirmed only by an
         // `init` event that reports it, so one that never came is a failure.
         if self.expect_auto && !self.auto_confirmed.load(Ordering::SeqCst) {
-            return Err("Auto permission mode was not confirmed: Claude Code finished without reporting \
+            return Err(
+                "Auto permission mode was not confirmed: Claude Code finished without reporting \
                         its permission mode. SlashIt does not fall back to bypassing permissions."
-                .to_string());
+                    .to_string(),
+            );
         }
 
         Ok(true)
@@ -1861,7 +1994,10 @@ impl ClaudeRunner {
     /// For an Auto run, the `init` event must report Auto. If it does not, the
     /// reader records why and stops the run before any tool can act; if it
     /// does, the reader confirms it. See [`auto_mode_mismatch`].
-    fn start_reader(&self, stdout: Option<tokio::process::ChildStdout>) -> tauri::async_runtime::JoinHandle<()> {
+    fn start_reader(
+        &self,
+        stdout: Option<tokio::process::ChildStdout>,
+    ) -> tauri::async_runtime::JoinHandle<()> {
         let event_tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
         let accumulated_output = self.accumulated_output.clone();
@@ -1930,9 +2066,16 @@ impl ClaudeRunner {
                                     CodingRunEvent::AssistantMessage { content } => {
                                         if let Some(arr) = content.as_array() {
                                             for block in arr {
-                                                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                                        accumulated_output.write().await.push_str(text);
+                                                if block.get("type").and_then(|t| t.as_str())
+                                                    == Some("text")
+                                                {
+                                                    if let Some(text) =
+                                                        block.get("text").and_then(|t| t.as_str())
+                                                    {
+                                                        accumulated_output
+                                                            .write()
+                                                            .await
+                                                            .push_str(text);
                                                     }
                                                 }
                                             }
@@ -1953,9 +2096,7 @@ impl ClaudeRunner {
                         Err(_) => {
                             // Non-JSON line — treat as raw text
                             accumulated_output.write().await.push_str(&line);
-                            let _ = event_tx.send(CodingRunEvent::TextDelta {
-                                text: line,
-                            });
+                            let _ = event_tx.send(CodingRunEvent::TextDelta { text: line });
                         }
                     }
                 }
@@ -1991,7 +2132,10 @@ async fn parse_claude_event(
     match msg_type {
         "system" => {
             let subtype = json.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
-            let sid = json.get("session_id").and_then(|s| s.as_str()).map(|s| s.to_string());
+            let sid = json
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
             if let Some(ref s) = sid {
                 *session_id.lock().await = Some(s.clone());
             }
@@ -2012,7 +2156,10 @@ async fn parse_claude_event(
                     summary: system_notice_summary(subtype),
                 });
             }
-            let model = json.get("model").and_then(|s| s.as_str()).map(|s| s.to_string());
+            let model = json
+                .get("model")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
             Some(CodingRunEvent::SystemInit {
                 session_id: sid.unwrap_or_default(),
                 model,
@@ -2023,14 +2170,21 @@ async fn parse_claude_event(
         "assistant" => {
             // Full assistant message with content blocks
             let message = json.get("message")?;
-            let content = message.get("content").cloned().unwrap_or(serde_json::Value::Null);
+            let content = message
+                .get("content")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
 
             // Check for tool_use blocks in content
             if let Some(arr) = content.as_array() {
                 for block in arr {
                     if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
                         if block_type == "tool_use" {
-                            let tool = block.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
+                            let tool = block
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
                             let input = block.get("input").cloned();
                             return Some(CodingRunEvent::ToolUse { tool, input });
                         }
@@ -2042,15 +2196,30 @@ async fn parse_claude_event(
         }
 
         "result" => {
-            let text = json.get("result").and_then(|r| r.as_str()).unwrap_or("").to_string();
-            let is_error = json.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
-            let sid = json.get("session_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let text = json
+                .get("result")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            let is_error = json
+                .get("is_error")
+                .and_then(|e| e.as_bool())
+                .unwrap_or(false);
+            let sid = json
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
 
             if !sid.is_empty() {
                 *session_id.lock().await = Some(sid.clone());
             }
 
-            Some(CodingRunEvent::Result { session_id: sid, text, is_error })
+            Some(CodingRunEvent::Result {
+                session_id: sid,
+                text,
+                is_error,
+            })
         }
 
         // Stream events (content_block_delta with text_delta)
@@ -2058,7 +2227,11 @@ async fn parse_claude_event(
             let delta = json.get("delta")?;
             let delta_type = delta.get("type").and_then(|t| t.as_str())?;
             if delta_type == "text_delta" {
-                let text = delta.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let text = delta
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 Some(CodingRunEvent::TextDelta { text })
             } else {
                 None
@@ -2069,7 +2242,11 @@ async fn parse_claude_event(
             let block = json.get("content_block")?;
             let block_type = block.get("type").and_then(|t| t.as_str())?;
             if block_type == "tool_use" {
-                let tool = block.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
+                let tool = block
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 Some(CodingRunEvent::ToolUse { tool, input: None })
             } else {
                 None
@@ -2142,11 +2319,14 @@ mod system_event_tests {
         );
 
         match &events[..] {
-            [
-                CodingRunEvent::SystemInit { session_id, model, message },
-                ..,
-                CodingRunEvent::Result { session_id: result_session, .. },
-            ] => {
+            [CodingRunEvent::SystemInit {
+                session_id,
+                model,
+                message,
+            }, .., CodingRunEvent::Result {
+                session_id: result_session,
+                ..
+            }] => {
                 assert_eq!(session_id, session);
                 assert_eq!(model.as_deref(), Some("haiku"));
                 assert_eq!(message.as_deref(), Some("system:init"));
@@ -2156,7 +2336,12 @@ mod system_event_tests {
         }
 
         // The notices name their subtypes, in the order the provider sent them.
-        let subtypes_planned = ["api_retry", "notification", "informational", "compact_boundary"];
+        let subtypes_planned = [
+            "api_retry",
+            "notification",
+            "informational",
+            "compact_boundary",
+        ];
         let subtypes_seen: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
@@ -2288,10 +2473,13 @@ mod lease_launch_tests {
         // A read-only lease makes the spawn mark fail, as a full disk would.
         let lease = ProviderLease::read_only_for_test(&path).unwrap();
 
-        let error = match ClaudeRunner::start_leased_program("/nonexistent/claude", config(), Some(lease)).await {
-            Ok(_) => panic!("a provider must not start when its mark cannot be written"),
-            Err(error) => error,
-        };
+        let error =
+            match ClaudeRunner::start_leased_program("/nonexistent/claude", config(), Some(lease))
+                .await
+            {
+                Ok(_) => panic!("a provider must not start when its mark cannot be written"),
+                Err(error) => error,
+            };
         // The mark comes before the spawn, so this message proves nothing was spawned.
         assert!(!error.spawned(), "{error}");
         assert!(
@@ -2379,10 +2567,19 @@ mod args_tests {
         let plain = config(ToolAccess::ReadOnly);
         assert_eq!(value_of(&args(&plain), "--json-schema"), None);
 
-        let structured = ClaudeRunConfig { json_schema: Some(schema.clone()), ..config(ToolAccess::ReadOnly) };
+        let structured = ClaudeRunConfig {
+            json_schema: Some(schema.clone()),
+            ..config(ToolAccess::ReadOnly)
+        };
         let argv = args(&structured);
-        assert_eq!(value_of(&argv, "--json-schema"), Some(schema.to_string().as_str()));
-        assert!(argv.contains(&"--restricted".to_string()), "a structured run stays read-only: {argv:?}");
+        assert_eq!(
+            value_of(&argv, "--json-schema"),
+            Some(schema.to_string().as_str())
+        );
+        assert!(
+            argv.contains(&"--restricted".to_string()),
+            "a structured run stays read-only: {argv:?}"
+        );
         assert!(argv.contains(&"-p".to_string()));
     }
 
@@ -2390,16 +2587,27 @@ mod args_tests {
     fn a_cli_without_json_schema_is_named_without_a_version() {
         let reason = json_schema_unsupported_reason("error: unknown option '--json-schema'\n")
             .expect("the unknown-option error is recognised");
-        assert!(reason.contains("does not support --json-schema"), "{reason}");
-        assert!(!reason.contains("v2."), "no minimum version is invented: {reason}");
-        assert_eq!(json_schema_unsupported_reason("error: unknown option '--no-such-flag'"), None);
+        assert!(
+            reason.contains("does not support --json-schema"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("v2."),
+            "no minimum version is invented: {reason}"
+        );
+        assert_eq!(
+            json_schema_unsupported_reason("error: unknown option '--no-such-flag'"),
+            None
+        );
         assert_eq!(json_schema_unsupported_reason(""), None);
     }
 
     /// The arguments of an isolated run, and the settings its `--settings` file
     /// holds, read back the way the CLI will read them. The file is created as
     /// a run creates it, and is deleted when this returns.
-    pub(super) fn isolated_args_and_settings(config: &ClaudeRunConfig) -> (Vec<String>, serde_json::Value) {
+    pub(super) fn isolated_args_and_settings(
+        config: &ClaudeRunConfig,
+    ) -> (Vec<String>, serde_json::Value) {
         let file = IsolatedSettingsFile::create(
             &provider_env(std::env::vars_os()),
             std::path::Path::new(&config.working_dir),
@@ -2411,7 +2619,10 @@ mod args_tests {
             .map(|a| a.into_string().expect("utf-8 arg"))
             .collect();
         let text = std::fs::read_to_string(file.path()).expect("the settings file is readable");
-        (args, serde_json::from_str(&text).expect("the settings file is JSON"))
+        (
+            args,
+            serde_json::from_str(&text).expect("the settings file is JSON"),
+        )
     }
 
     #[test]
@@ -2422,21 +2633,44 @@ mod args_tests {
         assert_eq!(available, "Read,Glob,Grep");
         for tool in available.split(',') {
             assert!(
-                !["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"].contains(&tool),
+                ![
+                    "Bash",
+                    "Edit",
+                    "Write",
+                    "NotebookEdit",
+                    "WebFetch",
+                    "WebSearch"
+                ]
+                .contains(&tool),
                 "{tool} must not be available to a read-only run"
             );
         }
         assert_eq!(value_of(&args, "--allowedTools"), Some("Read,Glob,Grep"));
 
         let denied = value_of(&args, "--disallowedTools").expect("read-only runs deny by name too");
-        for tool in ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Agent"] {
-            assert!(denied.split(',').any(|d| d == tool), "{tool} should be denied, got {denied}");
+        for tool in [
+            "Bash",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Agent",
+        ] {
+            assert!(
+                denied.split(',').any(|d| d == tool),
+                "{tool} should be denied, got {denied}"
+            );
         }
     }
 
     #[test]
     fn a_run_with_additional_dirs_asks_the_cli_for_their_instruction_files() {
-        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None ,denied_tools: Vec::new(),});
+        let mut cfg = config(ToolAccess::Full {
+            auto_approve: Vec::new(),
+            permission_mode: None,
+            denied_tools: Vec::new(),
+        });
         cfg.additional_dirs = vec![std::path::PathBuf::from(".")];
         assert_eq!(
             additional_dirs_instruction_env(&cfg),
@@ -2446,7 +2680,11 @@ mod args_tests {
 
     #[test]
     fn a_run_without_additional_dirs_leaves_the_instruction_environment_alone() {
-        let cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None ,denied_tools: Vec::new(),});
+        let cfg = config(ToolAccess::Full {
+            auto_approve: Vec::new(),
+            permission_mode: None,
+            denied_tools: Vec::new(),
+        });
         assert_eq!(additional_dirs_instruction_env(&cfg), None);
     }
 
@@ -2456,19 +2694,33 @@ mod args_tests {
     /// it to another value.
     #[test]
     fn an_isolated_run_with_additional_dirs_pins_their_instruction_variable() {
-        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None ,denied_tools: Vec::new(),});
+        let mut cfg = config(ToolAccess::Full {
+            auto_approve: Vec::new(),
+            permission_mode: None,
+            denied_tools: Vec::new(),
+        });
         cfg.isolate_customizations = true;
         cfg.additional_dirs = vec![std::path::PathBuf::from(".")];
         let (_, settings) = isolated_args_and_settings(&cfg);
-        assert_eq!(settings["env"][ADDITIONAL_DIRS_CLAUDE_MD_ENV], "1", "{settings}");
+        assert_eq!(
+            settings["env"][ADDITIONAL_DIRS_CLAUDE_MD_ENV], "1",
+            "{settings}"
+        );
     }
 
     #[test]
     fn an_isolated_run_without_additional_dirs_does_not_pin_the_instruction_variable() {
-        let mut cfg = config(ToolAccess::Full { auto_approve: Vec::new(), permission_mode: None ,denied_tools: Vec::new(),});
+        let mut cfg = config(ToolAccess::Full {
+            auto_approve: Vec::new(),
+            permission_mode: None,
+            denied_tools: Vec::new(),
+        });
         cfg.isolate_customizations = true;
         let (_, settings) = isolated_args_and_settings(&cfg);
-        assert!(settings["env"].get(ADDITIONAL_DIRS_CLAUDE_MD_ENV).is_none(), "{settings}");
+        assert!(
+            settings["env"].get(ADDITIONAL_DIRS_CLAUDE_MD_ENV).is_none(),
+            "{settings}"
+        );
     }
 
     /// Windows keeps the casing it was given (`Path`, `SystemRoot`, `ComSpec`),
@@ -2478,20 +2730,39 @@ mod args_tests {
     #[test]
     fn provider_env_matches_names_without_case_only_where_names_ignore_case() {
         let vars = || {
-            [("Path", "C:\\bin"), ("SystemRoot", "C:\\Windows"), ("ComSpec", "cmd.exe"), ("anthropic_base_url", "https://gateway.test")]
-                .map(|(name, value)| (std::ffi::OsString::from(name), std::ffi::OsString::from(value)))
+            [
+                ("Path", "C:\\bin"),
+                ("SystemRoot", "C:\\Windows"),
+                ("ComSpec", "cmd.exe"),
+                ("anthropic_base_url", "https://gateway.test"),
+            ]
+            .map(|(name, value)| {
+                (
+                    std::ffi::OsString::from(name),
+                    std::ffi::OsString::from(value),
+                )
+            })
         };
         let kept: Vec<String> = provider_env_with(vars(), true)
             .into_iter()
             .map(|(name, _)| name.into_string().unwrap())
             .collect();
-        assert_eq!(kept, ["Path", "SystemRoot", "ComSpec", "anthropic_base_url"]);
+        assert_eq!(
+            kept,
+            ["Path", "SystemRoot", "ComSpec", "anthropic_base_url"]
+        );
         assert!(provider_env_with(vars(), false).is_empty());
     }
 
     #[test]
     fn isolated_settings_pin_a_windows_path_under_its_stored_name() {
-        let child = provider_env_with(vec![(std::ffi::OsString::from("Path"), std::ffi::OsString::from("/usr/bin:/bin"))], true);
+        let child = provider_env_with(
+            vec![(
+                std::ffi::OsString::from("Path"),
+                std::ffi::OsString::from("/usr/bin:/bin"),
+            )],
+            true,
+        );
         let folded: serde_json::Value = serde_json::from_str(&isolated_settings_with(
             &child,
             std::path::Path::new("/srv/checkout"),
@@ -2516,7 +2787,10 @@ mod args_tests {
     #[test]
     fn read_only_never_bypasses_permissions_and_is_restricted() {
         let args = args(&config(ToolAccess::ReadOnly));
-        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "{args:?}"
+        );
         assert_eq!(value_of(&args, "--permission-mode"), Some("dontAsk"));
         assert!(args.iter().any(|a| a == "--restricted"), "{args:?}");
     }
@@ -2526,7 +2800,10 @@ mod args_tests {
         let mut cfg = config(ToolAccess::ReadOnly);
         cfg.disable_mcp = false;
         let args = args(&cfg);
-        assert_eq!(args.iter().filter(|a| *a == "--strict-mcp-config").count(), 1);
+        assert_eq!(
+            args.iter().filter(|a| *a == "--strict-mcp-config").count(),
+            1
+        );
     }
 
     #[test]
@@ -2536,7 +2813,10 @@ mod args_tests {
             permission_mode: None,
             denied_tools: Vec::new(),
         }));
-        assert!(!args.iter().any(|a| a == "--tools" || a == "--restricted"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a == "--tools" || a == "--restricted"),
+            "{args:?}"
+        );
         assert_eq!(value_of(&args, "--allowedTools"), Some("Read,Edit,Bash"));
         assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
         assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
@@ -2550,7 +2830,9 @@ mod args_tests {
             denied_tools: Vec::new(),
         }));
         assert_eq!(value_of(&args, "--permission-mode"), Some("acceptEdits"));
-        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions" || a == "--allowedTools"));
+        assert!(!args
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions" || a == "--allowedTools"));
     }
 
     #[test]
@@ -2562,8 +2844,16 @@ mod args_tests {
             denied_tools: denied,
         }));
         assert_eq!(value_of(&denying, "--permission-mode"), Some("auto"));
-        assert_eq!(value_of(&denying, "--disallowedTools"), Some("Bash(gh:*),Bash(curl:*)"));
-        assert!(!denying.iter().any(|a| a == "--tools" || a == "--restricted"), "{denying:?}");
+        assert_eq!(
+            value_of(&denying, "--disallowedTools"),
+            Some("Bash(gh:*),Bash(curl:*)")
+        );
+        assert!(
+            !denying
+                .iter()
+                .any(|a| a == "--tools" || a == "--restricted"),
+            "{denying:?}"
+        );
 
         let plain = args(&config(ToolAccess::Full {
             auto_approve: Vec::new(),
@@ -2617,7 +2907,11 @@ mod args_tests {
     /// argument carries any of the prompt's text.
     #[test]
     fn the_prompt_is_not_passed_in_argv() {
-        let full = ToolAccess::Full { auto_approve: vec!["Read".into()], permission_mode: None ,denied_tools: Vec::new(),};
+        let full = ToolAccess::Full {
+            auto_approve: vec!["Read".into()],
+            permission_mode: None,
+            denied_tools: Vec::new(),
+        };
         for tools in [ToolAccess::ReadOnly, full] {
             let mut cfg = config(tools);
             cfg.prompt = "PROMPT-LINE-ONE\n--tools Bash\n".into();
@@ -2625,7 +2919,9 @@ mod args_tests {
             assert_eq!(args[0], "-p");
             assert_eq!(args[1], "--verbose", "-p is a bare flag: {args:?}");
             assert!(
-                !args.iter().any(|a| a.contains("PROMPT-LINE-ONE") || a.contains("--tools Bash")),
+                !args
+                    .iter()
+                    .any(|a| a.contains("PROMPT-LINE-ONE") || a.contains("--tools Bash")),
                 "the prompt leaked into argv: {args:?}"
             );
             assert_ne!(value_of(&args, "--tools"), Some("Bash"), "{args:?}");
@@ -2643,7 +2939,11 @@ mod launch_policy_tests {
         ClaudeRunConfig {
             prompt: String::new(),
             working_dir: ".".into(),
-            tools: ToolAccess::Full { auto_approve, permission_mode: Some("auto".into()) ,denied_tools: Vec::new(),},
+            tools: ToolAccess::Full {
+                auto_approve,
+                permission_mode: Some("auto".into()),
+                denied_tools: Vec::new(),
+            },
             max_turns: None,
             max_budget_usd: None,
             session_id: None,
@@ -2663,19 +2963,34 @@ mod launch_policy_tests {
     }
 
     fn kept(vars: Vec<(OsString, OsString)>) -> Vec<String> {
-        provider_env(vars).into_iter().map(|(name, _)| name.into_string().unwrap()).collect()
+        provider_env(vars)
+            .into_iter()
+            .map(|(name, _)| name.into_string().unwrap())
+            .collect()
     }
 
     #[test]
     fn auto_passes_auto_and_never_bypass_or_an_approval_list() {
-        let args: Vec<String> = claude_args(&auto_config(vec!["Bash".into(), "Edit".into()]), None, None)
-            .into_iter()
-            .map(|a| a.into_string().unwrap())
-            .collect();
-        assert_eq!(args.iter().position(|a| a == "--permission-mode").map(|i| args[i + 1].as_str()), Some("auto"));
-        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
+        let args: Vec<String> =
+            claude_args(&auto_config(vec!["Bash".into(), "Edit".into()]), None, None)
+                .into_iter()
+                .map(|a| a.into_string().unwrap())
+                .collect();
+        assert_eq!(
+            args.iter()
+                .position(|a| a == "--permission-mode")
+                .map(|i| args[i + 1].as_str()),
+            Some("auto")
+        );
+        assert!(
+            !args.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "{args:?}"
+        );
         assert!(!args.iter().any(|a| a == "--allowedTools"), "{args:?}");
-        assert!(!args.iter().any(|a| a == "--tools" || a == "--restricted"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a == "--tools" || a == "--restricted"),
+            "{args:?}"
+        );
         assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
     }
 
@@ -2684,7 +2999,11 @@ mod launch_policy_tests {
         let mut config = auto_config(vec![]);
         config.isolate_customizations = true;
         let (args, settings) = isolated_args_and_settings(&config);
-        assert_eq!(value_of(&args, "--setting-sources"), Some("project"), "{args:?}");
+        assert_eq!(
+            value_of(&args, "--setting-sources"),
+            Some("project"),
+            "{args:?}"
+        );
         assert_eq!(settings["disableAllHooks"], true, "{args:?}");
         assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
     }
@@ -2702,14 +3021,21 @@ mod launch_policy_tests {
             .iter()
             .map(|v| v.as_str().expect("path"))
             .collect();
-        assert!(excludes.contains(&"/home/owner/.claude/CLAUDE.md"), "{excludes:?}");
+        assert!(
+            excludes.contains(&"/home/owner/.claude/CLAUDE.md"),
+            "{excludes:?}"
+        );
         assert!(excludes.contains(&"/home/owner/CLAUDE.md"), "{excludes:?}");
         assert!(
-            excludes.contains(&"/home/owner/.local/share/slashit/worktrees/p/.claude/CLAUDE.local.md"),
+            excludes
+                .contains(&"/home/owner/.local/share/slashit/worktrees/p/.claude/CLAUDE.local.md"),
             "{excludes:?}"
         );
         let checkout = "/home/owner/.local/share/slashit/worktrees/p/t";
-        assert!(!excludes.iter().any(|p| p.starts_with(checkout)), "{excludes:?}");
+        assert!(
+            !excludes.iter().any(|p| p.starts_with(checkout)),
+            "{excludes:?}"
+        );
     }
 
     #[test]
@@ -2718,7 +3044,11 @@ mod launch_policy_tests {
         let paths: Vec<&str> = excludes.iter().map(|v| v.as_str().unwrap()).collect();
         // `/a/b`, `/a` and the root: every directory above `/a/b/c`. Compared as
         // `Path`s with `join`, so the expected separator is the platform's.
-        assert_eq!(paths.len(), 3 * ANCESTOR_INSTRUCTION_FILES.len(), "{paths:?}");
+        assert_eq!(
+            paths.len(),
+            3 * ANCESTOR_INSTRUCTION_FILES.len(),
+            "{paths:?}"
+        );
         for dir in ["/a/b", "/a", "/"] {
             for name in ANCESTOR_INSTRUCTION_FILES {
                 let expected = std::path::Path::new(dir).join(name);
@@ -2729,7 +3059,12 @@ mod launch_policy_tests {
                 );
             }
         }
-        assert!(!paths.iter().any(|p| std::path::Path::new(p).starts_with("/a/b/c")), "{paths:?}");
+        assert!(
+            !paths
+                .iter()
+                .any(|p| std::path::Path::new(p).starts_with("/a/b/c")),
+            "{paths:?}"
+        );
     }
 
     /// Creates the `--settings` file of an isolated run exactly as a run does,
@@ -2743,14 +3078,18 @@ mod launch_policy_tests {
         let Ok(out) = std::env::var("SLASHIT_ISOLATED_SETTINGS_OUT") else {
             return;
         };
-        let working_dir = std::env::var("SLASHIT_ISOLATED_WORKING_DIR").expect("SLASHIT_ISOLATED_WORKING_DIR");
+        let working_dir =
+            std::env::var("SLASHIT_ISOLATED_WORKING_DIR").expect("SLASHIT_ISOLATED_WORKING_DIR");
         let file = IsolatedSettingsFile::create(
             &provider_env(std::env::vars_os()),
             std::path::Path::new(&working_dir),
             None,
         )
         .expect("the settings file is written");
-        let kept = file.0.keep().expect("the settings file is kept for the probe");
+        let kept = file
+            .0
+            .keep()
+            .expect("the settings file is kept for the probe");
         std::fs::write(out, kept.to_string_lossy().as_bytes()).unwrap();
     }
 
@@ -2770,7 +3109,12 @@ mod launch_policy_tests {
                 OsString::from("--require /tmp/x.js"),
             ),
         ]);
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(
+            &child,
+            std::path::Path::new("/srv/checkout"),
+            None,
+        ))
+        .unwrap();
         assert_eq!(settings["disableAllHooks"], true);
         assert_eq!(settings["apiKeyHelper"], "");
         assert_eq!(
@@ -2788,8 +3132,12 @@ mod launch_policy_tests {
     /// does not receive it. An unpinned name would let the project set it.
     #[test]
     fn isolated_settings_pin_endpoint_ca_and_loader_names_when_absent() {
-        let settings: serde_json::Value =
-            serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(
+            &[],
+            std::path::Path::new("/srv/checkout"),
+            None,
+        ))
+        .unwrap();
         for name in [
             "ANTHROPIC_BEDROCK_BASE_URL",
             "ANTHROPIC_VERTEX_BASE_URL",
@@ -2815,8 +3163,12 @@ mod launch_policy_tests {
     /// its endpoint, or enable a skip switch when the child does not have one.
     #[test]
     fn isolated_settings_pin_every_provider_selector_and_skip_switch_when_absent() {
-        let settings: serde_json::Value =
-            serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(
+            &[],
+            std::path::Path::new("/srv/checkout"),
+            None,
+        ))
+        .unwrap();
         for name in [
             "CLAUDE_CODE_USE_BEDROCK",
             "CLAUDE_CODE_USE_VERTEX",
@@ -2848,12 +3200,25 @@ mod launch_policy_tests {
     #[test]
     fn isolated_settings_keep_the_user_configured_skip_switch_and_region() {
         let child = provider_env(vec![
-            (OsString::from("CLAUDE_CODE_SKIP_VERTEX_AUTH"), OsString::from("1")),
-            (OsString::from("CLOUD_ML_REGION"), OsString::from("europe-west1")),
-            (OsString::from("CLAUDE_CODE_USE_ANTHROPIC_AWS"), OsString::from("1")),
+            (
+                OsString::from("CLAUDE_CODE_SKIP_VERTEX_AUTH"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("CLOUD_ML_REGION"),
+                OsString::from("europe-west1"),
+            ),
+            (
+                OsString::from("CLAUDE_CODE_USE_ANTHROPIC_AWS"),
+                OsString::from("1"),
+            ),
         ]);
-        let settings: serde_json::Value =
-            serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(
+            &child,
+            std::path::Path::new("/srv/checkout"),
+            None,
+        ))
+        .unwrap();
         assert_eq!(settings["env"]["CLAUDE_CODE_SKIP_VERTEX_AUTH"], "1");
         assert_eq!(settings["env"]["CLOUD_ML_REGION"], "europe-west1");
         assert_eq!(settings["env"]["CLAUDE_CODE_USE_ANTHROPIC_AWS"], "1");
@@ -2873,8 +3238,10 @@ mod launch_policy_tests {
             "CLAUDE_CODE_SKIP_UNRELATED_AUTH",
         ];
         let kept = provider_env(names.map(|n| (OsString::from(n), OsString::from("1"))));
-        let kept: std::collections::BTreeSet<String> =
-            kept.into_iter().map(|(n, _)| n.into_string().unwrap()).collect();
+        let kept: std::collections::BTreeSet<String> = kept
+            .into_iter()
+            .map(|(n, _)| n.into_string().unwrap())
+            .collect();
         for name in &names[..5] {
             assert!(kept.contains(*name), "{name} must reach the provider child");
         }
@@ -2886,13 +3253,26 @@ mod launch_policy_tests {
     #[test]
     fn isolated_settings_pin_the_config_dir_to_its_default_or_its_value() {
         let at = |vars: Vec<(&str, &str)>| {
-            let child = provider_env(vars.into_iter().map(|(n, v)| (OsString::from(n), OsString::from(v))));
-            let settings: serde_json::Value =
-                serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
-            settings["env"]["CLAUDE_CONFIG_DIR"].as_str().unwrap().to_string()
+            let child = provider_env(
+                vars.into_iter()
+                    .map(|(n, v)| (OsString::from(n), OsString::from(v))),
+            );
+            let settings: serde_json::Value = serde_json::from_str(&isolated_settings(
+                &child,
+                std::path::Path::new("/srv/checkout"),
+                None,
+            ))
+            .unwrap();
+            settings["env"]["CLAUDE_CONFIG_DIR"]
+                .as_str()
+                .unwrap()
+                .to_string()
         };
         assert_eq!(at(vec![("HOME", "/home/u")]), "/home/u/.claude");
-        assert_eq!(at(vec![("HOME", "/home/u"), ("CLAUDE_CONFIG_DIR", "/cfg")]), "/cfg");
+        assert_eq!(
+            at(vec![("HOME", "/home/u"), ("CLAUDE_CONFIG_DIR", "/cfg")]),
+            "/cfg"
+        );
         assert_eq!(at(vec![]), "");
     }
 
@@ -2914,8 +3294,10 @@ mod launch_policy_tests {
             "AWS_CA_BUNDLE",
         ];
         let kept = provider_env(names.map(|n| (OsString::from(n), OsString::from("v"))));
-        let kept: std::collections::BTreeSet<String> =
-            kept.into_iter().map(|(n, _)| n.into_string().unwrap()).collect();
+        let kept: std::collections::BTreeSet<String> = kept
+            .into_iter()
+            .map(|(n, _)| n.into_string().unwrap())
+            .collect();
         for name in names {
             assert!(kept.contains(name), "{name} must reach the provider child");
         }
@@ -2923,8 +3305,16 @@ mod launch_policy_tests {
 
     #[test]
     fn isolated_settings_pin_the_shell_and_child_process_inlets() {
-        let child = provider_env(vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]);
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)).unwrap();
+        let child = provider_env(vec![(
+            OsString::from("PATH"),
+            OsString::from("/usr/bin:/bin"),
+        )]);
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(
+            &child,
+            std::path::Path::new("/srv/checkout"),
+            None,
+        ))
+        .unwrap();
         // The project cannot prepend its own directory to the child's PATH.
         assert_eq!(settings["env"]["PATH"], "/usr/bin:/bin");
         for name in ["BASH_ENV", "ENV", "LD_PRELOAD", "CLAUDE_CODE_SHELL_PREFIX"] {
@@ -2934,7 +3324,12 @@ mod launch_policy_tests {
 
     #[test]
     fn isolated_settings_disable_helpers_and_optional_telemetry() {
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(
+            &[],
+            std::path::Path::new("/srv/checkout"),
+            None,
+        ))
+        .unwrap();
         for name in HELPER_SETTINGS {
             assert_eq!(settings[*name], "", "{name} must be pinned empty");
         }
@@ -2944,7 +3339,12 @@ mod launch_policy_tests {
 
     #[test]
     fn isolated_settings_name_the_default_endpoint_when_the_child_has_none() {
-        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(&[], std::path::Path::new("/srv/checkout"), None)).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&isolated_settings(
+            &[],
+            std::path::Path::new("/srv/checkout"),
+            None,
+        ))
+        .unwrap();
         assert_eq!(
             settings["env"]["ANTHROPIC_BASE_URL"],
             DEFAULT_ANTHROPIC_BASE_URL
@@ -2953,9 +3353,16 @@ mod launch_policy_tests {
 
     #[test]
     fn runs_that_are_not_isolated_keep_the_settings_their_user_configured() {
-        let args: Vec<String> =
-            claude_args(&auto_config(vec![]), None, None).into_iter().map(|a| a.into_string().unwrap()).collect();
-        assert!(!args.iter().any(|a| a == "--setting-sources" || a == "--settings"), "{args:?}");
+        let args: Vec<String> = claude_args(&auto_config(vec![]), None, None)
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--setting-sources" || a == "--settings"),
+            "{args:?}"
+        );
     }
 
     /// The settings file is created owner-only, so no other local user can read
@@ -2965,20 +3372,46 @@ mod launch_policy_tests {
     fn isolated_settings_file_is_owner_only_from_its_creation() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
-        let file = IsolatedSettingsFile::create_in(dir.path(), &[], std::path::Path::new("/srv/checkout"), None).unwrap();
+        let file = IsolatedSettingsFile::create_in(
+            dir.path(),
+            &[],
+            std::path::Path::new("/srv/checkout"),
+            None,
+        )
+        .unwrap();
         let mode = std::fs::metadata(file.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        let name = file.path().file_name().unwrap().to_string_lossy().into_owned();
-        assert!(name.starts_with(SETTINGS_FILE_PREFIX) && name.ends_with(".json"), "{name}");
+        let name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with(SETTINGS_FILE_PREFIX) && name.ends_with(".json"),
+            "{name}"
+        );
     }
 
     #[test]
     fn isolated_settings_file_holds_exactly_the_settings_the_run_pins() {
-        let child = provider_env(vec![(OsString::from("ANTHROPIC_BASE_URL"), OsString::from("https://gateway.test"))]);
+        let child = provider_env(vec![(
+            OsString::from("ANTHROPIC_BASE_URL"),
+            OsString::from("https://gateway.test"),
+        )]);
         let dir = tempfile::TempDir::new().unwrap();
-        let file = IsolatedSettingsFile::create_in(dir.path(), &child, std::path::Path::new("/srv/checkout"), None).unwrap();
+        let file = IsolatedSettingsFile::create_in(
+            dir.path(),
+            &child,
+            std::path::Path::new("/srv/checkout"),
+            None,
+        )
+        .unwrap();
         let text = std::fs::read_to_string(file.path()).unwrap();
-        assert_eq!(text, isolated_settings(&child, std::path::Path::new("/srv/checkout"), None));
+        assert_eq!(
+            text,
+            isolated_settings(&child, std::path::Path::new("/srv/checkout"), None)
+        );
     }
 
     /// Deleting the file is what ends the credentials' life on disk, so it must
@@ -2986,7 +3419,13 @@ mod launch_policy_tests {
     #[test]
     fn isolated_settings_file_is_deleted_when_it_is_dropped() {
         let dir = tempfile::TempDir::new().unwrap();
-        let file = IsolatedSettingsFile::create_in(dir.path(), &[], std::path::Path::new("/srv/checkout"), None).unwrap();
+        let file = IsolatedSettingsFile::create_in(
+            dir.path(),
+            &[],
+            std::path::Path::new("/srv/checkout"),
+            None,
+        )
+        .unwrap();
         let path = file.path().to_path_buf();
         assert!(path.is_file());
         drop(file);
@@ -2998,14 +3437,25 @@ mod launch_policy_tests {
     #[test]
     fn a_settings_file_that_cannot_be_written_fails_closed_without_its_content() {
         let secret = "SECRET-HEADER-9c1e";
-        let child = provider_env(vec![(OsString::from("ANTHROPIC_CUSTOM_HEADERS"), OsString::from(secret))]);
+        let child = provider_env(vec![(
+            OsString::from("ANTHROPIC_CUSTOM_HEADERS"),
+            OsString::from(secret),
+        )]);
         let dir = tempfile::TempDir::new().unwrap();
         let missing = dir.path().join("no-such-directory");
-        let err = IsolatedSettingsFile::create_in(&missing, &child, std::path::Path::new("/srv/checkout"), None)
-            .err()
-            .expect("a file in a missing directory cannot be created");
+        let err = IsolatedSettingsFile::create_in(
+            &missing,
+            &child,
+            std::path::Path::new("/srv/checkout"),
+            None,
+        )
+        .err()
+        .expect("a file in a missing directory cannot be created");
         assert_eq!(err, SETTINGS_FILE_FAILURE);
-        assert!(!err.contains(secret) && !err.contains("no-such-directory"), "{err}");
+        assert!(
+            !err.contains(secret) && !err.contains("no-such-directory"),
+            "{err}"
+        );
     }
 
     /// The settings do carry the pinned secrets, so the file is where they
@@ -3024,8 +3474,16 @@ mod launch_policy_tests {
             ),
         ]);
         let dir = tempfile::TempDir::new().unwrap();
-        let file = IsolatedSettingsFile::create_in(dir.path(), &child, std::path::Path::new("/srv/checkout"), None).unwrap();
-        assert!(std::fs::read_to_string(file.path()).unwrap().contains(secret));
+        let file = IsolatedSettingsFile::create_in(
+            dir.path(),
+            &child,
+            std::path::Path::new("/srv/checkout"),
+            None,
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(file.path())
+            .unwrap()
+            .contains(secret));
 
         let mut config = auto_config(vec![]);
         config.isolate_customizations = true;
@@ -3033,22 +3491,37 @@ mod launch_policy_tests {
             .into_iter()
             .map(|a| a.into_string().unwrap())
             .collect();
-        assert!(!args.iter().any(|a| a.contains(secret) || a.contains("disableAllHooks")), "{args:?}");
-        assert_eq!(value_of(&args, "--settings"), file.path().to_str(), "{args:?}");
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains(secret) || a.contains("disableAllHooks")),
+            "{args:?}"
+        );
+        assert_eq!(
+            value_of(&args, "--settings"),
+            file.path().to_str(),
+            "{args:?}"
+        );
     }
 
     #[test]
     fn an_init_event_must_report_auto_and_a_missing_mode_is_not_proof() {
-        let auto = serde_json::json!({"type": "system", "subtype": "init", "permissionMode": "auto"});
+        let auto =
+            serde_json::json!({"type": "system", "subtype": "init", "permissionMode": "auto"});
         assert_eq!(auto_mode_mismatch(&auto), None);
 
-        let manual = serde_json::json!({"type": "system", "subtype": "init", "permissionMode": "default"});
+        let manual =
+            serde_json::json!({"type": "system", "subtype": "init", "permissionMode": "default"});
         let reason = auto_mode_mismatch(&manual).expect("a Manual session is a mismatch");
         assert!(reason.contains("\"default\""), "{reason}");
-        assert!(reason.contains("does not fall back to bypassing permissions"), "{reason}");
+        assert!(
+            reason.contains("does not fall back to bypassing permissions"),
+            "{reason}"
+        );
 
         let unreported = serde_json::json!({"type": "system", "subtype": "init"});
-        let reason = auto_mode_mismatch(&unreported).expect("an unreported mode is not proof of Auto");
+        let reason =
+            auto_mode_mismatch(&unreported).expect("an unreported mode is not proof of Auto");
         assert!(reason.contains("reported permission mode none"), "{reason}");
     }
 
@@ -3057,7 +3530,10 @@ mod launch_policy_tests {
         assert_eq!(auto_unsupported_reason("2.1.306 (Claude Code)\n"), None);
         assert_eq!(auto_unsupported_reason("2.1.283"), None);
         let old = auto_unsupported_reason("2.1.282 (Claude Code)").expect("too old");
-        assert!(old.contains(AUTO_MIN_VERSION) && old.contains("v2.1.282"), "{old}");
+        assert!(
+            old.contains(AUTO_MIN_VERSION) && old.contains("v2.1.282"),
+            "{old}"
+        );
         assert!(old.contains("does not fall back"), "{old}");
         assert!(auto_unsupported_reason("").is_some());
         assert!(auto_unsupported_reason("command not understood").is_some());
@@ -3066,32 +3542,81 @@ mod launch_policy_tests {
     #[test]
     fn provider_env_drops_session_metadata_and_unrelated_credentials() {
         let vars = [
-            "HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "HTTPS_PROXY", "SSL_CERT_FILE",
-            "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET",
-            "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_PID", "GH_TOKEN", "GITHUB_TOKEN",
-            "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "GIT_EDITOR", "DISPLAY",
+            "HOME",
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TMPDIR",
+            "HTTPS_PROXY",
+            "SSL_CERT_FILE",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDECODE",
+            "CLAUDE_PID",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "GIT_EDITOR",
+            "DISPLAY",
         ]
         .map(var)
         .to_vec();
         let kept = kept(vars);
-        for name in ["HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "HTTPS_PROXY", "SSL_CERT_FILE",
-            "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK"]
-        {
-            assert!(kept.iter().any(|k| k == name), "{name} must be kept: {kept:?}");
+        for name in [
+            "HOME",
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TMPDIR",
+            "HTTPS_PROXY",
+            "SSL_CERT_FILE",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+        ] {
+            assert!(
+                kept.iter().any(|k| k == name),
+                "{name} must be kept: {kept:?}"
+            );
         }
-        for name in ["CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MESSAGING_SOCKET",
-            "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_PID", "GH_TOKEN", "GITHUB_TOKEN",
-            "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "GIT_EDITOR", "DISPLAY"]
-        {
-            assert!(!kept.iter().any(|k| k == name), "{name} must be dropped: {kept:?}");
+        for name in [
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDECODE",
+            "CLAUDE_PID",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "GIT_EDITOR",
+            "DISPLAY",
+        ] {
+            assert!(
+                !kept.iter().any(|k| k == name),
+                "{name} must be dropped: {kept:?}"
+            );
         }
     }
 
     #[test]
     fn provider_env_keeps_values_unchanged_and_drops_non_utf8_names() {
         let kept = provider_env([(OsString::from("HOME"), OsString::from("/home/u"))]);
-        assert_eq!(kept, vec![(OsString::from("HOME"), OsString::from("/home/u"))]);
+        assert_eq!(
+            kept,
+            vec![(OsString::from("HOME"), OsString::from("/home/u"))]
+        );
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
@@ -3125,7 +3650,10 @@ mod failure_reason_tests {
             "type": "result", "subtype": "error_during_execution", "is_error": true,
             "errors": ["first", "  ", "second"], "result": "MODEL TEXT",
         });
-        assert_eq!(result_failure_reason(&event).as_deref(), Some("error_during_execution: first; second"));
+        assert_eq!(
+            result_failure_reason(&event).as_deref(),
+            Some("error_during_execution: first; second")
+        );
     }
 
     #[test]
@@ -3148,7 +3676,8 @@ mod failure_reason_tests {
 
     #[test]
     fn a_successful_result_or_another_event_is_no_failure() {
-        let success = json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"});
+        let success =
+            json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"});
         assert_eq!(result_failure_reason(&success), None);
         let assistant = json!({"type": "assistant", "is_error": true, "subtype": "error"});
         assert_eq!(result_failure_reason(&assistant), None);
@@ -3164,7 +3693,9 @@ mod failure_reason_tests {
         let reason = result_failure_reason(&event).expect("an error result");
         assert!(!reason.contains('\n'), "{reason}");
         assert!(reason.ends_with('…'), "{reason}");
-        let quoted = reason.strip_prefix("error_during_execution: ").expect("labelled");
+        let quoted = reason
+            .strip_prefix("error_during_execution: ")
+            .expect("labelled");
         assert_eq!(quoted.chars().count(), RESULT_TEXT_LIMIT + 1);
 
         let errors: Vec<String> = (0..1_000).map(|i| format!("error number {i}")).collect();
@@ -3176,8 +3707,14 @@ mod failure_reason_tests {
 
     #[test]
     fn a_carriage_return_ends_a_line_too() {
-        assert_eq!(truncate_one_line("first\r\nsecond\rthird\n\r\n", 100), "first / second / third");
-        assert_eq!(truncate_one_line_tail("first\r\nsecond\rthird", 100), "first / second / third");
+        assert_eq!(
+            truncate_one_line("first\r\nsecond\rthird\n\r\n", 100),
+            "first / second / third"
+        );
+        assert_eq!(
+            truncate_one_line_tail("first\r\nsecond\rthird", 100),
+            "first / second / third"
+        );
     }
 
     /// The tail variant keeps the end, which is where a run's output says
@@ -3200,14 +3737,23 @@ mod failure_reason_tests {
     #[cfg(unix)]
     #[test]
     fn a_failed_exit_without_an_error_result_falls_back_in_order() {
-        let success = json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"});
-        assert_eq!(failed_exit_reason(exited(2), "", Some(&success), None), "Exit code 2 — no details");
+        let success =
+            json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"});
+        assert_eq!(
+            failed_exit_reason(exited(2), "", Some(&success), None),
+            "Exit code 2 — no details"
+        );
         assert_eq!(
             failed_exit_reason(exited(2), "", Some(&success), Some("prompt cut short")),
             "Exit code 2 — prompt cut short"
         );
         assert_eq!(
-            failed_exit_reason(exited(2), "first\nlast line\n\n", Some(&success), Some("prompt cut short")),
+            failed_exit_reason(
+                exited(2),
+                "first\nlast line\n\n",
+                Some(&success),
+                Some("prompt cut short")
+            ),
             "Exit code 2 — last line"
         );
     }
@@ -3217,7 +3763,9 @@ mod failure_reason_tests {
     fn a_long_stderr_line_is_bounded() {
         let stderr = "x".repeat(10_000);
         let reason = failed_exit_reason(exited(1), &stderr, None, None);
-        let quoted = reason.strip_prefix("Exit code 1 — ").expect("exit code first");
+        let quoted = reason
+            .strip_prefix("Exit code 1 — ")
+            .expect("exit code first");
         assert_eq!(quoted.chars().count(), STDERR_LINE_LIMIT + 1);
     }
 
@@ -3227,7 +3775,8 @@ mod failure_reason_tests {
     #[test]
     fn a_signalled_exit_reports_the_signal_only() {
         let killed = std::os::unix::process::ExitStatusExt::from_raw(libc::SIGKILL);
-        let error = json!({"type": "result", "subtype": "error_during_execution", "is_error": true});
+        let error =
+            json!({"type": "result", "subtype": "error_during_execution", "is_error": true});
         assert_eq!(
             failed_exit_reason(killed, "", Some(&error), Some("prompt cut short")),
             "Terminated by signal 9 — no details"
@@ -3406,7 +3955,11 @@ mod tests {
 
     impl Fixture {
         fn config_with_prompt(&self, prompt: &str, tools: ToolAccess) -> ClaudeRunConfig {
-            ClaudeRunConfig { prompt: prompt.to_string(), tools, ..self.config() }
+            ClaudeRunConfig {
+                prompt: prompt.to_string(),
+                tools,
+                ..self.config()
+            }
         }
 
         async fn start_with(&self, config: ClaudeRunConfig) -> ClaudeRunner {
@@ -3422,7 +3975,8 @@ mod tests {
 
         /// The arguments the `stdin_echo` fixture was started with.
         fn recorded_argv(&self) -> Vec<Vec<u8>> {
-            let raw = std::fs::read(self.dir.path().join("argv")).expect("the fixture recorded argv");
+            let raw =
+                std::fs::read(self.dir.path().join("argv")).expect("the fixture recorded argv");
             let mut fields: Vec<Vec<u8>> = raw.split(|b| *b == 0).map(<[u8]>::to_vec).collect();
             // Every field is NUL-terminated, which leaves one empty piece.
             assert_eq!(fields.pop().as_deref(), Some(&[][..]));
@@ -3444,8 +3998,10 @@ mod tests {
     #[cfg(test)]
     fn fixture_executable(program: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
-        let mode =
-            std::fs::metadata(program).expect("the fixture program exists").permissions().mode();
+        let mode = std::fs::metadata(program)
+            .expect("the fixture program exists")
+            .permissions()
+            .mode();
         assert_eq!(
             mode & 0o111,
             0o111,
@@ -3534,9 +4090,15 @@ mod tests {
             .start_with(fixture.config_with_prompt("Coordinator turn", read_only()))
             .await;
         assert_eq!(bounded("structured answer", &runner).await, Ok(true));
-        let answer = runner.final_structured_output().await.expect("an object is the answer");
+        let answer = runner
+            .final_structured_output()
+            .await
+            .expect("an object is the answer");
         let answer: serde_json::Value = serde_json::from_str(&answer).expect("the answer is JSON");
-        assert_eq!(answer, serde_json::json!({"type": "reply", "text": "hello"}));
+        assert_eq!(
+            answer,
+            serde_json::json!({"type": "reply", "text": "hello"})
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3546,12 +4108,19 @@ mod tests {
             let runner = fixture
                 .start_with(fixture.config_with_prompt(case, read_only()))
                 .await;
-            assert_eq!(bounded(case, &runner).await, Ok(true), "{case} exits successfully");
+            assert_eq!(
+                bounded(case, &runner).await,
+                Ok(true),
+                "{case} exits successfully"
+            );
             assert!(
                 runner.final_structured_output().await.is_err(),
                 "{case}: a missing or null structured answer must fail, not fall back to prose"
             );
-            assert!(runner.final_result_text().await.is_ok(), "{case}: the prose is still there for other callers");
+            assert!(
+                runner.final_result_text().await.is_ok(),
+                "{case}: the prose is still there for other callers"
+            );
         }
     }
 
@@ -3566,7 +4135,10 @@ mod tests {
         let error = bounded("structured run on an old CLI", &runner)
             .await
             .expect_err("a CLI that rejects --json-schema must fail the run");
-        assert_eq!(Some(error), json_schema_unsupported_reason("error: unknown option '--json-schema'"));
+        assert_eq!(
+            Some(error),
+            json_schema_unsupported_reason("error: unknown option '--json-schema'")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3666,7 +4238,10 @@ mod tests {
     async fn the_first_subscriber_sees_what_the_agent_wrote_before_it_subscribed() {
         let fixture = Fixture::new(STREAMING);
         let runner = fixture.start().await;
-        assert_eq!(bounded("finish before subscribing", &runner).await, Ok(true));
+        assert_eq!(
+            bounded("finish before subscribing", &runner).await,
+            Ok(true)
+        );
 
         let mut events = runner.subscribe();
         drop(runner);
@@ -3676,7 +4251,13 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec!["system_init", "tool_use", "assistant_message", "text_delta", "result"]
+            vec![
+                "system_init",
+                "tool_use",
+                "assistant_message",
+                "text_delta",
+                "result"
+            ]
         );
     }
 
@@ -3712,7 +4293,13 @@ mod tests {
         let kinds = seen.iter().map(describe).collect::<Vec<_>>();
         assert_eq!(
             kinds,
-            vec!["system_init", "tool_use", "assistant_message", "text_delta", "result"],
+            vec![
+                "system_init",
+                "tool_use",
+                "assistant_message",
+                "text_delta",
+                "result"
+            ],
             "every event should have been broadcast, in order"
         );
 
@@ -3921,8 +4508,13 @@ mod tests {
     async fn a_failure_with_no_stderr_reports_the_result_event_reason() {
         let fixture = Fixture::new(MAX_TURNS);
         let runner = fixture.start().await;
-        let error = bounded("max turns", &runner).await.expect_err("exit 1 is a failure");
-        assert_eq!(error, "Exit code 1 — error_max_turns: Reached maximum number of turns (1)");
+        let error = bounded("max turns", &runner)
+            .await
+            .expect_err("exit 1 is a failure");
+        assert_eq!(
+            error,
+            "Exit code 1 — error_max_turns: Reached maximum number of turns (1)"
+        );
         assert_eq!(runner.exit_status().await, Some((false, Some(1))));
     }
 
@@ -3932,7 +4524,9 @@ mod tests {
     async fn a_failure_with_stderr_and_a_result_reports_both() {
         let fixture = Fixture::new(API_ERROR);
         let runner = fixture.start().await;
-        let error = bounded("api error", &runner).await.expect_err("exit 1 is a failure");
+        let error = bounded("api error", &runner)
+            .await
+            .expect_err("exit 1 is a failure");
         assert_eq!(
             error,
             "Exit code 1 — api_error (API status 404): There is an issue with the selected \
@@ -3947,7 +4541,9 @@ mod tests {
     async fn a_failure_with_malformed_output_falls_back_to_the_exit_code() {
         let fixture = Fixture::new(MALFORMED_RESULT);
         let runner = fixture.start().await;
-        let error = bounded("malformed", &runner).await.expect_err("exit 1 is a failure");
+        let error = bounded("malformed", &runner)
+            .await
+            .expect_err("exit 1 is a failure");
         assert_eq!(error, "Exit code 1 — no details");
     }
 
@@ -3967,24 +4563,35 @@ mod tests {
             .expect("kill must succeed");
         assert!(!is_alive(pid));
 
-        let error = bounded("wait after kill", &runner).await.expect_err("a killed run failed");
+        let error = bounded("wait after kill", &runner)
+            .await
+            .expect_err("a killed run failed");
         assert_eq!(error, "Terminated by signal 9 — no details");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cli_without_restricted_fails_a_read_only_run_with_an_actionable_reason() {
         let fixture = Fixture::new(NO_RESTRICTED);
-        let config = ClaudeRunConfig { tools: ToolAccess::ReadOnly, ..fixture.config() };
+        let config = ClaudeRunConfig {
+            tools: ToolAccess::ReadOnly,
+            ..fixture.config()
+        };
         let runner = ClaudeRunner::start_program(&fixture.program, config)
             .await
             .expect("fixture should spawn");
         let error = bounded("read-only on an old CLI", &runner)
             .await
             .expect_err("a CLI that rejects --restricted must fail the run");
-        assert_eq!(Some(error), restricted_unsupported_reason("error: unknown option '--restricted'"));
+        assert_eq!(
+            Some(error),
+            restricted_unsupported_reason("error: unknown option '--restricted'")
+        );
 
         let runner = fixture.start().await;
-        assert_eq!(bounded("full access on an old CLI", &runner).await, Ok(true));
+        assert_eq!(
+            bounded("full access on an old CLI", &runner).await,
+            Ok(true)
+        );
     }
 
     #[test]
@@ -3993,8 +4600,14 @@ mod tests {
             .expect("the unknown-option error is recognised");
         assert!(reason.contains("update Claude Code"), "{reason}");
         assert!(reason.contains(RESTRICTED_MIN_VERSION), "{reason}");
-        assert_eq!(restricted_unsupported_reason("error: unknown option '--no-such-flag'"), None);
-        assert_eq!(restricted_unsupported_reason("something went wrong in the CLI"), None);
+        assert_eq!(
+            restricted_unsupported_reason("error: unknown option '--no-such-flag'"),
+            None
+        );
+        assert_eq!(
+            restricted_unsupported_reason("something went wrong in the CLI"),
+            None
+        );
         assert_eq!(restricted_unsupported_reason(""), None);
     }
 
@@ -4197,7 +4810,10 @@ mod tests {
         let runner = fixture.start().await;
         let leader_pid = unix_announced_pid(&fixture, "blocked.pid").await;
         let descendant_pid = unix_announced_pid(&fixture, "descendant.pid").await;
-        assert!(unix_pid_is_alive(leader_pid), "the leader must still be running");
+        assert!(
+            unix_pid_is_alive(leader_pid),
+            "the leader must still be running"
+        );
         assert!(
             unix_pid_is_alive(descendant_pid),
             "the descendant must be running before cancellation"
@@ -4240,19 +4856,31 @@ mod tests {
             assert_eq!(bounded(label, &runner).await, Ok(true), "{label}");
 
             let argv = fixture.recorded_argv();
-            assert_eq!(argv, expected_argv, "{label}: the child got exactly claude_args");
+            assert_eq!(
+                argv, expected_argv,
+                "{label}: the child got exactly claude_args"
+            );
             assert!(
-                !argv.iter().any(|a| a.windows(13).any(|w| w == b"PROMPT-MARKER")),
+                !argv
+                    .iter()
+                    .any(|a| a.windows(13).any(|w| w == b"PROMPT-MARKER")),
                 "{label}: the prompt leaked into argv"
             );
             assert_eq!(fixture.recorded_prompt(), prompt.as_bytes(), "{label}");
-            assert_eq!(runner.get_output().await, prompt.len().to_string(), "{label}");
+            assert_eq!(
+                runner.get_output().await,
+                prompt.len().to_string(),
+                "{label}"
+            );
         }
     }
 
     /// The settings path an isolated run was given, from its recorded argv.
     fn settings_path_in(argv: &[Vec<u8>]) -> std::path::PathBuf {
-        let at = argv.iter().position(|a| a == b"--settings").expect("--settings is passed");
+        let at = argv
+            .iter()
+            .position(|a| a == b"--settings")
+            .expect("--settings is passed");
         let path = String::from_utf8(argv[at + 1].clone()).expect("the path is text");
         std::path::PathBuf::from(path)
     }
@@ -4268,13 +4896,25 @@ mod tests {
         assert_eq!(bounded("isolated", &runner).await, Ok(true));
 
         let argv = fixture.recorded_argv();
-        assert_eq!(value_of_bytes(&argv, b"--setting-sources"), Some(&b"project"[..]), "{argv:?}");
+        assert_eq!(
+            value_of_bytes(&argv, b"--setting-sources"),
+            Some(&b"project"[..]),
+            "{argv:?}"
+        );
         assert!(
-            !argv.iter().any(|a| a.windows(b"disableAllHooks".len()).any(|w| w == b"disableAllHooks")),
+            !argv.iter().any(|a| a
+                .windows(b"disableAllHooks".len())
+                .any(|w| w == b"disableAllHooks")),
             "the settings JSON reached argv"
         );
         let path = settings_path_in(&argv);
-        assert!(path.file_name().unwrap().to_string_lossy().starts_with(SETTINGS_FILE_PREFIX), "{path:?}");
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(SETTINGS_FILE_PREFIX),
+            "{path:?}"
+        );
         assert!(!path.exists(), "{path:?} outlived its run");
     }
 
@@ -4290,11 +4930,16 @@ mod tests {
         let started = std::time::Instant::now();
         let argv = loop {
             if let Ok(raw) = std::fs::read(&argv_file) {
-                if raw.ends_with(&[0]) && raw.windows(b"--settings".len()).any(|w| w == b"--settings") {
+                if raw.ends_with(&[0])
+                    && raw.windows(b"--settings".len()).any(|w| w == b"--settings")
+                {
                     break fixture.recorded_argv();
                 }
             }
-            assert!(started.elapsed() < DEADLINE, "the fixture never recorded its argv");
+            assert!(
+                started.elapsed() < DEADLINE,
+                "the fixture never recorded its argv"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         let path = settings_path_in(&argv);
@@ -4311,7 +4956,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_version_probe_reads_what_the_cli_prints() {
         let fixture = Fixture::new("version_ok");
-        let version = read_claude_version(&fixture.program, Vec::new(), DEADLINE).await.unwrap();
+        let version = read_claude_version(&fixture.program, Vec::new(), DEADLINE)
+            .await
+            .unwrap();
         assert_eq!(version, "2.1.307 (Claude Code)\n");
         assert_eq!(auto_unsupported_reason(&version), None);
     }
@@ -4324,8 +4971,14 @@ mod tests {
     async fn a_version_probe_that_never_answers_is_stopped_and_reaped() {
         let fixture = Fixture::new("version_hangs");
         let env = vec![
-            (std::ffi::OsString::from("HOME"), fixture.dir.path().as_os_str().to_owned()),
-            (std::ffi::OsString::from("PATH"), std::env::var_os("PATH").unwrap_or_default()),
+            (
+                std::ffi::OsString::from("HOME"),
+                fixture.dir.path().as_os_str().to_owned(),
+            ),
+            (
+                std::ffi::OsString::from("PATH"),
+                std::env::var_os("PATH").unwrap_or_default(),
+            ),
         ];
         let limit = Duration::from_millis(500);
         let program = fixture.program.clone();
@@ -4336,16 +4989,29 @@ mod tests {
         let pid_file = fixture.dir.path().join("version-probe.pid");
         let started = std::time::Instant::now();
         let pid: libc::pid_t = loop {
-            if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|t| t.trim().parse().ok()) {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+            {
                 break pid;
             }
-            assert!(started.elapsed() < DEADLINE, "the hanging fixture never started");
+            assert!(
+                started.elapsed() < DEADLINE,
+                "the hanging fixture never started"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
 
-        let outcome = tokio::time::timeout(DEADLINE, probe).await.expect("the probe returns within its bound");
-        let err = outcome.unwrap().expect_err("a probe that never answers fails");
-        assert!(err.contains("did not answer") && err.contains("not started"), "{err}");
+        let outcome = tokio::time::timeout(DEADLINE, probe)
+            .await
+            .expect("the probe returns within its bound");
+        let err = outcome
+            .unwrap()
+            .expect_err("a probe that never answers fails");
+        assert!(
+            err.contains("did not answer") && err.contains("not started"),
+            "{err}"
+        );
         assert!(err.contains("does not fall back"), "{err}");
 
         // Reaped: a zombie would still answer `kill(pid, 0)`, so ESRCH is the
@@ -4359,12 +5025,18 @@ mod tests {
         let fixture = Fixture::new(STDIN_ECHO);
         let mut prompt = String::new();
         for line in 0..200 {
-            prompt.push_str(&format!("line {line}: ünïcødé ✓ 漢字 🦀 \t tab \r cr \x01\x1b[31m\x7f\n"));
+            prompt.push_str(&format!(
+                "line {line}: ünïcødé ✓ 漢字 🦀 \t tab \r cr \x01\x1b[31m\x7f\n"
+            ));
         }
-        prompt.push_str("\n\n-p --dangerously-skip-permissions\n$(echo not run) `x` 'q' \"dq\" \\ \n");
+        prompt.push_str(
+            "\n\n-p --dangerously-skip-permissions\n$(echo not run) `x` 'q' \"dq\" \\ \n",
+        );
         prompt.push_str("no trailing newline");
 
-        let runner = fixture.start_with(fixture.config_with_prompt(&prompt, read_only())).await;
+        let runner = fixture
+            .start_with(fixture.config_with_prompt(&prompt, read_only()))
+            .await;
         assert_eq!(bounded("unicode prompt", &runner).await, Ok(true));
         assert_eq!(fixture.recorded_prompt(), prompt.as_bytes());
     }
@@ -4388,7 +5060,9 @@ mod tests {
             "a {OVER_ARG_LIMIT_PROMPT}-byte argument should exceed MAX_ARG_STRLEN"
         );
 
-        let runner = fixture.start_with(fixture.config_with_prompt(&prompt, full())).await;
+        let runner = fixture
+            .start_with(fixture.config_with_prompt(&prompt, full()))
+            .await;
         assert_eq!(bounded("large prompt", &runner).await, Ok(true));
         assert_eq!(fixture.recorded_prompt().len(), prompt.len());
         assert_eq!(fixture.recorded_prompt(), prompt.as_bytes());
@@ -4406,8 +5080,16 @@ mod tests {
                 .await
                 .expect_err("an undelivered prompt must not be reported as success");
             assert!(error.contains("prompt"), "attempt {attempt}: {error}");
-            assert_eq!(runner.exit_status().await, Some((true, Some(0))), "attempt {attempt}");
-            assert_eq!(runner.prompt_failure().await, Some(error), "attempt {attempt}");
+            assert_eq!(
+                runner.exit_status().await,
+                Some((true, Some(0))),
+                "attempt {attempt}"
+            );
+            assert_eq!(
+                runner.prompt_failure().await,
+                Some(error),
+                "attempt {attempt}"
+            );
         }
     }
 
@@ -4462,7 +5144,10 @@ mod tests {
         let config = fixture.config_with_prompt(&filler(UNBUFFERABLE_PROMPT), full());
         let runner = fixture.start_with(config).await;
         let pid = blocked_pid(&fixture).await;
-        assert!(!runner.prompt_writer_finished().await, "setup: the writer must be blocked");
+        assert!(
+            !runner.prompt_writer_finished().await,
+            "setup: the writer must be blocked"
+        );
 
         tokio::time::timeout(DEADLINE, runner.kill())
             .await
@@ -4471,7 +5156,9 @@ mod tests {
         assert!(!is_alive(pid));
         writer_ends(&runner, "blocked child").await;
 
-        let error = bounded("wait after kill", &runner).await.expect_err("a killed run failed");
+        let error = bounded("wait after kill", &runner)
+            .await
+            .expect_err("a killed run failed");
         assert!(!error.is_empty());
     }
 
@@ -4501,17 +5188,25 @@ mod tests {
         let runner = fixture.start_with(config).await;
         let holder = KillOnDrop(unix_announced_pid(&fixture, "holder.pid").await);
         let pid = blocked_pid(&fixture).await;
-        assert!(!runner.prompt_writer_finished().await, "setup: the writer must be blocked");
+        assert!(
+            !runner.prompt_writer_finished().await,
+            "setup: the writer must be blocked"
+        );
 
         tokio::time::timeout(DEADLINE, runner.kill())
             .await
             .expect("kill must not wait for the prompt writer")
             .expect("kill must succeed");
         assert!(!is_alive(pid));
-        assert!(unix_pid_is_alive(holder.0), "setup: the pipe must still have a reader");
+        assert!(
+            unix_pid_is_alive(holder.0),
+            "setup: the pipe must still have a reader"
+        );
         writer_ends(&runner, "pipe held elsewhere").await;
 
-        let error = bounded("wait after kill", &runner).await.expect_err("a killed run failed");
+        let error = bounded("wait after kill", &runner)
+            .await
+            .expect_err("a killed run failed");
         assert!(!error.is_empty());
     }
 
@@ -4540,13 +5235,19 @@ mod tests {
                 isolate_customizations: false,
                 json_schema: None,
             };
-            let runner = ClaudeRunner::start_leased(config, None).await.expect("claude should start");
+            let runner = ClaudeRunner::start_leased(config, None)
+                .await
+                .expect("claude should start");
             let result = tokio::time::timeout(Duration::from_secs(120), runner.wait())
                 .await
                 .unwrap_or_else(|_| panic!("{label}: the real CLI did not finish"));
             assert_eq!(result, Ok(true), "{label}: {}", runner.get_output().await);
             assert_eq!(runner.prompt_failure().await, None, "{label}");
-            assert!(runner.get_output().await.contains("PONG"), "{label}: {}", runner.get_output().await);
+            assert!(
+                runner.get_output().await.contains("PONG"),
+                "{label}: {}",
+                runner.get_output().await
+            );
         }
     }
 }
@@ -4562,14 +5263,20 @@ mod mode_mismatch_tests {
     /// concurrent fork in this test binary can hold the write descriptor until
     /// its `exec`. See `Fixture::new` for the same rule.
     fn fixture(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/claude-cli").join(name)
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/claude-cli")
+            .join(name)
     }
 
     fn auto_config(dir: &TempDir) -> ClaudeRunConfig {
         ClaudeRunConfig {
             prompt: "hello".to_string(),
             working_dir: dir.path().to_string_lossy().into_owned(),
-            tools: ToolAccess::Full { auto_approve: Vec::new(), permission_mode: Some("auto".into()) ,denied_tools: Vec::new(),},
+            tools: ToolAccess::Full {
+                auto_approve: Vec::new(),
+                permission_mode: Some("auto".into()),
+                denied_tools: Vec::new(),
+            },
             max_turns: None,
             max_budget_usd: None,
             session_id: None,
@@ -4590,22 +5297,33 @@ mod mode_mismatch_tests {
     async fn an_auto_run_that_reports_manual_is_stopped_before_it_can_act() {
         let dir = TempDir::new().expect("temp dir");
         let program = fixture("auto_reports_manual");
-        let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
+        let runner = ClaudeRunner::start_program(&program, auto_config(&dir))
+            .await
+            .expect("stub should spawn");
 
         let started = Instant::now();
         let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())
             .await
             .expect("the run should be stopped, not left to finish its sleep");
-        assert!(started.elapsed() < Duration::from_secs(30), "stopped after {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "stopped after {:?}",
+            started.elapsed()
+        );
         let reason = result.expect_err("a run that reports Manual must fail");
-        assert!(reason.contains("Auto permission mode was not active"), "{reason}");
+        assert!(
+            reason.contains("Auto permission mode was not active"),
+            "{reason}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_auto_run_that_reports_auto_is_not_stopped() {
         let dir = TempDir::new().expect("temp dir");
         let program = fixture("auto_reports_auto");
-        let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
+        let runner = ClaudeRunner::start_program(&program, auto_config(&dir))
+            .await
+            .expect("stub should spawn");
 
         let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())
             .await
@@ -4618,7 +5336,9 @@ mod mode_mismatch_tests {
     async fn an_auto_run_that_never_reports_its_mode_is_not_a_success() {
         let dir = TempDir::new().expect("temp dir");
         let program = fixture("auto_never_reports_mode");
-        let runner = ClaudeRunner::start_program(&program, auto_config(&dir)).await.expect("stub should spawn");
+        let runner = ClaudeRunner::start_program(&program, auto_config(&dir))
+            .await
+            .expect("stub should spawn");
 
         let result = tokio::time::timeout(Duration::from_secs(30), runner.wait())
             .await
@@ -4643,11 +5363,16 @@ mod child_environment_tests {
     /// the names of the variables it saw, with their values.
     async fn child_environment() -> Vec<(String, OsString)> {
         let dir = TempDir::new().expect("temp dir");
-        let program = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/claude-cli/env_echo");
+        let program =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/claude-cli/env_echo");
         let config = ClaudeRunConfig {
             prompt: "hello".to_string(),
             working_dir: dir.path().to_string_lossy().into_owned(),
-            tools: ToolAccess::Full { auto_approve: Vec::new(), permission_mode: Some("auto".into()) ,denied_tools: Vec::new(),},
+            tools: ToolAccess::Full {
+                auto_approve: Vec::new(),
+                permission_mode: Some("auto".into()),
+                denied_tools: Vec::new(),
+            },
             max_turns: None,
             max_budget_usd: None,
             session_id: None,
@@ -4660,9 +5385,12 @@ mod child_environment_tests {
             isolate_customizations: false,
             json_schema: None,
         };
-        let runner = ClaudeRunner::start_program(&program, config).await.expect("fixture should spawn");
+        let runner = ClaudeRunner::start_program(&program, config)
+            .await
+            .expect("fixture should spawn");
         assert!(runner.wait().await.is_ok(), "fixture run should succeed");
-        let record = std::fs::read(dir.path().join("env")).expect("fixture records its environment");
+        let record =
+            std::fs::read(dir.path().join("env")).expect("fixture records its environment");
         record
             .split(|byte| *byte == 0)
             .filter(|entry| !entry.is_empty())
@@ -4690,7 +5418,10 @@ mod child_environment_tests {
             if allowed.contains(name) || SHELL_ADDED.contains(&name) {
                 continue;
             }
-            assert!(!child_names.contains(name), "the provider child inherited {name}");
+            assert!(
+                !child_names.contains(name),
+                "the provider child inherited {name}"
+            );
         }
         for name in &child_names {
             assert!(
@@ -4699,7 +5430,10 @@ mod child_environment_tests {
             );
         }
         if let Some((_, home)) = parent.iter().find(|(name, _)| name == "HOME") {
-            let (_, child_home) = child.iter().find(|(name, _)| name == "HOME").expect("HOME is kept");
+            let (_, child_home) = child
+                .iter()
+                .find(|(name, _)| name == "HOME")
+                .expect("HOME is kept");
             assert_eq!(child_home, home, "HOME is passed through, not replaced");
         }
     }

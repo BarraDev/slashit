@@ -148,7 +148,10 @@ impl IntegrationPreview {
     }
 
     fn refused(reason: impl Into<String>) -> Self {
-        Self { reason: Some(reason.into()), ..Self::new(PreviewState::Refused) }
+        Self {
+            reason: Some(reason.into()),
+            ..Self::new(PreviewState::Refused)
+        }
     }
 }
 
@@ -246,10 +249,16 @@ pub(crate) async fn tip_to_approve(state: &crate::AppState, task: &Task) -> Opti
     // The resolver the review display uses, so the commit shown and the commit
     // approved are read the same way, including in a jj workspace.
     task.branch_name.as_deref()?;
-    crate::commands::pr::task_branch_tip(state, task.id).await.ok().flatten()
+    crate::commands::pr::task_branch_tip(state, task.id)
+        .await
+        .ok()
+        .flatten()
 }
 
-pub(crate) async fn repo_path_of(state: &crate::AppState, project_id: Uuid) -> Result<String, String> {
+pub(crate) async fn repo_path_of(
+    state: &crate::AppState,
+    project_id: Uuid,
+) -> Result<String, String> {
     let repository_id = {
         let projects = state.project.projects.read().await;
         projects
@@ -259,11 +268,22 @@ pub(crate) async fn repo_path_of(state: &crate::AppState, project_id: Uuid) -> R
             .ok_or("No repository is linked to this project")?
     };
     let repositories = state.repository.repositories.read().await;
-    Ok(repositories.get(&repository_id).ok_or("Repository not found")?.local_path.clone())
+    Ok(repositories
+        .get(&repository_id)
+        .ok_or("Repository not found")?
+        .local_path
+        .clone())
 }
 
 async fn current(state: &crate::AppState, task_id: Uuid) -> Result<Task, String> {
-    state.task.tasks.read().await.get(&task_id).cloned().ok_or_else(|| "Task not found".to_string())
+    state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .cloned()
+        .ok_or_else(|| "Task not found".to_string())
 }
 
 /// The lock that serializes integrations into one branch of one project's
@@ -334,7 +354,10 @@ async fn eligible(state: &crate::AppState, task: &Task, intent: Intent) -> Resul
         _ => {}
     }
     if !task.human_review.is_approved() {
-        return Err("This task has no approval on record, so there is nothing approved to integrate.".to_string());
+        return Err(
+            "This task has no approval on record, so there is nothing approved to integrate."
+                .to_string(),
+        );
     }
     if task.pr_url.is_some()
         || task.external_refs.iter().any(|r| r.is_pr())
@@ -350,17 +373,26 @@ async fn eligible(state: &crate::AppState, task: &Task, intent: Intent) -> Resul
         return Err(refusal);
     }
     if task.cleanup_in_flight {
-        return Err("This task's checkout cleanup was interrupted; resolve that first.".to_string());
+        return Err(
+            "This task's checkout cleanup was interrupted; resolve that first.".to_string(),
+        );
     }
     Ok(())
 }
 
-async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Result<Prepared, String> {
+async fn prepare(
+    state: &crate::AppState,
+    task_id: Uuid,
+    intent: Intent,
+) -> Result<Prepared, String> {
     let task = current(state, task_id).await?;
     eligible(state, &task, intent).await?;
     let repo_path = repo_path_of(state, task.project_id).await?;
     let repo = Path::new(&repo_path);
-    if let Some(refused) = crate::worktree::vcs::detect(repo).await?.refusal(&repo_path) {
+    if let Some(refused) = crate::worktree::vcs::detect(repo)
+        .await?
+        .refusal(&repo_path)
+    {
         return Err(refused);
     }
     // Completing removes the Task Checkout, and Git refuses to remove one
@@ -368,7 +400,9 @@ async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Resu
     // spares a person an integration whose completion cannot follow.
     if intent == Intent::WithCompletion {
         if let Some(executor) = state.executor.get() {
-            if crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), task_id).await {
+            if crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), task_id)
+                .await
+            {
                 return Err(
                     "An agent is still running for this task, and completing it would remove the \
                      checkout the agent works in. Stop the run first."
@@ -376,7 +410,11 @@ async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Resu
                 );
             }
         }
-        if let Some(checkout) = task.worktree_path.as_deref().filter(|p| Path::new(p).exists()) {
+        if let Some(checkout) = task
+            .worktree_path
+            .as_deref()
+            .filter(|p| Path::new(p).exists())
+        {
             let changed = git::uncommitted_paths(checkout).await?;
             if !changed.is_empty() {
                 return Err(format!(
@@ -394,7 +432,13 @@ async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Resu
         .ok_or("This task has no branch recorded, so there is no work to integrate.")?;
     let branch_tip = git::branch_tip(repo, &branch).await?;
 
-    let project_base = state.project.projects.read().await.get(&task.project_id).and_then(|p| p.base.clone());
+    let project_base = state
+        .project
+        .projects
+        .read()
+        .await
+        .get(&task.project_id)
+        .and_then(|p| p.base.clone());
     let local_is_base = project_base.as_ref().is_some_and(|b| b.prefers_local());
     let target = match project_base {
         Some(base) => base.branch().to_string(),
@@ -407,7 +451,8 @@ async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Resu
         .ok_or_else(|| format!("The target branch {target} does not exist in this repository."))?;
 
     match &task.branch_origin {
-        Some(BranchOrigin::LocalBase { branch: b }) | Some(BranchOrigin::DefaultBase { branch: Some(b) })
+        Some(BranchOrigin::LocalBase { branch: b })
+        | Some(BranchOrigin::DefaultBase { branch: Some(b) })
             if *b != target =>
         {
             return Err(format!(
@@ -445,7 +490,10 @@ async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Resu
             // branch is never recreated or moved here.
             if intent != Intent::AfterCompletion
                 || !task.completed_locally()
-                || task.local_integration.as_ref().is_some_and(|r| r.is_pending())
+                || task
+                    .local_integration
+                    .as_ref()
+                    .is_some_and(|r| r.is_pending())
             {
                 return Err(missing_branch());
             }
@@ -453,7 +501,9 @@ async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Resu
                 return Err(missing_branch());
             };
             if !crate::worktree::restack::has_commit(repo, approved).await? {
-                return Err(format!("The approved commit {approved} is not in this repository any more."));
+                return Err(format!(
+                    "The approved commit {approved} is not in this repository any more."
+                ));
             }
             if !is_ancestor(repo, approved, &target_tip).await? {
                 return Err(missing_branch());
@@ -461,7 +511,15 @@ async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Resu
             approved.to_string()
         }
     };
-    Ok(Prepared { task, repo_path, branch, branch_tip, target, target_tip, local_is_base })
+    Ok(Prepared {
+        task,
+        repo_path,
+        branch,
+        branch_tip,
+        target,
+        target_tip,
+        local_is_base,
+    })
 }
 
 fn merge_message(branch: &str, target: &str) -> String {
@@ -491,7 +549,10 @@ fn observed_name(observed: Observed) -> &'static str {
 
 /// What integrating would do now, without changing anything. Writes no ref
 /// and no object.
-pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<IntegrationPreview, String> {
+pub(crate) async fn preview(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<IntegrationPreview, String> {
     let task = current(state, task_id).await?;
     if let Some(record) = task.local_integration.as_ref().filter(|r| r.is_pending()) {
         let repo_path = repo_path_of(state, task.project_id).await?;
@@ -516,7 +577,9 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
                          checkout.",
                         record.target_branch
                     )];
-                } else if let git::CheckoutReadiness::Blocked(problems) = git::inspect_checkout(&path, &plan).await? {
+                } else if let git::CheckoutReadiness::Blocked(problems) =
+                    git::inspect_checkout(&path, &plan).await?
+                {
                     out.checkout_problems = problems;
                 }
                 out.checked_out_at = Some(path);
@@ -546,8 +609,12 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
         out.state = PreviewState::NeedsReconfirmation;
         out.reconfirm = Some(Reconfirm {
             branch_tip: p.branch_tip.clone(),
-            commits: git::subjects(repo, &p.target_tip, &p.branch_tip, 50).await.unwrap_or_default(),
-            changed_files: git::changed_files(repo, &p.target_tip, &p.branch_tip, 100).await.unwrap_or_default(),
+            commits: git::subjects(repo, &p.target_tip, &p.branch_tip, 50)
+                .await
+                .unwrap_or_default(),
+            changed_files: git::changed_files(repo, &p.target_tip, &p.branch_tip, 100)
+                .await
+                .unwrap_or_default(),
         });
         out.reason = Some(
             "This approval did not record which commit was approved. Confirm the commit shown \
@@ -579,7 +646,15 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
         }
     }
 
-    let plan = match git::plan(repo, &p.target, &approved, &merge_message(&p.branch, &p.target), false).await {
+    let plan = match git::plan(
+        repo,
+        &p.target,
+        &approved,
+        &merge_message(&p.branch, &p.target),
+        false,
+    )
+    .await
+    {
         Ok(plan) => plan,
         Err(PlanError::Conflicts(paths)) => {
             out.conflicts = paths;
@@ -592,13 +667,19 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
         }
     };
     out.strategy = Some(plan.strategy);
-    out.commits = git::subjects(repo, &p.target_tip, &approved, 50).await.unwrap_or_default();
+    out.commits = git::subjects(repo, &p.target_tip, &approved, 50)
+        .await
+        .unwrap_or_default();
 
     out.has_remote = git::has_origin(repo).await;
     let relation = git::remote_relation(repo, &p.target).await?;
     out.remote_target = git::remote_tracking_tip(repo, &p.target)
         .await?
-        .map(|tip| RemoteTarget { name: format!("origin/{}", p.target), tip, relation });
+        .map(|tip| RemoteTarget {
+            name: format!("origin/{}", p.target),
+            tip,
+            relation,
+        });
     if let Some(why) = git::not_behind_origin(repo, &p.target, p.local_is_base).await? {
         out.reason = Some(why);
         return Ok(out);
@@ -608,7 +689,9 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
         if let Some(path) = git::checked_out_at(&p.repo_path, &p.target).await? {
             out.checked_out_at = Some(path.clone());
             match git::inspect_checkout(&path, &plan).await? {
-                git::CheckoutReadiness::Ready | git::CheckoutReadiness::FilesAlreadyUpdated => in_checkout = true,
+                git::CheckoutReadiness::Ready | git::CheckoutReadiness::FilesAlreadyUpdated => {
+                    in_checkout = true
+                }
                 git::CheckoutReadiness::Blocked(problems) => {
                     out.reason = Some(format!(
                         "{} To integrate it yourself once that is resolved, run: {}",
@@ -643,11 +726,20 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
 /// a new integration: a completion interrupted mid-removal sets
 /// `cleanup_in_flight`, which refuses a new integration but not finishing
 /// this one.
-async fn completion_pending(state: &crate::AppState, task: &Task) -> Result<Option<IntegrationPreview>, String> {
-    let Some(record) = task.local_integration.as_ref().filter(|r| r.state == IntegrationState::Integrated) else {
+async fn completion_pending(
+    state: &crate::AppState,
+    task: &Task,
+) -> Result<Option<IntegrationPreview>, String> {
+    let Some(record) = task
+        .local_integration
+        .as_ref()
+        .filter(|r| r.state == IntegrationState::Integrated)
+    else {
         return Ok(None);
     };
-    if task.human_review.approved_tip() != Some(record.approved_tip.as_str()) || !task.human_review.is_approved() {
+    if task.human_review.approved_tip() != Some(record.approved_tip.as_str())
+        || !task.human_review.is_approved()
+    {
         return Ok(None);
     }
     let repo_path = repo_path_of(state, task.project_id).await?;
@@ -680,7 +772,9 @@ async fn other_pending_on(state: &crate::AppState, task: &Task, target: &str) ->
         .find(|t| {
             t.id != task.id
                 && t.project_id == task.project_id
-                && t.local_integration.as_ref().is_some_and(|r| r.is_pending() && r.target_branch == target)
+                && t.local_integration
+                    .as_ref()
+                    .is_some_and(|r| r.is_pending() && r.target_branch == target)
         })
         .map(|t| {
             format!(
@@ -699,11 +793,18 @@ pub(crate) async fn integrate(
     confirmed: IntegrationConfirmation,
 ) -> Result<Task, String> {
     let project_id = current(state, task_id).await?.project_id;
-    let _target = state.task_lifecycle_locks.acquire(target_lock_id(project_id, &confirmed.target_branch)).await?;
+    let _target = state
+        .task_lifecycle_locks
+        .acquire(target_lock_id(project_id, &confirmed.target_branch))
+        .await?;
     let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await?;
-    if task.local_integration.as_ref().is_some_and(|r| r.is_pending()) {
+    if task
+        .local_integration
+        .as_ref()
+        .is_some_and(|r| r.is_pending())
+    {
         return resume_locked(state, task_id).await;
     }
     integrate_locked(state, task_id, confirmed, Intent::AfterCompletion).await
@@ -720,13 +821,17 @@ pub(crate) async fn complete_and_integrate(
     confirmed: IntegrationConfirmation,
 ) -> Result<Task, String> {
     let project_id = current(state, task_id).await?.project_id;
-    let _target = state.task_lifecycle_locks.acquire(target_lock_id(project_id, &confirmed.target_branch)).await?;
+    let _target = state
+        .task_lifecycle_locks
+        .acquire(target_lock_id(project_id, &confirmed.target_branch))
+        .await?;
     let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await?;
     if task.completed_locally() {
         let integrated = if let Some(record) = task.local_integration.as_ref().filter(|r| {
-            r.state == IntegrationState::Integrated && task.human_review.approved_tip() == Some(r.approved_tip.as_str())
+            r.state == IntegrationState::Integrated
+                && task.human_review.approved_tip() == Some(r.approved_tip.as_str())
         }) {
             let repo_path = repo_path_of(state, task.project_id).await?;
             match git::branch_tip(Path::new(&repo_path), &record.target_branch).await? {
@@ -744,7 +849,11 @@ pub(crate) async fn complete_and_integrate(
                 .to_string())
         };
     }
-    if task.local_integration.as_ref().is_some_and(|r| r.is_pending()) {
+    if task
+        .local_integration
+        .as_ref()
+        .is_some_and(|r| r.is_pending())
+    {
         return resume_locked(state, task_id).await;
     }
     if task.status == TaskStatus::HumanReview {
@@ -772,9 +881,14 @@ async fn integrate_locked(
         ));
     }
     let repo = Path::new(&p.repo_path);
-    let approved = p.task.human_review.approved_tip().map(str::to_string).ok_or(
-        "This approval did not record which commit was approved. Confirm the commit first.",
-    )?;
+    let approved = p
+        .task
+        .human_review
+        .approved_tip()
+        .map(str::to_string)
+        .ok_or(
+            "This approval did not record which commit was approved. Confirm the commit first.",
+        )?;
     if approved != confirmed.approved_tip {
         return Err("The approved commit is not the one that was shown, so nothing was changed. Review it again.".to_string());
     }
@@ -794,7 +908,9 @@ async fn integrate_locked(
         {
             return match intent {
                 Intent::AfterCompletion => Ok(p.task),
-                Intent::WithCompletion => complete_after_integration(state, task_id, &p.target).await,
+                Intent::WithCompletion => {
+                    complete_after_integration(state, task_id, &p.target).await
+                }
             };
         }
     }
@@ -806,9 +922,15 @@ async fn integrate_locked(
     }
     sweep_orphan_pins(state, repo).await;
 
-    let plan = git::plan(repo, &p.target, &approved, &merge_message(&p.branch, &p.target), true)
-        .await
-        .map_err(|e| e.to_string())?;
+    let plan = git::plan(
+        repo,
+        &p.target,
+        &approved,
+        &merge_message(&p.branch, &p.target),
+        true,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if plan.target_old != confirmed.target_tip {
         return Err(format!(
             "{} moved after the integration was shown, so nothing was changed. Review it again.",
@@ -820,8 +942,13 @@ async fn integrate_locked(
         let checkout = git::checked_out_at(&p.repo_path, &p.target).await?;
         match (&checkout, &confirmed.checkout_path) {
             (Some(path), Some(confirmed_path)) if path == confirmed_path => {
-                if let git::CheckoutReadiness::Blocked(problems) = git::inspect_checkout(path, &plan).await? {
-                    return Err(format!("{} Nothing was changed. Review it again.", problems.join(" ")));
+                if let git::CheckoutReadiness::Blocked(problems) =
+                    git::inspect_checkout(path, &plan).await?
+                {
+                    return Err(format!(
+                        "{} Nothing was changed. Review it again.",
+                        problems.join(" ")
+                    ));
                 }
                 consented_checkout = checkout.clone();
             }
@@ -867,26 +994,43 @@ async fn integrate_locked(
         if let Some(t) = staged.get_mut(&task_id) {
             let in_state = match intent {
                 Intent::AfterCompletion => t.status == TaskStatus::Done,
-                Intent::WithCompletion => t.status == TaskStatus::HumanReview && t.human_review.is_approved(),
+                Intent::WithCompletion => {
+                    t.status == TaskStatus::HumanReview && t.human_review.is_approved()
+                }
             };
             if in_state && t.local_integration.as_ref().is_none_or(|r| !r.is_pending()) {
                 t.local_integration = Some(stored.clone());
             }
         }
     };
-    let saved = match crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await {
-        Ok(saved) => saved.ok_or("Task not found")?,
-        Err(e) => {
-            // Nothing recorded the plan, so nothing may keep its result alive.
-            let _ = git::unpin(repo, task_id).await;
-            return Err(format!("The integration was not started, because recording it failed: {e}"));
-        }
-    };
+    let saved =
+        match crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend)
+            .await
+        {
+            Ok(saved) => saved.ok_or("Task not found")?,
+            Err(e) => {
+                // Nothing recorded the plan, so nothing may keep its result alive.
+                let _ = git::unpin(repo, task_id).await;
+                return Err(format!(
+                    "The integration was not started, because recording it failed: {e}"
+                ));
+            }
+        };
     if saved.local_integration.as_ref() != Some(&record) {
         let _ = git::unpin(repo, task_id).await;
-        return Err("The task changed while the integration was being started, so nothing was changed.".to_string());
+        return Err(
+            "The task changed while the integration was being started, so nothing was changed."
+                .to_string(),
+        );
     }
-    apply(state, &p.repo_path, task_id, &plan, consented_checkout.as_deref()).await
+    apply(
+        state,
+        &p.repo_path,
+        task_id,
+        &plan,
+        consented_checkout.as_deref(),
+    )
+    .await
 }
 
 /// Move the target (if it has to move), then record the result. `checkout`
@@ -925,13 +1069,26 @@ async fn apply(
 }
 
 /// Record that the target holds the result, and release the pin.
-async fn finish(state: &crate::AppState, repo: &Path, task_id: Uuid, plan: &Plan) -> Result<Task, String> {
+async fn finish(
+    state: &crate::AppState,
+    repo: &Path,
+    task_id: Uuid,
+    plan: &Plan,
+) -> Result<Task, String> {
     let now = chrono::Utc::now();
-    let (target, strategy, commit, expected) =
-        (plan.target_branch.clone(), plan.strategy, plan.result.clone(), plan.result.clone());
+    let (target, strategy, commit, expected) = (
+        plan.target_branch.clone(),
+        plan.strategy,
+        plan.result.clone(),
+        plan.result.clone(),
+    );
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(t) = staged.get_mut(&task_id) {
-            if let Some(record) = t.local_integration.as_mut().filter(|r| r.is_pending() && r.result_oid == expected) {
+            if let Some(record) = t
+                .local_integration
+                .as_mut()
+                .filter(|r| r.is_pending() && r.result_oid == expected)
+            {
                 record.state = IntegrationState::Integrated;
                 record.completed_at = Some(now);
                 t.record_activity(ActivityKind::IntegratedLocally {
@@ -954,7 +1111,10 @@ async fn finish(state: &crate::AppState, repo: &Path, task_id: Uuid, plan: &Plan
         .ok_or("Task not found")?;
     // A pin that cannot be removed is swept later; it holds no ref anyone reads.
     let _ = git::unpin(repo, task_id).await;
-    let completes = saved.local_integration.as_ref().is_some_and(|r| r.completes_task);
+    let completes = saved
+        .local_integration
+        .as_ref()
+        .is_some_and(|r| r.completes_task);
     if completes && saved.status == TaskStatus::HumanReview {
         return complete_after_integration(state, task_id, &plan.target_branch).await;
     }
@@ -968,7 +1128,11 @@ async fn finish(state: &crate::AppState, repo: &Path, task_id: Uuid, plan: &Plan
 /// here. A checkout Git will not remove leaves the Task in Human Review with
 /// the reason, and that Task is returned; any other failure is reported
 /// saying the work is integrated, so that nothing reads as undone.
-async fn complete_after_integration(state: &crate::AppState, task_id: Uuid, target: &str) -> Result<Task, String> {
+async fn complete_after_integration(
+    state: &crate::AppState,
+    task_id: Uuid,
+    target: &str,
+) -> Result<Task, String> {
     let held = |why: String| {
         format!(
             "{target} holds the approved work and that is recorded, but the task was not completed: \
@@ -981,16 +1145,26 @@ async fn complete_after_integration(state: &crate::AppState, task_id: Uuid, targ
     }
     match crate::commands::human_review::complete_leased(state, task_id).await {
         Ok(done) => Ok(done),
-        Err(crate::lifecycle::TerminalizeRefusal::CleanupRefused { .. }) => current(state, task_id).await,
+        Err(crate::lifecycle::TerminalizeRefusal::CleanupRefused { .. }) => {
+            current(state, task_id).await
+        }
         Err(other) => Err(held(other.to_string())),
     }
 }
 
-async fn clear_pending(state: &crate::AppState, repo: &Path, task_id: Uuid, plan: &Plan) -> Result<(), String> {
+async fn clear_pending(
+    state: &crate::AppState,
+    repo: &Path,
+    task_id: Uuid,
+    plan: &Plan,
+) -> Result<(), String> {
     let result = plan.result.clone();
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(t) = staged.get_mut(&task_id) {
-            if t.local_integration.as_ref().is_some_and(|r| r.is_pending() && r.result_oid == result) {
+            if t.local_integration
+                .as_ref()
+                .is_some_and(|r| r.is_pending() && r.result_oid == result)
+            {
                 t.local_integration = None;
             }
         }
@@ -1010,7 +1184,10 @@ pub(crate) async fn resume(state: &crate::AppState, task_id: Uuid) -> Result<Tas
         .as_ref()
         .filter(|r| r.is_pending())
         .ok_or("This task has no pending integration.")?;
-    let _target = state.task_lifecycle_locks.acquire(target_lock_id(task.project_id, &record.target_branch)).await?;
+    let _target = state
+        .task_lifecycle_locks
+        .acquire(target_lock_id(task.project_id, &record.target_branch))
+        .await?;
     let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
     resume_locked(state, task_id).await
 }
@@ -1052,7 +1229,8 @@ async fn resume_locked(state: &crate::AppState, task_id: Uuid) -> Result<Task, S
             if plan.strategy != IntegrationStrategy::AlreadyContained {
                 if !crate::worktree::restack::has_commit(repo, &plan.result).await? {
                     return Err(
-                        "The commit this integration planned is gone. Discard it and review again.".to_string()
+                        "The commit this integration planned is gone. Discard it and review again."
+                            .to_string(),
                     );
                 }
                 git::pin(repo, task_id, &plan.result).await?;
@@ -1060,7 +1238,14 @@ async fn resume_locked(state: &crate::AppState, task_id: Uuid) -> Result<Task, S
             if let Some(why) = git::not_behind_origin(repo, &p.target, p.local_is_base).await? {
                 return Err(why);
             }
-            apply(state, &repo_path, task_id, &plan, record.checkout_path.as_deref()).await
+            apply(
+                state,
+                &repo_path,
+                task_id,
+                &plan,
+                record.checkout_path.as_deref(),
+            )
+            .await
         }
     }
 }
@@ -1075,7 +1260,10 @@ pub(crate) async fn discard(state: &crate::AppState, task_id: Uuid) -> Result<Ta
         .as_ref()
         .filter(|r| r.is_pending())
         .ok_or("This task has no pending integration.")?;
-    let _target = state.task_lifecycle_locks.acquire(target_lock_id(task.project_id, &record.target_branch)).await?;
+    let _target = state
+        .task_lifecycle_locks
+        .acquire(target_lock_id(task.project_id, &record.target_branch))
+        .await?;
     let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
 
     let task = current(state, task_id).await?;
@@ -1100,7 +1288,11 @@ pub(crate) async fn discard(state: &crate::AppState, task_id: Uuid) -> Result<Ta
 /// Record the commit a person was shown as the approved one, for an
 /// approval that did not record it. The branch must still be at exactly that
 /// commit.
-pub(crate) async fn reconfirm(state: &crate::AppState, task_id: Uuid, tip: &str) -> Result<Task, String> {
+pub(crate) async fn reconfirm(
+    state: &crate::AppState,
+    task_id: Uuid,
+    tip: &str,
+) -> Result<Task, String> {
     let _lease = crate::commands::project::lease_active_task(state, task_id).await?;
     let task = current(state, task_id).await?;
     eligible(state, &task, Intent::of(&task)).await?;
@@ -1108,7 +1300,10 @@ pub(crate) async fn reconfirm(state: &crate::AppState, task_id: Uuid, tip: &str)
         return Err("This approval already records the commit that was approved.".to_string());
     }
     let repo_path = repo_path_of(state, task.project_id).await?;
-    let branch = task.branch_name.as_deref().ok_or("This task has no branch recorded.")?;
+    let branch = task
+        .branch_name
+        .as_deref()
+        .ok_or("This task has no branch recorded.")?;
     let branch_tip = git::branch_tip(Path::new(&repo_path), branch).await?;
     if branch_tip.as_deref() != Some(tip) {
         return Err(
@@ -1128,7 +1323,9 @@ pub(crate) async fn reconfirm(state: &crate::AppState, task_id: Uuid, tip: &str)
         .map_err(|e| format!("The confirmation was not saved: {e}"))?
         .ok_or("Task not found")?;
     if saved.human_review.approved_tip().is_none() {
-        return Err("The task changed while it was being confirmed, so nothing was recorded.".to_string());
+        return Err(
+            "The task changed while it was being confirmed, so nothing was recorded.".to_string(),
+        );
     }
     Ok(saved)
 }
@@ -1138,9 +1335,13 @@ pub(crate) async fn reconfirm(state: &crate::AppState, task_id: Uuid, tip: &str)
 /// written before the move), so removing it loses nothing. A Task whose
 /// lease is held is left alone: it may be between pinning and recording.
 async fn sweep_orphan_pins(state: &crate::AppState, repo: &Path) {
-    let Ok(pinned) = git::pinned(repo).await else { return };
+    let Ok(pinned) = git::pinned(repo).await else {
+        return;
+    };
     for id in pinned {
-        let Ok(task_id) = Uuid::parse_str(&id) else { continue };
+        let Ok(task_id) = Uuid::parse_str(&id) else {
+            continue;
+        };
         let pending = state
             .task
             .tasks
@@ -1151,7 +1352,9 @@ async fn sweep_orphan_pins(state: &crate::AppState, repo: &Path) {
         if pending {
             continue;
         }
-        let Some(_lease) = state.task_lifecycle_locks.try_acquire(task_id).await else { continue };
+        let Some(_lease) = state.task_lifecycle_locks.try_acquire(task_id).await else {
+            continue;
+        };
         let _ = git::unpin(repo, &id).await;
     }
 }
@@ -1170,7 +1373,11 @@ mod tests {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .output()
             .expect("run git");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -1218,7 +1425,9 @@ mod tests {
             tmp.path().join("cache"),
             tmp.path().join("runtime"),
         ));
-        let (state, _) = crate::app_core::build_state_with_paths(paths).await.expect("state");
+        let (state, _) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state");
         (tmp, state)
     }
 
@@ -1256,7 +1465,9 @@ mod tests {
                 repository_id: Some(repository_id),
                 scope: crate::domain::project::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
-                base: Some(crate::domain::project::ProjectBase::LocalBranch { branch: "main".to_string() }),
+                base: Some(crate::domain::project::ProjectBase::LocalBranch {
+                    branch: "main".to_string(),
+                }),
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,
@@ -1274,22 +1485,46 @@ mod tests {
         git(&repo, &["branch", "task-a"]);
         let tip = commit_on(&repo, "task-a", "a.txt", "a\n");
         let task_id = seed(&state, project_id, "task-a", Some(&tip)).await;
-        Fx { _tmp: tmp, state, repo, project_id, task_id, branch: "task-a".to_string(), tip }
+        Fx {
+            _tmp: tmp,
+            state,
+            repo,
+            project_id,
+            task_id,
+            branch: "task-a".to_string(),
+            tip,
+        }
     }
 
     /// A Done task, completed locally, approved at `tip` (or with an approval
     /// that recorded none).
-    async fn seed(state: &crate::AppState, project_id: Uuid, branch: &str, tip: Option<&str>) -> Uuid {
+    async fn seed(
+        state: &crate::AppState,
+        project_id: Uuid,
+        branch: &str,
+        tip: Option<&str>,
+    ) -> Uuid {
         let mut task = create_test_task_full(branch, project_id, TaskStatus::Done, 0);
         task.branch_name = Some(branch.to_string());
         task.human_review.record_arrival();
-        task.human_review.approve(tip.map(str::to_string), chrono::Utc::now());
+        task.human_review
+            .approve(tip.map(str::to_string), chrono::Utc::now());
         task.record_activity(ActivityKind::CompletedLocally {});
         let id = task.id;
         state.task.tasks.write().await.insert(id, task);
-        let all: Vec<Task> =
-            state.task.tasks.read().await.values().filter(|t| t.project_id == project_id).cloned().collect();
-        state.storage.save_project_tasks(project_id, &all).expect("seed the board");
+        let all: Vec<Task> = state
+            .task
+            .tasks
+            .read()
+            .await
+            .values()
+            .filter(|t| t.project_id == project_id)
+            .cloned()
+            .collect();
+        state
+            .storage
+            .save_project_tasks(project_id, &all)
+            .expect("seed the board");
         id
     }
 
@@ -1315,7 +1550,10 @@ mod tests {
     async fn ready(fx: &Fx, id: Uuid) -> IntegrationConfirmation {
         let p = preview(&fx.state, id).await.unwrap();
         assert!(
-            matches!(p.state, PreviewState::Ready | PreviewState::AlreadyContained),
+            matches!(
+                p.state,
+                PreviewState::Ready | PreviewState::AlreadyContained
+            ),
             "{:?}: {:?}",
             p.state,
             p.reason
@@ -1336,11 +1574,20 @@ mod tests {
         assert_eq!(p.strategy, Some(IntegrationStrategy::FastForward));
         assert_eq!(p.commits.len(), 1);
         assert_eq!(tip_of(&fx.repo, "main"), before, "a preview moves nothing");
-        assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)), "a preview leaves no pin");
+        assert!(
+            !ref_exists(&fx.repo, &git::pin_ref(fx.task_id)),
+            "a preview leaves no pin"
+        );
 
-        let done = integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
+        let done = integrate(&fx.state, fx.task_id, confirmation(&p))
+            .await
+            .unwrap();
         assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
-        assert_eq!(tip_of(&fx.repo, &fx.branch), fx.tip, "the Task branch is untouched");
+        assert_eq!(
+            tip_of(&fx.repo, &fx.branch),
+            fx.tip,
+            "the Task branch is untouched"
+        );
         let record = done.local_integration.clone().expect("a record");
         assert_eq!(record.state, IntegrationState::Integrated);
         assert_eq!(record.strategy, IntegrationStrategy::FastForward);
@@ -1351,15 +1598,28 @@ mod tests {
         )));
         assert_eq!(done.status, TaskStatus::Done);
         assert!(done.completed_locally());
-        assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)), "the pin is released");
-        assert!(ref_exists(&fx.repo, &git::marker_ref("main")), "the repository records that main is integrated into");
-        assert_eq!(on_disk(&fx, fx.task_id).local_integration.unwrap().state, IntegrationState::Integrated);
+        assert!(
+            !ref_exists(&fx.repo, &git::pin_ref(fx.task_id)),
+            "the pin is released"
+        );
+        assert!(
+            ref_exists(&fx.repo, &git::marker_ref("main")),
+            "the repository records that main is integrated into"
+        );
+        assert_eq!(
+            on_disk(&fx, fx.task_id).local_integration.unwrap().state,
+            IntegrationState::Integrated
+        );
 
         // Asked again, it answers and does nothing.
         let again = integrate(&fx.state, fx.task_id, confirmation(&p)).await;
         let verified = preview(&fx.state, fx.task_id).await.unwrap();
         assert_eq!(verified.state, PreviewState::Integrated);
-        assert!(complete_and_integrate(&fx.state, fx.task_id, confirmation(&verified)).await.is_ok());
+        assert!(
+            complete_and_integrate(&fx.state, fx.task_id, confirmation(&verified))
+                .await
+                .is_ok()
+        );
         assert!(again.is_ok());
         assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
     }
@@ -1372,14 +1632,26 @@ mod tests {
         assert_eq!(p.strategy, Some(IntegrationStrategy::MergeCommit));
         assert_eq!(p.state, PreviewState::Ready);
 
-        let done = integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
+        let done = integrate(&fx.state, fx.task_id, confirmation(&p))
+            .await
+            .unwrap();
         let result = tip_of(&fx.repo, "main");
         assert_eq!(done.local_integration.unwrap().result_oid, result);
         let parents = git(&fx.repo, &["rev-list", "--parents", "-n1", &result]);
-        assert_eq!(parents.split_whitespace().skip(1).collect::<Vec<_>>(), vec![other.as_str(), fx.tip.as_str()]);
+        assert_eq!(
+            parents.split_whitespace().skip(1).collect::<Vec<_>>(),
+            vec![other.as_str(), fx.tip.as_str()]
+        );
         assert_eq!(git(&fx.repo, &["show", &format!("{result}:a.txt")]), "a");
-        assert_eq!(git(&fx.repo, &["show", &format!("{result}:other.txt")]), "other");
-        assert_eq!(tip_of(&fx.repo, &fx.branch), fx.tip, "the Task branch is not rewritten");
+        assert_eq!(
+            git(&fx.repo, &["show", &format!("{result}:other.txt")]),
+            "other"
+        );
+        assert_eq!(
+            tip_of(&fx.repo, &fx.branch),
+            fx.tip,
+            "the Task branch is not rewritten"
+        );
     }
 
     /// Where `origin/main` stands against local `main` in the fixture: the
@@ -1395,7 +1667,10 @@ mod tests {
     }
 
     async fn with_origin(fx: &Fx, origin: Origin, prefer_local: bool) {
-        git(&fx.repo, &["remote", "add", "origin", "/nonexistent/origin.git"]);
+        git(
+            &fx.repo,
+            &["remote", "add", "origin", "/nonexistent/origin.git"],
+        );
         let init = git(&fx.repo, &["rev-parse", "main"]);
         let remote_commit = |name: &str| {
             git(&fx.repo, &["branch", name, "main"]);
@@ -1413,10 +1688,25 @@ mod tests {
                 tip
             }
         };
-        git(&fx.repo, &["update-ref", "refs/remotes/origin/main", &remote_tip]);
-        let base = crate::domain::project::ProjectBase::LocalBranch { branch: "main".to_string() };
-        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().base =
-            Some(if prefer_local { base.choosing(true) } else { base });
+        git(
+            &fx.repo,
+            &["update-ref", "refs/remotes/origin/main", &remote_tip],
+        );
+        let base = crate::domain::project::ProjectBase::LocalBranch {
+            branch: "main".to_string(),
+        };
+        fx.state
+            .project
+            .projects
+            .write()
+            .await
+            .get_mut(&fx.project_id)
+            .unwrap()
+            .base = Some(if prefer_local {
+            base.choosing(true)
+        } else {
+            base
+        });
     }
 
     #[tokio::test]
@@ -1439,10 +1729,23 @@ mod tests {
             assert_eq!(remote.relation, Some(expected), "{origin:?}");
             let remote_before = git(&fx.repo, &["rev-parse", "refs/remotes/origin/main"]);
 
-            let done = integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
-            assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated, "{origin:?}");
-            assert!(git(&fx.repo, &["merge-base", "--is-ancestor", &fx.tip, "main"]).is_empty(), "{origin:?}");
-            assert_eq!(git(&fx.repo, &["rev-parse", "refs/remotes/origin/main"]), remote_before, "{origin:?}: origin is not touched");
+            let done = integrate(&fx.state, fx.task_id, confirmation(&p))
+                .await
+                .unwrap();
+            assert_eq!(
+                done.local_integration.unwrap().state,
+                IntegrationState::Integrated,
+                "{origin:?}"
+            );
+            assert!(
+                git(&fx.repo, &["merge-base", "--is-ancestor", &fx.tip, "main"]).is_empty(),
+                "{origin:?}"
+            );
+            assert_eq!(
+                git(&fx.repo, &["rev-parse", "refs/remotes/origin/main"]),
+                remote_before,
+                "{origin:?}: origin is not touched"
+            );
         }
     }
 
@@ -1453,7 +1756,12 @@ mod tests {
             with_origin(&fx, origin, false).await;
             let p = preview(&fx.state, fx.task_id).await.unwrap();
             assert_eq!(p.state, PreviewState::Refused, "{origin:?}");
-            assert!(p.reason.unwrap().contains("does not contain everything origin/main has"), "{origin:?}");
+            assert!(
+                p.reason
+                    .unwrap()
+                    .contains("does not contain everything origin/main has"),
+                "{origin:?}"
+            );
             let confirmed = IntegrationConfirmation {
                 target_branch: "main".into(),
                 target_tip: tip_of(&fx.repo, "main"),
@@ -1461,8 +1769,15 @@ mod tests {
                 checkout_path: None,
             };
             let before = tip_of(&fx.repo, "main");
-            assert!(integrate(&fx.state, fx.task_id, confirmed).await.is_err(), "{origin:?}");
-            assert_eq!(tip_of(&fx.repo, "main"), before, "{origin:?}: nothing moved");
+            assert!(
+                integrate(&fx.state, fx.task_id, confirmed).await.is_err(),
+                "{origin:?}"
+            );
+            assert_eq!(
+                tip_of(&fx.repo, "main"),
+                before,
+                "{origin:?}: nothing moved"
+            );
         }
     }
 
@@ -1472,7 +1787,9 @@ mod tests {
         with_origin(&fx, Origin::Behind, false).await;
         let p = preview(&fx.state, fx.task_id).await.unwrap();
         assert_eq!(p.state, PreviewState::Ready, "{:?}", p.reason);
-        integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
+        integrate(&fx.state, fx.task_id, confirmation(&p))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1482,7 +1799,9 @@ mod tests {
         let b_tip = commit_on(&fx.repo, "task-b", "a.txt", "b version\n");
         let b = seed(&fx.state, fx.project_id, "task-b", Some(&b_tip)).await;
         let p = preview(&fx.state, fx.task_id).await.unwrap();
-        integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
+        integrate(&fx.state, fx.task_id, confirmation(&p))
+            .await
+            .unwrap();
         let main_after_a = tip_of(&fx.repo, "main");
 
         let refused = preview(&fx.state, b).await.unwrap();
@@ -1500,7 +1819,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("a.txt") && err.contains("Nothing was changed"), "{err}");
+        assert!(
+            err.contains("a.txt") && err.contains("Nothing was changed"),
+            "{err}"
+        );
         assert_eq!(tip_of(&fx.repo, "main"), main_after_a);
         assert!(on_disk(&fx, b).local_integration.is_none());
         assert!(!ref_exists(&fx.repo, &git::pin_ref(b)));
@@ -1514,14 +1836,23 @@ mod tests {
         assert_eq!(p.approved_tip.as_deref(), Some(fx.tip.as_str()));
         assert_eq!(p.unapproved_commits, 1);
 
-        integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
-        assert_eq!(tip_of(&fx.repo, "main"), fx.tip, "the commit added after approval stays out");
+        integrate(&fx.state, fx.task_id, confirmation(&p))
+            .await
+            .unwrap();
+        assert_eq!(
+            tip_of(&fx.repo, "main"),
+            fx.tip,
+            "the commit added after approval stays out"
+        );
         assert_ne!(tip_of(&fx.repo, "main"), later);
 
         // The earlier integration says nothing about the newer commit.
         let after = preview(&fx.state, fx.task_id).await.unwrap();
         assert_eq!(after.state, PreviewState::Integrated);
-        assert_eq!(after.unapproved_commits, 1, "the new commit is reported as neither approved nor integrated");
+        assert_eq!(
+            after.unapproved_commits, 1,
+            "the new commit is reported as neither approved nor integrated"
+        );
     }
 
     #[tokio::test]
@@ -1540,7 +1871,12 @@ mod tests {
         assert!(integrate(
             &fx.state,
             fx.task_id,
-            IntegrationConfirmation { target_branch: "main".into(), target_tip: before.clone(), approved_tip: fx.tip.clone(), checkout_path: None }
+            IntegrationConfirmation {
+                target_branch: "main".into(),
+                target_tip: before.clone(),
+                approved_tip: fx.tip.clone(),
+                checkout_path: None
+            }
         )
         .await
         .is_err());
@@ -1556,33 +1892,57 @@ mod tests {
         let shown = p.reconfirm.expect("what to confirm");
         assert_eq!(shown.branch_tip, fx.tip);
         assert_eq!(shown.commits.len(), 1);
-        assert_eq!(shown.changed_files, vec!["A a.txt".to_string()], "the changes themselves are shown");
+        assert_eq!(
+            shown.changed_files,
+            vec!["A a.txt".to_string()],
+            "the changes themselves are shown"
+        );
 
         let before = tip_of(&fx.repo, "main");
         assert!(integrate(
             &fx.state,
             legacy,
-            IntegrationConfirmation { target_branch: "main".into(), target_tip: before.clone(), approved_tip: fx.tip.clone(), checkout_path: None }
+            IntegrationConfirmation {
+                target_branch: "main".into(),
+                target_tip: before.clone(),
+                approved_tip: fx.tip.clone(),
+                checkout_path: None
+            }
         )
         .await
         .is_err());
-        assert_eq!(tip_of(&fx.repo, "main"), before, "nothing is trusted silently");
+        assert_eq!(
+            tip_of(&fx.repo, "main"),
+            before,
+            "nothing is trusted silently"
+        );
 
         // The branch moved on after it was shown: the confirmation is refused.
         let moved = commit_on(&fx.repo, "task-a", "more.txt", "m\n");
-        let err = reconfirm(&fx.state, legacy, &shown.branch_tip).await.unwrap_err();
+        let err = reconfirm(&fx.state, legacy, &shown.branch_tip)
+            .await
+            .unwrap_err();
         assert!(err.contains("not at the commit that was shown"), "{err}");
         assert!(on_disk(&fx, legacy).human_review.approved_tip().is_none());
 
         let confirmed = reconfirm(&fx.state, legacy, &moved).await.unwrap();
         assert_eq!(confirmed.human_review.approved_tip(), Some(moved.as_str()));
-        assert!(confirmed.human_review.entries.last().unwrap().tip_reconfirmed);
+        assert!(
+            confirmed
+                .human_review
+                .entries
+                .last()
+                .unwrap()
+                .tip_reconfirmed
+        );
         let again = reconfirm(&fx.state, legacy, &moved).await.unwrap_err();
         assert!(again.contains("already records"), "{again}");
 
         let p = preview(&fx.state, legacy).await.unwrap();
         assert_eq!(p.state, PreviewState::Ready);
-        integrate(&fx.state, legacy, confirmation(&p)).await.unwrap();
+        integrate(&fx.state, legacy, confirmation(&p))
+            .await
+            .unwrap();
         assert_eq!(tip_of(&fx.repo, "main"), moved);
     }
 
@@ -1593,16 +1953,34 @@ mod tests {
         let before = tip_of(&fx.repo, "main");
         let moved = commit_on(&fx.repo, "main", "late.txt", "l\n");
 
-        let err = integrate(&fx.state, fx.task_id, c.clone()).await.unwrap_err();
-        assert!(err.contains("moved after the integration was shown"), "{err}");
+        let err = integrate(&fx.state, fx.task_id, c.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("moved after the integration was shown"),
+            "{err}"
+        );
         assert_eq!(tip_of(&fx.repo, "main"), moved);
         assert_ne!(before, moved);
         assert!(on_disk(&fx, fx.task_id).local_integration.is_none());
 
-        let wrong_tip = IntegrationConfirmation { approved_tip: "0".repeat(40), target_tip: moved.clone(), ..c.clone() };
-        assert!(integrate(&fx.state, fx.task_id, wrong_tip).await.unwrap_err().contains("not the one that was shown"));
-        let wrong_branch = IntegrationConfirmation { target_branch: "other".into(), target_tip: moved, ..c };
-        assert!(integrate(&fx.state, fx.task_id, wrong_branch).await.is_err());
+        let wrong_tip = IntegrationConfirmation {
+            approved_tip: "0".repeat(40),
+            target_tip: moved.clone(),
+            ..c.clone()
+        };
+        assert!(integrate(&fx.state, fx.task_id, wrong_tip)
+            .await
+            .unwrap_err()
+            .contains("not the one that was shown"));
+        let wrong_branch = IntegrationConfirmation {
+            target_branch: "other".into(),
+            target_tip: moved,
+            ..c
+        };
+        assert!(integrate(&fx.state, fx.task_id, wrong_branch)
+            .await
+            .is_err());
         assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
     }
 
@@ -1612,11 +1990,16 @@ mod tests {
         git(&fx.repo, &["branch", "-f", "main", &fx.tip]);
         let p = preview(&fx.state, fx.task_id).await.unwrap();
         assert_eq!(p.state, PreviewState::AlreadyContained);
-        let done = integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
+        let done = integrate(&fx.state, fx.task_id, confirmation(&p))
+            .await
+            .unwrap();
         let record = done.local_integration.unwrap();
         assert_eq!(record.strategy, IntegrationStrategy::AlreadyContained);
         assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
-        assert!(!ref_exists(&fx.repo, &git::marker_ref("main")), "nothing was integrated by SlashIt");
+        assert!(
+            !ref_exists(&fx.repo, &git::marker_ref("main")),
+            "nothing was integrated by SlashIt"
+        );
     }
 
     #[tokio::test]
@@ -1625,22 +2008,43 @@ mod tests {
         git(&fx.repo, &["branch", "-f", "main", &fx.tip]);
         git(&fx.repo, &["branch", "-D", &fx.branch]);
         assert!(!ref_exists(&fx.repo, &format!("refs/heads/{}", fx.branch)));
-        assert!(is_ancestor(&fx.repo, &fx.tip, &tip_of(&fx.repo, "main")).await.unwrap());
+        assert!(is_ancestor(&fx.repo, &fx.tip, &tip_of(&fx.repo, "main"))
+            .await
+            .unwrap());
 
         let target_before = tip_of(&fx.repo, "main");
         let refs_before = refs(&fx.repo);
         let shown = preview(&fx.state, fx.task_id).await.unwrap();
         assert_eq!(shown.state, PreviewState::AlreadyContained);
         assert_eq!(shown.approved_tip.as_deref(), Some(fx.tip.as_str()));
-        let done = integrate(&fx.state, fx.task_id, confirmation(&shown)).await.unwrap();
-        let record = done.local_integration.clone().expect("durable integration record");
+        let done = integrate(&fx.state, fx.task_id, confirmation(&shown))
+            .await
+            .unwrap();
+        let record = done
+            .local_integration
+            .clone()
+            .expect("durable integration record");
         assert_eq!(record.state, IntegrationState::Integrated);
         assert_eq!(record.strategy, IntegrationStrategy::AlreadyContained);
         assert_eq!(record.approved_tip, fx.tip);
-        assert_eq!(tip_of(&fx.repo, "main"), target_before, "confirmation moves no target");
-        assert_eq!(refs(&fx.repo), refs_before, "recognition creates or moves no Git refs");
-        assert!(!ref_exists(&fx.repo, &format!("refs/heads/{}", fx.branch)), "the Task branch stays deleted");
-        assert_eq!(on_disk(&fx, fx.task_id).local_integration, Some(record.clone()));
+        assert_eq!(
+            tip_of(&fx.repo, "main"),
+            target_before,
+            "confirmation moves no target"
+        );
+        assert_eq!(
+            refs(&fx.repo),
+            refs_before,
+            "recognition creates or moves no Git refs"
+        );
+        assert!(
+            !ref_exists(&fx.repo, &format!("refs/heads/{}", fx.branch)),
+            "the Task branch stays deleted"
+        );
+        assert_eq!(
+            on_disk(&fx, fx.task_id).local_integration,
+            Some(record.clone())
+        );
 
         // Reload the durable board as startup does, then verify the record
         // against Git again after the Task branch is still absent.
@@ -1657,14 +2061,34 @@ mod tests {
         // The fixture's Project and repository are in memory only. Rehydrate
         // them alongside the durable Task so the restarted state can verify
         // integration against Git.
-        *restarted.repository.repositories.write().await = fx.state.repository.repositories.read().await.clone();
+        *restarted.repository.repositories.write().await =
+            fx.state.repository.repositories.read().await.clone();
         *restarted.project.projects.write().await = fx.state.project.projects.read().await.clone();
         let restarted_tasks = restarted.storage.load_project_tasks(fx.project_id).unwrap();
-        restarted.task.tasks.write().await.extend(restarted_tasks.into_iter().map(|task| (task.id, task)));
-        assert_eq!(restarted.task.tasks.read().await.get(&fx.task_id).unwrap().local_integration, Some(record));
+        restarted
+            .task
+            .tasks
+            .write()
+            .await
+            .extend(restarted_tasks.into_iter().map(|task| (task.id, task)));
+        assert_eq!(
+            restarted
+                .task
+                .tasks
+                .read()
+                .await
+                .get(&fx.task_id)
+                .unwrap()
+                .local_integration,
+            Some(record)
+        );
         let verified = preview(&restarted, fx.task_id).await.unwrap();
         assert_eq!(verified.state, PreviewState::Integrated);
-        assert!(complete_and_integrate(&restarted, fx.task_id, confirmation(&verified)).await.is_ok());
+        assert!(
+            complete_and_integrate(&restarted, fx.task_id, confirmation(&verified))
+                .await
+                .is_ok()
+        );
 
         // The persisted Integrated flag is no substitute for current Git
         // ancestry when the recorded target no longer holds the approval.
@@ -1672,8 +2096,16 @@ mod tests {
         git(&fx.repo, &["update-ref", "refs/heads/main", &parent]);
         let no_longer_contained = preview(&restarted, fx.task_id).await.unwrap();
         assert_eq!(no_longer_contained.state, PreviewState::Refused);
-        assert!(no_longer_contained.reason.unwrap().contains("no longer exists"));
-        assert!(complete_and_integrate(&restarted, fx.task_id, confirmation(&verified)).await.unwrap_err().contains("without its approved work being integrated"));
+        assert!(no_longer_contained
+            .reason
+            .unwrap()
+            .contains("no longer exists"));
+        assert!(
+            complete_and_integrate(&restarted, fx.task_id, confirmation(&verified))
+                .await
+                .unwrap_err()
+                .contains("without its approved work being integrated")
+        );
     }
 
     #[tokio::test]
@@ -1688,28 +2120,67 @@ mod tests {
                 let task_id = fx.task_id;
                 let approved_later = later.clone();
                 let amend = move |tasks: &mut HashMap<Uuid, Task>| {
-                    tasks.get_mut(&task_id).unwrap().human_review.approve(Some(approved_later.clone()), chrono::Utc::now());
+                    tasks
+                        .get_mut(&task_id)
+                        .unwrap()
+                        .human_review
+                        .approve(Some(approved_later.clone()), chrono::Utc::now());
                 };
-                crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend).await.unwrap();
+                crate::lifecycle::record(
+                    &fx.state.task.tasks,
+                    &fx.state.storage,
+                    fx.task_id,
+                    &amend,
+                )
+                .await
+                .unwrap();
                 later
             };
             if missing_object {
                 let task_id = fx.task_id;
                 let missing_approved = approved.clone();
                 let amend = move |tasks: &mut HashMap<Uuid, Task>| {
-                    tasks.get_mut(&task_id).unwrap().human_review.approve(Some(missing_approved.clone()), chrono::Utc::now());
+                    tasks
+                        .get_mut(&task_id)
+                        .unwrap()
+                        .human_review
+                        .approve(Some(missing_approved.clone()), chrono::Utc::now());
                 };
-                crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend).await.unwrap();
+                crate::lifecycle::record(
+                    &fx.state.task.tasks,
+                    &fx.state.storage,
+                    fx.task_id,
+                    &amend,
+                )
+                .await
+                .unwrap();
             }
             git(&fx.repo, &["branch", "-D", &fx.branch]);
             let p = preview(&fx.state, fx.task_id).await.unwrap();
-            assert_eq!(p.state, PreviewState::Refused, "missing object: {missing_object}");
+            assert_eq!(
+                p.state,
+                PreviewState::Refused,
+                "missing object: {missing_object}"
+            );
             let reason = p.reason.unwrap();
             assert!(
-                reason.contains(if missing_object { "not in this repository" } else { "no longer exists" }),
+                reason.contains(if missing_object {
+                    "not in this repository"
+                } else {
+                    "no longer exists"
+                }),
                 "{reason}"
             );
-            assert!(fx.state.task.tasks.read().await.get(&fx.task_id).unwrap().local_integration.is_none());
+            assert!(fx
+                .state
+                .task
+                .tasks
+                .read()
+                .await
+                .get(&fx.task_id)
+                .unwrap()
+                .local_integration
+                .is_none());
         }
     }
 
@@ -1734,10 +2205,16 @@ mod tests {
         let fx = fixture().await;
         let parent = tip_of(&fx.repo, "main");
         let tree = git(&fx.repo, &["rev-parse", &format!("{}^{{tree}}", fx.tip)]);
-        let squashed = git(&fx.repo, &["commit-tree", &tree, "-p", &parent, "-m", "squashed task"]);
+        let squashed = git(
+            &fx.repo,
+            &["commit-tree", &tree, "-p", &parent, "-m", "squashed task"],
+        );
         git(&fx.repo, &["update-ref", "refs/heads/main", &squashed]);
         git(&fx.repo, &["branch", "-D", &fx.branch]);
-        assert_eq!(git(&fx.repo, &["rev-parse", &format!("{}^{{tree}}", squashed)]), tree);
+        assert_eq!(
+            git(&fx.repo, &["rev-parse", &format!("{}^{{tree}}", squashed)]),
+            tree
+        );
         assert!(!is_ancestor(&fx.repo, &fx.tip, &squashed).await.unwrap());
 
         let p = preview(&fx.state, fx.task_id).await.unwrap();
@@ -1751,21 +2228,44 @@ mod tests {
         git(&fx.repo, &["branch", "-f", "main", &fx.tip]);
         let task_id = fx.task_id;
         let amend = move |tasks: &mut HashMap<Uuid, Task>| {
-            tasks.get_mut(&task_id).unwrap().branch_origin = Some(BranchOrigin::LocalBase { branch: "other".into() });
+            tasks.get_mut(&task_id).unwrap().branch_origin = Some(BranchOrigin::LocalBase {
+                branch: "other".into(),
+            });
         };
-        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend).await.unwrap();
+        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend)
+            .await
+            .unwrap();
         git(&fx.repo, &["branch", "-D", &fx.branch]);
         let p = preview(&fx.state, fx.task_id).await.unwrap();
         assert_eq!(p.state, PreviewState::Refused);
         assert!(p.reason.unwrap().contains("started from other"));
 
-        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().base =
-            Some(crate::domain::ProjectBase::LocalBranch { branch: "absent".into() });
-        fx.state.task.tasks.write().await.get_mut(&fx.task_id).unwrap().branch_origin =
-            Some(BranchOrigin::LocalBase { branch: "absent".into() });
+        fx.state
+            .project
+            .projects
+            .write()
+            .await
+            .get_mut(&fx.project_id)
+            .unwrap()
+            .base = Some(crate::domain::ProjectBase::LocalBranch {
+            branch: "absent".into(),
+        });
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&fx.task_id)
+            .unwrap()
+            .branch_origin = Some(BranchOrigin::LocalBase {
+            branch: "absent".into(),
+        });
         let p = preview(&fx.state, fx.task_id).await.unwrap();
         assert_eq!(p.state, PreviewState::Refused);
-        assert!(p.reason.unwrap().contains("target branch absent does not exist"));
+        assert!(p
+            .reason
+            .unwrap()
+            .contains("target branch absent does not exist"));
     }
 
     #[tokio::test]
@@ -1782,13 +2282,26 @@ mod tests {
                     review.approve(None, chrono::Utc::now());
                 }
             };
-            crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend).await.unwrap();
+            crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend)
+                .await
+                .unwrap();
             git(&fx.repo, &["branch", "-D", &fx.branch]);
 
             let p = preview(&fx.state, fx.task_id).await.unwrap();
-            assert_eq!(p.state, PreviewState::Refused, "no current approval: {no_approval}");
+            assert_eq!(
+                p.state,
+                PreviewState::Refused,
+                "no current approval: {no_approval}"
+            );
             let reason = p.reason.unwrap();
-            assert!(reason.contains(if no_approval { "no approval on record" } else { "branch " }), "{reason}");
+            assert!(
+                reason.contains(if no_approval {
+                    "no approval on record"
+                } else {
+                    "branch "
+                }),
+                "{reason}"
+            );
         }
     }
 
@@ -1808,12 +2321,20 @@ mod tests {
             let t = s.get_mut(&fx.task_id).unwrap();
             t.activity.clear();
         };
-        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend).await.unwrap();
-        let err = integrate(&fx.state, fx.task_id, confirm.clone()).await.unwrap_err();
+        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, fx.task_id, &amend)
+            .await
+            .unwrap();
+        let err = integrate(&fx.state, fx.task_id, confirm.clone())
+            .await
+            .unwrap_err();
         assert!(err.contains("completed locally"), "{err}");
         git(&fx.repo, &["branch", "-D", &fx.branch]);
         let p = preview(&fx.state, fx.task_id).await.unwrap();
-        assert_eq!(p.state, PreviewState::Refused, "Done without the milestone stays ineligible");
+        assert_eq!(
+            p.state,
+            PreviewState::Refused,
+            "Done without the milestone stays ineligible"
+        );
         assert!(p.reason.unwrap().contains("completed locally"));
 
         // A pull request.
@@ -1821,8 +2342,13 @@ mod tests {
         let amend = move |s: &mut HashMap<Uuid, Task>| {
             s.get_mut(&with_pr).unwrap().pr_url = Some("https://example.invalid/pr/1".into());
         };
-        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, with_pr, &amend).await.unwrap();
-        assert!(integrate(&fx.state, with_pr, confirm.clone()).await.unwrap_err().contains("pull request"));
+        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, with_pr, &amend)
+            .await
+            .unwrap();
+        assert!(integrate(&fx.state, with_pr, confirm.clone())
+            .await
+            .unwrap_err()
+            .contains("pull request"));
 
         // A branch that is gone.
         let gone = seed(&fx.state, fx.project_id, "task-gone", Some(&fx.tip)).await;
@@ -1842,21 +2368,31 @@ mod tests {
             let base = base.clone();
             move |s: &mut HashMap<Uuid, Task>| {
                 let t = s.get_mut(&child).unwrap();
-                t.branch_origin = Some(BranchOrigin::Stacked { parent_branch: "task-a".into() });
+                t.branch_origin = Some(BranchOrigin::Stacked {
+                    parent_branch: "task-a".into(),
+                });
                 t.base_commit = Some(base.clone());
             }
         };
-        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, child, &amend).await.unwrap();
+        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, child, &amend)
+            .await
+            .unwrap();
 
         let p = preview(&fx.state, child).await.unwrap();
         assert_eq!(p.state, PreviewState::Refused);
         assert!(p.reason.unwrap().contains("Integrate that work first"));
 
         let parent = preview(&fx.state, fx.task_id).await.unwrap();
-        integrate(&fx.state, fx.task_id, confirmation(&parent)).await.unwrap();
+        integrate(&fx.state, fx.task_id, confirmation(&parent))
+            .await
+            .unwrap();
         let p = preview(&fx.state, child).await.unwrap();
         assert_eq!(p.state, PreviewState::Ready);
-        assert_eq!(p.strategy, Some(IntegrationStrategy::FastForward), "ancestry was preserved, no rewrite");
+        assert_eq!(
+            p.strategy,
+            Some(IntegrationStrategy::FastForward),
+            "ancestry was preserved, no rewrite"
+        );
         integrate(&fx.state, child, confirmation(&p)).await.unwrap();
         assert_eq!(tip_of(&fx.repo, "main"), child_tip);
     }
@@ -1868,7 +2404,9 @@ mod tests {
     /// branch leaves.
     async fn pending_unmoved(fx: &Fx) -> Plan {
         let c = ready(fx, fx.task_id).await;
-        let plan = git::plan(&fx.repo, &c.target_branch, &c.approved_tip, "m", true).await.unwrap();
+        let plan = git::plan(&fx.repo, &c.target_branch, &c.approved_tip, "m", true)
+            .await
+            .unwrap();
         git::pin(&fx.repo, fx.task_id, &plan.result).await.unwrap();
         let record = LocalIntegration {
             state: IntegrationState::Pending,
@@ -1883,8 +2421,12 @@ mod tests {
             completes_task: false,
         };
         let id = fx.task_id;
-        let amend = move |s: &mut HashMap<Uuid, Task>| s.get_mut(&id).unwrap().local_integration = Some(record.clone());
-        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend).await.unwrap();
+        let amend = move |s: &mut HashMap<Uuid, Task>| {
+            s.get_mut(&id).unwrap().local_integration = Some(record.clone())
+        };
+        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend)
+            .await
+            .unwrap();
         plan
     }
 
@@ -1894,16 +2436,32 @@ mod tests {
         let plan = pending_unmoved(&fx).await;
         assert_eq!(tip_of(&fx.repo, "main"), plan.target_old);
         let p = preview(&fx.state, fx.task_id).await.unwrap();
-        assert_eq!((p.state, p.observed.as_deref()), (PreviewState::Pending, Some("unmoved")));
+        assert_eq!(
+            (p.state, p.observed.as_deref()),
+            (PreviewState::Pending, Some("unmoved"))
+        );
         // What a restart reads: the file alone, with no process that started it.
-        assert_eq!(on_disk(&fx, fx.task_id).needs_you(false), Some(AttentionReason::IntegrationUnfinished));
+        assert_eq!(
+            on_disk(&fx, fx.task_id).needs_you(false),
+            Some(AttentionReason::IntegrationUnfinished)
+        );
         let before = on_disk(&fx, fx.task_id);
 
         let done = resume(&fx.state, fx.task_id).await.unwrap();
-        assert_eq!(done.needs_you(false), None, "resuming resolves the attention");
+        assert_eq!(
+            done.needs_you(false),
+            None,
+            "resuming resolves the attention"
+        );
         assert_eq!(on_disk(&fx, fx.task_id).needs_you(false), None);
-        assert_eq!(before.status, done.status, "attention is computed, never a status change");
-        assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
+        assert_eq!(
+            before.status, done.status,
+            "attention is computed, never a status change"
+        );
+        assert_eq!(
+            done.local_integration.unwrap().state,
+            IntegrationState::Integrated
+        );
         assert_eq!(tip_of(&fx.repo, "main"), plan.result);
         assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
     }
@@ -1915,30 +2473,47 @@ mod tests {
         git(&fx.repo, &["branch", "-D", &fx.branch]);
 
         let p = preview(&fx.state, fx.task_id).await.unwrap();
-        assert_eq!((p.state, p.observed.as_deref()), (PreviewState::Pending, Some("unmoved")));
+        assert_eq!(
+            (p.state, p.observed.as_deref()),
+            (PreviewState::Pending, Some("unmoved"))
+        );
         let err = resume(&fx.state, fx.task_id).await.unwrap_err();
         assert!(err.contains("no longer exists"), "{err}");
         assert_eq!(tip_of(&fx.repo, "main"), plan.target_old);
-        assert_eq!(on_disk(&fx, fx.task_id).local_integration.unwrap().state, IntegrationState::Pending);
+        assert_eq!(
+            on_disk(&fx, fx.task_id).local_integration.unwrap().state,
+            IntegrationState::Pending
+        );
     }
 
     #[tokio::test]
     async fn a_crash_after_the_branch_moved_is_recorded_without_moving_it_again() {
         let fx = fixture().await;
         let plan = pending_unmoved(&fx).await;
-        git::advance(fx.repo.to_str().unwrap(), &plan, None).await.unwrap();
+        git::advance(fx.repo.to_str().unwrap(), &plan, None)
+            .await
+            .unwrap();
         let moved_at = tip_of(&fx.repo, "main");
         // The target has since advanced past the result: still applied.
         let later = commit_on(&fx.repo, "main", "later.txt", "l\n");
 
         let p = preview(&fx.state, fx.task_id).await.unwrap();
         assert_eq!(p.observed.as_deref(), Some("applied"));
-        assert!(discard(&fx.state, fx.task_id).await.unwrap_err().contains("already holds"));
+        assert!(discard(&fx.state, fx.task_id)
+            .await
+            .unwrap_err()
+            .contains("already holds"));
         let done = resume(&fx.state, fx.task_id).await.unwrap();
-        assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
+        assert_eq!(
+            done.local_integration.unwrap().state,
+            IntegrationState::Integrated
+        );
         assert_eq!(moved_at, plan.result);
         assert_eq!(tip_of(&fx.repo, "main"), later);
-        assert!(done.activity.iter().any(|e| matches!(e.kind, ActivityKind::IntegratedLocally { .. })));
+        assert!(done
+            .activity
+            .iter()
+            .any(|e| matches!(e.kind, ActivityKind::IntegratedLocally { .. })));
     }
 
     #[tokio::test]
@@ -1959,13 +2534,23 @@ mod tests {
     async fn a_pending_integration_can_be_discarded_while_nothing_moved() {
         let fx = fixture().await;
         let plan = pending_unmoved(&fx).await;
-        assert_eq!(on_disk(&fx, fx.task_id).needs_you(false), Some(AttentionReason::IntegrationUnfinished));
+        assert_eq!(
+            on_disk(&fx, fx.task_id).needs_you(false),
+            Some(AttentionReason::IntegrationUnfinished)
+        );
         let task = discard(&fx.state, fx.task_id).await.unwrap();
         assert!(task.local_integration.is_none());
-        assert_eq!(task.needs_you(false), None, "discarding resolves the attention");
+        assert_eq!(
+            task.needs_you(false),
+            None,
+            "discarding resolves the attention"
+        );
         assert_eq!(tip_of(&fx.repo, "main"), plan.target_old);
         assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
-        assert!(resume(&fx.state, fx.task_id).await.is_err(), "nothing is pending any more");
+        assert!(
+            resume(&fx.state, fx.task_id).await.is_err(),
+            "nothing is pending any more"
+        );
     }
 
     #[tokio::test]
@@ -1989,7 +2574,9 @@ mod tests {
                 completes_task: false,
             });
         };
-        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, other, &amend).await.unwrap();
+        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, other, &amend)
+            .await
+            .unwrap();
 
         sweep_orphan_pins(&fx.state, &fx.repo).await;
         assert!(!ref_exists(&fx.repo, &git::pin_ref(orphan)));
@@ -2017,7 +2604,10 @@ mod tests {
         let ca = ready(&fx, fx.task_id).await;
         let cb = ready(&fx, b).await;
 
-        let (ra, rb) = tokio::join!(integrate(&fx.state, fx.task_id, ca), integrate(&fx.state, b, cb.clone()));
+        let (ra, rb) = tokio::join!(
+            integrate(&fx.state, fx.task_id, ca),
+            integrate(&fx.state, b, cb.clone())
+        );
         // Both were planned against the same target, so the second to run
         // finds it moved and is refused rather than merged blind.
         assert!(ra.is_ok() ^ rb.is_ok(), "{ra:?} {rb:?}");
@@ -2040,14 +2630,35 @@ mod tests {
     #[tokio::test]
     async fn an_integration_never_deletes_or_rewrites_anything_but_the_target() {
         let fx = fixture().await;
-        let refs_before = git(&fx.repo, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]);
+        let refs_before = git(
+            &fx.repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+            ],
+        );
         let c = ready(&fx, fx.task_id).await;
         integrate(&fx.state, fx.task_id, c).await.unwrap();
-        let refs_after = git(&fx.repo, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]);
-        let changed: Vec<_> = refs_before.lines().filter(|l| !refs_after.lines().any(|a| a == *l)).collect();
+        let refs_after = git(
+            &fx.repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+            ],
+        );
+        let changed: Vec<_> = refs_before
+            .lines()
+            .filter(|l| !refs_after.lines().any(|a| a == *l))
+            .collect();
         assert_eq!(changed.len(), 1, "only main moved: {changed:?}");
         assert!(changed[0].starts_with("refs/heads/main "));
-        assert_eq!(refs_before.lines().count(), refs_after.lines().count(), "no branch was deleted or added");
+        assert_eq!(
+            refs_before.lines().count(),
+            refs_after.lines().count(),
+            "no branch was deleted or added"
+        );
     }
 
     /// A target branch that is checked out: the person is shown the
@@ -2078,7 +2689,11 @@ mod tests {
         }
 
         fn clean(repo: &Path) {
-            assert_eq!(git(repo, &["status", "--porcelain"]), "", "index and files are clean");
+            assert_eq!(
+                git(repo, &["status", "--porcelain"]),
+                "",
+                "index and files are clean"
+            );
         }
 
         #[tokio::test]
@@ -2094,13 +2709,23 @@ mod tests {
             assert_eq!(tip_of(&fx.repo, "main"), before, "a preview moves nothing");
             assert!(!fx.repo.join("a.txt").exists());
 
-            let done = integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
+            let done = integrate(&fx.state, fx.task_id, confirmation(&p))
+                .await
+                .unwrap();
             let record = done.local_integration.unwrap();
             assert_eq!(record.state, IntegrationState::Integrated);
             assert_eq!(record.checkout_path, Some(path_of(&fx)));
             assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
-            assert_eq!(git(&fx.repo, &["symbolic-ref", "HEAD"]), "refs/heads/main", "still on main");
-            assert_eq!(std::fs::read_to_string(fx.repo.join("a.txt")).unwrap(), "a\n", "the files moved too");
+            assert_eq!(
+                git(&fx.repo, &["symbolic-ref", "HEAD"]),
+                "refs/heads/main",
+                "still on main"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fx.repo.join("a.txt")).unwrap(),
+                "a\n",
+                "the files moved too"
+            );
             clean(&fx.repo);
             assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
 
@@ -2125,7 +2750,10 @@ mod tests {
             let result = tip_of(&fx.repo, "main");
             assert_eq!(done.local_integration.unwrap().result_oid, result);
             let parents = git(&fx.repo, &["rev-list", "--parents", "-n1", &result]);
-            assert_eq!(parents.split_whitespace().skip(1).collect::<Vec<_>>(), vec![other.as_str(), fx.tip.as_str()]);
+            assert_eq!(
+                parents.split_whitespace().skip(1).collect::<Vec<_>>(),
+                vec![other.as_str(), fx.tip.as_str()]
+            );
             assert!(fx.repo.join("a.txt").is_file() && fx.repo.join("other.txt").is_file());
             clean(&fx.repo);
         }
@@ -2134,15 +2762,23 @@ mod tests {
         async fn a_linked_worktree_that_has_the_target_is_the_checkout_that_moves() {
             let fx = fixture().await;
             let linked = fx._tmp.path().join("linked main");
-            git(&fx.repo, &["worktree", "add", "-q", linked.to_str().unwrap(), "main"]);
+            git(
+                &fx.repo,
+                &["worktree", "add", "-q", linked.to_str().unwrap(), "main"],
+            );
             let shown = git(&linked, &["rev-parse", "--show-toplevel"]);
             let p = preview(&fx.state, fx.task_id).await.unwrap();
             assert_eq!(p.state, PreviewState::ReadyInCheckout);
             assert_eq!(p.checked_out_at, Some(shown.clone()));
 
-            integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
+            integrate(&fx.state, fx.task_id, confirmation(&p))
+                .await
+                .unwrap();
             assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
-            assert!(linked.join("a.txt").is_file(), "the linked checkout's files moved");
+            assert!(
+                linked.join("a.txt").is_file(),
+                "the linked checkout's files moved"
+            );
             clean(&linked);
         }
 
@@ -2152,8 +2788,13 @@ mod tests {
             let before = tip_of(&fx.repo, "main");
             let mut c = confirm_checkout(&fx, fx.task_id).await;
             c.checkout_path = None;
-            let err = integrate(&fx.state, fx.task_id, c.clone()).await.unwrap_err();
-            assert!(err.contains("checked out") && err.contains("git -C "), "{err}");
+            let err = integrate(&fx.state, fx.task_id, c.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("checked out") && err.contains("git -C "),
+                "{err}"
+            );
             assert_eq!(tip_of(&fx.repo, "main"), before);
             assert!(on_disk(&fx, fx.task_id).local_integration.is_none());
             assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
@@ -2185,8 +2826,12 @@ mod tests {
         async fn inspecting_a_checkout_does_not_rewrite_its_index() {
             let fx = on_main().await;
             let readme = fx.repo.join("README.md");
-            let file = std::fs::OpenOptions::new().write(true).open(&readme).unwrap();
-            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&readme)
+                .unwrap();
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .unwrap();
             drop(file);
             let index = fx.repo.join(".git/index");
             let before = std::fs::read(&index).unwrap();
@@ -2194,7 +2839,11 @@ mod tests {
             let p = preview(&fx.state, fx.task_id).await.unwrap();
 
             assert_eq!(p.state, PreviewState::ReadyInCheckout, "{:?}", p.reason);
-            assert_eq!(std::fs::read(&index).unwrap(), before, "the index is byte for byte what it was");
+            assert_eq!(
+                std::fs::read(&index).unwrap(),
+                before,
+                "the index is byte for byte what it was"
+            );
             assert!(!fx.repo.join(".git/index.lock").exists());
         }
 
@@ -2220,7 +2869,11 @@ mod tests {
 
                 let p = preview(&fx.state, fx.task_id).await.unwrap();
                 assert_eq!(p.state, PreviewState::Refused, "{label}");
-                assert!(p.checkout_problems.iter().any(|m| m.contains("README.md")), "{label}: {:?}", p.checkout_problems);
+                assert!(
+                    p.checkout_problems.iter().any(|m| m.contains("README.md")),
+                    "{label}: {:?}",
+                    p.checkout_problems
+                );
                 assert!(p.reason.unwrap().contains("git -C "), "{label}");
 
                 let c = IntegrationConfirmation {
@@ -2230,13 +2883,27 @@ mod tests {
                     checkout_path: Some(path_of(&fx)),
                 };
                 let err = integrate(&fx.state, fx.task_id, c).await.unwrap_err();
-                assert!(err.contains("uncommitted changes") && err.contains("Nothing was changed"), "{label}: {err}");
+                assert!(
+                    err.contains("uncommitted changes") && err.contains("Nothing was changed"),
+                    "{label}: {err}"
+                );
                 assert_eq!(tip_of(&fx.repo, "main"), before, "{label}");
-                assert_eq!(git(&fx.repo, &["status", "--porcelain"]), status_before, "{label}: untouched");
+                assert_eq!(
+                    git(&fx.repo, &["status", "--porcelain"]),
+                    status_before,
+                    "{label}: untouched"
+                );
                 if setup != "delete" {
-                    assert_eq!(std::fs::read_to_string(&readme).unwrap(), "mine\n", "{label}");
+                    assert_eq!(
+                        std::fs::read_to_string(&readme).unwrap(),
+                        "mine\n",
+                        "{label}"
+                    );
                 }
-                assert!(on_disk(&fx, fx.task_id).local_integration.is_none(), "{label}");
+                assert!(
+                    on_disk(&fx, fx.task_id).local_integration.is_none(),
+                    "{label}"
+                );
                 assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)), "{label}");
             }
         }
@@ -2249,7 +2916,10 @@ mod tests {
             let c = confirm_checkout(&fx, fx.task_id).await;
             integrate(&fx.state, fx.task_id, c).await.unwrap();
             assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
-            assert_eq!(std::fs::read_to_string(fx.repo.join("notes.txt")).unwrap(), "keep me\n");
+            assert_eq!(
+                std::fs::read_to_string(fx.repo.join("notes.txt")).unwrap(),
+                "keep me\n"
+            );
         }
 
         #[tokio::test]
@@ -2257,13 +2927,18 @@ mod tests {
             for ignored in [false, true] {
                 let fx = on_main().await;
                 if ignored {
-                    std::fs::write(fx.repo.join(".git").join("info").join("exclude"), "a.txt\n").unwrap();
+                    std::fs::write(fx.repo.join(".git").join("info").join("exclude"), "a.txt\n")
+                        .unwrap();
                 }
                 std::fs::write(fx.repo.join("a.txt"), "precious\n").unwrap();
                 let before = tip_of(&fx.repo, "main");
                 let p = preview(&fx.state, fx.task_id).await.unwrap();
                 assert_eq!(p.state, PreviewState::Refused, "ignored: {ignored}");
-                assert!(p.checkout_problems.iter().any(|m| m.contains("a.txt")), "{:?}", p.checkout_problems);
+                assert!(
+                    p.checkout_problems.iter().any(|m| m.contains("a.txt")),
+                    "{:?}",
+                    p.checkout_problems
+                );
                 let c = IntegrationConfirmation {
                     target_branch: "main".into(),
                     target_tip: before.clone(),
@@ -2271,14 +2946,25 @@ mod tests {
                     checkout_path: Some(path_of(&fx)),
                 };
                 assert!(integrate(&fx.state, fx.task_id, c).await.is_err());
-                assert_eq!(std::fs::read_to_string(fx.repo.join("a.txt")).unwrap(), "precious\n", "ignored: {ignored}");
+                assert_eq!(
+                    std::fs::read_to_string(fx.repo.join("a.txt")).unwrap(),
+                    "precious\n",
+                    "ignored: {ignored}"
+                );
                 assert_eq!(tip_of(&fx.repo, "main"), before);
             }
         }
 
         #[tokio::test]
         async fn a_git_operation_under_way_blocks_the_integration() {
-            for marker in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "BISECT_LOG", "index.lock"] {
+            for marker in [
+                "MERGE_HEAD",
+                "CHERRY_PICK_HEAD",
+                "REVERT_HEAD",
+                "rebase-merge",
+                "BISECT_LOG",
+                "index.lock",
+            ] {
                 let fx = on_main().await;
                 let path = fx.repo.join(".git").join(marker);
                 if marker == "rebase-merge" {
@@ -2297,7 +2983,10 @@ mod tests {
                     checkout_path: Some(path_of(&fx)),
                 };
                 let err = integrate(&fx.state, fx.task_id, c).await.unwrap_err();
-                assert!(err.contains("in progress") || err.contains("index.lock"), "{marker}: {err}");
+                assert!(
+                    err.contains("in progress") || err.contains("index.lock"),
+                    "{marker}: {err}"
+                );
                 assert_eq!(tip_of(&fx.repo, "main"), before, "{marker}");
             }
         }
@@ -2312,7 +3001,10 @@ mod tests {
             git(&fx.repo, &["commit", "-q", "-m", "late"]);
             let moved = tip_of(&fx.repo, "main");
             let err = integrate(&fx.state, fx.task_id, c).await.unwrap_err();
-            assert!(err.contains("moved after the integration was shown"), "{err}");
+            assert!(
+                err.contains("moved after the integration was shown"),
+                "{err}"
+            );
             assert_eq!(tip_of(&fx.repo, "main"), moved);
 
             // The checkout left main: nothing has it checked out any more.
@@ -2328,21 +3020,39 @@ mod tests {
         /// before it moved the branch: exactly what `git merge --ff-only`
         /// leaves if it dies between its two steps.
         #[tokio::test]
-        async fn a_crash_after_the_files_changed_and_before_the_branch_moved_is_finished_by_resuming() {
+        async fn a_crash_after_the_files_changed_and_before_the_branch_moved_is_finished_by_resuming(
+        ) {
             let fx = on_main().await;
             let c = confirm_checkout(&fx, fx.task_id).await;
             let plan = pending_unmoved_in_checkout(&fx, &c).await;
-            git(&fx.repo, &["read-tree", "-m", "-u", &plan.target_old, &plan.result]);
-            assert_eq!(tip_of(&fx.repo, "main"), plan.target_old, "the branch has not moved");
-            assert!(fx.repo.join("a.txt").is_file(), "the files already have the work");
+            git(
+                &fx.repo,
+                &["read-tree", "-m", "-u", &plan.target_old, &plan.result],
+            );
+            assert_eq!(
+                tip_of(&fx.repo, "main"),
+                plan.target_old,
+                "the branch has not moved"
+            );
+            assert!(
+                fx.repo.join("a.txt").is_file(),
+                "the files already have the work"
+            );
 
             let p = preview(&fx.state, fx.task_id).await.unwrap();
             assert_eq!(p.state, PreviewState::Pending);
             assert_eq!(p.observed.as_deref(), Some("unmoved"));
-            assert!(p.checkout_problems.is_empty(), "resume can finish: {:?}", p.checkout_problems);
+            assert!(
+                p.checkout_problems.is_empty(),
+                "resume can finish: {:?}",
+                p.checkout_problems
+            );
 
             let done = resume(&fx.state, fx.task_id).await.unwrap();
-            assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
+            assert_eq!(
+                done.local_integration.unwrap().state,
+                IntegrationState::Integrated
+            );
             assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
             clean(&fx.repo);
             assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
@@ -2384,14 +3094,25 @@ mod tests {
 
             let p = preview(&fx.state, id).await.unwrap();
             assert_eq!(p.state, PreviewState::ReadyInCheckout, "{:?}", p.reason);
-            let err = integrate(&fx.state, id, confirmation(&p)).await.unwrap_err();
+            let err = integrate(&fx.state, id, confirmation(&p))
+                .await
+                .unwrap_err();
             std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
-            assert!(err.contains("pending") || err.contains("did not fast-forward"), "{err}");
+            assert!(
+                err.contains("pending") || err.contains("did not fast-forward"),
+                "{err}"
+            );
 
             // Still pending, the branch where it was, the person's file intact.
-            assert!(on_disk(&fx, id).local_integration.expect("still recorded").is_pending());
+            assert!(on_disk(&fx, id)
+                .local_integration
+                .expect("still recorded")
+                .is_pending());
             assert_eq!(tip_of(&fx.repo, "main"), main_before);
-            assert_eq!(std::fs::read_to_string(sealed.join("keep.txt")).unwrap(), "mine\n");
+            assert_eq!(
+                std::fs::read_to_string(sealed.join("keep.txt")).unwrap(),
+                "mine\n"
+            );
 
             let partial = fx.repo.join("aaa.txt").exists();
             let resumed = resume(&fx.state, id).await;
@@ -2400,15 +3121,27 @@ mod tests {
                 // state SlashIt overwrites or resets its way out of.
                 let why = resumed.expect_err("a half-updated checkout is not finished by force");
                 assert!(why.contains("aaa.txt"), "{why}");
-                assert_eq!(std::fs::read_to_string(fx.repo.join("aaa.txt")).unwrap(), "task\n");
+                assert_eq!(
+                    std::fs::read_to_string(fx.repo.join("aaa.txt")).unwrap(),
+                    "task\n"
+                );
                 assert_eq!(tip_of(&fx.repo, "main"), main_before);
                 discard(&fx.state, id).await.unwrap();
                 assert!(on_disk(&fx, id).local_integration.is_none());
-                assert!(fx.repo.join("aaa.txt").exists(), "discarding the record keeps the files");
+                assert!(
+                    fx.repo.join("aaa.txt").exists(),
+                    "discarding the record keeps the files"
+                );
             } else {
-                assert_eq!(resumed.unwrap().local_integration.unwrap().state, IntegrationState::Integrated);
+                assert_eq!(
+                    resumed.unwrap().local_integration.unwrap().state,
+                    IntegrationState::Integrated
+                );
             }
-            assert_eq!(std::fs::read_to_string(sealed.join("keep.txt")).unwrap(), "mine\n");
+            assert_eq!(
+                std::fs::read_to_string(sealed.join("keep.txt")).unwrap(),
+                "mine\n"
+            );
         }
 
         /// Resuming moves a checked-out branch only in the checkout that was
@@ -2424,9 +3157,18 @@ mod tests {
 
             let p = preview(&fx.state, fx.task_id).await.unwrap();
             assert_eq!(p.state, PreviewState::Pending);
-            assert!(p.checkout_problems.iter().any(|m| m.contains("not confirmed")), "{:?}", p.checkout_problems);
+            assert!(
+                p.checkout_problems
+                    .iter()
+                    .any(|m| m.contains("not confirmed")),
+                "{:?}",
+                p.checkout_problems
+            );
             let err = resume(&fx.state, fx.task_id).await.unwrap_err();
-            assert!(err.contains("checked out") && err.contains("Nothing was changed"), "{err}");
+            assert!(
+                err.contains("checked out") && err.contains("Nothing was changed"),
+                "{err}"
+            );
             assert_eq!(tip_of(&fx.repo, "main"), plan.target_old);
             clean(&fx.repo);
 
@@ -2465,7 +3207,11 @@ mod tests {
                     checkout_path: None,
                 };
                 assert!(integrate(&fx.state, fx.task_id, c).await.is_err(), "{file}");
-                assert_eq!(tip_of(&fx.repo, "main"), before, "{file}: the branch did not move");
+                assert_eq!(
+                    tip_of(&fx.repo, "main"),
+                    before,
+                    "{file}: the branch did not move"
+                );
             }
         }
 
@@ -2481,14 +3227,21 @@ mod tests {
             git(&fx.repo, &["commit", "-q", "-m", "space"]);
             let tip = git(&fx.repo, &["rev-parse", "HEAD"]);
             git(&fx.repo, &["checkout", "-q", "main"]);
-            std::fs::write(fx.repo.join(".git").join("info").join("exclude"), "\\ secret\n").unwrap();
+            std::fs::write(
+                fx.repo.join(".git").join("info").join("exclude"),
+                "\\ secret\n",
+            )
+            .unwrap();
             std::fs::write(fx.repo.join(" secret"), "USER DATA\n").unwrap();
             let id = seed(&fx.state, fx.project_id, "task-sp", Some(&tip)).await;
 
             let p = preview(&fx.state, id).await.unwrap();
             assert_eq!(p.state, PreviewState::Refused, "{:?}", p.reason);
             assert!(p.checkout_problems.iter().any(|m| m.contains(" secret")));
-            assert_eq!(std::fs::read_to_string(fx.repo.join(" secret")).unwrap(), "USER DATA\n");
+            assert_eq!(
+                std::fs::read_to_string(fx.repo.join(" secret")).unwrap(),
+                "USER DATA\n"
+            );
         }
 
         /// Replacing a tracked file by a directory is the task's own change,
@@ -2512,7 +3265,10 @@ mod tests {
 
             let c = confirm_checkout(&fx, id).await;
             integrate(&fx.state, id, c).await.unwrap();
-            assert_eq!(std::fs::read_to_string(fx.repo.join("thing").join("inner")).unwrap(), "x\n");
+            assert_eq!(
+                std::fs::read_to_string(fx.repo.join("thing").join("inner")).unwrap(),
+                "x\n"
+            );
             clean(&fx.repo);
         }
 
@@ -2522,7 +3278,10 @@ mod tests {
         async fn a_detached_worktree_whose_directory_is_gone_does_not_block_integrating() {
             let fx = fixture().await;
             let gone = fx._tmp.path().join("gone worktree");
-            git(&fx.repo, &["worktree", "add", "-q", "--detach", gone.to_str().unwrap()]);
+            git(
+                &fx.repo,
+                &["worktree", "add", "-q", "--detach", gone.to_str().unwrap()],
+            );
             std::fs::remove_dir_all(&gone).unwrap();
             assert!(git(&fx.repo, &["worktree", "list", "--porcelain"]).contains("gone worktree"));
 
@@ -2534,10 +3293,20 @@ mod tests {
         /// Record the plan as pending, pinned, without moving anything.
         async fn pending_unmoved_in_checkout(fx: &Fx, c: &IntegrationConfirmation) -> Plan {
             let repo = fx.repo.as_path();
-            let plan = git::plan(repo, "main", &fx.tip, &merge_message(&fx.branch, "main"), true).await.unwrap();
+            let plan = git::plan(
+                repo,
+                "main",
+                &fx.tip,
+                &merge_message(&fx.branch, "main"),
+                true,
+            )
+            .await
+            .unwrap();
             assert_eq!(plan.target_old, c.target_tip);
             git::pin(repo, fx.task_id, &plan.result).await.unwrap();
-            git::mark_base(repo, "main", &plan.target_old).await.unwrap();
+            git::mark_base(repo, "main", &plan.target_old)
+                .await
+                .unwrap();
             let record = LocalIntegration {
                 state: IntegrationState::Pending,
                 target_branch: plan.target_branch.clone(),
@@ -2551,9 +3320,12 @@ mod tests {
                 completes_task: false,
             };
             let id = fx.task_id;
-            let amend =
-                move |s: &mut HashMap<Uuid, Task>| s.get_mut(&id).unwrap().local_integration = Some(record.clone());
-            crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend).await.unwrap();
+            let amend = move |s: &mut HashMap<Uuid, Task>| {
+                s.get_mut(&id).unwrap().local_integration = Some(record.clone())
+            };
+            crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend)
+                .await
+                .unwrap();
             plan
         }
     }
@@ -2565,7 +3337,8 @@ mod tests {
         use super::*;
         use tauri::Manager;
 
-        const REFUSAL: &str = "An integration is unfinished. Resume or Discard it before moving this Task.";
+        const REFUSAL: &str =
+            "An integration is unfinished. Resume or Discard it before moving this Task.";
 
         struct Board {
             _tmp: tempfile::TempDir,
@@ -2596,7 +3369,8 @@ mod tests {
             }
 
             async fn status(&self, to: TaskStatus) -> Result<Option<Task>, String> {
-                crate::commands::task::update_task_status(GuiMutation::untracked(), 
+                crate::commands::task::update_task_status(
+                    GuiMutation::untracked(),
                     self.app.state(),
                     self.task_id.to_string(),
                     to,
@@ -2605,8 +3379,13 @@ mod tests {
                 .await
             }
 
-            async fn drag(&self, to: Option<TaskStatus>, position: i32) -> Result<Option<Task>, String> {
-                crate::commands::task::reorder_task(GuiMutation::untracked(), 
+            async fn drag(
+                &self,
+                to: Option<TaskStatus>,
+                position: i32,
+            ) -> Result<Option<Task>, String> {
+                crate::commands::task::reorder_task(
+                    GuiMutation::untracked(),
                     self.app.state(),
                     self.task_id.to_string(),
                     to,
@@ -2650,28 +3429,55 @@ mod tests {
             let fx = fixture().await;
             let plan = pending_unmoved(&fx).await;
             if target_moved {
-                git::advance(fx.repo.to_str().unwrap(), &plan, None).await.unwrap();
+                git::advance(fx.repo.to_str().unwrap(), &plan, None)
+                    .await
+                    .unwrap();
             }
             if in_review {
                 let id = fx.task_id;
                 let amend = move |s: &mut HashMap<Uuid, Task>| {
                     let t = s.get_mut(&id).unwrap();
                     t.status = TaskStatus::HumanReview;
-                    t.activity.retain(|e| !matches!(e.kind, ActivityKind::CompletedLocally {}));
+                    t.activity
+                        .retain(|e| !matches!(e.kind, ActivityKind::CompletedLocally {}));
                     t.local_integration.as_mut().unwrap().completes_task = true;
                 };
-                crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend).await.unwrap();
+                crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend)
+                    .await
+                    .unwrap();
             }
-            let Fx { _tmp, state, repo, project_id, task_id, .. } = fx;
+            let Fx {
+                _tmp,
+                state,
+                repo,
+                project_id,
+                task_id,
+                ..
+            } = fx;
             let app = tauri::test::mock_app();
             app.manage(state);
-            Board { _tmp, app, repo, project_id, task_id, plan }
+            Board {
+                _tmp,
+                app,
+                repo,
+                project_id,
+                task_id,
+                plan,
+            }
         }
 
         async fn refused_everywhere(b: &Board) {
             let before = recovery(&b.in_memory().await);
-            assert_eq!(before.needs_you, Some(AttentionReason::IntegrationUnfinished));
-            for to in [TaskStatus::Backlog, TaskStatus::Queue, TaskStatus::InProgress, TaskStatus::Done] {
+            assert_eq!(
+                before.needs_you,
+                Some(AttentionReason::IntegrationUnfinished)
+            );
+            for to in [
+                TaskStatus::Backlog,
+                TaskStatus::Queue,
+                TaskStatus::InProgress,
+                TaskStatus::Done,
+            ] {
                 let label = format!("{to:?}");
                 let refusal = b.status(to.clone()).await.expect_err(&label);
                 assert_eq!(refusal, REFUSAL, "{label}");
@@ -2682,9 +3488,20 @@ mod tests {
                     let refusal = b.drag(Some(to), 0).await.expect_err(&label);
                     assert_eq!(refusal, REFUSAL, "{label} by drag");
                 }
-                assert_eq!(recovery(&b.in_memory().await), before, "{label}: the board is unchanged");
-                assert_eq!(recovery(&b.on_disk()), before, "{label}: the file is unchanged");
-                assert!(ref_exists(&b.repo, &git::pin_ref(b.task_id)), "{label}: the pin is kept");
+                assert_eq!(
+                    recovery(&b.in_memory().await),
+                    before,
+                    "{label}: the board is unchanged"
+                );
+                assert_eq!(
+                    recovery(&b.on_disk()),
+                    before,
+                    "{label}: the file is unchanged"
+                );
+                assert!(
+                    ref_exists(&b.repo, &git::pin_ref(b.task_id)),
+                    "{label}: the pin is kept"
+                );
             }
         }
 
@@ -2692,11 +3509,20 @@ mod tests {
         async fn a_done_task_stays_put_while_its_integration_has_not_moved_the_target() {
             let b = board(false, false).await;
             refused_everywhere(&b).await;
-            assert_eq!(git(&b.repo, &["rev-parse", "refs/heads/main"]), b.plan.target_old);
+            assert_eq!(
+                git(&b.repo, &["rev-parse", "refs/heads/main"]),
+                b.plan.target_old
+            );
 
             let done = resume(&b.state(), b.task_id).await.unwrap();
-            assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
-            assert_eq!(git(&b.repo, &["rev-parse", "refs/heads/main"]), b.plan.result);
+            assert_eq!(
+                done.local_integration.unwrap().state,
+                IntegrationState::Integrated
+            );
+            assert_eq!(
+                git(&b.repo, &["rev-parse", "refs/heads/main"]),
+                b.plan.result
+            );
         }
 
         #[tokio::test]
@@ -2705,8 +3531,14 @@ mod tests {
             refused_everywhere(&b).await;
 
             let done = resume(&b.state(), b.task_id).await.unwrap();
-            assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
-            assert_eq!(git(&b.repo, &["rev-parse", "refs/heads/main"]), b.plan.result);
+            assert_eq!(
+                done.local_integration.unwrap().state,
+                IntegrationState::Integrated
+            );
+            assert_eq!(
+                git(&b.repo, &["rev-parse", "refs/heads/main"]),
+                b.plan.result
+            );
         }
 
         #[tokio::test]
@@ -2715,11 +3547,21 @@ mod tests {
                 let b = board(target_moved, true).await;
                 assert_eq!(b.in_memory().await.status, TaskStatus::HumanReview);
                 refused_everywhere(&b).await;
-                assert!(b.in_memory().await.human_review.is_approved(), "the approval is kept");
+                assert!(
+                    b.in_memory().await.human_review.is_approved(),
+                    "the approval is kept"
+                );
 
                 let finished = resume(&b.state(), b.task_id).await.unwrap();
-                assert_eq!(finished.status, TaskStatus::Done, "moved={target_moved}: resuming completes it");
-                assert_eq!(finished.local_integration.unwrap().state, IntegrationState::Integrated);
+                assert_eq!(
+                    finished.status,
+                    TaskStatus::Done,
+                    "moved={target_moved}: resuming completes it"
+                );
+                assert_eq!(
+                    finished.local_integration.unwrap().state,
+                    IntegrationState::Integrated
+                );
             }
         }
 
@@ -2739,17 +3581,30 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(matches!(verdict, crate::lifecycle::EnqueueVerdict::Blocked(_)), "{verdict:?}");
+            assert!(
+                matches!(verdict, crate::lifecycle::EnqueueVerdict::Blocked(_)),
+                "{verdict:?}"
+            );
 
-            let refusal = crate::commands::task::delete_task(GuiMutation::untracked(), b.app.state(), b.task_id.to_string())
-                .await
-                .expect_err("a delete would drop the only record of the integration");
-            assert_eq!(refusal, crate::lifecycle::DELETE_BLOCKED_BY_INTEGRATION_REASON);
+            let refusal = crate::commands::task::delete_task(
+                GuiMutation::untracked(),
+                b.app.state(),
+                b.task_id.to_string(),
+            )
+            .await
+            .expect_err("a delete would drop the only record of the integration");
+            assert_eq!(
+                refusal,
+                crate::lifecycle::DELETE_BLOCKED_BY_INTEGRATION_REASON
+            );
 
             assert_eq!(recovery(&b.in_memory().await), before);
             assert_eq!(recovery(&b.on_disk()), before);
             assert!(ref_exists(&b.repo, &git::pin_ref(b.task_id)));
-            assert_eq!(resume(&b.state(), b.task_id).await.unwrap().status, TaskStatus::Done);
+            assert_eq!(
+                resume(&b.state(), b.task_id).await.unwrap().status,
+                TaskStatus::Done
+            );
         }
 
         #[tokio::test]
@@ -2759,13 +3614,26 @@ mod tests {
                 let before = recovery(&b.in_memory().await);
 
                 let id = b.task_id.to_string();
-                let refusal = crate::commands::queue::add_to_queue(GuiMutation::untracked(), b.app.state(), id.clone()).await.unwrap_err();
+                let refusal = crate::commands::queue::add_to_queue(
+                    GuiMutation::untracked(),
+                    b.app.state(),
+                    id.clone(),
+                )
+                .await
+                .unwrap_err();
                 assert_eq!(refusal, REFUSAL);
-                let results = crate::commands::queue::bulk_add_to_queue(GuiMutation::untracked(), b.app.state(), vec![id.clone()])
-                    .await
-                    .unwrap();
+                let results = crate::commands::queue::bulk_add_to_queue(
+                    GuiMutation::untracked(),
+                    b.app.state(),
+                    vec![id.clone()],
+                )
+                .await
+                .unwrap();
                 assert!(results[0].contains(REFUSAL), "{results:?}");
-                let refusal = crate::commands::pr::create_pr(GuiMutation::untracked(), b.app.state(), id).await.unwrap_err();
+                let refusal =
+                    crate::commands::pr::create_pr(GuiMutation::untracked(), b.app.state(), id)
+                        .await
+                        .unwrap_err();
                 assert_eq!(refusal, REFUSAL);
 
                 assert_eq!(recovery(&b.in_memory().await), before);
@@ -2780,11 +3648,18 @@ mod tests {
         async fn a_record_where_no_control_can_finish_it_does_not_pin_the_task() {
             let b = board(false, false).await;
             let id = b.task_id;
-            let amend = move |s: &mut HashMap<Uuid, Task>| s.get_mut(&id).unwrap().status = TaskStatus::Backlog;
-            crate::lifecycle::record(&b.state().task.tasks, &b.state().storage, id, &amend).await.unwrap();
+            let amend = move |s: &mut HashMap<Uuid, Task>| {
+                s.get_mut(&id).unwrap().status = TaskStatus::Backlog
+            };
+            crate::lifecycle::record(&b.state().task.tasks, &b.state().storage, id, &amend)
+                .await
+                .unwrap();
             let moved = b.status(TaskStatus::Queue).await.unwrap().expect("exists");
             assert_eq!(moved.status, TaskStatus::Queue);
-            assert!(moved.local_integration.is_some_and(|r| r.is_pending()), "the record itself is kept");
+            assert!(
+                moved.local_integration.is_some_and(|r| r.is_pending()),
+                "the record itself is kept"
+            );
         }
 
         #[tokio::test]
@@ -2794,7 +3669,11 @@ mod tests {
 
             let discarded = discard(&b.state(), b.task_id).await.unwrap();
             assert!(discarded.local_integration.is_none());
-            let moved = b.status(TaskStatus::Backlog).await.unwrap().expect("exists");
+            let moved = b
+                .status(TaskStatus::Backlog)
+                .await
+                .unwrap()
+                .expect("exists");
             assert_eq!(moved.status, TaskStatus::Backlog);
         }
 
@@ -2802,7 +3681,11 @@ mod tests {
         async fn an_integrated_task_is_not_held_by_its_finished_record() {
             let b = board(false, false).await;
             resume(&b.state(), b.task_id).await.unwrap();
-            let moved = b.status(TaskStatus::Backlog).await.unwrap().expect("exists");
+            let moved = b
+                .status(TaskStatus::Backlog)
+                .await
+                .unwrap()
+                .expect("exists");
             assert_eq!(moved.status, TaskStatus::Backlog);
         }
 
@@ -2811,13 +3694,20 @@ mod tests {
             let b = board(false, false).await;
             let before = recovery(&b.in_memory().await);
 
-            let kept = b.drag(Some(TaskStatus::Done), 0).await.unwrap().expect("exists");
+            let kept = b
+                .drag(Some(TaskStatus::Done), 0)
+                .await
+                .unwrap()
+                .expect("exists");
             assert_eq!(recovery(&kept), before);
             let kept = b.drag(None, 0).await.unwrap().expect("exists");
             assert_eq!(recovery(&kept), before);
 
             let done = resume(&b.state(), b.task_id).await.unwrap();
-            assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
+            assert_eq!(
+                done.local_integration.unwrap().state,
+                IntegrationState::Integrated
+            );
         }
     }
 }

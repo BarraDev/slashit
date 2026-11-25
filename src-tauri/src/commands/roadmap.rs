@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
-use crate::domain::{
-    RoadmapFeature, CreateFeatureRequest, UpdateFeatureRequest,
-    RoadmapStatus,
-};
-use uuid::Uuid;
+use crate::domain::{CreateFeatureRequest, RoadmapFeature, RoadmapStatus, UpdateFeatureRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct RoadmapState {
@@ -240,11 +237,20 @@ mod tests {
             id: String,
         ) {
             let _ = create_roadmap_feature(GuiMutation::untracked(), state.clone(), create).await;
-            let _ = update_roadmap_feature(GuiMutation::untracked(), state.clone(), id.clone(), update).await;
-            let _ = delete_roadmap_feature(GuiMutation::untracked(), state.clone(), id.clone()).await;
+            let _ =
+                update_roadmap_feature(GuiMutation::untracked(), state.clone(), id.clone(), update)
+                    .await;
+            let _ =
+                delete_roadmap_feature(GuiMutation::untracked(), state.clone(), id.clone()).await;
             let _ = list_roadmap_features(state.clone(), None, None).await;
             let _ = get_roadmap_feature(state.clone(), id.clone()).await;
-            let _ = link_task_to_feature(GuiMutation::untracked(), state.clone(), id.clone(), id.clone()).await;
+            let _ = link_task_to_feature(
+                GuiMutation::untracked(),
+                state.clone(),
+                id.clone(),
+                id.clone(),
+            )
+            .await;
             let _ = unlink_task_from_feature(GuiMutation::untracked(), state, id.clone(), id).await;
         }
 

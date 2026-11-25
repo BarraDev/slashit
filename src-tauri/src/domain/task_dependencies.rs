@@ -28,10 +28,13 @@ pub fn parse_requested(raw: &[String]) -> Result<Vec<Uuid>, String> {
     let mut seen = HashSet::with_capacity(raw.len());
     let mut ids = Vec::with_capacity(raw.len());
     for text in raw {
-        let id = Uuid::parse_str(text)
-            .map_err(|_| format!("\"{text}\" is not a valid Task identifier; nothing was changed"))?;
+        let id = Uuid::parse_str(text).map_err(|_| {
+            format!("\"{text}\" is not a valid Task identifier; nothing was changed")
+        })?;
         if !seen.insert(id) {
-            return Err(format!("Task {id} is listed as a dependency more than once; nothing was changed"));
+            return Err(format!(
+                "Task {id} is listed as a dependency more than once; nothing was changed"
+            ));
         }
         ids.push(id);
     }
@@ -142,7 +145,9 @@ pub fn column_name(status: &TaskStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{NewTask, TaskCategory, TaskComplexity, TaskImpact, TaskPriority, SecuritySeverity};
+    use crate::domain::{
+        NewTask, SecuritySeverity, TaskCategory, TaskComplexity, TaskImpact, TaskPriority,
+    };
 
     fn task(project_id: Uuid, title: &str, dependencies: Vec<Uuid>) -> Task {
         let existing = HashMap::new();
@@ -271,7 +276,10 @@ mod tests {
         let parent = task(project, "parent", vec![]);
         let child = task(project, "child", vec![]);
         let graph = board(&[parent.clone(), child.clone()]);
-        assert_eq!(check_targets(&graph, child.id, project, &[parent.id]), Ok(()));
+        assert_eq!(
+            check_targets(&graph, child.id, project, &[parent.id]),
+            Ok(())
+        );
     }
 
     #[test]
@@ -287,8 +295,12 @@ mod tests {
         let project = Uuid::new_v4();
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         let legacy = task(project, "legacy", vec![a, b]);
-        assert!(change_refusal(&legacy, &[]).expect("refused").contains("more than one"));
-        assert!(change_refusal(&legacy, &[a]).expect("refused").contains("more than one"));
+        assert!(change_refusal(&legacy, &[])
+            .expect("refused")
+            .contains("more than one"));
+        assert!(change_refusal(&legacy, &[a])
+            .expect("refused")
+            .contains("more than one"));
     }
 
     #[test]

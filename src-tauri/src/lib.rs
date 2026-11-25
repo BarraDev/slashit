@@ -1,41 +1,41 @@
 // SPDX-License-Identifier: MPL-2.0
-pub mod domain;
 pub mod commands;
+pub mod domain;
 
-pub mod test_helpers;
 mod acp;
 mod agents;
 pub mod config;
-mod session;
-mod queue;
-pub mod review_fix_residue;
-pub mod review_fix_apply;
-mod pty;
 mod host_process;
-mod worktree;
 mod main_window;
+mod pty;
+mod queue;
+pub mod review_fix_apply;
+pub mod review_fix_residue;
+mod session;
 mod storage_accounting;
+pub mod test_helpers;
+mod worktree;
 // Public because `build.rs` compiles this module too; the declaration parser is
 // used by the build script and by tests, not by the application's runtime.
 pub mod release_channel;
 // Public for the same reason: `build.rs` compiles the provenance rules too.
-pub mod source_provenance;
-mod update_feed;
-/// What GitHub last said about the pull requests linked to tasks.
-pub mod pr_status;
-/// Building `AppState` once, for whichever front end wants it.
-pub mod lifecycle;
-pub mod conversation_actions;
-pub mod conversation_executions;
-pub mod conversation_context;
-pub mod coordinator_reads;
 pub mod app_core;
+pub mod conversation_actions;
+pub mod conversation_context;
+pub mod conversation_executions;
+pub mod coordinator_reads;
 /// Headless execution, sharing the whole stack with the GUI.
 pub mod daemon;
 /// Transport-neutral event emission, so the backend does not need a webview.
 pub mod events;
 /// What kind of process this is, and the few operations that differ.
 pub mod instance;
+/// Building `AppState` once, for whichever front end wants it.
+pub mod lifecycle;
+/// What GitHub last said about the pull requests linked to tasks.
+pub mod pr_status;
+pub mod source_provenance;
+mod update_feed;
 // The control channel. No longer Unix-gated: the transport layer now provides
 // a Windows named pipe alongside the Unix socket, so the module compiles and
 // works on every supported platform.
@@ -252,183 +252,197 @@ pub fn run() {
             let restart_requested = restart_requested.clone();
             let ownership_slot = ownership_slot.clone();
             move |app| {
-            // The main window first, so nothing below runs before its boundary exists.
-            main_window::create(app)?;
-            let state: tauri::State<AppState> = app.state();
+                // The main window first, so nothing below runs before its boundary exists.
+                main_window::create(app)?;
+                let state: tauri::State<AppState> = app.state();
 
-            // The webview exists now, so the sink the rest of the backend
-            // emits through can finally be installed.
-            let events: events::SharedEventSink =
-                Arc::new(events::TauriEventSink::new(app.handle().clone()));
-            state.set_event_sink(events.clone());
+                // The webview exists now, so the sink the rest of the backend
+                // emits through can finally be installed.
+                let events: events::SharedEventSink =
+                    Arc::new(events::TauriEventSink::new(app.handle().clone()));
+                state.set_event_sink(events.clone());
 
-            let control: instance::SharedInstanceControl = Arc::new(GuiControl {
-                handle: app.handle().clone(),
-            });
-
-            let executor = Arc::new(queue::TaskExecutor::new(
-                queue::executor::TaskExecutorConfig {
-                    tasks: state.task.tasks.clone(),
-                    queue_manager: state.queue.manager.clone(),
-                    executions: state.agent.executions.clone(),
-                    logs: state.agent.logs.clone(),
-                    projects: state.project.projects.clone(),
-                    repositories: state.repository.repositories.clone(),
-                    workspace_registry: state.workspace.registry.clone(),
-                    storage: state.storage.clone(),
-                    worktree_manager: state.worktree_manager.clone(),
-                    events: events.clone(),
-                    lifecycle: state.task_lifecycle_locks.clone(),
-                    start_guard: state.start_guard.clone(),
-                    pr_statuses: state.pr_statuses.clone(),
-                },
-            ));
-            let _ = state.executor.set(executor.clone());
-            // Tauri's runtime, not `tokio::spawn`: this closure runs on the
-            // main thread before the event loop starts, with no reactor in
-            // thread-local scope. Same idiom as the IPC server below.
-            let polling_handle = tauri::async_runtime::spawn(
-                executor.polling_loop(Some(shutdown_rx.clone())),
-            );
-            println!("SlashIt: Task executor started");
-
-            // The control channel. The same server the daemon runs; only the
-            // sink and the window control differ.
-            {
-                let ipc_ctx = Arc::new(ipc::IpcContext {
-                    tasks: state.task.tasks.clone(),
-                    projects: state.project.projects.clone(),
-                    executions: state.agent.executions.clone(),
-                    pty: state.pty.clone(),
-                    queue_manager: state.queue.manager.clone(),
-                    storage: state.storage.clone(),
-                    project_gate: state.task.project_gate.clone(),
-                    events: events.clone(),
-                    control: control.clone(),
-                    features: state.features.clone(),
-                    repositories: state.repository.repositories.clone(),
-                    worktree_manager: state.worktree_manager.clone(),
-                    task_lifecycle_locks: state.task_lifecycle_locks.clone(),
-                    executor: state.executor.clone(),
-                    feature_diagnostics: None,
-                    paths: state.paths.clone(),
-                    start_guard: state.start_guard.clone(),
+                let control: instance::SharedInstanceControl = Arc::new(GuiControl {
+                    handle: app.handle().clone(),
                 });
-                // Serving the endpoints claimed before hydration. Nothing is
-                // bound here, so this can no longer fail because another
-                // instance took them in the meantime — that race was decided
-                // at the top of `run()`, while there was still nothing to
-                // corrupt.
-                let app_handle = app.handle().clone();
-                // The claim on the endpoints stays with this supervising task,
-                // not with the server task inside it, and is released only
-                // after the executor is quiescent.
-                let ownership = bound.ownership();
-                let poller = ipc::poller_join(polling_handle);
-                let handlers = ipc::HandlerRescue::default();
-                let supervision = ipc::Supervision {
-                    shutdown: shutdown_rx.clone(),
-                    poller: Some(poller.clone()),
-                    handlers: handlers.clone(),
-                    // The user already confirmed quitting with work running
-                    // (`request_quit`), so running agents are cancelled and
-                    // reaped, not waited for.
-                    finish_grace: std::time::Duration::ZERO,
-                };
-                let executor_cell = state.executor.clone();
-                tauri::async_runtime::spawn(async move {
-                    let server = tauri::async_runtime::spawn(async move {
-                        bound.attach(ipc_ctx).serve_until(supervision).await
-                    });
-                    let result = match server.await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            eprintln!("SlashIt: the IPC supervisor task failed: {error}");
-                            ipc::quiesce_after_supervisor_failure(
-                                executor_cell.get().map(|executor| executor.as_ref()),
-                                Some(poller),
-                                &handlers,
-                            )
-                            .await;
-                            Err(anyhow::anyhow!("the IPC supervisor task failed: {error}"))
-                        }
-                    };
-                    if let Err(error) = &result {
-                        eprintln!("SlashIt: the instance failed closed and is exiting: {error}");
-                    }
-                    // Terminals end with the application, and the shutdown waits
-                    // for their process groups to be gone: the process exits
-                    // right after this, before a detached SIGKILL could run.
-                    let terminals: Vec<_> = app_handle.state::<AppState>().pty.sessions.lock().await.drain().map(|(_, session)| session).collect();
-                    pty::manager::end_sessions(terminals).await;
-                    *ownership_slot.lock().unwrap() = Some(ownership);
-                    shutdown_complete.store(true, std::sync::atomic::Ordering::Release);
-                    // An update restart waits for the same drain as a quit.
-                    if result.is_ok()
-                        && restart_requested.load(std::sync::atomic::Ordering::SeqCst)
-                    {
-                        // Windows installs here, after the drain: the
-                        // installer step ends the process.
-                        if let Err(error) =
-                            commands::updater::install_staged_after_drain(&app_handle).await
-                        {
-                            eprintln!("SlashIt: the staged update could not be installed: {error}");
-                        }
-                        app_handle.restart();
-                    }
-                    app_handle.exit(if result.is_ok() { 0 } else { 1 });
-                });
-                println!("SlashIt: IPC server starting");
-            }
 
-            // System tray
-            {
-                use tauri::menu::{MenuBuilder, MenuItem};
-                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+                let executor = Arc::new(queue::TaskExecutor::new(
+                    queue::executor::TaskExecutorConfig {
+                        tasks: state.task.tasks.clone(),
+                        queue_manager: state.queue.manager.clone(),
+                        executions: state.agent.executions.clone(),
+                        logs: state.agent.logs.clone(),
+                        projects: state.project.projects.clone(),
+                        repositories: state.repository.repositories.clone(),
+                        workspace_registry: state.workspace.registry.clone(),
+                        storage: state.storage.clone(),
+                        worktree_manager: state.worktree_manager.clone(),
+                        events: events.clone(),
+                        lifecycle: state.task_lifecycle_locks.clone(),
+                        start_guard: state.start_guard.clone(),
+                        pr_statuses: state.pr_statuses.clone(),
+                    },
+                ));
+                let _ = state.executor.set(executor.clone());
+                // Tauri's runtime, not `tokio::spawn`: this closure runs on the
+                // main thread before the event loop starts, with no reactor in
+                // thread-local scope. Same idiom as the IPC server below.
+                let polling_handle =
+                    tauri::async_runtime::spawn(executor.polling_loop(Some(shutdown_rx.clone())));
+                println!("SlashIt: Task executor started");
 
-                // The hover name on Linux is the StatusNotifierItem title, which libayatana
-                // takes from the GLib application name (default: the binary, `slashit-ui`).
-                #[cfg(target_os = "linux")]
+                // The control channel. The same server the daemon runs; only the
+                // sink and the window control differ.
                 {
-                    extern "C" {
-                        fn g_set_application_name(application_name: *const std::ffi::c_char);
-                    }
-                    // Safety: the literal is a valid NUL-terminated string, and GLib copies it.
-                    unsafe { g_set_application_name(c"SlashIt".as_ptr()) };
+                    let ipc_ctx = Arc::new(ipc::IpcContext {
+                        tasks: state.task.tasks.clone(),
+                        projects: state.project.projects.clone(),
+                        executions: state.agent.executions.clone(),
+                        pty: state.pty.clone(),
+                        queue_manager: state.queue.manager.clone(),
+                        storage: state.storage.clone(),
+                        project_gate: state.task.project_gate.clone(),
+                        events: events.clone(),
+                        control: control.clone(),
+                        features: state.features.clone(),
+                        repositories: state.repository.repositories.clone(),
+                        worktree_manager: state.worktree_manager.clone(),
+                        task_lifecycle_locks: state.task_lifecycle_locks.clone(),
+                        executor: state.executor.clone(),
+                        feature_diagnostics: None,
+                        paths: state.paths.clone(),
+                        start_guard: state.start_guard.clone(),
+                    });
+                    // Serving the endpoints claimed before hydration. Nothing is
+                    // bound here, so this can no longer fail because another
+                    // instance took them in the meantime — that race was decided
+                    // at the top of `run()`, while there was still nothing to
+                    // corrupt.
+                    let app_handle = app.handle().clone();
+                    // The claim on the endpoints stays with this supervising task,
+                    // not with the server task inside it, and is released only
+                    // after the executor is quiescent.
+                    let ownership = bound.ownership();
+                    let poller = ipc::poller_join(polling_handle);
+                    let handlers = ipc::HandlerRescue::default();
+                    let supervision = ipc::Supervision {
+                        shutdown: shutdown_rx.clone(),
+                        poller: Some(poller.clone()),
+                        handlers: handlers.clone(),
+                        // The user already confirmed quitting with work running
+                        // (`request_quit`), so running agents are cancelled and
+                        // reaped, not waited for.
+                        finish_grace: std::time::Duration::ZERO,
+                    };
+                    let executor_cell = state.executor.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let server = tauri::async_runtime::spawn(async move {
+                            bound.attach(ipc_ctx).serve_until(supervision).await
+                        });
+                        let result = match server.await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                eprintln!("SlashIt: the IPC supervisor task failed: {error}");
+                                ipc::quiesce_after_supervisor_failure(
+                                    executor_cell.get().map(|executor| executor.as_ref()),
+                                    Some(poller),
+                                    &handlers,
+                                )
+                                .await;
+                                Err(anyhow::anyhow!("the IPC supervisor task failed: {error}"))
+                            }
+                        };
+                        if let Err(error) = &result {
+                            eprintln!(
+                                "SlashIt: the instance failed closed and is exiting: {error}"
+                            );
+                        }
+                        // Terminals end with the application, and the shutdown waits
+                        // for their process groups to be gone: the process exits
+                        // right after this, before a detached SIGKILL could run.
+                        let terminals: Vec<_> = app_handle
+                            .state::<AppState>()
+                            .pty
+                            .sessions
+                            .lock()
+                            .await
+                            .drain()
+                            .map(|(_, session)| session)
+                            .collect();
+                        pty::manager::end_sessions(terminals).await;
+                        *ownership_slot.lock().unwrap() = Some(ownership);
+                        shutdown_complete.store(true, std::sync::atomic::Ordering::Release);
+                        // An update restart waits for the same drain as a quit.
+                        if result.is_ok()
+                            && restart_requested.load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            // Windows installs here, after the drain: the
+                            // installer step ends the process.
+                            if let Err(error) =
+                                commands::updater::install_staged_after_drain(&app_handle).await
+                            {
+                                eprintln!(
+                                    "SlashIt: the staged update could not be installed: {error}"
+                                );
+                            }
+                            app_handle.restart();
+                        }
+                        app_handle.exit(if result.is_ok() { 0 } else { 1 });
+                    });
+                    println!("SlashIt: IPC server starting");
                 }
 
-                let toggle_i = MenuItem::with_id(app, "toggle", "Show/Hide SlashIt", true, None::<&str>)?;
-                let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-                let menu = MenuBuilder::new(app).items(&[&toggle_i, &quit_i]).build()?;
-                let tray_icon = tauri::include_image!("icons/32x32.png");
+                // System tray
+                {
+                    use tauri::menu::{MenuBuilder, MenuItem};
+                    use tauri::tray::{
+                        MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
+                    };
 
-                let tray = TrayIconBuilder::new()
-                    .icon(tray_icon)
-                    .menu(&menu)
-                    .tooltip("SlashIt")
-                    .on_menu_event(move |app, event| match event.id.as_ref() {
-                        "toggle" => toggle_window(app),
-                        "quit" => request_quit(app),
-                        _ => {}
-                    })
-                    .on_tray_icon_event(|tray, event| {
-                        if let TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        } = event
-                        {
-                            toggle_window(tray.app_handle());
+                    // The hover name on Linux is the StatusNotifierItem title, which libayatana
+                    // takes from the GLib application name (default: the binary, `slashit-ui`).
+                    #[cfg(target_os = "linux")]
+                    {
+                        extern "C" {
+                            fn g_set_application_name(application_name: *const std::ffi::c_char);
                         }
-                    });
+                        // Safety: the literal is a valid NUL-terminated string, and GLib copies it.
+                        unsafe { g_set_application_name(c"SlashIt".as_ptr()) };
+                    }
 
-                #[cfg(not(target_os = "linux"))]
-                let tray = tray.show_menu_on_left_click(false);
+                    let toggle_i =
+                        MenuItem::with_id(app, "toggle", "Show/Hide SlashIt", true, None::<&str>)?;
+                    let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+                    let menu = MenuBuilder::new(app).items(&[&toggle_i, &quit_i]).build()?;
+                    let tray_icon = tauri::include_image!("icons/32x32.png");
 
-                let _tray = tray.build(app)?;
+                    let tray = TrayIconBuilder::new()
+                        .icon(tray_icon)
+                        .menu(&menu)
+                        .tooltip("SlashIt")
+                        .on_menu_event(move |app, event| match event.id.as_ref() {
+                            "toggle" => toggle_window(app),
+                            "quit" => request_quit(app),
+                            _ => {}
+                        })
+                        .on_tray_icon_event(|tray, event| {
+                            if let TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            } = event
+                            {
+                                toggle_window(tray.app_handle());
+                            }
+                        });
 
-                println!("SlashIt: System tray initialized");
-            }
+                    #[cfg(not(target_os = "linux"))]
+                    let tray = tray.show_menu_on_left_click(false);
+
+                    let _tray = tray.build(app)?;
+
+                    println!("SlashIt: System tray initialized");
+                }
 
                 Ok(())
             }

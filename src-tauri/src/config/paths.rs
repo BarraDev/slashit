@@ -320,7 +320,9 @@ impl AppPaths {
     /// Workspace has no custom folder. Application-owned, so it never lands in
     /// a Project's repository.
     pub fn workspace_managed_root(&self, workspace_id: Uuid) -> PathBuf {
-        self.data_dir.join("workspaces").join(workspace_id.to_string())
+        self.data_dir
+            .join("workspaces")
+            .join(workspace_id.to_string())
     }
 
     /// Daemon credentials. Separate from `config.toml` so it can be locked to
@@ -382,7 +384,8 @@ impl AppPaths {
     }
 
     pub fn primary_conversation_file(&self, project_id: Uuid) -> PathBuf {
-        self.conversations_dir().join(format!("{project_id}.primary"))
+        self.conversations_dir()
+            .join(format!("{project_id}.primary"))
     }
 
     /// The composer draft of a Project. The name carries no `.json` suffix on
@@ -394,7 +397,8 @@ impl AppPaths {
     /// Durable recovery records for Project deletions whose Conversation
     /// cleanup may not have completed before process exit.
     pub fn pending_project_conversation_deletion_file(&self, project_id: Uuid) -> PathBuf {
-        self.conversations_dir().join(format!("{project_id}.delete-pending"))
+        self.conversations_dir()
+            .join(format!("{project_id}.delete-pending"))
     }
 
     /// Durable recovery records for Project deletions whose Task-record
@@ -405,7 +409,8 @@ impl AppPaths {
     /// deletion must still have been able to record the retry, and the fixed
     /// listing here finds every record however the file it names was routed.
     pub fn pending_project_tasks_deletion_file(&self, project_id: Uuid) -> PathBuf {
-        self.config_dir.join(format!("{project_id}.tasks-delete-pending"))
+        self.config_dir
+            .join(format!("{project_id}.tasks-delete-pending"))
     }
 
     /// Recovery record for an import of a Project from a bundle. It is written
@@ -416,7 +421,8 @@ impl AppPaths {
     }
 
     pub fn conversation_file(&self, conversation_id: Uuid) -> PathBuf {
-        self.conversations_dir().join(format!("{conversation_id}.json"))
+        self.conversations_dir()
+            .join(format!("{conversation_id}.json"))
     }
 
     // --- Machine-local files -----------------------------------------------
@@ -676,8 +682,7 @@ mod tests {
         // The temp directory is world-writable and shared between accounts, so
         // a fixed name there can be pre-created by another local user, who then
         // owns the directory our socket is bound in.
-        let dir =
-            with_xdg_runtime_dir("", || AppPaths::new().unwrap().runtime_dir().to_path_buf());
+        let dir = with_xdg_runtime_dir("", || AppPaths::new().unwrap().runtime_dir().to_path_buf());
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
             name.starts_with("slashit-") && name.len() > "slashit-".len(),
@@ -722,7 +727,10 @@ mod tests {
         let ka = ProjectKey::for_path(&one).key;
         let kb = ProjectKey::for_path(&two).key;
 
-        assert_ne!(ka, kb, "same directory name in different parents must differ");
+        assert_ne!(
+            ka, kb,
+            "same directory name in different parents must differ"
+        );
         assert!(ka.as_str().starts_with("myapp-"));
         assert!(kb.as_str().starts_with("myapp-"));
     }
@@ -797,7 +805,10 @@ mod tests {
         let key = ProjectKey::for_path(&project).key;
 
         let wt = p.worktree_path(&key, "task-1");
-        assert!(!wt.starts_with(&project), "worktree must not be inside the repo");
+        assert!(
+            !wt.starts_with(&project),
+            "worktree must not be inside the repo"
+        );
         assert!(wt.starts_with(p.data_dir()));
     }
 

@@ -241,7 +241,9 @@ pub(super) fn spawn_with(
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
         end_unsupervised(child, pid, held);
-        return Err(AcpError::Spawn("the provider's pipes were not captured".into()));
+        return Err(AcpError::Spawn(
+            "the provider's pipes were not captured".into(),
+        ));
     };
 
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -565,7 +567,8 @@ mod tests {
 
         fn kill_group(&self, _pid: u32) -> Result<(), String> {
             self.kill_calls.fetch_add(1, SeqCst);
-            self.kill_error.map_or(Ok(()), |reason| Err(reason.to_string()))
+            self.kill_error
+                .map_or(Ok(()), |reason| Err(reason.to_string()))
         }
     }
 
@@ -595,7 +598,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_interrupted_wait_is_retried_before_the_group_is_ended() {
-        let kernel = Scripted::new(vec![Step::Interrupted, Step::Interrupted, Step::Exited], None);
+        let kernel = Scripted::new(
+            vec![Step::Interrupted, Step::Interrupted, Step::Exited],
+            None,
+        );
         let exit = reaped(kernel.clone(), &spec("sh", &["-c", "exit 3"])).await;
         assert_eq!(kernel.wait_calls.load(SeqCst), 3);
         assert_eq!(kernel.kill_calls.load(SeqCst), 1);
@@ -605,12 +611,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_leader_wait_never_signals_the_group() {
-        for failure in ["waitid: No child processes (ECHILD)", "waitid: Invalid argument (EINVAL)"] {
+        for failure in [
+            "waitid: No child processes (ECHILD)",
+            "waitid: Invalid argument (EINVAL)",
+        ] {
             let kernel = Scripted::new(vec![Step::Failed(failure)], None);
             let exit = reaped(kernel.clone(), &spec("sh", &["-c", "exit 0"])).await;
             assert_eq!(kernel.kill_calls.load(SeqCst), 0, "{failure}");
             assert_eq!(exit.group, GroupEnd::Unconfirmed(failure.to_string()));
-            assert!(exit.status.success(), "the leader is still reaped: {failure}");
+            assert!(
+                exit.status.success(),
+                "the leader is still reaped: {failure}"
+            );
         }
     }
 
@@ -629,7 +641,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_group_signal_is_reported_as_unconfirmed() {
-        let kernel = Scripted::new(vec![Step::Exited], Some("killpg: Operation not permitted (EPERM)"));
+        let kernel = Scripted::new(
+            vec![Step::Exited],
+            Some("killpg: Operation not permitted (EPERM)"),
+        );
         let exit = reaped(kernel.clone(), &spec("sh", &["-c", "exit 0"])).await;
         assert_eq!(kernel.kill_calls.load(SeqCst), 1);
         assert_eq!(
@@ -669,6 +684,9 @@ mod tests {
         let mut group = Group::new(kernel, Some(4242));
         group.signal();
         group.distrust("waitid: EINVAL".to_string());
-        assert_eq!(group.end, GroupEnd::Unconfirmed("killpg: EPERM".to_string()));
+        assert_eq!(
+            group.end,
+            GroupEnd::Unconfirmed("killpg: EPERM".to_string())
+        );
     }
 }

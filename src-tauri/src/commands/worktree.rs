@@ -13,8 +13,10 @@ pub async fn create_worktree(
 }
 
 /// [`create_worktree`], on an already parsed task id.
-pub(crate) async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result<String, String> {
-
+pub(crate) async fn create_worktree_inner(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<String, String> {
     // Acquiring a worktree for a task is a lifecycle ownership change, so it
     // waits behind any cleanup, terminalization or delete already running for
     // the same task. Without this, a create could hand back the very directory
@@ -23,7 +25,11 @@ pub(crate) async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid
 
     // Creating a checkout is what grows the disk, so it waits while new work
     // is paused for disk space, before anything is read or created.
-    state.start_guard.check().await.map_err(|block| block.to_string())?;
+    state
+        .start_guard
+        .check()
+        .await
+        .map_err(|block| block.to_string())?;
 
     // A cleanup that a previous process never finished leaves the recorded
     // checkout untrustworthy: nothing on disk says how much of it a dead
@@ -81,7 +87,9 @@ pub(crate) async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid
         if let Some(task) = staged.get_mut(&task_id) {
             task.worktree_path = Some(acquired.info.path.clone());
             task.branch_name = Some(acquired.info.branch.clone());
-            if let Some(evidence) = &acquired.checkout_admission { task.checkout_admission = Some(evidence.clone()); }
+            if let Some(evidence) = &acquired.checkout_admission {
+                task.checkout_admission = Some(evidence.clone());
+            }
             if let Some(base_commit) = &acquired.base_commit {
                 task.base_commit = Some(base_commit.clone());
             }
@@ -110,7 +118,9 @@ pub(crate) async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid
                 .release_unrecorded(&repo_path, &acquired.info, acquired.created_at.as_deref())
                 .await
         };
-        return Err(format!("The task's checkout could not be recorded ({e}); {outcome}"));
+        return Err(format!(
+            "The task's checkout could not be recorded ({e}); {outcome}"
+        ));
     }
 
     Ok(acquired.info.path)
@@ -190,7 +200,11 @@ mod tests {
             .current_dir(dir)
             .output()
             .expect("spawn git");
-        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
@@ -204,17 +218,20 @@ mod tests {
         git(&repo, &["init", "-q", "-b", "main"]);
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
         git(&repo, &["init", "-q", "--bare", remote.to_str().unwrap()]);
-        git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
         git(&repo, &["push", "-q", "origin", "main"]);
         git(&repo, &["remote", "set-head", "origin", "main"]);
-        let manager = WorktreeManager::new(
-            std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+        let manager = WorktreeManager::new(std::sync::Arc::new(
+            crate::config::paths::AppPaths::with_roots(
                 temp.path().join("config"),
                 temp.path().join("data"),
                 temp.path().join("cache"),
                 temp.path().join("runtime"),
-            )),
-        );
+            ),
+        ));
         (repo, manager)
     }
 
@@ -239,8 +256,9 @@ mod tests {
             b_branch: Option<&str>,
         ) -> (crate::AppState, std::path::PathBuf) {
             let (repo, _) = fixture(temp);
-            let (state, _) =
-                crate::app_core::build_state_with_paths(paths(temp)).await.expect("state");
+            let (state, _) = crate::app_core::build_state_with_paths(paths(temp))
+                .await
+                .expect("state");
             crate::test_helpers::attach_test_executor(&state);
             let repository = crate::domain::Repository {
                 id: Uuid::new_v4(),
@@ -250,7 +268,12 @@ mod tests {
                 created_at: chrono::Utc::now(),
             };
             let repository_id = repository.id;
-            state.repository.repositories.write().await.insert(repository_id, repository);
+            state
+                .repository
+                .repositories
+                .write()
+                .await
+                .insert(repository_id, repository);
             let project = crate::domain::Project {
                 id: Uuid::new_v4(),
                 name: "project".to_string(),
@@ -272,7 +295,12 @@ mod tests {
                 removed_at: None,
             };
             let project_id = project.id;
-            state.project.projects.write().await.insert(project_id, project);
+            state
+                .project
+                .projects
+                .write()
+                .await
+                .insert(project_id, project);
             for (id, branch) in [(A, a_branch), (B, b_branch)] {
                 let mut task = crate::test_helpers::create_test_task_full(
                     &format!("task {id}"),
@@ -317,7 +345,18 @@ mod tests {
                 "legacy" => repo.parent().unwrap().join(format!("repository.{branch}")),
                 _ => temp.path().join("elsewhere").join(branch),
             };
-            git(repo, &["worktree", "add", "-q", "-b", branch, "--", path.to_str().unwrap()]);
+            git(
+                repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    branch,
+                    "--",
+                    path.to_str().unwrap(),
+                ],
+            );
             path.to_string_lossy().to_string()
         }
 
@@ -341,10 +380,20 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{placement}: {e}"));
 
                 let b = state.task.tasks.read().await[&B].clone();
-                assert_eq!(b.branch_name, Some(WorktreeManager::branch_for_task(B)), "{placement}");
-                assert!(!same_path(&a_path, &b_path), "{placement}: B was given A's checkout");
+                assert_eq!(
+                    b.branch_name,
+                    Some(WorktreeManager::branch_for_task(B)),
+                    "{placement}"
+                );
+                assert!(
+                    !same_path(&a_path, &b_path),
+                    "{placement}: B was given A's checkout"
+                );
                 assert_eq!(git(&repo, &["rev-parse", BRANCH]), a_tip, "{placement}");
-                assert_eq!(git(Path::new(&a_path), &["branch", "--show-current"]), BRANCH);
+                assert_eq!(
+                    git(Path::new(&a_path), &["branch", "--show-current"]),
+                    BRANCH
+                );
             }
         }
 
@@ -397,9 +446,17 @@ mod tests {
             assert!(!same_path(&a_path, &b_path));
             let tasks = state.task.tasks.read().await;
             for id in [A, B] {
-                assert_eq!(tasks[&id].branch_name, Some(WorktreeManager::branch_for_task(id)));
+                assert_eq!(
+                    tasks[&id].branch_name,
+                    Some(WorktreeManager::branch_for_task(id))
+                );
             }
-            assert_eq!(git(&repo, &["worktree", "list", "--porcelain"]).matches("worktree ").count(), 3);
+            assert_eq!(
+                git(&repo, &["worktree", "list", "--porcelain"])
+                    .matches("worktree ")
+                    .count(),
+                3
+            );
         }
 
         /// A checkout the panel created stays on the board when its record
@@ -435,7 +492,9 @@ mod tests {
             // amended one, in memory and on the file: the checkout is
             // recorded, and both sides agree.
             let recorded = state.task.tasks.read().await[&A].clone();
-            let path = recorded.worktree_path.expect("the record is adopted in memory");
+            let path = recorded
+                .worktree_path
+                .expect("the record is adopted in memory");
             let project_id = recorded.project_id;
             let persisted = state
                 .storage
@@ -449,7 +508,10 @@ mod tests {
 
             // The checkout itself survives, registered with git, on the
             // branch the record named.
-            assert!(Path::new(&path).is_dir(), "the checkout file tree must be kept");
+            assert!(
+                Path::new(&path).is_dir(),
+                "the checkout file tree must be kept"
+            );
             let listing = git(&repo, &["worktree", "list", "--porcelain"]);
             assert!(
                 listing.contains(&format!("worktree {path}\n")),
@@ -469,14 +531,25 @@ mod tests {
             let temp = tempfile::TempDir::new().unwrap();
             let (state, repo) = state_with_two_tasks(&temp, Some(BRANCH), Some(BRANCH)).await;
             place_checkout(&state, &temp, &repo, BRANCH, "managed").await;
-            let refs = git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+            let refs = git(
+                &repo,
+                &["for-each-ref", "--format=%(refname) %(objectname)"],
+            );
 
             for (task, other) in [(A, B), (B, A)] {
-                let refused = create_worktree_inner(&state, task).await.expect_err("refused");
+                let refused = create_worktree_inner(&state, task)
+                    .await
+                    .expect_err("refused");
                 assert!(refused.contains(&other.to_string()), "{refused}");
                 assert_eq!(state.task.tasks.read().await[&task].worktree_path, None);
             }
-            assert_eq!(git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+            assert_eq!(
+                git(
+                    &repo,
+                    &["for-each-ref", "--format=%(refname) %(objectname)"]
+                ),
+                refs
+            );
         }
 
         /// A checkout of the old name that no task records, as a start whose
@@ -490,16 +563,28 @@ mod tests {
                 let temp = tempfile::TempDir::new().unwrap();
                 let (state, repo) = state_with_two_tasks(&temp, Some("feature/a"), None).await;
                 let path = place_checkout(&state, &temp, &repo, BRANCH, placement).await;
-                let refs = git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+                let refs = git(
+                    &repo,
+                    &["for-each-ref", "--format=%(refname) %(objectname)"],
+                );
 
                 let refused = create_worktree_inner(&state, B)
                     .await
                     .err()
                     .unwrap_or_else(|| panic!("{placement}: an orphan was taken or stranded"));
                 let full = WorktreeManager::branch_for_task(B);
-                assert!(refused.contains(&format!("git branch -m {BRANCH} {full}")), "{refused}");
+                assert!(
+                    refused.contains(&format!("git branch -m {BRANCH} {full}")),
+                    "{refused}"
+                );
                 assert_eq!(state.task.tasks.read().await[&B].branch_name, None);
-                assert_eq!(git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+                assert_eq!(
+                    git(
+                        &repo,
+                        &["for-each-ref", "--format=%(refname) %(objectname)"]
+                    ),
+                    refs
+                );
 
                 git(&repo, &["branch", "-m", BRANCH, &full]);
                 let adopted = create_worktree_inner(&state, B)
@@ -522,8 +607,14 @@ mod tests {
             let full = WorktreeManager::branch_for_task(B);
 
             let refused = create_worktree_inner(&state, B).await.expect_err("refused");
-            assert!(refused.contains(&format!("git branch -m {BRANCH} {full}")), "{refused}");
-            assert!(refused.contains(&format!("git worktree add <directory> {full}")), "{refused}");
+            assert!(
+                refused.contains(&format!("git branch -m {BRANCH} {full}")),
+                "{refused}"
+            );
+            assert!(
+                refused.contains(&format!("git worktree add <directory> {full}")),
+                "{refused}"
+            );
 
             git(&repo, &["branch", "-m", BRANCH, &full]);
             let refused = create_worktree_inner(&state, B)
@@ -532,7 +623,10 @@ mod tests {
             assert!(refused.contains("already exists"), "{refused}");
 
             let dir = temp.path().join("taken-up");
-            git(&repo, &["worktree", "add", "-q", dir.to_str().unwrap(), &full]);
+            git(
+                &repo,
+                &["worktree", "add", "-q", dir.to_str().unwrap(), &full],
+            );
             let adopted = create_worktree_inner(&state, B).await.expect("adopted");
 
             assert!(same_path(&adopted, dir.to_str().unwrap()));
@@ -547,14 +641,21 @@ mod tests {
         async fn a_recorded_branch_is_reattached_after_its_checkout_is_removed_and_a_restart() {
             let temp = tempfile::TempDir::new().unwrap();
             let (state, repo) = state_with_two_tasks(&temp, None, None).await;
-            let first = create_worktree_inner(&state, B).await.expect("first checkout");
-            git(Path::new(&first), &["commit", "-q", "--allow-empty", "-m", "task work"]);
+            let first = create_worktree_inner(&state, B)
+                .await
+                .expect("first checkout");
+            git(
+                Path::new(&first),
+                &["commit", "-q", "--allow-empty", "-m", "task work"],
+            );
             let full = WorktreeManager::branch_for_task(B);
             let tip = git(&repo, &["rev-parse", &full]);
             git(&repo, &["worktree", "remove", "--", &first]);
             let mut config = crate::config::storage::AppConfig::default();
             for (id, repository) in state.repository.repositories.read().await.iter() {
-                config.repositories.insert(id.to_string(), repository.clone());
+                config
+                    .repositories
+                    .insert(id.to_string(), repository.clone());
             }
             for (id, project) in state.project.projects.read().await.iter() {
                 config.projects.insert(id.to_string(), project.clone());
@@ -562,14 +663,20 @@ mod tests {
             state.storage.save_config(&config).expect("save config");
             drop(state);
 
-            let (state, _) =
-                crate::app_core::build_state_with_paths(paths(&temp)).await.expect("restart");
+            let (state, _) = crate::app_core::build_state_with_paths(paths(&temp))
+                .await
+                .expect("restart");
             crate::test_helpers::attach_test_executor(&state);
             let reloaded = state.task.tasks.read().await[&B].clone();
             assert_eq!(reloaded.branch_name.as_deref(), Some(full.as_str()));
-            assert_eq!(reloaded.worktree_path, None, "startup clears a checkout git confirms gone");
+            assert_eq!(
+                reloaded.worktree_path, None,
+                "startup clears a checkout git confirms gone"
+            );
 
-            let second = create_worktree_inner(&state, B).await.expect("second checkout");
+            let second = create_worktree_inner(&state, B)
+                .await
+                .expect("second checkout");
 
             assert_eq!(git(Path::new(&second), &["rev-parse", "HEAD"]), tip);
             assert_eq!(git(Path::new(&second), &["branch", "--show-current"]), full);
@@ -609,12 +716,26 @@ mod tests {
             main_tip: String,
         }
 
-        fn provenance(t: &Task) -> (Option<String>, Option<String>, Option<String>, Option<BranchOrigin>) {
-            (t.worktree_path.clone(), t.branch_name.clone(), t.base_commit.clone(), t.branch_origin.clone())
+        fn provenance(
+            t: &Task,
+        ) -> (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<BranchOrigin>,
+        ) {
+            (
+                t.worktree_path.clone(),
+                t.branch_name.clone(),
+                t.base_commit.clone(),
+                t.branch_origin.clone(),
+            )
         }
 
         fn on_main() -> BranchOrigin {
-            BranchOrigin::DefaultBase { branch: Some("main".to_string()) }
+            BranchOrigin::DefaultBase {
+                branch: Some("main".to_string()),
+            }
         }
 
         fn refs(repo: &Path) -> String {
@@ -622,7 +743,9 @@ mod tests {
         }
 
         fn worktrees(repo: &Path) -> usize {
-            git(repo, &["worktree", "list", "--porcelain"]).matches("worktree ").count()
+            git(repo, &["worktree", "list", "--porcelain"])
+                .matches("worktree ")
+                .count()
         }
 
         /// A project over a repository with a published default base, one
@@ -637,7 +760,9 @@ mod tests {
                 temp.path().join("cache"),
                 temp.path().join("runtime"),
             ));
-            let (state, _) = crate::app_core::build_state_with_paths(paths).await.expect("state");
+            let (state, _) = crate::app_core::build_state_with_paths(paths)
+                .await
+                .expect("state");
             crate::test_helpers::attach_test_executor(&state);
             let repository = crate::domain::Repository {
                 id: Uuid::new_v4(),
@@ -647,7 +772,12 @@ mod tests {
                 created_at: chrono::Utc::now(),
             };
             let repository_id = repository.id;
-            state.repository.repositories.write().await.insert(repository_id, repository);
+            state
+                .repository
+                .repositories
+                .write()
+                .await
+                .insert(repository_id, repository);
             let project_id = Uuid::new_v4();
             state.project.projects.write().await.insert(
                 project_id,
@@ -690,17 +820,48 @@ mod tests {
                     task.base_commit = Some(main_tip.clone());
                     task.branch_origin = Some(on_main());
                     if class == Class::ReattachedRegistered {
-                        git(&repo, &["worktree", "add", "-q", "--", elsewhere.to_str().unwrap(), &branch]);
+                        git(
+                            &repo,
+                            &[
+                                "worktree",
+                                "add",
+                                "-q",
+                                "--",
+                                elsewhere.to_str().unwrap(),
+                                &branch,
+                            ],
+                        );
                     }
                 }
                 Class::AdoptedUnrecorded => {
-                    git(&repo, &["worktree", "add", "-q", "-b", &branch, "--", elsewhere.to_str().unwrap()]);
+                    git(
+                        &repo,
+                        &[
+                            "worktree",
+                            "add",
+                            "-q",
+                            "-b",
+                            &branch,
+                            "--",
+                            elsewhere.to_str().unwrap(),
+                        ],
+                    );
                 }
             }
             state.task.tasks.write().await.insert(task_id, task.clone());
-            state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+            state
+                .storage
+                .save_project_tasks(project_id, &[task])
+                .expect("seed the board");
 
-            World { temp, state, repo, task_id, project_id, main_tip }
+            World {
+                temp,
+                state,
+                repo,
+                task_id,
+                project_id,
+                main_tip,
+            }
         }
 
         impl World {
@@ -725,7 +886,12 @@ mod tests {
             /// What a restart does: read the board back from disk.
             async fn restart(&self) {
                 let on_disk = self.on_disk();
-                self.state.task.tasks.write().await.insert(self.task_id, on_disk);
+                self.state
+                    .task
+                    .tasks
+                    .write()
+                    .await
+                    .insert(self.task_id, on_disk);
             }
         }
 
@@ -746,24 +912,48 @@ mod tests {
                 .await
                 .expect_err("a checkout that cannot be recorded is not reported");
 
-            assert!(refused.contains("could not be recorded"), "{class:?}: {refused}");
-            assert_eq!(provenance(&w.in_memory().await), before, "{class:?}: the board");
+            assert!(
+                refused.contains("could not be recorded"),
+                "{class:?}: {refused}"
+            );
+            assert_eq!(
+                provenance(&w.in_memory().await),
+                before,
+                "{class:?}: the board"
+            );
             assert_eq!(provenance(&w.on_disk()), before, "{class:?}: the disk");
-            assert_eq!(refs(&w.repo), refs_before, "{class:?}: no branch is left created or moved");
+            assert_eq!(
+                refs(&w.repo),
+                refs_before,
+                "{class:?}: no branch is left created or moved"
+            );
             let added = usize::from(class == Class::AddedForRecorded);
-            assert_eq!(worktrees(&w.repo), worktrees_before + added, "{class:?}: worktrees");
+            assert_eq!(
+                worktrees(&w.repo),
+                worktrees_before + added,
+                "{class:?}: worktrees"
+            );
             drop(unwritable);
 
             w.restart().await;
-            create_worktree_inner(&w.state, w.task_id).await.expect("recorded once writes work");
+            create_worktree_inner(&w.state, w.task_id)
+                .await
+                .expect("recorded once writes work");
 
             let recorded = w.on_disk();
             let expected = match class {
                 Class::AdoptedUnrecorded => (None, None),
                 _ => (Some(w.main_tip.clone()), Some(on_main())),
             };
-            assert_eq!((recorded.base_commit, recorded.branch_origin), expected, "{class:?}");
-            assert_eq!(recorded.branch_name, Some(WorktreeManager::branch_for_task(w.task_id)));
+            assert_eq!(
+                (recorded.base_commit, recorded.branch_origin),
+                expected,
+                "{class:?}"
+            );
+            assert_eq!(
+                recorded.branch_name,
+                Some(WorktreeManager::branch_for_task(w.task_id))
+            );
         }
 
         #[tokio::test]
@@ -799,21 +989,35 @@ mod tests {
             // Published by `write_executable`'s short-lived child, not written
             // by this process, so git's exec of the hook cannot fail with
             // ETXTBSY while a fork still holds it open for writing.
-            crate::test_helpers::write_executable(&hook, "#!/bin/sh\necho made-by-hook > hook-output.txt\n");
+            crate::test_helpers::write_executable(
+                &hook,
+                "#!/bin/sh\necho made-by-hook > hook-output.txt\n",
+            );
             let Some(unwritable) = crate::test_helpers::UnwritableDir::new(&w.tasks_dir()) else {
                 eprintln!("skipped: the tasks directory stays writable (running as root?)");
                 return;
             };
 
-            let refused = create_worktree_inner(&w.state, w.task_id).await.expect_err("refused");
+            let refused = create_worktree_inner(&w.state, w.task_id)
+                .await
+                .expect_err("refused");
             drop(unwritable);
 
             let branch = WorktreeManager::branch_for_task(w.task_id);
             assert!(refused.contains("could not be recorded"), "{refused}");
-            assert!(refused.contains("kept"), "the refusal names what was kept: {refused}");
+            assert!(
+                refused.contains("kept"),
+                "the refusal names what was kept: {refused}"
+            );
             let checkout = git(&w.repo, &["worktree", "list", "--porcelain"]);
-            assert!(checkout.contains(&format!("branch refs/heads/{branch}")), "{checkout}");
-            assert_eq!(git(&w.repo, &["rev-parse", &format!("refs/heads/{branch}")]), w.main_tip);
+            assert!(
+                checkout.contains(&format!("branch refs/heads/{branch}")),
+                "{checkout}"
+            );
+            assert_eq!(
+                git(&w.repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+                w.main_tip
+            );
             assert_eq!(provenance(&w.on_disk()), (None, None, None, None));
         }
     }

@@ -53,7 +53,8 @@ fn spec(scenario: &str, request_timeout: Duration, permission_timeout: Duration)
 }
 
 fn start(scenario: &str) -> Connection {
-    Connection::spawn_holding(&spec(scenario, LONG, LONG), None, Box::new(())).expect("spawn fixture")
+    Connection::spawn_holding(&spec(scenario, LONG, LONG), None, Box::new(()))
+        .expect("spawn fixture")
 }
 
 /// Waits for the next event that satisfies `matches`, skipping the rest.
@@ -146,7 +147,10 @@ fn frame_excerpt_redacts_a_value_written_in_the_next_token() {
         assert!(shown.contains("[redacted]"), "{text} became {shown}");
     }
     let bearer = frame::excerpt("Authorization: Bearer xyz987");
-    assert!(bearer.contains("Bearer"), "the scheme stays visible: {bearer}");
+    assert!(
+        bearer.contains("Bearer"),
+        "the scheme stays visible: {bearer}"
+    );
 }
 
 #[test]
@@ -254,7 +258,10 @@ async fn unsupported_protocol_version_fails_closed_and_kills_the_agent() {
     let error = conn.initialize().await.unwrap_err();
     assert!(matches!(error, AcpError::UnsupportedProtocolVersion { ref agent } if agent == "2"));
     // The connection refuses every later request.
-    let later = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap_err();
+    let later = conn
+        .new_session_with_dirs(&std::env::temp_dir(), &[])
+        .await
+        .unwrap_err();
     assert!(matches!(
         later,
         AcpError::NotInitialized | AcpError::Closed(_)
@@ -272,7 +279,10 @@ async fn session_new_requires_an_absolute_working_directory() {
         .await
         .unwrap_err();
     assert!(matches!(relative, AcpError::InvalidWorkingDirectory(_)));
-    let session = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap();
+    let session = conn
+        .new_session_with_dirs(&std::env::temp_dir(), &[])
+        .await
+        .unwrap();
     assert_eq!(session.id(), "fixture-session-1");
     conn.shutdown(LONG).await.unwrap();
 }
@@ -280,7 +290,10 @@ async fn session_new_requires_an_absolute_working_directory() {
 #[tokio::test]
 async fn session_new_before_initialize_is_refused() {
     let conn = start("ok");
-    let error = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap_err();
+    let error = conn
+        .new_session_with_dirs(&std::env::temp_dir(), &[])
+        .await
+        .unwrap_err();
     assert_eq!(error, AcpError::NotInitialized);
     conn.shutdown(LONG).await.unwrap();
 }
@@ -301,9 +314,15 @@ async fn session_new_with_dirs_is_refused_when_the_agent_does_not_advertise_them
 #[test]
 fn session_new_params_omit_the_field_without_directories() {
     let params = super::connection::session_new_params("/work", &[]);
-    assert_eq!(params, serde_json::json!({"cwd": "/work", "mcpServers": []}));
+    assert_eq!(
+        params,
+        serde_json::json!({"cwd": "/work", "mcpServers": []})
+    );
     let with_dirs = super::connection::session_new_params("/work", &["/root".to_string()]);
-    assert_eq!(with_dirs["additionalDirectories"], serde_json::json!(["/root"]));
+    assert_eq!(
+        with_dirs["additionalDirectories"],
+        serde_json::json!(["/root"])
+    );
 }
 
 #[test]
@@ -361,9 +380,17 @@ async fn streamed_updates_are_typed_and_unknown_events_are_not_actions() {
 
 #[tokio::test]
 async fn permission_without_a_decision_is_cancelled_by_timeout() {
-    let conn = Connection::spawn_holding(&spec("permission", LONG, Duration::from_millis(100)), None, Box::new(())).unwrap();
+    let conn = Connection::spawn_holding(
+        &spec("permission", LONG, Duration::from_millis(100)),
+        None,
+        Box::new(()),
+    )
+    .unwrap();
     conn.initialize().await.unwrap();
-    let session = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap();
+    let session = conn
+        .new_session_with_dirs(&std::env::temp_dir(), &[])
+        .await
+        .unwrap();
     let mut events = conn.take_events().unwrap();
 
     let turn = {
@@ -393,9 +420,13 @@ async fn permission_without_a_decision_is_cancelled_by_timeout() {
 #[tokio::test]
 async fn permission_decisions_must_name_an_offered_option_of_the_matching_kind() {
     let (conn, session) = {
-        let conn = Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
+        let conn =
+            Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
         conn.initialize().await.unwrap();
-        let session = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap();
+        let session = conn
+            .new_session_with_dirs(&std::env::temp_dir(), &[])
+            .await
+            .unwrap();
         (conn, session)
     };
     let mut events = conn.take_events().unwrap();
@@ -436,9 +467,13 @@ async fn permission_decisions_must_name_an_offered_option_of_the_matching_kind()
 
 #[tokio::test]
 async fn an_explicit_reject_selects_only_the_reject_option() {
-    let conn = Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
+    let conn =
+        Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
     conn.initialize().await.unwrap();
-    let session = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap();
+    let session = conn
+        .new_session_with_dirs(&std::env::temp_dir(), &[])
+        .await
+        .unwrap();
     let mut events = conn.take_events().unwrap();
     let turn = {
         let conn = conn.clone();
@@ -471,9 +506,13 @@ async fn an_explicit_reject_selects_only_the_reject_option() {
 
 #[tokio::test]
 async fn cancel_answers_pending_permission_and_ends_the_turn_as_cancelled() {
-    let conn = Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
+    let conn =
+        Connection::spawn_holding(&spec("permission", LONG, LONG), None, Box::new(())).unwrap();
     conn.initialize().await.unwrap();
-    let session = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap();
+    let session = conn
+        .new_session_with_dirs(&std::env::temp_dir(), &[])
+        .await
+        .unwrap();
     let mut events = conn.take_events().unwrap();
     let turn = {
         let conn = conn.clone();
@@ -541,9 +580,17 @@ async fn a_cancel_is_written_while_a_request_is_waiting_for_its_reply() {
 
 #[tokio::test]
 async fn a_request_times_out_when_the_agent_is_silent() {
-    let conn = Connection::spawn_holding(&spec("silent", Duration::from_millis(150), LONG), None, Box::new(())).unwrap();
+    let conn = Connection::spawn_holding(
+        &spec("silent", Duration::from_millis(150), LONG),
+        None,
+        Box::new(()),
+    )
+    .unwrap();
     conn.initialize().await.unwrap();
-    let error = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap_err();
+    let error = conn
+        .new_session_with_dirs(&std::env::temp_dir(), &[])
+        .await
+        .unwrap_err();
     assert_eq!(
         error,
         AcpError::Timeout {
@@ -588,7 +635,10 @@ async fn an_unexpected_exit_fails_the_pending_turn_and_reports_the_status() {
 async fn malformed_stdout_fails_the_connection_and_kills_the_agent() {
     let conn = start("bad-json");
     conn.initialize().await.unwrap();
-    let error = conn.new_session_with_dirs(&std::env::temp_dir(), &[]).await.unwrap_err();
+    let error = conn
+        .new_session_with_dirs(&std::env::temp_dir(), &[])
+        .await
+        .unwrap_err();
     assert!(matches!(error, AcpError::Malformed(_)), "{error:?}");
     let status = conn.shutdown(LONG).await.unwrap();
     assert!(exit_is_failure(status));
@@ -639,13 +689,23 @@ async fn a_burst_of_kill_requests_starts_one_leader_wait() {
     };
     let owned = process::spawn(&spec, None, Box::new(())).expect("spawn");
     for _ in 0..50 {
-        owned.control.send(Control::Kill).expect("the supervisor is running");
+        owned
+            .control
+            .send(Control::Kill)
+            .expect("the supervisor is running");
     }
     let mut exit = owned.exit.clone();
-    exit.wait_for(Option::is_some).await.expect("the supervisor reports");
+    exit.wait_for(Option::is_some)
+        .await
+        .expect("the supervisor reports");
     let report = exit.borrow().clone();
     let exit = report.expect("a report").expect("the child was reaped");
-    assert_eq!(exit.status.signal(), Some(libc::SIGKILL), "{:?}", exit.status);
+    assert_eq!(
+        exit.status.signal(),
+        Some(libc::SIGKILL),
+        "{:?}",
+        exit.status
+    );
     assert_eq!(exit.group, process::GroupEnd::Ended);
     assert_eq!(owned.leader_waits.load(Ordering::SeqCst), 1);
 }
@@ -688,7 +748,10 @@ async fn a_failed_connection_ends_the_processes_its_agent_started() {
         permission_timeout: LONG,
     };
     let conn = Connection::spawn_holding(&spec, None, Box::new(())).expect("spawn");
-    assert!(conn.initialize().await.is_err(), "a malformed frame must fail");
+    assert!(
+        conn.initialize().await.is_err(),
+        "a malformed frame must fail"
+    );
     let pid: i32 = std::fs::read_to_string(&pid_file)
         .expect("the agent recorded its grandchild")
         .trim()
@@ -761,12 +824,9 @@ async fn a_held_resource_is_released_only_after_a_dropped_child_has_ended() {
     let lease = crate::agents::provider_lease::acquire(&lease_path)
         .expect("acquire")
         .expect("unix lease");
-    let conn = Connection::spawn_holding(
-        &spec("ignore-eof", LONG, LONG),
-        Some(lease),
-        Box::new(held),
-    )
-    .expect("spawn");
+    let conn =
+        Connection::spawn_holding(&spec("ignore-eof", LONG, LONG), Some(lease), Box::new(held))
+            .expect("spawn");
     drop(conn);
     // The child ignores the end of its input, and this test has not yielded
     // since the kill was requested, so the child is still running.
@@ -794,7 +854,9 @@ async fn a_held_resource_is_released_only_after_a_shut_down_child_has_ended() {
         .expect("unix lease");
     let conn = Connection::spawn_holding(&spec("ok", LONG, LONG), Some(lease), Box::new(held))
         .expect("spawn");
-    conn.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    conn.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
     let ended_when_released = tokio::time::timeout(LONG, ended)
         .await
         .expect("the held resource was never released")
@@ -819,7 +881,10 @@ async fn a_held_resource_is_released_only_after_a_child_that_failed_to_initializ
         Box::new(held),
     )
     .expect("spawn");
-    assert!(conn.initialize().await.is_err(), "the bad version must fail");
+    assert!(
+        conn.initialize().await.is_err(),
+        "the bad version must fail"
+    );
     drop(conn);
     let ended_when_released = tokio::time::timeout(LONG, ended)
         .await

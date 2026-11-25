@@ -39,7 +39,10 @@ pub struct ModelCatalog {
 }
 
 /// The last successful OpenCode discovery, kept for the process lifetime.
-static OPENCODE_CACHE: Mutex<OpenCodeCache> = Mutex::new(OpenCodeCache { started: 0, kept: None });
+static OPENCODE_CACHE: Mutex<OpenCodeCache> = Mutex::new(OpenCodeCache {
+    started: 0,
+    kept: None,
+});
 
 #[derive(Debug, Default)]
 struct OpenCodeCache {
@@ -50,7 +53,9 @@ struct OpenCodeCache {
 }
 
 fn locked(cache: &Mutex<OpenCodeCache>) -> std::sync::MutexGuard<'_, OpenCodeCache> {
-    cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Claude Code's model aliases. Always listed, whether or not the CLI is
@@ -89,7 +94,10 @@ pub fn parse_opencode_models(stdout: &str) -> Vec<RuntimeModel> {
 
 /// Reads at most `limit` bytes from `reader`. A stream longer than that is an
 /// error, so a runaway process cannot grow the buffer without bound.
-async fn read_capped(reader: impl tokio::io::AsyncRead + Unpin, limit: u64) -> Result<Vec<u8>, String> {
+async fn read_capped(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
     use tokio::io::AsyncReadExt;
     let mut bytes = Vec::new();
     // One byte past the limit tells an exact-size stream from a longer one.
@@ -198,7 +206,9 @@ async fn run_listing(
         }
     };
     if !status.success() {
-        return Err(format!("OpenCode exited with {status} while listing its models"));
+        return Err(format!(
+            "OpenCode exited with {status} while listing its models"
+        ));
     }
     let models = parse_opencode_models(&String::from_utf8_lossy(&bytes));
     if models.is_empty() {
@@ -260,7 +270,11 @@ async fn opencode_catalog(
         Err(error) => {
             // Keep the last good list: a failed refresh must not empty the
             // picker or drop a saved model.
-            let models = locked(cache).kept.as_ref().map(|(_, models)| models.clone()).unwrap_or_default();
+            let models = locked(cache)
+                .kept
+                .as_ref()
+                .map(|(_, models)| models.clone())
+                .unwrap_or_default();
             ModelCatalog {
                 provider: CodingProvider::OpenCode,
                 models,
@@ -277,7 +291,10 @@ mod tests {
     #[test]
     fn opencode_output_keeps_provider_model_lines_once_in_order() {
         let stdout = "ollama/llama3.2:3b\n\n  opencode-go/beam-free  \nnot a model\n/leading\ntrailing/\nollama/llama3.2:3b\nbad id/with space\n";
-        let ids: Vec<String> = parse_opencode_models(stdout).into_iter().map(|m| m.id).collect();
+        let ids: Vec<String> = parse_opencode_models(stdout)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
         assert_eq!(ids, vec!["ollama/llama3.2:3b", "opencode-go/beam-free"]);
     }
 
@@ -289,7 +306,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_listing_within_the_bound_is_read_whole() {
-        let bytes = read_capped(&b"ollama/llama3.2:3b\n"[..], 64).await.expect("within the bound");
+        let bytes = read_capped(&b"ollama/llama3.2:3b\n"[..], 64)
+            .await
+            .expect("within the bound");
         assert_eq!(bytes, b"ollama/llama3.2:3b\n");
     }
 
@@ -306,14 +325,20 @@ mod tests {
     #[tokio::test]
     async fn a_listing_of_exactly_the_bound_is_accepted() {
         let exact = [b'a'; 16];
-        let bytes = read_capped(&exact[..], 16).await.expect("exactly the bound is allowed");
+        let bytes = read_capped(&exact[..], 16)
+            .await
+            .expect("exactly the bound is allowed");
         assert_eq!(bytes.len(), 16);
     }
 
     /// Runs a shell script as the discovery program. `/bin/sh` is used directly
     /// so no executable file is written, which avoids a busy-binary race.
     #[cfg(unix)]
-    fn shell_listing(script: &str, timeout: Duration, max_output: u64) -> impl std::future::Future<Output = Result<Vec<RuntimeModel>, String>> {
+    fn shell_listing(
+        script: &str,
+        timeout: Duration,
+        max_output: u64,
+    ) -> impl std::future::Future<Output = Result<Vec<RuntimeModel>, String>> {
         let script = script.to_string();
         async move { run_listing("/bin/sh", &["-c", &script], "/unused", timeout, max_output).await }
     }
@@ -331,7 +356,11 @@ mod tests {
         .expect_err("an endless listing is refused");
         assert!(error.contains("more than 4096 bytes"), "{error}");
         // Overflow ends the run at once, not at the 20-second deadline.
-        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[cfg(unix)]
@@ -380,7 +409,10 @@ mod tests {
         while process_is_running(child) && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(!process_is_running(child), "background child {child} survived the deadline");
+        assert!(
+            !process_is_running(child),
+            "background child {child} survived the deadline"
+        );
     }
 
     #[cfg(unix)]
@@ -431,7 +463,10 @@ mod tests {
         while process_is_running(child) && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(!process_is_running(child), "background child {child} outlived the listing");
+        assert!(
+            !process_is_running(child),
+            "background child {child} outlived the listing"
+        );
     }
 
     #[tokio::test]
@@ -459,7 +494,9 @@ mod tests {
         let (release_older, released) = tokio::sync::oneshot::channel::<()>();
         let (older, newer) = tokio::join!(
             opencode_catalog(&cache, true, async {
-                older_started.send(()).expect("the newer refresh waits for this");
+                older_started
+                    .send(())
+                    .expect("the newer refresh waits for this");
                 released.await.expect("the older refresh is released");
                 Ok(parse_opencode_models("ollama/older:1b\n"))
             }),
@@ -472,7 +509,9 @@ mod tests {
                     std::future::ready(Ok(parse_opencode_models("ollama/newer:1b\n"))),
                 )
                 .await;
-                release_older.send(()).expect("the older refresh is waiting");
+                release_older
+                    .send(())
+                    .expect("the older refresh is waiting");
                 newer
             },
         );
@@ -485,6 +524,9 @@ mod tests {
             std::future::ready(Err("discovery must not run for a cached list".to_string())),
         )
         .await;
-        assert_eq!(kept.models[0].id, "ollama/newer:1b", "the newer list is what the cache keeps");
+        assert_eq!(
+            kept.models[0].id, "ollama/newer:1b",
+            "the newer list is what the cache keeps"
+        );
     }
 }

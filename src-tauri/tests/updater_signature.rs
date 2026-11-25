@@ -55,7 +55,9 @@ fn serve(routes: Routes) -> String {
 }
 
 fn answer(mut stream: TcpStream, routes: &Routes) {
-    let Ok(clone) = stream.try_clone() else { return };
+    let Ok(clone) = stream.try_clone() else {
+        return;
+    };
     let mut reader = BufReader::new(clone);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -69,7 +71,11 @@ fn answer(mut stream: TcpStream, routes: &Routes) {
             Ok(_) => {}
         }
     }
-    let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string();
     let (status, body) = routes
         .lock()
         .expect("routes lock")
@@ -85,7 +91,10 @@ fn answer(mut stream: TcpStream, routes: &Routes) {
 }
 
 fn publish(routes: &Routes, path: &str, status: u16, body: Vec<u8>) {
-    routes.lock().expect("routes lock").insert(path.to_string(), (status, body));
+    routes
+        .lock()
+        .expect("routes lock")
+        .insert(path.to_string(), (status, body));
 }
 
 /// A static updater manifest offering `version` for [`TARGET`].
@@ -106,7 +115,12 @@ fn start(artifact: &[u8], signature: &str) -> (Routes, String) {
     let routes = Routes::default();
     let base = serve(routes.clone());
     publish(&routes, ARTIFACT, 200, artifact.to_vec());
-    publish(&routes, MANIFEST, 200, manifest("2.0.0", signature, &format!("{base}{ARTIFACT}")));
+    publish(
+        &routes,
+        MANIFEST,
+        200,
+        manifest("2.0.0", signature, &format!("{base}{ARTIFACT}")),
+    );
     (routes, base)
 }
 
@@ -128,7 +142,9 @@ fn app() -> tauri::App<MockRuntime> {
 fn updater(app: &tauri::App<MockRuntime>, base: &str) -> Updater {
     app.handle()
         .updater_builder()
-        .endpoints(vec![format!("{base}{MANIFEST}").parse().expect("manifest URL")])
+        .endpoints(vec![format!("{base}{MANIFEST}")
+            .parse()
+            .expect("manifest URL")])
         .expect("endpoint")
         .target(TARGET)
         .timeout(Duration::from_secs(10))
@@ -162,7 +178,11 @@ async fn a_valid_artifact_and_signature_are_accepted() {
     let (_routes, base) = start(PAYLOAD, SIGNATURE.trim());
 
     let app = app();
-    let found = updater(&app, &base).check().await.expect("manifest").expect("update");
+    let found = updater(&app, &base)
+        .check()
+        .await
+        .expect("manifest")
+        .expect("update");
     // Download is where the plugin verifies the payload. Installation is not run.
     let bytes = found
         .download(|_, _| {}, || {})
@@ -178,7 +198,11 @@ async fn an_artifact_changed_after_signing_is_refused() {
     let (_routes, base) = start(TAMPERED, SIGNATURE.trim());
 
     let app = app();
-    let found = updater(&app, &base).check().await.expect("manifest").expect("update");
+    let found = updater(&app, &base)
+        .check()
+        .await
+        .expect("manifest")
+        .expect("update");
     let outcome = found.download(|_, _| {}, || {}).await;
 
     assert!(
@@ -192,7 +216,11 @@ async fn a_signature_from_another_key_is_refused() {
     let (_routes, base) = start(PAYLOAD, OTHER_KEY_SIGNATURE.trim());
 
     let app = app();
-    let found = updater(&app, &base).check().await.expect("manifest").expect("update");
+    let found = updater(&app, &base)
+        .check()
+        .await
+        .expect("manifest")
+        .expect("update");
     let outcome = found.download(|_, _| {}, || {}).await;
 
     assert!(
@@ -209,10 +237,18 @@ async fn a_release_that_is_not_newer_is_never_offered() {
         let routes = Routes::default();
         let base = serve(routes.clone());
         publish(&routes, ARTIFACT, 200, PAYLOAD.to_vec());
-        publish(&routes, MANIFEST, 200, manifest(version, SIGNATURE.trim(), &format!("{base}{ARTIFACT}")));
+        publish(
+            &routes,
+            MANIFEST,
+            200,
+            manifest(version, SIGNATURE.trim(), &format!("{base}{ARTIFACT}")),
+        );
 
         let app = app();
-        let answer = updater(&app, &base).check().await.map(|found| found.map(|update| update.version));
+        let answer = updater(&app, &base)
+            .check()
+            .await
+            .map(|found| found.map(|update| update.version));
 
         assert!(
             matches!(answer, Ok(None)),
@@ -228,20 +264,36 @@ async fn a_malformed_manifest_is_an_error_and_not_up_to_date() {
     publish(&routes, MANIFEST, 200, b"{ this is not a manifest".to_vec());
 
     let app = app();
-    let answer = updater(&app, &base).check().await.map(|found| found.map(|update| update.version));
+    let answer = updater(&app, &base)
+        .check()
+        .await
+        .map(|found| found.map(|update| update.version));
 
-    assert!(answer.is_err(), "an unreadable manifest must not read as up to date, got {answer:?}");
+    assert!(
+        answer.is_err(),
+        "an unreadable manifest must not read as up to date, got {answer:?}"
+    );
 }
 
 #[tokio::test]
 async fn an_unreachable_manifest_is_an_error_and_not_up_to_date() {
     // Reserve a port, then close it, so nothing listens there.
-    let port = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("address").port();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("address")
+        .port();
 
     let app = app();
-    let answer = updater(&app, &format!("http://127.0.0.1:{port}")).check().await.map(|found| found.map(|update| update.version));
+    let answer = updater(&app, &format!("http://127.0.0.1:{port}"))
+        .check()
+        .await
+        .map(|found| found.map(|update| update.version));
 
-    assert!(answer.is_err(), "an unreachable manifest must not read as up to date, got {answer:?}");
+    assert!(
+        answer.is_err(),
+        "an unreachable manifest must not read as up to date, got {answer:?}"
+    );
 }
 
 #[tokio::test]
@@ -252,13 +304,21 @@ async fn an_update_already_found_keeps_the_release_it_was_found_as() {
 
     let app = app();
     let plugin_updater = updater(&app, &base);
-    let found = plugin_updater.check().await.expect("manifest").expect("update");
+    let found = plugin_updater
+        .check()
+        .await
+        .expect("manifest")
+        .expect("update");
 
     publish(
         &routes,
         MANIFEST,
         200,
-        manifest("3.0.0", OTHER_KEY_SIGNATURE.trim(), &format!("{base}{ARTIFACT}")),
+        manifest(
+            "3.0.0",
+            OTHER_KEY_SIGNATURE.trim(),
+            &format!("{base}{ARTIFACT}"),
+        ),
     );
 
     assert_eq!(found.version, "2.0.0");
@@ -266,5 +326,8 @@ async fn an_update_already_found_keeps_the_release_it_was_found_as() {
         .download(|_, _| {}, || {})
         .await
         .expect("the release already found still verifies");
-    assert_eq!(bytes, PAYLOAD, "the accepted release, not the newer manifest, is what is fetched");
+    assert_eq!(
+        bytes, PAYLOAD,
+        "the accepted release, not the newer manifest, is what is fetched"
+    );
 }

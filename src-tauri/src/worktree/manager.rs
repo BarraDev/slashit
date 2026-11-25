@@ -87,7 +87,11 @@ pub enum WorktreeRecovery {
     /// is gone. The branch stays checked out there, and no checkout of it can
     /// be created until the user unlocks it, so the reference is kept. The
     /// fields are those of [`CheckoutRegistration::MissingLocked`].
-    Locked { path: String, branch: Option<String>, reason: Option<String> },
+    Locked {
+        path: String,
+        branch: Option<String>,
+        reason: Option<String>,
+    },
 }
 
 /// What git holds for one Task Checkout, found by its path or by its branch.
@@ -113,11 +117,19 @@ pub enum CheckoutRegistration {
     /// Registered and not locked, and its directory is gone. `branch` is the
     /// branch it has checked out, `None` when its `HEAD` is detached; `head`
     /// is the commit its `HEAD` is at, as git lists it.
-    MissingPrunable { path: String, branch: Option<String>, head: Option<String> },
+    MissingPrunable {
+        path: String,
+        branch: Option<String>,
+        head: Option<String>,
+    },
     /// Registered and locked, and its directory is gone. `branch` is the
     /// branch it has checked out, `None` when its `HEAD` is detached;
     /// `reason` is the one given to `git worktree lock --reason`, if any.
-    MissingLocked { path: String, branch: Option<String>, reason: Option<String> },
+    MissingLocked {
+        path: String,
+        branch: Option<String>,
+        reason: Option<String>,
+    },
     /// Git could not be asked, or the filesystem could not say whether the
     /// directory is there. Nothing may be concluded from it.
     Unknown(String),
@@ -143,7 +155,12 @@ impl<'a> ListedWorktree<'a> {
         for field in porcelain.split('\0') {
             if let Some(path) = field.strip_prefix("worktree ") {
                 records.extend(current.take());
-                current = Some(Self { path, head: None, branch: None, locked: None });
+                current = Some(Self {
+                    path,
+                    head: None,
+                    branch: None,
+                    locked: None,
+                });
             } else if field.is_empty() {
                 records.extend(current.take());
             } else if let Some(record) = current.as_mut() {
@@ -401,7 +418,9 @@ impl ReflogEntry {
             .map(|(action, _)| action);
         Some(match action {
             Some("start") => RebaseStep::Start,
-            Some("finish") if self.message.contains(": returning to refs/heads/") => RebaseStep::Finish,
+            Some("finish") if self.message.contains(": returning to refs/heads/") => {
+                RebaseStep::Finish
+            }
             Some("finish") => RebaseStep::Abort,
             Some("abort") => RebaseStep::Abort,
             _ => RebaseStep::Step,
@@ -491,7 +510,11 @@ fn completed_rebase_transients(
     if let Some((_, produced)) = open {
         protected.extend(produced);
     }
-    steps.into_iter().filter(|id| !protected.contains(id)).map(str::to_string).collect()
+    steps
+        .into_iter()
+        .filter(|id| !protected.contains(id))
+        .map(str::to_string)
+        .collect()
 }
 
 /// What to tell a user whose Task Checkout at `path` is gone while git
@@ -505,7 +528,12 @@ pub fn locked_registration_notice(
     reason: Option<&str>,
 ) -> String {
     let branch = branch
-        .map(|b| format!(", which keeps branch {} checked out there", b.trim_start_matches("refs/heads/")))
+        .map(|b| {
+            format!(
+                ", which keeps branch {} checked out there",
+                b.trim_start_matches("refs/heads/")
+            )
+        })
         .unwrap_or_default();
     let reason = reason
         .map(|r| format!(" (lock reason: {r})"))
@@ -560,13 +588,19 @@ mod same_path_tests {
         let through_alias = through_alias.to_str().unwrap();
         let resolved = real.join("checkout");
         let resolved = resolved.to_str().unwrap();
-        assert!(same_path(through_alias, resolved), "the alias reaches the same directory");
+        assert!(
+            same_path(through_alias, resolved),
+            "the alias reaches the same directory"
+        );
 
         // Retargeting the alias moves the name to another directory, so it no
         // longer matches the one it used to name.
         std::fs::remove_file(&alias).unwrap();
         symlink(&other, &alias).unwrap();
-        assert!(!same_path(through_alias, resolved), "a retargeted alias is another checkout");
+        assert!(
+            !same_path(through_alias, resolved),
+            "a retargeted alias is another checkout"
+        );
 
         // A path that does not exist names nothing that exists, so it matches
         // only itself as written.
@@ -720,13 +754,15 @@ impl WorktreeManager {
         // where nothing can reach it, and the task's reference is then the
         // only thing pointing at it.
         match CheckoutState::of(Ok(porcelain), recorded_path, branch).holding() {
-            Some(CheckoutRegistration::MissingLocked { path, branch, reason }) => {
-                WorktreeRecovery::Locked {
-                    path: path.clone(),
-                    branch: branch.clone(),
-                    reason: reason.clone(),
-                }
-            }
+            Some(CheckoutRegistration::MissingLocked {
+                path,
+                branch,
+                reason,
+            }) => WorktreeRecovery::Locked {
+                path: path.clone(),
+                branch: branch.clone(),
+                reason: reason.clone(),
+            },
             Some(_) => WorktreeRecovery::Unverified,
             None => WorktreeRecovery::ConfirmedAbsent,
         }
@@ -825,10 +861,17 @@ impl WorktreeManager {
     /// (see [`Self::is_primary_checkout`]), reading git's registrations
     /// without changing anything. A listing git cannot produce refuses too:
     /// whether the checkout is the user's own is then unknown.
-    pub(crate) async fn refuse_primary_checkout(repo_path: &str, checkout: &str) -> Result<(), String> {
-        let output = super::registry_lock::output(git_program(), repo_path, &["worktree", "list", "--porcelain", "-z"])
-            .await
-            .map_err(|e| format!("Git's checkout registrations could not be read: {e}"))?;
+    pub(crate) async fn refuse_primary_checkout(
+        repo_path: &str,
+        checkout: &str,
+    ) -> Result<(), String> {
+        let output = super::registry_lock::output(
+            git_program(),
+            repo_path,
+            &["worktree", "list", "--porcelain", "-z"],
+        )
+        .await
+        .map_err(|e| format!("Git's checkout registrations could not be read: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "Git's checkout registrations could not be read: {}",
@@ -837,7 +880,9 @@ impl WorktreeManager {
         }
         let porcelain = String::from_utf8_lossy(&output.stdout);
         let project_root = Self::project_checkout_root(repo_path).await?;
-        if Self::is_primary_checkout(Path::new(checkout), repo_path, &porcelain) || same_path(checkout, &project_root) {
+        if Self::is_primary_checkout(Path::new(checkout), repo_path, &porcelain)
+            || same_path(checkout, &project_root)
+        {
             return Err(format!(
                 "{checkout} is the repository's own checkout, not a Task Checkout, so no coding run may start \
                  there. Nothing was changed."
@@ -854,20 +899,29 @@ impl WorktreeManager {
     /// listing names it. A failed lookup refuses: the checkout's identity is
     /// then unknown.
     async fn project_checkout_root(repo_path: &str) -> Result<String, String> {
-        let output = super::registry_lock::output(git_program(), repo_path, &["rev-parse", "--show-toplevel"])
-            .await
-            .map_err(|e| format!("The Project's own checkout could not be identified: {e}"))?;
+        let output = super::registry_lock::output(
+            git_program(),
+            repo_path,
+            &["rev-parse", "--show-toplevel"],
+        )
+        .await
+        .map_err(|e| format!("The Project's own checkout could not be identified: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "The Project's own checkout could not be identified: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        let root = String::from_utf8(output.stdout)
-            .map_err(|_| "The Project's own checkout could not be identified: git's output is not UTF-8".to_string())?;
+        let root = String::from_utf8(output.stdout).map_err(|_| {
+            "The Project's own checkout could not be identified: git's output is not UTF-8"
+                .to_string()
+        })?;
         let root = root.trim_end_matches(['\r', '\n']);
         if root.is_empty() {
-            return Err("The Project's own checkout could not be identified: git reported no checkout root".into());
+            return Err(
+                "The Project's own checkout could not be identified: git reported no checkout root"
+                    .into(),
+            );
         }
         Ok(root.to_string())
     }
@@ -886,9 +940,17 @@ impl WorktreeManager {
     /// never adopted, and git would refuse to check it out a second time
     /// anyway. A listing git could not produce adopts nothing, and whatever
     /// is then tried instead fails on the same git.
-    async fn adoptable_worktree(&self, repo_path: &str, branch: &str) -> Result<Option<String>, String> {
-        let Ok(output) =
-            super::registry_lock::output(git_program(), repo_path, &["worktree", "list", "--porcelain", "-z"]).await
+    async fn adoptable_worktree(
+        &self,
+        repo_path: &str,
+        branch: &str,
+    ) -> Result<Option<String>, String> {
+        let Ok(output) = super::registry_lock::output(
+            git_program(),
+            repo_path,
+            &["worktree", "list", "--porcelain", "-z"],
+        )
+        .await
         else {
             return Ok(None);
         };
@@ -932,7 +994,11 @@ impl WorktreeManager {
             // Saying why, and what only the user may do about it, is better
             // than git's own refusal, which names neither the lock nor its
             // reason.
-            Some(CheckoutRegistration::MissingLocked { path, branch: held, reason }) => {
+            Some(CheckoutRegistration::MissingLocked {
+                path,
+                branch: held,
+                reason,
+            }) => {
                 return Err(format!(
                     "the checkout of branch {branch} cannot be created: {}",
                     locked_registration_notice(repo_path, path, held.as_deref(), reason.as_deref())
@@ -969,7 +1035,11 @@ impl WorktreeManager {
         let mut prunable: Vec<&str> = Vec::new();
         for registration in std::iter::once(&state.by_path).chain(state.by_branch.as_ref()) {
             match registration {
-                CheckoutRegistration::MissingPrunable { path, branch: None, head } => {
+                CheckoutRegistration::MissingPrunable {
+                    path,
+                    branch: None,
+                    head,
+                } => {
                     let head = head.as_deref().unwrap_or("an unknown commit");
                     return Err(format!(
                         "the checkout of branch {branch} cannot be created: git still registers \
@@ -989,12 +1059,14 @@ impl WorktreeManager {
             }
         }
         for path in prunable {
-            self.remove_with_git(path, repo_path, None).await.map_err(|e| {
-                format!(
+            self.remove_with_git(path, repo_path, None)
+                .await
+                .map_err(|e| {
+                    format!(
                     "git still registers {path}, which is gone, and that registration could not \
                      be cleared for branch {branch}: {e}"
                 )
-            })?;
+                })?;
         }
         Ok(None)
     }
@@ -1019,7 +1091,9 @@ impl WorktreeManager {
     /// Starts a new branch only at a remote default base: a project's local
     /// base is not known here.
     pub async fn create(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
-        self.create_or_adopt(repo_path, branch, None).await.map(|(info, _)| info)
+        self.create_or_adopt(repo_path, branch, None)
+            .await
+            .map(|(info, _)| info)
     }
 
     /// [`Self::create`], also returning the default base the new branch was
@@ -1104,12 +1178,20 @@ impl WorktreeManager {
     /// Refuse to adopt a checkout whose branch lacks any of `held`. The branch
     /// and the checkout are left exactly as they are: bringing the branch up to
     /// date is the person's decision.
-    async fn require_branch_holds(repo_path: &str, branch: &str, held: &[String]) -> Result<(), String> {
+    async fn require_branch_holds(
+        repo_path: &str,
+        branch: &str,
+        held: &[String],
+    ) -> Result<(), String> {
         if held.is_empty() {
             return Ok(());
         }
         let tip = crate::host_process::tokio_command(git_program())
-            .args(["rev-parse", "--verify", &format!("refs/heads/{branch}^{{commit}}")])
+            .args([
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{branch}^{{commit}}"),
+            ])
             .current_dir(repo_path)
             .output()
             .await
@@ -1148,7 +1230,11 @@ impl WorktreeManager {
     /// `held`. The check is against the base the branch is actually created at,
     /// so the new branch holds the work its Task's dependencies hold. Nothing is
     /// created when it refuses.
-    async fn require_base_holds(repo_path: &str, base: &ResolvedBase, held: &[String]) -> Result<(), String> {
+    async fn require_base_holds(
+        repo_path: &str,
+        base: &ResolvedBase,
+        held: &[String],
+    ) -> Result<(), String> {
         for commit in held {
             match super::restack::is_ancestor(Path::new(repo_path), commit, &base.commit).await {
                 Ok(true) => {}
@@ -1177,14 +1263,24 @@ impl WorktreeManager {
     /// The worktree already holding `branch`, when there is one to adopt. A
     /// folder git cannot create a worktree from is refused saying what to do
     /// about it, not with whatever `git worktree list` answers.
-    async fn adoptable_task_checkout(&self, repo_path: &str, branch: &str) -> Result<Option<WorktreeInfo>, String> {
-        if let Some(refused) = super::vcs::detect(Path::new(repo_path)).await?.refusal(repo_path) {
+    async fn adoptable_task_checkout(
+        &self,
+        repo_path: &str,
+        branch: &str,
+    ) -> Result<Option<WorktreeInfo>, String> {
+        if let Some(refused) = super::vcs::detect(Path::new(repo_path))
+            .await?
+            .refusal(repo_path)
+        {
             return Err(refused);
         }
         Ok(self
             .adoptable_worktree(repo_path, branch)
             .await?
-            .map(|path| WorktreeInfo { path, branch: branch.to_string() }))
+            .map(|path| WorktreeInfo {
+                path,
+                branch: branch.to_string(),
+            }))
     }
 
     /// Create `branch` at `base` and check it out in a new worktree.
@@ -1196,7 +1292,10 @@ impl WorktreeManager {
     ) -> Result<(WorktreeInfo, Option<ResolvedBase>), String> {
         Self::create_branch_at(repo_path, branch, &base.commit).await?;
         let worktree_path = self.managed_path(repo_path, branch);
-        let info = match self.git_worktree_add(repo_path, &worktree_path, branch).await {
+        let info = match self
+            .git_worktree_add(repo_path, &worktree_path, branch)
+            .await
+        {
             Ok(info) => info,
             Err(e) => {
                 return match Self::discard_created_branch(repo_path, branch, &base.commit).await {
@@ -1252,7 +1351,10 @@ impl WorktreeManager {
                 String::from_utf8_lossy(&commit.stderr).trim()
             ));
         }
-        Ok((symbolic, String::from_utf8_lossy(&commit.stdout).trim().to_string()))
+        Ok((
+            symbolic,
+            String::from_utf8_lossy(&commit.stdout).trim().to_string(),
+        ))
     }
 
     /// Reattach to an existing branch. Used when re-queuing a task that
@@ -1268,14 +1370,18 @@ impl WorktreeManager {
     pub async fn reattach(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
         let branch = checked_task_branch(branch)?;
         if let Some(path) = self.adoptable_worktree(repo_path, branch).await? {
-            return Ok(WorktreeInfo { path, branch: branch.to_string() });
+            return Ok(WorktreeInfo {
+                path,
+                branch: branch.to_string(),
+            });
         }
         // Attaching by name alone is not enough: with no local branch of
         // that name, `git worktree add` reads a full object ID, `FETCH_HEAD`
         // or `ORIG_HEAD` as a commit and checks it out detached.
         Self::local_branch_tip(repo_path, branch).await?;
         let worktree_path = self.managed_path(repo_path, branch);
-        self.git_worktree_add(repo_path, &worktree_path, branch).await
+        self.git_worktree_add(repo_path, &worktree_path, branch)
+            .await
     }
 
     /// Run `git worktree add` to check out the existing local branch
@@ -1360,9 +1466,13 @@ impl WorktreeManager {
     pub async fn local_branch_exists(repo_path: &str, branch: &str) -> Result<bool, String> {
         let branch = checked_task_branch(branch)?;
         let refname = format!("refs/heads/{branch}");
-        let output = super::registry_lock::output(git_program(), repo_path, &["for-each-ref", "--format=%(refname)", &refname])
-            .await
-            .map_err(|e| format!("Failed to run git for-each-ref: {e}"))?;
+        let output = super::registry_lock::output(
+            git_program(),
+            repo_path,
+            &["for-each-ref", "--format=%(refname)", &refname],
+        )
+        .await
+        .map_err(|e| format!("Failed to run git for-each-ref: {e}"))?;
         if !output.status.success() || !output.stderr.is_empty() {
             return Err(format!(
                 "Could not check for local branch {branch:?}: {}",
@@ -1388,7 +1498,10 @@ impl WorktreeManager {
     /// older than 2.43 does not know `--exists` and exits 129 for it; that
     /// git is asked through [`Self::local_branch_exists`] instead, so there
     /// stderr alongside an answer is still a failure.
-    pub async fn local_branch_exists_by_status(repo_path: &str, branch: &str) -> Result<bool, String> {
+    pub async fn local_branch_exists_by_status(
+        repo_path: &str,
+        branch: &str,
+    ) -> Result<bool, String> {
         let checked = checked_task_branch(branch)?;
         let output = crate::host_process::tokio_command(git_program())
             .args(["show-ref", "--exists"])
@@ -1409,7 +1522,11 @@ impl WorktreeManager {
     }
 
     /// Whether `ancestor` is reachable from the local branch `branch`.
-    async fn branch_contains(repo_path: &str, branch: &str, ancestor: &str) -> Result<bool, String> {
+    async fn branch_contains(
+        repo_path: &str,
+        branch: &str,
+        ancestor: &str,
+    ) -> Result<bool, String> {
         let output = crate::host_process::tokio_command(git_program())
             .args(["merge-base", "--is-ancestor", ancestor])
             .arg(format!("refs/heads/{branch}"))
@@ -1579,7 +1696,10 @@ impl WorktreeManager {
                 info.branch
             );
         };
-        match self.undo_created_checkout(repo_path, info, created_at).await {
+        match self
+            .undo_created_checkout(repo_path, info, created_at)
+            .await
+        {
             Ok(()) => format!(
                 "the checkout created for it at {path} was removed again, so the next attempt \
                  creates it afresh"
@@ -1628,7 +1748,11 @@ impl WorktreeManager {
                 ));
             }
             let info = self.reattach(repo_path, branch).await?;
-            return Ok(StackedWorktree { info, dependency_tip, resumed: true });
+            return Ok(StackedWorktree {
+                info,
+                dependency_tip,
+                resumed: true,
+            });
         }
         // Create the branch at the dependency's tip, then attach a worktree
         // to it. A branch that could not be created stops here: attaching to
@@ -1638,7 +1762,10 @@ impl WorktreeManager {
         // left behind.
         Self::create_branch_at(repo_path, branch, &dependency_tip).await?;
         let worktree_path = self.managed_path(repo_path, branch);
-        let info = match self.git_worktree_add(repo_path, &worktree_path, branch).await {
+        let info = match self
+            .git_worktree_add(repo_path, &worktree_path, branch)
+            .await
+        {
             Ok(info) => info,
             Err(e) => {
                 return match Self::discard_created_branch(repo_path, branch, &dependency_tip).await
@@ -1648,7 +1775,11 @@ impl WorktreeManager {
                 };
             }
         };
-        Ok(StackedWorktree { info, dependency_tip, resumed: false })
+        Ok(StackedWorktree {
+            info,
+            dependency_tip,
+            resumed: false,
+        })
     }
 
     /// Remove a task's worktree -- the disposable checkout, and nothing else.
@@ -1755,21 +1886,27 @@ impl WorktreeManager {
                 }
             },
             Presence::Absent => {
-                let listing = Self::worktree_listing(repo_path)
-                    .await
-                    .map_err(|why| indeterminate("git's worktree listing could not be read", &why))?;
+                let listing = Self::worktree_listing(repo_path).await.map_err(|why| {
+                    indeterminate("git's worktree listing could not be read", &why)
+                })?;
                 match CheckoutRegistration::of_path(Ok(&listing), worktree_path) {
                     CheckoutRegistration::MissingPrunable { path, branch, head } => {
                         (path, head.unwrap_or_default(), true, branch.is_some())
                     }
                     CheckoutRegistration::Unknown(why) => {
-                        return Err(indeterminate("git's registration of it could not be read", &why))
+                        return Err(indeterminate(
+                            "git's registration of it could not be read",
+                            &why,
+                        ))
                     }
                     _ => return Ok(()),
                 }
             }
             Presence::Unverified(why) => {
-                return Err(indeterminate("whether the directory is there could not be told", &why.to_string()))
+                return Err(indeterminate(
+                    "whether the directory is there could not be told",
+                    &why.to_string(),
+                ))
             }
         };
         let state = match (gone, attached) {
@@ -1802,7 +1939,9 @@ impl WorktreeManager {
         // sole name for it.
         let reaching = match attached {
             true => Vec::new(),
-            false => Self::refs_reaching(repo_path, &head).await.map_err(|why| cannot_say(&why))?,
+            false => Self::refs_reaching(repo_path, &head)
+                .await
+                .map_err(|why| cannot_say(&why))?,
         };
         if !attached && reaching.is_empty() {
             return Err(format!(
@@ -1854,11 +1993,18 @@ impl WorktreeManager {
             )
         };
         let git = |args: &[&str]| {
-            crate::host_process::tokio_command(git_program()).args(args).current_dir(repo_path).output()
+            crate::host_process::tokio_command(git_program())
+                .args(args)
+                .current_dir(repo_path)
+                .output()
         };
         let shown = git(&["rev-parse", "--show-ref-format"])
             .await
-            .map_err(|e| undetermined(&format!("`git rev-parse` could not be run in {repo_path}: {e}")))?;
+            .map_err(|e| {
+                undetermined(&format!(
+                    "`git rev-parse` could not be run in {repo_path}: {e}"
+                ))
+            })?;
         if !shown.status.success() {
             return Err(undetermined(String::from_utf8_lossy(&shown.stderr).trim()));
         }
@@ -1870,7 +2016,11 @@ impl WorktreeManager {
         }
         let config = git(&["config", "--get", "extensions.refStorage"])
             .await
-            .map_err(|e| undetermined(&format!("`git config` could not be run in {repo_path}: {e}")))?;
+            .map_err(|e| {
+                undetermined(&format!(
+                    "`git config` could not be run in {repo_path}: {e}"
+                ))
+            })?;
         match config.status.code() {
             Some(1) => Ok(()),
             Some(0) => match String::from_utf8_lossy(&config.stdout).trim() {
@@ -1888,7 +2038,11 @@ impl WorktreeManager {
     /// A reflog git never kept (`core.logAllRefUpdates` off) has no entries
     /// and is not an error. An entry whose object is gone is skipped by git
     /// itself, since it can no longer be lost.
-    async fn reflog_only_commits(repo_path: &str, path: &str, present: bool) -> Result<Vec<String>, String> {
+    async fn reflog_only_commits(
+        repo_path: &str,
+        path: &str,
+        present: bool,
+    ) -> Result<Vec<String>, String> {
         let common = Self::common_git_dir(repo_path).await?;
         let Some(git_dir) = Self::registration_git_dir(&common, path, present).await? else {
             return Err(format!("git has no registration directory for {path}"));
@@ -1923,7 +2077,9 @@ impl WorktreeManager {
                 if is_dir {
                     dirs.push(entry.path());
                 } else {
-                    kept.extend(distinct_commits(&Self::reflog_entries(&entry.path()).await?));
+                    kept.extend(distinct_commits(
+                        &Self::reflog_entries(&entry.path()).await?,
+                    ));
                 }
             }
         }
@@ -1942,22 +2098,32 @@ impl WorktreeManager {
         let (output, written) = (ran.output, ran.input_written);
         if !output.status.success() {
             let said = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let said = if said.is_empty() { format!("`git rev-list` exited with {}", output.status) } else { said };
+            let said = if said.is_empty() {
+                format!("`git rev-list` exited with {}", output.status)
+            } else {
+                said
+            };
             return Err(match written {
                 Err(e) => format!("{said}; writing the reflog to it failed: {e}"),
                 Ok(()) => said,
             });
         }
         written.map_err(|e| format!("`git rev-list` could not be given the reflog: {e}"))?;
-        let unreachable: Vec<String> =
-            String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect();
+        let unreachable: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
         // What a successfully completed rebase only passed through is not
         // work the checkout holds: its result is named by a ref, and what is
         // left in the `HEAD` reflog are the steps that built it.
         let still_unreachable: std::collections::HashSet<&str> =
             unreachable.iter().map(String::as_str).collect();
-        let transient = completed_rebase_transients(&entries, |result| !still_unreachable.contains(result));
-        Ok(unreachable.into_iter().filter(|c| !transient.contains(c)).collect())
+        let transient =
+            completed_rebase_transients(&entries, |result| !still_unreachable.contains(result));
+        Ok(unreachable
+            .into_iter()
+            .filter(|c| !transient.contains(c))
+            .collect())
     }
 
     /// The entries of a reflog file, oldest first, or none when git never
@@ -1972,9 +2138,14 @@ impl WorktreeManager {
         for line in reflog.lines().filter(|l| !l.trim().is_empty()) {
             let (head, message) = line.split_once('\t').unwrap_or((line, ""));
             let ids: Vec<&str> = head.split(' ').take(2).collect();
-            let is_id = |id: &&str| matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit());
+            let is_id = |id: &&str| {
+                matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
+            };
             if ids.len() < 2 || !ids.iter().all(is_id) {
-                return Err(format!("{} has a line git would not write: {line:?}", file.display()));
+                return Err(format!(
+                    "{} has a line git would not write: {line:?}",
+                    file.display()
+                ));
             }
             entries.push(ReflogEntry {
                 old: ids[0].to_string(),
@@ -1996,7 +2167,9 @@ impl WorktreeManager {
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
-        Ok(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+        Ok(PathBuf::from(
+            String::from_utf8_lossy(&output.stdout).trim(),
+        ))
     }
 
     /// The directory under the common git dir that holds the registration of
@@ -2019,7 +2192,9 @@ impl WorktreeManager {
             if !output.status.success() {
                 return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
             }
-            return Ok(Some(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())));
+            return Ok(Some(PathBuf::from(
+                String::from_utf8_lossy(&output.stdout).trim(),
+            )));
         }
         let worktrees = common.join("worktrees");
         let wanted = resolved_path(Path::new(path)).join(".git");
@@ -2058,7 +2233,10 @@ impl WorktreeManager {
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
-        Ok(String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect())
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect())
     }
 
     /// Check if a worktree directory exists on disk.
@@ -2127,10 +2305,13 @@ impl WorktreeManager {
     /// that refusal is reported like any other failure to answer, never read
     /// as an empty listing.
     pub(super) async fn worktree_listing(repo_path: &str) -> Result<String, String> {
-        let output =
-            super::registry_lock::output(git_program(), repo_path, &["worktree", "list", "--porcelain", "-z"])
-                .await
-                .map_err(|e| format!("`git worktree list` could not be run in {repo_path}: {e}"))?;
+        let output = super::registry_lock::output(
+            git_program(),
+            repo_path,
+            &["worktree", "list", "--porcelain", "-z"],
+        )
+        .await
+        .map_err(|e| format!("`git worktree list` could not be run in {repo_path}: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "`git worktree list` failed in {repo_path}: {}",
@@ -2158,7 +2339,11 @@ impl WorktreeManager {
         git_said: &str,
     ) -> Result<(), String> {
         match state.holding() {
-            Some(CheckoutRegistration::MissingLocked { path, branch, reason }) => {
+            Some(CheckoutRegistration::MissingLocked {
+                path,
+                branch,
+                reason,
+            }) => {
                 return Err(locked_registration_notice(
                     repo_path,
                     path,
@@ -2179,7 +2364,11 @@ impl WorktreeManager {
                 "the worktree at {worktree_path} is gone, but git still registers it at {path} \
                  after `git worktree remove`{}; `git worktree prune` in {repo_path} clears such a \
                  registration",
-                if git_said.is_empty() { String::new() } else { format!(", which said: {git_said}") }
+                if git_said.is_empty() {
+                    String::new()
+                } else {
+                    format!(", which said: {git_said}")
+                }
             )),
             CheckoutRegistration::Present { path } => Err(format!(
                 "the worktree at {worktree_path} is gone, but git registers a checkout there that \
@@ -2216,10 +2405,13 @@ impl WorktreeManager {
         // second-guess it; ignored build output is not dirty to git and this
         // removal takes the checkout away build output and all.
         let was_present = matches!(Presence::of(Path::new(worktree_path)), Presence::Present);
-        let output =
-            super::registry_lock::output(git_program(), repo_path, &["worktree", "remove", worktree_path])
-                .await
-                .map_err(|e| format!("Failed to remove worktree: {}", e))?;
+        let output = super::registry_lock::output(
+            git_program(),
+            repo_path,
+            &["worktree", "remove", worktree_path],
+        )
+        .await
+        .map_err(|e| format!("Failed to remove worktree: {}", e))?;
 
         // Kept for the failure message below. A refusal git explains in
         // stderr is the only thing that can tell the user *which* file is
@@ -2397,7 +2589,10 @@ impl WorktreeRecord {
             Ok(contents) => {
                 // Under `worktree.useRelativePaths` the pointer is relative
                 // to the directory it is in.
-                let pointed = std::str::from_utf8(&contents).ok()?.strip_prefix("gitdir:")?.trim();
+                let pointed = std::str::from_utf8(&contents)
+                    .ok()?
+                    .strip_prefix("gitdir:")?
+                    .trim();
                 let admin = worktree_relative(Path::new(worktree_path), pointed);
                 (admin, contents)
             }
@@ -2668,12 +2863,19 @@ mod tests {
             root.path().join("cache"),
             root.path().join("runtime"),
         );
-        TestManager { manager: WorktreeManager::new(Arc::new(paths)), _root: root }
+        TestManager {
+            manager: WorktreeManager::new(Arc::new(paths)),
+            _root: root,
+        }
     }
 
     /// The directory a test manager keeps its state under.
     fn state_root(mgr: &WorktreeManager) -> PathBuf {
-        mgr.paths.data_dir().parent().expect("the data root has a parent").to_path_buf()
+        mgr.paths
+            .data_dir()
+            .parent()
+            .expect("the data root has a parent")
+            .to_path_buf()
     }
 
     /// A test manager's worktrees are gone with it: a test that passes
@@ -2684,8 +2886,14 @@ mod tests {
         let repo_path = repo.path().to_str().unwrap();
         let mgr = test_manager();
         let root = state_root(&mgr);
-        let info = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
-        assert!(Path::new(&info.path).starts_with(&root), "the worktree is under the root");
+        let info = mgr
+            .create(repo_path, "task-0a1b2c3d")
+            .await
+            .expect("create");
+        assert!(
+            Path::new(&info.path).starts_with(&root),
+            "the worktree is under the root"
+        );
 
         drop(mgr);
 
@@ -2704,7 +2912,9 @@ mod tests {
                 tokio::spawn(async move {
                     let mgr = test_manager();
                     let root = state_root(&mgr);
-                    mgr.create(&repo_path, &format!("task-0000000{i}")).await.expect("create");
+                    mgr.create(&repo_path, &format!("task-0000000{i}"))
+                        .await
+                        .expect("create");
                     assert!(root.exists());
                     root
                 })
@@ -2716,7 +2926,11 @@ mod tests {
         }
 
         let distinct: std::collections::HashSet<_> = roots.iter().collect();
-        assert_eq!(distinct.len(), roots.len(), "every manager has a root of its own");
+        assert_eq!(
+            distinct.len(),
+            roots.len(),
+            "every manager has a root of its own"
+        );
         let left: Vec<_> = roots.iter().filter(|root| root.exists()).collect();
         assert!(left.is_empty(), "left behind: {left:?}");
     }
@@ -2725,7 +2939,8 @@ mod tests {
     /// registrations in between fails. Creating, listing and removing from
     /// several managers on one repository must never meet one half made.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn managers_creating_listing_and_removing_in_one_repository_never_meet_a_half_made_registration() {
+    async fn managers_creating_listing_and_removing_in_one_repository_never_meet_a_half_made_registration(
+    ) {
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
         let runs: Vec<_> = (0..6)
@@ -2736,8 +2951,12 @@ mod tests {
                     for round in 0..4 {
                         let branch = format!("task-{i:04}{round:04}");
                         let info = mgr.create(&repo_path, &branch).await.expect("create");
-                        WorktreeManager::worktree_listing(&repo_path).await.expect("list");
-                        mgr.remove(&info.path, &repo_path, None).await.expect("remove");
+                        WorktreeManager::worktree_listing(&repo_path)
+                            .await
+                            .expect("list");
+                        mgr.remove(&info.path, &repo_path, None)
+                            .await
+                            .expect("remove");
                     }
                 })
             })
@@ -2745,8 +2964,14 @@ mod tests {
         for run in runs {
             run.await.expect("the run completes");
         }
-        let listing = WorktreeManager::worktree_listing(&repo_path).await.expect("list");
-        assert_eq!(listing.matches("worktree ").count(), 1, "only the primary checkout is left: {listing:?}");
+        let listing = WorktreeManager::worktree_listing(&repo_path)
+            .await
+            .expect("list");
+        assert_eq!(
+            listing.matches("worktree ").count(),
+            1,
+            "only the primary checkout is left: {listing:?}"
+        );
     }
 
     /// A test that panics still removes the root: the owner is dropped
@@ -2781,7 +3006,10 @@ mod tests {
         drop(mgr);
 
         assert!(!root.exists(), "{} was left behind", root.display());
-        assert!(outside.path().join("keep.txt").exists(), "the link target must survive");
+        assert!(
+            outside.path().join("keep.txt").exists(),
+            "the link target must survive"
+        );
     }
 
     /// A recorded checkout path that is not on disk and that no hand-written
@@ -2819,7 +3047,10 @@ mod tests {
             "the stale registration must be cleared, or the branch can never be checked out \
              again"
         );
-        assert!(branch_exists(&repo_path, "task-abcd1234"), "the branch is kept");
+        assert!(
+            branch_exists(&repo_path, "task-abcd1234"),
+            "the branch is kept"
+        );
     }
 
     /// Git's record for exactly `worktree_path`, one field per line, or
@@ -2850,7 +3081,10 @@ mod tests {
         let branch = "task-abcd1234";
         let info = mgr.create(&repo_path, branch).await.expect("create failed");
         let reason = "on a drive that is not mounted";
-        run_git(&repo_path, &["worktree", "lock", "--reason", reason, &info.path]);
+        run_git(
+            &repo_path,
+            &["worktree", "lock", "--reason", reason, &info.path],
+        );
         std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
         let before = registration_of(&repo_path, &info.path).expect("still registered");
 
@@ -2901,7 +3135,10 @@ mod tests {
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
         let mgr = test_manager();
-        let info = mgr.create(&repo_path, "task-abcd1234").await.expect("create failed");
+        let info = mgr
+            .create(&repo_path, "task-abcd1234")
+            .await
+            .expect("create failed");
         run_git(&repo_path, &["worktree", "remove", &info.path]);
 
         mgr.remove(&info.path, &repo_path, None)
@@ -2923,7 +3160,10 @@ mod tests {
             .remove(&missing, not_a_repo, None)
             .await
             .expect_err("absence of the directory alone does not prove the removal");
-        assert!(refused.contains(&missing), "the checkout is named: {refused}");
+        assert!(
+            refused.contains(&missing),
+            "the checkout is named: {refused}"
+        );
     }
 
     /// Git records a checkout's path with symlinks resolved. A task whose
@@ -2945,9 +3185,15 @@ mod tests {
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let recorded = alias.join("sub").join("wt").to_string_lossy().to_string();
         run_git(&repo_path, &["branch", branch]);
-        run_git(&repo_path, &["worktree", "add", "-q", "--", &recorded, branch]);
+        run_git(
+            &repo_path,
+            &["worktree", "add", "-q", "--", &recorded, branch],
+        );
         let reason = "on a drive that is not mounted";
-        run_git(&repo_path, &["worktree", "lock", "--reason", reason, &recorded]);
+        run_git(
+            &repo_path,
+            &["worktree", "lock", "--reason", reason, &recorded],
+        );
 
         std::fs::remove_dir_all(real.join("sub")).unwrap();
         let refused = mgr
@@ -2955,7 +3201,10 @@ mod tests {
             .await
             .expect_err("the locked registration is found through the symlink");
         assert!(refused.contains(reason), "the lock is named: {refused}");
-        assert!(refused.contains(branch), "and the branch it holds: {refused}");
+        assert!(
+            refused.contains(branch),
+            "and the branch it holds: {refused}"
+        );
 
         std::fs::remove_dir_all(&real).unwrap();
         let refused = mgr
@@ -2998,7 +3247,10 @@ mod tests {
         let detached = commit_work(&info.path, "detached.txt");
         assert!(refs_reaching(&repo_path, &detached).is_empty());
         let reason = "on a drive that is not mounted";
-        run_git(&repo_path, &["worktree", "lock", "--reason", reason, &info.path]);
+        run_git(
+            &repo_path,
+            &["worktree", "lock", "--reason", reason, &info.path],
+        );
         std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
 
         let refused = mgr
@@ -3014,14 +3266,28 @@ mod tests {
             .await
             .err()
             .expect("a detached registration is not cleared automatically");
-        assert!(refused.contains(&detached), "the detached commit is named: {refused}");
-        assert!(refused.contains("git worktree prune"), "the way out is named: {refused}");
+        assert!(
+            refused.contains(&detached),
+            "the detached commit is named: {refused}"
+        );
+        assert!(
+            refused.contains("git worktree prune"),
+            "the way out is named: {refused}"
+        );
         assert!(
             registration_of(&repo_path, &info.path)
                 .is_some_and(|r| r.contains(&format!("HEAD {detached}"))),
             "the registration, and the HEAD it keeps, are left alone"
         );
-        run_git(&repo_path, &["rev-parse", "--verify", "-q", &format!("{detached}^{{commit}}")]);
+        run_git(
+            &repo_path,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("{detached}^{{commit}}"),
+            ],
+        );
 
         run_git(&repo_path, &["branch", "kept-work", &detached]);
         run_git(&repo_path, &["worktree", "prune"]);
@@ -3055,7 +3321,15 @@ mod tests {
             registration_of(repo_path, path).is_some_and(|r| r.contains(&format!("HEAD {commit}"))),
             "the registration, and the HEAD it keeps, are left alone"
         );
-        run_git(repo_path, &["rev-parse", "--verify", "-q", &format!("{commit}^{{commit}}")]);
+        run_git(
+            repo_path,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("{commit}^{{commit}}"),
+            ],
+        );
         let unreachable = run_git(repo_path, &["fsck", "--unreachable", "--no-reflogs"]);
         assert!(
             !unreachable.contains(commit),
@@ -3069,12 +3343,18 @@ mod tests {
     async fn refs_reaching_counts_any_ref_and_refuses_an_unknown_commit() {
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap();
-        let head = run_git(repo_path, &["rev-parse", "HEAD"]).trim().to_string();
+        let head = run_git(repo_path, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
         run_git(repo_path, &["tag", "-a", "-m", "note", "keep", &head]);
-        let refs = WorktreeManager::refs_reaching(repo_path, &head).await.unwrap();
+        let refs = WorktreeManager::refs_reaching(repo_path, &head)
+            .await
+            .unwrap();
         assert!(refs.iter().any(|r| r == "refs/tags/keep"), "{refs:?}");
         assert!(WorktreeManager::refs_reaching(repo_path, "").await.is_err());
-        assert!(WorktreeManager::refs_reaching(repo_path, &"0".repeat(40)).await.is_err());
+        assert!(WorktreeManager::refs_reaching(repo_path, &"0".repeat(40))
+            .await
+            .is_err());
     }
 
     /// Removing a checkout that is there, detached at a commit nothing else
@@ -3094,9 +3374,18 @@ mod tests {
             .remove(&info.path, &repo_path, Some(branch))
             .await
             .expect_err("the detached HEAD is the only thing naming the commit");
-        assert!(refused.contains(&detached), "the commit is named: {refused}");
-        assert!(refused.contains("unreachable"), "the consequence is named: {refused}");
-        assert!(refused.contains("git branch <name>"), "the way to keep it is named: {refused}");
+        assert!(
+            refused.contains(&detached),
+            "the commit is named: {refused}"
+        );
+        assert!(
+            refused.contains("unreachable"),
+            "the consequence is named: {refused}"
+        );
+        assert!(
+            refused.contains("git branch <name>"),
+            "the way to keep it is named: {refused}"
+        );
         assert!(Path::new(&info.path).is_dir(), "the checkout is untouched");
         assert_detached_commit_kept(&repo_path, &info.path, &detached);
 
@@ -3123,13 +3412,24 @@ mod tests {
             .remove(&info.path, &repo_path, Some(branch))
             .await
             .expect_err("clearing the registration would drop the only HEAD naming the commit");
-        assert!(refused.contains(&detached), "the commit is named: {refused}");
-        assert!(refused.contains("unreachable"), "the consequence is named: {refused}");
-        assert!(refused.contains("git branch <name>"), "the way to keep it is named: {refused}");
+        assert!(
+            refused.contains(&detached),
+            "the commit is named: {refused}"
+        );
+        assert!(
+            refused.contains("unreachable"),
+            "the consequence is named: {refused}"
+        );
+        assert!(
+            refused.contains("git branch <name>"),
+            "the way to keep it is named: {refused}"
+        );
         assert_detached_commit_kept(&repo_path, &info.path, &detached);
 
         // Refused again, not worn down by a second attempt.
-        mgr.remove(&info.path, &repo_path, Some(branch)).await.expect_err("still refused");
+        mgr.remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect_err("still refused");
         assert_detached_commit_kept(&repo_path, &info.path, &detached);
 
         run_git(&repo_path, &["tag", "kept-work", &detached]);
@@ -3185,16 +3485,33 @@ mod tests {
         let other = run_git(repo_path, &["commit-tree", &tree, "-p", &head, "-m", "B"]);
         run_git(repo_path, &["update-ref", "refs/heads/other", &other]);
         run_git(&info.path, &["checkout", "-q", "--detach", "other"]);
-        assert!(refs_reaching(repo_path, &first).is_empty(), "no ref reaches the commit left behind");
-        assert!(!refs_reaching(repo_path, &other).is_empty(), "the commit it is at is named");
+        assert!(
+            refs_reaching(repo_path, &first).is_empty(),
+            "no ref reaches the commit left behind"
+        );
+        assert!(
+            !refs_reaching(repo_path, &other).is_empty(),
+            "the commit it is at is named"
+        );
         (info, first)
     }
 
     /// The commit is reachable, as far as git is concerned, only because the
     /// registration's `HEAD` reflog still names it.
     fn assert_reflog_still_keeps(repo_path: &str, path: &str, commit: &str) {
-        assert!(registration_of(repo_path, path).is_some(), "the registration is left alone");
-        run_git(repo_path, &["rev-parse", "--verify", "-q", &format!("{commit}^{{commit}}")]);
+        assert!(
+            registration_of(repo_path, path).is_some(),
+            "the registration is left alone"
+        );
+        run_git(
+            repo_path,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("{commit}^{{commit}}"),
+            ],
+        );
         assert!(
             !run_git(repo_path, &["fsck", "--unreachable"]).contains(commit),
             "the reflog still protects the commit from being unreachable"
@@ -3211,7 +3528,8 @@ mod tests {
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
         let mgr = test_manager();
-        let (info, first) = detached_after_moving_away_from_unique_commit(&mgr, &repo_path, "task-feed0001").await;
+        let (info, first) =
+            detached_after_moving_away_from_unique_commit(&mgr, &repo_path, "task-feed0001").await;
         assert_reflog_still_keeps(&repo_path, &info.path, &first);
         run_git(&repo_path, &["worktree", "remove", &info.path]);
         assert!(refs_reaching(&repo_path, &first).is_empty());
@@ -3223,13 +3541,17 @@ mod tests {
         // Present.
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
-        let (info, first) = detached_after_moving_away_from_unique_commit(&mgr, &repo_path, "task-abcd1234").await;
+        let (info, first) =
+            detached_after_moving_away_from_unique_commit(&mgr, &repo_path, "task-abcd1234").await;
         let refused = mgr
             .remove(&info.path, &repo_path, Some("task-abcd1234"))
             .await
             .expect_err("the reflog is the only thing reaching the commit");
         assert!(refused.contains(&first), "the commit is named: {refused}");
-        assert!(refused.contains("git branch <name>"), "the way to keep it is named: {refused}");
+        assert!(
+            refused.contains("git branch <name>"),
+            "the way to keep it is named: {refused}"
+        );
         assert!(Path::new(&info.path).is_dir(), "the checkout is untouched");
         assert_reflog_still_keeps(&repo_path, &info.path, &first);
         run_git(&repo_path, &["branch", "kept-work", &first]);
@@ -3242,12 +3564,15 @@ mod tests {
         // Gone.
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
-        let (info, first) = detached_after_moving_away_from_unique_commit(&mgr, &repo_path, "task-abcd1234").await;
+        let (info, first) =
+            detached_after_moving_away_from_unique_commit(&mgr, &repo_path, "task-abcd1234").await;
         std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
         let refused = mgr
             .remove(&info.path, &repo_path, Some("task-abcd1234"))
             .await
-            .expect_err("clearing the registration would delete the only reflog reaching the commit");
+            .expect_err(
+                "clearing the registration would delete the only reflog reaching the commit",
+            );
         assert!(refused.contains(&first), "the commit is named: {refused}");
         assert_reflog_still_keeps(&repo_path, &info.path, &first);
         run_git(&repo_path, &["tag", "kept-work", &first]);
@@ -3264,7 +3589,10 @@ mod tests {
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
         let mgr = test_manager();
-        let info = mgr.create(&repo_path, "task-abcd1234").await.expect("create failed");
+        let info = mgr
+            .create(&repo_path, "task-abcd1234")
+            .await
+            .expect("create failed");
         run_git(&info.path, &["checkout", "-q", "--detach"]);
         let first = commit_work(&info.path, "first.txt");
         let second = commit_work(&info.path, "second.txt");
@@ -3298,7 +3626,9 @@ mod tests {
         assert!(refused.contains(&left), "{refused}");
         assert_reflog_still_keeps(&repo_path, &info.path, &left);
         run_git(&repo_path, &["tag", "kept-work", &left]);
-        mgr.remove(&info.path, &repo_path, Some(branch)).await.expect("named, so removable");
+        mgr.remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect("named, so removable");
     }
 
     /// Work amended or rebased away on the task branch is still in the
@@ -3334,7 +3664,14 @@ mod tests {
     fn commit_file(dir: &str, file: &str, contents: &str, extra: &[&str]) -> String {
         std::fs::write(Path::new(dir).join(file), contents).expect("write file");
         run_git(dir, &["add", "-A"]);
-        let mut args = vec!["-c", "user.email=t@t.t", "-c", "user.name=T", "commit", "-q"];
+        let mut args = vec![
+            "-c",
+            "user.email=t@t.t",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-q",
+        ];
         args.extend_from_slice(extra);
         run_git(dir, &args);
         run_git(dir, &["rev-parse", "HEAD"])
@@ -3347,7 +3684,10 @@ mod tests {
             run_git(dir, args).lines().map(str::to_string).collect()
         };
         let head = ids(&["log", "-g", "--format=%H", "HEAD"], wt);
-        let kept = ids(&["log", "-g", "--format=%H", &format!("refs/heads/{branch}")], repo_path);
+        let kept = ids(
+            &["log", "-g", "--format=%H", &format!("refs/heads/{branch}")],
+            repo_path,
+        );
         let reachable = ids(&["rev-list", "--all"], repo_path);
         let mut only: Vec<String> = Vec::new();
         for id in head {
@@ -3389,7 +3729,11 @@ mod tests {
                 &[("GIT_SEQUENCE_EDITOR", "true")],
                 &["rebase", "-q", "-i", "--autosquash", "main"],
             );
-            assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+            assert!(
+                done.status.success(),
+                "{}",
+                String::from_utf8_lossy(&done.stderr)
+            );
             assert!(
                 !head_reflog_only(&repo_path, &info.path, branch).is_empty(),
                 "the rebase left steps that only the HEAD reflog reaches"
@@ -3401,7 +3745,10 @@ mod tests {
                 .await
                 .expect("only the steps of a completed rebase are unreferenced");
             assert!(registration_of(&repo_path, &info.path).is_none());
-            assert!(branch_exists(&repo_path, branch), "the rebased branch is kept");
+            assert!(
+                branch_exists(&repo_path, branch),
+                "the rebased branch is kept"
+            );
         }
     }
 
@@ -3418,9 +3765,20 @@ mod tests {
             commit_file(&info.path, "a.txt", "a\n", &["-m", "add a"]);
             commit_file(&info.path, "b.txt", "b\n", &["-m", "add b"]);
             commit_file(&repo_path, "main.txt", "m\n", &["-m", "main moves"]);
-            let done = run_git_env(&info.path, &[("GIT_SEQUENCE_EDITOR", editor)], &["rebase", "-q", "-i", "main"]);
-            assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
-            assert_eq!(!head_reflog_only(&repo_path, &info.path, branch).is_empty(), leaves_steps);
+            let done = run_git_env(
+                &info.path,
+                &[("GIT_SEQUENCE_EDITOR", editor)],
+                &["rebase", "-q", "-i", "main"],
+            );
+            assert!(
+                done.status.success(),
+                "{}",
+                String::from_utf8_lossy(&done.stderr)
+            );
+            assert_eq!(
+                !head_reflog_only(&repo_path, &info.path, branch).is_empty(),
+                leaves_steps
+            );
             mgr.remove(&info.path, &repo_path, Some(branch))
                 .await
                 .expect("a completed rebase's steps are not unique work");
@@ -3458,7 +3816,10 @@ mod tests {
             .remove(&info.path, &repo_path, Some(branch))
             .await
             .expect_err("the rebase has not finished; its commits are not a result");
-        assert!(refused.contains(&work) || refused.contains("no ref names"), "{refused}");
+        assert!(
+            refused.contains(&work) || refused.contains("no ref names"),
+            "{refused}"
+        );
         assert!(Path::new(&info.path).is_dir(), "the checkout is untouched");
         assert_reflog_still_keeps(&repo_path, &info.path, &work);
     }
@@ -3473,9 +3834,14 @@ mod tests {
             let repo = create_temp_git_repo();
             let repo_path = repo.path().to_str().unwrap().to_string();
             let branch = "task-abcd1234";
-            let (info, work) = checkout_stopped_in_a_rebase_with_work(&mgr, &repo_path, branch).await;
+            let (info, work) =
+                checkout_stopped_in_a_rebase_with_work(&mgr, &repo_path, branch).await;
             let aborted = run_git_env(&info.path, &[], &["rebase", "--abort"]);
-            assert!(aborted.status.success(), "{}", String::from_utf8_lossy(&aborted.stderr));
+            assert!(
+                aborted.status.success(),
+                "{}",
+                String::from_utf8_lossy(&aborted.stderr)
+            );
             assert!(
                 run_git(&repo_path, &["fsck", "--unreachable", "--no-reflogs"]).contains(&work),
                 "only the HEAD reflog keeps the commit once the rebase is aborted"
@@ -3490,7 +3856,9 @@ mod tests {
             assert!(refused.contains(&work), "{refused}");
             assert_reflog_still_keeps(&repo_path, &info.path, &work);
             run_git(&repo_path, &["branch", "kept-work", &work]);
-            mgr.remove(&info.path, &repo_path, Some(branch)).await.expect("named, so removable");
+            mgr.remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect("named, so removable");
         }
     }
 
@@ -3510,14 +3878,22 @@ mod tests {
         );
         assert!(done.status.success());
         run_git(&info.path, &["checkout", "-q", "--detach"]);
-        let manual = commit_file(&info.path, "manual.txt", "manual\n", &["-m", "detached work"]);
+        let manual = commit_file(
+            &info.path,
+            "manual.txt",
+            "manual\n",
+            &["-m", "detached work"],
+        );
         run_git(&info.path, &["switch", "-q", branch]);
         let refused = mgr
             .remove(&info.path, &repo_path, Some(branch))
             .await
             .expect_err("a manual detached commit is unique work");
         assert!(refused.contains(&manual), "{refused}");
-        assert!(refused.contains("1 commit(s)"), "only the manual commit is counted: {refused}");
+        assert!(
+            refused.contains("1 commit(s)"),
+            "only the manual commit is counted: {refused}"
+        );
         assert_reflog_still_keeps(&repo_path, &info.path, &manual);
     }
 
@@ -3530,15 +3906,25 @@ mod tests {
         let repo_path = repo.path().to_str().unwrap().to_string();
         let branch = "task-abcd1234";
         let info = branch_checkout_with_fixup(&mgr, &repo_path, branch).await;
-        run_git_env(&info.path, &[("GIT_SEQUENCE_EDITOR", "true")], &["rebase", "-q", "-i", "--autosquash", "main"]);
+        run_git_env(
+            &info.path,
+            &[("GIT_SEQUENCE_EDITOR", "true")],
+            &["rebase", "-q", "-i", "--autosquash", "main"],
+        );
         run_git(&info.path, &["commit", "-q", "--amend", "-m", "amended"]);
         run_git(&info.path, &["reset", "-q", "--hard", "HEAD~1"]);
-        mgr.remove(&info.path, &repo_path, Some(branch)).await.expect("branch reflog keeps them");
+        mgr.remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect("branch reflog keeps them");
     }
 
     fn entry(old: &str, new: &str, message: &str) -> ReflogEntry {
         let id = |c: &str| c.repeat(40);
-        ReflogEntry { old: id(old), new: id(new), message: message.to_string() }
+        ReflogEntry {
+            old: id(old),
+            new: id(new),
+            message: message.to_string(),
+        }
     }
 
     /// The rule on hand-written logs: what counts as a completed rebase and
@@ -3578,25 +3964,40 @@ mod tests {
         // An ordinary entry naming a step's commit keeps it, wherever it is.
         let mut named_elsewhere = vec![entry("0", "3", "commit: user work")];
         named_elsewhere.extend(complete.clone());
-        assert_eq!(completed_rebase_transients(&named_elsewhere, named), [id("4")].into_iter().collect());
+        assert_eq!(
+            completed_rebase_transients(&named_elsewhere, named),
+            [id("4")].into_iter().collect()
+        );
         // A later aborted rebase that reuses a step's commit keeps it too.
         let mut reused = complete.clone();
         reused.push(entry("5", "5", "rebase (start): checkout main"));
         reused.push(entry("5", "4", "rebase (pick): z"));
-        assert_eq!(completed_rebase_transients(&reused, named), [id("3")].into_iter().collect());
+        assert_eq!(
+            completed_rebase_transients(&reused, named),
+            [id("3")].into_iter().collect()
+        );
         // A message that only starts with the word is not a rebase.
         let mut forged = complete.clone();
         forged[1] = entry("2", "3", "rebased: x");
-        assert_eq!(completed_rebase_transients(&forged, named), [id("4")].into_iter().collect());
+        assert_eq!(
+            completed_rebase_transients(&forged, named),
+            [id("4")].into_iter().collect()
+        );
         // A parenthesis in a subject is not an action.
         let mut subject = complete.clone();
         subject[1] = entry("2", "3", "rebase: fast-forward (finish) (abort)");
-        assert_eq!(completed_rebase_transients(&subject, named), [id("3"), id("4")].into_iter().collect());
+        assert_eq!(
+            completed_rebase_transients(&subject, named),
+            [id("3"), id("4")].into_iter().collect()
+        );
         // Older git spelled the interactive rebase's messages with the option.
         let mut legacy = complete.clone();
         legacy[0] = entry("1", "2", "rebase -i (start): checkout main");
         legacy[4] = entry("5", "5", "rebase -i (finish): returning to refs/heads/t");
-        assert_eq!(completed_rebase_transients(&legacy, named), [id("3"), id("4")].into_iter().collect());
+        assert_eq!(
+            completed_rebase_transients(&legacy, named),
+            [id("3"), id("4")].into_iter().collect()
+        );
         // An amend while stopped does not end the rebase, and is itself kept.
         let edited = vec![
             entry("1", "2", "rebase (start): checkout main"),
@@ -3606,7 +4007,10 @@ mod tests {
             entry("4", "6", "rebase (pick): y"),
             entry("6", "6", "rebase (finish): returning to refs/heads/t"),
         ];
-        assert_eq!(completed_rebase_transients(&edited, named), [id("4")].into_iter().collect());
+        assert_eq!(
+            completed_rebase_transients(&edited, named),
+            [id("4")].into_iter().collect()
+        );
     }
 
     /// A relative `gitdir` is resolved against the registration directory it
@@ -3620,9 +4024,18 @@ mod tests {
         std::fs::create_dir_all(&admin).unwrap();
         std::fs::create_dir_all(root.join("checkouts")).unwrap();
         let wanted = root.join("checkouts/wt/.git");
-        assert_eq!(registered_gitdir(&admin, "../../../../checkouts/wt/.git\n"), wanted);
-        assert_eq!(registered_gitdir(&admin, &format!("{}\n", wanted.display())), wanted);
-        assert_ne!(registered_gitdir(&admin, "../../../../checkouts/other/.git"), wanted);
+        assert_eq!(
+            registered_gitdir(&admin, "../../../../checkouts/wt/.git\n"),
+            wanted
+        );
+        assert_eq!(
+            registered_gitdir(&admin, &format!("{}\n", wanted.display())),
+            wanted
+        );
+        assert_ne!(
+            registered_gitdir(&admin, "../../../../checkouts/other/.git"),
+            wanted
+        );
 
         let worktrees = root.join("repo/.git/worktrees");
         std::fs::write(admin.join("gitdir"), "../../../../checkouts/wt/.git\n").unwrap();
@@ -3631,7 +4044,10 @@ mod tests {
             Some(admin.clone()),
         );
         assert_eq!(
-            WorktreeRecord::locate_admin(&worktrees, root.join("checkouts/other").to_str().unwrap()),
+            WorktreeRecord::locate_admin(
+                &worktrees,
+                root.join("checkouts/other").to_str().unwrap()
+            ),
             None,
         );
         #[cfg(unix)]
@@ -3657,7 +4073,10 @@ mod tests {
             run_git(&repo_path, &["config", "worktree.useRelativePaths", "true"]);
             let branch = "task-abcd1234";
             let info = mgr.create(&repo_path, branch).await.expect("create failed");
-            let common = run_git(&repo_path, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+            let common = run_git(
+                &repo_path,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            );
             let admins: Vec<_> = std::fs::read_dir(Path::new(&common).join("worktrees"))
                 .unwrap()
                 .flatten()
@@ -3715,10 +4134,23 @@ mod tests {
                 .expect_err("the reflog cannot be inspected under reftable");
             assert!(refused.contains("reftable"), "{refused}");
             assert!(refused.contains("Nothing was changed"), "{refused}");
-            assert!(refused.contains("git worktree remove"), "the way forward is named: {refused}");
-            assert_eq!(Path::new(&info.path).exists(), !gone, "the checkout is untouched");
-            assert!(registration_of(&repo_path, &info.path).is_some(), "the registration is intact");
-            run_git(&repo_path, &["rev-parse", "--verify", "-q", &format!("{left}^{{commit}}")]);
+            assert!(
+                refused.contains("git worktree remove"),
+                "the way forward is named: {refused}"
+            );
+            assert_eq!(
+                Path::new(&info.path).exists(),
+                !gone,
+                "the checkout is untouched"
+            );
+            assert!(
+                registration_of(&repo_path, &info.path).is_some(),
+                "the registration is intact"
+            );
+            run_git(
+                &repo_path,
+                &["rev-parse", "--verify", "-q", &format!("{left}^{{commit}}")],
+            );
         }
     }
 
@@ -3728,7 +4160,9 @@ mod tests {
     async fn ref_storage_is_asked_of_git_and_anything_but_files_or_unknown_is_refused() {
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
-        WorktreeManager::ensure_reflog_inspectable(&repo_path).await.expect("files storage is read");
+        WorktreeManager::ensure_reflog_inspectable(&repo_path)
+            .await
+            .expect("files storage is read");
 
         // Not a repository, or a directory that is not there: not determined.
         let nowhere = repo.path().join("missing");
@@ -3743,7 +4177,10 @@ mod tests {
         let why = WorktreeManager::ensure_reflog_inspectable(&repo_path)
             .await
             .expect_err("an unknown backend is refused");
-        assert!(why.contains("could not be determined") || why.contains("`future`"), "{why}");
+        assert!(
+            why.contains("could not be determined") || why.contains("`future`"),
+            "{why}"
+        );
 
         // `reftable` itself, where this git has it.
         let repo = create_temp_git_repo();
@@ -3784,7 +4221,10 @@ mod tests {
         // The checkout's own HEAD cannot be read.
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
-        let info = mgr.create(&repo_path, "task-abcd1234").await.expect("create failed");
+        let info = mgr
+            .create(&repo_path, "task-abcd1234")
+            .await
+            .expect("create failed");
         std::fs::write(Path::new(&info.path).join(".git"), "not a gitdir pointer\n").unwrap();
         let refused = mgr
             .remove(&info.path, &repo_path, Some("task-abcd1234"))
@@ -3793,17 +4233,28 @@ mod tests {
         assert!(refused.contains("was not removed"), "{refused}");
         assert!(refused.contains("HEAD could not be read"), "{refused}");
         assert!(Path::new(&info.path).is_dir(), "the checkout is untouched");
-        assert!(registration_of(&repo_path, &info.path).is_some(), "so is its registration");
+        assert!(
+            registration_of(&repo_path, &info.path).is_some(),
+            "so is its registration"
+        );
 
         // The directory is gone and git cannot list worktrees.
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
-        let info = mgr.create(&repo_path, "task-abcd1234").await.expect("create failed");
+        let info = mgr
+            .create(&repo_path, "task-abcd1234")
+            .await
+            .expect("create failed");
         run_git(&info.path, &["checkout", "-q", "--detach"]);
         let kept = commit_work(&info.path, "kept.txt");
         std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
         let admin = Path::new(&repo_path).join(".git/worktrees");
-        let registration = std::fs::read_dir(&admin).unwrap().next().unwrap().unwrap().path();
+        let registration = std::fs::read_dir(&admin)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         let head_file = Path::new(&repo_path).join(".git/HEAD");
         let head = std::fs::read(&head_file).unwrap();
         std::fs::write(&head_file, "garbage\n").unwrap();
@@ -3812,7 +4263,10 @@ mod tests {
             .await
             .expect_err("a listing git cannot give is not an empty one");
         assert!(refused.contains("was not removed"), "{refused}");
-        assert!(refused.contains("worktree listing could not be read"), "{refused}");
+        assert!(
+            refused.contains("worktree listing could not be read"),
+            "{refused}"
+        );
         assert!(registration.is_dir(), "the registration is untouched");
         std::fs::write(&head_file, head).unwrap();
         assert_detached_commit_kept(&repo_path, &info.path, &kept);
@@ -3841,7 +4295,10 @@ mod tests {
         // Somewhere SlashIt did not choose, the same.
         let elsewhere = repo.root().join("elsewhere").to_string_lossy().to_string();
         run_git(&repo_path, &["worktree", "remove", &again.path]);
-        run_git(&repo_path, &["worktree", "add", "-q", "--", &elsewhere, branch]);
+        run_git(
+            &repo_path,
+            &["worktree", "add", "-q", "--", &elsewhere, branch],
+        );
         std::fs::remove_dir_all(&elsewhere).expect("remove worktree dir");
 
         let again = mgr
@@ -3904,7 +4361,10 @@ HEAD 1111111111111111111111111111111111111111
 branch refs/heads/feature-two
 ";
         let porcelain = z(porcelain);
-        assert_eq!(WorktreeManager::worktree_for_branch(&porcelain, "feature"), None);
+        assert_eq!(
+            WorktreeManager::worktree_for_branch(&porcelain, "feature"),
+            None
+        );
     }
 
     #[test]
@@ -4078,11 +4538,7 @@ branch refs/heads/main
         let porcelain = z(&format!("{PRIMARY}{porcelain}"));
 
         assert_eq!(
-            WorktreeManager::adopt_any_registered(
-                tmp.path().to_str().unwrap(),
-                branch,
-                &porcelain
-            ),
+            WorktreeManager::adopt_any_registered(tmp.path().to_str().unwrap(), branch, &porcelain),
             Some(registered_at.to_string_lossy().to_string())
         );
     }
@@ -4203,8 +4659,10 @@ branch refs/heads/some-other-branch
     fn branch_for_task_distinguishes_ids_sharing_a_prefix() {
         let a = Uuid::from_u128(0x12345678_0000_4000_8000_000000000001);
         let b = Uuid::from_u128(0x12345678_0000_4000_8000_000000000002);
-        let (branch_a, branch_b) =
-            (WorktreeManager::branch_for_task(a), WorktreeManager::branch_for_task(b));
+        let (branch_a, branch_b) = (
+            WorktreeManager::branch_for_task(a),
+            WorktreeManager::branch_for_task(b),
+        );
         assert_ne!(branch_a, branch_b);
         let mgr = test_manager();
         assert_ne!(
@@ -4273,10 +4731,7 @@ branch refs/heads/some-other-branch
         let expected = parent.join(format!("{}.{}", repo_name, branch));
         // PathBuf normalizes this: the "feature" part becomes a directory component
         // This is the actual behavior of the code -- it will create a nested path.
-        assert_eq!(
-            expected.to_string_lossy(),
-            "/home/user/my-repo.feature/foo"
-        );
+        assert_eq!(expected.to_string_lossy(), "/home/user/my-repo.feature/foo");
     }
 
     // -------------------------------------------------------
@@ -4342,7 +4797,10 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
 
-        let info = mgr.create(repo_path, "test-branch").await.expect("create failed");
+        let info = mgr
+            .create(repo_path, "test-branch")
+            .await
+            .expect("create failed");
         assert!(Path::new(&info.path).exists(), "worktree dir should exist");
         assert_eq!(info.branch, "test-branch");
         assert!(mgr.exists(&info.path));
@@ -4378,7 +4836,10 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let info = mgr.create(repo_path, "task-old-git").await.expect("create failed");
+        let info = mgr
+            .create(repo_path, "task-old-git")
+            .await
+            .expect("create failed");
 
         test_git::scope(old_git, async {
             mgr.remove(&info.path, repo_path, Some("task-old-git"))
@@ -4390,9 +4851,14 @@ branch refs/heads/some-other-branch
             );
         })
         .await;
-        assert!(!Path::new(&info.path).exists(), "worktree dir should be gone");
         assert!(
-            std::fs::read_to_string(&log).unwrap_or_default().contains("worktree remove"),
+            !Path::new(&info.path).exists(),
+            "worktree dir should be gone"
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("worktree remove"),
             "precondition: the removal ran through the old git"
         );
     }
@@ -4426,7 +4892,10 @@ branch refs/heads/some-other-branch
             .await
             .expect("removal of a live worktree should succeed");
 
-        assert!(!Path::new(&info.path).exists(), "worktree dir should be gone");
+        assert!(
+            !Path::new(&info.path).exists(),
+            "worktree dir should be gone"
+        );
         assert_eq!(
             refs_reaching(repo_path, &work),
             vec!["refs/heads/task-removeme".to_string()],
@@ -4455,7 +4924,10 @@ branch refs/heads/some-other-branch
             .await
             .expect("removal of a live worktree should succeed");
 
-        assert!(!Path::new(&info.path).exists(), "worktree dir should be gone");
+        assert!(
+            !Path::new(&info.path).exists(),
+            "worktree dir should be gone"
+        );
         assert!(
             branch_exists(repo_path, "task-removeme"),
             "removal takes the checkout only: the branch is what a later PR push and a later \
@@ -4479,7 +4951,9 @@ branch refs/heads/some-other-branch
             .expect("create failed");
         let work = commit_work(&info.path, "agent-work.txt");
 
-        mgr.remove(&info.path, repo_path, None).await.expect("remove failed");
+        mgr.remove(&info.path, repo_path, None)
+            .await
+            .expect("remove failed");
 
         let again = mgr
             .reattach(repo_path, "task-reattach")
@@ -5083,7 +5557,12 @@ branch refs/heads/some-other-branch
         );
         let porcelain = z(&format!("{PRIMARY}{porcelain}"));
 
-        let result = mgr.classify_missing_worktree(repo.to_str().unwrap(), RECORDED, Some(branch), Some(&porcelain));
+        let result = mgr.classify_missing_worktree(
+            repo.to_str().unwrap(),
+            RECORDED,
+            Some(branch),
+            Some(&porcelain),
+        );
 
         assert_eq!(
             result,
@@ -5111,7 +5590,12 @@ branch refs/heads/some-other-branch
         );
         let porcelain = z(&porcelain);
 
-        let result = mgr.classify_missing_worktree(repo.to_str().unwrap(), RECORDED, Some(branch), Some(&porcelain));
+        let result = mgr.classify_missing_worktree(
+            repo.to_str().unwrap(),
+            RECORDED,
+            Some(branch),
+            Some(&porcelain),
+        );
 
         assert_eq!(
             result,
@@ -5155,7 +5639,13 @@ branch refs/heads/some-other-branch
         let by_branch = |branch: &str| CheckoutRegistration::of_branch(Ok(&listing), branch);
         let by_path = |path: &str| CheckoutRegistration::of_path(Ok(&listing), path);
         for (branch, path, expected) in [
-            ("task-present", present.clone(), CheckoutRegistration::Present { path: present.clone() }),
+            (
+                "task-present",
+                present.clone(),
+                CheckoutRegistration::Present {
+                    path: present.clone(),
+                },
+            ),
             (
                 "task-prunable",
                 gone("prunable"),
@@ -5183,7 +5673,11 @@ branch refs/heads/some-other-branch
                     reason: None,
                 },
             ),
-            ("task-removed", gone("removed"), CheckoutRegistration::NotRegistered),
+            (
+                "task-removed",
+                gone("removed"),
+                CheckoutRegistration::NotRegistered,
+            ),
         ] {
             assert_eq!(by_branch(branch), expected, "by branch {branch}");
             assert_eq!(by_path(&path), expected, "by path {path}");
@@ -5238,9 +5732,18 @@ branch refs/heads/some-other-branch
         std::os::unix::fs::symlink("real", root.join("relative")).unwrap();
         std::os::unix::fs::symlink(root.join("unmounted"), root.join("dangling")).unwrap();
 
-        assert_eq!(resolved_path(&root.join("relative/a/b")), root.join("real/a/b"));
-        assert_eq!(resolved_path(&root.join("dangling/a")), root.join("unmounted/a"));
-        assert_eq!(resolved_path(&root.join("real/./x/../y")), root.join("real/y"));
+        assert_eq!(
+            resolved_path(&root.join("relative/a/b")),
+            root.join("real/a/b")
+        );
+        assert_eq!(
+            resolved_path(&root.join("dangling/a")),
+            root.join("unmounted/a")
+        );
+        assert_eq!(
+            resolved_path(&root.join("real/./x/../y")),
+            root.join("real/y")
+        );
         assert_eq!(resolved_path(Path::new("/")), PathBuf::from("/"));
     }
 
@@ -5249,8 +5752,14 @@ branch refs/heads/some-other-branch
     #[cfg(windows)]
     #[test]
     fn resolved_path_keeps_the_drive_a_root_follows() {
-        assert_eq!(resolved_path(Path::new(r"C:\x\y")), PathBuf::from(r"C:\x\y"));
-        assert_ne!(resolved_path(Path::new(r"C:\x\y")), resolved_path(Path::new(r"D:\x\y")));
+        assert_eq!(
+            resolved_path(Path::new(r"C:\x\y")),
+            PathBuf::from(r"C:\x\y")
+        );
+        assert_ne!(
+            resolved_path(Path::new(r"C:\x\y")),
+            resolved_path(Path::new(r"D:\x\y"))
+        );
     }
 
     #[test]
@@ -5263,7 +5772,12 @@ branch refs/heads/some-other-branch
         ));
 
         assert_eq!(
-            mgr.classify_missing_worktree("/home/u/app", RECORDED, Some("task-abcd1234"), Some(&listing)),
+            mgr.classify_missing_worktree(
+                "/home/u/app",
+                RECORDED,
+                Some("task-abcd1234"),
+                Some(&listing)
+            ),
             WorktreeRecovery::Locked {
                 path: gone.clone(),
                 branch: Some("task-abcd1234".to_string()),
@@ -5273,7 +5787,12 @@ branch refs/heads/some-other-branch
 
         let unlocked = listing.replace("locked usb\0", "");
         assert_eq!(
-            mgr.classify_missing_worktree("/home/u/app", RECORDED, Some("task-abcd1234"), Some(&unlocked)),
+            mgr.classify_missing_worktree(
+                "/home/u/app",
+                RECORDED,
+                Some("task-abcd1234"),
+                Some(&unlocked)
+            ),
             WorktreeRecovery::ConfirmedAbsent,
             "an unlocked registration is cleared by the next acquisition, so it does not hold \
              the reference"
@@ -5304,7 +5823,10 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
 
-        let info = mgr.create(repo_path, "remove-me").await.expect("create failed");
+        let info = mgr
+            .create(repo_path, "remove-me")
+            .await
+            .expect("create failed");
         assert!(Path::new(&info.path).exists());
 
         // `remove_with_git` now takes `repo_path` explicitly and sets
@@ -5573,13 +6095,19 @@ branch refs/heads/some-other-branch
 
         let mine_admin = worktrees_dir.join("mine");
         std::fs::create_dir(&mine_admin).expect("create mine's record");
-        std::fs::write(mine_admin.join("gitdir"), format!("{}\n", mine.join(".git").display()))
-            .expect("write mine's gitdir");
+        std::fs::write(
+            mine_admin.join("gitdir"),
+            format!("{}\n", mine.join(".git").display()),
+        )
+        .expect("write mine's gitdir");
 
         let theirs_admin = worktrees_dir.join("theirs");
         std::fs::create_dir(&theirs_admin).expect("create theirs' record");
-        std::fs::write(theirs_admin.join("gitdir"), format!("{}\n", theirs.join(".git").display()))
-            .expect("write theirs' gitdir");
+        std::fs::write(
+            theirs_admin.join("gitdir"),
+            format!("{}\n", theirs.join(".git").display()),
+        )
+        .expect("write theirs' gitdir");
 
         assert_eq!(
             WorktreeRecord::locate_admin(&worktrees_dir, mine.to_str().unwrap()),
@@ -5610,8 +6138,11 @@ branch refs/heads/some-other-branch
         for name in ["a", "b"] {
             let admin = worktrees_dir.join(name);
             std::fs::create_dir(&admin).expect("create a record");
-            std::fs::write(admin.join("gitdir"), format!("{}\n", shared.join(".git").display()))
-                .expect("write its gitdir");
+            std::fs::write(
+                admin.join("gitdir"),
+                format!("{}\n", shared.join(".git").display()),
+            )
+            .expect("write its gitdir");
         }
 
         assert_eq!(
@@ -5635,8 +6166,11 @@ branch refs/heads/some-other-branch
         let mine = tmp.path().join("checkouts").join("mine");
         let mine_admin = worktrees_dir.join("mine");
         std::fs::create_dir(&mine_admin).expect("create mine's record");
-        std::fs::write(mine_admin.join("gitdir"), format!("{}\n", mine.join(".git").display()))
-            .expect("write mine's gitdir");
+        std::fs::write(
+            mine_admin.join("gitdir"),
+            format!("{}\n", mine.join(".git").display()),
+        )
+        .expect("write mine's gitdir");
 
         assert_eq!(
             WorktreeRecord::locate_admin(&worktrees_dir, mine.to_str().unwrap()),
@@ -5786,7 +6320,10 @@ branch refs/heads/some-other-branch
         // Saved exactly as both backends save it: before anything
         // destructive runs.
         let record = WorktreeRecord::save(&info.path, repo_path).await;
-        assert!(record.is_some(), "a real, freshly created worktree always has a record to save");
+        assert!(
+            record.is_some(),
+            "a real, freshly created worktree always has a record to save"
+        );
 
         // Exactly the state a removal tool leaves when it prunes git's own
         // registration without finishing the physical removal -- confirmed
@@ -5827,7 +6364,10 @@ branch refs/heads/some-other-branch
         mgr.remove(&info.path, repo_path, None)
             .await
             .expect("the retry has to actually finish once the registration is back");
-        assert!(!Path::new(&info.path).exists(), "the retry has to actually remove the worktree");
+        assert!(
+            !Path::new(&info.path).exists(),
+            "the retry has to actually remove the worktree"
+        );
         assert!(
             branch_exists(repo_path, "task-tool-pruned-registration"),
             "the branch must survive, as it does for every other removal path"
@@ -6262,10 +6802,19 @@ branch refs/heads/some-other-branch
             .output()
             .unwrap();
         let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
-        let info = mgr.create(repo_path, "diff-clean").await.expect("create failed");
+        let info = mgr
+            .create(repo_path, "diff-clean")
+            .await
+            .expect("create failed");
 
-        let diff = crate::worktree::task_diff(&info.path, Some(&base)).await.expect("task_diff failed");
-        assert!(diff.patch.is_empty(), "expected empty diff on clean worktree, got: {}", diff.patch);
+        let diff = crate::worktree::task_diff(&info.path, Some(&base))
+            .await
+            .expect("task_diff failed");
+        assert!(
+            diff.patch.is_empty(),
+            "expected empty diff on clean worktree, got: {}",
+            diff.patch
+        );
     }
 
     #[tokio::test]
@@ -6280,7 +6829,10 @@ branch refs/heads/some-other-branch
             .output()
             .unwrap();
         let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
-        let info = mgr.create(repo_path, "diff-change").await.expect("create failed");
+        let info = mgr
+            .create(repo_path, "diff-change")
+            .await
+            .expect("create failed");
 
         // Make a change and commit it in the worktree
         std::fs::write(Path::new(&info.path).join("new_file.txt"), "hello").unwrap();
@@ -6295,9 +6847,17 @@ branch refs/heads/some-other-branch
             .output()
             .unwrap();
 
-        let diff = crate::worktree::task_diff(&info.path, Some(&base)).await.expect("task_diff failed");
-        assert!(diff.patch.contains("new_file.txt"), "diff should mention the new file");
-        assert!(diff.stat.contains("new_file.txt"), "stat should mention the new file");
+        let diff = crate::worktree::task_diff(&info.path, Some(&base))
+            .await
+            .expect("task_diff failed");
+        assert!(
+            diff.patch.contains("new_file.txt"),
+            "diff should mention the new file"
+        );
+        assert!(
+            diff.stat.contains("new_file.txt"),
+            "stat should mention the new file"
+        );
     }
 
     #[tokio::test]
@@ -6306,7 +6866,10 @@ branch refs/heads/some-other-branch
         let repo_path = tmp.path().to_str().unwrap();
 
         let mgr = test_manager();
-        let info = mgr.create(repo_path, "stat-branch").await.expect("create failed");
+        let info = mgr
+            .create(repo_path, "stat-branch")
+            .await
+            .expect("create failed");
 
         let result = crate::worktree::task_diff(&info.path, None).await;
         assert_eq!(result, Err(crate::worktree::TaskDiffError::UnknownBoundary));
@@ -6332,7 +6895,8 @@ branch refs/heads/some-other-branch
         let stacked = mgr
             .create_stacked_branch(repo_path, "stacked-branch", "base-branch")
             .await
-            .expect("git-only stacked branch creation from a non-main base must succeed").info;
+            .expect("git-only stacked branch creation from a non-main base must succeed")
+            .info;
 
         assert!(Path::new(&stacked.path).exists());
         assert_eq!(stacked.branch, "stacked-branch");
@@ -6346,7 +6910,10 @@ branch refs/heads/some-other-branch
         let mgr = test_manager();
         // Git rejects empty branch names, so this should fail.
         let result = mgr.create(repo_path, "").await;
-        assert!(result.is_err(), "creating worktree with empty branch should fail");
+        assert!(
+            result.is_err(),
+            "creating worktree with empty branch should fail"
+        );
     }
 
     #[tokio::test]
@@ -6368,7 +6935,10 @@ branch refs/heads/some-other-branch
         let mgr = test_manager();
 
         // Create a worktree, then remove the worktree (keep the branch)
-        let info = mgr.create(repo_path, "reattach-me").await.expect("create failed");
+        let info = mgr
+            .create(repo_path, "reattach-me")
+            .await
+            .expect("create failed");
         let wt_path = info.path.clone();
 
         // Remove worktree only (not the branch)
@@ -6379,15 +6949,24 @@ branch refs/heads/some-other-branch
             .expect("worktree remove failed");
 
         // Reattach to the existing branch
-        let reattached = mgr.reattach(repo_path, "reattach-me").await.expect("reattach failed");
-        assert!(Path::new(&reattached.path).exists(), "reattached worktree should exist");
+        let reattached = mgr
+            .reattach(repo_path, "reattach-me")
+            .await
+            .expect("reattach failed");
+        assert!(
+            Path::new(&reattached.path).exists(),
+            "reattached worktree should exist"
+        );
         assert_eq!(reattached.branch, "reattach-me");
     }
 
     /// Every ref in the repository with the commit it names, so a test can
     /// show a refused operation left all of them exactly as they were.
     fn all_refs(repo_path: &str) -> String {
-        run_git(repo_path, &["for-each-ref", "--format=%(refname) %(objectname)"])
+        run_git(
+            repo_path,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        )
     }
 
     /// The worktrees git has registered, the primary checkout included.
@@ -6421,10 +7000,24 @@ branch refs/heads/some-other-branch
         let mgr = test_manager();
         let result = mgr.reattach(repo_path, "-Bvictim").await;
 
-        assert_eq!(all_refs(repo_path), refs_before, "no ref may move, `victim` above all");
-        assert!(result.is_err(), "a branch shaped like an option must be refused");
-        assert_eq!(registered_worktrees(repo_path).len(), 1, "no worktree may be created");
-        assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(
+            all_refs(repo_path),
+            refs_before,
+            "no ref may move, `victim` above all"
+        );
+        assert!(
+            result.is_err(),
+            "a branch shaped like an option must be refused"
+        );
+        assert_eq!(
+            registered_worktrees(repo_path).len(),
+            1,
+            "no worktree may be created"
+        );
+        assert_eq!(
+            run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
         assert!(!mgr.managed_path(repo_path, "-Bvictim").exists());
     }
 
@@ -6439,8 +7032,15 @@ branch refs/heads/some-other-branch
         let mgr = test_manager();
         let result = mgr.reattach(repo_path, "HEAD~1").await;
 
-        assert!(result.is_err(), "a revision must be refused where a branch is expected");
-        assert_eq!(registered_worktrees(repo_path).len(), 1, "no detached worktree may appear");
+        assert!(
+            result.is_err(),
+            "a revision must be refused where a branch is expected"
+        );
+        assert_eq!(
+            registered_worktrees(repo_path).len(),
+            1,
+            "no detached worktree may appear"
+        );
         assert_eq!(all_refs(repo_path), refs_before);
     }
 
@@ -6455,11 +7055,23 @@ branch refs/heads/some-other-branch
         let refs_before = all_refs(repo_path);
 
         let mgr = test_manager();
-        let result = mgr.create_stacked_branch(repo_path, "task-1234abcd", "-m").await;
+        let result = mgr
+            .create_stacked_branch(repo_path, "task-1234abcd", "-m")
+            .await;
 
-        assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
-        assert_eq!(all_refs(repo_path), refs_before, "no ref may be created, moved or renamed");
-        assert!(result.is_err(), "a dependency shaped like an option must be refused");
+        assert_eq!(
+            run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
+        assert_eq!(
+            all_refs(repo_path),
+            refs_before,
+            "no ref may be created, moved or renamed"
+        );
+        assert!(
+            result.is_err(),
+            "a dependency shaped like an option must be refused"
+        );
         assert!(!branch_exists(repo_path, "task-1234abcd"));
         assert_eq!(registered_worktrees(repo_path).len(), 1);
     }
@@ -6482,7 +7094,11 @@ branch refs/heads/some-other-branch
             let result = mgr.create_stacked_branch(repo_path, branch, after).await;
             assert!(result.is_err(), "{branch:?} on {after:?} must be refused");
             assert_eq!(all_refs(repo_path), refs_before, "{branch:?} on {after:?}");
-            assert_eq!(registered_worktrees(repo_path).len(), 1, "{branch:?} on {after:?}");
+            assert_eq!(
+                registered_worktrees(repo_path).len(),
+                1,
+                "{branch:?} on {after:?}"
+            );
         }
     }
 
@@ -6499,7 +7115,10 @@ branch refs/heads/some-other-branch
         let repo_path = tmp.path().to_str().unwrap();
         run_git(repo_path, &["branch", "task-1234abcd"]);
         run_git(repo_path, &["checkout", "-q", "-b", "task-5678abcd"]);
-        run_git(repo_path, &["commit", "--allow-empty", "-m", "dependency work"]);
+        run_git(
+            repo_path,
+            &["commit", "--allow-empty", "-m", "dependency work"],
+        );
         run_git(repo_path, &["checkout", "-q", "main"]);
         let refs_before = all_refs(repo_path);
 
@@ -6508,7 +7127,9 @@ branch refs/heads/some-other-branch
             .create_stacked_branch(repo_path, "task-1234abcd", "task-5678abcd")
             .await;
 
-        let error = result.err().expect("a branch that could not be created must not be reported as stacked");
+        let error = result
+            .err()
+            .expect("a branch that could not be created must not be reported as stacked");
         assert!(
             error.contains("task-1234abcd") && error.contains("task-5678abcd"),
             "the refusal has to name both branches: {error}"
@@ -6538,7 +7159,11 @@ branch refs/heads/some-other-branch
         let dest = mgr.managed_path(repo_path, "unchecked");
         let result = mgr.git_worktree_add(repo_path, &dest, "-Bvictim").await;
 
-        assert_eq!(all_refs(repo_path), refs_before, "`victim` must not be reset");
+        assert_eq!(
+            all_refs(repo_path),
+            refs_before,
+            "`victim` must not be reset"
+        );
         assert!(result.is_err());
         assert_eq!(registered_worktrees(repo_path).len(), 1);
     }
@@ -6557,7 +7182,10 @@ branch refs/heads/some-other-branch
         WorktreeManager::create_branch_at(repo_path, "task-1234abcd", &commit)
             .await
             .expect("create");
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-1234abcd"]), commit);
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-1234abcd"]),
+            commit
+        );
 
         let refs_before = all_refs(repo_path);
         let main = run_git(repo_path, &["rev-parse", "main"]);
@@ -6581,7 +7209,11 @@ branch refs/heads/some-other-branch
         )
         .unwrap();
         for name in [commit.as_str(), "FETCH_HEAD", "ORIG_HEAD"] {
-            assert_eq!(run_git(repo_path, &["rev-parse", name]), commit, "{name} must resolve");
+            assert_eq!(
+                run_git(repo_path, &["rev-parse", name]),
+                commit,
+                "{name} must resolve"
+            );
         }
         (tmp, commit)
     }
@@ -6600,8 +7232,15 @@ branch refs/heads/some-other-branch
         let mgr = test_manager();
         for name in [commit.as_str(), "FETCH_HEAD", "ORIG_HEAD"] {
             let result = mgr.reattach(repo_path, name).await;
-            assert!(result.is_err(), "{name:?} is not a local branch and must be refused");
-            assert_eq!(registered_worktrees(repo_path).len(), 1, "{name:?}: no detached worktree");
+            assert!(
+                result.is_err(),
+                "{name:?} is not a local branch and must be refused"
+            );
+            assert_eq!(
+                registered_worktrees(repo_path).len(),
+                1,
+                "{name:?}: no detached worktree"
+            );
             assert!(!mgr.managed_path(repo_path, name).exists(), "{name:?}");
             assert_eq!(all_refs(repo_path), refs_before, "{name:?}");
         }
@@ -6618,8 +7257,13 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
         for name in [commit.as_str(), "FETCH_HEAD", "ORIG_HEAD"] {
-            let result = mgr.create_stacked_branch(repo_path, "task-1234abcd", name).await;
-            assert!(result.is_err(), "{name:?} is not a local branch and must be refused");
+            let result = mgr
+                .create_stacked_branch(repo_path, "task-1234abcd", name)
+                .await;
+            assert!(
+                result.is_err(),
+                "{name:?} is not a local branch and must be refused"
+            );
             assert!(!branch_exists(repo_path, "task-1234abcd"), "{name:?}");
             assert_eq!(all_refs(repo_path), refs_before, "{name:?}");
             assert_eq!(registered_worktrees(repo_path).len(), 1, "{name:?}");
@@ -6636,7 +7280,10 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         run_git(repo_path, &["checkout", "-q", "-b", "task-5678abcd"]);
-        run_git(repo_path, &["commit", "--allow-empty", "-m", "dependency work"]);
+        run_git(
+            repo_path,
+            &["commit", "--allow-empty", "-m", "dependency work"],
+        );
         run_git(repo_path, &["checkout", "-q", "main"]);
         let refs_before = all_refs(repo_path);
 
@@ -6649,7 +7296,10 @@ branch refs/heads/some-other-branch
             .create_stacked_branch(repo_path, "task-1234abcd", "task-5678abcd")
             .await;
         assert!(result.is_err(), "the worktree could not be attached");
-        assert!(!branch_exists(repo_path, "task-1234abcd"), "the branch it created must go");
+        assert!(
+            !branch_exists(repo_path, "task-1234abcd"),
+            "the branch it created must go"
+        );
         assert_eq!(all_refs(repo_path), refs_before);
         assert_eq!(registered_worktrees(repo_path).len(), 1);
 
@@ -6657,8 +7307,12 @@ branch refs/heads/some-other-branch
         let stacked = mgr
             .create_stacked_branch(repo_path, "task-1234abcd", "task-5678abcd")
             .await
-            .expect("a retry once the obstacle is gone").info;
-        assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), "task-1234abcd");
+            .expect("a retry once the obstacle is gone")
+            .info;
+        assert_eq!(
+            run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]),
+            "task-1234abcd"
+        );
         assert_eq!(
             run_git(&stacked.path, &["rev-parse", "HEAD"]),
             run_git(repo_path, &["rev-parse", "task-5678abcd"])
@@ -6690,7 +7344,10 @@ branch refs/heads/some-other-branch
         let porcelain = run_git(repo_path, &["worktree", "list", "--porcelain", "-z"]);
         let registered = WorktreeManager::registration_for_branch(&porcelain, "task-1234abcd")
             .expect("git registered the worktree before the hook failed");
-        assert!(branch_exists(repo_path, "task-1234abcd"), "the checked-out branch must be kept");
+        assert!(
+            branch_exists(repo_path, "task-1234abcd"),
+            "the checked-out branch must be kept"
+        );
         assert_eq!(
             run_git(&registered, &["rev-parse", "HEAD"]),
             run_git(repo_path, &["rev-parse", "task-5678abcd"])
@@ -6707,7 +7364,10 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         run_git(repo_path, &["checkout", "-q", "-b", "task-5678abcd"]);
-        run_git(repo_path, &["commit", "--allow-empty", "-m", "dependency work"]);
+        run_git(
+            repo_path,
+            &["commit", "--allow-empty", "-m", "dependency work"],
+        );
         run_git(repo_path, &["checkout", "-q", "main"]);
         let dependency_tip = run_git(repo_path, &["rev-parse", "task-5678abcd"]);
         let hook = tmp.path().join(".git/hooks/post-checkout");
@@ -6730,10 +7390,23 @@ branch refs/heads/some-other-branch
         assert!(retried.resumed);
         assert_eq!(retried.dependency_tip, dependency_tip);
         let retried = retried.info;
-        assert_eq!(run_git(&retried.path, &["symbolic-ref", "--short", "HEAD"]), "task-1234abcd");
-        assert_eq!(run_git(&retried.path, &["rev-parse", "HEAD"]), dependency_tip);
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-1234abcd"]), dependency_tip);
-        assert_eq!(registered_worktrees(repo_path).len(), 2, "no second worktree for the branch");
+        assert_eq!(
+            run_git(&retried.path, &["symbolic-ref", "--short", "HEAD"]),
+            "task-1234abcd"
+        );
+        assert_eq!(
+            run_git(&retried.path, &["rev-parse", "HEAD"]),
+            dependency_tip
+        );
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-1234abcd"]),
+            dependency_tip
+        );
+        assert_eq!(
+            registered_worktrees(repo_path).len(),
+            2,
+            "no second worktree for the branch"
+        );
     }
 
     /// A branch an earlier attempt created and recorded nowhere -- the start
@@ -6744,9 +7417,15 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         run_git(repo_path, &["checkout", "-q", "-b", "task-5678abcd"]);
-        run_git(repo_path, &["commit", "--allow-empty", "-m", "dependency work"]);
+        run_git(
+            repo_path,
+            &["commit", "--allow-empty", "-m", "dependency work"],
+        );
         run_git(repo_path, &["checkout", "-q", "-b", "task-1234abcd"]);
-        run_git(repo_path, &["commit", "--allow-empty", "-m", "the task's own work"]);
+        run_git(
+            repo_path,
+            &["commit", "--allow-empty", "-m", "the task's own work"],
+        );
         run_git(repo_path, &["checkout", "-q", "main"]);
         let task_tip = run_git(repo_path, &["rev-parse", "task-1234abcd"]);
         let refs_before = all_refs(repo_path);
@@ -6763,9 +7442,16 @@ branch refs/heads/some-other-branch
             "the stack is reported against the dependency, not the branch's own tip"
         );
         let attached = attached.info;
-        assert_eq!(run_git(&attached.path, &["symbolic-ref", "--short", "HEAD"]), "task-1234abcd");
+        assert_eq!(
+            run_git(&attached.path, &["symbolic-ref", "--short", "HEAD"]),
+            "task-1234abcd"
+        );
         assert_eq!(run_git(&attached.path, &["rev-parse", "HEAD"]), task_tip);
-        assert_eq!(all_refs(repo_path), refs_before, "the branch is attached, never moved");
+        assert_eq!(
+            all_refs(repo_path),
+            refs_before,
+            "the branch is attached, never moved"
+        );
     }
 
     /// The cleanup deletes the branch only while it still names the commit
@@ -6784,7 +7470,10 @@ branch refs/heads/some-other-branch
         let result =
             WorktreeManager::discard_created_branch(repo_path, "task-1234abcd", &created_at).await;
         assert!(result.is_err(), "a branch that was kept must be reported");
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-1234abcd"]), moved_to);
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-1234abcd"]),
+            moved_to
+        );
 
         WorktreeManager::discard_created_branch(repo_path, "task-1234abcd", &moved_to)
             .await
@@ -6803,17 +7492,30 @@ branch refs/heads/some-other-branch
         run_git(repo_path, &["branch", &task_branch]);
         let mgr = test_manager();
 
-        let reattached = mgr.reattach(repo_path, &task_branch).await.expect("reattach");
-        assert_eq!(run_git(&reattached.path, &["symbolic-ref", "--short", "HEAD"]), task_branch);
+        let reattached = mgr
+            .reattach(repo_path, &task_branch)
+            .await
+            .expect("reattach");
+        assert_eq!(
+            run_git(&reattached.path, &["symbolic-ref", "--short", "HEAD"]),
+            task_branch
+        );
         let dependency_tip = commit_work(&reattached.path, "dependency.txt");
         run_git(repo_path, &["worktree", "remove", &reattached.path]);
 
         let stacked = mgr
             .create_stacked_branch(repo_path, &newer, &task_branch)
             .await
-            .expect("stacked").info;
-        assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), newer);
-        assert_eq!(run_git(&stacked.path, &["rev-parse", "HEAD"]), dependency_tip);
+            .expect("stacked")
+            .info;
+        assert_eq!(
+            run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]),
+            newer
+        );
+        assert_eq!(
+            run_git(&stacked.path, &["rev-parse", "HEAD"]),
+            dependency_tip
+        );
     }
 
     /// The names SlashIt generates keep working on every git-only path.
@@ -6823,22 +7525,44 @@ branch refs/heads/some-other-branch
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
 
-        let created = mgr.create(repo_path, "task-1234abcd").await.expect("create");
-        assert_eq!(run_git(&created.path, &["symbolic-ref", "--short", "HEAD"]), "task-1234abcd");
+        let created = mgr
+            .create(repo_path, "task-1234abcd")
+            .await
+            .expect("create");
+        assert_eq!(
+            run_git(&created.path, &["symbolic-ref", "--short", "HEAD"]),
+            "task-1234abcd"
+        );
         let dependency_tip = commit_work(&created.path, "dependency.txt");
 
         run_git(repo_path, &["worktree", "remove", &created.path]);
-        let reattached = mgr.reattach(repo_path, "task-1234abcd").await.expect("reattach");
-        assert_eq!(run_git(&reattached.path, &["symbolic-ref", "--short", "HEAD"]), "task-1234abcd");
+        let reattached = mgr
+            .reattach(repo_path, "task-1234abcd")
+            .await
+            .expect("reattach");
+        assert_eq!(
+            run_git(&reattached.path, &["symbolic-ref", "--short", "HEAD"]),
+            "task-1234abcd"
+        );
         run_git(repo_path, &["worktree", "remove", &reattached.path]);
 
         let stacked = mgr
             .create_stacked_branch(repo_path, "task-5678abcd", "task-1234abcd")
             .await
-            .expect("stacked").info;
-        assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), "task-5678abcd");
-        assert_eq!(run_git(&stacked.path, &["rev-parse", "HEAD"]), dependency_tip);
-        assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
+            .expect("stacked")
+            .info;
+        assert_eq!(
+            run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]),
+            "task-5678abcd"
+        );
+        assert_eq!(
+            run_git(&stacked.path, &["rev-parse", "HEAD"]),
+            dependency_tip
+        );
+        assert_eq!(
+            run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
     }
 
     /// Stack `stacked` on a `dependency` branch one commit ahead of `main`,
@@ -6855,25 +7579,41 @@ branch refs/heads/some-other-branch
         let dependency_tip = commit_work(&dependency, "dependency.txt");
         run_git(repo_path, &["worktree", "remove", &dependency]);
         let main_tip = run_git(repo_path, &["rev-parse", "main"]);
-        assert_ne!(dependency_tip, main_tip, "the fixture must tell the two bases apart");
+        assert_ne!(
+            dependency_tip, main_tip,
+            "the fixture must tell the two bases apart"
+        );
 
         let mgr = test_manager();
         let stacked = mgr
             .create_stacked_branch(repo_path, "stacked", "dependency")
             .await
-            .expect("stacking on a local branch must succeed whatever is on PATH").info;
+            .expect("stacking on a local branch must succeed whatever is on PATH")
+            .info;
 
         assert_eq!(fake.invocations(), "", "git-spice must never be run");
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/stacked"]), dependency_tip);
-        assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), "stacked");
-        assert_eq!(run_git(&stacked.path, &["rev-parse", "HEAD"]), dependency_tip);
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/stacked"]),
+            dependency_tip
+        );
+        assert_eq!(
+            run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]),
+            "stacked"
+        );
+        assert_eq!(
+            run_git(&stacked.path, &["rev-parse", "HEAD"]),
+            dependency_tip
+        );
         assert!(
             registered_worktrees(repo_path)
                 .iter()
                 .any(|w| Path::new(w) == Path::new(&stacked.path)),
             "the stacked worktree must be registered with git"
         );
-        assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(
+            run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
         assert_eq!(run_git(repo_path, &["rev-parse", "main"]), main_tip);
     }
 
@@ -6894,7 +7634,11 @@ branch refs/heads/some-other-branch
     #[cfg(unix)]
     #[tokio::test]
     async fn a_git_spice_that_succeeds_does_not_change_the_stacked_branch() {
-        let fake = crate::test_helpers::FakeProgram::install("git-spice", "exec git checkout -q -b \"$3\"").await;
+        let fake = crate::test_helpers::FakeProgram::install(
+            "git-spice",
+            "exec git checkout -q -b \"$3\"",
+        )
+        .await;
         assert_stacks_on_the_dependency_tip_with(&fake).await;
     }
 
@@ -6919,9 +7663,17 @@ branch refs/heads/some-other-branch
     async fn local_branch_exists_separates_absent_from_unanswerable() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
-        assert_eq!(WorktreeManager::local_branch_exists(repo_path, "main").await, Ok(true));
-        assert_eq!(WorktreeManager::local_branch_exists(repo_path, "gone").await, Ok(false));
-        assert!(WorktreeManager::local_branch_exists(repo_path, "-Bvictim").await.is_err());
+        assert_eq!(
+            WorktreeManager::local_branch_exists(repo_path, "main").await,
+            Ok(true)
+        );
+        assert_eq!(
+            WorktreeManager::local_branch_exists(repo_path, "gone").await,
+            Ok(false)
+        );
+        assert!(WorktreeManager::local_branch_exists(repo_path, "-Bvictim")
+            .await
+            .is_err());
 
         // Present but broken is not absent: a ref naming a missing object,
         // which `rev-parse --verify --quiet` reports exactly like no ref at
@@ -6936,10 +7688,15 @@ branch refs/heads/some-other-branch
             Ok(true)
         );
         std::fs::write(tmp.path().join(".git/refs/heads/garbage"), "garbage\n").unwrap();
-        assert!(WorktreeManager::local_branch_exists(repo_path, "garbage").await.is_err());
+        assert!(WorktreeManager::local_branch_exists(repo_path, "garbage")
+            .await
+            .is_err());
         // Refs below `refs/heads/<name>/` are not the branch `<name>`.
         run_git(repo_path, &["branch", "nested/child"]);
-        assert_eq!(WorktreeManager::local_branch_exists(repo_path, "nested").await, Ok(false));
+        assert_eq!(
+            WorktreeManager::local_branch_exists(repo_path, "nested").await,
+            Ok(false)
+        );
 
         let not_a_repo = tempfile::tempdir().expect("tempdir");
         assert!(
@@ -6955,7 +7712,9 @@ branch refs/heads/some-other-branch
     async fn local_branch_exists_by_status_separates_absent_from_unanswerable() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
-        let exists = |branch: &'static str| WorktreeManager::local_branch_exists_by_status(repo_path, branch);
+        let exists = |branch: &'static str| {
+            WorktreeManager::local_branch_exists_by_status(repo_path, branch)
+        };
         assert_eq!(exists("main").await, Ok(true));
         assert_eq!(exists("gone").await, Ok(false));
         assert!(exists("-Bvictim").await.is_err());
@@ -6974,18 +7733,28 @@ branch refs/heads/some-other-branch
         assert_ne!(exists("nested").await, Ok(true));
 
         let not_a_repo = tempfile::tempdir().expect("tempdir");
-        assert!(
-            WorktreeManager::local_branch_exists_by_status(not_a_repo.path().to_str().unwrap(), "main")
-                .await
-                .is_err()
-        );
+        assert!(WorktreeManager::local_branch_exists_by_status(
+            not_a_repo.path().to_str().unwrap(),
+            "main"
+        )
+        .await
+        .is_err());
     }
 
     fn commit_in(repo: &str, message: &str) -> String {
         run_git(
             repo,
-            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-q",
-              "--allow-empty", "-m", message],
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                message,
+            ],
         );
         run_git(repo, &["rev-parse", "HEAD"])
     }
@@ -6996,7 +7765,10 @@ branch refs/heads/some-other-branch
 
     /// The commit `refs/remotes/origin/main` names in `repo_path`.
     fn origin_main(repo_path: &str) -> String {
-        run_git(repo_path, &["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"])
+        run_git(
+            repo_path,
+            &["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
+        )
     }
 
     /// Every `branch.<branch>.*` setting, one per line, or the empty string.
@@ -7004,7 +7776,11 @@ branch refs/heads/some-other-branch
     /// answer this is after, so its status is not asserted.
     fn branch_config(repo_path: &str, branch: &str) -> String {
         let output = std::process::Command::new("git")
-            .args(["config", "--get-regexp", &format!("^branch\\.{}\\.", branch.replace('.', "\\."))])
+            .args([
+                "config",
+                "--get-regexp",
+                &format!("^branch\\.{}\\.", branch.replace('.', "\\.")),
+            ])
             .current_dir(repo_path)
             .output()
             .expect("spawn git config");
@@ -7026,11 +7802,20 @@ branch refs/heads/some-other-branch
         assert_ne!(feature, base, "the fixture must tell the two starts apart");
 
         let mgr = test_manager();
-        let info = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
+        let info = mgr
+            .create(repo_path, "task-0a1b2c3d")
+            .await
+            .expect("create");
 
         assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), base);
-        assert_eq!(run_git(&info.path, &["symbolic-ref", "HEAD"]), "refs/heads/task-0a1b2c3d");
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), base);
+        assert_eq!(
+            run_git(&info.path, &["symbolic-ref", "HEAD"]),
+            "refs/heads/task-0a1b2c3d"
+        );
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]),
+            base
+        );
         assert_eq!(
             run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]),
             "feature-f",
@@ -7052,10 +7837,17 @@ branch refs/heads/some-other-branch
         let local = commit_in(repo_path, "local work ahead of origin");
 
         let mgr = test_manager();
-        let info = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
+        let info = mgr
+            .create(repo_path, "task-0a1b2c3d")
+            .await
+            .expect("create");
 
         assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), base);
-        assert_eq!(run_git(repo_path, &["rev-parse", "HEAD"]), local, "the primary is untouched");
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "HEAD"]),
+            local,
+            "the primary is untouched"
+        );
     }
 
     /// A new task branch tracks nothing, whatever `branch.autoSetupMerge`
@@ -7068,7 +7860,10 @@ branch refs/heads/some-other-branch
         for setting in ["always", "inherit", "true", "simple"] {
             let tmp = create_temp_git_repo();
             let repo_path = tmp.path().to_str().unwrap();
-            run_git(repo_path, &["branch", "--set-upstream-to=origin/main", "main"]);
+            run_git(
+                repo_path,
+                &["branch", "--set-upstream-to=origin/main", "main"],
+            );
             run_git(repo_path, &["config", "branch.autoSetupMerge", setting]);
 
             let mgr = test_manager();
@@ -7094,10 +7889,16 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let base = origin_main(repo_path);
-        run_git(repo_path, &["branch", "--set-upstream-to=origin/main", "main"]);
+        run_git(
+            repo_path,
+            &["branch", "--set-upstream-to=origin/main", "main"],
+        );
         run_git(repo_path, &["config", "branch.autoSetupMerge", "inherit"]);
         let mgr = test_manager();
-        let info = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
+        let info = mgr
+            .create(repo_path, "task-0a1b2c3d")
+            .await
+            .expect("create");
         commit_work(&info.path, "agent-work.txt");
 
         let _ = std::process::Command::new("git")
@@ -7107,7 +7908,10 @@ branch refs/heads/some-other-branch
             .expect("spawn git push");
 
         let origin = tmp.origin();
-        assert_eq!(run_git(origin.to_str().unwrap(), &["rev-parse", "refs/heads/main"]), base);
+        assert_eq!(
+            run_git(origin.to_str().unwrap(), &["rev-parse", "refs/heads/main"]),
+            base
+        );
     }
 
     /// The start is the object ID of the exact ref, never a name git looks
@@ -7134,10 +7938,16 @@ branch refs/heads/some-other-branch
         }
 
         let mgr = test_manager();
-        let info = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
+        let info = mgr
+            .create(repo_path, "task-0a1b2c3d")
+            .await
+            .expect("create");
 
         assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), base);
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), base);
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]),
+            base
+        );
     }
 
     /// A worktree of the task's branch registered at a path of somebody
@@ -7149,8 +7959,22 @@ branch refs/heads/some-other-branch
     async fn reattach_adopts_a_worktree_registered_at_a_custom_path() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
-        let custom = tmp.root().join("repo.worktrunk-template").join("task-c0ffee11");
-        run_git(repo_path, &["worktree", "add", "-q", "-b", "task-c0ffee11", "--", custom.to_str().unwrap()]);
+        let custom = tmp
+            .root()
+            .join("repo.worktrunk-template")
+            .join("task-c0ffee11");
+        run_git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-c0ffee11",
+                "--",
+                custom.to_str().unwrap(),
+            ],
+        );
         let before = registered_worktrees(repo_path);
 
         let mgr = test_manager();
@@ -7163,7 +7987,11 @@ branch refs/heads/some-other-branch
             std::fs::canonicalize(&info.path).unwrap(),
             std::fs::canonicalize(&custom).unwrap()
         );
-        assert_eq!(registered_worktrees(repo_path), before, "nothing new is created");
+        assert_eq!(
+            registered_worktrees(repo_path),
+            before,
+            "nothing new is created"
+        );
     }
 
     /// A Project path inside a linked worktree never adopts that worktree's
@@ -7174,19 +8002,39 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let project_root = tmp.root().join("project-worktree");
-        run_git(repo_path, &["worktree", "add", "-q", "-b", "project-branch", project_root.to_str().unwrap()]);
+        run_git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "project-branch",
+                project_root.to_str().unwrap(),
+            ],
+        );
         let subdir = project_root.join("subdir");
         std::fs::create_dir(&subdir).unwrap();
-        run_git(project_root.to_str().unwrap(), &["checkout", "-q", "-b", "task-c0ffee11"]);
+        run_git(
+            project_root.to_str().unwrap(),
+            &["checkout", "-q", "-b", "task-c0ffee11"],
+        );
         let before = registered_worktrees(repo_path);
 
         let mgr = test_manager();
-        let Err(err) = mgr.reattach(subdir.to_str().unwrap(), "task-c0ffee11").await else {
+        let Err(err) = mgr
+            .reattach(subdir.to_str().unwrap(), "task-c0ffee11")
+            .await
+        else {
             panic!("the Project's own linked worktree is never adopted");
         };
 
         assert!(err.contains("repository's own checkout"), "{err}");
-        assert_eq!(registered_worktrees(repo_path), before, "nothing is changed");
+        assert_eq!(
+            registered_worktrees(repo_path),
+            before,
+            "nothing is changed"
+        );
     }
 
     /// The same worktree is adopted when a task that never recorded its
@@ -7195,8 +8043,22 @@ branch refs/heads/some-other-branch
     async fn acquisition_adopts_a_worktree_registered_at_a_custom_path() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
-        let custom = tmp.root().join("repo.worktrunk-template").join("task-c0ffee11");
-        run_git(repo_path, &["worktree", "add", "-q", "-b", "task-c0ffee11", "--", custom.to_str().unwrap()]);
+        let custom = tmp
+            .root()
+            .join("repo.worktrunk-template")
+            .join("task-c0ffee11");
+        run_git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-c0ffee11",
+                "--",
+                custom.to_str().unwrap(),
+            ],
+        );
         let before = registered_worktrees(repo_path);
 
         let mgr = test_manager();
@@ -7205,12 +8067,19 @@ branch refs/heads/some-other-branch
             .await
             .expect("the registered worktree is adopted");
 
-        assert_eq!(created_from, None, "adopted, not created, and no base is claimed");
+        assert_eq!(
+            created_from, None,
+            "adopted, not created, and no base is claimed"
+        );
         assert_eq!(
             std::fs::canonicalize(&info.path).unwrap(),
             std::fs::canonicalize(&custom).unwrap()
         );
-        assert_eq!(registered_worktrees(repo_path), before, "nothing new is created");
+        assert_eq!(
+            registered_worktrees(repo_path),
+            before,
+            "nothing new is created"
+        );
     }
 
     /// The primary checkout is never a task's worktree, even when it has
@@ -7223,7 +8092,9 @@ branch refs/heads/some-other-branch
         run_git(repo_path, &["checkout", "-q", "-b", "task-c0ffee11"]);
 
         let reattached = test_manager().reattach(repo_path, "task-c0ffee11").await;
-        let acquired = test_manager().create_or_adopt(repo_path, "task-c0ffee11", None).await;
+        let acquired = test_manager()
+            .create_or_adopt(repo_path, "task-c0ffee11", None)
+            .await;
 
         assert!(reattached.is_err(), "{:?}", reattached.map(|i| i.path));
         assert!(acquired.is_err(), "{:?}", acquired.map(|(i, _)| i.path));
@@ -7238,8 +8109,29 @@ branch refs/heads/some-other-branch
         let repo_path = tmp.path().to_str().unwrap();
         let other = tmp.root().join("other");
         let detached = tmp.root().join("detached");
-        run_git(repo_path, &["worktree", "add", "-q", "-b", "task-c0ffee11-other", "--", other.to_str().unwrap()]);
-        run_git(repo_path, &["worktree", "add", "-q", "--detach", "--", detached.to_str().unwrap()]);
+        run_git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-c0ffee11-other",
+                "--",
+                other.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                "--",
+                detached.to_str().unwrap(),
+            ],
+        );
 
         let mgr = test_manager();
         let (info, created_from) = mgr
@@ -7248,7 +8140,10 @@ branch refs/heads/some-other-branch
             .expect("a new worktree");
 
         assert!(created_from.is_some(), "created, not adopted");
-        assert_eq!(Path::new(&info.path), mgr.managed_path(repo_path, "task-c0ffee11").as_path());
+        assert_eq!(
+            Path::new(&info.path),
+            mgr.managed_path(repo_path, "task-c0ffee11").as_path()
+        );
     }
 
     /// A worktree that cannot be added takes the branch just created for it
@@ -7266,9 +8161,15 @@ branch refs/heads/some-other-branch
         let refused = mgr.create(repo_path, "task-0a1b2c3d").await;
 
         assert!(refused.is_err());
-        assert_eq!(all_refs(repo_path), refs_before, "the new branch is discarded");
+        assert_eq!(
+            all_refs(repo_path),
+            refs_before,
+            "the new branch is discarded"
+        );
         std::fs::remove_dir_all(&dest).unwrap();
-        mgr.create(repo_path, "task-0a1b2c3d").await.expect("a retry succeeds");
+        mgr.create(repo_path, "task-0a1b2c3d")
+            .await
+            .expect("a retry succeeds");
     }
 
     /// A `post-checkout` hook that moves the new checkout means the branch
@@ -7296,8 +8197,15 @@ branch refs/heads/some-other-branch
             .expect_err("a moved checkout is not a default-base start");
 
         assert!(refused.contains("post-checkout"), "{refused}");
-        assert!(branch_exists(repo_path, "task-0a1b2c3d"), "the branch is left as it is");
-        assert_eq!(registered_worktrees(repo_path).len(), 2, "and so is the worktree");
+        assert!(
+            branch_exists(repo_path, "task-0a1b2c3d"),
+            "the branch is left as it is"
+        );
+        assert_eq!(
+            registered_worktrees(repo_path).len(),
+            2,
+            "and so is the worktree"
+        );
     }
 
     /// A Project can itself be a linked worktree of another checkout. The
@@ -7311,13 +8219,27 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let main_worktree = tmp.path().to_str().unwrap();
         let project = tmp.root().join("project-w");
-        run_git(main_worktree, &["worktree", "add", "-q", "-b", "project-w", "--", project.to_str().unwrap()]);
+        run_git(
+            main_worktree,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "project-w",
+                "--",
+                project.to_str().unwrap(),
+            ],
+        );
         run_git(main_worktree, &["checkout", "-q", "-b", "task-c0ffee11"]);
         let before = registered_worktrees(main_worktree);
         let project = project.to_str().unwrap();
         let mgr = test_manager();
 
-        let reattached = mgr.reattach(project, "task-c0ffee11").await.map(|info| info.path);
+        let reattached = mgr
+            .reattach(project, "task-c0ffee11")
+            .await
+            .map(|info| info.path);
         let acquired = mgr
             .create_or_adopt(project, "task-c0ffee11", None)
             .await
@@ -7328,7 +8250,11 @@ branch refs/heads/some-other-branch
             assert!(refused.contains(main_worktree), "{what}: {refused}");
             assert!(refused.contains("checked out"), "{what}: {refused}");
         }
-        assert_eq!(registered_worktrees(main_worktree), before, "nothing is created");
+        assert_eq!(
+            registered_worktrees(main_worktree),
+            before,
+            "nothing is created"
+        );
     }
 
     /// A newline in a worktree's path cannot forge a `branch` record in
@@ -7340,7 +8266,10 @@ branch refs/heads/some-other-branch
         let victim = tmp.root().join("victim");
         std::fs::create_dir_all(&victim).unwrap();
         let forged = format!("{}\nbranch refs/heads/task-c0ffee11", victim.display());
-        run_git(repo_path, &["worktree", "add", "-q", "-b", "unrelated", "--", &forged]);
+        run_git(
+            repo_path,
+            &["worktree", "add", "-q", "-b", "unrelated", "--", &forged],
+        );
 
         let mgr = test_manager();
         let (info, created_from) = mgr
@@ -7348,10 +8277,17 @@ branch refs/heads/some-other-branch
             .await
             .expect("a new worktree");
 
-        assert!(created_from.is_some(), "created, not adopted: {}", info.path);
+        assert!(
+            created_from.is_some(),
+            "created, not adopted: {}",
+            info.path
+        );
         assert_ne!(Path::new(&info.path), victim.as_path());
         let listing = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
-        assert_eq!(WorktreeManager::registration_for_branch(&listing, "unrelated"), Some(forged));
+        assert_eq!(
+            WorktreeManager::registration_for_branch(&listing, "unrelated"),
+            Some(forged)
+        );
     }
 
     /// A worktree registered at a path SlashIt did not choose is removed
@@ -7360,8 +8296,22 @@ branch refs/heads/some-other-branch
     async fn a_worktree_at_a_custom_path_can_be_removed_and_keeps_its_branch() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
-        let custom = tmp.root().join("repo.worktrunk-template").join("task-c0ffee11");
-        run_git(repo_path, &["worktree", "add", "-q", "-b", "task-c0ffee11", "--", custom.to_str().unwrap()]);
+        let custom = tmp
+            .root()
+            .join("repo.worktrunk-template")
+            .join("task-c0ffee11");
+        run_git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-c0ffee11",
+                "--",
+                custom.to_str().unwrap(),
+            ],
+        );
         let work = commit_work(custom.to_str().unwrap(), "agent-work.txt");
 
         test_manager()
@@ -7371,7 +8321,10 @@ branch refs/heads/some-other-branch
 
         assert!(!custom.exists());
         assert_eq!(registered_worktrees(repo_path).len(), 1);
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-c0ffee11"]), work);
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-c0ffee11"]),
+            work
+        );
     }
 
     /// Whatever `wt` on `PATH` would do, SlashIt never runs it: creating,
@@ -7386,14 +8339,25 @@ branch refs/heads/some-other-branch
             let base = origin_main(repo_path);
             let mgr = test_manager();
 
-            let created = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
+            let created = mgr
+                .create(repo_path, "task-0a1b2c3d")
+                .await
+                .expect("create");
             assert_eq!(run_git(&created.path, &["rev-parse", "HEAD"]), base);
             let work = commit_work(&created.path, "agent-work.txt");
-            mgr.remove(&created.path, repo_path, None).await.expect("remove");
+            mgr.remove(&created.path, repo_path, None)
+                .await
+                .expect("remove");
             assert!(!Path::new(&created.path).exists());
-            assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), work);
+            assert_eq!(
+                run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]),
+                work
+            );
 
-            let again = mgr.reattach(repo_path, "task-0a1b2c3d").await.expect("reattach");
+            let again = mgr
+                .reattach(repo_path, "task-0a1b2c3d")
+                .await
+                .expect("reattach");
             assert_eq!(run_git(&again.path, &["rev-parse", "HEAD"]), work);
 
             let stacked = mgr
@@ -7402,8 +8366,12 @@ branch refs/heads/some-other-branch
                 .expect("stacked create")
                 .info;
             assert_eq!(run_git(&stacked.path, &["rev-parse", "HEAD"]), work);
-            mgr.remove(&stacked.path, repo_path, None).await.expect("remove stacked");
-            mgr.remove(&again.path, repo_path, None).await.expect("remove reattached");
+            mgr.remove(&stacked.path, repo_path, None)
+                .await
+                .expect("remove stacked");
+            mgr.remove(&again.path, repo_path, None)
+                .await
+                .expect("remove reattached");
             assert_eq!(registered_worktrees(repo_path).len(), 1);
             assert!(branch_exists(repo_path, "task-0a1b2c3d"));
             assert!(branch_exists(repo_path, "task-5eed5eed"));
@@ -7441,7 +8409,10 @@ branch refs/heads/some-other-branch
         let moved = run_git(repo_path, &["rev-parse", "HEAD"]);
         assert_ne!(moved, validated.commit);
         assert_eq!(
-            resolve_default_base(repo_path, None).await.expect("a base").commit,
+            resolve_default_base(repo_path, None)
+                .await
+                .expect("a base")
+                .commit,
             moved,
             "the default base has moved on"
         );
@@ -7452,8 +8423,14 @@ branch refs/heads/some-other-branch
             .await
             .expect("create");
 
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), validated.commit);
-        assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), validated.commit);
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]),
+            validated.commit
+        );
+        assert_eq!(
+            run_git(&info.path, &["rev-parse", "HEAD"]),
+            validated.commit
+        );
         assert_eq!(base, Some(validated));
     }
 
@@ -7466,7 +8443,10 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (leftover, _) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (leftover, _) = mgr
+            .create_or_adopt(repo_path, "task-0a1b2c3d", None)
+            .await
+            .expect("create");
         let branch_before = run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]);
 
         std::fs::write(tmp.path().join("later.txt"), "later\n").unwrap();
@@ -7477,14 +8457,23 @@ branch refs/heads/some-other-branch
         assert_ne!(validated.commit, branch_before);
 
         let held = [validated.commit.clone()];
-        let refused = match mgr.create_or_adopt_from(repo_path, "task-0a1b2c3d", validated, &held).await {
+        let refused = match mgr
+            .create_or_adopt_from(repo_path, "task-0a1b2c3d", validated, &held)
+            .await
+        {
             Err(refused) => refused,
             Ok(_) => panic!("a checkout that lacks the validated base was adopted"),
         };
 
         assert!(refused.contains("task-0a1b2c3d"), "{refused}");
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), branch_before);
-        assert!(Path::new(&leftover.path).exists(), "the existing checkout is left as it is");
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]),
+            branch_before
+        );
+        assert!(
+            Path::new(&leftover.path).exists(),
+            "the existing checkout is left as it is"
+        );
     }
 
     /// A checkout is adopted when its branch holds the commits the start needs,
@@ -7496,7 +8485,10 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (leftover, _) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (leftover, _) = mgr
+            .create_or_adopt(repo_path, "task-0a1b2c3d", None)
+            .await
+            .expect("create");
         let held_commit = run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]);
 
         std::fs::write(tmp.path().join("later.txt"), "later\n").unwrap();
@@ -7507,7 +8499,12 @@ branch refs/heads/some-other-branch
         assert_ne!(moved.commit, held_commit);
 
         let (adopted, base) = mgr
-            .create_or_adopt_from(repo_path, "task-0a1b2c3d", moved, std::slice::from_ref(&held_commit))
+            .create_or_adopt_from(
+                repo_path,
+                "task-0a1b2c3d",
+                moved,
+                std::slice::from_ref(&held_commit),
+            )
             .await
             .expect("adopted");
 
@@ -7516,7 +8513,10 @@ branch refs/heads/some-other-branch
             std::fs::canonicalize(&leftover.path).unwrap()
         );
         assert_eq!(base, None, "an adopted checkout claims no start");
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), held_commit);
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]),
+            held_commit
+        );
     }
 
     /// A new branch for a Task whose dependency work is not in the base it would
@@ -7535,7 +8535,12 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
         let refused = match mgr
-            .create_or_adopt_holding(repo_path, "task-0a1b2c3d", None, std::slice::from_ref(&held_commit))
+            .create_or_adopt_holding(
+                repo_path,
+                "task-0a1b2c3d",
+                None,
+                std::slice::from_ref(&held_commit),
+            )
             .await
         {
             Err(refused) => refused,
@@ -7554,13 +8559,22 @@ branch refs/heads/some-other-branch
         let repo_path = tmp.path().to_str().unwrap();
         let refs_before = all_refs(repo_path);
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (info, base) = mgr
+            .create_or_adopt(repo_path, "task-0a1b2c3d", None)
+            .await
+            .expect("create");
         let created_at = base.expect("created, not adopted").commit;
 
-        mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect("taken back");
+        mgr.undo_created_checkout(repo_path, &info, &created_at)
+            .await
+            .expect("taken back");
 
         assert!(!Path::new(&info.path).exists());
-        assert_eq!(registered_worktrees(repo_path).len(), 1, "only the primary checkout");
+        assert_eq!(
+            registered_worktrees(repo_path).len(),
+            1,
+            "only the primary checkout"
+        );
         assert_eq!(all_refs(repo_path), refs_before);
     }
 
@@ -7571,15 +8585,27 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (info, base) = mgr
+            .create_or_adopt(repo_path, "task-0a1b2c3d", None)
+            .await
+            .expect("create");
         let created_at = base.expect("created").commit;
         std::fs::write(Path::new(&info.path).join("notes.txt"), "unsaved\n").unwrap();
 
-        let kept = mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect_err("kept");
+        let kept = mgr
+            .undo_created_checkout(repo_path, &info, &created_at)
+            .await
+            .expect_err("kept");
 
         assert!(kept.contains("kept"), "{kept}");
-        assert_eq!(std::fs::read_to_string(Path::new(&info.path).join("notes.txt")).unwrap(), "unsaved\n");
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), created_at);
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&info.path).join("notes.txt")).unwrap(),
+            "unsaved\n"
+        );
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]),
+            created_at
+        );
     }
 
     /// A commit made in the checkout after it was created keeps the worktree
@@ -7589,15 +8615,24 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (info, base) = mgr
+            .create_or_adopt(repo_path, "task-0a1b2c3d", None)
+            .await
+            .expect("create");
         let created_at = base.expect("created").commit;
         let work = commit_in(&info.path, "work nobody recorded");
 
-        let kept = mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect_err("kept");
+        let kept = mgr
+            .undo_created_checkout(repo_path, &info, &created_at)
+            .await
+            .expect_err("kept");
 
         assert!(kept.contains("kept"), "{kept}");
         assert!(Path::new(&info.path).is_dir());
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), work);
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]),
+            work
+        );
     }
 
     /// When the worktree is removed but the branch cannot be deleted -- here
@@ -7609,9 +8644,16 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (info, base) = mgr
+            .create_or_adopt(repo_path, "task-0a1b2c3d", None)
+            .await
+            .expect("create");
         let created_at = base.expect("created").commit;
-        let hook = tmp.path().join(".git").join("hooks").join("reference-transaction");
+        let hook = tmp
+            .path()
+            .join(".git")
+            .join("hooks")
+            .join("reference-transaction");
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
         // Published by `write_executable`'s short-lived child, not written by
         // this process, so git's exec of the hook cannot fail with ETXTBSY
@@ -7621,11 +8663,20 @@ branch refs/heads/some-other-branch
             "#!/bin/sh\n[ \"$1\" = prepared ] && grep -q ' refs/heads/task-0a1b2c3d$' && exit 1\nexit 0\n",
         );
 
-        let kept = mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect_err("kept");
+        let kept = mgr
+            .undo_created_checkout(repo_path, &info, &created_at)
+            .await
+            .expect_err("kept");
 
         assert!(!Path::new(&info.path).exists(), "the worktree was removed");
-        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), created_at);
-        assert!(kept.contains(&format!("the worktree at {} was removed", info.path)), "{kept}");
+        assert_eq!(
+            run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]),
+            created_at
+        );
+        assert!(
+            kept.contains(&format!("the worktree at {} was removed", info.path)),
+            "{kept}"
+        );
         assert!(kept.contains(&created_at), "{kept}");
         assert!(kept.contains("deleted or renamed"), "{kept}");
     }

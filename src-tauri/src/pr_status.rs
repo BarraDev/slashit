@@ -63,7 +63,10 @@ pub struct PrKey {
 
 impl PrKey {
     pub fn new(repo: impl Into<String>, number: u32) -> Self {
-        Self { repo: repo.into(), number }
+        Self {
+            repo: repo.into(),
+            number,
+        }
     }
 }
 
@@ -220,7 +223,9 @@ fn classify_check(check: &Value) -> CheckOutcome {
             }
             _ => CheckOutcome::Unrecognized,
         },
-        Some("QUEUED" | "IN_PROGRESS" | "WAITING" | "PENDING" | "REQUESTED") => CheckOutcome::Running,
+        Some("QUEUED" | "IN_PROGRESS" | "WAITING" | "PENDING" | "REQUESTED") => {
+            CheckOutcome::Running
+        }
         _ => CheckOutcome::Unrecognized,
     }
 }
@@ -282,7 +287,8 @@ fn summarize_checks(rollup: Option<&Value>) -> (ChecksState, Vec<String>, u32) {
 /// Read what `gh pr view --json state,statusCheckRollup,reviewDecision,mergeable,mergeCommit,headRefOid`
 /// printed.
 pub fn parse_pr_status(json: &Value) -> PrStatus {
-    let (checks, failing_checks, failing_check_count) = summarize_checks(json.get("statusCheckRollup"));
+    let (checks, failing_checks, failing_check_count) =
+        summarize_checks(json.get("statusCheckRollup"));
     let state = PrState::from_gh(json.get("state").and_then(Value::as_str).unwrap_or(""));
     // Only a full object ID is kept: anything else cannot be checked against
     // a repository, so it is not evidence of anything.
@@ -302,8 +308,14 @@ pub fn parse_pr_status(json: &Value) -> PrStatus {
         checks,
         failing_checks,
         failing_check_count,
-        review_decision: json.get("reviewDecision").and_then(Value::as_str).and_then(ReviewDecision::from_gh),
-        mergeable: json.get("mergeable").and_then(Value::as_str).and_then(Mergeability::from_gh),
+        review_decision: json
+            .get("reviewDecision")
+            .and_then(Value::as_str)
+            .and_then(ReviewDecision::from_gh),
+        mergeable: json
+            .get("mergeable")
+            .and_then(Value::as_str)
+            .and_then(Mergeability::from_gh),
         merge_commit,
         head_oid,
     }
@@ -341,7 +353,10 @@ impl std::fmt::Display for PrFetchError {
 
 impl PrFetchError {
     fn new(kind: PrFetchErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into() }
+        Self {
+            kind,
+            message: message.into(),
+        }
     }
 
     fn rate_limited() -> Self {
@@ -408,7 +423,11 @@ impl PrFetchError {
         if rate_limited {
             return Self::rate_limited();
         }
-        let first_line = said.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+        let first_line = said
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
         let message = if first_line.is_empty() {
             "GitHub CLI failed without saying why".to_string()
         } else {
@@ -675,7 +694,10 @@ impl PrStatuses {
     /// Each is its own attempt, with its own timeout and its own cache entry,
     /// so one that hangs or fails holds up a single slot and never takes a
     /// sibling's answer with it.
-    pub async fn refresh_each(&self, keys: Vec<PrKey>) -> Vec<(PrKey, Result<PrStatus, PrFetchError>)> {
+    pub async fn refresh_each(
+        &self,
+        keys: Vec<PrKey>,
+    ) -> Vec<(PrKey, Result<PrStatus, PrFetchError>)> {
         in_order_bounded(keys, CONCURRENCY, |key| async move {
             let answer = self.refresh(&key).await;
             (key, answer)
@@ -685,13 +707,20 @@ impl PrStatuses {
 
     /// The cached entry for `key`, without asking anyone.
     pub fn get(&self, key: &PrKey) -> Option<PrStatusEntry> {
-        self.entries.read().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+        self.entries
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
     }
 
     /// The cached entries among `keys`, without asking anyone.
     pub fn entries_for<'a>(&self, keys: impl IntoIterator<Item = &'a PrKey>) -> Vec<PrStatusEntry> {
         let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
-        let mut found: Vec<PrStatusEntry> = keys.into_iter().filter_map(|k| entries.get(k).cloned()).collect();
+        let mut found: Vec<PrStatusEntry> = keys
+            .into_iter()
+            .filter_map(|k| entries.get(k).cloned())
+            .collect();
         found.sort_by(|a, b| (&a.repo, a.number).cmp(&(&b.repo, b.number)));
         found.dedup_by(|a, b| a.repo == b.repo && a.number == b.number);
         found
@@ -787,10 +816,21 @@ impl PrStatuses {
 
     async fn fetch(&self, key: &PrKey) -> Result<PrStatus, PrFetchError> {
         let number = key.number.to_string();
-        let args = ["pr", "view", number.as_str(), "--repo", key.repo.as_str(), "--json", FIELDS];
+        let args = [
+            "pr",
+            "view",
+            number.as_str(),
+            "--repo",
+            key.repo.as_str(),
+            "--json",
+            FIELDS,
+        ];
         let stdout = run_bounded(&self.program, &args, self.timeout).await?;
         let json: Value = serde_json::from_slice(&stdout).map_err(|e| {
-            PrFetchError::new(PrFetchErrorKind::Failed, format!("GitHub's answer could not be read: {e}"))
+            PrFetchError::new(
+                PrFetchErrorKind::Failed,
+                format!("GitHub's answer could not be read: {e}"),
+            )
         })?;
         Ok(parse_pr_status(&json))
     }
@@ -801,7 +841,11 @@ impl PrStatuses {
 ///
 /// The child leads its own process group, and a timeout kills the whole group
 /// before reaping the leader, so nothing it started is left behind.
-async fn run_bounded(program: &OsString, args: &[&str], timeout: Duration) -> Result<Vec<u8>, PrFetchError> {
+async fn run_bounded(
+    program: &OsString,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Vec<u8>, PrFetchError> {
     use tokio::io::AsyncReadExt;
 
     let mut cmd = tokio::process::Command::new(program);
@@ -823,7 +867,10 @@ async fn run_bounded(program: &OsString, args: &[&str], timeout: Duration) -> Re
                 "GitHub CLI (gh) is not installed or not on PATH",
             )
         } else {
-            PrFetchError::new(PrFetchErrorKind::Failed, format!("GitHub CLI could not be started: {e}"))
+            PrFetchError::new(
+                PrFetchErrorKind::Failed,
+                format!("GitHub CLI could not be started: {e}"),
+            )
         }
     })?;
     let pid = child.id();
@@ -851,9 +898,10 @@ async fn run_bounded(program: &OsString, args: &[&str], timeout: Duration) -> Re
 
     match finished {
         Ok((Ok(status), stdout, _)) if status.success() => Ok(stdout),
-        Ok((Ok(status), _, stderr)) => {
-            Err(PrFetchError::from_exit(status.code(), &String::from_utf8_lossy(&stderr)))
-        }
+        Ok((Ok(status), _, stderr)) => Err(PrFetchError::from_exit(
+            status.code(),
+            &String::from_utf8_lossy(&stderr),
+        )),
         Ok((Err(e), _, _)) => Err(PrFetchError::new(
             PrFetchErrorKind::Failed,
             format!("GitHub CLI could not be waited for: {e}"),
@@ -889,7 +937,11 @@ where
     Fut: std::future::Future,
 {
     use futures::StreamExt;
-    futures::stream::iter(items).map(work).buffered(limit).collect().await
+    futures::stream::iter(items)
+        .map(work)
+        .buffered(limit)
+        .collect()
+        .await
 }
 
 #[cfg(test)]
@@ -909,7 +961,6 @@ mod tests {
         summarize_checks(Some(&Value::Array(checks))).0
     }
 
-
     #[test]
     fn pr_state_from_gh_known_values() {
         assert_eq!(PrState::from_gh("OPEN"), PrState::Open);
@@ -920,17 +971,35 @@ mod tests {
 
     #[test]
     fn review_decision_from_gh_known_values() {
-        assert_eq!(ReviewDecision::from_gh("APPROVED"), Some(ReviewDecision::Approved));
-        assert_eq!(ReviewDecision::from_gh("CHANGES_REQUESTED"), Some(ReviewDecision::ChangesRequested));
-        assert_eq!(ReviewDecision::from_gh("REVIEW_REQUIRED"), Some(ReviewDecision::ReviewRequired));
+        assert_eq!(
+            ReviewDecision::from_gh("APPROVED"),
+            Some(ReviewDecision::Approved)
+        );
+        assert_eq!(
+            ReviewDecision::from_gh("CHANGES_REQUESTED"),
+            Some(ReviewDecision::ChangesRequested)
+        );
+        assert_eq!(
+            ReviewDecision::from_gh("REVIEW_REQUIRED"),
+            Some(ReviewDecision::ReviewRequired)
+        );
         assert_eq!(ReviewDecision::from_gh("OTHER"), None);
     }
 
     #[test]
     fn mergeability_from_gh_known_values() {
-        assert_eq!(Mergeability::from_gh("MERGEABLE"), Some(Mergeability::Mergeable));
-        assert_eq!(Mergeability::from_gh("CONFLICTING"), Some(Mergeability::Conflicting));
-        assert_eq!(Mergeability::from_gh("UNKNOWN"), Some(Mergeability::Unknown));
+        assert_eq!(
+            Mergeability::from_gh("MERGEABLE"),
+            Some(Mergeability::Mergeable)
+        );
+        assert_eq!(
+            Mergeability::from_gh("CONFLICTING"),
+            Some(Mergeability::Conflicting)
+        );
+        assert_eq!(
+            Mergeability::from_gh("UNKNOWN"),
+            Some(Mergeability::Unknown)
+        );
         assert_eq!(Mergeability::from_gh("other"), None);
     }
 
@@ -955,7 +1024,11 @@ mod tests {
             ("SOMETHING_NEW", None, CheckOutcome::Unrecognized),
         ];
         for (status, conclusion, expected) in table {
-            assert_eq!(classify_check(&run(status, conclusion)), expected, "{status} {conclusion:?}");
+            assert_eq!(
+                classify_check(&run(status, conclusion)),
+                expected,
+                "{status} {conclusion:?}"
+            );
         }
     }
 
@@ -973,8 +1046,14 @@ mod tests {
             assert_eq!(classify_check(&context(state)), expected, "{state}");
         }
         // Without a type name, a lone `state` is a legacy status.
-        assert_eq!(classify_check(&json!({ "context": "ci", "state": "SUCCESS" })), CheckOutcome::Passed);
-        assert_eq!(classify_check(&json!({ "__typename": "Mystery", "state": "SUCCESS" })), CheckOutcome::Unrecognized);
+        assert_eq!(
+            classify_check(&json!({ "context": "ci", "state": "SUCCESS" })),
+            CheckOutcome::Passed
+        );
+        assert_eq!(
+            classify_check(&json!({ "__typename": "Mystery", "state": "SUCCESS" })),
+            CheckOutcome::Unrecognized
+        );
     }
 
     #[test]
@@ -986,17 +1065,38 @@ mod tests {
 
         assert_eq!(summarize_checks(None).0, ChecksState::Unknown);
         assert_eq!(summarize_checks(Some(&Value::Null)).0, ChecksState::Unknown);
-        assert_eq!(summarize_checks(Some(&json!("nope"))).0, ChecksState::Unknown);
+        assert_eq!(
+            summarize_checks(Some(&json!("nope"))).0,
+            ChecksState::Unknown
+        );
         assert_eq!(state_of(vec![]), ChecksState::NoChecks);
         assert_eq!(state_of(vec![passed(), passed()]), ChecksState::Passing);
-        assert_eq!(state_of(vec![passed(), context("SUCCESS")]), ChecksState::Passing);
-        assert_eq!(state_of(vec![run("COMPLETED", Some("SKIPPED")), run("COMPLETED", Some("NEUTRAL"))]), ChecksState::Passing);
+        assert_eq!(
+            state_of(vec![passed(), context("SUCCESS")]),
+            ChecksState::Passing
+        );
+        assert_eq!(
+            state_of(vec![
+                run("COMPLETED", Some("SKIPPED")),
+                run("COMPLETED", Some("NEUTRAL"))
+            ]),
+            ChecksState::Passing
+        );
         assert_eq!(state_of(vec![passed(), running()]), ChecksState::Pending);
-        assert_eq!(state_of(vec![passed(), context("PENDING")]), ChecksState::Pending);
-        assert_eq!(state_of(vec![passed(), context("EXPECTED")]), ChecksState::Pending);
+        assert_eq!(
+            state_of(vec![passed(), context("PENDING")]),
+            ChecksState::Pending
+        );
+        assert_eq!(
+            state_of(vec![passed(), context("EXPECTED")]),
+            ChecksState::Pending
+        );
         assert_eq!(state_of(vec![running(), failed()]), ChecksState::Failing);
         assert_eq!(state_of(vec![failed(), odd()]), ChecksState::Failing);
-        assert_eq!(state_of(vec![context("ERROR"), running()]), ChecksState::Failing);
+        assert_eq!(
+            state_of(vec![context("ERROR"), running()]),
+            ChecksState::Failing
+        );
         assert_eq!(state_of(vec![passed(), odd()]), ChecksState::Unknown);
         assert_eq!(state_of(vec![running(), odd()]), ChecksState::Unknown);
     }
@@ -1042,13 +1142,21 @@ mod tests {
             }
         );
 
-        let bare = parse_pr_status(&json!({ "state": "MERGED", "reviewDecision": "", "mergeable": "UNKNOWN" }));
+        let bare = parse_pr_status(
+            &json!({ "state": "MERGED", "reviewDecision": "", "mergeable": "UNKNOWN" }),
+        );
         assert_eq!(bare.state, PrState::Merged);
-        assert_eq!(bare.checks, ChecksState::Unknown, "no rollup at all is not 'no checks'");
+        assert_eq!(
+            bare.checks,
+            ChecksState::Unknown,
+            "no rollup at all is not 'no checks'"
+        );
         assert_eq!(bare.review_decision, None);
         assert_eq!(bare.mergeable, Some(Mergeability::Unknown));
 
-        let odd = parse_pr_status(&json!({ "state": "DRAFTISH", "reviewDecision": "MAYBE", "mergeable": "SOMETIMES", "statusCheckRollup": null }));
+        let odd = parse_pr_status(
+            &json!({ "state": "DRAFTISH", "reviewDecision": "MAYBE", "mergeable": "SOMETIMES", "statusCheckRollup": null }),
+        );
         assert_eq!(odd.state, PrState::Unknown);
         assert_eq!(odd.checks, ChecksState::Unknown);
         assert_eq!(odd.review_decision, None);
@@ -1064,10 +1172,16 @@ mod tests {
         assert_eq!(open.head_oid.as_deref(), Some(head));
 
         let short = parse_pr_status(&json!({ "state": "OPEN", "headRefOid": "0123456" }));
-        assert_eq!(short.head_oid, None, "an abbreviated head cannot be checked");
+        assert_eq!(
+            short.head_oid, None,
+            "an abbreviated head cannot be checked"
+        );
 
         let missing = parse_pr_status(&json!({ "state": "OPEN" }));
-        assert_eq!(missing.head_oid, None, "an answer without a head reads no head");
+        assert_eq!(
+            missing.head_oid, None,
+            "an answer without a head reads no head"
+        );
     }
 
     /// The merge commit is read only from a merged answer, and only when it is
@@ -1085,13 +1199,19 @@ mod tests {
             "state": "OPEN",
             "mergeCommit": { "oid": commit },
         }));
-        assert_eq!(open.merge_commit, None, "an open pull request has no merge commit");
+        assert_eq!(
+            open.merge_commit, None,
+            "an open pull request has no merge commit"
+        );
 
         let short = parse_pr_status(&json!({
             "state": "MERGED",
             "mergeCommit": { "oid": "0123456" },
         }));
-        assert_eq!(short.merge_commit, None, "an abbreviated ID cannot be checked");
+        assert_eq!(
+            short.merge_commit, None,
+            "an abbreviated ID cannot be checked"
+        );
 
         let absent = parse_pr_status(&json!({ "state": "MERGED", "mergeCommit": null }));
         assert_eq!(absent.merge_commit, None);
@@ -1101,7 +1221,9 @@ mod tests {
     /// Both sides test against this same literal.
     #[test]
     fn an_entry_serializes_to_the_shape_the_frontend_reads() {
-        let at = DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z").unwrap().with_timezone(&Utc);
+        let at = DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let entry = PrStatusEntry {
             repo: "o/r".to_string(),
             number: 7,
@@ -1141,14 +1263,29 @@ mod tests {
 
     #[test]
     fn a_failed_exit_is_classified() {
-        assert_eq!(PrFetchError::from_exit(Some(4), "").kind, PrFetchErrorKind::Auth);
-        let auth = PrFetchError::from_exit(Some(1), "To get started with GitHub CLI, please run:  gh auth login");
+        assert_eq!(
+            PrFetchError::from_exit(Some(4), "").kind,
+            PrFetchErrorKind::Auth
+        );
+        let auth = PrFetchError::from_exit(
+            Some(1),
+            "To get started with GitHub CLI, please run:  gh auth login",
+        );
         assert_eq!(auth.kind, PrFetchErrorKind::Auth);
         assert!(auth.message.contains("gh auth login"));
-        let other = PrFetchError::from_exit(Some(1), "\nGraphQL: Could not resolve to a PullRequest\nmore");
+        let other = PrFetchError::from_exit(
+            Some(1),
+            "\nGraphQL: Could not resolve to a PullRequest\nmore",
+        );
         assert_eq!(other.kind, PrFetchErrorKind::Failed);
-        assert_eq!(other.message, "GitHub CLI failed: GraphQL: Could not resolve to a PullRequest");
-        assert_eq!(PrFetchError::from_exit(Some(1), "  ").message, "GitHub CLI failed without saying why");
+        assert_eq!(
+            other.message,
+            "GitHub CLI failed: GraphQL: Could not resolve to a PullRequest"
+        );
+        assert_eq!(
+            PrFetchError::from_exit(Some(1), "  ").message,
+            "GitHub CLI failed without saying why"
+        );
     }
 
     #[test]
@@ -1347,7 +1484,16 @@ mod tests {
     }
 
     fn status(state: PrState, checks: ChecksState) -> PrStatus {
-        PrStatus { state, checks, failing_checks: vec![], failing_check_count: 0, review_decision: None, mergeable: None , merge_commit: None, head_oid: None}
+        PrStatus {
+            state,
+            checks,
+            failing_checks: vec![],
+            failing_check_count: 0,
+            review_decision: None,
+            mergeable: None,
+            merge_commit: None,
+            head_oid: None,
+        }
     }
 
     #[test]
@@ -1361,7 +1507,11 @@ mod tests {
         let fail = PrFetchError::new(PrFetchErrorKind::Failed, "down");
         cache.record(&key, t(30), t(31), &Err(fail.clone()));
         let entry = cache.get(&key).unwrap();
-        assert_eq!(entry.status, Some(good), "a failed refresh never forgets what was known");
+        assert_eq!(
+            entry.status,
+            Some(good),
+            "a failed refresh never forgets what was known"
+        );
         assert_eq!(entry.fetched_at, Some(t(1)));
         assert_eq!(entry.attempted_at, t(30));
         assert_eq!(entry.error, Some(fail));
@@ -1369,14 +1519,20 @@ mod tests {
         let newer = status(PrState::Open, ChecksState::Failing);
         cache.record(&key, t(60), t(61), &Ok(newer.clone()));
         let entry = cache.get(&key).unwrap();
-        assert_eq!((entry.status, entry.fetched_at, entry.error), (Some(newer.clone()), Some(t(61)), None));
+        assert_eq!(
+            (entry.status, entry.fetched_at, entry.error),
+            (Some(newer.clone()), Some(t(61)), None)
+        );
 
         // An older attempt answering late does not put its reading back, and
         // its caller is not handed it to act on.
         let late = cache.settle(&key, t(45), t(90), Ok(good_again()));
         assert_eq!(late.map_err(|e| e.kind), Err(PrFetchErrorKind::Failed));
         assert_eq!(cache.get(&key).unwrap().status, Some(newer.clone()));
-        assert_eq!(cache.settle(&key, t(70), t(71), Ok(newer.clone())), Ok(newer));
+        assert_eq!(
+            cache.settle(&key, t(70), t(71), Ok(newer.clone())),
+            Ok(newer)
+        );
 
         fn good_again() -> PrStatus {
             status(PrState::Open, ChecksState::Passing)
@@ -1388,13 +1544,21 @@ mod tests {
         let cache = PrStatuses::with_program("unused", FETCH_TIMEOUT);
         let key = PrKey::new("o/r", 2);
         let now = Utc::now();
-        cache.record(&key, now, now, &Err(PrFetchError::new(PrFetchErrorKind::Auth, "sign in")));
+        cache.record(
+            &key,
+            now,
+            now,
+            &Err(PrFetchError::new(PrFetchErrorKind::Auth, "sign in")),
+        );
         let entry = cache.get(&key).unwrap();
         assert_eq!(entry.status, None);
         assert_eq!(entry.fetched_at, None);
         assert_eq!(entry.error.map(|e| e.kind), Some(PrFetchErrorKind::Auth));
         assert!(cache.get(&PrKey::new("o/r", 3)).is_none());
-        assert_eq!(cache.entries_for([&key, &key, &PrKey::new("o/r", 3)]).len(), 1);
+        assert_eq!(
+            cache.entries_for([&key, &key, &PrKey::new("o/r", 3)]).len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1418,7 +1582,11 @@ mod tests {
         })
         .await;
         assert_eq!(answers, (0..10).collect::<Vec<_>>());
-        assert_eq!(most.load(Ordering::SeqCst), CONCURRENCY, "overlapping, and never more than the limit");
+        assert_eq!(
+            most.load(Ordering::SeqCst),
+            CONCURRENCY,
+            "overlapping, and never more than the limit"
+        );
     }
 
     #[cfg(unix)]
@@ -1443,7 +1611,11 @@ mod tests {
             let path = dir.join("gh");
             // An absolute path: tests that shadow `PATH` must not decide
             // which `cp` this is.
-            let copied = std::process::Command::new("/bin/cp").arg(&source).arg(&path).status().unwrap();
+            let copied = std::process::Command::new("/bin/cp")
+                .arg(&source)
+                .arg(&path)
+                .status()
+                .unwrap();
             assert!(copied.success(), "could not create the fake gh: {copied}");
             std::fs::remove_file(&source).unwrap();
             path
@@ -1461,7 +1633,12 @@ mod tests {
                 return false;
             }
             match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                Ok(stat) => !stat.rsplit(')').next().unwrap_or("").trim_start().starts_with(['Z', 'X', 'x']),
+                Ok(stat) => !stat
+                    .rsplit(')')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start()
+                    .starts_with(['Z', 'X', 'x']),
                 Err(_) => false,
             }
         }
@@ -1480,7 +1657,10 @@ mod tests {
             assert_eq!(status.review_decision, Some(ReviewDecision::Approved));
             assert_eq!(statuses.get(&key).unwrap().status, Some(status));
             let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
-            assert_eq!(args.trim(), format!("pr view 42 --repo owner/repo --json {FIELDS}"));
+            assert_eq!(
+                args.trim(),
+                format!("pr view 42 --repo owner/repo --json {FIELDS}")
+            );
         }
 
         #[tokio::test]
@@ -1502,19 +1682,35 @@ esac"#,
 
             let answers = statuses.refresh_each(keys.clone()).await;
 
-            assert_eq!(answers.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), keys, "answered in order");
+            assert_eq!(
+                answers.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+                keys,
+                "answered in order"
+            );
             assert!(answers[0].1.is_err());
             assert_eq!(answers[1].1.as_ref().map(|s| s.state), Ok(PrState::Open));
-            assert_eq!(answers[2].1.as_ref().map_err(|e| e.kind), Err(PrFetchErrorKind::Timeout));
+            assert_eq!(
+                answers[2].1.as_ref().map_err(|e| e.kind),
+                Err(PrFetchErrorKind::Timeout)
+            );
             assert!(statuses.get(&keys[0]).unwrap().error.is_some());
-            assert!(statuses.get(&keys[1]).unwrap().status.is_some(), "a sibling's failure keeps this answer");
-            assert_eq!(statuses.get(&keys[2]).unwrap().error.map(|e| e.kind), Some(PrFetchErrorKind::Timeout));
+            assert!(
+                statuses.get(&keys[1]).unwrap().status.is_some(),
+                "a sibling's failure keeps this answer"
+            );
+            assert_eq!(
+                statuses.get(&keys[2]).unwrap().error.map(|e| e.kind),
+                Some(PrFetchErrorKind::Timeout)
+            );
         }
 
         #[tokio::test]
         async fn an_auth_failure_is_recorded_as_one() {
             let dir = tempfile::tempdir().unwrap();
-            let gh = script(dir.path(), "echo 'You are not logged into any GitHub hosts. Run gh auth login' >&2; exit 4");
+            let gh = script(
+                dir.path(),
+                "echo 'You are not logged into any GitHub hosts. Run gh auth login' >&2; exit 4",
+            );
             let statuses = PrStatuses::with_program(gh, Duration::from_secs(10));
             let key = PrKey::new("o/r", 1);
             let err = statuses.refresh(&key).await.unwrap_err();
@@ -1524,7 +1720,8 @@ esac"#,
 
         #[tokio::test]
         async fn a_missing_gh_is_reported_as_not_installed() {
-            let statuses = PrStatuses::with_program("/nonexistent/slashit-no-gh", Duration::from_secs(1));
+            let statuses =
+                PrStatuses::with_program("/nonexistent/slashit-no-gh", Duration::from_secs(1));
             let err = statuses.refresh(&PrKey::new("o/r", 1)).await.unwrap_err();
             assert_eq!(err.kind, PrFetchErrorKind::NotInstalled, "{err:?}");
         }
@@ -1648,25 +1845,41 @@ esac"#,
             let began = std::time::Instant::now();
             let err = statuses.refresh(&key).await.unwrap_err();
             assert_eq!(err.kind, PrFetchErrorKind::Timeout, "{err:?}");
-            assert!(began.elapsed() < Duration::from_secs(5), "took {:?}", began.elapsed());
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "took {:?}",
+                began.elapsed()
+            );
 
             let entry = statuses.get(&key).unwrap();
-            assert_eq!(entry.status, Some(good), "a timeout keeps the last good status");
+            assert_eq!(
+                entry.status,
+                Some(good),
+                "a timeout keeps the last good status"
+            );
             assert_eq!(entry.error.map(|e| e.kind), Some(PrFetchErrorKind::Timeout));
 
             // Whether the group kill reached every process is checked only
             // where `alive` can tell a zombie from a running process.
             #[cfg(target_os = "linux")]
             {
-                let read =
-                    |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap().trim().parse::<i32>().unwrap();
+                let read = |name: &str| {
+                    std::fs::read_to_string(dir.path().join(name))
+                        .unwrap()
+                        .trim()
+                        .parse::<i32>()
+                        .unwrap()
+                };
                 let (leader, grandchild) = (read("leader"), read("grandchild"));
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 while (alive(leader) || alive(grandchild)) && std::time::Instant::now() < deadline {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 assert!(!alive(leader), "the timed-out gh is still running");
-                assert!(!alive(grandchild), "a process the timed-out gh started is still running");
+                assert!(
+                    !alive(grandchild),
+                    "a process the timed-out gh started is still running"
+                );
             }
         }
     }

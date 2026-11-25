@@ -352,17 +352,21 @@ impl FeatureFlags {
         let path = paths.feature_flags_file();
         let text = toml::to_string_pretty(self)
             .map_err(|e| ConfigWriteError::NotPublished(anyhow::Error::new(e)))?;
-        slashit_durable_fs::write_atomic(&path, text.as_bytes(), slashit_durable_fs::Permissions::Preserve)
-            .map(|_| ())
-            .map_err(|e| {
-                let published = e.is_published();
-                let error = anyhow::Error::new(e).context("Failed to write the feature flags");
-                if published {
-                    ConfigWriteError::PublishedNotDurable(error)
-                } else {
-                    ConfigWriteError::NotPublished(error)
-                }
-            })
+        slashit_durable_fs::write_atomic(
+            &path,
+            text.as_bytes(),
+            slashit_durable_fs::Permissions::Preserve,
+        )
+        .map(|_| ())
+        .map_err(|e| {
+            let published = e.is_published();
+            let error = anyhow::Error::new(e).context("Failed to write the feature flags");
+            if published {
+                ConfigWriteError::PublishedNotDurable(error)
+            } else {
+                ConfigWriteError::NotPublished(error)
+            }
+        })
     }
 
     /// Look a flag up by name, for the frontend toggle.
@@ -940,7 +944,9 @@ mod tests {
 
     #[test]
     fn every_documented_spelling_parses() {
-        for truthy in ["1", "true", "TRUE", "True", "yes", "YES", "on", "ON", " on "] {
+        for truthy in [
+            "1", "true", "TRUE", "True", "yes", "YES", "on", "ON", " on ",
+        ] {
             assert_eq!(parse_bool(truthy), Some(true), "{truthy}");
             let resolved = FeatureResolver::new()
                 .with_env(env(&[("SLASHIT_FEATURE_DAEMON_MODE", truthy)]))
@@ -948,7 +954,9 @@ mod tests {
             assert_eq!(resolved.get("daemon_mode"), Some(true), "{truthy}");
             assert!(resolved.warnings().is_empty(), "{truthy}");
         }
-        for falsy in ["0", "false", "FALSE", "False", "no", "NO", "off", "OFF", " off "] {
+        for falsy in [
+            "0", "false", "FALSE", "False", "no", "NO", "off", "OFF", " off ",
+        ] {
             assert_eq!(parse_bool(falsy), Some(false), "{falsy}");
             let resolved = FeatureResolver::new()
                 .with_config(config_with("daemon_mode", true))
@@ -1100,7 +1108,10 @@ mod tests {
         );
         let bare = FeatureResolver::new().resolve().to_flag_info();
         assert_eq!(
-            bare.iter().find(|i| i.name == "daemon_mode").unwrap().source,
+            bare.iter()
+                .find(|i| i.name == "daemon_mode")
+                .unwrap()
+                .source,
             "default"
         );
         assert_eq!(FlagSource::Config.as_str(), "config");

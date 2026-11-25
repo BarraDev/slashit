@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, Child};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -54,13 +54,20 @@ fn group_is_running(pgid: i32) -> bool {
 /// `limit` has passed. Reaping matters: an exited shell stays a zombie, which
 /// keeps its group non-empty until it is collected.
 #[cfg(unix)]
-async fn wait_for_groups(sessions: &mut [PtySession], groups: &[i32], limit: std::time::Duration, poll: std::time::Duration) {
+async fn wait_for_groups(
+    sessions: &mut [PtySession],
+    groups: &[i32],
+    limit: std::time::Duration,
+    poll: std::time::Duration,
+) {
     let deadline = std::time::Instant::now() + limit;
     loop {
         for session in sessions.iter_mut() {
             let _ = session._child.try_wait();
         }
-        if !groups.iter().any(|&pgid| group_is_running(pgid)) || std::time::Instant::now() >= deadline {
+        if !groups.iter().any(|&pgid| group_is_running(pgid))
+            || std::time::Instant::now() >= deadline
+        {
             return;
         }
         tokio::time::sleep(poll).await;
@@ -80,7 +87,10 @@ pub async fn end_sessions(mut sessions: Vec<PtySession>) {
     const HANGUP_GRACE: Duration = Duration::from_millis(500);
     const KILL_GRACE: Duration = Duration::from_secs(1);
 
-    let groups: Vec<i32> = sessions.iter_mut().filter_map(PtySession::live_group).collect();
+    let groups: Vec<i32> = sessions
+        .iter_mut()
+        .filter_map(PtySession::live_group)
+        .collect();
     for &pgid in &groups {
         // Safety: each group is one this process's own terminal shell leads.
         unsafe { libc::killpg(pgid, libc::SIGHUP) };
@@ -133,16 +143,17 @@ impl PtySession {
         self.writer.write_all(data)?;
         self.writer.flush()
     }
-    
+
     /// Resize the PTY
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-    
-        self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        }).map_err(|e| format!("Failed to resize: {}", e))
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("Failed to resize: {}", e))
     }
 }
 
@@ -173,7 +184,11 @@ impl PtyState {
     /// Publish a spawned terminal, and only after its record is written. If the
     /// record cannot be written, nothing is published: the scrollback is
     /// removed, and the session is dropped, which ends its shell.
-    pub async fn register_session(&self, session: PtySession, metadata: SessionMetadata) -> Result<(), String> {
+    pub async fn register_session(
+        &self,
+        session: PtySession,
+        metadata: SessionMetadata,
+    ) -> Result<(), String> {
         let session_id = session.id;
         self.scrollback.create(session_id).await;
         if let Err(e) = self.store.upsert_session(metadata) {
@@ -196,7 +211,7 @@ fn get_shell_command() -> CommandBuilder {
     #[cfg(windows)]
     {
         println!("[PTY Manager] Detecting Windows shell...");
-        
+
         // Prefer pwsh (PowerShell Core 7+) > powershell.exe (Windows PowerShell 5.1) > cmd.exe
         if which::which("pwsh").is_ok() {
             println!("[PTY Manager] Using pwsh.exe (PowerShell Core 7+)");
@@ -205,7 +220,11 @@ fn get_shell_command() -> CommandBuilder {
             cmd.arg("-NoExit");
             cmd.arg("-Interactive");
             cmd
-        } else if std::path::Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists() {
+        } else if std::path::Path::new(
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        )
+        .exists()
+        {
             println!("[PTY Manager] Using powershell.exe (Windows PowerShell 5.1)");
             let mut cmd = CommandBuilder::new("powershell.exe");
             cmd.arg("-NoLogo");
@@ -215,11 +234,11 @@ fn get_shell_command() -> CommandBuilder {
             let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
             println!("[PTY Manager] Using cmd.exe or COMSPEC: {}", shell);
             let mut cmd = CommandBuilder::new(&shell);
-            cmd.arg("/K");  // Keep cmd.exe alive
+            cmd.arg("/K"); // Keep cmd.exe alive
             cmd
         }
     }
-    
+
     #[cfg(not(windows))]
     {
         // On Unix, use the user's preferred shell with interactive flag
@@ -240,14 +259,20 @@ pub fn spawn_pty_session(
     working_directory: Option<String>,
 ) -> Result<(PtySession, Box<dyn Read + Send>), String> {
     println!("[PTY Manager] === spawn_pty_session START ===");
-    println!("[PTY Manager] name={}, cols={}, rows={}, working_directory={:?}", name, cols, rows, working_directory);
-    
+    println!(
+        "[PTY Manager] name={}, cols={}, rows={}, working_directory={:?}",
+        name, cols, rows, working_directory
+    );
+
     println!("[PTY Manager] Step 1: Getting native PTY system...");
     let pty_system = native_pty_system();
     println!("[PTY Manager] Step 1: ✓ Got native PTY system");
 
     // Open PTY with specified size
-    println!("[PTY Manager] Step 2: Opening PTY with size {}x{}...", cols, rows);
+    println!(
+        "[PTY Manager] Step 2: Opening PTY with size {}x{}...",
+        cols, rows
+    );
     let pair = pty_system
         .openpty(PtySize {
             rows,
@@ -260,28 +285,29 @@ pub fn spawn_pty_session(
             format!("Failed to open PTY: {}", e)
         })?;
     println!("[PTY Manager] Step 2: ✓ PTY opened successfully");
-    
-
 
     // Build shell command - platform specific
     println!("[PTY Manager] Step 3: Building shell command...");
     let mut cmd = get_shell_command();
     println!("[PTY Manager] Step 3: ✓ Shell command built");
-    
+
     // Set environment variables for proper terminal emulation
     println!("[PTY Manager] Step 4: Setting environment variables...");
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("LC_ALL", "C.UTF-8");
     println!("[PTY Manager] Step 4: ✓ Environment variables set");
-    
+
     // Set the current working directory
     // Priority: 1) Provided working_directory, 2) Project root detection, 3) Home directory
     println!("[PTY Manager] Step 5: Setting working directory...");
     if let Some(ref wd) = working_directory {
         let path = std::path::PathBuf::from(wd);
         if path.exists() {
-            println!("[PTY Manager] Step 5: Using provided working directory: {:?}", path);
+            println!(
+                "[PTY Manager] Step 5: Using provided working directory: {:?}",
+                path
+            );
             cmd.cwd(path);
         } else {
             println!("[PTY Manager] Step 5: Provided directory doesn't exist, using default");
@@ -293,46 +319,29 @@ pub fn spawn_pty_session(
     }
     println!("[PTY Manager] Step 5: ✓ Working directory set");
 
-
-    
     // Spawn the shell process on the slave side
     println!("[PTY Manager] Step 6: Spawning shell process...");
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| {
-            eprintln!("[PTY Manager] Step 6: ✗ Failed to spawn shell: {}", e);
-            format!("Failed to spawn shell: {}", e)
-        })?;
+    let child = pair.slave.spawn_command(cmd).map_err(|e| {
+        eprintln!("[PTY Manager] Step 6: ✗ Failed to spawn shell: {}", e);
+        format!("Failed to spawn shell: {}", e)
+    })?;
     println!("[PTY Manager] Step 6: ✓ Shell process spawned");
-    
-
 
     // Get writer for sending input to PTY
     println!("[PTY Manager] Step 7: Getting PTY writer...");
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| {
-            eprintln!("[PTY Manager] Step 7: ✗ Failed to get PTY writer: {}", e);
-            format!("Failed to get PTY writer: {}", e)
-        })?;
+    let writer = pair.master.take_writer().map_err(|e| {
+        eprintln!("[PTY Manager] Step 7: ✗ Failed to get PTY writer: {}", e);
+        format!("Failed to get PTY writer: {}", e)
+    })?;
     println!("[PTY Manager] Step 7: ✓ PTY writer obtained");
-    
-
 
     // Get reader for receiving output from PTY
     println!("[PTY Manager] Step 8: Getting PTY reader...");
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| {
-            eprintln!("[PTY Manager] Step 8: ✗ Failed to get PTY reader: {}", e);
-            format!("Failed to get PTY reader: {}", e)
-        })?;
+    let reader = pair.master.try_clone_reader().map_err(|e| {
+        eprintln!("[PTY Manager] Step 8: ✗ Failed to get PTY reader: {}", e);
+        format!("Failed to get PTY reader: {}", e)
+    })?;
     println!("[PTY Manager] Step 8: ✓ PTY reader obtained");
-    
-
 
     println!("[PTY Manager] Step 9: Creating PtySession...");
     let session_id = Uuid::new_v4();
@@ -346,8 +355,11 @@ pub fn spawn_pty_session(
         master: pair.master,
         _child: child,
     };
-    
-    println!("[PTY Manager] Step 9: ✓ PtySession created with id={}", session_id);
+
+    println!(
+        "[PTY Manager] Step 9: ✓ PtySession created with id={}",
+        session_id
+    );
     println!("[PTY Manager] === spawn_pty_session SUCCESS ===");
 
     Ok((session, reader))
@@ -371,10 +383,6 @@ fn set_default_cwd(cmd: &mut CommandBuilder) {
 }
 
 /// Resize an existing PTY session
-pub fn resize_pty_session(
-    session: &PtySession,
-    cols: u16,
-    rows: u16,
-) -> Result<(), String> {
+pub fn resize_pty_session(session: &PtySession, cols: u16, rows: u16) -> Result<(), String> {
     session.resize(cols, rows)
 }
