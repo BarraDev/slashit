@@ -856,7 +856,7 @@ mod terminal_xdg_tests {
     /// Spawns the real shell and compares the child's XDG environment with the
     /// decision made from this process's environment. Run it on a disposable
     /// environment, for example with XDG_STATE_HOME set to a redirected tree:
-    /// `cargo test -p slashit-ui test_spawn_pty_session_child_xdg_environment -- --ignored --exact`
+    /// `cargo test -p slashit-ui --lib pty::tests::terminal_xdg_tests::test_spawn_pty_session_child_xdg_environment -- --ignored --exact`
     #[test]
     #[ignore] // Spawns a real shell
     fn test_spawn_pty_session_child_xdg_environment() {
